@@ -54,8 +54,9 @@ pub enum Presence {
 impl Presence {
     /// Whether bx may generate configuration that depends on this tool.
     ///
-    /// Callers ask this rather than matching the variants themselves: whether
-    /// bx may configure for a tool is one decision, so it has one definition.
+    /// This is the seam between detection and [`Action`](crate::report::Action):
+    /// a target whose tool is not usable plans as
+    /// [`Action::Blocked`](crate::report::Action::Blocked).
     #[must_use]
     pub const fn is_usable(&self) -> bool {
         matches!(self, Self::Present { .. })

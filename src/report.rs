@@ -14,6 +14,10 @@
 use std::fmt;
 
 /// What `apply` would do to one target.
+///
+/// The declaration order is load-bearing: `Ord` is derived from it, and the
+/// variants are declared in increasing order of how much a human has to do
+/// about them. Reordering them silently reorders any sorted plan output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
     /// Already converged. Hidden unless the user asks for detail.
@@ -25,6 +29,16 @@ pub enum Action {
     /// The target exists, differs, and bx does not own it — or bx owns it but
     /// the user has since edited it. Reported and skipped, never overwritten.
     Conflict,
+    /// The tool this target configures is not usable on this machine. Reported
+    /// and skipped until the user installs it.
+    ///
+    /// Produced from [`crate::detect::Presence::is_usable`]. It matters most
+    /// where a tool is configured entirely by environment and bx's output is a
+    /// shell fragment naming a binary: writing `RUSTC_WRAPPER=/usr/bin/sccache`
+    /// when sccache is absent does not degrade gracefully, it breaks every
+    /// `cargo build` on the machine. [`env_guard`](crate::env_guard) cannot
+    /// catch that — it checks the name being assigned, not the value.
+    Blocked,
 }
 
 impl Action {
@@ -36,23 +50,26 @@ impl Action {
             Self::Create => '+',
             Self::Modify => '~',
             Self::Conflict => '!',
+            Self::Blocked => '?',
         }
     }
 
     /// Whether this action means `apply` has work to do.
     ///
-    /// A conflict is *not* pending work: bx will skip it, and it stays reported
-    /// until the user resolves it. Counting it as pending would make `plan`
-    /// signal "changes waiting" forever.
+    /// Neither a conflict nor a blocked target is pending work: bx will skip
+    /// both, and they stay reported until the user resolves the conflict or
+    /// installs the tool. Counting them as pending would make `plan` signal
+    /// "changes waiting" forever.
     #[must_use]
     pub const fn is_pending(self) -> bool {
         matches!(self, Self::Create | Self::Modify)
     }
 
-    /// Whether this action needs the user to decide something.
+    /// Whether this action needs the user to do something before bx can
+    /// converge: resolve a conflict, or install a missing tool.
     #[must_use]
     pub const fn needs_attention(self) -> bool {
-        matches!(self, Self::Conflict)
+        matches!(self, Self::Conflict | Self::Blocked)
     }
 }
 
@@ -63,6 +80,7 @@ impl fmt::Display for Action {
             Self::Create => "create",
             Self::Modify => "modify",
             Self::Conflict => "conflict",
+            Self::Blocked => "blocked",
         };
         write!(f, "{word}")
     }
@@ -78,7 +96,7 @@ pub enum Exit {
     Converged = 0,
     /// Something went wrong.
     Error = 1,
-    /// Changes are pending, or a conflict needs a decision.
+    /// Changes are pending, or a conflict or blocked target needs a decision.
     Pending = 2,
 }
 
@@ -91,9 +109,9 @@ impl Exit {
 
     /// The status a set of actions implies.
     ///
-    /// Conflicts count as pending here even though they are not pending *work*:
-    /// the machine is not converged and a human has to look at it, which is
-    /// exactly what a non-zero exit is for.
+    /// Conflicts and blocked targets count as pending here even though they
+    /// are not pending *work*: the machine is not converged and a human has to
+    /// look at it, which is exactly what a non-zero exit is for.
     #[must_use]
     pub fn from_actions(actions: &[Action]) -> Self {
         let unresolved = actions
@@ -112,10 +130,11 @@ impl Exit {
 pub fn summary(actions: &[Action]) -> String {
     let count = |want: Action| actions.iter().filter(|a| **a == want).count();
     format!(
-        "Plan: {} to create, {} to modify, {} conflict, {} unchanged.",
+        "Plan: {} to create, {} to modify, {} conflict, {} blocked, {} unchanged.",
         count(Action::Create),
         count(Action::Modify),
         count(Action::Conflict),
+        count(Action::Blocked),
         count(Action::Unchanged),
     )
 }
@@ -131,6 +150,7 @@ mod tests {
             Action::Create,
             Action::Modify,
             Action::Conflict,
+            Action::Blocked,
         ];
         let mut symbols: Vec<char> = all.iter().map(|a| a.symbol()).collect();
         symbols.sort_unstable();
@@ -143,6 +163,7 @@ mod tests {
         assert_eq!(Action::Create.symbol(), '+');
         assert_eq!(Action::Modify.symbol(), '~');
         assert_eq!(Action::Conflict.symbol(), '!');
+        assert_eq!(Action::Blocked.symbol(), '?');
         assert_eq!(Action::Unchanged.symbol(), '=');
     }
 
@@ -151,20 +172,47 @@ mod tests {
         assert!(Action::Create.is_pending());
         assert!(Action::Modify.is_pending());
         assert!(!Action::Conflict.is_pending());
+        assert!(!Action::Blocked.is_pending());
         assert!(!Action::Unchanged.is_pending());
     }
 
     #[test]
-    fn only_a_conflict_needs_a_decision() {
+    fn conflicts_and_blocked_targets_need_a_decision() {
         assert!(Action::Conflict.needs_attention());
+        assert!(Action::Blocked.needs_attention());
         for a in [Action::Create, Action::Modify, Action::Unchanged] {
             assert!(!a.needs_attention(), "{a} should not need attention");
         }
     }
 
     #[test]
+    fn actions_order_by_how_much_a_human_must_do() {
+        // `Ord` is derived from the declaration order, so this pins it: a
+        // reordering that looks cosmetic would resort plan output.
+        let mut actions = [
+            Action::Blocked,
+            Action::Create,
+            Action::Unchanged,
+            Action::Conflict,
+            Action::Modify,
+        ];
+        actions.sort_unstable();
+        assert_eq!(
+            actions,
+            [
+                Action::Unchanged,
+                Action::Create,
+                Action::Modify,
+                Action::Conflict,
+                Action::Blocked,
+            ]
+        );
+    }
+
+    #[test]
     fn actions_render_as_words() {
         assert_eq!(Action::Conflict.to_string(), "conflict");
+        assert_eq!(Action::Blocked.to_string(), "blocked");
         assert_eq!(Action::Unchanged.to_string(), "unchanged");
         assert_eq!(Action::Create.to_string(), "create");
         assert_eq!(Action::Modify.to_string(), "modify");
@@ -203,19 +251,31 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_target_alone_exits_two() {
+        // Same reasoning as a conflict: apply skips it, but the machine is not
+        // converged until someone installs the tool.
+        assert_eq!(Exit::from_actions(&[Action::Blocked]), Exit::Pending);
+        assert_eq!(
+            Exit::from_actions(&[Action::Unchanged, Action::Blocked]),
+            Exit::Pending
+        );
+    }
+
+    #[test]
     fn the_summary_counts_every_category() {
         let actions = [
             Action::Create,
             Action::Create,
             Action::Modify,
             Action::Conflict,
+            Action::Blocked,
             Action::Unchanged,
             Action::Unchanged,
             Action::Unchanged,
         ];
         assert_eq!(
             summary(&actions),
-            "Plan: 2 to create, 1 to modify, 1 conflict, 3 unchanged."
+            "Plan: 2 to create, 1 to modify, 1 conflict, 1 blocked, 3 unchanged."
         );
     }
 
@@ -223,7 +283,7 @@ mod tests {
     fn an_empty_plan_still_summarises() {
         assert_eq!(
             summary(&[]),
-            "Plan: 0 to create, 0 to modify, 0 conflict, 0 unchanged."
+            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged."
         );
     }
 }

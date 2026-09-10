@@ -8,9 +8,11 @@
 //! * [`paths`] — anything stored in the config repo is home-relative, so a repo
 //!   moves between machines with different `$HOME` values without edits.
 //!
-//! [`report`] holds the vocabulary `plan` and `apply` share, including the fact
-//! that an additive-only tool has no destroy action.
+//! [`detect`] answers whether a tool bx is configuring for is actually usable
+//! on this machine, and [`report`] holds the vocabulary `plan` and `apply`
+//! share, including the fact that an additive-only tool has no destroy action.
 
+pub mod detect;
 pub mod env_guard;
 pub mod paths;
 pub mod report;

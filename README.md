@@ -60,15 +60,20 @@ and secrets, not just the flag list.
 
 ### Reading a plan
 
-Four symbols, and there is deliberately no fifth. A tool that only adds has no
-"destroy", so that slot goes to the case that actually matters for one that
-must not be invasive: something it does not own is in the way.
+Five symbols, and none of them is "destroy". A tool that only adds never has
+one, so those slots go to the two cases that actually matter for a tool that
+must not be invasive: something it does not own is in the way, and the tool it
+is configuring for is not on this machine.
 
 ```
   +  create     it does not exist yet
   ~  modify     bx owns it and the content differs
   !  conflict   it exists, differs, and bx does not own it — or you edited
                 bx's output. Reported and skipped, never overwritten.
+  ?  blocked    the tool this configures is not installed, or is installed
+                where you cannot run it. Reported and skipped until you
+                install it — writing the config anyway would break your
+                shell or your builds, not just that one tool.
   =  unchanged  already converged (hidden unless you ask)
 ```
 
@@ -84,7 +89,7 @@ or a login banner without anyone parsing its output:
 |---|---|
 | `0` | converged — nothing to do |
 | `1` | error |
-| `2` | changes pending, or a conflict needs a decision |
+| `2` | changes pending, or a conflict or blocked target needs a decision |
 
 ## Requirements
 

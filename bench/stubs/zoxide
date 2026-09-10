@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stand-in for zoxide: emits an init block of representative size, then exits.
+# The process spawn is the point — it is what `eval "\$(zoxide init zsh)"` costs.
+exec "$(dirname "$0")/gen.sh" zoxide 20

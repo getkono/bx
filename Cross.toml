@@ -1,0 +1,16 @@
+# cross-rs — bx ships only statically linked Linux binaries.
+#
+# musl (not gnu) for both targets: the binary must run on a barebones box with
+# no toolchain and no assumption about the host's glibc version, because
+# bootstrapping such a box is what bx is for. Every dependency is pure Rust, so
+# there is no OpenSSL or other C library to link against.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+
+[build.env]
+# The cross container has no git, so the release workflow exports the commit
+# hash on the host and forwards it here; build.rs prefers it over its own probe.
+passthrough = ["BX_BUILD_SHA"]

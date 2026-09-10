@@ -1,0 +1,19 @@
+//! `bx` — an idempotent, additive Linux developer-environment manager.
+//!
+//! The crate is organised around two invariants that the rest of the tool is
+//! built on top of, and that are enforced here rather than by convention:
+//!
+//! * [`env_guard`] — bx may never emit an environment variable that relocates
+//!   another tool's config, data, or cache away from that tool's default.
+//! * [`paths`] — anything stored in the config repo is home-relative, so a repo
+//!   moves between machines with different `$HOME` values without edits.
+//!
+//! [`report`] holds the vocabulary `plan` and `apply` share, including the fact
+//! that an additive-only tool has no destroy action.
+
+pub mod env_guard;
+pub mod paths;
+pub mod report;
+
+/// The version reported by `bx --version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

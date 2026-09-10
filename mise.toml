@@ -1,0 +1,76 @@
+# mise — dev tools + task runner. https://mise.jdx.dev
+#
+# The Rust toolchain itself is pinned by rust-toolchain.toml (rustup); mise
+# manages only the auxiliary dev tools and the project task list.
+
+[tools]
+hk = "1.57.0"                            # git hook manager; keep in sync with the hk.pkl amends URL
+pkl = "latest"                           # config language hk.pkl is written in
+"cargo:convco" = "0.6.4"                 # Conventional Commits linter for the commit-msg hook + CI
+"aqua:taiki-e/cargo-llvm-cov" = "latest" # coverage (needs the llvm-tools-preview component)
+"cargo:cargo-mutants" = "27.1.0"
+"aqua:sharkdp/hyperfine" = "latest"      # the shell-startup benchmark's measurement tool
+shellcheck = "latest"                    # install.sh and the bench harness are gated on it (pre-commit + CI)
+
+# After `mise install`, wire hk's git hooks through mise so they resolve hk and
+# convco without requiring shell activation. Skipped in CI, where the hooks
+# aren't installed (CI calls the checks directly).
+[hooks]
+postinstall = 'test -n "$CI" || hk install --mise'
+
+[tasks.run]
+description = "Run the application"
+run = "cargo run"
+
+[tasks.install]
+description = "Build and install the `bx` binary to ~/.cargo/bin"
+run = '''
+cargo install --path .
+echo ''
+echo '✓ Installed bx to ~/.cargo/bin'
+echo 'Next: bx init'
+'''
+
+[tasks.format]
+description = "Format the code"
+run = "cargo fmt"
+
+[tasks.format-check]
+description = "Check formatting without modifying files (used by CI and pre-push)"
+run = "cargo fmt --check"
+
+[tasks.lint]
+description = "Lint with Clippy, treating warnings as errors"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.lint-fix]
+description = "Lint and auto-fix where possible (used by the pre-commit hook)"
+run = "cargo clippy --fix --allow-dirty --allow-staged --all-targets"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test"
+
+[tasks.coverage]
+description = "Run tests with coverage (minimum 80% line coverage; the main.rs entry point is excluded)"
+run = '''cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80'''
+
+[tasks.bench]
+description = "Measure bx's contribution to zsh startup against its 5 ms budget"
+# The budget is a product requirement, so it is measured, not assumed. See
+# bench/README.md for what the fixture controls for.
+run = "bench/run.sh"
+
+[tasks.commit-check]
+description = "Verify this branch's commits (vs origin/master) follow Conventional Commits"
+run = "convco check origin/master..HEAD"
+
+[tasks.commit-msg-check]
+description = "Lint a single commit message file against Conventional Commits (commit-msg hook)"
+usage = 'arg "<file>" help="Path to the commit message file"'
+run = 'convco check --from-stdin --strip < "${usage_file}"'
+
+[tasks.mutants]
+description = "Mutation testing — find logic the tests don't pin down (slow); args pass through"
+raw_args = true
+run = "cargo mutants"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stand-in for mise: emits an init block of representative size, then exits.
+# The process spawn is the point — it is what `eval "\$(mise init zsh)"` costs.
+exec "$(dirname "$0")/gen.sh" mise 20

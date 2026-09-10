@@ -1,0 +1,66 @@
+amends "package://github.com/jdx/hk/releases/download/v1.57.0/hk@1.57.0#/Config.pkl"
+
+// hk git hooks — https://hk.jdx.dev
+//
+// pre-commit auto-fixes formatting then linting (formatting can affect lint
+// output); pre-push is the final gate (format-check, clippy, tests, coverage).
+// cargo fmt/clippy operate on the whole workspace, so the *.rs glob only gates
+// *whether* a step runs — the commands take no file arguments. `depends`
+// serialises the steps within each hook.
+//
+// git invokes hooks with GIT_DIR (and friends) exported, and git honours those
+// over a `-C <dir>` argument. bx's tests spawn real processes against throwaway
+// temp homes, so the test/coverage steps strip the inherited GIT_* location
+// variables first — otherwise those subprocesses would target this repo.
+
+hooks {
+  // Reject commit messages that aren't Conventional Commits.
+  ["commit-msg"] {
+    steps = new Mapping<String, Step> {
+      ["convco"] {
+        check = "mise run commit-msg-check {{commit_msg_file}}"
+      }
+    }
+  }
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = new Mapping<String, Step> {
+      ["format"] {
+        glob = "*.rs"
+        fix = "cargo fmt"
+      }
+      ["lint-fix"] {
+        glob = "*.rs"
+        depends = List("format")
+        fix = "cargo clippy --fix --allow-dirty --allow-staged --all-targets"
+      }
+      // install.sh runs on machines with nothing else on them; a shell bug
+      // there is the one bug a user cannot work around.
+      ["shellcheck"] {
+        glob = "*.sh"
+        check = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh"
+      }
+    }
+  }
+  ["pre-push"] {
+    fix = false
+    steps = new Mapping<String, Step> {
+      ["format-check"] {
+        check = "cargo fmt --check"
+      }
+      ["lint"] {
+        depends = List("format-check")
+        check = "cargo clippy --all-targets -- -D warnings"
+      }
+      ["test"] {
+        depends = List("lint")
+        check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX cargo test"
+      }
+      ["coverage"] {
+        depends = List("test")
+        check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX cargo llvm-cov --ignore-filename-regex 'src/main\\.rs' --fail-under-lines 80"
+      }
+    }
+  }
+}

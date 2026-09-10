@@ -1,0 +1,28 @@
+# release-plz: automated, Conventional-Commit-driven releases for bx.
+# Docs: https://release-plz.dev
+#
+# On every push to master, .github/workflows/release-plz.yml either opens/updates
+# a "release PR" that bumps the version and updates CHANGELOG.md, or — when that
+# PR is merged — cuts a GitHub Release + `v{version}` tag, which triggers the
+# static-binary build that install.sh downloads from.
+[workspace]
+# bx is NOT published to crates.io. Its only install channel is install.sh
+# pulling a static musl binary from GitHub Releases, because the tool's job is
+# to bootstrap a machine that has no Rust toolchain on it. With publishing off,
+# release-plz must detect versions from git tags rather than the registry, which
+# is what `git_only` does (it is mutually exclusive with `publish = true`).
+publish = false
+git_only = true
+
+# Maintain CHANGELOG.md from Conventional Commits (keep-a-changelog format).
+changelog_update = true
+
+# Cut a GitHub Release (with generated notes) and a `v{version}` git tag per
+# release. The tag name is referenced by the binary build job, so pin it.
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+
+# bx exposes a library target only so the binary can be tested through it; it
+# has no external consumers, so cargo-semver-checks would only add noise.
+semver_check = false

@@ -1,0 +1,158 @@
+name: Release-plz
+
+# On every push to master, release-plz either opens/updates a "release PR"
+# (version bump + CHANGELOG) or, once that PR is merged, cuts a GitHub Release
+# and a `v{version}` tag. Cutting a release fans out to the build job below,
+# which attaches the static binaries install.sh downloads.
+#
+# bx is NOT published to crates.io — install.sh pulling a static musl binary is
+# the only channel, because bootstrapping a machine with no toolchain on it is
+# what bx is for. See release-plz.toml and RELEASING.md.
+on:
+  push:
+    branches:
+      - master
+  # Lets the very first release — or any re-run — be kicked off by hand from the
+  # Actions tab without waiting for a release PR.
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'getkono' }}
+    permissions:
+      contents: write # push tags, create the GitHub Release
+      pull-requests: read
+    # Surfaced to the build job so it only runs when a release was actually cut.
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          # A PAT is only nice-to-have, so the Release shows the maintainer as
+          # author; it falls back to GITHUB_TOKEN until one is added.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  release-plz-pr:
+    name: Release-plz PR
+    # Runs after the release job: release-plz determines the next version by
+    # diffing against the last released tag, so the just-cut tag must exist —
+    # otherwise this diffs against a stale one.
+    needs: release-plz-release
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'getkono' && github.event_name == 'push' }}
+    permissions:
+      contents: write # push the release branch
+      pull-requests: write # open/update the release PR
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          # A PAT (not GITHUB_TOKEN) is required for CI to run on the release PR,
+          # so branch protection can gate it. Falls back until the secret exists.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  # ── Static binaries ───────────────────────────────────────────────────────
+  # These are the product's only distribution channel, so they are part of the
+  # release, not an afterthought attached to it.
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: release-plz-release
+    if: ${{ needs.release-plz-release.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Key the cache by target: both musl targets run on the same runner and
+      # rust-cache's default key omits the target, so without this the aarch64
+      # job would restore the x86_64 job's host-compiled build scripts.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+      - name: Build
+        run: |
+          # The cross container has no git, so export the commit hash here and
+          # forward it via Cross.toml.
+          export BX_BUILD_SHA="$(git rev-parse --short=12 HEAD)"
+          cross build --release --locked --target ${{ matrix.target }}
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/release
+          tar czf "$GITHUB_WORKSPACE/bx-${{ matrix.target }}.tar.gz" bx
+          cd "$GITHUB_WORKSPACE"
+          # install.sh refuses to install without verifying, so the checksum is a
+          # required asset, not an optional nicety. Written in `sha256sum -c`
+          # format so the installer can hand it straight to the tool.
+          sha256sum "bx-${{ matrix.target }}.tar.gz" > "bx-${{ matrix.target }}.tar.gz.sha256"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bx-${{ matrix.target }}
+          path: |
+            bx-${{ matrix.target }}.tar.gz
+            bx-${{ matrix.target }}.tar.gz.sha256
+
+  upload-assets:
+    name: Upload release binaries
+    needs: [release-plz-release, build]
+    if: ${{ needs.release-plz-release.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload assets to the existing Release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Upload binaries to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The merged release PR bumped Cargo.toml, so its version is the one
+          # just released and release-plz tagged it `v{version}`. Read the first
+          # top-level `version =` — no toolchain needed on this runner.
+          VERSION="$(grep -m1 '^version *=' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          gh release upload "v${VERSION}" bx-*.tar.gz bx-*.tar.gz.sha256 --clobber

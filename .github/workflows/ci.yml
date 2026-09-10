@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  commit-lint:
+    name: Conventional commits
+    runs-on: ubuntu-latest
+    # Only PRs carry an unmerged commit series worth linting; pushes to master are history.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # convco needs full history to walk the commit range
+      # mise provisions convco (see mise.toml); the install is cached across runs.
+      - uses: jdx/mise-action@v2
+      - name: Conventional Commits check
+        run: convco check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
+  check:
+    name: Format, Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+      - name: Check formatting
+        run: mise run format-check
+      - name: Clippy
+        run: mise run lint
+      - name: Test
+        run: mise run test
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    # install.sh runs on machines that have nothing else on them, so a bug there
+    # is the one bug a user cannot work around. bench/run.sh gates the startup
+    # budget, so a bug there silently disables that gate.
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck install.sh bench/run.sh bench/stubs/gen.sh
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+      - name: Collect coverage data
+        run: cargo llvm-cov --no-report
+      - name: Generate lcov report and enforce threshold
+        run: cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' --lcov --output-path lcov.info --fail-under-lines 80
+      - name: Coverage summary
+        run: cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' --summary-only
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: lcov.info
+
+  bench:
+    name: Shell startup budget
+    runs-on: ubuntu-latest
+    # bx runs at every shell start, so "fast enough to forget" is a product
+    # requirement — and an unmeasured requirement is one that regresses. The
+    # fixture is hermetic (scratch HOME, stub tools), so this is a real gate and
+    # not a measurement of the runner's mood. See bench/README.md.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Measure
+        run: mise run bench | tee bench-result.txt
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: startup-benchmark
+          path: |
+            bench-result.txt
+            bench/results/

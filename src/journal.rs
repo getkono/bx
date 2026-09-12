@@ -20,7 +20,9 @@
 //! 4. the [`Intent`] frame is appended and `fsync`ed.
 //! 5. **only then** [`crate::fs::Filled::publish`] renames the temporary file
 //!    into place and `fsync`s the directory.
-//! 6. a [`Done`] frame is appended and `fsync`ed.
+//! 6. the in-memory ledger is told — only now, so a publish that fails leaves no
+//!    record of a write that never happened.
+//! 7. a [`Done`] frame is appended and `fsync`ed.
 //!
 //! At every instant `journal.mpk` either does not exist — no session is in
 //! flight — or describes, durably, a superset of the destinations that may have
@@ -62,18 +64,35 @@
 //! test is exact rather than probabilistic, and a run of NUL bytes left by a
 //! filesystem cannot decode as a record.
 //!
-//! # Why the journal is not written through [`crate::fs::atomic`]
+//! # Created through [`crate::fs::atomic`], appended to in place
 //!
-//! Everything else in bx reaches the filesystem through one atomic write —
-//! temporary file, `fsync`, `rename`. A write-ahead log cannot: it is *appended*
-//! to and `fsync`ed in place, and replacing it by `rename` would discard the
-//! frames it exists to keep. It is opened once per session, appended to with one
-//! `write` call per frame so a torn frame can only ever be the file's last
-//! bytes, and unlinked — last of all — when the session ends.
+//! A journal comes into existence whole. Its header and its [`Begin`] frame are
+//! written to a temporary file in the state directory, `fsync`ed, and renamed
+//! into place by [`crate::fs::write_atomically`], like every other file bx
+//! writes. No reader ever sees a journal that is empty or half a header, which
+//! matters because [`crate::recover::pending`] reads it without the lock while a
+//! session may be starting. A crash before the rename leaves a `.bx-` temporary
+//! file in the state directory — bx's own directory, holding no byte of the
+//! user's — and no journal.
+//!
+//! After that a write-ahead log cannot go through a rename: it is *appended* to
+//! and `fsync`ed in place, and replacing it would discard the frames it exists to
+//! keep. It is appended to with one `write` call per frame so a torn frame can
+//! only ever be the file's last bytes, and unlinked — last of all — when the
+//! session ends.
+//!
+//! # A failed write ends the session
+//!
+//! The first write in a session that returns an error *poisons* it: every later
+//! [`Session::apply`] and [`Session::finish`] is refused, so the journal stays
+//! for recovery to roll back. A failed append may have left a torn frame at the
+//! tail, and a frame appended after it would be invisible to [`load`] — an
+//! Intent recovery could never see. A failed publish leaves an Intent with no
+//! Done, which an `End` frame and a ledger save would close out as though it
+//! had landed.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode as RawMode, OFlags};
@@ -140,6 +159,17 @@ pub enum Error {
     )]
     InProgress {
         /// The journal that stands.
+        path: PathBuf,
+    },
+    /// A write in this session already failed, so the session may neither
+    /// write again nor finish.
+    #[error(
+        "an earlier write in this bx session failed; the session cannot go on, \
+         and {} is left for recovery to roll back",
+        .path.display()
+    )]
+    Poisoned {
+        /// The journal that records the session.
         path: PathBuf,
     },
     /// The state directory failed.
@@ -287,15 +317,19 @@ pub enum Loaded {
     Terminated(Vec<Record>),
     /// The journal has no [`End`]: the session was interrupted.
     Unterminated(Vec<Record>),
-    /// The header, or the first frame after it, is not a bx journal.
+    /// The bytes cannot be the start of a bx journal: a wrong header, a format
+    /// this build does not know, or a whole first frame that is not a record.
     ///
     /// It carries no information, so there is nothing to recover and nothing
-    /// recovery could damage. The bytes are moved aside — never deleted — and
-    /// the caller treats this exactly as [`Loaded::Absent`]. What the write may
-    /// have completed is then recomputed by `plan`, which reports a file bx
-    /// wrote but never recorded as a conflict: skipped, never overwritten.
+    /// recovery could damage, and the caller treats this exactly as
+    /// [`Loaded::Absent`]. [`load_exclusive`] moves the bytes aside — never
+    /// deletes them — and [`load`], which runs without the lock, leaves them
+    /// where they are. What the write may have completed is then recomputed by
+    /// `plan`, which reports a file bx wrote but never recorded as a conflict:
+    /// skipped, never overwritten.
     Unreadable {
-        /// Where the bytes were kept, or `None` if they could not be moved.
+        /// Where the bytes were kept, or `None` if they were not moved: the read
+        /// held no lock, or the rename failed.
         moved_to: Option<PathBuf>,
     },
 }
@@ -307,6 +341,31 @@ impl Loaded {
             Record::Intent(intent) => Some(intent),
             _ => None,
         })
+    }
+
+    /// Every [`Intent`], in the order it was written, with whether it was
+    /// published.
+    ///
+    /// A session appends an Intent's [`Done`] as the very next frame, and a
+    /// session whose write fails appends nothing more at all, so "the next frame
+    /// is its `Done`" is exactly "it landed".
+    #[must_use]
+    pub fn landed(&self) -> Vec<(&Intent, bool)> {
+        let records = self.records();
+        records
+            .iter()
+            .enumerate()
+            .filter_map(|(at, record)| match record {
+                Record::Intent(intent) => Some((
+                    intent,
+                    matches!(
+                        records.get(at + 1),
+                        Some(Record::Done(done)) if done.target == intent.target
+                    ),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The session header, if the journal has one.
@@ -334,22 +393,65 @@ impl Loaded {
     }
 }
 
-/// Read a journal, classifying anything a crash can leave behind.
+/// Read a journal, classifying anything a crash can leave behind, and move
+/// nothing.
 ///
 /// A torn *tail* frame is discarded: the ordering discipline in
 /// [`Session::apply`] means a frame whose `fsync` had not returned announces a
-/// write that had not begun. A bad *header*, or garbage where the first frame
-/// should be, is [`Loaded::Unreadable`] — quarantined to `journal.mpk.corrupt`
-/// and reported at `error`.
+/// write that had not begun. A file that is only a prefix of a header, or a
+/// header and a prefix of its first frame, is a session that wrote nothing —
+/// [`Loaded::Unterminated`] with no records — because a torn first frame says
+/// exactly as little as a torn tail. Only bytes that cannot be the start of a bx
+/// journal are [`Loaded::Unreadable`]: a wrong magic, a format this build does
+/// not know, or a first frame that is whole and does not decode.
+///
+/// This is the read [`crate::recover::pending`] makes without the state lock,
+/// so it never renames, unlinks or writes: the journal it is looking at may
+/// belong to a session running right now. Setting an unreadable journal aside
+/// is [`load_exclusive`]'s, and only the lock holder's.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] when the file exists and cannot be read at all. Damage is a
 /// value, not an error; only a failure to look is.
 pub fn load(path: &Path) -> Result<Loaded, Error> {
+    Ok(match inspect(path)? {
+        Ok(loaded) => loaded,
+        Err(why) => {
+            tracing::warn!(
+                path = %path.display(),
+                "the write-ahead journal {} is unreadable: {why}. It is left in \
+                 place for the next writing bx run to set aside.",
+                path.display(),
+            );
+            Loaded::Unreadable { moved_to: None }
+        }
+    })
+}
+
+/// [`load`], and move an unreadable journal aside to `journal.mpk.corrupt`.
+///
+/// The [`ExclusiveLock`] is the proof that no session can be creating or
+/// appending to the journal while it is moved. A reader without it could rename
+/// a live journal out from under the session writing it, which is why [`load`]
+/// does not.
+///
+/// # Errors
+///
+/// As [`load`].
+pub fn load_exclusive(path: &Path, _lock: &ExclusiveLock) -> Result<Loaded, Error> {
+    Ok(match inspect(path)? {
+        Ok(loaded) => loaded,
+        Err(why) => quarantine(path, why),
+    })
+}
+
+/// Classify the bytes at `path`: what a session, or a crash of one, left there,
+/// or why it is neither.
+fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Absent),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Ok(Loaded::Absent)),
         Err(source) => {
             return Err(Error::Io {
                 path: path.to_path_buf(),
@@ -358,60 +460,84 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
         }
     };
 
-    if bytes.len() < HEADER || &bytes[..MAGIC.len()] != MAGIC.as_slice() {
-        return Ok(quarantine(
-            path,
-            "it does not start with a bx journal header",
-        ));
+    if bytes.len() < HEADER {
+        // Only the magic can be cut this short; the version byte is the
+        // header's last. A prefix of it is a header a crash tore.
+        return Ok(if MAGIC.starts_with(&bytes) {
+            Ok(Loaded::Unterminated(Vec::new()))
+        } else {
+            Err("it does not start with a bx journal header")
+        });
+    }
+    if &bytes[..MAGIC.len()] != MAGIC.as_slice() {
+        return Ok(Err("it does not start with a bx journal header"));
     }
     if bytes[MAGIC.len()] != FORMAT {
-        return Ok(quarantine(
-            path,
-            "it is a journal format this bx cannot read",
-        ));
+        return Ok(Err("it is a journal format this bx cannot read"));
     }
 
     let mut records = Vec::new();
     let mut at = HEADER;
-    while let Some((record, next)) = frame(&bytes, at) {
-        records.push(record);
-        at = next;
+    while at < bytes.len() {
+        match frame(&bytes, at) {
+            Ok((record, next)) => {
+                records.push(record);
+                at = next;
+            }
+            // A first frame that is all there and still not a record is not a
+            // write a crash cut short: it is bytes bx never wrote.
+            Err(Damage::Invalid) if records.is_empty() => {
+                return Ok(Err("no record decodes where the first frame should be"));
+            }
+            Err(_) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    discarded = bytes.len() - at,
+                    "discarding a torn trailing journal frame",
+                );
+                break;
+            }
+        }
     }
 
-    // A header with bytes after it that yield no whole record is garbage rather
-    // than a clean, empty log. A header with *nothing* after it is the real
-    // state a crash between creating the file and appending `Begin` leaves.
-    if records.is_empty() && at < bytes.len() {
-        return Ok(quarantine(path, "no whole record follows the header"));
-    }
-    if at < bytes.len() {
-        tracing::debug!(
-            path = %path.display(),
-            discarded = bytes.len() - at,
-            "discarding a torn trailing journal frame",
-        );
-    }
-
-    Ok(if matches!(records.last(), Some(Record::End(_))) {
+    Ok(Ok(if matches!(records.last(), Some(Record::End(_))) {
         Loaded::Terminated(records)
     } else {
         Loaded::Unterminated(records)
-    })
+    }))
 }
 
-/// Decode the frame at `at`, or `None` for anything that is not a whole one.
-fn frame(bytes: &[u8], at: usize) -> Option<(Record, usize)> {
-    let body = at.checked_add(size_of::<u32>())?;
-    let len: [u8; 4] = bytes.get(at..body)?.try_into().ok()?;
-    let len = usize::try_from(u32::from_le_bytes(len)).ok()?;
-    // Zero is not a length any record can have — an encoded container is at
-    // least one byte — so a run of NUL bytes ends the log rather than decoding.
-    if len == 0 || len > MAX_FRAME {
-        return None;
+/// Why there is no whole record at an offset.
+enum Damage {
+    /// The bytes stop before the frame does: a write a crash cut short.
+    Torn,
+    /// The frame is all there, and it is not a record.
+    Invalid,
+}
+
+/// Decode the frame at `at`.
+fn frame(bytes: &[u8], at: usize) -> Result<(Record, usize), Damage> {
+    let prefix_end = at.checked_add(size_of::<u32>()).ok_or(Damage::Invalid)?;
+    let prefix: [u8; 4] = bytes
+        .get(at..prefix_end)
+        .ok_or(Damage::Torn)?
+        .try_into()
+        .map_err(|_| Damage::Torn)?;
+    let len = usize::try_from(u32::from_le_bytes(prefix)).map_err(|_| Damage::Invalid)?;
+    // Past the bound is garbage however many bytes follow, and is what stops four
+    // bytes of garbage asking for a gigabyte.
+    //
+    // A zero length has no test of its own. An encoded record is at least one
+    // byte, so a zero-length body is an empty slice, and an empty slice never
+    // decodes: a run of NUL bytes is `Invalid` through the decode below, which
+    // `a_run_of_nul_bytes_is_not_a_valid_frame` pins.
+    if len > MAX_FRAME {
+        return Err(Damage::Invalid);
     }
-    let end = body.checked_add(len)?;
-    let record = rmp_serde::from_slice::<Record>(bytes.get(body..end)?).ok()?;
-    Some((record, end))
+    let end = prefix_end.checked_add(len).ok_or(Damage::Invalid)?;
+    let body = bytes.get(prefix_end..end).ok_or(Damage::Torn)?;
+    let record = rmp_serde::from_slice::<Record>(body).map_err(|_| Damage::Invalid)?;
+    Ok((record, end))
 }
 
 /// Move a journal that carries no information aside, and say so.
@@ -457,40 +583,38 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Truncate-and-create the journal, write its header, and `fsync` both the
-    /// file and the directory holding it.
+    /// Create the journal whole — header and [`Begin`] frame — through
+    /// [`crate::fs::write_atomically`], then open it for appending.
+    ///
+    /// Whatever was at `path` is replaced by `rename`, never truncated in place,
+    /// so an unlocked reader sees either the file that was there or the new
+    /// journal with its `Begin`, and never an empty or half-written one. The
+    /// temporary file is `fsync`ed before the rename and the directory after it,
+    /// and the journal is at `0600` from its first instant.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] wrapping the first failing syscall.
-    pub fn create(path: &Path) -> Result<Self, Error> {
-        let fail = |source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(Mode::PRIVATE_FILE.bits())
-            .open(path)
-            .map_err(fail)?;
-        // `OpenOptions::mode` is masked by the process umask; `fchmod` is not.
-        rustix::fs::fchmod(&file, Mode::PRIVATE_FILE.into())
-            .map_err(|source| fail(source.into()))?;
+    /// [`Error::Encode`] or [`Error::FrameTooLarge`] for a `Begin` that cannot be
+    /// framed, [`Error::Write`] when the file cannot be written, and
+    /// [`Error::Io`] when it cannot be reopened for appending.
+    pub fn create(path: &Path, begin: Begin) -> Result<Self, Error> {
+        let mut bytes = Vec::with_capacity(HEADER);
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(FORMAT);
+        bytes.extend_from_slice(&encode(&Record::Begin(begin))?);
+        fs::write_atomically(path, &bytes, Mode::PRIVATE_FILE)?;
 
-        let mut journal = Self {
+        let file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(Self {
             file,
             path: path.to_path_buf(),
-        };
-        let mut header = Vec::with_capacity(HEADER);
-        header.extend_from_slice(MAGIC);
-        header.push(FORMAT);
-        journal.emit(&header)?;
-        if let Some(dir) = path.parent() {
-            fsync_dir(dir)?;
-        }
-        Ok(journal)
+        })
     }
 
     /// The journal's path.
@@ -510,16 +634,9 @@ impl Journal {
     /// [`Error::FrameTooLarge`] for one that is absurdly big, and [`Error::Io`]
     /// wrapping the failing `write` or `fsync`.
     pub fn append(&mut self, record: &Record) -> Result<(), Error> {
-        let payload = rmp_serde::to_vec_named(record).map_err(|source| Error::Encode { source })?;
-        let len = u32::try_from(payload.len())
-            .ok()
-            .filter(|_| payload.len() <= MAX_FRAME)
-            .ok_or(Error::FrameTooLarge { len: payload.len() })?;
         // One buffer and one `write_all`, so a frame torn by a crash can only
         // ever be the last bytes of the file.
-        let mut frame = Vec::with_capacity(size_of::<u32>() + payload.len());
-        frame.extend_from_slice(&len.to_le_bytes());
-        frame.extend_from_slice(&payload);
+        let frame = encode(record)?;
         self.emit(&frame)
     }
 
@@ -532,6 +649,20 @@ impl Journal {
         self.file.write_all(bytes).map_err(fail)?;
         self.file.sync_all().map_err(fail)
     }
+}
+
+/// One record as a frame: its length as a little-endian `u32`, then its
+/// MessagePack encoding.
+fn encode(record: &Record) -> Result<Vec<u8>, Error> {
+    let payload = rmp_serde::to_vec_named(record).map_err(|source| Error::Encode { source })?;
+    let len = u32::try_from(payload.len())
+        .ok()
+        .filter(|_| payload.len() <= MAX_FRAME)
+        .ok_or(Error::FrameTooLarge { len: payload.len() })?;
+    let mut frame = Vec::with_capacity(size_of::<u32>() + payload.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
 }
 
 /// A transaction over the state directory: the lock, the ledger, the journal.
@@ -552,7 +683,14 @@ pub struct Session {
     ledger: Ledger,
     home: PathBuf,
     written: usize,
+    /// Set by the first write that fails. See [`Session::apply`].
+    poisoned: bool,
     crash: Crash,
+    /// Called with the destination just before a write is published, so a test
+    /// can make the publish fail the way a concurrent change to the destination
+    /// would.
+    #[cfg(test)]
+    before_publish: Option<fn(&Path)>,
     /// Held, never read: dropping it releases the state directory.
     _lock: ExclusiveLock,
 }
@@ -620,17 +758,19 @@ impl Session {
         // The lock first, so the check below cannot race a second bx.
         let lock = ExclusiveLock::acquire(state)?;
         let path = state.journal();
-        if load(&path)?.is_interrupted() {
+        if load_exclusive(&path, &lock)?.is_interrupted() {
             return Err(Error::InProgress { path });
         }
 
         let ledger = Ledger::open(state, &lock)?.value;
-        let mut journal = Journal::create(&path)?;
-        journal.append(&Record::Begin(Begin {
-            kind,
-            home: home.to_path_buf(),
-            scope,
-        }))?;
+        let journal = Journal::create(
+            &path,
+            Begin {
+                kind,
+                home: home.to_path_buf(),
+                scope,
+            },
+        )?;
         tracing::debug!(%kind, home = %home.display(), "opened a journalled session");
 
         Ok(Self {
@@ -639,7 +779,10 @@ impl Session {
             ledger,
             home: home.to_path_buf(),
             written: 0,
+            poisoned: false,
             crash: Crash::from_env(),
+            #[cfg(test)]
+            before_publish: None,
             _lock: lock,
         })
     }
@@ -693,12 +836,24 @@ impl Session {
     /// The one place the ordering discipline this module documents is expressed,
     /// and therefore the only place it can be got wrong.
     ///
+    /// # A failed write poisons the session
+    ///
+    /// Any error here leaves the session refusing every later `apply` and
+    /// [`Session::finish`], so its journal stays for recovery to roll back —
+    /// whatever failed, and however early. A caller that wants to skip a target
+    /// and go on decides that before calling, the way [`crate::restore`] asks
+    /// [`crate::restore::plan_restore`] first.
+    ///
     /// # Errors
     ///
     /// [`Error::Write`] when the destination cannot be written or is not a file
-    /// bx may replace, [`Error::State`] when the prior bytes cannot be stored,
-    /// and [`Error::Io`] when the journal cannot be appended to.
+    /// bx may replace, [`Error::State`] when the prior bytes cannot be stored or
+    /// recorded, [`Error::Io`] when the journal cannot be appended to, and
+    /// [`Error::Poisoned`] when an earlier write in this session failed.
     pub fn apply(&mut self, request: Request) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(self.poisoned_error());
+        }
         let index = self.written;
         let Request {
             target,
@@ -708,14 +863,23 @@ impl Session {
             ownership,
         } = request;
         self.crash.reached(index, Phase::BeforeStage);
-        match content {
-            Content::Bytes(bytes) => self.write(index, target, dest, &bytes, mode, &ownership)?,
-            Content::Absent { created_dirs } => {
-                self.remove(index, target, dest, created_dirs)?;
-            }
+        let applied = match content {
+            Content::Bytes(bytes) => self.write(index, target, dest, &bytes, mode, &ownership),
+            Content::Absent { created_dirs } => self.remove(index, target, dest, created_dirs),
+        };
+        if let Err(e) = applied {
+            self.poisoned = true;
+            return Err(e);
         }
         self.written += 1;
         Ok(())
+    }
+
+    /// The refusal a poisoned session gives.
+    fn poisoned_error(&self) -> Error {
+        Error::Poisoned {
+            path: self.journal.path().to_path_buf(),
+        }
     }
 
     /// The write path: stage, fill, record, journal, publish, done.
@@ -739,18 +903,16 @@ impl Session {
         // Durable before the Intent frame that names it, and therefore before
         // anything can displace it.
         let before = store_prior(&self.state, filled.prior())?;
-        let mechanism = match ownership {
-            Ownership::Owned(mechanism) => {
-                self.ledger
-                    .record(filled.new_entry(&self.home, mechanism.clone()))?;
-                Some(mechanism.clone())
-            }
-            // The restore half of `bx rm`: bx is handing the target back, so
-            // there is nothing left for it to own.
-            Ownership::Released => {
-                self.ledger.forget(&target);
-                None
-            }
+        // Assembled now, while the writer still holds the prior, and handed to
+        // the ledger only once the write has landed. `None` is the restore half
+        // of `bx rm`: bx is handing the target back, so there is nothing left for
+        // it to own.
+        let (entry, mechanism) = match ownership {
+            Ownership::Owned(mechanism) => (
+                Some(filled.new_entry(&self.home, mechanism.clone())),
+                Some(mechanism.clone()),
+            ),
+            Ownership::Released => (None, None),
         };
 
         self.journal.append(&Record::Intent(Intent {
@@ -767,7 +929,21 @@ impl Session {
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
+        #[cfg(test)]
+        if let Some(meddle) = self.before_publish {
+            meddle(filled.dest());
+        }
         filled.publish()?;
+        // Only now is there something to own, or to stop owning. Told any
+        // earlier, the ledger would describe a write whose publish then failed.
+        match entry {
+            Some(entry) => {
+                self.ledger.record(entry)?;
+            }
+            None => {
+                self.ledger.forget(&target);
+            }
+        }
         self.crash.reached(index, Phase::AfterPublish);
 
         self.journal.append(&Record::Done(Done { target }))?;
@@ -795,7 +971,6 @@ impl Session {
         // Same as in `write`: the bytes the removal is about to displace are
         // made durable before the Intent frame that names them.
         let before = store_prior(&self.state, &observed)?;
-        self.ledger.forget(&target);
 
         self.journal.append(&Record::Intent(Intent {
             target: target.clone(),
@@ -810,6 +985,8 @@ impl Session {
 
         unlink(&dest)?;
         prune_dirs(&created_dirs)?;
+        // As in `write`: the entry goes only once the file has.
+        self.ledger.forget(&target);
         self.crash.reached(index, Phase::AfterPublish);
 
         self.journal.append(&Record::Done(Done { target }))?;
@@ -829,7 +1006,12 @@ impl Session {
     ///
     /// [`Error::Io`], [`Error::State`] or [`Error::Write`]. The journal is left
     /// in place on any failure, so the session stays recoverable.
+    /// [`Error::Poisoned`] when a write in the session failed: nothing is
+    /// appended, nothing is saved, and the journal is left for recovery.
     pub fn finish(mut self) -> Result<usize, Error> {
+        if self.poisoned {
+            return Err(self.poisoned_error());
+        }
         let written = self.written;
         self.journal.append(&Record::End(End { written }))?;
         self.ledger.save()?;
@@ -1114,35 +1296,42 @@ pub(crate) mod tests {
     fn a_record_round_trips_through_a_frame() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
-        let begin = Record::Begin(Begin {
+        let begin = Begin {
             kind: SessionKind::Restore,
             home: PathBuf::from("/home/someone"),
             scope: vec![Portable::parse("~/.bashrc").expect("portable")],
-        });
+        };
         let done = Record::Done(Done {
             target: Portable::parse("~/.bashrc").expect("portable"),
         });
 
-        let mut journal = Journal::create(&path).expect("create");
-        journal.append(&begin).expect("append");
+        let mut journal = Journal::create(&path, begin.clone()).expect("create");
         journal.append(&done).expect("append");
         drop(journal);
 
         let loaded = load(&path).expect("load");
-        assert_eq!(loaded, Loaded::Unterminated(vec![begin, done]));
+        assert_eq!(
+            loaded,
+            Loaded::Unterminated(vec![Record::Begin(begin), done])
+        );
     }
 
     #[test]
-    fn the_journal_is_created_at_0600_and_replaces_whatever_was_there() {
+    fn the_journal_is_created_whole_at_0600_and_replaces_whatever_was_there() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
         plant_file(&path, "not a journal at all", Mode::DEFAULT_FILE);
 
-        let journal = Journal::create(&path).expect("create");
+        let journal = Journal::create(&path, some_begin()).expect("create");
         assert_eq!(journal.path(), path);
         let (bytes, mode) = peek(&path).expect("the journal");
         assert_eq!(mode, Mode::PRIVATE_FILE);
-        assert_eq!(bytes.len(), HEADER, "truncated to just the header");
+        assert!(bytes.starts_with(MAGIC), "the previous bytes are gone");
+        assert_eq!(
+            load(&path).expect("load"),
+            Loaded::Unterminated(vec![Record::Begin(some_begin())]),
+            "and it exists whole, header and Begin, from its first instant",
+        );
     }
 
     #[test]
@@ -1153,12 +1342,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_journal_with_a_bad_header_is_moved_aside_and_read_as_absent() {
+    fn a_journal_with_a_bad_header_is_moved_aside_by_the_lock_holder_and_read_as_absent() {
         let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let state = StateDir::new(dir.path().to_path_buf());
+        let lock = ExclusiveLock::acquire(&state).expect("lock");
+        let path = state.journal();
         plant_file(&path, "GARBAGE!", Mode::PRIVATE_FILE);
 
-        let loaded = load(&path).expect("load");
+        assert_eq!(
+            load(&path).expect("load"),
+            Loaded::Unreadable { moved_to: None },
+            "a read without the lock moves nothing",
+        );
+        assert!(path.is_file());
+
+        let loaded = load_exclusive(&path, &lock).expect("load");
         let Loaded::Unreadable { moved_to } = &loaded else {
             panic!("expected Unreadable, got {loaded:?}")
         };
@@ -1175,10 +1373,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_journal_too_short_to_hold_a_header_is_unreadable() {
+    fn a_short_journal_that_is_not_the_start_of_a_header_is_unreadable() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
-        plant_file(&path, "BX", Mode::PRIVATE_FILE);
+        // Too short for a header, like a torn one, but not a prefix of one.
+        plant_file(&path, "BY", Mode::PRIVATE_FILE);
         assert!(matches!(
             load(&path).expect("load"),
             Loaded::Unreadable { .. }
@@ -1218,14 +1417,8 @@ pub(crate) mod tests {
     fn nul_bytes_after_a_whole_frame_end_the_log_rather_than_decoding() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
-        let begin = Record::Begin(Begin {
-            kind: SessionKind::Apply,
-            home: PathBuf::from("/home/someone"),
-            scope: Vec::new(),
-        });
-        let mut journal = Journal::create(&path).expect("create");
-        journal.append(&begin).expect("append");
-        drop(journal);
+        let begin = Record::Begin(some_begin());
+        drop(Journal::create(&path, some_begin()).expect("create"));
 
         let mut bytes = std::fs::read(&path).expect("read");
         bytes.extend(std::iter::repeat_n(0_u8, 512));
@@ -1241,7 +1434,9 @@ pub(crate) mod tests {
     fn a_header_with_nothing_after_it_is_an_empty_interrupted_session() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
-        drop(Journal::create(&path).expect("create"));
+        let mut header = MAGIC.to_vec();
+        header.push(FORMAT);
+        std::fs::write(&path, &header).expect("write");
         assert_eq!(load(&path).expect("load"), Loaded::Unterminated(Vec::new()));
     }
 
@@ -1305,7 +1500,7 @@ pub(crate) mod tests {
     fn a_journal_truncated_at_any_byte_offset_keeps_every_whole_frame() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let source = dir.path().join("source.mpk");
-        let records = vec![
+        let records = [
             Record::Begin(Begin {
                 kind: SessionKind::Apply,
                 home: PathBuf::from("/home/someone"),
@@ -1322,10 +1517,15 @@ pub(crate) mod tests {
 
         // Record the file length after each frame, so "every whole frame" is an
         // exact expectation rather than an approximation.
-        let mut journal = Journal::create(&source).expect("create");
+        let Record::Begin(begin) = &records[0] else {
+            unreachable!("the first record is the header")
+        };
+        let mut journal = Journal::create(&source, begin.clone()).expect("create");
         let mut boundaries: Vec<usize> = Vec::new();
-        for record in &records {
-            journal.append(record).expect("append");
+        for (at, record) in records.iter().enumerate() {
+            if at > 0 {
+                journal.append(record).expect("append");
+            }
             boundaries.push(
                 std::fs::metadata(&source)
                     .expect("stat")
@@ -1342,14 +1542,9 @@ pub(crate) mod tests {
             std::fs::write(&path, &whole[..cut]).expect("write");
             let loaded = load(&path).expect("load");
 
+            // Short of the first whole frame, inside the header or inside the
+            // Begin, is a session that wrote nothing rather than damage.
             let kept: usize = boundaries.iter().filter(|end| **end <= cut).count();
-            if cut < HEADER || (kept == 0 && cut > HEADER) {
-                assert!(
-                    matches!(loaded, Loaded::Unreadable { .. }),
-                    "cut at {cut} should carry no information, got {loaded:?}",
-                );
-                continue;
-            }
             assert_eq!(
                 loaded.records(),
                 &records[..kept],
@@ -1686,6 +1881,11 @@ pub(crate) mod tests {
             "got {err}",
         );
 
+        // A refused write poisons its session, so the removal is refused in a
+        // session of its own.
+        let other = StateDir::new(home.child("other-state"));
+        let mut session =
+            Session::open(&other, SessionKind::Apply, home.path(), Vec::new()).expect("open");
         let err = session
             .apply(Request {
                 target: target(home.path(), ".conf").0,
@@ -1725,14 +1925,8 @@ pub(crate) mod tests {
     fn a_journal_that_ends_with_an_end_record_is_terminated() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
-        let begin = Record::Begin(Begin {
-            kind: SessionKind::Apply,
-            home: PathBuf::from("/home/someone"),
-            scope: Vec::new(),
-        });
-        let mut journal = Journal::create(&path).expect("create");
-        journal.append(&begin).expect("append");
-        drop(journal);
+        let begin = Record::Begin(some_begin());
+        drop(Journal::create(&path, some_begin()).expect("create"));
         assert!(matches!(
             load(&path).expect("load"),
             Loaded::Unterminated(_)
@@ -1743,6 +1937,306 @@ pub(crate) mod tests {
             load(&path).expect("load"),
             Loaded::Terminated(vec![begin, Record::End(End { written: 0 })]),
         );
+    }
+
+    #[test]
+    fn a_zero_byte_journal_is_an_empty_interrupted_session_and_stays_in_place() {
+        // What a crash between creating the file and writing its header used to
+        // leave. It records no write, so it is an empty interrupted session -
+        // never corruption - even for the lock holder, the only reader that
+        // could move it.
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let state = StateDir::new(dir.path().to_path_buf());
+        let lock = ExclusiveLock::acquire(&state).expect("lock");
+        let path = state.journal();
+        std::fs::write(&path, b"").expect("write");
+
+        assert_eq!(
+            load_exclusive(&path, &lock).expect("load"),
+            Loaded::Unterminated(Vec::new()),
+        );
+        assert!(path.is_file(), "left exactly where it was");
+        assert!(
+            !StateDir::quarantine(&path).exists(),
+            "and nothing was set aside",
+        );
+    }
+
+    #[test]
+    fn a_torn_first_frame_is_an_empty_interrupted_session_not_corruption() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let state = StateDir::new(dir.path().join("state"));
+        let lock = ExclusiveLock::acquire(&state).expect("lock");
+        let whole = dir.path().join("whole.mpk");
+        drop(Journal::create(&whole, some_begin()).expect("create"));
+        let bytes = std::fs::read(&whole).expect("read");
+
+        // Every cut short of the first whole frame: inside the header, inside
+        // the frame's length prefix, and inside its body.
+        for cut in 0..bytes.len() {
+            let path = state.root().join(format!("torn-{cut}.mpk"));
+            std::fs::write(&path, &bytes[..cut]).expect("write");
+            assert_eq!(
+                load_exclusive(&path, &lock).expect("load"),
+                Loaded::Unterminated(Vec::new()),
+                "a cut at {cut} is a session that wrote nothing",
+            );
+            assert!(path.is_file(), "a cut at {cut} stays in place");
+            assert!(!StateDir::quarantine(&path).exists());
+        }
+    }
+
+    #[test]
+    fn creating_a_journal_replaces_its_name_and_never_truncates_a_file_in_place() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let path = dir.path().join("journal.mpk");
+        plant_file(&path, "the previous file\n", Mode::PRIVATE_FILE);
+
+        // A reader that opened the previous file before the create - `bx plan`
+        // running unlocked beside an `apply` - goes on reading whole bytes. An
+        // in-place truncate would hand it an emptied file instead.
+        let mut earlier = File::open(&path).expect("open the previous file");
+        let journal = Journal::create(&path, some_begin()).expect("create");
+        let mut seen = String::new();
+        std::io::Read::read_to_string(&mut earlier, &mut seen).expect("read");
+        assert_eq!(seen, "the previous file\n");
+        assert_eq!(
+            load(&path).expect("load"),
+            Loaded::Unterminated(vec![Record::Begin(some_begin())]),
+            "and the name holds the whole new journal, Begin and all",
+        );
+        drop(journal);
+    }
+
+    #[test]
+    fn a_frame_appended_after_a_torn_one_is_hidden_from_recovery() {
+        // Why a failed append has to end the session: a frame torn mid-write
+        // stops the loader, so anything appended after it is invisible to
+        // recovery - including the Intent for a write that then lands.
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let path = dir.path().join("journal.mpk");
+        let mut journal = Journal::create(&path, some_begin()).expect("create");
+        let after_begin = std::fs::read(&path).expect("read").len();
+        journal
+            .append(&Record::Done(Done {
+                target: Portable::parse("~/.torn").expect("portable"),
+            }))
+            .expect("append");
+        let after_torn = std::fs::read(&path).expect("read").len();
+        journal
+            .append(&Record::Done(Done {
+                target: Portable::parse("~/.hidden").expect("portable"),
+            }))
+            .expect("append");
+        drop(journal);
+
+        let whole = std::fs::read(&path).expect("read");
+        let mut torn = whole[..after_begin + (after_torn - after_begin) / 2].to_vec();
+        torn.extend_from_slice(&whole[after_torn..]);
+        std::fs::write(&path, &torn).expect("write");
+
+        assert_eq!(
+            load(&path).expect("load").records(),
+            &[Record::Begin(some_begin())],
+        );
+    }
+
+    #[test]
+    fn a_failed_append_poisons_the_session() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let real = std::mem::replace(
+            &mut session.journal.file,
+            OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .expect("/dev/full"),
+        );
+        let err = session
+            .apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
+            .expect_err("a full disk fails the Intent append");
+        assert!(matches!(err, Error::Io { .. }), "got {err}");
+        assert_eq!(
+            peek(&home.child(".conf")).expect("untouched").0,
+            b"old\n",
+            "nothing is published without its Intent",
+        );
+
+        // The disk has room again. A torn frame may now sit at the journal's
+        // tail, and anything appended after it would be hidden from recovery, so
+        // the session must append nothing more at all.
+        session.journal.file = real;
+        let err = session
+            .apply(write_to(home.path(), ".other", "x\n", Mode::DEFAULT_FILE))
+            .expect_err("a poisoned session refuses another write");
+        assert!(matches!(err, Error::Poisoned { .. }), "got {err}");
+        assert!(err.to_string().contains("roll back"), "{err}");
+        assert!(!home.child(".other").exists());
+
+        let err = session.finish().expect_err("and refuses to finish");
+        assert!(matches!(err, Error::Poisoned { .. }), "got {err}");
+        assert!(state.journal().exists(), "the journal is left for recovery");
+        assert!(!state.ledger().exists(), "and the ledger was never saved");
+        assert!(matches!(
+            load(&state.journal()).expect("load"),
+            Loaded::Unterminated(_)
+        ));
+    }
+
+    #[test]
+    fn a_failed_publish_poisons_the_session_and_records_nothing() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".conf");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        // Something occupies the destination between the Intent and the rename:
+        // a directory with an entry in it, which no rename(2) replaces with a
+        // file.
+        session.before_publish = Some(|dest: &Path| {
+            std::fs::create_dir_all(dest.join("occupied")).expect("occupy the destination");
+        });
+        let err = session
+            .apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
+            .expect_err("the rename cannot land");
+        assert!(matches!(err, Error::Write(_)), "got {err}");
+        assert!(
+            session.ledger().get(&portable).is_none(),
+            "a write that never landed is not recorded, not even in memory",
+        );
+
+        let err = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(err, Error::Poisoned { .. }), "got {err}");
+        assert!(!state.ledger().exists(), "no ledger entry was saved");
+        let loaded = load(&state.journal()).expect("load");
+        assert!(
+            matches!(loaded, Loaded::Unterminated(_)),
+            "no End frame: {loaded:?}"
+        );
+        assert!(
+            !loaded
+                .records()
+                .iter()
+                .any(|record| matches!(record, Record::Done(_))),
+            "and no Done frame",
+        );
+        assert!(dest.is_dir());
+    }
+
+    #[test]
+    fn a_failed_removal_keeps_the_ledger_entry_and_poisons_the_session() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), "locked/made.conf");
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first
+            .apply(write_to(
+                home.path(),
+                "locked/made.conf",
+                "made\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        first.finish().expect("finish");
+
+        let locked = home.child("locked");
+        fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make the directory read-only");
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+        let removed = session.apply(Request {
+            target: portable.clone(),
+            dest: dest.clone(),
+            content: Content::Absent {
+                created_dirs: vec![locked.clone()],
+            },
+            mode: Mode::DEFAULT_FILE,
+            ownership: Ownership::Released,
+        });
+        let still_managed = session.ledger().get(&portable).is_some();
+        let finished = session.finish();
+        // Before any assertion, so the tempdir can be removed whatever happens.
+        fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
+
+        let err = removed.expect_err("an unlink in a read-only directory fails");
+        assert!(matches!(err, Error::Io { .. }), "got {err}");
+        assert!(
+            still_managed,
+            "a removal that did not happen does not drop the entry"
+        );
+        assert!(
+            matches!(finished, Err(Error::Poisoned { .. })),
+            "got {finished:?}"
+        );
+        assert!(dest.is_file());
+        assert!(
+            LedgerView::read(&state)
+                .expect("read the ledger")
+                .value
+                .get(&portable)
+                .is_some(),
+            "the saved ledger still owns the file that is still there",
+        );
+    }
+
+    #[test]
+    fn a_journal_that_cannot_be_moved_aside_is_still_read_as_absent() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let lock = ExclusiveLock::acquire(&state).expect("lock");
+        std::fs::write(state.journal(), b"GARBAGE!").expect("write");
+
+        // No root here, so a directory without write permission refuses the
+        // rename. Narrower than 0700 rather than wider, so nothing tightens it.
+        fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
+        let loaded = load_exclusive(&state.journal(), &lock);
+        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+
+        assert_eq!(loaded.expect("load"), Loaded::Unreadable { moved_to: None });
+        assert_eq!(
+            std::fs::read(state.journal()).expect("still in place"),
+            b"GARBAGE!",
+        );
+        assert!(!StateDir::quarantine(&state.journal()).exists());
+    }
+
+    /// A session header for a journal that needs one and does not care what it
+    /// says.
+    fn some_begin() -> Begin {
+        Begin {
+            kind: SessionKind::Apply,
+            home: PathBuf::from("/home/someone"),
+            scope: Vec::new(),
+        }
+    }
+
+    /// Write a journal exactly as given: a header, then each record as a frame.
+    ///
+    /// For journals no session writes - one with no `Begin`, or one whose `End`
+    /// follows an Intent that has no `Done` - so recovery can be tested against
+    /// what damage or an earlier bx could leave behind.
+    pub(crate) fn raw_journal(path: &Path, records: &[Record]) {
+        let mut header = MAGIC.to_vec();
+        header.push(FORMAT);
+        std::fs::write(path, &header).expect("write the header");
+        let mut journal = Journal {
+            file: OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("reopen the journal"),
+            path: path.to_path_buf(),
+        };
+        for record in records {
+            journal.append(record).expect("append");
+        }
     }
 
     /// Append an `End` frame to an existing journal.

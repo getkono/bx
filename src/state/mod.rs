@@ -6,6 +6,15 @@
 //! needs to know about this account — what bx wrote, what it replaced, and what
 //! it can skip recomputing.
 //!
+//! # Every file here is reconstructible
+//!
+//! A machine-owned file that becomes an error the user cannot clear is a defect,
+//! so damage is never fatal. A truncated, garbled, wrong-kind or
+//! future-versioned file is moved aside to a fixed `<name>.corrupt`, reported
+//! through `tracing::warn!`, and replaced by the empty default; the next save
+//! writes a clean file. The damaged bytes are kept, never deleted, so a human or
+//! `bx doctor` can still look at them. See [`Damage`] and [`Health`].
+//!
 //! # A note on network filesystems
 //!
 //! The lock is `flock(2)`. On a home directory mounted over NFS with `nolock`,
@@ -22,14 +31,18 @@
 //! value to honour passes it to [`StateDir::resolve_in`].
 
 mod dir;
+mod fingerprint;
 mod hash;
 mod lock;
+mod store;
 
 use std::path::PathBuf;
 
 pub use dir::StateDir;
+pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use lock::{ExclusiveLock, Holder, SharedLock};
+pub use store::{Damage, Health, Loaded};
 
 /// Everything that can go wrong in the state directory.
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +61,19 @@ pub enum Error {
         /// The underlying failure.
         #[source]
         source: std::io::Error,
+    },
+    /// A write failed.
+    #[error(transparent)]
+    Write(#[from] crate::fs::Error),
+    /// A value could not be encoded as MessagePack. Only reachable for a type
+    /// that cannot round-trip, which is a bug rather than a user condition.
+    #[error("encoding {kind}: {source}")]
+    Encode {
+        /// The envelope kind being written — `bx.ledger`, `bx.fingerprints`.
+        kind: &'static str,
+        /// The underlying failure.
+        #[source]
+        source: rmp_serde::encode::Error,
     },
     /// Another process holds the state directory lock.
     #[error("another bx process is already running: {holder} (lock file {})", .path.display())]

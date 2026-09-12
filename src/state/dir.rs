@@ -107,6 +107,18 @@ impl StateDir {
         self.root.join("lock")
     }
 
+    /// The quarantine path for a damaged state file: `<name>.corrupt`.
+    ///
+    /// A fixed name, deliberately. A timestamped or numbered quarantine would
+    /// be nondeterministic and would grow without bound; this one holds the
+    /// most recent damage and nothing more.
+    #[must_use]
+    pub(crate) fn quarantine(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".corrupt");
+        PathBuf::from(name)
+    }
+
     /// Create the state directory and its subdirectories, at `0700`.
     ///
     /// Idempotent: running it twice changes nothing and fails on nothing.
@@ -377,6 +389,14 @@ mod tests {
         let dir = StateDir::resolve(home.path());
         let err = dir.ensure().expect_err("must fail");
         assert!(matches!(err, Error::CreateDir { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_quarantine_name_appends_rather_than_replacing_the_extension() {
+        assert_eq!(
+            StateDir::quarantine(Path::new("/s/bx/ledger.mpk")),
+            PathBuf::from("/s/bx/ledger.mpk.corrupt"),
+        );
     }
 
     #[test]

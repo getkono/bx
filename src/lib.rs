@@ -12,9 +12,10 @@
 //! on this machine, and [`report`] holds the vocabulary `plan` and `apply`
 //! share, including the fact that an additive-only tool has no destroy action.
 //!
-//! [`fs`] holds the one atomic write in the crate — temporary file in the
-//! destination directory, `fsync`, `rename`, `fsync` the directory — and the one
-//! type that carries a file mode.
+//! [`state`] is the other half of the layout: `$XDG_STATE_HOME/bx`, which is
+//! never a git working tree and never published. [`fs`] holds the one atomic
+//! write in the crate — temporary file in the destination directory, `fsync`,
+//! `rename`, `fsync` the directory — and the one type that carries a file mode.
 //!
 //! [`testing`] is the tempdir-`$HOME` guard every home-touching test in this
 //! crate runs behind. It is compiled unconditionally, and hidden from the docs,
@@ -25,6 +26,7 @@ pub mod env_guard;
 pub mod fs;
 pub mod paths;
 pub mod report;
+pub mod state;
 #[doc(hidden)]
 pub mod testing;
 

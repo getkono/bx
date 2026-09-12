@@ -112,12 +112,29 @@ pub struct LedgerEntry {
     pub mode: Mode,
     /// How bx attached to it.
     pub mechanism: Mechanism,
-    /// What was there before — or that nothing was.
+    /// What the user last had there before bx's current bytes — or that there
+    /// was nothing. This is what `bx rm` restores. See [`Ledger::record`] for
+    /// how a re-record decides it.
     pub prior: Prior,
     /// Directories bx created on the way to the target, deepest first, so
     /// `bx rm` can remove them in order and leave nothing behind.
+    ///
+    /// Accumulated across re-records, never replaced: a later apply finds the
+    /// parents already there and reports none created, and forgetting the ones
+    /// an earlier apply invented would leave them behind on `bx rm`.
     #[serde(default)]
     pub created_dirs: Vec<crate::paths::Portable>,
+    /// Earlier priors the user has since replaced, in the order they were
+    /// replaced.
+    ///
+    /// When the user writes over a file bx manages and a later apply displaces
+    /// those bytes, they become the [`LedgerEntry::prior`], because they are
+    /// what the user last had. The snapshot they replace is not dropped: its
+    /// reference moves here, so every blob `record` ever stored for a live
+    /// target is still reachable from that target's entry, and nothing a user
+    /// wrote becomes an unindexed orphan in `restore/`.
+    #[serde(default)]
+    pub superseded: Vec<RestoreRef>,
 }
 
 /// The bytes a target held before bx wrote it, as handed to [`Ledger::record`].
@@ -161,9 +178,9 @@ impl NewEntry {
     /// which is only true for a target bx created. Use
     /// [`NewEntry::with_prior`] whenever there were bytes to displace.
     ///
-    /// Defaulting is safe on a re-record: [`Ledger::record`] keeps the prior
-    /// already stored for a path and ignores the one on the incoming entry, so
-    /// an omitted prior can never overwrite the user's snapshot with
+    /// Defaulting is safe on a re-record: [`Ledger::record`] never lets an
+    /// incoming [`PriorBytes::Absent`] replace the prior already stored for a
+    /// path, so an omitted prior can never overwrite the user's snapshot with
     /// "unlink it".
     #[must_use]
     pub fn new(
@@ -337,22 +354,45 @@ impl Ledger {
     }
 
     /// Record a target, replacing any entry for the same path — **except its
-    /// prior, which is kept.**
+    /// prior, which is replaced only by bytes a third party wrote.**
     ///
-    /// # First prior wins
+    /// # The prior is what the user last had
     ///
-    /// When an entry already exists for `entry.path`, the [`Prior`] stored on
-    /// it is kept and `entry.prior` is ignored — no blob is written for it. The
-    /// first prior is the only one that answers Invariant 4's question: it is
-    /// what the *user* had before bx ever touched the file. On every later
-    /// apply the bytes on disk are bx's own previous output, so a second
-    /// snapshot would record bx's generated content as the thing `bx rm`
-    /// restores, and `PriorBytes::Absent` — what [`NewEntry::new`] defaults to —
-    /// would rewrite "restore the user's file" into "unlink it".
+    /// Invariant 4 needs two things of a re-record: no byte the user wrote is
+    /// ever lost, and `bx rm` restores what the user last had. When an entry
+    /// already exists for `entry.path`, the incoming prior is one of three
+    /// things, and the entry's own `written` digest — the whole file as bx last
+    /// left it — tells them apart:
     ///
-    /// Re-adoption, when a target genuinely has a new prior worth snapshotting,
-    /// is [`Ledger::forget`] followed by `record`: two calls, so discarding a
-    /// prior is always something a caller asked for.
+    /// * [`PriorBytes::Absent`] — the stored prior is kept. It is also what
+    ///   [`NewEntry::new`] defaults to, so it cannot be trusted to mean "there
+    ///   is no file", and it carries no bytes that keeping the stored prior
+    ///   could lose. A stored snapshot is therefore never rewritten into
+    ///   "unlink it".
+    /// * bytes that hash to the stored `written` — bx's own previous output,
+    ///   untouched. The stored prior is kept and nothing is written: snapshotting
+    ///   these would make `bx rm` restore bx's generated content.
+    /// * bytes that do **not** hash to `written` — someone other than bx wrote
+    ///   the file since bx last did, and this apply is about to displace those
+    ///   bytes. They are stored in `restore/`, durably, and become the prior. A
+    ///   stored [`Prior::Existed`] they replace moves to
+    ///   [`LedgerEntry::superseded`] rather than being dropped, and a stored
+    ///   [`Prior::Absent`] they replace had no bytes to keep.
+    ///
+    /// The comparison is on content only. A file whose bytes still match
+    /// `written` but whose mode the user changed is treated as bx's own output,
+    /// because snapshotting it would record bx's generated content as the
+    /// user's file.
+    ///
+    /// [`Ledger::forget`] followed by `record` remains the way to discard a
+    /// stored prior deliberately.
+    ///
+    /// # Created directories accumulate
+    ///
+    /// `entry.created_dirs` is merged into the stored list rather than replacing
+    /// it — deduplicated, and re-sorted deepest first so `bx rm` can still
+    /// remove them in order. A second apply creates no parents, because the
+    /// first one did; replacing the list would forget them.
     ///
     /// The prior bytes are written to `restore/` and **fsynced, along with the
     /// directory entry naming them, before this returns** — so by the time the
@@ -371,11 +411,20 @@ impl Ledger {
     /// stored. The ledger is left unchanged when that happens.
     pub fn record(&mut self, entry: NewEntry) -> Result<&LedgerEntry, Error> {
         let key = entry.path.clone();
-        let prior = match self.view.entries.get(&key) {
-            // First prior wins. The incoming prior is dropped without being
-            // stored, so re-recording never leaves an orphan blob behind.
-            Some(existing) => existing.prior.clone(),
-            None => self.store_prior(entry.prior)?,
+        let (prior, superseded, created_dirs) = match self.view.entries.get(&key) {
+            None => (
+                self.store_prior(entry.prior)?,
+                Vec::new(),
+                entry.created_dirs,
+            ),
+            Some(existing) => {
+                let (prior, superseded) = self.carry_prior(existing, entry.prior)?;
+                (
+                    prior,
+                    superseded,
+                    merge_created_dirs(&existing.created_dirs, entry.created_dirs),
+                )
+            }
         };
         self.view.entries.insert(
             key.clone(),
@@ -385,17 +434,55 @@ impl Ledger {
                 mode: entry.mode,
                 mechanism: entry.mechanism,
                 prior,
-                created_dirs: entry.created_dirs,
+                created_dirs,
+                superseded,
             },
         );
         Ok(&self.view.entries[&key])
     }
 
+    /// Decide the prior and the superseded list for a re-record of `existing`.
+    ///
+    /// The rule is documented on [`Ledger::record`]. Any bytes that are to be
+    /// adopted are durable in `restore/` before this returns.
+    fn carry_prior(
+        &self,
+        existing: &LedgerEntry,
+        incoming: PriorBytes,
+    ) -> Result<(Prior, Vec<RestoreRef>), Error> {
+        let kept = || (existing.prior.clone(), existing.superseded.clone());
+        let PriorBytes::Bytes { bytes, mode } = incoming else {
+            return Ok(kept());
+        };
+        let digest = ContentHash::of(&bytes);
+        if digest == existing.written {
+            return Ok(kept());
+        }
+
+        // A third party wrote these bytes and this apply displaces them: they
+        // reach `restore/` before anything else is decided.
+        let adopted = self.store_restore(digest, &bytes, mode)?;
+        let mut superseded = existing.superseded.clone();
+        if let Prior::Existed(previous) = &existing.prior
+            && !superseded.contains(previous)
+        {
+            superseded.push(previous.clone());
+        }
+        // A snapshot the user has put back is the prior again, not history.
+        superseded.retain(|reference| *reference != adopted);
+        tracing::info!(
+            path = %existing.path,
+            digest = %adopted.digest,
+            "the file changed since bx last wrote it; keeping the displaced bytes as its prior",
+        );
+        Ok((Prior::Existed(adopted), superseded))
+    }
+
     /// Drop a target from the ledger, returning the entry that was there.
     ///
-    /// This is also half of re-adoption: `forget` then [`Ledger::record`] is
-    /// how a caller deliberately replaces a prior that [`Ledger::record`] alone
-    /// would have kept.
+    /// This is also how a caller deliberately discards a stored prior: `forget`
+    /// then [`Ledger::record`] records the incoming prior as though bx had
+    /// never written the target.
     ///
     /// The restore blob is deliberately left in place: it may be shared with
     /// another entry, and content-addressed bytes cost far less than a wrong
@@ -408,16 +495,27 @@ impl Ledger {
     fn store_prior(&self, prior: PriorBytes) -> Result<Prior, Error> {
         match prior {
             PriorBytes::Absent => Ok(Prior::Absent),
-            PriorBytes::Bytes { bytes, mode } => {
-                let digest = ContentHash::of(&bytes);
-                self.store_blob(digest, &bytes)?;
-                Ok(Prior::Existed(RestoreRef {
-                    digest,
-                    mode,
-                    len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                }))
-            }
+            PriorBytes::Bytes { bytes, mode } => Ok(Prior::Existed(self.store_restore(
+                ContentHash::of(&bytes),
+                &bytes,
+                mode,
+            )?)),
         }
+    }
+
+    /// Store `bytes`, already hashed to `digest`, and return the reference.
+    fn store_restore(
+        &self,
+        digest: ContentHash,
+        bytes: &[u8],
+        mode: Mode,
+    ) -> Result<RestoreRef, Error> {
+        self.store_blob(digest, bytes)?;
+        Ok(RestoreRef {
+            digest,
+            mode,
+            len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        })
     }
 
     /// Write the ledger out, atomically.
@@ -456,6 +554,25 @@ impl Ledger {
         write_atomically(&path, bytes, Mode::PRIVATE_FILE)?;
         Ok(())
     }
+}
+
+/// The directories an earlier record created, plus any a later one did.
+///
+/// Every entry is an ancestor of the same target, so depth alone orders them:
+/// the result is deduplicated and sorted deepest first, with ties — which two
+/// distinct ancestors of one path cannot produce — kept in first-seen order.
+fn merge_created_dirs(
+    existing: &[crate::paths::Portable],
+    incoming: Vec<crate::paths::Portable>,
+) -> Vec<crate::paths::Portable> {
+    let mut merged = existing.to_vec();
+    for dir in incoming {
+        if !merged.contains(&dir) {
+            merged.push(dir);
+        }
+    }
+    merged.sort_by_key(|dir| std::cmp::Reverse(dir.as_str().split('/').count()));
+    merged
 }
 
 /// The length of the file at `path`, or `None` if it is not a readable file.
@@ -594,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn a_re_record_neither_stores_nor_adopts_the_incoming_prior() {
+    fn a_re_record_over_bxs_own_output_neither_stores_nor_adopts_it() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
@@ -604,9 +721,10 @@ mod tests {
                 mode: Mode::DEFAULT_FILE,
             }))
             .expect("first");
+        // What is on disk is exactly what the first record said bx wrote.
         ledger
             .record(entry("~/.bashrc", b"second").with_prior(PriorBytes::Bytes {
-                bytes: b"bx generated this".to_vec(),
+                bytes: b"first".to_vec(),
                 mode: Mode::DEFAULT_FILE,
             }))
             .expect("second");
@@ -616,7 +734,8 @@ mod tests {
             panic!("expected the first prior");
         };
         assert_eq!(reference.digest, ContentHash::of(b"the user wrote this"));
-        // The ignored prior is never written, so re-recording leaves no orphan.
+        assert!(stored.superseded.is_empty());
+        // bx's own output is never written, so re-recording leaves no orphan.
         let blobs: Vec<_> = std::fs::read_dir(dir.restore())
             .expect("read_dir")
             .map(|e| e.expect("entry").file_name())
@@ -679,6 +798,316 @@ mod tests {
                 Prior::Absent,
                 "re-recording must never rewrite a restore into an unlink",
             );
+        }
+    }
+
+    /// Bytes as a prior, at `mode`.
+    fn prior(body: &[u8], mode: u32) -> PriorBytes {
+        PriorBytes::Bytes {
+            bytes: body.to_vec(),
+            mode: Mode::from_bits(mode),
+        }
+    }
+
+    /// Whether `restore/` holds a blob for `body`.
+    fn has_blob(dir: &StateDir, body: &[u8]) -> bool {
+        dir.restore().join(ContentHash::of(body).to_hex()).is_file()
+    }
+
+    /// Every blob name in `restore/`, sorted.
+    fn blob_names(dir: &StateDir) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir.restore()) else {
+            return Vec::new();
+        };
+        let mut names: Vec<_> = entries
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What `bx rm` does with an entry, reduced to the prior: unlink for
+    /// `Absent`, write the snapshot back for `Existed`.
+    fn simulate_rm(dir: &StateDir, home: &GuardedHome, name: &str) {
+        let view = LedgerView::read(dir).expect("read").value;
+        let stored = view.get(&target(name)).expect("entry");
+        let dest = stored.path.render(home.path());
+        match &stored.prior {
+            Prior::Absent => std::fs::remove_file(&dest).expect("unlink"),
+            Prior::Existed(reference) => {
+                let bytes = view.restore_bytes(dir, reference).expect("restore bytes");
+                write_atomically(&dest, &bytes, reference.mode).expect("restore");
+            }
+        }
+    }
+
+    /// One apply of `body` to `rel`, as the writer does it: observe what is
+    /// there, record it as the prior, then replace the file.
+    fn apply(dir: &StateDir, lock: &ExclusiveLock, home: &GuardedHome, rel: &str, body: &[u8]) {
+        let dest = home.child(rel);
+        let observed = match std::fs::read(&dest) {
+            Ok(bytes) => PriorBytes::Bytes {
+                bytes,
+                mode: mode_of(&dest),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PriorBytes::Absent,
+            Err(e) => panic!("observing {}: {e}", dest.display()),
+        };
+        let mut ledger = Ledger::open(dir, lock).expect("open").value;
+        ledger
+            .record(entry(&format!("~/{rel}"), body).with_prior(observed))
+            .expect("record");
+        std::fs::create_dir_all(dest.parent().expect("a parent")).expect("parents");
+        write_atomically(&dest, body, Mode::DEFAULT_FILE).expect("write the target");
+        ledger.save().expect("save");
+    }
+
+    #[test]
+    fn a_file_the_user_creates_between_two_applies_is_restored_by_rm_not_unlinked() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let rel = ".config/tool.toml";
+        let users: &[u8] = b"[user]\nname = \"mine\"\ntheme = \"dark\"\n";
+        assert_eq!(users.len(), 36);
+
+        // Apply #1: nothing is there, so bx creates the file and the prior is
+        // "there was no file".
+        apply(&dir, &lock, &home, rel, b"# bx v1\n");
+        // Between applies the user replaces bx's file with 36 bytes of their own.
+        std::fs::write(home.child(rel), users).expect("the user writes");
+        // Apply #2 displaces those bytes.
+        apply(&dir, &lock, &home, rel, b"# bx v2\n");
+
+        assert!(
+            has_blob(&dir, users),
+            "the displaced bytes must be in restore/, found {:?}",
+            blob_names(&dir),
+        );
+        simulate_rm(&dir, &home, "~/.config/tool.toml");
+        assert_eq!(
+            std::fs::read(home.child(rel)).expect("rm must leave the user's file"),
+            users,
+        );
+    }
+
+    #[test]
+    fn a_user_edit_between_two_applies_is_what_rm_restores() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let rel = ".ssh/config";
+        home.write(rel, "Host theirs\n");
+        std::fs::set_permissions(home.child(rel), std::fs::Permissions::from_mode(0o640))
+            .expect("chmod");
+
+        apply(&dir, &lock, &home, rel, b"Host v1\n");
+        std::fs::write(home.child(rel), b"Host edited\n").expect("the user edits");
+        apply(&dir, &lock, &home, rel, b"Host v2\n");
+
+        simulate_rm(&dir, &home, "~/.ssh/config");
+        assert_eq!(
+            std::fs::read(home.child(rel)).expect("read"),
+            b"Host edited\n",
+            "rm restores what the user last had, not what bx displaced first",
+        );
+        assert!(has_blob(&dir, b"Host theirs\n"), "the original is kept too");
+        let view = LedgerView::read(&dir).expect("read").value;
+        let stored = view.get(&target("~/.ssh/config")).expect("entry");
+        assert_eq!(stored.superseded.len(), 1, "the original stays indexed");
+        assert_eq!(
+            view.restore_bytes(&dir, &stored.superseded[0])
+                .expect("restore"),
+            b"Host theirs\n",
+        );
+        assert_eq!(stored.superseded[0].mode, Mode::from_bits(0o640));
+    }
+
+    #[test]
+    fn repeated_user_edits_are_superseded_in_order_and_an_untouched_apply_adds_nothing() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let rel = ".gitconfig";
+        home.write(rel, "original\n");
+
+        apply(&dir, &lock, &home, rel, b"bx 1\n");
+        std::fs::write(home.child(rel), b"edit 1\n").expect("edit");
+        apply(&dir, &lock, &home, rel, b"bx 2\n");
+        let after_edit = std::fs::read(dir.ledger()).expect("read");
+        // Nobody touches the file and bx writes the same bytes again: the
+        // ledger must come out byte-identical, with no new prior and no history.
+        apply(&dir, &lock, &home, rel, b"bx 2\n");
+        assert_eq!(std::fs::read(dir.ledger()).expect("read"), after_edit);
+        std::fs::write(home.child(rel), b"edit 2\n").expect("edit");
+        apply(&dir, &lock, &home, rel, b"bx 3\n");
+
+        let view = LedgerView::read(&dir).expect("read").value;
+        let stored = view.get(&target("~/.gitconfig")).expect("entry");
+        assert_eq!(
+            stored.prior,
+            Prior::Existed(reference(b"edit 2\n", 0o644)),
+            "the prior is the last thing the user had",
+        );
+        let history: Vec<Vec<u8>> = stored
+            .superseded
+            .iter()
+            .map(|r| view.restore_bytes(&dir, r).expect("restore"))
+            .collect();
+        assert_eq!(history, vec![b"original\n".to_vec(), b"edit 1\n".to_vec()]);
+
+        // The user puts the first edit back; it is the prior again, not history.
+        std::fs::write(home.child(rel), b"edit 1\n").expect("edit");
+        apply(&dir, &lock, &home, rel, b"bx 4\n");
+        let view = LedgerView::read(&dir).expect("read").value;
+        let stored = view.get(&target("~/.gitconfig")).expect("entry");
+        assert_eq!(stored.prior, Prior::Existed(reference(b"edit 1\n", 0o644)));
+        assert_eq!(
+            stored.superseded,
+            vec![
+                reference(b"original\n", 0o644),
+                reference(b"edit 2\n", 0o644),
+            ],
+        );
+    }
+
+    /// What a cell's stored prior is.
+    #[derive(Debug, Clone, Copy)]
+    enum Stored {
+        Absent,
+        Existed,
+    }
+
+    /// What a cell's second record is handed.
+    #[derive(Debug, Clone, Copy)]
+    enum Incoming {
+        /// No file on disk, or a caller that supplied no prior.
+        Absent,
+        /// The bytes bx left there, untouched.
+        BxsOwnOutput,
+        /// Bytes nobody but the user could have written.
+        UserChanged,
+        /// The user put their original bytes back.
+        OriginalPutBack,
+    }
+
+    const ORIGINAL: &[u8] = b"the user's original\n";
+    const BX_V1: &[u8] = b"bx v1\n";
+    const BX_V2: &[u8] = b"bx v2\n";
+    const EDIT: &[u8] = b"the user's later edit\n";
+
+    /// Record `stored`, then re-record with `incoming`, and return the entry and
+    /// the blobs on disk.
+    fn run_cell(stored: Stored, incoming: Incoming) -> (LedgerEntry, Vec<String>) {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let first = match stored {
+            Stored::Absent => entry("~/t", BX_V1),
+            Stored::Existed => entry("~/t", BX_V1).with_prior(prior(ORIGINAL, 0o640)),
+        };
+        ledger.record(first).expect("first");
+        let second = entry("~/t", BX_V2);
+        let second = match incoming {
+            Incoming::Absent => second,
+            Incoming::BxsOwnOutput => second.with_prior(prior(BX_V1, 0o644)),
+            Incoming::UserChanged => second.with_prior(prior(EDIT, 0o600)),
+            Incoming::OriginalPutBack => second.with_prior(prior(ORIGINAL, 0o640)),
+        };
+        let stored = ledger.record(second).expect("second").clone();
+        ledger.save().expect("save");
+        let reloaded = LedgerView::read(&dir).expect("read").value;
+        assert_eq!(reloaded.get(&target("~/t")), Some(&stored), "round trip");
+        (stored, blob_names(&dir))
+    }
+
+    fn hex(body: &[u8]) -> String {
+        ContentHash::of(body).to_hex()
+    }
+
+    fn reference(body: &[u8], mode: u32) -> RestoreRef {
+        RestoreRef {
+            digest: ContentHash::of(body),
+            mode: Mode::from_bits(mode),
+            len: u64::try_from(body.len()).expect("len"),
+        }
+    }
+
+    fn sorted(mut names: Vec<String>) -> Vec<String> {
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_re_record_keeps_or_adopts_the_prior_in_every_cell_of_the_matrix() {
+        let cells = [
+            (
+                Stored::Absent,
+                Incoming::Absent,
+                Prior::Absent,
+                vec![],
+                vec![],
+            ),
+            (
+                Stored::Absent,
+                Incoming::BxsOwnOutput,
+                Prior::Absent,
+                vec![],
+                vec![],
+            ),
+            (
+                Stored::Absent,
+                Incoming::UserChanged,
+                Prior::Existed(reference(EDIT, 0o600)),
+                vec![],
+                vec![hex(EDIT)],
+            ),
+            (
+                Stored::Existed,
+                Incoming::Absent,
+                Prior::Existed(reference(ORIGINAL, 0o640)),
+                vec![],
+                vec![hex(ORIGINAL)],
+            ),
+            (
+                Stored::Existed,
+                Incoming::BxsOwnOutput,
+                Prior::Existed(reference(ORIGINAL, 0o640)),
+                vec![],
+                vec![hex(ORIGINAL)],
+            ),
+            (
+                Stored::Existed,
+                Incoming::UserChanged,
+                Prior::Existed(reference(EDIT, 0o600)),
+                vec![reference(ORIGINAL, 0o640)],
+                sorted(vec![hex(ORIGINAL), hex(EDIT)]),
+            ),
+            (
+                Stored::Existed,
+                Incoming::OriginalPutBack,
+                Prior::Existed(reference(ORIGINAL, 0o640)),
+                vec![],
+                vec![hex(ORIGINAL)],
+            ),
+        ];
+        for (stored, incoming, want_prior, want_superseded, want_blobs) in cells {
+            let (entry, blobs) = run_cell(stored, incoming);
+            let cell = format!("{stored:?} x {incoming:?}");
+            assert_eq!(entry.prior, want_prior, "{cell}: prior");
+            assert_eq!(entry.superseded, want_superseded, "{cell}: superseded");
+            assert_eq!(blobs, want_blobs, "{cell}: restore/");
+            // Every blob on disk is reachable from the entry: nothing orphaned.
+            let mut reachable: Vec<String> = entry
+                .superseded
+                .iter()
+                .chain(match &entry.prior {
+                    Prior::Existed(reference) => Some(reference),
+                    Prior::Absent => None,
+                })
+                .map(RestoreRef::blob_name)
+                .collect();
+            reachable.sort();
+            reachable.dedup();
+            assert_eq!(reachable, blobs, "{cell}: every blob is indexed");
+            assert_eq!(entry.written, ContentHash::of(BX_V2), "{cell}: written");
         }
     }
 
@@ -1170,6 +1599,62 @@ mod tests {
     }
 
     #[test]
+    fn a_re_record_keeps_the_directories_an_earlier_apply_created() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let file = "~/.config/newdir/x.conf";
+        let dirs = vec![target("~/.config/newdir"), target("~/.config")];
+
+        // Apply #1 invents both parents.
+        ledger
+            .record(entry(file, b"v1").with_created_dirs(dirs.clone()))
+            .expect("first");
+        // Apply #2: the parents exist now, so the writer reports none created.
+        ledger.record(entry(file, b"v2")).expect("second");
+        assert_eq!(
+            ledger.get(&target(file)).expect("entry").created_dirs,
+            dirs,
+            "`bx rm` must still know which directories bx invented",
+        );
+
+        // Apply #3 re-creates one it had already recorded: no duplicate.
+        ledger
+            .record(entry(file, b"v3").with_created_dirs(vec![target("~/.config/newdir")]))
+            .expect("third");
+        assert_eq!(ledger.get(&target(file)).expect("entry").created_dirs, dirs);
+
+        ledger.save().expect("save");
+        let reloaded = LedgerView::read(&dir).expect("read").value;
+        assert_eq!(
+            reloaded.get(&target(file)).expect("entry").created_dirs,
+            dirs
+        );
+    }
+
+    #[test]
+    fn directories_merged_across_re_records_stay_deepest_first() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let file = "~/.config/newdir/x.conf";
+
+        // Apply #1 invents only `~/.config`; `newdir` was there already.
+        ledger
+            .record(entry(file, b"v1").with_created_dirs(vec![target("~/.config")]))
+            .expect("first");
+        // Later `newdir` is gone and apply #2 invents it: deeper than the one
+        // already recorded, so appending it would break the removal order.
+        ledger
+            .record(entry(file, b"v2").with_created_dirs(vec![target("~/.config/newdir")]))
+            .expect("second");
+        assert_eq!(
+            ledger.get(&target(file)).expect("entry").created_dirs,
+            vec![target("~/.config/newdir"), target("~/.config")],
+        );
+    }
+
+    #[test]
     fn an_entry_without_created_dirs_still_loads() {
         // The `serde(default)` guarantee that justifies named encoding: a
         // ledger written before the field existed still loads.
@@ -1211,6 +1696,15 @@ mod tests {
                 .expect("entry")
                 .created_dirs
                 .is_empty(),
+        );
+        assert!(
+            loaded
+                .value
+                .get(&target("~/a"))
+                .expect("entry")
+                .superseded
+                .is_empty(),
+            "a ledger written before `superseded` existed still loads",
         );
     }
 

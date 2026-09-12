@@ -329,9 +329,9 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 
 /// Why a relocating assignment was rejected.
 ///
-/// Each names a different user action — declare a root, move the value out of
-/// bx's own directory, move it inside a declared one, write an absolute path,
-/// define the referenced variable earlier — so a caller that only knew *which*
+/// Each names a different user action — declare a root, split the line, move
+/// the value out of bx's own directory, move it inside a declared one, write an
+/// absolute path, define the referenced variable earlier — so a caller that only knew *which*
 /// variable was rejected could not say what to do about it. The messages name
 /// no data: the caller already holds the value and the root set, and prints
 /// them itself.
@@ -340,6 +340,9 @@ pub enum Reason {
     /// Nothing was declared, so nothing may be relocated.
     #[error("no root is declared, so nothing may be relocated")]
     NoRootsDeclared,
+    /// The line assigns a second variable this guard would not judge.
+    #[error("puts more than one assignment on one line")]
+    MultipleAssignments,
     /// It points at a directory bx owns, whatever the roots say.
     #[error("points inside a directory bx owns")]
     BxOwnedDirectory,
@@ -425,9 +428,11 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// over bx's own output, **not a shell parser** — content bx merely *copies*
 /// from another tool (a cached `mise activate` block, say) is that tool's
 /// business and is not scanned. Specifically not understood, and deliberately
-/// so: `local X=`, `env X=y cmd`, several assignments on one line, an inline
-/// `# comment` after a value, and `'single quotes'` suppressing expansion for
-/// any use of the name other than the one on that line.
+/// so: `local X=`, `env X=y cmd`, an inline `# comment` after a value, and
+/// `'single quotes'` suppressing expansion for any use of the name other than
+/// the one on that line. Several assignments on one line is not understood
+/// either, and is the one of these that is **refused** rather than misread:
+/// see [`Reason::MultipleAssignments`].
 #[must_use]
 pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
     let mut found = Vec::new();
@@ -440,13 +445,27 @@ pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
         let Some((name, value)) = assignment(line) else {
             continue;
         };
-        if let Some(reason) = evaluate(name, value, &seen, roots) {
+        // `assignment` returns the *first* `NAME=` on the line and treats
+        // everything after it as one value. A shell would export both, so
+        // judging the head alone can allow a line whose tail relocates a tool
+        // anywhere — the guard's error direction would invert on exactly the
+        // input it cannot parse. Refuse the line instead, and do not learn it:
+        // its value is not the value any shell would give the name.
+        let reason = if has_further_assignment(value) {
+            Some(Reason::MultipleAssignments)
+        } else {
+            evaluate(name, value, &seen, roots)
+        };
+        if let Some(reason) = reason {
             found.push(Violation {
                 line: idx + 1,
                 name: name.to_string(),
                 value: value.to_string(),
                 reason,
             });
+            if reason == Reason::MultipleAssignments {
+                continue;
+            }
         }
         // Learn the assignment only *after* judging it, as a shell does: the
         // right-hand side sees the previous value of the name, not this one.
@@ -632,6 +651,21 @@ fn assignment(line: &str) -> Option<(&str, &str)> {
     };
     let name = name.trim();
     is_variable_name(name).then_some((name, value.trim()))
+}
+
+/// Whether `value` has another `NAME=` in it, behind whitespace.
+///
+/// This is the one thing the scanner refuses rather than misreads. It is not a
+/// step towards parsing the line: the second assignment is never judged, and
+/// nothing about it is reported beyond its existence. bx does not generate a
+/// line like this, so the only way one reaches the guard is from content it
+/// cannot judge — which it must then not approve.
+fn has_further_assignment(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|word| word.split_once('='))
+        .any(|(name, _)| is_variable_name(name))
 }
 
 /// Whether `name` is a shell-legal variable name.
@@ -1155,6 +1189,67 @@ mod tests {
                 scan_with(content, &RootSet::strict()),
                 "{content}"
             );
+        }
+    }
+
+    #[test]
+    fn a_second_assignment_on_one_line_is_refused_rather_than_half_judged() {
+        // A real shell exports both names. Judging the head alone allowed the
+        // tail unread: this line is clean to a guard that stops at the first
+        // value, and `GOPATH` lands outside every root. The name-based guard
+        // this replaced denied the line, so allowing it would invert the
+        // guard's error direction between two commits.
+        let content = "export CARGO_HOME=/var/mnt/scratch/example/cargo GOPATH=/etc/evil\n";
+        assert_eq!(
+            scan_with(content, &rooted()),
+            vec![Violation {
+                line: 1,
+                name: "CARGO_HOME".into(),
+                value: "/var/mnt/scratch/example/cargo GOPATH=/etc/evil".into(),
+                reason: Reason::MultipleAssignments,
+            }]
+        );
+        // The head need not relocate anything for the tail to matter.
+        let content = "export EDITOR=nvim GOPATH=/etc/evil\n";
+        assert_eq!(
+            scan_with(content, &rooted())
+                .iter()
+                .map(|violation| violation.reason)
+                .collect::<Vec<_>>(),
+            vec![Reason::MultipleAssignments]
+        );
+    }
+
+    #[test]
+    fn a_refused_line_teaches_the_scan_nothing() {
+        // The head's "value" is not the value any shell would give the name,
+        // so learning it would resolve a later reference to a fiction.
+        let content = concat!(
+            "A=/var/mnt/scratch/example B=/etc\n",
+            "export CARGO_HOME=$A/cargo\n",
+        );
+        let found = scan_with(content, &rooted());
+        assert_eq!(
+            found
+                .iter()
+                .map(|violation| (violation.line, violation.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Reason::MultipleAssignments),
+                (2, Reason::UnresolvedReference),
+            ]
+        );
+    }
+
+    #[test]
+    fn whitespace_in_a_value_is_not_a_second_assignment() {
+        // The refusal is for another `NAME=`, not for a space: a quoted path
+        // with a space in it, and a trailing comment, both still resolve.
+        for content in [
+            "export CARGO_HOME=\"/var/mnt/scratch/example/my cache\"\n",
+            "export CARGO_HOME=/var/mnt/scratch/example/cargo # written by bx\n",
+        ] {
+            assert_eq!(scan_with(content, &rooted()), vec![], "{content}");
         }
     }
 

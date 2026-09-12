@@ -981,6 +981,64 @@ mod tests {
     }
 
     #[test]
+    fn a_braced_reference_consumes_its_closing_brace() {
+        // `${X}` must expand to X's value and nothing else. Leaving the `}`
+        // behind would produce a path with a `}` in a component name, which is
+        // a different directory — and one that is no longer inside the root.
+        let content = format!("X={ROOT}\nexport CARGO_HOME=${{X}}/cargo\n");
+        assert_eq!(scan_with(&content, &rooted()), vec![]);
+
+        // The brace ends the name and nothing more: text after it is appended
+        // verbatim, with no separator invented. `${X}suffix` therefore names a
+        // *sibling* of the root, which is outside it.
+        let content = format!("X={ROOT}\nexport CARGO_HOME=${{X}}suffix/cargo\n");
+        let found = scan_with(&content, &rooted());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].reason, Reason::OutsideDeclaredRoots);
+    }
+
+    #[test]
+    fn an_unbalanced_quote_is_not_stripped() {
+        // Only a *matched* pair is stripped. Treating one stray quote as a pair
+        // would eat a character from each end and change which path the value
+        // names — here, from an absolute path to a relative one.
+        for value in [
+            "\"/var/mnt/scratch/example/cargo",
+            "'/var/mnt/scratch/example/cargo",
+            "\"",
+            "'",
+        ] {
+            assert_eq!(
+                reason_of(&check("CARGO_HOME", value, &rooted())),
+                Some(Reason::NotAbsolute),
+                "{value}"
+            );
+        }
+        // A stray *trailing* quote leaves the value absolute and inside the
+        // root; it is part of the directory's name, not a delimiter.
+        for value in [
+            "/var/mnt/scratch/example/cargo\"",
+            "/var/mnt/scratch/example/cargo'",
+        ] {
+            assert_eq!(
+                check("CARGO_HOME", value, &rooted()),
+                Verdict::Allowed,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expansion_of_exactly_the_length_bound_still_resolves() {
+        // The bound is a limit, not a ceiling one short of it: a value of
+        // exactly MAX_EXPANDED_LEN bytes is within it.
+        let exact = format!("{ROOT}/{}", "a".repeat(MAX_EXPANDED_LEN - ROOT.len() - 1));
+        assert_eq!(exact.len(), MAX_EXPANDED_LEN);
+        let content = format!("X={exact}\nexport CARGO_HOME=$X\n");
+        assert_eq!(scan_with(&content, &rooted()), vec![]);
+    }
+
+    #[test]
     fn a_dollar_that_begins_no_reference_is_literal_text() {
         // The expansion grammar is closed: `$NAME` and `${NAME}`, nothing else.
         // Anything else is text, and text that is not an absolute path is

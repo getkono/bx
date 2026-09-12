@@ -13,9 +13,11 @@
 //! share, including the fact that an additive-only tool has no destroy action.
 //!
 //! [`state`] is the other half of the layout: `$XDG_STATE_HOME/bx`, which is
-//! never a git working tree and never published. [`fs`] holds the one atomic
-//! write in the crate — temporary file in the destination directory, `fsync`,
-//! `rename`, `fsync` the directory — and the one type that carries a file mode.
+//! never a git working tree and never published. [`fs`] is the single place a
+//! byte reaches the filesystem: the one atomic write in the crate — temporary
+//! file in the destination directory, the mode set before any content, `fsync`,
+//! `rename`, `fsync` the directory — the one comparison `plan` and `apply`
+//! share, and the one type that carries a file mode.
 //!
 //! [`testing`] is the tempdir-`$HOME` guard every home-touching test in this
 //! crate runs behind. It is compiled unconditionally, and hidden from the docs,

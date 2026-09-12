@@ -17,7 +17,8 @@
 //!                                               #   beside it, the line *is* the body
 //! direction  = "apply"                          # apply | track; default apply
 //! format     = "opaque"                         # opaque | jsonc | env.d; default opaque
-//! owns       = ["agent.default_model"]          # permitted iff format = "jsonc"
+//!                                               #   jsonc and env.d need attach = "own"
+//! owns       = ["agent.default_model"]          # required and non-empty iff format = "jsonc"
 //! requires   = ["starship"]                     # default []
 //! references = ["~/.gitconfig.local"]           # default []
 //! enabled    = true                             # default true
@@ -328,6 +329,39 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
         }
     }
 
+    if matches!(&format, Format::Jsonc { owns } if owns.is_empty()) {
+        // `Jsonc { owns: [] }` says bx manages part of a file and names no part:
+        // every run a silent no-op. Checked here rather than in `parse_format`
+        // so a directory target's more specific message above still wins.
+        return Err(ctx.bad(
+            table,
+            "format",
+            "format = \"jsonc\" claims only the keys `owns` lists, so it needs at least \
+             one key in `owns`; with none the target claims nothing",
+        ));
+    }
+
+    if format != Format::Opaque && attach != Attach::Own {
+        // `Format` says how much of the file a target's `path` names bx claims:
+        // `jsonc` the listed keys of a whole JSON document, `env.d` a whole
+        // fragment. A region is a delimited span inside a file the user also
+        // writes and an include is one line in it; neither is a JSON document or
+        // a fragment, so the pair would claim two contradictory things about one
+        // file and entry A5 would have to drop one of them silently. The raw
+        // spellings are re-read because both keys have already been validated.
+        let kind = ctx.str_at(table, "format")?.unwrap_or("opaque");
+        let how = ctx.str_at(table, "attach")?.unwrap_or("own");
+        return Err(ctx.bad(
+            table,
+            "format",
+            format!(
+                "format = {kind:?} describes a whole file bx owns, so it needs attach = \"own\"; \
+                 this target is attached as {how:?}, which is part of a file the user also \
+                 writes. Use format = \"opaque\", or attach = \"own\""
+            ),
+        ));
+    }
+
     let requires = ctx.str_array_at(table, "requires")?;
     let references = ctx
         .str_array_at(table, "references")?
@@ -626,7 +660,7 @@ fn parse_direction(ctx: &Ctx, table: &Table) -> Result<Direction, Error> {
     }
 }
 
-/// `format`, and the `owns` list only `jsonc` may carry.
+/// `format`, and the `owns` list that `jsonc` must carry and nothing else may.
 fn parse_format(ctx: &Ctx, table: &Table) -> Result<Format, Error> {
     let kind = ctx.str_at(table, "format")?.unwrap_or("opaque");
     let owns_declared = table.contains_key("owns");
@@ -1139,6 +1173,69 @@ mod tests {
             Format::EnvD
         );
         assert!(message(&with("format = \"envd\"\n")).contains("\"env.d\""));
+    }
+
+    /// A structured format describes a file bx owns whole, so it needs `own`.
+    ///
+    /// All four parsed. `Format` says how much of the file a target claims:
+    /// `jsonc` claims the listed keys of a whole JSON document, and `env.d` claims
+    /// a whole fragment. A region is a delimited span inside someone else's file,
+    /// and an include is one line in it. Neither is a JSON document or a
+    /// fragment, so each combination claims two contradictory things about one
+    /// file, and entry A5 would have to pick one silently.
+    #[test]
+    fn a_structured_format_needs_attach_own() {
+        let region = "attach = \"region\"\ncomment = \"#\"\ncontent = \"x\"\n";
+        let include = "attach = \"include\"\ninclude = \"Include x\"\n";
+        let jsonc = "format = \"jsonc\"\nowns = [\"a.b\"]\n";
+        let env_d = "format = \"env.d\"\n";
+
+        for (attach, format) in [
+            (region, jsonc),
+            (region, env_d),
+            (include, jsonc),
+            (include, env_d),
+        ] {
+            let text = format!("[[target]]\npath = \"~/.config/x\"\n{attach}{format}");
+            let message = message(&text);
+            assert!(
+                message.contains("needs attach = \"own\""),
+                "{attach}{format}: {message}"
+            );
+            assert!(message.contains("bx.toml:"), "{attach}{format}: {message}");
+        }
+
+        // Opaque is the one format every attachment can carry.
+        for attach in [region, include] {
+            let text = format!("[[target]]\npath = \"~/.config/x\"\n{attach}format = \"opaque\"\n");
+            parse(&text).unwrap_or_else(|e| panic!("{attach}: {e}"));
+        }
+    }
+
+    /// `format = "jsonc"` with no owned key claims nothing.
+    ///
+    /// It parsed as `Jsonc { owns: [] }`: a target that says bx manages part of
+    /// a file and names no part, so every run is a silent no-op.
+    #[test]
+    fn jsonc_without_an_owned_key_is_rejected() {
+        for owns in ["", "owns = []\n"] {
+            let message = message(&with(&format!("format = \"jsonc\"\n{owns}")));
+            assert!(
+                message.contains("at least one key in `owns`"),
+                "{owns:?}: {message}"
+            );
+        }
+    }
+
+    /// `dir` counts as a body key when two are declared.
+    #[test]
+    fn a_directory_target_that_also_declares_a_body_has_two_bodies() {
+        for body in ["file = \"f\"", "content = \"x\""] {
+            let text = format!("[[target]]\npath = \"~/.ssh\"\ndir = true\n{body}\n");
+            let message = message(&text);
+            assert!(message.contains("exactly one body"), "{body}: {message}");
+            assert!(message.contains("`dir`"), "{body}: {message}");
+        }
     }
 
     #[test]

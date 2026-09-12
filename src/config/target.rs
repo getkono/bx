@@ -142,10 +142,13 @@ impl Mode {
 
     /// Parse the quoted octal form a config file uses.
     ///
-    /// **A bare TOML integer is not accepted.** TOML has no octal literal, so
-    /// `mode = 600` is decimal 600 and means nothing at all; only `mode = "0600"`
-    /// parses. One to four octal digits, so the setuid, setgid and sticky bits
-    /// are expressible and a fifth digit is a typo.
+    /// **A bare TOML integer is not accepted.** `mode = 600` is decimal 600 and
+    /// means nothing at all, and while TOML *does* have an octal literal it is
+    /// spelled `0o600`, which is not how a mode is written anywhere else a user
+    /// meets one. Only the quoted `mode = "0600"` parses — one spelling, and the
+    /// one `chmod`, `ls -l` and every other tool already use. One to four octal
+    /// digits, so the setuid, setgid and sticky bits are expressible and a fifth
+    /// digit is a typo.
     ///
     /// # Errors
     ///
@@ -222,7 +225,12 @@ pub enum Format {
         /// The key paths bx owns. Everything else in the file is the user's.
         owns: Vec<KeyPath>,
     },
-    /// A `conf.d`-style directory of environment fragments.
+    /// One fragment file in a `conf.d`-style directory of environment settings.
+    ///
+    /// A `Format` describes the file a target's `path` names, so this is the
+    /// fragment, not the directory holding it: bx owns the whole fragment and
+    /// says nothing about its neighbours. What the fragment's syntax is, and
+    /// how the directory is assembled, belong to the entry that generates one.
     EnvD,
 }
 
@@ -532,8 +540,9 @@ fn parse_mode(ctx: &Ctx, table: &Table) -> Result<Option<Mode>, Error> {
         return Err(ctx.bad(
             table,
             "mode",
-            "`mode` is a quoted octal string: TOML has no octal literal, so \
-             mode = 600 is decimal 600. Write mode = \"0600\".",
+            "`mode` is a quoted octal string: mode = 600 is decimal 600, and \
+             TOML's own octal literal is spelled 0o600, which is not how a mode \
+             is written anywhere else. Write mode = \"0600\".",
         ));
     }
 

@@ -39,7 +39,7 @@ use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
 
 /// The section header, as messages spell it.
-const SECTION: &str = "[[target]]";
+pub(crate) const SECTION: &str = "[[target]]";
 
 /// Every key a `[[target]]` entry may carry.
 const KEYS: [&str; 15] = [

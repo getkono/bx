@@ -62,7 +62,7 @@ use super::{Ctx, Error, Origin};
 use crate::paths;
 
 /// The `[[value]]` section header, as messages spell it.
-const DECL_SECTION: &str = "[[value]]";
+pub(crate) const DECL_SECTION: &str = "[[value]]";
 
 /// The `[values]` section header, as messages spell it.
 const ASSIGN_SECTION: &str = "[values]";

@@ -14,6 +14,10 @@
 //! through [`scan`] before it is written, and the check is covered by tests
 //! rather than left to review.
 
+use std::path::{Path, PathBuf};
+
+use crate::paths;
+
 /// Exact variable names bx must never assign.
 const DENIED_EXACT: &[&str] = &[
     // XDG roots — relocating any of these moves every tool at once.
@@ -85,6 +89,90 @@ pub fn is_relocating(name: &str) -> bool {
             .any(|s| name.ends_with(s) && name.len() > s.len())
 }
 
+/// The roots a configuration declares as its own.
+///
+/// A relocation is judged against this set: a tool may be pointed at a
+/// different directory exactly when that directory lies inside a root the user
+/// declared. The set is a `Vec` in declaration order, not a `HashSet`, because
+/// invariant 3 forbids any iteration order reaching generated output.
+///
+/// `home` is kept so that `~` and `$HOME` expand, and **not** as a permissive
+/// root: relocating a tool inside `$HOME` is as invisible to a shell bx did not
+/// initialise as relocating it anywhere else. A user who wants their home to be
+/// a root declares a root whose value is `~`.
+///
+/// Containment is decided **lexically**, never by touching the filesystem.
+/// `canonicalize` would make the verdict depend on what exists and on what is
+/// mounted, so the same `plan` would differ between two machines and between
+/// two runs on one — which invariant 3 forbids. The price is that lexical `..`
+/// normalisation is unsound across a symlink: `<root>/link/../x`, where `link`
+/// points outside the root, is judged inside it. That is accepted rather than
+/// fixed, because the only fix is the one invariant 3 rules out, and the values
+/// bx checks are generated from declared roots, so a `..` component in one is
+/// anomalous by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootSet {
+    home: Option<PathBuf>,
+    roots: Vec<PathBuf>,
+}
+
+impl RootSet {
+    /// The set that declares nothing, and therefore permits no relocation.
+    ///
+    /// This is what [`scan`] uses, and it is why `scan` needs no home: with no
+    /// root declared every relocating variable is a violation before its value
+    /// is ever looked at, so there is nothing to expand `~` against.
+    #[must_use]
+    pub fn strict() -> Self {
+        Self {
+            home: None,
+            roots: Vec::new(),
+        }
+    }
+
+    /// A set of declared roots, resolved against `home`.
+    ///
+    /// Each root is `~`-expanded with [`paths::render`] and lexically
+    /// normalised with [`paths::normalize`], so that a root and a value being
+    /// compared have been through the same rules.
+    #[must_use]
+    pub fn new(home: &Path, roots: &[PathBuf]) -> Self {
+        let home = paths::normalize(home);
+        let roots = roots
+            .iter()
+            .map(|root| paths::normalize(&paths::render(&root.to_string_lossy(), &home)))
+            .collect();
+        Self {
+            home: Some(home),
+            roots,
+        }
+    }
+
+    /// Whether `path` lies inside some declared root.
+    ///
+    /// The comparison is component-wise, so `/scratch/examplefoo` is **not**
+    /// inside `/scratch/example`, and it is lexical, so `<root>/../etc` is not
+    /// inside `<root>` either. A relative path keeps its leading `..` through
+    /// normalisation and can therefore never be inside an absolute root.
+    #[must_use]
+    pub fn contains(&self, path: &Path) -> bool {
+        let normalised = paths::normalize(path);
+        self.roots.iter().any(|root| normalised.starts_with(root))
+    }
+
+    /// Whether no root is declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    /// The home `~` and `$HOME` expand against, if this set has one.
+    #[must_use]
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+}
+
 /// A forbidden assignment found in generated shell content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
@@ -148,6 +236,109 @@ fn assigned_name(line: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A deliberately neutral home and scratch root: nothing in this file may
+    // name a real account or a real machine's layout (invariant 5).
+    const HOME: &str = "/var/home/example";
+    const ROOT: &str = "/var/mnt/scratch/example";
+
+    fn rooted() -> RootSet {
+        RootSet::new(Path::new(HOME), &[PathBuf::from(ROOT)])
+    }
+
+    #[test]
+    fn a_declared_root_contains_itself() {
+        assert!(rooted().contains(Path::new(ROOT)));
+    }
+
+    #[test]
+    fn a_path_under_a_declared_root_is_inside() {
+        assert!(rooted().contains(Path::new("/var/mnt/scratch/example/cache/cargo")));
+    }
+
+    #[test]
+    fn a_sibling_whose_name_extends_the_root_is_outside() {
+        // Containment is component-wise, not textual: `examplefoo` is a
+        // different directory that merely shares a prefix of its name.
+        assert!(!rooted().contains(Path::new("/var/mnt/scratch/examplefoo")));
+        assert!(!rooted().contains(Path::new("/var/mnt/scratch/examplefoo/cargo")));
+    }
+
+    #[test]
+    fn a_traversal_out_of_a_root_is_outside() {
+        assert!(!rooted().contains(Path::new("/var/mnt/scratch/example/../etc")));
+    }
+
+    #[test]
+    fn a_traversal_that_returns_inside_is_inside() {
+        assert!(rooted().contains(Path::new("/var/mnt/scratch/example/a/../b")));
+    }
+
+    #[test]
+    fn a_single_dot_component_is_ignored() {
+        assert!(rooted().contains(Path::new("/var/mnt/scratch/example/./cache")));
+    }
+
+    #[test]
+    fn traversal_cannot_escape_above_the_filesystem_root() {
+        // `/..` is `/`, and `/` is not inside any declared root here.
+        assert!(!rooted().contains(Path::new("/..")));
+        assert!(!rooted().contains(Path::new("/../../..")));
+    }
+
+    #[test]
+    fn a_relative_path_is_never_inside_a_root() {
+        assert!(!rooted().contains(Path::new("cache/cargo")));
+        assert!(!rooted().contains(Path::new("../example/cache")));
+    }
+
+    #[test]
+    fn a_second_root_covers_what_the_first_does_not() {
+        // The root set is a set precisely so an sccache directory can live
+        // outside the scratch root without the scratch root being widened.
+        let roots = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from(ROOT), PathBuf::from("/var/cache/sccache")],
+        );
+        assert!(roots.contains(Path::new("/var/mnt/scratch/example/cargo")));
+        assert!(roots.contains(Path::new("/var/cache/sccache/x")));
+        assert!(!roots.contains(Path::new("/var/cache/other")));
+    }
+
+    #[test]
+    fn a_root_written_with_a_tilde_expands_against_home() {
+        let roots = RootSet::new(Path::new(HOME), &[PathBuf::from("~/scratch")]);
+        assert!(roots.contains(Path::new("/var/home/example/scratch/cargo")));
+        assert!(!roots.contains(Path::new("/var/home/example/other")));
+    }
+
+    #[test]
+    fn a_root_set_that_declares_nothing_is_empty_and_has_no_home() {
+        let strict = RootSet::strict();
+        assert!(strict.is_empty());
+        assert_eq!(strict.home(), None);
+        assert!(!strict.contains(Path::new(ROOT)));
+
+        let rooted = rooted();
+        assert!(!rooted.is_empty());
+        assert_eq!(rooted.home(), Some(Path::new(HOME)));
+    }
+
+    #[test]
+    fn containment_never_touches_the_filesystem() {
+        // Both the root and the path are under a directory that has just been
+        // removed, so `canonicalize` would return `Err` for either of them.
+        // A verdict that depended on the filesystem would be wrong here, and a
+        // `plan` built on it would differ between machines — invariant 3.
+        let gone = tempfile::tempdir().expect("tempdir");
+        let base = gone.path().to_path_buf();
+        drop(gone);
+        assert!(!base.exists());
+
+        let roots = RootSet::new(Path::new(HOME), std::slice::from_ref(&base));
+        assert!(roots.contains(&base.join("cache/cargo")));
+        assert!(!roots.contains(Path::new("/var/cache/elsewhere")));
+    }
 
     #[test]
     fn xdg_roots_are_denied() {

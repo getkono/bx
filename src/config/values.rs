@@ -330,9 +330,9 @@ fn assigned_value(item: &toml_edit::Item) -> Option<AssignedValue> {
 
 /// An answer that is not of the kind it was declared as.
 ///
-/// Carries no [`Origin`] on purpose: [`ValueKind::check`] is called both by the
-/// loader, which has an origin to attach, and by `bx init`, which has a prompt
-/// instead. The caller supplies the provenance it has.
+/// Carries no [`Origin`] on purpose: [`ResolvedValues::check_answer`] is called
+/// both by the loader, which has an origin to attach, and by `bx init`, which
+/// has a prompt instead. The caller supplies the provenance it has.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValueError {
     /// The answer does not parse as its declared kind.
@@ -348,15 +348,19 @@ pub enum ValueError {
 }
 
 impl ValueKind {
-    /// Validate one answer and return the text bx would store.
+    /// Validate one **already-substituted** answer and return the text bx stores.
     ///
-    /// **This is the same function the loader calls.** `bx init` validating what
-    /// a user typed and bx validating a line already in `local.toml` have to
-    /// agree by construction rather than by two implementations that happen to
-    /// match, so there is one of them and both paths call it. It returns the
-    /// *canonical* text — a `path` expanded against `home` and lexically
-    /// normalised, a `bool` lowercased — so a prompt writes exactly what a load
-    /// would have produced.
+    /// The second half of validating an answer, and deliberately not public:
+    /// [`ResolvedValues::check_answer`] is the whole of it, and it is the whole
+    /// of it that `bx init` has to call. An answer is resolved as *expand, then
+    /// check*, so a check without the expansion disagrees with the loader in
+    /// both directions — it accepts `Someone {{Nested}}` as a `string`, which no
+    /// later load can read, and it rejects `{{scratch_root}}/sccache` as a
+    /// `path`, which is the spelling the design documents as valid.
+    ///
+    /// It returns the *canonical* text — a `path` expanded against `home` and
+    /// lexically normalised, a `bool` lowercased — so a prompt writes exactly
+    /// what a load would have produced.
     ///
     /// Nothing here touches the network or the filesystem: an `ssh-key` and an
     /// `age-recipient` are syntax-checked only. A `plan` that reached out to a
@@ -366,7 +370,7 @@ impl ValueKind {
     /// # Errors
     ///
     /// [`ValueError::Malformed`] when `answer` is not of this kind.
-    pub fn check(self, answer: &str, home: &Path) -> Result<String, ValueError> {
+    pub(crate) fn check(self, answer: &str, home: &Path) -> Result<String, ValueError> {
         let malformed = |expected: &'static str| ValueError::Malformed {
             kind: self,
             answer: answer.to_string(),
@@ -622,6 +626,23 @@ pub enum Unresolved {
     Forward(String),
 }
 
+/// Why an answer is not usable.
+///
+/// The error of [`ResolvedValues::check_answer`], which is the one entry point
+/// that validates an answer the way the loader does. The two halves are kept
+/// apart because their callers act on them differently: a
+/// [`AnswerError::Reference`] carrying [`Unresolved::Unset`] means *answer that
+/// one first*, and everything else means *this answer is wrong*.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnswerError {
+    /// The answer's own `{{name}}` references could not be resolved.
+    #[error(transparent)]
+    Reference(#[from] Unresolved),
+    /// The answer resolved, but is not of its declared kind.
+    #[error(transparent)]
+    Kind(#[from] ValueError),
+}
+
 /// What a name resolved to while expanding.
 enum Lookup<'a> {
     /// Answered, with this text.
@@ -690,7 +711,7 @@ pub fn init_hint(names: &[&str]) -> String {
 /// One resolved answer: the canonical text, and the layer that supplied it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Value {
-    /// The canonical text, as [`ValueKind::check`] returned it.
+    /// The canonical text, as [`ResolvedValues::check_answer`] returned it.
     pub text: String,
     /// The layer that answered — the local layer, or the one whose `default`
     /// applied — so `bx plan` can name which file made this account differ.
@@ -774,36 +795,32 @@ impl ResolvedValues {
                     value: None,
                     cause: vec![decl.name.clone()],
                 },
-                Some(raw) => match resolved.expand_against_earlier(&raw, &declared) {
-                    Ok(text) => {
-                        let canonical =
-                            decl.kind
-                                .check(&text, home)
-                                .map_err(|source| Error::BadValue {
-                                    origin: origin.clone(),
-                                    message: format!("value `{}`: {source}", decl.name),
-                                })?;
-                        Answer {
+                // The same function `bx init` calls, at this declaration's own
+                // position: expand against the values declared before it, then
+                // check the result against the kind.
+                Some(raw) => {
+                    match resolved.validate(decl.kind, resolved.decls.len(), &raw, &declared) {
+                        Ok(canonical) => Answer {
                             value: Some(Value {
                                 text: canonical,
                                 origin,
                             }),
                             cause: Vec::new(),
+                        },
+                        // An earlier value is unanswered, so this one is too — and it
+                        // carries the earlier name, which is the one to act on.
+                        Err(AnswerError::Reference(Unresolved::Unset { names })) => Answer {
+                            value: None,
+                            cause: names,
+                        },
+                        Err(other) => {
+                            return Err(Error::BadValue {
+                                origin,
+                                message: format!("value `{}`: {other}", decl.name),
+                            });
                         }
                     }
-                    // An earlier value is unanswered, so this one is too — and it
-                    // carries the earlier name, which is the one to act on.
-                    Err(Unresolved::Unset { names }) => Answer {
-                        value: None,
-                        cause: names,
-                    },
-                    Err(other) => {
-                        return Err(Error::BadValue {
-                            origin,
-                            message: format!("value `{}`: {other}", decl.name),
-                        });
-                    }
-                },
+                }
             };
 
             resolved.decls.push(decl);
@@ -813,15 +830,63 @@ impl ResolvedValues {
         Ok(resolved)
     }
 
-    /// Expand `text` against the declarations resolved so far.
-    fn expand_against_earlier(
+    /// Validate one answer for a declaration at `horizon`, as the loader does.
+    ///
+    /// **The whole of answer validation, in one function**, because `bx init`
+    /// checking what a user typed and bx checking a line already in `local.toml`
+    /// have to agree by construction rather than by two implementations that
+    /// happen to match. An answer is *expanded* against the values declared
+    /// before it and then *checked* against its kind; doing either half alone
+    /// disagrees with the loader for any answer carrying a brace pair.
+    fn validate(
+        &self,
+        kind: ValueKind,
+        horizon: usize,
+        answer: &str,
+        declared: &[String],
+    ) -> Result<String, AnswerError> {
+        let text = self.expand_before(answer, horizon, declared)?;
+        Ok(kind.check(&text, &self.home)?)
+    }
+
+    /// Validate an answer for `name` exactly as loading it from `local.toml`
+    /// would.
+    ///
+    /// The canonical text is what bx would have stored, so `bx init` writes the
+    /// same bytes a hand-edit would have to. A `{{name}}` reference to an
+    /// **earlier** declared value is expanded, which is what makes
+    /// `sccache_dir = "{{scratch_root}}/sccache"` as legal at a prompt as it is
+    /// in the file.
+    ///
+    /// # Errors
+    ///
+    /// [`AnswerError::Reference`] when the answer's own references cannot be
+    /// resolved — including [`Unresolved::Undeclared`] when no enabled
+    /// declaration carries `name` — and [`AnswerError::Kind`] when the resolved
+    /// text is not of the declared kind.
+    pub fn check_answer(&self, name: &str, answer: &str) -> Result<String, AnswerError> {
+        let Some(index) = self.index_of(name) else {
+            return Err(Unresolved::Undeclared(name.to_string()).into());
+        };
+        let declared: Vec<String> = self.decls.iter().map(|decl| decl.name.clone()).collect();
+        self.validate(self.decls[index].kind, index, answer, &declared)
+    }
+
+    /// Expand `text` against the values declared before `horizon`.
+    ///
+    /// Everything at or after it is a forward reference, which is what keeps
+    /// resolution one pass and a cycle unrepresentable.
+    fn expand_before(
         &self,
         text: &str,
+        horizon: usize,
         declared: &[String],
     ) -> Result<String, Unresolved> {
         expand(text, &|name: &str| match self.index_of(name) {
-            Some(index) => self.lookup_at(index),
-            // Declared, but not yet resolved: later, or this very declaration.
+            Some(index) if index < horizon => self.lookup_at(index),
+            // Declared, but not resolvable from here: later, or this very
+            // declaration.
+            Some(_) => Lookup::Forward,
             None if declared.iter().any(|d| d == name) => Lookup::Forward,
             None => Lookup::Undeclared,
         })
@@ -1944,53 +2009,98 @@ mod tests {
 
     // --- the two validation paths are one behaviour -------------------------
 
-    /// Resolve a one-value configuration whose answer is `answer`.
+    /// The scratch root every brace-bearing case below references.
+    const SCRATCH: &str = "/var/mnt/scratch/one";
+
+    /// A two-value configuration: an answered `scratch_root`, then `v`.
+    ///
+    /// `v` is deliberately left unanswered, so the same fixture serves both the
+    /// prompt path — which validates an answer that is not in the file yet — and
+    /// the load path, which supplies one.
+    fn a_prompt(kind: ValueKind) -> ResolvedValues {
+        ResolvedValues::resolve(
+            vec![a_decl("scratch_root", ValueKind::Path), a_decl("v", kind)],
+            &[answer("scratch_root", SCRATCH)],
+            &a_home(),
+        )
+        .expect("the fixture resolves")
+    }
+
+    /// What `bx init` would accept `answer_text` as, for a `v` of `kind`.
+    fn through_a_prompt(kind: ValueKind, answer_text: &str) -> Result<String, String> {
+        a_prompt(kind)
+            .check_answer("v", answer_text)
+            .map_err(|e| e.to_string())
+    }
+
+    /// What a `local.toml` line answering `v` resolves to.
     fn through_the_loader(kind: ValueKind, answer_text: &str) -> Result<String, String> {
-        let decl = a_decl("v", kind);
-        let values = resolve(vec![decl], &[answer("v", answer_text)])?;
+        let values = resolve(
+            vec![a_decl("scratch_root", ValueKind::Path), a_decl("v", kind)],
+            &[answer("scratch_root", SCRATCH), answer("v", answer_text)],
+        )?;
         Ok(values.get("v").expect("answered").text.clone())
     }
 
     /// Every kind, with an answer it accepts and one it does not.
-    const KIND_CASES: [(ValueKind, &str, &str); 6] = [
-        (ValueKind::Path, "~/scratch/./one", "relative/path"),
-        (ValueKind::String, "anything at all", ""),
-        (ValueKind::Bool, "TRUE", "yes"),
-        (ValueKind::Email, "someone@example.invalid", "someone"),
+    ///
+    /// The brace-bearing rows are the ones that matter: an answer is resolved as
+    /// *expand, then check*, and a validator that did only half of that accepted
+    /// `Someone {{Nested}}` and rejected `{{scratch_root}}/sccache`.
+    const KIND_CASES: [(ValueKind, &str, Option<&str>); 9] = [
+        (ValueKind::Path, "~/scratch/./one", Some("relative/path")),
+        (ValueKind::String, "anything at all", None),
+        (ValueKind::Bool, "TRUE", Some("yes")),
+        (ValueKind::Email, "someone@example.invalid", Some("someone")),
         (
             ValueKind::SshKey,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample",
-            "not-a-key",
+            Some("not-a-key"),
         ),
         (
             ValueKind::AgeRecipient,
             "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p",
-            "age1BAD",
+            Some("age1BAD"),
         ),
+        // A brace pair a person typed into a prompt, escaped, and one that is
+        // not a value name.
+        (
+            ValueKind::String,
+            "Someone {{{{Nested}}",
+            Some("Someone {{Nested}}"),
+        ),
+        // A reference to an earlier value, and one that never closes.
+        (
+            ValueKind::Path,
+            "{{scratch_root}}/sccache",
+            Some("{{scratch_root/sccache"),
+        ),
+        // A reference to a value no layer declares is a repo defect either way.
+        (ValueKind::String, "{{{{scratch_root}}", Some("{{nowhere}}")),
     ];
 
     #[test]
-    fn kind_check_accepts_what_the_loader_accepts() {
+    fn a_prompt_accepts_what_the_loader_accepts() {
         // `bx init` validating a typed answer and bx validating a `local.toml`
         // line are one behaviour, not two that happen to agree.
         for (kind, good, _) in KIND_CASES {
-            let prompted = check(kind, good).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let prompted = through_a_prompt(kind, good).unwrap_or_else(|e| panic!("{kind}: {e}"));
             let loaded = through_the_loader(kind, good).unwrap_or_else(|e| panic!("{kind}: {e}"));
             assert_eq!(
                 prompted, loaded,
-                "{kind} disagreed about the canonical text"
+                "{kind} disagreed about the canonical text for {good:?}"
             );
         }
     }
 
     #[test]
-    fn kind_check_rejects_what_the_loader_rejects() {
+    fn a_prompt_rejects_what_the_loader_rejects() {
         for (kind, _, bad) in KIND_CASES {
-            if kind == ValueKind::String {
+            let Some(bad) = bad else {
                 continue; // every string is a string; there is nothing to reject
-            }
+            };
             assert!(
-                check(kind, bad).is_err(),
+                through_a_prompt(kind, bad).is_err(),
                 "{kind} accepted {bad:?} at a prompt"
             );
             assert!(
@@ -1998,5 +2108,86 @@ mod tests {
                 "{kind} accepted {bad:?} from a file"
             );
         }
+    }
+
+    #[test]
+    fn a_prompt_expands_a_reference_to_an_earlier_value() {
+        // The spelling the design documents as valid, and the one a check
+        // without the expansion refused outright.
+        assert_eq!(
+            through_a_prompt(ValueKind::Path, "{{scratch_root}}/sccache").unwrap(),
+            "/var/mnt/scratch/one/sccache"
+        );
+    }
+
+    #[test]
+    fn a_prompt_refuses_a_brace_pair_that_is_not_a_reference() {
+        // `bx init` has no escaping step, so an answer it accepts is written to
+        // `local.toml` verbatim. Accepting this would make every later `bx plan`
+        // and `bx apply` fail at load, which is not the blocked-target
+        // degradation an unanswered value gets.
+        let message = through_a_prompt(ValueKind::String, "Someone {{Nested}}").unwrap_err();
+
+        assert!(message.contains("is not a value name"), "{message}");
+    }
+
+    #[test]
+    fn a_prompt_refuses_a_reference_to_a_later_value() {
+        // Resolution is one pass in declaration order, so an answer may only
+        // reach backwards — the same rule the loader applies to a `default`.
+        let values = ResolvedValues::resolve(
+            vec![
+                a_decl("v", ValueKind::Path),
+                a_decl("later", ValueKind::Path),
+            ],
+            &[],
+            &a_home(),
+        )
+        .unwrap();
+
+        let message = values
+            .check_answer("v", "{{later}}/x")
+            .unwrap_err()
+            .to_string();
+
+        assert!(message.contains("is declared later"), "{message}");
+    }
+
+    #[test]
+    fn a_prompt_for_an_undeclared_value_says_so() {
+        let message = through_a_prompt(ValueKind::String, "anything");
+        assert!(message.is_ok(), "the fixture declares `v`");
+
+        let message = a_prompt(ValueKind::String)
+            .check_answer("nowhere", "anything")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            message.contains("no layer declares the value `nowhere`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_reports_an_earlier_value_that_needs_answering_first() {
+        // Not an invalid answer: the name the account has to supply before this
+        // one can be validated at all.
+        let values = ResolvedValues::resolve(
+            vec![
+                a_decl("scratch_root", ValueKind::Path),
+                a_decl("v", ValueKind::Path),
+            ],
+            &[],
+            &a_home(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            values.check_answer("v", "{{scratch_root}}/sccache"),
+            Err(AnswerError::Reference(Unresolved::Unset {
+                names: vec!["scratch_root".to_string()]
+            }))
+        );
     }
 }

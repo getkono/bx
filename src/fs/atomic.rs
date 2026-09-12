@@ -1814,6 +1814,30 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_that_cannot_be_stat_ed_is_an_error_not_an_absent_directory() {
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so there is nothing to assert.
+            return;
+        }
+        let home = guarded_home();
+        let locked = home.child("locked");
+        std::fs::create_dir(&locked).expect("mkdir");
+        // No execute bit, so nothing below it can be stat'd at all.
+        set_mode(&locked, Mode::from_bits(0o000)).expect("chmod");
+
+        // The third `ENOENT`-adjacent case, and the one that must *not* become
+        // a directory bx invents: the parent may well be there, and bx cannot
+        // see. A read error is the only honest answer.
+        let err = observe(&locked.join("sub/f")).expect_err("must fail");
+        let Error::Read { path, .. } = &err else {
+            panic!("expected a read error, got {err:?}");
+        };
+        assert_eq!(path, &locked.join("sub"));
+
+        set_mode(&locked, Mode::PRIVATE_DIR).expect("unlock for cleanup");
+    }
+
+    #[test]
     fn a_path_with_no_parent_is_refused() {
         let err =
             write_atomically(Path::new("/"), b"x", Mode::DEFAULT_FILE).expect_err("must fail");

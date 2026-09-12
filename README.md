@@ -116,8 +116,10 @@ or a login banner without anyone parsing its output:
   without it being shown first.
 - Every write is journalled and recorded, including the original bytes of
   whatever it replaced, so `bx rm` restores exactly what was there.
-- An interrupted `apply` is detected on the next run and either completed or
-  rolled back. No torn files, ever.
+- An interrupted `apply` is detected on the next run and rolled back: a
+  read-only command reports it, and the next writing command undoes it before
+  it does anything else. No torn files, ever, and no half-applied plan left
+  standing.
 - Two `bx` processes cannot corrupt each other.
 
 ### Opinionated, to avoid surprises

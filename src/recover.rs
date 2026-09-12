@@ -701,7 +701,7 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        crash_phases, peek, plant_file, raw_journal, seal, target, write_to,
+        crash_phases, peek, permissions_refuse, plant_file, raw_journal, seal, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
@@ -1798,6 +1798,10 @@ mod tests {
         // the directory; the rename does. Narrower than 0700 rather than wider,
         // so nothing tightens it back.
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
+        if !permissions_refuse(state.root()) {
+            fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+            return;
+        }
         let abandoned = abandon(&state);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
 

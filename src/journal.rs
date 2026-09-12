@@ -2149,6 +2149,10 @@ pub(crate) mod tests {
 
         let locked = home.child("locked");
         fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make the directory read-only");
+        if !permissions_refuse(&locked) {
+            fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
+            return;
+        }
         let mut session =
             Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
         let removed = session.apply(Request {
@@ -2197,6 +2201,10 @@ pub(crate) mod tests {
         // No root here, so a directory without write permission refuses the
         // rename. Narrower than 0700 rather than wider, so nothing tightens it.
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
+        if !permissions_refuse(state.root()) {
+            fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+            return;
+        }
         let loaded = load_exclusive(&state.journal(), &lock);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
 
@@ -2206,6 +2214,23 @@ pub(crate) mod tests {
             b"GARBAGE!",
         );
         assert!(!StateDir::quarantine(&state.journal()).exists());
+    }
+
+    /// Whether a directory without write permission refuses this process.
+    ///
+    /// It does not refuse root, so a test that needs a refused rename or unlink
+    /// cannot produce one there. Such a test skips and says so, rather than
+    /// failing for a reason that has nothing to do with bx.
+    pub(crate) fn permissions_refuse(dir: &Path) -> bool {
+        let probe = dir.join("permission-probe");
+        if std::fs::write(&probe, b"").is_err() {
+            return true;
+        }
+        std::fs::remove_file(&probe).expect("remove the probe");
+        eprintln!(
+            "skipped: this process writes through directory permissions, so the failure cannot be produced"
+        );
+        false
     }
 
     /// A session header for a journal that needs one and does not care what it

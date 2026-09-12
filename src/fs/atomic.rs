@@ -943,15 +943,25 @@ fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<Vec<PathBuf>, Erro
         .map(Path::to_path_buf)
         .collect();
 
+    // Only what bx actually created goes in the list. A directory that appeared
+    // between the stat and the `mkdir` is somebody else's, and a reversal that
+    // removed it would be deleting a directory another tool made — Invariant 1,
+    // with no way to notice afterwards, because the wrong list is durable on
+    // disk by the time `bx rm` reads it.
+    let mut created = Vec::with_capacity(missing.len());
     for path in missing.iter().rev() {
         let mode = if path == dir {
             leaf_mode
         } else {
             Mode::DEFAULT_DIR
         };
-        create_dir_at(path, mode)?;
+        if create_dir_at(path, mode)? {
+            created.push(path.clone());
+        }
     }
-    Ok(missing)
+    // The walk above is shallowest first; a reversal wants deepest first.
+    created.reverse();
+    Ok(created)
 }
 
 /// `mkdir` one directory at exactly `mode`.
@@ -969,12 +979,13 @@ fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<Vec<PathBuf>, Erro
 /// contents — the directory is empty — it is the **descriptor**: a process that
 /// opens it inside that window holds a handle whose access checks have already
 /// passed, and the later `chmod` does not revoke it.
-fn create_dir_at(path: &Path, mode: Mode) -> Result<(), Error> {
+fn create_dir_at(path: &Path, mode: Mode) -> Result<bool, Error> {
     match rustix::fs::mkdir(path, mode.into()) {
         Ok(()) => {}
         // Somebody else created it between the stat and the mkdir. It is not
-        // bx's directory then, so its mode is not bx's to set.
-        Err(Errno::EXIST) => return Ok(()),
+        // bx's directory then, so its mode is not bx's to set — and it is not
+        // bx's to record as one it invented, because a reversal removes those.
+        Err(Errno::EXIST) => return Ok(false),
         Err(source) => {
             return Err(Error::Write {
                 path: path.to_path_buf(),
@@ -983,7 +994,8 @@ fn create_dir_at(path: &Path, mode: Mode) -> Result<(), Error> {
         }
     }
     // `mkdir`'s mode argument is masked by the umask; `chmod` is not.
-    set_mode(path, mode)
+    set_mode(path, mode)?;
+    Ok(true)
 }
 
 /// `fchmod`, so the mode is the declared one and not the declared one masked by
@@ -2091,6 +2103,34 @@ mod tests {
             "nothing was displaced, and that is not the same as empty bytes",
         );
         filled.publish().expect("publish");
+    }
+
+    #[test]
+    fn a_directory_that_was_already_there_is_not_recorded_as_one_bx_invented() {
+        let home = guarded_home();
+        let path = home.child("theirs");
+        std::fs::create_dir(&path).expect("mkdir");
+        set_mode(&path, Mode::DEFAULT_DIR).expect("chmod");
+
+        // The race `create_missing_dirs` cannot design away: the stat said
+        // nothing was there, and by the time the `mkdir` ran another tool had
+        // made it. It is that tool's directory, and `bx rm` removing it would
+        // be deleting something bx did not create.
+        assert!(
+            !create_dir_at(&path, Mode::PRIVATE_DIR).expect("create_dir_at"),
+            "an existing directory was not created by this call",
+        );
+        assert_eq!(
+            mode_of_path(&path),
+            Mode::DEFAULT_DIR,
+            "and its mode is not bx's to take either",
+        );
+
+        assert!(
+            create_dir_at(&home.child("ours"), Mode::PRIVATE_DIR).expect("create_dir_at"),
+            "a directory bx made is reported as bx's",
+        );
+        assert_eq!(mode_of_path(&home.child("ours")), Mode::PRIVATE_DIR);
     }
 
     #[test]

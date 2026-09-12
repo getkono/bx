@@ -932,6 +932,13 @@ fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<Vec<PathBuf>, Erro
     // removal order; reversing it gives shallowest-first creation order.
     let missing: Vec<PathBuf> = dir
         .ancestors()
+        // `ancestors` on a *relative* path ends with `""`, which names the
+        // working directory. `symlink_metadata("")` reports `ENOENT` for it, so
+        // without this it enters `missing` and `mkdir("")` fails naming the
+        // empty path — an error message with no path in it, from a call that
+        // had nothing to create. The working directory is always there and is
+        // never bx's to invent.
+        .filter(|path| !path.as_os_str().is_empty())
         .take_while(|path| matches!(optional_metadata(path), Ok(None)))
         .map(Path::to_path_buf)
         .collect();
@@ -1022,6 +1029,13 @@ mod tests {
     /// `fchmod`s and every directory bx creates is `chmod`'d — so a leak could
     /// not flip another assertion even without this.
     static UMASK: Mutex<()> = Mutex::new(());
+
+    /// Serialises the one test that mutates the process working directory.
+    ///
+    /// Every other test in the suite addresses its files absolutely, so a leak
+    /// could not flip another assertion; the lock is here so the two relative
+    /// writes cannot race each other or a future third.
+    static CWD: Mutex<()> = Mutex::new(());
 
     /// The mode on disk, following no symlink.
     fn mode_of_path(path: &Path) -> Mode {
@@ -1775,6 +1789,34 @@ mod tests {
     #[test]
     fn a_bare_file_name_writes_into_the_working_directory() {
         assert_eq!(parent_of(Path::new("f")).expect("parent"), Path::new("."));
+    }
+
+    #[test]
+    fn a_relative_destination_writes_under_the_working_directory() {
+        let _serialised = CWD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = guarded_home();
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(home.path()).expect("chdir");
+
+        // A bare name, which `parent_of` resolves to `.` — the contract it goes
+        // out of its way to support, and which nothing had ever exercised
+        // through an actual write.
+        let bare = write_atomically(Path::new("bare"), b"x", Mode::DEFAULT_FILE);
+        // And a relative path more than one component deep, where `ancestors`
+        // ends with `""`.
+        let deep = write_atomically(Path::new("a/b/c.txt"), b"y", Mode::PRIVATE_FILE);
+
+        std::env::set_current_dir(&previous).expect("restore the working directory");
+        bare.expect("a bare relative name");
+        deep.expect("a relative path two directories deep");
+
+        assert_eq!(std::fs::read(home.child("bare")).expect("read"), b"x");
+        assert_eq!(std::fs::read(home.child("a/b/c.txt")).expect("read"), b"y");
+        for rel in ["a", "a/b"] {
+            assert_eq!(mode_of_path(&home.child(rel)), Mode::DEFAULT_DIR, "{rel}");
+        }
     }
 
     #[test]

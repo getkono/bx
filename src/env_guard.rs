@@ -98,6 +98,11 @@ const DENIED_SUFFIXES: &[&str] = &[
 
 /// Names that match a prefix or suffix above but carry no path at all: they
 /// configure behaviour, so their value must not be checked against a root.
+///
+/// Three names against five prefix families: this list is not complete and
+/// cannot be. A behaviour variable it does not name is rejected as
+/// [`Reason::NotAPath`], whose message points back here — the incompleteness
+/// surfaces as a diagnosable violation rather than as a wrong verdict.
 const ALLOWED_EXCEPTIONS: &[&str] = &["UV_SYSTEM_PYTHON", "MISE_VERBOSE", "PIP_REQUIRE_VIRTUALENV"];
 
 /// Whether assigning `name` requires its **value** to be checked against the
@@ -330,8 +335,9 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// Why a relocating assignment was rejected.
 ///
 /// Each names a different user action — declare a root, split the line, move
-/// the value out of bx's own directory, move it inside a declared one, write an
-/// absolute path, define the referenced variable earlier — so a caller that only knew *which*
+/// the value out of bx's own directory, move it inside a declared one, list the
+/// variable as an exception, write an absolute path, define the referenced
+/// variable earlier — so a caller that only knew *which*
 /// variable was rejected could not say what to do about it. The messages name
 /// no data: the caller already holds the value and the root set, and prints
 /// them itself.
@@ -349,7 +355,14 @@ pub enum Reason {
     /// It resolves to a path, but not one inside any declared root.
     #[error("resolves outside every declared root")]
     OutsideDeclaredRoots,
-    /// Empty, relative, or `~user` — it cannot be shown to be inside a root.
+    /// Not a path at all: a number, a flag, a URL.
+    #[error(
+        "is not a path; a variable that configures behaviour rather than a \
+             location belongs in the guard's allowed exceptions"
+    )]
+    NotAPath,
+    /// Empty, relative, or `~user` — it is shaped like a path, but not one
+    /// that can be shown to be inside a root.
     #[error("is not an absolute path")]
     NotAbsolute,
     /// It names a variable this fragment has not assigned by this line.
@@ -497,6 +510,11 @@ fn evaluate(name: &str, value: &str, seen: &Assignments, roots: &RootSet) -> Opt
     };
 
     let (inner, expands) = unquote(value);
+    // An empty value is a degenerate path, not a non-path: `export CARGO_HOME`
+    // with nothing after it does relocate the tool, to nowhere.
+    if !inner.is_empty() && !path_shaped(inner) {
+        return Some(Reason::NotAPath);
+    }
     let resolved = if expands {
         match expand(inner, seen, home) {
             Ok(resolved) => resolved,
@@ -616,6 +634,27 @@ fn substitute_once(value: &str, seen: &Assignments, home: &str) -> Result<(Strin
     }
     out.push_str(rest);
     Ok((out, substituted))
+}
+
+/// Whether `value` is shaped like a path at all.
+///
+/// The name lists are matched by prefix and suffix, so they catch variables
+/// that carry no path: `PIP_TIMEOUT`, `UV_NO_CACHE`, `NPM_CONFIG_REGISTRY`.
+/// [`ALLOWED_EXCEPTIONS`] names the ones that are known, and cannot plausibly be
+/// complete — five prefix families generate far more names than anyone will
+/// enumerate — so the ones it does not name have to be rejected for the right
+/// reason. "Is not an absolute path" prescribes making it one, and a user who
+/// does that gets `PIP_NO_CACHE_DIR=/some/directory`: a guard that passes and a
+/// tool that misbehaves.
+///
+/// Shaped like a path means: absolute, `~`-relative, containing a `$` that may
+/// name one, or containing a `/` without a `://` — a URL has slashes and is
+/// still not a path. Everything else is a number, a flag or a word.
+fn path_shaped(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with('~')
+        || value.contains('$')
+        || (value.contains('/') && !value.contains("://"))
 }
 
 /// Strip one matched pair of surrounding quotes.
@@ -1041,6 +1080,38 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_is_no_kind_of_path_says_so_rather_than_asking_for_an_absolute_one() {
+        // Every one of these matches a prefix rule and carries no path. Told
+        // that the value "is not an absolute path", a user does the one thing
+        // that message prescribes — `PIP_NO_CACHE_DIR=/var/mnt/scratch/example`
+        // — and gets a guard that passes and a pip that misbehaves. The fix is
+        // the exceptions list, and the reason has to point there.
+        for (name, value) in [
+            ("PIP_TIMEOUT", "60"),
+            ("NPM_CONFIG_REGISTRY", "https://registry.example.invalid"),
+            ("UV_NO_CACHE", "1"),
+            ("MISE_QUIET", "1"),
+            ("PIP_NO_CACHE_DIR", "1"),
+        ] {
+            assert!(is_relocating(name), "{name}");
+            assert_eq!(
+                reason_of(&check(name, value, &rooted())),
+                Some(Reason::NotAPath),
+                "{name}"
+            );
+        }
+        // And the reason a user can act on is kept for values that really are
+        // paths, where making it absolute is the right thing to do.
+        for value in ["cache/cargo", "~other/cargo", "$HOME/../x"] {
+            assert_ne!(
+                reason_of(&check("PIP_CACHE_DIR", value, &rooted())),
+                Some(Reason::NotAPath),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn a_relative_value_is_not_absolute() {
         for value in ["cache/cargo", "./cargo", "../example/cargo"] {
             assert_eq!(
@@ -1162,6 +1233,11 @@ mod tests {
         assert_eq!(
             Reason::BxOwnedDirectory.to_string(),
             "points inside a directory bx owns"
+        );
+        assert_eq!(
+            Reason::NotAPath.to_string(),
+            "is not a path; a variable that configures behaviour rather than a \
+             location belongs in the guard's allowed exceptions"
         );
         assert_eq!(Reason::NotAbsolute.to_string(), "is not an absolute path");
         assert_eq!(
@@ -1351,12 +1427,20 @@ mod tests {
         for value in [
             "\"/var/mnt/scratch/example/cargo",
             "'/var/mnt/scratch/example/cargo",
-            "\"",
-            "'",
         ] {
             assert_eq!(
                 reason_of(&check("CARGO_HOME", value, &rooted())),
                 Some(Reason::NotAbsolute),
+                "{value}"
+            );
+        }
+        // A lone quote is not a path at all. Were it stripped it would be the
+        // empty value, which is `NotAbsolute`, so this still falsifies
+        // stripping — by a different reason than the two above.
+        for value in ["\"", "'"] {
+            assert_eq!(
+                reason_of(&check("CARGO_HOME", value, &rooted())),
+                Some(Reason::NotAPath),
                 "{value}"
             );
         }

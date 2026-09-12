@@ -13,6 +13,8 @@
 //! attach     = "own"                            # own | region | include; default own
 //! comment    = "#"                              # required iff attach = "region"
 //! include    = "Include ~/.ssh/config.d/*.conf" # required iff attach = "include"
+//!                                               #   one non-empty line; no body key
+//!                                               #   beside it, the line *is* the body
 //! direction  = "apply"                          # apply | track; default apply
 //! format     = "opaque"                         # opaque | jsonc | env.d; default opaque
 //! owns       = ["agent.default_model"]          # permitted iff format = "jsonc"
@@ -142,10 +144,13 @@ impl Mode {
 
     /// Parse the quoted octal form a config file uses.
     ///
-    /// **A bare TOML integer is not accepted.** TOML has no octal literal, so
-    /// `mode = 600` is decimal 600 and means nothing at all; only `mode = "0600"`
-    /// parses. One to four octal digits, so the setuid, setgid and sticky bits
-    /// are expressible and a fifth digit is a typo.
+    /// **A bare TOML integer is not accepted.** `mode = 600` is decimal 600 and
+    /// means nothing at all, and while TOML *does* have an octal literal it is
+    /// spelled `0o600`, which is not how a mode is written anywhere else a user
+    /// meets one. Only the quoted `mode = "0600"` parses — one spelling, and the
+    /// one `chmod`, `ls -l` and every other tool already use. One to four octal
+    /// digits, so the setuid, setgid and sticky bits are expressible and a fifth
+    /// digit is a typo.
     ///
     /// # Errors
     ///
@@ -222,7 +227,12 @@ pub enum Format {
         /// The key paths bx owns. Everything else in the file is the user's.
         owns: Vec<KeyPath>,
     },
-    /// A `conf.d`-style directory of environment fragments.
+    /// One fragment file in a `conf.d`-style directory of environment settings.
+    ///
+    /// A `Format` describes the file a target's `path` names, so this is the
+    /// fragment, not the directory holding it: bx owns the whole fragment and
+    /// says nothing about its neighbours. What the fragment's syntax is, and
+    /// how the directory is assembled, belong to the entry that generates one.
     EnvD,
 }
 
@@ -273,17 +283,22 @@ pub enum KeyPathError {
 /// Exposed for entry A3, which parses a single entry out of a layer it is
 /// merging without going through a whole document.
 ///
-/// `text` is the whole layer file, because spans index into it.
+/// `text` is the whole layer file, because spans index into it. `home` is the
+/// account's home directory: a target path is parsed against it so that a file
+/// under the home has exactly one spelling, `~/…`, and cannot acquire a second
+/// key by being written absolutely somewhere else in the layer set. See
+/// [`Portable::parse_in`].
 ///
 /// # Errors
 ///
 /// Any [`Error`] the entry's own keys can produce. Every one carries an origin.
-pub fn parse_target(table: &Table, file: &Path, text: &str) -> Result<Target, Error> {
+pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Result<Target, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);
     ctx.reject_unknown_keys(table, &KEYS)?;
 
     let raw_path = ctx.required_str(table, "path")?;
-    let path = Portable::parse(raw_path).map_err(|e| ctx.bad(table, "path", e.to_string()))?;
+    let path =
+        Portable::parse_in(raw_path, home).map_err(|e| ctx.bad(table, "path", e.to_string()))?;
 
     let attach = parse_attach(&ctx, table)?;
     let body = parse_body(&ctx, table, &attach)?;
@@ -317,7 +332,7 @@ pub fn parse_target(table: &Table, file: &Path, text: &str) -> Result<Target, Er
     let references = ctx
         .str_array_at(table, "references")?
         .iter()
-        .map(|raw| Portable::parse(raw))
+        .map(|raw| Portable::parse_in(raw, home))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ctx.bad(table, "references", e.to_string()))?;
 
@@ -353,8 +368,8 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
                 )
             })?;
             let mut chars = raw.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => Attach::Region { comment: c },
+            let comment = match (chars.next(), chars.next()) {
+                (Some(c), None) => c,
                 _ => {
                     return Err(ctx.bad(
                         table,
@@ -362,7 +377,24 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
                         format!("`comment` must be a single character, got {raw:?}"),
                     ));
                 }
+            };
+            // Type-checked is not value-checked. `comment = "\n"` is a single
+            // character and produced region delimiters that cannot be found
+            // again, so the region stops delimiting anything: bx appends a
+            // fresh region on every run, which is Invariant 3, or writes
+            // outside the one it meant to, which is Invariant 1. A whitespace
+            // comment character is the same defect with a subtler spelling.
+            if comment.is_whitespace() || comment.is_control() {
+                return Err(ctx.bad(
+                    table,
+                    "comment",
+                    format!(
+                        "`comment` starts the delimiter lines bx has to find again, so it \
+                         may not be whitespace or a control character; got {raw:?}"
+                    ),
+                ));
             }
+            Attach::Region { comment }
         }
         "include" => {
             let line = include.ok_or_else(|| {
@@ -372,6 +404,24 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
                     "attach = \"include\" needs an `include` line to insert",
                 )
             })?;
+            // The key is called `include` and holds one *line*: entry A5 finds
+            // it again by looking for it in the file. An empty line matches
+            // every blank line in `~/.ssh/config`, or is appended on every run
+            // — Invariant 3 either way. A value bearing a line terminator is
+            // not one line, so no line-wise search finds it whole; a multi-line
+            // insertion is `attach = "region"`, which has delimiters for
+            // exactly that reason.
+            if line.is_empty() || line.contains(['\n', '\r']) {
+                return Err(ctx.bad(
+                    table,
+                    "include",
+                    format!(
+                        "`include` is the single line bx inserts and finds again, so it may \
+                         not be empty or span lines; for a multi-line insertion use \
+                         attach = \"region\". Got {line:?}"
+                    ),
+                ));
+            }
             Attach::Include {
                 line: line.to_string(),
             }
@@ -403,13 +453,37 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
     Ok(attach)
 }
 
-/// Exactly one body key, or none for an `include` target.
+/// Exactly one body key — and for an `include` target, none, because its body
+/// *is* its line.
 fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> {
     let declared: Vec<&str> = BODY_KEYS
         .iter()
         .copied()
         .filter(|key| table.contains_key(key))
         .collect();
+
+    // The same rule the other companion keys follow: a key that cannot mean
+    // anything is an error, not a key that is quietly ignored. An include
+    // target's body *is* its `include` line, so a `content`, `file` or
+    // `generated` beside it is a second body nothing reads. Taken silently, an
+    // author who edits an include target into an own-file target and forgets to
+    // change `attach` gets a target whose forty lines of content entry A5 must
+    // either drop or insert into a file bx does not own.
+    //
+    // `dir` is excluded because it already has a stricter rule, applied in
+    // `parse_target`: a directory target's only admissible attachment is `own`,
+    // whatever else it declares, and that message says so.
+    let unreachable = declared.iter().find(|key| **key != "dir");
+    if let (Attach::Include { .. }, Some(first)) = (attach, unreachable) {
+        return Err(ctx.bad(
+            table,
+            first,
+            format!(
+                "attach = \"include\" already declares the only line bx writes, so `{first}` \
+                 would never be read; drop it, or set `attach` to \"own\" or \"region\""
+            ),
+        ));
+    }
 
     match declared.as_slice() {
         [] => match attach {
@@ -447,14 +521,26 @@ fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> 
 ///
 /// The stored form is normalised, so `files/./a` and `files/a` are one body.
 fn repo_relative(ctx: &Ctx, table: &Table, key: &str, raw: &str) -> Result<PathBuf, Error> {
+    confine_to_repo(key, raw).map_err(|message| ctx.bad(table, key, message))
+}
+
+/// The rule itself, without the provenance to report it against.
+///
+/// Separate from [`repo_relative`] because it has **two** callers and may not
+/// have two implementations. A `file` may carry a `{{name}}`, so what the parser
+/// validates is the path as written and what reaches `repo.join` is the path as
+/// *substituted*: `cfg/{{account}}/gitconfig` with an answer of `../../../etc`
+/// is a repo escape that the parse-time check never sees. [`super::resolve`]
+/// re-applies this to the substituted value.
+///
+/// The message is returned rather than an [`Error`], because the two callers
+/// have different provenance to attach: a table and a key, or a target and its
+/// origin.
+pub(crate) fn confine_to_repo(key: &str, raw: &str) -> Result<PathBuf, String> {
     if raw.starts_with('/') || raw.starts_with('~') {
-        return Err(ctx.bad(
-            table,
-            key,
-            format!(
-                "`{key}` names a file inside the config repo, so it is relative to the \
-                 repo root; got {raw:?}"
-            ),
+        return Err(format!(
+            "`{key}` names a file inside the config repo, so it is relative to the \
+             repo root; got {raw:?}"
         ));
     }
 
@@ -464,10 +550,8 @@ fn repo_relative(ctx: &Ctx, table: &Table, key: &str, raw: &str) -> Result<PathB
             "" | "." => {}
             ".." => {
                 if parts.pop().is_none() {
-                    return Err(ctx.bad(
-                        table,
-                        key,
-                        format!("`{key}` may not climb out of the config repo; got {raw:?}"),
+                    return Err(format!(
+                        "`{key}` may not climb out of the config repo; got {raw:?}"
                     ));
                 }
             }
@@ -476,10 +560,8 @@ fn repo_relative(ctx: &Ctx, table: &Table, key: &str, raw: &str) -> Result<PathB
     }
 
     if parts.is_empty() {
-        return Err(ctx.bad(
-            table,
-            key,
-            format!("`{key}` must name a file in the config repo; got {raw:?}"),
+        return Err(format!(
+            "`{key}` must name a file in the config repo; got {raw:?}"
         ));
     }
 
@@ -527,8 +609,9 @@ fn parse_mode(ctx: &Ctx, table: &Table) -> Result<Option<Mode>, Error> {
         return Err(ctx.bad(
             table,
             "mode",
-            "`mode` is a quoted octal string: TOML has no octal literal, so \
-             mode = 600 is decimal 600. Write mode = \"0600\".",
+            "`mode` is a quoted octal string: mode = 600 is decimal 600, and \
+             TOML's own octal literal is spelled 0o600, which is not how a mode \
+             is written anywhere else. Write mode = \"0600\".",
         ));
     }
 
@@ -590,6 +673,14 @@ mod tests {
     use super::*;
     use toml_edit::Document;
 
+    /// The account's home every test in this module parses against.
+    ///
+    /// Deliberately not `/home/<user>`: nothing here may name a real account,
+    /// and nothing here may assume where a home lives.
+    fn home() -> &'static Path {
+        Path::new("/var/home/example")
+    }
+
     /// Parse the first `[[target]]` out of a document.
     fn parse(text: &str) -> Result<Target, Error> {
         let doc = Document::parse(text).expect("valid TOML");
@@ -601,7 +692,7 @@ mod tests {
             .expect("an array of tables")
             .get(0)
             .expect("one element");
-        parse_target(table, Path::new("bx.toml"), text)
+        parse_target(table, Path::new("bx.toml"), text, home())
     }
 
     /// A minimal valid target, plus whatever else the test needs.
@@ -634,7 +725,7 @@ mod tests {
     fn the_natural_key_is_the_path() {
         assert_eq!(
             parse(&with("")).unwrap().path,
-            Portable::parse("~/.gitconfig").unwrap()
+            Portable::parse_in("~/.gitconfig", home()).unwrap()
         );
     }
 
@@ -772,6 +863,37 @@ mod tests {
     }
 
     #[test]
+    fn an_absolute_target_path_under_home_is_rejected_with_its_line() {
+        // A layer is parsed against a home so that a file under it has exactly
+        // one spelling. Accepting both would let one file acquire two keys that
+        // `check_unique` cannot see.
+        let text = "[[target]]\npath = \"/var/home/example/.gitconfig\"\nfile = \"f\"\n";
+        let message = message(text);
+
+        assert!(message.contains("~/.gitconfig"), "{message}");
+        assert!(message.contains("bx.toml:2"), "{message}");
+    }
+
+    #[test]
+    fn an_absolute_reference_under_home_is_rejected_too() {
+        // `references` is the other place a target carries a portable path, and
+        // entry A7 reports drift keyed on it.
+        let message = message(&with(
+            "references = [\"/var/home/example/.gitconfig.local\"]\n",
+        ));
+
+        assert!(message.contains("~/.gitconfig.local"), "{message}");
+    }
+
+    #[test]
+    fn an_absolute_target_path_outside_home_is_kept() {
+        let target = parse("[[target]]\npath = \"/etc/hosts\"\nfile = \"f\"\n").unwrap();
+
+        assert_eq!(target.path.as_str(), "/etc/hosts");
+        assert!(!target.path.under_home());
+    }
+
+    #[test]
     fn a_mode_is_an_octal_string() {
         let target = parse(&with("mode = \"0600\"\n")).unwrap();
 
@@ -849,13 +971,41 @@ mod tests {
     #[test]
     fn an_include_carries_its_line() {
         let text = "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
-                    include = \"Include ~/.ssh/config.d/*.conf\"\ncontent = \"x\"\n";
+                    include = \"Include ~/.ssh/config.d/*.conf\"\n";
         assert_eq!(
             parse(text).unwrap().attach,
             Attach::Include {
                 line: "Include ~/.ssh/config.d/*.conf".to_string()
             }
         );
+    }
+
+    /// An include target's body is its line; a second body is unreachable.
+    ///
+    /// `parse_body` synthesised `Body::Inline(include_line)` only when *no* body
+    /// key was declared, so with one alongside the body key was taken and
+    /// nothing compared it against the include line -- the target parsed as an
+    /// `Include` carrying a line *and* an `Inline` carrying something else
+    /// entirely. An author editing an include target into an own-file target and
+    /// forgetting to change `attach` got forty lines A5 must either drop
+    /// silently or insert into a file bx does not own.
+    #[test]
+    fn an_include_target_may_not_also_declare_a_body() {
+        for body in [
+            "content = \"something else entirely\"",
+            "file = \"files/config\"",
+            "generated = \"shell-init\"",
+        ] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
+                 include = \"Include ~/.ssh/config.d/*.conf\"\n{body}\n"
+            );
+            let message = message(&text);
+            assert!(
+                message.contains("would never be read"),
+                "`{body}` beside an include line: {message}"
+            );
+        }
     }
 
     #[test]
@@ -870,14 +1020,67 @@ mod tests {
 
     #[test]
     fn an_include_body_defaults_to_its_line() {
-        let text = "[[target]]\npath = \"~/.gitconfig\"\nattach = \"include\"\n\
-                    include = \"[include]\\n\\tpath = ~/.gitconfig.bx\"\n";
+        let text = "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
+                    include = \"Include ~/.ssh/config.d/*.conf\"\n";
         let target = parse(text).unwrap();
 
         assert_eq!(
             target.body,
-            Body::Inline("[include]\n\tpath = ~/.gitconfig.bx".to_string()),
+            Body::Inline("Include ~/.ssh/config.d/*.conf".to_string()),
         );
+    }
+
+    /// An `include` line is type-checked and now value-checked.
+    ///
+    /// Both values here parsed. An empty line makes A5's idempotence check
+    /// match every blank line in the file, or append one on every run --
+    /// Invariant 3 either way. A value bearing a terminator is not one line, so
+    /// nothing line-wise finds it again; a multi-line insertion is
+    /// `attach = "region"`, which carries delimiters for that purpose.
+    #[test]
+    fn an_include_line_that_is_not_one_line_is_rejected() {
+        for raw in [
+            "",
+            "[include]\\n\\tpath = ~/.gitconfig.bx",
+            "Include a\\r\\nInclude b",
+        ] {
+            let text = format!(
+                "[[target]]\npath = \"~/.gitconfig\"\nattach = \"include\"\ninclude = \"{raw}\"\n"
+            );
+            let message = message(&text);
+            assert!(
+                message.contains("not be empty or span lines"),
+                "include = {raw:?}: {message}"
+            );
+        }
+    }
+
+    /// A `comment` character is type-checked and now value-checked.
+    ///
+    /// `comment = "\n"` is a single character and parsed. It produces region
+    /// delimiters that cannot be found again, so the region stops delimiting
+    /// anything: a fresh region on every run, which is Invariant 3, or a write
+    /// outside the one bx meant, which is Invariant 1.
+    #[test]
+    fn a_comment_character_that_cannot_start_a_delimiter_is_rejected() {
+        for raw in ["\\n", "\\t", " ", "\\u0000"] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"region\"\ncomment = \"{raw}\"\n"
+            );
+            let message = message(&text);
+            assert!(
+                message.contains("whitespace or a control character"),
+                "comment = {raw:?}: {message}"
+            );
+        }
+        // The characters real config syntaxes actually use still parse.
+        for raw in ["#", ";", "%", "\\\"", "/"] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"region\"\n\
+                 comment = \"{raw}\"\ncontent = \"x\"\n"
+            );
+            parse(&text).unwrap_or_else(|e| panic!("comment = {raw:?}: {e}"));
+        }
     }
 
     #[test]
@@ -963,7 +1166,7 @@ mod tests {
 
         assert_eq!(
             target.references,
-            [Portable::parse("~/.gitconfig.local").unwrap()]
+            [Portable::parse_in("~/.gitconfig.local", home()).unwrap()]
         );
         assert!(
             message(&with("references = [\"relative/path\"]\n"))

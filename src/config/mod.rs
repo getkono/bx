@@ -176,10 +176,10 @@ fn filename_bytes(path: &Path) -> &[u8] {
 /// # Errors
 ///
 /// Whatever [`layer_files`] and [`load_layer`] return.
-pub fn load_layers(repo: &Path) -> Result<Vec<Layer>, Error> {
+pub fn load_layers(repo: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
     layer_files(repo)?
         .iter()
-        .map(|path| load_layer(path))
+        .map(|path| load_layer(path, home))
         .collect()
 }
 
@@ -190,7 +190,7 @@ pub fn load_layers(repo: &Path) -> Result<Vec<Layer>, Error> {
 /// # Errors
 ///
 /// [`Error::Io`] if the file cannot be read, and whatever [`parse_str`] returns.
-pub fn load_layer(path: &Path) -> Result<Layer, Error> {
+pub fn load_layer(path: &Path, home: &Path) -> Result<Layer, Error> {
     tracing::debug!(file = %path.display(), "reading configuration layer");
     let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -202,7 +202,7 @@ pub fn load_layer(path: &Path) -> Result<Layer, Error> {
         // The repo loader only ever reads committed material. `layers::load_layer_set`
         // is what marks the one layer that came from the state directory.
         kind: LayerKind::Global,
-        config: parse_str(&text, path)?,
+        config: parse_str(&text, path, home)?,
     })
 }
 
@@ -211,12 +211,17 @@ pub fn load_layer(path: &Path) -> Result<Layer, Error> {
 /// `file` is used for provenance only; nothing is read from disk. Entry order
 /// inside each section is document order, which `toml_edit` preserves.
 ///
+/// `home` is the account's home directory. A layer is parsed *against* a home
+/// because a target path under it has exactly one spelling — `~/…` — and
+/// recognising the absolute spelling as the same file is what stops `bx.toml`
+/// and a module holding two keys for one file. See [`crate::paths::Portable`].
+///
 /// # Errors
 ///
 /// [`Error::Syntax`] for invalid TOML, [`Error::UnknownSection`] for a section
 /// this version of `bx` does not know, [`Error::Duplicate`] for two entries in
 /// one layer sharing a natural key, and whatever the per-entry parsers return.
-pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
+pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> {
     let doc = Document::parse(text).map_err(|source| Error::Syntax {
         file: file.to_path_buf(),
         source: Box::new(source),
@@ -231,24 +236,17 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
                     // A table whose only keys are `path` and `enabled` is a
                     // toggle, not a target with no body: it flips a flag on an
                     // entry an earlier layer introduced.
-                    match merge::toggle_of(table, "target", "path", target::SECTION, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Target, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .targets
-                            .push(target::parse_target(table, file, text)?),
+                            .push(target::parse_target(table, file, text, home)?),
                     }
                 }
             }
             "value" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(
-                        table,
-                        "value",
-                        "name",
-                        values::DECL_SECTION,
-                        file,
-                        text,
-                    )? {
+                    match merge::toggle_of(table, merge::Section::Value, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .values
@@ -283,7 +281,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
             .targets
             .iter()
             .map(|t| (t.path.as_str(), &t.origin))
-            .chain(toggles_in(&config, "target"))
+            .chain(toggles_in(&config, merge::Section::Target))
             .collect(),
     )?;
     check_unique(
@@ -292,7 +290,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
             .values
             .iter()
             .map(|v| (v.name.as_str(), &v.origin))
-            .chain(toggles_in(&config, "value"))
+            .chain(toggles_in(&config, merge::Section::Value))
             .collect(),
     )?;
 
@@ -301,10 +299,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
 
 /// The toggles in `config` that belong to one section, as `check_unique` wants
 /// them.
-fn toggles_in<'a>(
-    config: &'a Config,
-    section: &'static str,
-) -> impl Iterator<Item = (&'a str, &'a Origin)> {
+fn toggles_in(config: &Config, section: merge::Section) -> impl Iterator<Item = (&str, &Origin)> {
     config
         .toggles
         .iter()
@@ -620,8 +615,97 @@ mod tests {
             .collect()
     }
 
+    /// The account's home every test in this module parses against.
+    fn home() -> &'static Path {
+        Path::new("/var/home/example")
+    }
+
     fn parse(text: &str) -> Result<Config, Error> {
-        parse_str(text, Path::new("bx.toml"))
+        parse_str(text, Path::new("bx.toml"), home())
+    }
+
+    /// A `[[target]]` entry built in memory, with no spans anywhere.
+    ///
+    /// Entry A3 parses a single entry out of a layer it is merging without
+    /// going through a whole document, which is the case these tests cover.
+    fn in_memory_target(extra: &[(&str, toml_edit::Item)]) -> Table {
+        let mut table = Table::new();
+        table.insert("path", toml_edit::value("~/.gitconfig"));
+        table.insert("file", toml_edit::value("files/gitconfig"));
+        for (key, item) in extra {
+            table.insert(key, item.clone());
+        }
+        table
+    }
+
+    #[test]
+    fn an_entry_with_no_span_degrades_to_an_unknown_origin() {
+        // `Ctx::new` asks `toml_edit` for the entry header's span, and a table
+        // nothing parsed has none. Line 0 says "this file, position unknown"
+        // rather than pretending it is line 1 -- and rather than panicking on
+        // an `expect`, which is what a caller like entry A3 would hit.
+        let file = Path::new("bx.toml");
+        let target = target::parse_target(&in_memory_target(&[]), file, "", home()).unwrap();
+
+        assert_eq!(target.origin, Origin::unknown(file));
+        assert_eq!(target.origin.to_string(), "bx.toml:0");
+    }
+
+    #[test]
+    fn a_key_with_no_span_falls_back_to_its_entry() {
+        // `Ctx::key_origin` positions an error at the offending key. With no
+        // span it falls back to the entry's own origin, which for an in-memory
+        // table is itself unknown.
+        let file = Path::new("bx.toml");
+        let table = in_memory_target(&[("nope", toml_edit::value(1))]);
+        let error = target::parse_target(&table, file, "", home()).expect_err("unknown key");
+
+        assert!(error.to_string().starts_with("bx.toml:0:"), "{error}");
+        assert!(error.to_string().contains("`nope`"), "{error}");
+    }
+
+    #[test]
+    fn a_section_key_with_no_span_degrades_to_an_unknown_origin() {
+        // The third fallback. Unreachable from `parse_str`, because every key
+        // in a parsed document has a span -- including the implicit one in
+        // `[nope.deep]` -- so it is exercised where it lives.
+        let mut root = Table::new();
+        root.insert("target", toml_edit::value(1));
+
+        assert_eq!(
+            section_origin(&root, "target", Path::new("bx.toml"), ""),
+            Origin::unknown(Path::new("bx.toml"))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_modules_directory_names_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = repo(&[("bx.toml", ""), ("modules/a.toml", "")]);
+        let modules = dir.path().join(MODULES_DIR);
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        // A process that can read a 0000 directory -- root, or one holding
+        // CAP_DAC_READ_SEARCH -- cannot construct this case at all. Say so
+        // rather than assert something else and call it covered.
+        let reachable = std::fs::read_dir(&modules).is_err();
+        let result = layer_files(dir.path());
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
+            .expect("restore, so the tempdir can be removed");
+
+        assert!(
+            reachable,
+            "this process can read a 0000 directory, so the io error cannot be reached"
+        );
+        match result {
+            Err(Error::Io { path, .. }) => assert_eq!(path, modules),
+            other => panic!(
+                "expected an io error naming {}, got {other:?}",
+                modules.display()
+            ),
+        }
     }
 
     fn message(text: &str) -> String {
@@ -755,7 +839,7 @@ mod tests {
                 "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"overridden\"\n",
             ),
         ]);
-        let layers = load_layers(dir.path()).expect("loading");
+        let layers = load_layers(dir.path(), home()).expect("loading");
 
         assert_eq!(layers.len(), 2);
         assert_eq!(layers[0].file, dir.path().join("bx.toml"));
@@ -771,7 +855,7 @@ mod tests {
             "modules/git.toml",
             "# a module\n\n[[target]]\npath = \"~/.gitconfig\"\nfile = \"f\"\n",
         )]);
-        let layers = load_layers(dir.path()).expect("loading");
+        let layers = load_layers(dir.path(), home()).expect("loading");
         let origin = &layers[0].config.targets[0].origin;
 
         assert_eq!(origin.file, dir.path().join("modules/git.toml"));
@@ -783,7 +867,7 @@ mod tests {
         let dir = repo(&[]);
         let missing = dir.path().join("bx.toml");
 
-        let error = load_layer(&missing).expect_err("should be an error");
+        let error = load_layer(&missing, home()).expect_err("should be an error");
         assert!(matches!(error, Error::Io { .. }));
         assert!(error.to_string().contains("bx.toml"));
     }
@@ -837,7 +921,7 @@ mod tests {
 
     #[test]
     fn a_syntax_error_names_the_file_and_position() {
-        let error = parse_str("[[target]\n", Path::new("/repo/bx.toml"))
+        let error = parse_str("[[target]\n", Path::new("/repo/bx.toml"), home())
             .expect_err("should be a syntax error");
 
         assert!(matches!(error, Error::Syntax { .. }));
@@ -877,6 +961,62 @@ mod tests {
     }
 
     #[test]
+    fn the_absolute_spelling_of_a_home_file_never_becomes_a_second_key() {
+        // check_unique compares the stored strings, so it cannot see that
+        // `/var/home/example/.ssh/config` and `~/.ssh/config` are one file. The
+        // parser refuses the absolute spelling instead, which is what keeps one
+        // file from acquiring two `attach = "own"` targets in one layer set.
+        let text = "[[target]]\npath = \"~/.ssh/config\"\nfile = \"a\"\n\n\
+                    [[target]]\npath = \"/var/home/example/.ssh/config\"\nfile = \"b\"\n";
+        let message = message(text);
+
+        assert!(message.contains("~/.ssh/config"), "{message}");
+        assert!(
+            message.contains("bx.toml:6"),
+            "the caret must land on the offending `path` key: {message}"
+        );
+    }
+
+    /// `load_layers` parses against the home it is *given*.
+    ///
+    /// Nothing pinned that. Mutating `load_layers` to forward a hard-coded
+    /// `/nonexistent/mutated/home` left every test in this module passing,
+    /// because they all spell target paths `~/…`, which `parse_in` accepts
+    /// identically under any home; the tests that do depend on the home call
+    /// `parse_str` or `parse_target` directly and never reach the loader. So the
+    /// home threads through five call sites and the first two — `load_layers`
+    /// into `load_layer`, `load_layer` into `parse_str` — were unpinned, and
+    /// `load_layers` is the function entry A3's merge and every later entry read
+    /// a config repo through.
+    ///
+    /// An **absolutely** spelled target path is the discriminating input: it is
+    /// admissible under one home and refused under another, so the error can
+    /// only arrive if this exact home reached `Portable::parse_in`.
+    #[test]
+    fn load_layers_parses_against_the_home_it_is_given() {
+        let dir = repo(&[(
+            "modules/ssh.toml",
+            "[[target]]\npath = \"/var/home/example/.ssh/config\"\nfile = \"files/ssh\"\n",
+        )]);
+
+        let error = load_layers(dir.path(), home()).expect_err("absolute, and under this home");
+        let message = error.to_string();
+        assert!(
+            message.contains("write ~/.ssh/config"),
+            "the message must name the `~/…` spelling for *this* home: {message}"
+        );
+
+        // The same repo under a home the path is not inside parses, and keeps
+        // the absolute spelling: the rule is about this home, not about the
+        // string.
+        let layers = load_layers(dir.path(), Path::new("/var/home/other")).expect("outside");
+        assert_eq!(
+            layers[0].config.targets[0].path.as_str(),
+            "/var/home/example/.ssh/config"
+        );
+    }
+
+    #[test]
     fn a_target_path_that_climbs_out_of_home_is_rejected() {
         let text = "[[target]]\npath = \"~/../../etc/passwd\"\nfile = \"a\"\n";
         assert!(message(text).contains("climb out of the home"));
@@ -887,6 +1027,38 @@ mod tests {
         let text = "[[value]]\nname = \"scratch_root\"\nkind = \"path\"\n\n\
                     [[value]]\nname = \"scratch_root\"\nkind = \"string\"\n";
         assert!(message(text).contains("duplicate value `scratch_root`"));
+    }
+
+    #[test]
+    fn one_layer_may_not_both_restate_an_entry_and_toggle_it() {
+        // The silent no-op the toggle mechanism exists to prevent, at its
+        // sharpest: which of the two wins would depend on the order the merge
+        // happens to apply them in, and nothing in the file says what that order
+        // is. The uniqueness check sees toggles alongside the entries they flip
+        // for exactly this.
+        let text = "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n\n\
+                    [[target]]\npath = \"~/.gitconfig\"\nenabled = false\n";
+        let message = message(text);
+
+        assert!(
+            message.contains("duplicate target `~/.gitconfig`"),
+            "{message}"
+        );
+        assert!(message.contains("first declared at bx.toml:1"), "{message}");
+        assert!(message.contains("bx.toml:5"), "{message}");
+    }
+
+    #[test]
+    fn a_toggle_before_the_entry_it_flips_is_the_same_ambiguity() {
+        // Order within the file makes no difference: it is the pair that is
+        // ambiguous, not the direction.
+        let text = "[[target]]\npath = \"~/.gitconfig\"\nenabled = false\n\n\
+                    [[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n";
+        assert!(message(text).contains("duplicate target `~/.gitconfig`"));
+
+        let text = "[[value]]\nname = \"agent_slice\"\nkind = \"string\"\n\n\
+                    [[value]]\nname = \"agent_slice\"\nenabled = false\n";
+        assert!(message(text).contains("duplicate value `agent_slice`"));
     }
 
     #[test]

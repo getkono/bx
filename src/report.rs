@@ -29,10 +29,23 @@ pub enum Action {
     /// The target exists, differs, and bx does not own it — or bx owns it but
     /// the user has since edited it. Reported and skipped, never overwritten.
     Conflict,
-    /// The tool this target configures is not usable on this machine. Reported
-    /// and skipped until the user installs it.
+    /// A prerequisite this target needs is absent: a missing tool, or a declared
+    /// value this account has not answered. Reported and skipped until the user
+    /// supplies it, while every other target is applied.
     ///
-    /// Produced from [`crate::detect::Presence::is_usable`]. It matters most
+    /// There are two producers, and they share one reason enum —
+    /// [`config::resolve::BlockReason`](crate::config::resolve::BlockReason) —
+    /// so a later entry extends it rather than introducing a parallel blocked
+    /// state.
+    ///
+    /// An **unanswered value** blocks the targets that reference it and nothing
+    /// else. That is deliberate and is the difference between bx and the
+    /// source material it replaces, where a single missing account file makes
+    /// the whole apply exit 1. The blocked entry names the values and the
+    /// `bx init` invocation that sets them, so the report is actionable.
+    ///
+    /// An **absent tool** is produced from [`crate::detect::Presence::is_usable`].
+    /// It matters most
     /// where a tool is configured entirely by environment and bx's output is a
     /// shell fragment naming a binary: writing `RUSTC_WRAPPER=/usr/bin/sccache`
     /// when sccache is absent does not degrade gracefully, it breaks every

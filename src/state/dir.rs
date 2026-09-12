@@ -280,10 +280,19 @@ mod tests {
     #[test]
     fn resolution_ignores_the_process_environment() {
         let home = guarded_home();
-        home.set("XDG_STATE_HOME", Some(OsStr::new("/somewhere/else")));
+        // Whatever `$XDG_STATE_HOME` holds in this process — and the suite
+        // mutates no environment variable, so it holds whatever the developer's
+        // shell set — `resolve` reads none of it and answers under the home it
+        // was given. The only way the value reaches resolution is as an
+        // argument, which is what lets two tempdir homes get two independent
+        // state directories.
         assert_eq!(
             StateDir::resolve(home.path()).root(),
             home.child(".local/state/bx"),
+        );
+        assert_eq!(
+            StateDir::resolve_in(home.path(), Some(OsStr::new("/somewhere/else"))).root(),
+            Path::new("/somewhere/else/bx"),
         );
     }
 

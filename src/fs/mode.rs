@@ -34,9 +34,9 @@ use serde::{Deserialize, Serialize};
 ///   already wrote before this type was collapsed into one.
 /// * **human-readable** (TOML, in `bx.toml`): the quoted octal string
 ///   `"0600"`, parsed by [`Mode::parse_octal`]. A bare TOML integer is refused
-///   with the reason, because TOML has no octal literal: `mode = 600` would be
-///   decimal 600, which is `0o1130` — setgid set, and the owner unable to read
-///   their own file.
+///   with the reason: `mode = 600` would be decimal 600, which is `0o1130` —
+///   setgid set, and the owner unable to read their own file — and TOML's own
+///   octal literal, `0o600`, is not how a mode is written anywhere else.
 ///
 /// Without the split, the transparent `u32` codec the ledger needs would also
 /// be the config schema's, and `mode = 600` would deserialise silently into
@@ -71,12 +71,15 @@ impl Mode {
 
     /// Parse the quoted octal form a config file uses.
     ///
-    /// **A bare TOML integer is not accepted**: TOML has no octal literal, so
-    /// `mode = 600` is decimal 600 and means nothing at all; only
-    /// `mode = "0600"` parses. The [`Deserialize`] impl refuses an integer
-    /// before it reaches here, naming the decimal it would have meant. One to
-    /// four octal digits, so the setuid, setgid and sticky bits are expressible
-    /// and a fifth digit is a typo rather than a silently truncated mode.
+    /// **A bare TOML integer is not accepted.** `mode = 600` is decimal 600 and
+    /// means nothing at all, and while TOML *does* have an octal literal it is
+    /// spelled `0o600`, which is not how a mode is written anywhere else a user
+    /// meets one. Only the quoted `mode = "0600"` parses — one spelling, and the
+    /// one `chmod`, `ls -l` and every other tool already use. The
+    /// [`Deserialize`] impl refuses an integer before it reaches here, naming
+    /// the decimal it would have meant. One to four octal digits, so the
+    /// setuid, setgid and sticky bits are expressible and a fifth digit is a
+    /// typo rather than a silently truncated mode.
     ///
     /// # Errors
     ///

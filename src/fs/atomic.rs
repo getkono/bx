@@ -149,6 +149,20 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// A path the ledger would record cannot be made portable against the
+    /// home: it is not valid UTF-8, or the home is not absolute.
+    ///
+    /// [`crate::paths::Portable::from_path`] refuses rather than renaming such
+    /// a path, so the entry is refused rather than recorded under a key that
+    /// names a different file.
+    #[error("{} cannot be recorded: {source}", .path.display())]
+    NotPortable {
+        /// The path that could not be made portable.
+        path: PathBuf,
+        /// Why.
+        #[source]
+        source: crate::paths::Error,
+    },
 }
 
 impl Error {
@@ -161,7 +175,8 @@ impl Error {
             | Self::NotAFile { path, .. }
             | Self::UnusableParent { path, .. }
             | Self::Read { path, .. }
-            | Self::Write { path, .. } => path,
+            | Self::Write { path, .. }
+            | Self::NotPortable { path, .. } => path,
         }
     }
 }
@@ -716,10 +731,21 @@ impl Filled {
     /// [`crate::state::Ledger::record`], which fsyncs the prior bytes into
     /// `restore/` before it returns. A crash after the rename is then
     /// recoverable, because the bytes that were displaced are already durable.
-    #[must_use]
-    pub fn new_entry(&self, home: &Path, mechanism: Mechanism) -> NewEntry {
-        NewEntry::new(
-            Portable::from_path(&self.pending.dest, home),
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotPortable`] if the destination or a created directory is not
+    /// valid UTF-8, or `home` is not absolute: such a path has no key the
+    /// ledger could record it under without naming a different file.
+    pub fn new_entry(&self, home: &Path, mechanism: Mechanism) -> Result<NewEntry, Error> {
+        let portable = |path: &Path| {
+            Portable::from_path(path, home).map_err(|source| Error::NotPortable {
+                path: path.to_path_buf(),
+                source,
+            })
+        };
+        Ok(NewEntry::new(
+            portable(&self.pending.dest)?,
             self.written(),
             self.pending.mode,
             mechanism,
@@ -729,9 +755,9 @@ impl Filled {
             self.pending
                 .created_dirs
                 .iter()
-                .map(|dir| Portable::from_path(dir, home))
-                .collect(),
-        )
+                .map(|dir| portable(dir))
+                .collect::<Result<_, _>>()?,
+        ))
     }
 
     /// `rename` the temporary file onto the destination, then `fsync` the
@@ -2317,7 +2343,7 @@ mod tests {
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("ensure the state directory");
         let lock = ExclusiveLock::acquire(&dir).expect("acquire the lock");
-        let ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         (dir, lock, ledger)
     }
 
@@ -2337,7 +2363,11 @@ mod tests {
         // still the old content, and the entry describes both.
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host old\n");
         let recorded = ledger
-            .record(filled.new_entry(home.path(), Mechanism::Own))
+            .record(
+                filled
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry"),
+            )
             .expect("record")
             .clone();
         filled.publish().expect("publish");
@@ -2384,7 +2414,11 @@ mod tests {
                 .fill(content)
                 .expect("fill");
             ledger
-                .record(filled.new_entry(home.path(), Mechanism::Own))
+                .record(
+                    filled
+                        .new_entry(home.path(), Mechanism::Own)
+                        .expect("a portable entry"),
+                )
                 .expect("record");
             filled.publish().expect("publish");
             // The user edits what bx wrote, so the second apply's `observe`
@@ -2395,7 +2429,7 @@ mod tests {
         let recorded = ledger
             .record(
                 NewEntry::new(
-                    Portable::from_path(&dest, home.path()),
+                    Portable::from_path(&dest, home.path()).expect("portable"),
                     ContentHash::of(b"Host v2\n"),
                     Mode::PRIVATE_FILE,
                     Mechanism::Own,
@@ -2434,7 +2468,7 @@ mod tests {
         let recorded = ledger
             .record(
                 NewEntry::new(
-                    Portable::from_path(&dest, home.path()),
+                    Portable::from_path(&dest, home.path()).expect("portable"),
                     observed.digest().expect("a regular file has a digest"),
                     Mode::PRIVATE_FILE,
                     Mechanism::Own,
@@ -2479,7 +2513,9 @@ mod tests {
             ],
             "deepest first, which is the order a reversal removes them in",
         );
-        let entry = filled.new_entry(home.path(), Mechanism::Own);
+        let entry = filled
+            .new_entry(home.path(), Mechanism::Own)
+            .expect("a portable entry");
         assert_eq!(
             entry
                 .created_dirs

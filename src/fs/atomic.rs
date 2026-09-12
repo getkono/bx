@@ -948,16 +948,30 @@ fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<Vec<PathBuf>, Erro
 }
 
 /// `mkdir` one directory at exactly `mode`.
+///
+/// The mode is passed to `mkdir(2)` itself and then `chmod`'d, and both steps
+/// are load-bearing in opposite directions. `mkdir`'s argument is masked by the
+/// `umask`, so it can only ever produce something *narrower* than `mode` —
+/// which is what keeps the directory from existing, even for an instant, at
+/// bits wider than the ones declared for it. The `chmod` afterwards is not
+/// masked, so it is what makes the declared mode authoritative.
+///
+/// `std::fs::create_dir` cannot do the first half: it issues
+/// `mkdir(path, 0o777)` unconditionally, so under a default `umask` the
+/// directory exists at `0755` until the `chmod` lands. The exposure is not the
+/// contents — the directory is empty — it is the **descriptor**: a process that
+/// opens it inside that window holds a handle whose access checks have already
+/// passed, and the later `chmod` does not revoke it.
 fn create_dir_at(path: &Path, mode: Mode) -> Result<(), Error> {
-    match std::fs::create_dir(path) {
+    match rustix::fs::mkdir(path, mode.into()) {
         Ok(()) => {}
         // Somebody else created it between the stat and the mkdir. It is not
         // bx's directory then, so its mode is not bx's to set.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(Errno::EXIST) => return Ok(()),
         Err(source) => {
             return Err(Error::Write {
                 path: path.to_path_buf(),
-                source,
+                source: source.into(),
             });
         }
     }
@@ -1401,6 +1415,63 @@ mod tests {
             Mode::DEFAULT_DIR,
             "mkdir's mode is masked by the umask too; the directory is chmod'd",
         );
+    }
+
+    #[test]
+    fn a_directory_bx_creates_is_never_wider_than_its_declared_mode() {
+        let _serialised = UMASK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = guarded_home();
+        // umask 0 so the assertion means the same thing whatever the developer
+        // or the runner happens to have set. Without it, a umask of 077 would
+        // narrow `mkdir(0o777)` for free and the test would pass against the
+        // defect it exists to catch.
+        let previous = rustix::process::umask(Mode::from_bits(0).into());
+
+        let path = home.child("restore");
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let watcher = {
+            let (path, done, seen) = (path.clone(), done.clone(), seen.clone());
+            std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                        let mode = mode_of(&meta);
+                        let mut seen = seen
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if seen.last() != Some(&mode) {
+                            seen.push(mode);
+                        }
+                    }
+                }
+            })
+        };
+
+        let result = create_dir_at(&path, Mode::PRIVATE_DIR);
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        watcher.join().expect("the watcher thread");
+        rustix::process::umask(previous);
+        result.expect("mkdir");
+
+        // The exposure a `mkdir(0o777)` followed by a `chmod` opens is the
+        // descriptor, not the contents: a process that opens the directory
+        // inside the window keeps a handle whose access checks already passed,
+        // and the later `chmod` does not revoke it. So the assertion is about
+        // every instant, not about the end state.
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for mode in seen.iter() {
+            assert!(
+                mode.bits() & !Mode::PRIVATE_DIR.bits() == 0,
+                "the directory was {mode} at some instant, wider than the 0700 declared for it; \
+                 every mode observed was {seen:?}",
+            );
+        }
+        assert_eq!(mode_of_path(&path), Mode::PRIVATE_DIR);
     }
 
     #[test]

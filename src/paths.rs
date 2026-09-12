@@ -470,6 +470,26 @@ impl Portable {
     /// than folding, because an absolute home path in a *committed* repo is an
     /// account-specific literal that would mean a different file on the next
     /// account, and Invariant 5 says such a value must be loud.
+    ///
+    /// # The home is matched lexically, and a symlinked alias of it is not seen
+    ///
+    /// "Under `home`" means *textually* under the normalised `home` string. No
+    /// symlink is resolved, in `raw` or in `home`. So on a host where `/home` is a
+    /// symlink to `var/home` and `home` is `/var/home/u`, the absolute spelling
+    /// `/home/u/.gitconfig` is **accepted** and kept absolute: it does not start
+    /// with `/var/home/u`, so it is not refused and not folded to `~/.gitconfig`.
+    /// A layer set saying `~/.gitconfig` in one place and `/home/u/.gitconfig` in
+    /// another therefore carries two keys for one file, and `check_unique` and
+    /// entry A3's merge see two targets. The same holds for a home reached through
+    /// any other symlink or bind mount.
+    ///
+    /// That limit is deliberate. Resolving it would make this function read the
+    /// filesystem, so a layer would no longer parse as a pure function of its
+    /// bytes and a home, and the answer would change with mounts on the machine
+    /// doing the parsing. Of the paths it would catch, a committed
+    /// `/home/u/…` is already an account-specific literal, which Invariant 5
+    /// forbids in a config repo. Only the `~/…` spelling is portable, and that
+    /// spelling is the one the refusal message recommends.
     pub fn parse_in(raw: &str, home: &Path) -> Result<Self, Error> {
         let home = home_str(home)?;
         let normalised = normalise(raw)?;
@@ -1324,5 +1344,38 @@ mod tests {
                 built
             );
         }
+    }
+
+    /// The recorded limit: a home reached through a symlinked alias is not seen.
+    ///
+    /// This builds the ostree layout in a tempdir, with `home -> var/home` and
+    /// the account's home at `var/home/u`, and confirms the alias really does
+    /// reach the home. `parse_in` is lexical, so the alias spelling parses, stays
+    /// absolute, and is a different key from `~/.gitconfig`. Pinned so that
+    /// resolving symlinks, which would make parsing read the filesystem, is a
+    /// deliberate change to this test and not a quiet change of behaviour. See
+    /// the lexical-matching section of `Portable::parse_in`.
+    #[test]
+    fn a_symlinked_alias_of_the_home_is_not_folded_by_the_lexical_rule() {
+        let root = tempfile::TempDir::new().expect("a tempdir");
+        let home = root.path().join("var/home/u");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        std::os::unix::fs::symlink("var/home", root.path().join("home")).expect("symlink");
+        let alias = root.path().join("home/u");
+        assert_eq!(
+            alias.canonicalize().expect("the alias resolves"),
+            home.canonicalize().expect("the home resolves"),
+            "the fixture must really be one directory under two spellings"
+        );
+
+        let aliased = alias.join(".gitconfig");
+        let aliased = aliased.to_str().expect("a UTF-8 tempdir");
+        let parsed =
+            Portable::parse_in(aliased, &home).expect("accepted: not textually under home");
+
+        assert_eq!(parsed.as_str(), aliased);
+        assert!(!parsed.under_home());
+        assert_ne!(parsed, Portable::parse_in("~/.gitconfig", &home).unwrap());
+        assert_eq!(parsed.check_against(&home), Ok(()));
     }
 }

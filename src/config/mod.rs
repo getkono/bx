@@ -324,6 +324,15 @@ fn section_origin(root: &Table, name: &str, file: &Path, text: &str) -> Origin {
 /// Replacing an entry in place across layers is entry A3's merge rule. Twice in
 /// one file is a typo, and silently keeping one of them is how a config stops
 /// meaning what it says.
+///
+/// Keys are compared as stored strings. For a target that string is a
+/// [`crate::paths::Portable`], which is normalised and refuses an absolute
+/// spelling textually under the home, so `~/.ssh/./config` and
+/// `<home>/.ssh/config` both collide with `~/.ssh/config`. A spelling that
+/// reaches the same file only **through a symlink**, such as `/home/u/.gitconfig`
+/// where `/home` links to `var/home` and the home is `/var/home/u`, is a
+/// different string and is not caught. See the lexical-matching section of
+/// [`crate::paths::Portable::parse_in`] for why that is the recorded limit.
 fn check_unique(kind: &'static str, entries: Vec<(&str, &Origin)>) -> Result<(), Error> {
     let mut seen: BTreeMap<&str, &Origin> = BTreeMap::new();
     for (key, origin) in entries {

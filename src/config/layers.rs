@@ -335,6 +335,36 @@ mod tests {
     }
 
     #[test]
+    fn a_layer_set_is_parsed_against_the_home_it_is_given() {
+        // The home threaded in is what every target path is parsed against, and
+        // the reason it is threaded: a file under it has one spelling, so the
+        // absolute spelling in a module is refused at load, naming the `~` one.
+        // Parsed against any other home, the same line would load as a second
+        // key for the file `bx.toml` already owns.
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(
+            ".config/bx/bx.toml",
+            "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"global\"\n",
+        );
+        let absolute = home.child(".gitconfig");
+        home.write(
+            ".config/bx/modules/10-git.toml",
+            &format!(
+                "[[target]]\npath = \"{}\"\ncontent = \"module\"\n",
+                absolute.display()
+            ),
+        );
+
+        let message = load_layer_set(&repo, &state, home.path())
+            .expect_err("the absolute spelling of a file under the home is refused")
+            .to_string();
+
+        assert!(message.contains("10-git.toml"), "{message}");
+        assert!(message.contains("~/.gitconfig"), "{message}");
+    }
+
+    #[test]
     fn a_missing_repo_is_an_error() {
         let home = guarded_home();
         let (repo, state) = repo_and_state(&home);

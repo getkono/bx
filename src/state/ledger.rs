@@ -1239,9 +1239,9 @@ mod tests {
             }))
             .expect("record");
         ledger.save().expect("save");
-        let mut fingerprints = Fingerprints::open(&dir, &lock).expect("open").value;
+        let mut fingerprints = Fingerprints::read(&dir).expect("read").value;
         fingerprints.set("activation:rustup", Fingerprint::hashed(b"v1"));
-        fingerprints.save(&dir).expect("save");
+        fingerprints.save(&dir, &lock).expect("save");
 
         for path in walk(home.path()) {
             if before.contains(&path) {

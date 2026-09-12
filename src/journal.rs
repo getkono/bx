@@ -762,7 +762,7 @@ impl Session {
             return Err(Error::InProgress { path });
         }
 
-        let ledger = Ledger::open(state, &lock)?.value;
+        let ledger = Ledger::open(state, &lock, home)?.value;
         let journal = Journal::create(
             &path,
             Begin {
@@ -909,7 +909,7 @@ impl Session {
         // it to own.
         let (entry, mechanism) = match ownership {
             Ownership::Owned(mechanism) => (
-                Some(filled.new_entry(&self.home, mechanism.clone())),
+                Some(filled.new_entry(&self.home, mechanism.clone())?),
                 Some(mechanism.clone()),
             ),
             Ownership::Released => (None, None),
@@ -1261,7 +1261,7 @@ pub(crate) mod tests {
     /// A target under `home`, both halves of it.
     pub(crate) fn target(home: &Path, rel: &str) -> (Portable, PathBuf) {
         let dest = home.join(rel);
-        (Portable::from_path(&dest, home), dest)
+        (Portable::from_path(&dest, home).expect("portable"), dest)
     }
 
     /// A write request for `rel` under `home`.
@@ -1299,10 +1299,10 @@ pub(crate) mod tests {
         let begin = Begin {
             kind: SessionKind::Restore,
             home: PathBuf::from("/home/someone"),
-            scope: vec![Portable::parse("~/.bashrc").expect("portable")],
+            scope: vec![Portable::try_from("~/.bashrc".to_string()).expect("portable")],
         };
         let done = Record::Done(Done {
-            target: Portable::parse("~/.bashrc").expect("portable"),
+            target: Portable::try_from("~/.bashrc".to_string()).expect("portable"),
         });
 
         let mut journal = Journal::create(&path, begin.clone()).expect("create");
@@ -1488,7 +1488,9 @@ pub(crate) mod tests {
 
         assert!(!state.journal().exists(), "unlinked last");
         assert_eq!(load(&state.journal()).expect("load"), Loaded::Absent);
-        let ledger = LedgerView::read(&state).expect("read the ledger").value;
+        let ledger = LedgerView::read(&state, home.path())
+            .expect("read the ledger")
+            .value;
         let (portable, _) = target(home.path(), ".conf");
         assert_eq!(
             ledger.get(&portable).expect("an entry").mode,
@@ -1504,13 +1506,13 @@ pub(crate) mod tests {
             Record::Begin(Begin {
                 kind: SessionKind::Apply,
                 home: PathBuf::from("/home/someone"),
-                scope: vec![Portable::parse("~/.a").expect("portable")],
+                scope: vec![Portable::try_from("~/.a".to_string()).expect("portable")],
             }),
             Record::Done(Done {
-                target: Portable::parse("~/.a").expect("portable"),
+                target: Portable::try_from("~/.a".to_string()).expect("portable"),
             }),
             Record::Done(Done {
-                target: Portable::parse("~/.b").expect("portable"),
+                target: Portable::try_from("~/.b".to_string()).expect("portable"),
             }),
             Record::End(End { written: 2 }),
         ];
@@ -1720,7 +1722,7 @@ pub(crate) mod tests {
         // first prior. The journal answers "what was on disk a moment ago?" and
         // must not, or a rollback would compare the destination against a state
         // it has not been in since the first apply.
-        let entry = LedgerView::read(&state)
+        let entry = LedgerView::read(&state, home.path())
             .expect("read")
             .value
             .get(&portable)
@@ -1768,7 +1770,7 @@ pub(crate) mod tests {
         session.finish().expect("finish");
 
         assert!(
-            LedgerView::read(&state)
+            LedgerView::read(&state, home.path())
                 .expect("read the ledger")
                 .value
                 .get(&portable)
@@ -2019,13 +2021,13 @@ pub(crate) mod tests {
         let after_begin = std::fs::read(&path).expect("read").len();
         journal
             .append(&Record::Done(Done {
-                target: Portable::parse("~/.torn").expect("portable"),
+                target: Portable::try_from("~/.torn".to_string()).expect("portable"),
             }))
             .expect("append");
         let after_torn = std::fs::read(&path).expect("read").len();
         journal
             .append(&Record::Done(Done {
-                target: Portable::parse("~/.hidden").expect("portable"),
+                target: Portable::try_from("~/.hidden".to_string()).expect("portable"),
             }))
             .expect("append");
         drop(journal);
@@ -2181,7 +2183,7 @@ pub(crate) mod tests {
         );
         assert!(dest.is_file());
         assert!(
-            LedgerView::read(&state)
+            LedgerView::read(&state, home.path())
                 .expect("read the ledger")
                 .value
                 .get(&portable)

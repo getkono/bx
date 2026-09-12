@@ -72,6 +72,21 @@ pub enum Damage {
         /// The newest version this build understands.
         supported: u16,
     },
+    /// The envelope decoded, and a path it stores is one no constructor would
+    /// have built for this account.
+    ///
+    /// Decoding a [`crate::paths::Portable`] applies every rule that needs no
+    /// home. The one that does — an absolute spelling of a file under the home,
+    /// which is a second key for its `~/…` spelling — cannot run inside a
+    /// decoder, so the file's loader applies
+    /// [`crate::paths::Portable::check_against`] and a failure lands here, as
+    /// damage: the stored value is not believed.
+    ForeignPath {
+        /// The path as it is stored.
+        stored: String,
+        /// Why it cannot be used on this account.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for Damage {
@@ -83,6 +98,10 @@ impl std::fmt::Display for Damage {
             Self::FutureVersion { found, supported } => write!(
                 f,
                 "it is version {found}, and this bx understands up to {supported}",
+            ),
+            Self::ForeignPath { stored, reason } => write!(
+                f,
+                "it stores the path {stored}, which this account cannot use: {reason}",
             ),
         }
     }
@@ -161,6 +180,25 @@ pub(crate) fn load<T: DeserializeOwned + Default>(
     kind: &'static str,
     version: u16,
 ) -> Result<Loaded<T>, Error> {
+    load_checked(path, kind, version, |_| Ok(()))
+}
+
+/// [`load`], with a check on the decoded value that decoding alone cannot make.
+///
+/// `check` runs only on a value that decoded whole. A value it refuses is
+/// damage like any other decode failure: the file is quarantined and the empty
+/// default returned, so a stored value that fails a rule needing context the
+/// decoder did not have — the account's home — is never believed.
+///
+/// # Errors
+///
+/// As [`load`].
+pub(crate) fn load_checked<T: DeserializeOwned + Default>(
+    path: &Path,
+    kind: &'static str,
+    version: u16,
+    check: impl FnOnce(&T) -> Result<(), Damage>,
+) -> Result<Loaded<T>, Error> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -177,13 +215,13 @@ pub(crate) fn load<T: DeserializeOwned + Default>(
         }
     };
 
-    match decode::<T>(&bytes, kind, version) {
+    match decode::<T>(&bytes, kind, version).and_then(|value| check(&value).map(|()| value)) {
         Ok(value) => Ok(Loaded {
             value,
             health: Health::Loaded,
         }),
-        // Quarantine happens only here: after `read` succeeded and `decode`
-        // failed, so the bytes being moved aside are known to be unusable.
+        // Quarantine happens only here: after `read` succeeded and `decode` or
+        // `check` failed, so the bytes being moved aside are known to be unusable.
         Err(damage) => Ok(reset(path, &damage)),
     }
 }

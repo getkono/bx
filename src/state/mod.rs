@@ -125,6 +125,20 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// The home a stored document's paths are to be checked against is not a
+    /// home this crate can answer for.
+    ///
+    /// The caller's defect, not the document's, so it is reported before the
+    /// file is read: an intact ledger is never quarantined because it was
+    /// handed a bad home.
+    #[error("checking stored paths against the home {}: {source}", .home.display())]
+    Home {
+        /// The home that was passed.
+        home: PathBuf,
+        /// Why it was refused.
+        #[source]
+        source: crate::paths::Error,
+    },
     /// A ledger entry references a restore snapshot that is not on disk.
     #[error("the restore snapshot {digest} is missing from {}", .path.display())]
     RestoreMissing {

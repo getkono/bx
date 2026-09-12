@@ -379,7 +379,13 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     };
     let home = rebuild_home(&loaded, complete, &path)?;
 
-    let mut ledger = Ledger::open(state, lock)?.value;
+    // Only a terminated journal's bookkeeping touches the ledger, and it is the
+    // one kind with a home to check the ledger's stored paths against. A roll
+    // back leaves the saved ledger exactly as it was, so it opens nothing.
+    let mut ledger = match home {
+        Some(home) => Some(Ledger::open(state, lock, home)?.value),
+        None => None,
+    };
     let mut conflicts = Vec::new();
     let mut resolved = 0_usize;
 
@@ -416,10 +422,14 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             // work `plan` failed to announce: the ledger is machine state, not
             // the user's.
             Step::Record(entry) => {
-                ledger.record(entry)?;
+                if let Some(ledger) = ledger.as_mut() {
+                    ledger.record(entry)?;
+                }
             }
             Step::Forget => {
-                ledger.forget(&intent.target);
+                if let Some(ledger) = ledger.as_mut() {
+                    ledger.forget(&intent.target);
+                }
             }
         }
         resolved += 1;
@@ -434,7 +444,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         return Ok(Outcome::Blocked { conflicts });
     }
 
-    if complete {
+    if let Some(ledger) = &ledger {
         ledger.save()?;
     }
     // Last of all, and only once every step has succeeded. This is the rule that
@@ -566,8 +576,13 @@ fn decide(
             intent
                 .created_dirs
                 .iter()
-                .map(|dir| Portable::from_path(dir, home))
-                .collect(),
+                .map(|dir| {
+                    Portable::from_path(dir, home).map_err(|source| fs::Error::NotPortable {
+                        path: dir.clone(),
+                        source,
+                    })
+                })
+                .collect::<Result<_, _>>()?,
         );
     Ok((Step::Record(entry), report(true, recorded())))
 }
@@ -1521,7 +1536,9 @@ mod tests {
             "no destination is touched: only the machine's own bookkeeping",
         );
 
-        let ledger = LedgerView::read(&state).expect("read the ledger").value;
+        let ledger = LedgerView::read(&state, home.path())
+            .expect("read the ledger")
+            .value;
         let modified = ledger
             .get(&target(home.path(), ".conf").0)
             .expect("the modify");
@@ -1576,7 +1593,7 @@ mod tests {
             Outcome::Recorded { entries: 1 },
         );
         assert!(
-            LedgerView::read(&state)
+            LedgerView::read(&state, home.path())
                 .expect("read the ledger")
                 .value
                 .get(&portable)
@@ -1725,7 +1742,7 @@ mod tests {
             Outcome::Recorded { entries: 0 },
         );
         assert!(
-            LedgerView::read(&state)
+            LedgerView::read(&state, home.path())
                 .expect("read the ledger")
                 .value
                 .get(&portable)

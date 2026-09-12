@@ -325,8 +325,12 @@ mod tests {
     }
 
     /// The ledger entry for `portable`, as it stands on disk.
-    fn entry_for(state: &StateDir, portable: &Portable) -> Option<crate::state::LedgerEntry> {
-        LedgerView::read(state)
+    fn entry_for(
+        state: &StateDir,
+        home: &Path,
+        portable: &Portable,
+    ) -> Option<crate::state::LedgerEntry> {
+        LedgerView::read(state, home)
             .expect("read the ledger")
             .value
             .get(portable)
@@ -360,7 +364,7 @@ mod tests {
             "exact bytes and exact mode, not one or the other",
         );
         assert!(
-            entry_for(&state, &portable).is_none(),
+            entry_for(&state, home.path(), &portable).is_none(),
             "and bx no longer manages it",
         );
         assert!(
@@ -394,7 +398,7 @@ mod tests {
         );
         assert!(!home.child(".config/deep").exists());
         assert!(!home.child(".config").exists());
-        assert!(entry_for(&state, &portable).is_none());
+        assert!(entry_for(&state, home.path(), &portable).is_none());
     }
 
     #[test]
@@ -446,7 +450,7 @@ mod tests {
             "restoring the prior body would destroy bytes the user wrote",
         );
         assert!(
-            entry_for(&state, &portable).is_some(),
+            entry_for(&state, home.path(), &portable).is_some(),
             "bx still manages it, so `rm` can be retried once the user has decided",
         );
     }
@@ -518,7 +522,7 @@ mod tests {
             "{done:?}"
         );
         assert!(
-            entry_for(&state, &portable).is_none(),
+            entry_for(&state, home.path(), &portable).is_none(),
             "bx stops managing it, which is what `rm` was asked for",
         );
     }
@@ -606,13 +610,13 @@ mod tests {
 
         // A restore session that dies halfway is exactly an apply session that
         // dies halfway, and the same machinery undoes it.
-        let entry = entry_for(&state, &portable).expect("managed");
+        let entry = entry_for(&state, home.path(), &portable).expect("managed");
         let Restoration::Revert { reference, .. } =
             plan_restore(&entry, home.path()).expect("plan")
         else {
             panic!("a displaced file is reverted")
         };
-        let bytes = LedgerView::read(&state)
+        let bytes = LedgerView::read(&state, home.path())
             .expect("read the ledger")
             .value
             .restore_bytes(&state, &reference)
@@ -646,7 +650,7 @@ mod tests {
             "the rollback puts the file back the way the last finished run left it",
         );
         assert!(
-            entry_for(&state, &portable).is_some(),
+            entry_for(&state, home.path(), &portable).is_some(),
             "and the ledger never moved, because a session saves it only at the end",
         );
 
@@ -737,7 +741,9 @@ mod tests {
             Mode::DEFAULT_FILE,
         );
 
-        let ledger = LedgerView::read(&state).expect("read the ledger").value;
+        let ledger = LedgerView::read(&state, home.path())
+            .expect("read the ledger")
+            .value;
         let plan_for = |portable: &Portable| {
             plan_restore(ledger.get(portable).expect("managed"), home.path()).expect("plan")
         };

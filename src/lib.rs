@@ -34,7 +34,10 @@
 //! run that stops halfway leaves a record of everything it may have touched.
 //! [`recover`] is what a later run does with a log that is still there:
 //! detection and a report in a read-only command, an automatic roll back in a
-//! writing one. Between them they are the second half of Invariant 4.
+//! writing one. Between them they are the second half of Invariant 4, and
+//! [`restore`] is the first: `bx rm`, spending the ledger's record of the
+//! bytes bx displaced to put a file back exactly as it was — or to remove one
+//! bx created, which is not the same as emptying it.
 //!
 //! [`testing`] is the tempdir-`$HOME` guard every home-touching test in this
 //! crate runs behind. It is compiled unconditionally, and hidden from the docs,
@@ -48,6 +51,7 @@ pub mod journal;
 pub mod paths;
 pub mod recover;
 pub mod report;
+pub mod restore;
 pub mod state;
 #[doc(hidden)]
 pub mod testing;

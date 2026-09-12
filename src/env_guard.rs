@@ -603,8 +603,12 @@ fn substitute_once(value: &str, seen: &Assignments, home: &str) -> Result<(Strin
         let (name, tail) = match after.strip_prefix('{') {
             Some(braced) => match braced.find('}') {
                 Some(end) => (&braced[..end], &braced[end + 1..]),
-                // An unclosed `${` is not a reference; it is literal text.
-                None => ("", after),
+                // An unclosed `${` is a syntax error in every shell, so a
+                // fragment holding one aborts `.zshenv` on load. Treating it as
+                // literal text let it be *allowed* whenever the surrounding
+                // path was inside a root: the guard would approve bytes no
+                // shell will read.
+                None => return Err(Reason::UnresolvedReference),
             },
             None => {
                 let end = after
@@ -1473,7 +1477,7 @@ mod tests {
         // The expansion grammar is closed: `$NAME` and `${NAME}`, nothing else.
         // Anything else is text, and text that is not an absolute path is
         // rejected for being one, not for being unresolvable.
-        for value in ["$", "$1/x", "${/x", "${}/x"] {
+        for value in ["$", "$1/x", "${}/x"] {
             assert_eq!(
                 reason_of(&check("CARGO_HOME", value, &rooted())),
                 Some(Reason::NotAbsolute),
@@ -1487,6 +1491,18 @@ mod tests {
             check("CARGO_HOME", "/var/mnt/scratch/example/a$1b", &rooted()),
             Verdict::Allowed
         );
+        // An unclosed `${` is the exception, and not for being unresolvable:
+        // it is a shell syntax error, so it must not be approved even when the
+        // path around it is squarely inside a root — the two cases above both
+        // fail the absoluteness check, which would cover the arm without ever
+        // exercising it.
+        for value in ["${/x", "/var/mnt/scratch/example/${FOO", "${FOO"] {
+            assert_eq!(
+                reason_of(&check("CARGO_HOME", value, &rooted())),
+                Some(Reason::UnresolvedReference),
+                "{value}"
+            );
+        }
         // `$b` on the other hand *is* a reference, and an undefined one.
         assert_eq!(
             reason_of(&check(

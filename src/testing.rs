@@ -35,6 +35,14 @@
 //!   *child* process a home, pass it per-command — `Command::env("HOME", …)` —
 //!   which mutates nothing here.
 //!
+//! That last rule is not a convention: `Cargo.toml` sets
+//! `[lints.rust] unsafe_code = "forbid"`, which the compiler applies to the
+//! library, the binary, `build.rs` and every integration test in `tests/`, and
+//! which no module can re-allow. An earlier shape of this rule was a test that
+//! grepped `src/` for the keyword; it covered neither `tests/` — where someone
+//! reaching for `set_var` would actually write it — nor `build.rs`, it exempted
+//! a file it could not read, and it could be defeated by a line break.
+//!
 //! A guard mutates nothing global, so taking two of them, or nesting them, is
 //! fine and a shared fixture helper may take one of its own.
 //!
@@ -273,21 +281,88 @@ mod tests {
         check_is_a_throwaway_home(&candidate, Some(&real_home));
     }
 
+    /// How a forbidden needle is matched.
+    #[derive(Clone, Copy)]
+    enum Rule {
+        /// Anywhere in the text, boundaries included.
+        ///
+        /// For a **path** fragment. A path cannot occur inside an English word,
+        /// so it needs no leading word boundary — and demanding one is what made
+        /// this guard miss the very spelling it was written to catch: the real
+        /// directory is `/var/<fragment>`, where the fragment is preceded by
+        /// `r`, so the canonical path was not reported.
+        Anywhere,
+        /// Only where it is not preceded by an alphanumeric character.
+        ///
+        /// For an **account name**, which does occur inside ordinary words.
+        WholeWord,
+    }
+
+    /// Every user-specific needle, with the rule that matches it.
+    ///
+    /// Assembled from fragments at runtime so this file is not its own
+    /// counter-example.
+    fn user_specific_needles() -> Vec<(String, Rule)> {
+        vec![
+            (["/m", "nt/sc", "ratch/go", "lem"].concat(), Rule::Anywhere),
+            (["jus", "tin"].concat(), Rule::WholeWord),
+            (["jus", "ty"].concat(), Rule::WholeWord),
+            (["go", "lem"].concat(), Rule::WholeWord),
+        ]
+    }
+
+    /// Every forbidden needle `text` names. `text` is expected lowercased.
+    fn user_specific_offences(text: &str) -> Vec<String> {
+        user_specific_needles()
+            .into_iter()
+            .filter(|(needle, rule)| match rule {
+                Rule::Anywhere => text.contains(needle.as_str()),
+                Rule::WholeWord => contains_token(text, needle),
+            })
+            .map(|(needle, _)| needle)
+            .collect()
+    }
+
+    #[test]
+    fn a_user_specific_path_is_an_offence_wherever_it_appears() {
+        let fragment = ["/m", "nt/sc", "ratch/go", "lem"].concat();
+        let account = ["go", "lem"].concat();
+
+        // The canonical spelling on the machine this repository lives on. The
+        // fragment is preceded by `r`, so the word-boundary rule exempted it and
+        // the primary case went unreported.
+        assert!(!user_specific_offences(&format!("/var{fragment}/dev/x")).is_empty());
+        assert!(!user_specific_offences(&format!("{fragment}/dev/x")).is_empty());
+        // The bare account name, which was not a needle at all.
+        assert!(!user_specific_offences(&format!("/home/{account}")).is_empty());
+        assert!(!user_specific_offences(&format!("home = {account}")).is_empty());
+        // And an account name inside an ordinary word still is not an offence.
+        assert!(user_specific_offences(&format!("an amal{account} of prose")).is_empty());
+
+        // The path rule needs a negative case of its own, or a rule that
+        // reported every string would pass this test and still be useless. A
+        // path sharing the fragment's leading directories, but not the
+        // account-specific tail, is not an offence.
+        let prefix = ["/m", "nt/sc", "ratch/"].concat();
+        assert!(
+            user_specific_offences(&format!("{prefix}shared/dev/x")).is_empty(),
+            "only the account-specific tail makes the path a literal"
+        );
+        assert!(
+            user_specific_offences("/var/home/example/.ssh/config").is_empty(),
+            "the placeholder home every test in this crate uses is not an offence"
+        );
+    }
+
     /// Invariant 5 has no exception, and a one-time fix without a regression
-    /// guard is not enforcement. The needles are assembled from fragments at
-    /// runtime so this file is not its own counter-example, and this file is
-    /// skipped for the same reason.
+    /// guard is not enforcement. This file is skipped, because the needles it
+    /// hunts for have to appear in it somewhere.
     ///
     /// The blast radius is `src/` only. `Cargo.toml`'s `authors` field names a
     /// person on purpose: authorship metadata is a legitimate exception, and a
     /// guard that fired on it would be deleted rather than obeyed.
     #[test]
     fn no_user_specific_literal_survives_under_src() {
-        let needles = [
-            ["/m", "nt/sc", "ratch/go", "lem"].concat(),
-            ["jus", "tin"].concat(),
-            ["jus", "ty"].concat(),
-        ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let self_path = root.join("testing.rs");
 
@@ -299,10 +374,8 @@ mod tests {
             let text = std::fs::read_to_string(&file)
                 .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()))
                 .to_ascii_lowercase();
-            for needle in &needles {
-                if contains_token(&text, needle) {
-                    offences.push(format!("{} names {needle}", file.display()));
-                }
+            for needle in user_specific_offences(&text) {
+                offences.push(format!("{} names {needle}", file.display()));
             }
         }
 
@@ -344,84 +417,5 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !c.is_ascii_alphanumeric())
         })
-    }
-
-    /// `haystack` contains `needle` as a whole identifier.
-    ///
-    /// Stricter than [`contains_token`] at the far end, because a keyword search
-    /// must not fire on `an_unsafe_block` in a name while still firing on the
-    /// keyword itself.
-    fn contains_word(haystack: &str, needle: &str) -> bool {
-        let part_of_an_identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        haystack.match_indices(needle).any(|(at, _)| {
-            haystack[..at]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !part_of_an_identifier(c))
-                && haystack[at + needle.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| !part_of_an_identifier(c))
-        })
-    }
-
-    #[test]
-    fn a_username_inside_an_ordinary_word_is_not_an_offence() {
-        assert!(!contains_token("adjusting the margin", "justin"));
-        assert!(contains_token("home = justin", "justin"));
-        assert!(contains_token("justin", "justin"));
-        assert!(contains_token("/home/justin", "justin"));
-        // A username with a suffix is still the username.
-        assert!(contains_token("/var/home/justin13888", "justin"));
-    }
-
-    #[test]
-    fn a_keyword_inside_an_identifier_is_not_the_keyword() {
-        let needle = ["uns", "afe"].concat();
-
-        // Every subject is built from `needle`, so no line in this file carries
-        // the bare keyword and the scan above stays honest about its own source.
-        assert!(!contains_word(
-            &format!("fn an_{needle}_block() {{"),
-            &needle
-        ));
-        assert!(!contains_word(&format!("let {needle}ly = 1;"), &needle));
-        assert!(contains_word(&format!("    {needle} {{"), &needle));
-        assert!(contains_word(&format!("pub {needle} fn f() {{}}"), &needle));
-        assert!(contains_word(&needle, &needle));
-    }
-
-    #[test]
-    fn no_source_file_under_src_declares_an_unsafe_block() {
-        // The crate's only `unsafe` was a process-wide environment mutation,
-        // which is unsound under `cargo test` and was removed rather than
-        // serialised. The reason is not obvious from reading the code that
-        // replaced it, so this fails if one comes back. Comment lines are
-        // exempt, because explaining the hazard is how it stays explained, and
-        // the needle is assembled at runtime so this file is not its own
-        // counter-example.
-        let needle = ["uns", "afe"].concat();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-
-        let offenders: Vec<String> = rust_sources(&root)
-            .into_iter()
-            .filter(|file| {
-                std::fs::read_to_string(file)
-                    .unwrap_or_default()
-                    .lines()
-                    .any(|line| {
-                        let code = line.trim_start();
-                        !code.starts_with("//") && contains_word(code, &needle)
-                    })
-            })
-            .map(|file| file.display().to_string())
-            .collect();
-
-        assert!(
-            offenders.is_empty(),
-            "process-wide environment mutation is unsound under `cargo test`; \
-             take the environment as a parameter instead:\n  {}",
-            offenders.join("\n  ")
-        );
     }
 }

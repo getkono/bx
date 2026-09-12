@@ -93,16 +93,21 @@ pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error>
 /// Each layer knows whether it is [`LayerKind::Global`] — committed, and so
 /// forbidden from carrying a `[values]` table — or [`LayerKind::Local`].
 ///
+/// `home` is threaded in, never read here: it is what a target path is parsed
+/// against, so that `~/.gitconfig` in one layer and the absolute spelling in
+/// another are one key rather than two. It is the same `home` [`state_dir`]
+/// takes, so a caller that found the state directory already holds it.
+///
 /// # Errors
 ///
 /// Whatever [`layer_paths`] and [`super::load_layer`] return.
-pub fn load_layer_set(repo: &Path, state_dir: &Path) -> Result<Vec<Layer>, Error> {
+pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
     let local = local_layer_path(state_dir);
 
     layer_paths(repo, state_dir)?
         .iter()
         .map(|path| {
-            let mut layer = load_layer(path)?;
+            let mut layer = load_layer(path, home)?;
             if *path == local {
                 layer.kind = LayerKind::Local;
             }
@@ -260,7 +265,7 @@ mod tests {
         home.write(".config/bx/modules/10-shell.toml", "");
         home.write(".local/state/bx/local.toml", "");
 
-        let kinds: Vec<LayerKind> = load_layer_set(&repo, &state)
+        let kinds: Vec<LayerKind> = load_layer_set(&repo, &state, home.path())
             .unwrap()
             .iter()
             .map(|layer| layer.kind)
@@ -287,11 +292,76 @@ mod tests {
             "[values]\nscratch_root = \"/var/mnt/scratch/one\"\n",
         );
 
-        let layers = load_layer_set(&repo, &state).unwrap();
+        let layers = load_layer_set(&repo, &state, home.path()).unwrap();
 
         assert_eq!(layers[0].config.values[0].name, "scratch_root");
         assert!(layers[0].config.value_assignments.is_empty());
         assert_eq!(layers[1].config.value_assignments[0].name, "scratch_root");
+    }
+
+    #[test]
+    fn the_byte_sorted_later_module_wins_a_conflicting_key() {
+        // End to end, off the disk, because the ordering property is only worth
+        // anything if it survives the composition: `read_dir` order is the
+        // filesystem's, and Invariant 3 admits none of it. `10-a.toml` sorts
+        // *before* `9-a.toml` by raw filename bytes and after it numerically, so
+        // this fails under either a numeric sort or a naive `read_dir` order.
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        home.write(
+            ".config/bx/modules/9-a.toml",
+            "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"from nine\"\n",
+        );
+        home.write(
+            ".config/bx/modules/10-a.toml",
+            "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"from ten\"\n",
+        );
+
+        let layers = load_layer_set(&repo, &state, home.path()).unwrap();
+        let merged = crate::config::merge::merge(&layers, home.path()).unwrap();
+
+        assert_eq!(merged.targets.len(), 1, "one key, one entry");
+        assert_eq!(
+            merged.targets[0].body,
+            crate::config::target::Body::Inline("from nine".to_string()),
+            "`9-a.toml` sorts after `10-a.toml` by raw filename bytes"
+        );
+        assert_eq!(
+            merged.targets[0].origin.file.file_name().unwrap(),
+            OsStr::new("9-a.toml"),
+            "and the surviving entry says which layer set it"
+        );
+    }
+
+    #[test]
+    fn a_layer_set_is_parsed_against_the_home_it_is_given() {
+        // The home threaded in is what every target path is parsed against, and
+        // the reason it is threaded: a file under it has one spelling, so the
+        // absolute spelling in a module is refused at load, naming the `~` one.
+        // Parsed against any other home, the same line would load as a second
+        // key for the file `bx.toml` already owns.
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(
+            ".config/bx/bx.toml",
+            "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"global\"\n",
+        );
+        let absolute = home.child(".gitconfig");
+        home.write(
+            ".config/bx/modules/10-git.toml",
+            &format!(
+                "[[target]]\npath = \"{}\"\ncontent = \"module\"\n",
+                absolute.display()
+            ),
+        );
+
+        let message = load_layer_set(&repo, &state, home.path())
+            .expect_err("the absolute spelling of a file under the home is refused")
+            .to_string();
+
+        assert!(message.contains("10-git.toml"), "{message}");
+        assert!(message.contains("~/.gitconfig"), "{message}");
     }
 
     #[test]

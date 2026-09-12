@@ -22,6 +22,12 @@
 //! identity values become declared values, and their absence blocks the one
 //! target that needs them.
 //!
+//! The same holds for a value this account made unusable: an answer its kind
+//! refuses, such as `scratch_root = "/"` for a root, or a legal answer that
+//! makes a committed `default` invalid — `{{prefix}}/cache` as a `path` with
+//! `prefix` answered `scratch`. It blocks the targets that reference it, and the
+//! note names the `local.toml` line that caused it.
+//!
 //! A defect in the **committed** repo is not blocked but fatal — a malformed
 //! placeholder, or a reference to a value no layer declares, cannot be fixed by
 //! answering a prompt.
@@ -55,6 +61,26 @@ pub enum BlockReason {
         /// The values that need answering, in declaration order.
         names: Vec<String>,
     },
+    /// One or more declared values this entry references are switched off.
+    ///
+    /// Kept apart from [`BlockReason::UnsetValue`] because the two are cleared
+    /// by different acts, and a note that told an account to answer a value it
+    /// has itself refused would be advice it cannot follow.
+    DisabledValue {
+        /// The declarations to re-enable, in declaration order.
+        names: Vec<String>,
+    },
+    /// One or more declared values this entry references have no usable text,
+    /// because of an answer in this account's layer: one its kind refuses, or
+    /// one that made a committed `default` invalid.
+    ///
+    /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
+    /// unanswered: the answer that needs changing is already written, and the
+    /// hint names its line.
+    InvalidValue {
+        /// The declarations whose text is invalid, in declaration order.
+        names: Vec<String>,
+    },
 }
 
 /// An entry that was held back, and what it would take to release it.
@@ -66,7 +92,8 @@ pub struct BlockedEntry {
     pub origin: Origin,
     /// Why it is blocked.
     pub reason: BlockReason,
-    /// What the user should run. Spelled by `values::init_hint`, in one place.
+    /// What the user should do. Spelled in `values` — `init_hint`,
+    /// `disabled_hint` or `ResolvedValues::invalid_hint` — never at a call site.
     pub hint: String,
 }
 
@@ -91,7 +118,8 @@ pub struct Resolved {
 ///
 /// [`Error::BadValue`] for a defect in the committed repo: a malformed
 /// placeholder, a reference to a value no layer declares, a `default` that
-/// references a later value, or an answer that is not of its declared kind.
+/// references a later value, or a `default` that is not of its kind with no
+/// account answer involved; and for two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -101,12 +129,49 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         .map(|target| resolve_target(target, &values))
         .collect::<Result<Vec<_>, Error>>()?;
 
+    refuse_shared_files(&targets)?;
+
     Ok(Resolved { values, targets })
+}
+
+/// Refuse two ready targets that write one file.
+///
+/// The merge keys targets by the file they name, so a configuration that came
+/// through it cannot trip this. [`resolve`] takes any [`Config`], though, and
+/// `Portable` is the key the ledger and the journal are written against: two
+/// targets for one file would give `rm` two priors to restore and `apply` two
+/// writers, so the second `plan` would never be empty.
+fn refuse_shared_files(targets: &[Resolution<Target>]) -> Result<(), Error> {
+    let ready: Vec<&Target> = targets
+        .iter()
+        .filter_map(|resolution| match resolution {
+            Resolution::Ready(target) => Some(target),
+            Resolution::Blocked(_) => None,
+        })
+        .collect();
+
+    for (index, later) in ready.iter().enumerate() {
+        if let Some(earlier) = ready[..index]
+            .iter()
+            .find(|earlier| earlier.path.as_str() == later.path.as_str())
+        {
+            return Err(Error::BadValue {
+                origin: later.origin.clone(),
+                message: format!(
+                    "target `{}` is the same file as the target at {}; one file has one target",
+                    later.path, earlier.origin
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Substitute one target, or explain why it cannot be.
 fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution<Target>, Error> {
     let mut unset: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
     let mut bad: Option<Unresolved> = None;
 
     // One pass to find out whether it can be resolved at all, so a blocked
@@ -114,6 +179,8 @@ fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution
     let mut probe = |text: &str| match values.substitute(text) {
         Ok(_) => {}
         Err(Unresolved::Unset { names }) => unset.extend(names),
+        Err(Unresolved::Disabled { names }) => disabled.extend(names),
+        Err(Unresolved::Invalid { names }) => invalid.extend(names),
         Err(other) => bad = bad.take().or(Some(other)),
     };
     for_each_string(target, &mut probe);
@@ -125,15 +192,35 @@ fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution
         });
     }
 
+    let block = |reason, hint| {
+        Ok(Resolution::Blocked(BlockedEntry {
+            key: target.path.to_string(),
+            origin: target.origin.clone(),
+            reason,
+            hint,
+        }))
+    };
+
+    // A switched-off declaration is reported ahead of an unanswered one: it is
+    // the more specific statement about what this target is waiting for.
+    if !disabled.is_empty() {
+        let names = in_declaration_order(values, disabled);
+        let hint =
+            super::values::disabled_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        return block(BlockReason::DisabledValue { names }, hint);
+    }
+
+    // An invalid value ahead of an unanswered one: answering would not clear it.
+    if !invalid.is_empty() {
+        let names = in_declaration_order(values, invalid);
+        let hint = values.invalid_hint(&names);
+        return block(BlockReason::InvalidValue { names }, hint);
+    }
+
     if !unset.is_empty() {
         let names = in_declaration_order(values, unset);
         let hint = super::values::init_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
-        return Ok(Resolution::Blocked(BlockedEntry {
-            key: target.path.to_string(),
-            origin: target.origin.clone(),
-            reason: BlockReason::UnsetValue { names },
-            hint,
-        }));
+        return block(BlockReason::UnsetValue { names }, hint);
     }
 
     substituted(target, values).map(Resolution::Ready)
@@ -189,14 +276,29 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Error
         })
     };
     let portable = |text: &str| -> Result<Portable, Error> {
-        Portable::parse(&sub(text)?).map_err(|source| Error::BadValue {
+        // Against the home the values were resolved against, never a re-derived
+        // one: `Portable::parse_in` rejects an absolute path under the home, and
+        // a different home would make that judgement about a different file.
+        Portable::parse_in(&sub(text)?, values.home()).map_err(|source| Error::BadValue {
             origin: origin.clone(),
             message: format!("target `{}`: {source}", target.path),
         })
     };
 
     let body = match &target.body {
-        Body::File(path) => Body::File(sub(&path.to_string_lossy())?.into()),
+        // Through the parser's own rule, not straight into the target. A `file`
+        // is the one substituted field whose validator the parse-time check
+        // cannot stand in for: `cfg/{{account}}/gitconfig` is a legal body file
+        // as written, and an `account` answered `../../../../etc` makes it read
+        // a file off the machine and write it into a target.
+        Body::File(path) => Body::File(
+            super::target::confine_to_repo("file", &sub(&path.to_string_lossy())?).map_err(
+                |message| Error::BadValue {
+                    origin: origin.clone(),
+                    message: format!("target `{}`: {message}", target.path),
+                },
+            )?,
+        ),
         Body::Inline(text) => Body::Inline(sub(text)?),
         other => other.clone(),
     };
@@ -280,7 +382,8 @@ mod tests {
         Ok(Layer {
             file: PathBuf::from(file),
             kind,
-            config: parse_str(text, Path::new(file)).map_err(|e| format!("{file}: {e}"))?,
+            config: parse_str(text, Path::new(file), &home())
+                .map_err(|e| format!("{file}: {e}"))?,
         })
     }
 
@@ -290,7 +393,7 @@ mod tests {
         if let Some(local) = local {
             layers.push(layer("local.toml", LayerKind::Local, local)?);
         }
-        let merged = merge(&layers).map_err(|e| e.to_string())?;
+        let merged = merge(&layers, &home()).map_err(|e| e.to_string())?;
         resolve(&merged, &home()).map_err(|e| e.to_string())
     }
 
@@ -360,6 +463,121 @@ mod tests {
     }
 
     #[test]
+    fn a_substituted_body_file_is_confined_to_the_config_repo() {
+        // An account-varying `file` is the natural spelling for a per-account
+        // body, and it is the one substituted field the parse-time check cannot
+        // stand in for: what the parser saw was `cfg/{{account}}/gitconfig`, and
+        // what reaches `repo.join` is whatever the answer made of it.
+        const LAYER: &str = "[[value]]\n\
+                             name = \"account\"\n\
+                             kind = \"string\"\n\
+                             [[target]]\n\
+                             path = \"~/.gitconfig\"\n\
+                             file = \"cfg/{{account}}/gitconfig\"\n";
+
+        let message = resolved(LAYER, Some("[values]\naccount = \"../../../../etc\"\n"))
+            .expect_err("a climbing answer is a repo escape");
+        assert!(
+            message.contains("may not climb out of the config repo"),
+            "{message}"
+        );
+        assert!(message.contains("~/.gitconfig"), "{message}");
+
+        // A `file` that *opens* with a value, answered absolutely, would discard
+        // the repo root the moment it reached `repo.join`.
+        const ROOTED: &str = "[[value]]\n\
+                              name = \"account\"\n\
+                              kind = \"string\"\n\
+                              [[target]]\n\
+                              path = \"~/.gitconfig\"\n\
+                              file = \"{{account}}/gitconfig\"\n";
+
+        let message = resolved(ROOTED, Some("[values]\naccount = \"/etc\"\n"))
+            .expect_err("an absolute answer discards the repo root");
+        assert!(message.contains("relative to the repo root"), "{message}");
+
+        let ordinary = resolved(LAYER, Some("[values]\naccount = \"work\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig")),
+            "the case this spelling exists for still resolves"
+        );
+    }
+
+    #[test]
+    fn a_substitution_that_breaks_a_portable_path_is_a_load_error() {
+        // Every substituted field is re-validated, because substitution can turn
+        // a legal value into an illegal one. A path that climbs out of the home
+        // is the case that matters: `under_home` is a claim about location, and
+        // a `Portable` that escaped it would make a later entry's write gate on
+        // nothing.
+        let message = resolved(
+            "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{leaf}}\"\ncontent = \"x\"\n",
+            Some("[values]\nleaf = \"../../etc/passwd\"\n"),
+        )
+        .expect_err("the substituted path climbs out of the home");
+        assert!(message.contains("climb out of the home"), "{message}");
+
+        let message = resolved(
+            "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n\
+             references = [\"~/{{leaf}}\"]\n",
+            Some("[values]\nleaf = \"../../etc/passwd\"\n"),
+        )
+        .expect_err("a reference is a portable path too");
+        assert!(message.contains("climb out of the home"), "{message}");
+    }
+
+    #[test]
+    fn a_substitution_that_breaks_a_key_path_is_a_load_error() {
+        let message = resolved(
+            "[[value]]\nname = \"setting\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/zed/settings.json\"\ncontent = \"{{{{}}\"\n\
+             format = \"jsonc\"\nowns = [\"editor.{{setting}}\"]\n",
+            Some("[values]\nsetting = \"\"\n"),
+        )
+        .expect_err("`editor.` has an empty segment");
+
+        assert!(message.contains("empty segment"), "{message}");
+    }
+
+    #[test]
+    fn a_directory_target_resolves_with_nothing_to_substitute() {
+        // A directory has no body to visit, and a body-less target must still
+        // have its path and its other string fields substituted.
+        let resolved = resolved(
+            "[[value]]\nname = \"flavour\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{flavour}}.d\"\ndir = true\n\
+             requires = [\"{{flavour}}-tool\"]\n",
+            Some("[values]\nflavour = \"dark\"\n"),
+        )
+        .unwrap();
+
+        let target = ready(&resolved, 0);
+        assert_eq!(target.path.as_str(), "~/.config/dark.d");
+        assert_eq!(target.body, Body::Dir);
+        assert_eq!(target.requires, ["dark-tool"]);
+    }
+
+    #[test]
+    fn a_directory_target_is_blocked_on_an_unset_value_like_any_other() {
+        let resolved = resolved(
+            "[[value]]\nname = \"flavour\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{flavour}}.d\"\ndir = true\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&resolved, 0).reason,
+            BlockReason::UnsetValue {
+                names: vec!["flavour".to_string()]
+            }
+        );
+    }
+
+    #[test]
     fn a_target_path_may_not_open_with_a_placeholder() {
         // `Portable` is the natural key of a target and the key the ledger and
         // the journal are written against, so it is `~`- or `/`-rooted by
@@ -375,6 +593,88 @@ mod tests {
         .unwrap_err();
 
         assert!(message.contains("must start with `~` or `/`"), "{message}");
+    }
+
+    #[test]
+    fn disabling_a_declaration_blocks_its_targets_and_nothing_else() {
+        // The sanctioned three-line toggle. It used to fail the whole load with
+        // "no layer declares the value git_email" -- a statement that is not
+        // true, pointing at a committed file the account cannot edit.
+        let resolved = resolved(
+            "[[value]]\nname = \"git_email\"\nkind = \"email\"\nrequired = true\n\
+             [[target]]\npath = \"~/.gitconfig.d/id\"\ncontent = \"email = {{git_email}}\"\n\
+             [[target]]\npath = \"~/.config/starship.toml\"\ncontent = \"format = \\\"x\\\"\"\n",
+            Some("[[value]]\nname = \"git_email\"\nenabled = false\n"),
+        )
+        .unwrap();
+
+        let entry = blocked(&resolved, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::DisabledValue {
+                names: vec!["git_email".to_string()]
+            }
+        );
+        assert!(
+            entry.hint.contains("re-enable git_email"),
+            "a note telling the account to run `bx init` for a value it has \
+             itself switched off is advice it cannot follow: {}",
+            entry.hint
+        );
+        assert!(!entry.hint.contains("bx init"), "{}", entry.hint);
+
+        assert_eq!(
+            keys(&resolved),
+            ["~/.gitconfig.d/id", "~/.config/starship.toml"],
+            "one target is held back, in its own position, and the rest apply"
+        );
+        ready(&resolved, 1);
+    }
+
+    #[test]
+    fn a_value_derived_from_a_disabled_one_blocks_by_the_same_reason() {
+        // The cause travels: `sccache_dir` is unanswerable because the account
+        // switched off what its default derives from, and switching that back on
+        // is what clears both.
+        let resolved = resolved(
+            "[[value]]\nname = \"scratch_root\"\nkind = \"path\"\n\
+             [[value]]\nname = \"sccache_dir\"\nkind = \"path\"\n\
+             default = \"{{scratch_root}}/sccache\"\n\
+             [[target]]\npath = \"~/.config/env\"\ncontent = \"SCCACHE_DIR={{sccache_dir}}\"\n",
+            Some(
+                "[[value]]\nname = \"scratch_root\"\nenabled = false\n\
+                 [values]\nscratch_root = \"/var/mnt/scratch/one\"\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&resolved, 0).reason,
+            BlockReason::DisabledValue {
+                names: vec!["scratch_root".to_string()]
+            },
+            "the name reported is the one to act on, not the derived one"
+        );
+    }
+
+    #[test]
+    fn a_disabled_declaration_is_not_prompted_for() {
+        // The other half of the same decision: an account that switched a value
+        // off is not asked about it, so the blocked note may not say `bx init`.
+        let resolved = resolved(
+            "[[value]]\nname = \"agent_slice\"\nkind = \"string\"\nrequired = true\n",
+            Some("[[value]]\nname = \"agent_slice\"\nenabled = false\n"),
+        )
+        .unwrap();
+
+        assert!(resolved.values.unset_required_names().is_empty());
+        assert!(resolved.values.unset().is_empty());
+        assert!(resolved.values.decls().is_empty());
+        assert!(
+            resolved.values.decl("agent_slice").is_some(),
+            "still findable, which is what keeps a reference to it apart from a \
+             reference to a name no layer declares"
+        );
     }
 
     #[test]
@@ -469,6 +769,129 @@ mod tests {
     }
 
     #[test]
+    fn a_root_answered_as_the_filesystem_blocks_only_what_references_it() {
+        // End to end through the merge: the account's own local.toml line is
+        // refused and named, a target that references no value still applies,
+        // and nothing is admitted to the root set.
+        for spelling in ["/", "//", "/./", "/.."] {
+            let resolved = resolved(
+                &format!(
+                    "{SCRATCH}[[target]]\npath = \"~/.config/env\"\n\
+                     content = \"CACHE={{{{scratch_root}}}}/cache\"\n\
+                     [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n"
+                ),
+                Some(format!("[values]\nscratch_root = \"{spelling}\"\n").as_str()),
+            )
+            .unwrap_or_else(|e| panic!("{spelling:?} failed the whole load: {e}"));
+
+            let entry = blocked(&resolved, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["scratch_root".to_string()]
+                },
+                "{spelling:?}"
+            );
+            assert!(
+                entry.hint.contains("local.toml:2"),
+                "{spelling:?}: {}",
+                entry.hint
+            );
+            ready(&resolved, 1);
+            assert!(resolved.values.roots().is_empty(), "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn a_legal_answer_that_breaks_a_derived_default_blocks_only_its_dependents() {
+        // `prefix = "scratch"` is a perfectly good `string`. It makes `cache`'s
+        // default expand to `scratch/cache`, which is not a `path` — but that is
+        // this account's answer interacting with a committed default, not a repo
+        // defect, so it may not take `~/.zshrc` down with it, and the note has
+        // to name the local.toml line that caused it rather than the committed
+        // declaration the account may not edit.
+        let resolved = resolved(
+            "[[value]]\nname = \"prefix\"\nkind = \"string\"\n\
+             [[value]]\nname = \"cache\"\nkind = \"path\"\ndefault = \"{{prefix}}/cache\"\n\
+             [[target]]\npath = \"~/.config/env\"\ncontent = \"CACHE={{cache}}\"\n\
+             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+            Some("# this account's answers\n[values]\nprefix = \"scratch\"\n"),
+        )
+        .expect("an account's legal answer does not fail the load");
+
+        ready(&resolved, 1);
+        let entry = blocked(&resolved, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["cache".to_string()]
+            }
+        );
+        assert!(entry.hint.contains("local.toml:3"), "{}", entry.hint);
+        assert!(entry.hint.contains("prefix"), "{}", entry.hint);
+        assert!(entry.hint.contains("\"scratch/cache\""), "{}", entry.hint);
+    }
+
+    #[test]
+    fn an_account_overrides_a_placeholder_pathed_target_by_the_path_it_resolves_to() {
+        // End to end: this used to produce two `Ready` targets with
+        // byte-identical keys — one file with two owners.
+        let resolved = resolved(
+            "[[value]]\nname = \"acct\"\nkind = \"string\"\ndefault = \"one\"\n\
+             [[target]]\npath = \"~/.config/{{acct}}/settings.json\"\ncontent = \"GLOBAL\"\n",
+            Some("[[target]]\npath = \"~/.config/one/settings.json\"\ncontent = \"LOCAL\"\n"),
+        )
+        .unwrap();
+
+        assert_eq!(keys(&resolved), ["~/.config/one/settings.json"]);
+        assert_eq!(ready(&resolved, 0).body, Body::Inline("LOCAL".to_string()));
+    }
+
+    #[test]
+    fn an_account_opts_out_of_a_placeholder_pathed_target_by_the_path_it_resolves_to() {
+        // The three-line opt-out, by the path `plan` shows. It used to fail the
+        // whole load saying no earlier layer declares an entry `plan` lists.
+        let resolved = resolved(
+            "[[value]]\nname = \"acct\"\nkind = \"string\"\ndefault = \"one\"\n\
+             [[target]]\npath = \"~/.config/{{acct}}/settings.json\"\ncontent = \"GLOBAL\"\n\
+             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+            Some("[[target]]\npath = \"~/.config/one/settings.json\"\nenabled = false\n"),
+        )
+        .expect("the opt-out reaches the target");
+
+        assert_eq!(keys(&resolved), ["~/.zshrc"]);
+    }
+
+    #[test]
+    fn two_ready_targets_for_one_file_are_refused_even_unmerged() {
+        // `resolve` takes any `Config`, and one that did not come through the
+        // merge can still carry two spellings of one file.
+        let global = layer(
+            "bx.toml",
+            LayerKind::Global,
+            "[[value]]\nname = \"acct\"\nkind = \"string\"\ndefault = \"one\"\n\
+             [[target]]\npath = \"~/.config/{{acct}}/settings.json\"\ncontent = \"GLOBAL\"\n",
+        )
+        .unwrap();
+        let local = layer(
+            "local.toml",
+            LayerKind::Local,
+            "[[target]]\npath = \"~/.config/one/settings.json\"\ncontent = \"LOCAL\"\n",
+        )
+        .unwrap();
+        let mut config = global.config;
+        config.targets.extend(local.config.targets);
+
+        let message = resolve(&config, &home()).unwrap_err().to_string();
+
+        assert!(message.contains("local.toml:1"), "{message}");
+        assert!(
+            message.contains("same file as the target at bx.toml:"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn answering_the_values_releases_the_blocked_target() {
         let global = "[[value]]\nname = \"git_email\"\nkind = \"email\"\nrequired = true\n\
                       [[target]]\npath = \"~/.gitconfig.d/identity\"\n\
@@ -520,7 +943,7 @@ mod tests {
     fn an_include_line_is_substituted() {
         let resolved = resolved(
             "[[value]]\nname = \"ssh_dir\"\nkind = \"path\"\n\
-             [[target]]\npath = \"~/.ssh/config\"\ncontent = \"Host x\"\n\
+             [[target]]\npath = \"~/.ssh/config\"\n\
              attach = \"include\"\ninclude = \"Include {{ssh_dir}}/config.d/*.conf\"\n",
             Some("[values]\nssh_dir = \"~/.ssh\"\n"),
         )

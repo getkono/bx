@@ -7,8 +7,14 @@
 //! a store that has to be extended every time something new wants caching.
 //!
 //! Losing a fingerprint costs a recomputation and nothing else, which is why
-//! this is one type with two entry points rather than the ledger's read-only and
-//! writable pair: no consumer needs the write capability expressed in the type.
+//! this is one type rather than the ledger's read-only and writable pair: no
+//! consumer needs the write capability expressed in the type, and a
+//! `Fingerprints` value is not itself proof of anything.
+//!
+//! The lock is therefore demanded where it is actually needed — at
+//! [`Fingerprints::save`], the only call that writes — rather than at a
+//! constructor that would take a guard and drop it. [`Fingerprints::read`] is
+//! lockless and says so.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Iter;
@@ -109,18 +115,18 @@ pub struct Fingerprints {
 impl Fingerprints {
     /// Read the cache without taking a lock.
     ///
-    /// Never fails: a damaged `fingerprints.mpk` is quarantined and this returns
-    /// an empty cache. Losing a cache costs a recomputation, which is exactly
-    /// what a cache is allowed to cost.
-    #[must_use]
-    pub fn read(dir: &StateDir) -> Loaded<Self> {
+    /// A damaged `fingerprints.mpk` is quarantined and this returns an empty
+    /// cache. Losing a cache costs a recomputation, which is exactly what a
+    /// cache is allowed to cost.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Read`] if `fingerprints.mpk` exists and cannot be read. A file
+    /// whose bytes were never seen is not damaged and is never quarantined; a
+    /// caller is free to treat the failure as a cache miss, but it has to
+    /// decide that itself rather than have a rename decide it.
+    pub fn read(dir: &StateDir) -> Result<Loaded<Self>, Error> {
         store::load(&dir.fingerprints(), KIND, VERSION)
-    }
-
-    /// Read the cache for writing, under the exclusive lock.
-    #[must_use]
-    pub fn open(dir: &StateDir, _lock: &ExclusiveLock) -> Loaded<Self> {
-        Self::read(dir)
     }
 
     /// The fingerprint recorded under `key`.
@@ -166,13 +172,18 @@ impl Fingerprints {
         self.entries.is_empty()
     }
 
-    /// Write the cache out, atomically.
+    /// Write the cache out, atomically, under the exclusive lock.
+    ///
+    /// The guard is required rather than merely documented: this is the only
+    /// call in the module that writes the state directory, so this is the only
+    /// signature that can carry the requirement honestly. It is not stored —
+    /// presenting it is the point.
     ///
     /// # Errors
     ///
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
     /// leaves the previous cache exactly as it was.
-    pub fn save(&self, dir: &StateDir) -> Result<(), Error> {
+    pub fn save(&self, dir: &StateDir, _lock: &ExclusiveLock) -> Result<(), Error> {
         store::save(&dir.fingerprints(), KIND, VERSION, self)
     }
 }
@@ -238,13 +249,13 @@ mod tests {
         let dir = StateDir::resolve(home.path());
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
 
-        let mut fingerprints = Fingerprints::open(&dir, &lock).value;
+        let mut fingerprints = Fingerprints::read(&dir).expect("read").value;
         for key in ["activation:uv", "activation:mise", "activation:rustup"] {
             fingerprints.set(key, Fingerprint::hashed(key.as_bytes()));
         }
-        fingerprints.save(&dir).expect("save");
+        fingerprints.save(&dir, &lock).expect("save");
 
-        let reloaded = Fingerprints::read(&dir);
+        let reloaded = Fingerprints::read(&dir).expect("read");
         assert_eq!(reloaded.health, Health::Loaded);
         let keys: Vec<_> = reloaded.value.iter().map(|(key, _)| key.as_str()).collect();
         assert_eq!(
@@ -262,12 +273,13 @@ mod tests {
     fn saving_the_same_cache_twice_produces_identical_bytes() {
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
         let mut fingerprints = Fingerprints::default();
         fingerprints.set("b", Fingerprint::raw(vec![2]));
         fingerprints.set("a", Fingerprint::raw(vec![1]));
-        fingerprints.save(&dir).expect("first");
+        fingerprints.save(&dir, &lock).expect("first");
         let first = std::fs::read(dir.fingerprints()).expect("read");
-        fingerprints.save(&dir).expect("second");
+        fingerprints.save(&dir, &lock).expect("second");
         assert_eq!(std::fs::read(dir.fingerprints()).expect("read"), first);
     }
 
@@ -291,17 +303,21 @@ mod tests {
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("ensure");
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
         std::fs::write(dir.fingerprints(), b"\x00\x01 not an envelope").expect("seed");
 
-        let loaded = Fingerprints::read(&dir);
+        let loaded = Fingerprints::read(&dir).expect("read");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
         assert!(dir.root().join("fingerprints.mpk.corrupt").exists());
 
         // The point of a cache: the next save writes a clean file and nothing
         // the user has to clear is left behind.
-        loaded.value.save(&dir).expect("save");
-        assert_eq!(Fingerprints::read(&dir).health, Health::Loaded);
+        loaded.value.save(&dir, &lock).expect("save");
+        assert_eq!(
+            Fingerprints::read(&dir).expect("read").health,
+            Health::Loaded
+        );
     }
 
     #[test]
@@ -319,7 +335,7 @@ mod tests {
         )
         .expect("seed");
 
-        let loaded = Fingerprints::read(&dir);
+        let loaded = Fingerprints::read(&dir).expect("read");
         assert_eq!(
             loaded.health,
             Health::Reset(Damage::WrongKind {

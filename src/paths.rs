@@ -197,9 +197,12 @@ pub fn normalize_rooted(raw: &str) -> Result<String, Error> {
         });
     };
 
-    // `rest` is relative, so `normalize` keeps a leading `..` that has nothing
-    // to cancel — which is exactly the climb the root then rules on.
-    let folded = normalize(Path::new(rest));
+    // `rest` is relative to the root, so `normalize` keeps a leading `..` that
+    // has nothing to cancel — which is exactly the climb the root then rules on.
+    // Its leading slashes are separators and are stripped first: `~//..` has the
+    // rest `/..`, which `normalize` would read as absolute and clamp at `/`,
+    // turning a climb out of the home into the home itself.
+    let folded = normalize(Path::new(rest.trim_start_matches('/')));
     let folded = folded.to_string_lossy();
     let mut parts: Vec<&str> = folded
         .split('/')
@@ -1144,8 +1147,17 @@ mod tests {
             ".",
             "",
             "a/../../b",
+            // A rest that opens with a slash: `~//..` is `~` then `/..`, and it
+            // climbs out of the root however many slashes separate the two.
+            "/..",
+            "/../x",
+            "//..",
+            "/x",
+            "//x",
         ] {
-            let folded = normalize(Path::new(rest));
+            // The rest is relative to its root, so its leading slashes are the
+            // separator's and not an absolute path's.
+            let folded = normalize(Path::new(rest.trim_start_matches('/')));
             let folded = folded.to_string_lossy();
 
             let absolute = normalize_rooted(&format!("/{rest}")).expect("absolute always folds");
@@ -1180,6 +1192,12 @@ mod tests {
             "~/../../etc/passwd",
             "~/.ssh/../../etc",
             "~/a/../..",
+            // A doubled separator after `~` is still a climb out of the home,
+            // not an absolute `/..` clamped at the filesystem root.
+            "~//..",
+            "~//../x",
+            "~///../x",
+            "~//../.bashrc",
         ] {
             assert_eq!(
                 Portable::parse_in(escaping, &home()),
@@ -1187,6 +1205,11 @@ mod tests {
                 "{escaping}"
             );
         }
+        assert_eq!(
+            Portable::parse_in("~//x", &home()).unwrap().as_str(),
+            "~/x",
+            "a doubled separator that does not climb still folds"
+        );
         assert_eq!(
             Error::EscapesRoot("~/..".to_string()).to_string(),
             "a portable path may not climb out of the home it is rooted in: ~/.."

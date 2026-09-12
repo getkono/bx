@@ -1706,11 +1706,31 @@ mod tests {
         // Clamped, `~/../../..` is `/`, and an `is_root` value answered that way
         // makes every destination on the filesystem admissible with nothing on
         // screen to say so.
-        for climbing in ["~/..", "~/../../..", "~/.ssh/../../etc"] {
+        for climbing in [
+            "~/..",
+            "~/../../..",
+            "~/.ssh/../../etc",
+            "~//..",
+            "~//../etc",
+            "~///../etc",
+        ] {
             let message =
                 check(ValueKind::Path, climbing).expect_err(&format!("{climbing} was accepted"));
             assert!(message.contains("not climb out of"), "{message}");
         }
+
+        // Through the entry point `bx init` calls, which once answered
+        // `~//../etc` with `/var/home/example/etc`.
+        let values =
+            ResolvedValues::resolve(vec![a_decl("scratch", ValueKind::Path)], &[], &a_home())
+                .unwrap();
+        let message = values
+            .check_answer("scratch", "~//../etc")
+            .expect_err("a doubled separator is still a climb out of the home");
+        assert!(
+            message.to_string().contains("not climb out of"),
+            "{message}"
+        );
         assert_eq!(
             check(ValueKind::Path, "~/.cache/../scratch").unwrap(),
             "/var/home/example/scratch",

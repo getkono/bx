@@ -530,6 +530,19 @@ mod tests {
     }
 
     #[test]
+    fn a_committed_path_that_climbs_out_of_the_home_through_a_doubled_slash_is_refused() {
+        // `~//../.bashrc` once folded to `~/.bashrc` and resolved ready: its
+        // rest, `/../.bashrc`, was normalised as an absolute path and clamped.
+        let message = resolved(
+            "[[target]]\npath = \"~//../.bashrc\"\ncontent = \"x\"\n\
+             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+            None,
+        )
+        .expect_err("a climb out of the home is refused however it is spelled");
+        assert!(message.contains("climb out of the home"), "{message}");
+    }
+
+    #[test]
     fn a_substitution_that_breaks_a_key_path_is_a_load_error() {
         let message = resolved(
             "[[value]]\nname = \"setting\"\nkind = \"string\"\n\

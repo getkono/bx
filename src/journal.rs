@@ -1216,12 +1216,43 @@ fn blob_len(path: &Path) -> Option<u64> {
 /// Remove `path` if it is there, and `fsync` the directory it was in.
 ///
 /// Absence is success: the whole recovery path is re-runnable, and a second run
-/// finds what the first removed already gone.
+/// finds what the first removed already gone. A missing directory is the same
+/// absence, since nothing can be in it.
+///
+/// The directory is opened **before** the unlink and `fsync`ed after it, the
+/// order `fs::write_atomically` keeps for a rename. Removing an entry needs
+/// write and search permission on its directory, and opening the directory
+/// needs read, so in a `0300` directory an open placed after the unlink fails
+/// with the file already gone: an `Err` from a removal that happened. Opened
+/// first, that failure happens while the file is still in place.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] wrapping the failing `unlink` or `fsync`.
+/// [`Error::Io`] wrapping the failing `open` of the directory, `unlink`, or
+/// `fsync`. Only a failing `fsync` is returned after the file was removed.
 pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
+    // `Path::parent` of a bare name is the empty path, which names the current
+    // directory the unlink resolves against, not a directory that is absent.
+    let dir = path.parent().map(|dir| {
+        if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        }
+    });
+    let opened = match dir {
+        None => None,
+        Some(dir) => match crate::fs::durable::Dir::open(dir) {
+            Ok(handle) => Some((dir, handle)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(Error::Io {
+                    path: dir.to_path_buf(),
+                    source,
+                });
+            }
+        },
+    };
     match crate::fs::durable::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1232,8 +1263,8 @@ pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
             });
         }
     }
-    if let Some(dir) = path.parent() {
-        fsync_dir(dir)?;
+    if let Some((dir, handle)) = &opened {
+        sync_dir(handle, dir)?;
     }
     Ok(())
 }
@@ -1274,21 +1305,34 @@ pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
     Ok(())
 }
 
-/// `fsync` a directory, so a rename or an unlink inside it survives a power
-/// loss.
+/// Open a directory so that a rename or an unlink inside it can be made
+/// durable.
+///
+/// Call it **before** that operation and [`sync_dir`] after, never the two
+/// together afterwards: an open that fails after the operation reports an
+/// error for a change that has already happened. See [`unlink`].
 ///
 /// # Errors
 ///
-/// [`Error::Io`] wrapping the failing `open` or `fsync`.
-pub(crate) fn fsync_dir(dir: &Path) -> Result<(), Error> {
-    let fail = |source: std::io::Error| Error::Io {
+/// [`Error::Io`] naming `dir` for the failing `open`.
+pub(crate) fn open_dir(dir: &Path) -> Result<crate::fs::durable::Dir, Error> {
+    crate::fs::durable::Dir::open(dir).map_err(|source| Error::Io {
         path: dir.to_path_buf(),
         source,
-    };
-    crate::fs::durable::Dir::open(dir)
-        .map_err(fail)?
-        .sync()
-        .map_err(fail)
+    })
+}
+
+/// `fsync` a directory [`open_dir`] opened, so a rename or an unlink made
+/// inside it since survives a power loss.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming `dir` for the failing `fsync`.
+pub(crate) fn sync_dir(handle: &crate::fs::durable::Dir, dir: &Path) -> Result<(), Error> {
+    handle.sync().map_err(|source| Error::Io {
+        path: dir.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -1906,6 +1950,62 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("a tempdir");
         prune_dirs(&[dir.path().join("never-existed")]).expect("prune");
         unlink(&dir.path().join("never-there")).expect("unlink");
+        // Opening the directory first must not turn a missing one into an error.
+        unlink(&dir.path().join("gone/never-there")).expect("unlink in a missing directory");
+    }
+
+    #[test]
+    fn a_removal_opens_its_directory_before_the_unlink_and_syncs_it_after() {
+        // The order `fs::write_atomically` keeps for a rename, observed: the
+        // directory handle exists before the file goes, and the sync follows.
+        use crate::fs::durable::{Event, recording};
+
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let file = dir.path().join("f");
+        plant_file(&file, "x\n", Mode::DEFAULT_FILE);
+
+        let (removed, events) = recording(|| unlink(&file));
+        removed.expect("unlink");
+
+        assert_eq!(
+            events,
+            [
+                Event::OpenDir(dir.path().to_path_buf()),
+                Event::Unlink(file.clone()),
+                Event::SyncDir(dir.path().to_path_buf()),
+            ],
+        );
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_opened_fails_a_removal_before_the_file_goes() {
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so there is nothing to assert.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let file = dir.path().join("f");
+        plant_file(&file, "the user's\n", Mode::DEFAULT_FILE);
+        // Write and search, no read: the file can be unlinked, and the directory
+        // cannot be opened to fsync the unlink.
+        fs::set_mode(dir.path(), Mode::from_bits(0o300)).expect("chmod");
+
+        let result = unlink(&file);
+        fs::set_mode(dir.path(), Mode::PRIVATE_DIR).expect("unlock for cleanup");
+
+        match result {
+            Err(Error::Io { path, source }) => {
+                assert_eq!(path, dir.path());
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected an io error naming the directory, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&file).expect("the file is still there"),
+            b"the user's\n",
+            "an Err means the removal did not happen",
+        );
     }
 
     #[test]

@@ -353,12 +353,19 @@ pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
         return Ok(None);
     }
     let aside = StateDir::quarantine(&path);
+    // Opened before the rename, as `journal::unlink` opens before its unlink: in
+    // a directory that can be written but not read, an open placed after the
+    // rename fails with the journal already moved aside.
+    let dir = path
+        .parent()
+        .map(|dir| journal::open_dir(dir).map(|handle| (dir, handle)))
+        .transpose()?;
     std::fs::rename(&path, &aside).map_err(|source| journal::Error::Io {
         path: path.clone(),
         source,
     })?;
-    if let Some(dir) = path.parent() {
-        journal::fsync_dir(dir)?;
+    if let Some((dir, handle)) = &dir {
+        journal::sync_dir(handle, dir)?;
     }
     tracing::warn!(
         path = %path.display(),
@@ -1827,6 +1834,39 @@ mod tests {
             matches!(err, Error::Journal(journal::Error::Io { .. })),
             "got {err}"
         );
+        assert!(state.journal().is_file(), "the interruption still stands");
+        assert!(!StateDir::quarantine(&state.journal()).exists());
+    }
+
+    #[test]
+    fn abandoning_in_a_state_directory_that_cannot_be_opened_moves_nothing() {
+        // Write and search, no read: the rename would succeed and the directory
+        // cannot be opened to fsync it. The open comes first, so the failure
+        // leaves the journal where it was.
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so there is nothing to assert.
+            return;
+        }
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+
+        fs::set_mode(state.root(), Mode::from_bits(0o300)).expect("chmod");
+        let abandoned = abandon(&state);
+        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it readable again");
+
+        match abandoned {
+            Err(Error::Journal(journal::Error::Io { path, source })) => {
+                assert_eq!(path, state.root());
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected an io error naming the state directory, got {other:?}"),
+        }
         assert!(state.journal().is_file(), "the interruption still stands");
         assert!(!StateDir::quarantine(&state.journal()).exists());
     }

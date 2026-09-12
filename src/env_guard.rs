@@ -455,9 +455,13 @@ pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
         if line.starts_with('#') {
             continue;
         }
-        let Some((name, value)) = assignment(line) else {
+        let Some((name, assigned)) = assignment(line) else {
             continue;
         };
+        // A valueless `export NAME` still has to be judged — an inherited value
+        // is no more a declared root than an empty one — and `""` is what it is
+        // judged as. It is what happens *after* the verdict that differs.
+        let value = assigned.unwrap_or("");
         // `assignment` returns the *first* `NAME=` on the line and treats
         // everything after it as one value. A shell would export both, so
         // judging the head alone can allow a line whose tail relocates a tool
@@ -482,7 +486,13 @@ pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
         }
         // Learn the assignment only *after* judging it, as a shell does: the
         // right-hand side sees the previous value of the name, not this one.
-        seen.insert(name.to_string(), unquote(value).0.to_string());
+        // A line that assigned no value teaches nothing: recording it as empty
+        // would make `$NAME/x` resolve to `/x` here and to something else
+        // entirely in a shell that inherited a value. `$HOME` is the one name
+        // that may come from outside the fragment.
+        if let Some(assigned) = assigned {
+            seen.insert(name.to_string(), unquote(assigned).0.to_string());
+        }
     }
     found
 }
@@ -674,8 +684,14 @@ fn unquote(value: &str) -> (&str, bool) {
     (value, true)
 }
 
-/// The name and value a shell line assigns, if it assigns one.
-fn assignment(line: &str) -> Option<(&str, &str)> {
+/// The name a shell line assigns, and the value it gives it.
+///
+/// The value is `None` for `export NAME` with nothing after it. That form does
+/// **not** set the variable to the empty string: it marks whatever the process
+/// inherited for export, and what that is cannot be known from the fragment.
+/// The distinction matters to the caller, which must judge the line but must
+/// not learn a value the shell would not have.
+fn assignment(line: &str) -> Option<(&str, Option<&str>)> {
     let rest = ["export ", "typeset -x ", "declare -x ", "setenv "]
         .iter()
         .find_map(|kw| line.strip_prefix(*kw))
@@ -684,16 +700,14 @@ fn assignment(line: &str) -> Option<(&str, &str)> {
 
     // `setenv NAME value` separates with a space; everything else uses `=`.
     let (name, value) = match rest.split_once('=') {
-        Some((name, value)) => (name, value),
+        Some((name, value)) => (name, Some(value)),
         None => {
             let mut words = rest.split_whitespace();
-            // `export NAME` with no value yields an empty value, which is not
-            // an absolute path, so it stays flagged.
-            (words.next()?, words.next().unwrap_or(""))
+            (words.next()?, words.next())
         }
     };
     let name = name.trim();
-    is_variable_name(name).then_some((name, value.trim()))
+    is_variable_name(name).then_some((name, value.map(str::trim)))
 }
 
 /// Whether `value` has another `NAME=` in it, behind whitespace.
@@ -1298,6 +1312,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Reason::MultipleAssignments]
         );
+    }
+
+    #[test]
+    fn a_valueless_export_teaches_the_scan_nothing() {
+        // `export X` marks an inherited value for export; it does not set `X`
+        // to the empty string. Learned as empty, `$X/...` resolved to a path
+        // inside the root and the fragment scanned clean — while on a machine
+        // where `X` is `/tmp` the shell writes a `CARGO_HOME` outside every
+        // root. An absent name is unresolved, which is the safe direction.
+        let content = concat!(
+            "export X\n",
+            "export CARGO_HOME=$X/var/mnt/scratch/example/cargo\n",
+        );
+        let found = scan_with(content, &rooted());
+        assert_eq!(
+            found
+                .iter()
+                .map(|violation| (violation.line, violation.reason))
+                .collect::<Vec<_>>(),
+            vec![(2, Reason::UnresolvedReference)]
+        );
+
+        // The valueless form is still judged when the name itself relocates.
+        assert_eq!(
+            scan_with("export CARGO_HOME\n", &rooted())
+                .iter()
+                .map(|violation| (violation.line, violation.reason))
+                .collect::<Vec<_>>(),
+            vec![(1, Reason::NotAbsolute)]
+        );
+
+        // `setenv NAME value` does assign, and is still learned.
+        let content = concat!(
+            "setenv SCRATCH_HOME /var/mnt/scratch/example\n",
+            "export CARGO_HOME=$SCRATCH_HOME/cargo\n",
+        );
+        assert_eq!(scan_with(content, &rooted()), vec![]);
     }
 
     #[test]

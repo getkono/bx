@@ -42,8 +42,19 @@ pub struct Holder {
 impl Holder {
     /// The holder bx reports when the lock file says nothing usable.
     ///
-    /// A stale, empty or unreadable body is not an error: the kernel is the
-    /// authority on who holds the lock, and the body is only a courtesy.
+    /// An empty or unreadable body is not an error: the kernel is the authority
+    /// on who holds the lock, and the body is only a courtesy. This is the
+    /// honest answer whenever the holder is a *reader* — readers write no
+    /// identity, because several of them can hold the lock at once and there is
+    /// no single body for them to share — and whenever a writer released the
+    /// lock cleanly, since [`ExclusiveLock::drop`] truncates the body before
+    /// unlocking precisely so that no released pid is ever reported as current.
+    ///
+    /// A pid that *is* reported can still be stale in one case: a writer killed
+    /// outright leaves its line behind, because the kernel releases the lock and
+    /// nothing runs in the dead process to clear it. Naming a pid that has
+    /// just died is a smaller error than naming one that released normally
+    /// minutes ago, and both are bounded by the kernel remaining the authority.
     fn unknown() -> Self {
         Self {
             pid: 0,
@@ -244,6 +255,13 @@ fn read_holder(path: &Path) -> Holder {
 
 impl Drop for ExclusiveLock {
     fn drop(&mut self) {
+        // The body is truncated *before* the unlock, while this process is
+        // still the only one that can be writing it. Otherwise the identity
+        // line outlives the lock, and the next refusal — by a reader, which
+        // writes no body of its own — would name a released pid that may
+        // belong to an unrelated process by then. A user acting on that
+        // message acts on the wrong process.
+        let _ = rustix::fs::ftruncate(&self.fd, 0);
         // Closing the descriptor would release it anyway; the explicit unlock
         // makes the release immediate and independent of any dup that may exist.
         // A failure here has nowhere to go and nothing to fix.
@@ -441,6 +459,51 @@ mod tests {
         let _reader = SharedLock::acquire(&dir).expect("reader");
         let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
         assert!(matches!(err, Error::Locked { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_refusal_never_names_a_writer_that_has_already_released() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        // A writer runs and finishes, leaving its identity behind unless the
+        // drop clears it.
+        let writer = ExclusiveLock::acquire(&dir).expect("writer");
+        assert_eq!(
+            std::fs::read_to_string(dir.lock()).expect("read"),
+            format!("{} {}\n", std::process::id(), program_name()),
+        );
+        drop(writer);
+        assert_eq!(
+            std::fs::read(dir.lock()).expect("read"),
+            Vec::<u8>::new(),
+            "a released writer must not leave a pid behind",
+        );
+
+        // Now a reader holds it, and writes no identity of its own. The
+        // refusal must not attribute the lock to the writer that has gone.
+        let _reader = SharedLock::acquire(&dir).expect("reader");
+        let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
+        let Error::Locked { holder, .. } = &err else {
+            panic!("got {err}");
+        };
+        assert_eq!(
+            holder,
+            &Holder::unknown(),
+            "a reader-held lock must report an unknown holder, not a stale pid",
+        );
+        assert_eq!(holder.pid, 0);
+    }
+
+    /// The program name [`identify`] writes, derived the same way it derives it.
+    fn program_name() -> String {
+        std::env::args()
+            .next()
+            .and_then(|arg0| {
+                Path::new(&arg0)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "bx".to_string())
     }
 
     #[test]

@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Iter;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -360,9 +360,10 @@ impl Ledger {
     /// ledger entry referencing them cannot outlive them. The ledger itself is
     /// not written until [`Ledger::save`].
     ///
-    /// A blob whose digest already names a file is left alone: the content is
-    /// addressed by its hash, so an existing file with that name already holds
-    /// exactly these bytes.
+    /// A blob whose digest already names a file **of the same length** is left
+    /// alone; anything else at that name is rewritten. The name is evidence of
+    /// the content, not proof of it, and the guarantee this function owes its
+    /// caller is that the bytes behind the returned [`RestoreRef`] are on disk.
     ///
     /// # Errors
     ///
@@ -429,12 +430,25 @@ impl Ledger {
         store::save(&self.dir.ledger(), KIND, VERSION, &self.view)
     }
 
-    /// Write `bytes` to `restore/<digest>`, durably, unless it is already there.
+    /// Write `bytes` to `restore/<digest>`, durably, unless the bytes are
+    /// already there.
+    ///
+    /// The skip is guarded by the blob's *length*, not merely by its existence.
+    /// A name proves content only while nothing has damaged the file, and this
+    /// design already accepts that a blob can stop matching its name — that is
+    /// what [`Error::RestoreCorrupt`] is for. Checking when the bytes are in
+    /// hand costs one `stat` and repairs the blob; checking only in
+    /// [`LedgerView::restore_bytes`] discovers the loss when the target has
+    /// already been overwritten and the original bytes exist nowhere.
+    ///
+    /// A `stat` rather than a re-hash: it keeps the common repeat path O(1),
+    /// and the two ways a blob is plausibly lost — a truncated write and an
+    /// empty file left by an interrupted one — both change the length.
     fn store_blob(&self, digest: ContentHash, bytes: &[u8]) -> Result<(), Error> {
         let restore = self.dir.restore();
         ensure_dir(&restore, Mode::PRIVATE_DIR)?;
         let path = restore.join(digest.to_hex());
-        if path.exists() {
+        if blob_len(&path) == Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
             return Ok(());
         }
         // `write_atomically` fsyncs the blob and then `restore/` itself, which
@@ -442,6 +456,15 @@ impl Ledger {
         write_atomically(&path, bytes, Mode::PRIVATE_FILE)?;
         Ok(())
     }
+}
+
+/// The length of the file at `path`, or `None` if it is not a readable file.
+///
+/// `None` means *rewrite it*: a blob that cannot be stat'ed is not a blob whose
+/// content has been established.
+fn blob_len(path: &Path) -> Option<u64> {
+    let metadata = std::fs::metadata(path).ok()?;
+    metadata.is_file().then_some(metadata.len())
 }
 
 /// Where a snapshot with this digest lives.
@@ -820,14 +843,79 @@ mod tests {
         let blob = dir.restore().join(ContentHash::of(b"unchanged").to_hex());
         let first = std::fs::metadata(&blob).expect("stat");
 
+        // A second, distinct target displacing identical bytes: the skip is
+        // reached through `store_blob` rather than through first-prior-wins.
         ledger
-            .record(entry("~/a", b"y").with_prior(prior))
+            .record(entry("~/b", b"y").with_prior(prior))
             .expect("second");
         let second = std::fs::metadata(&blob).expect("stat");
         assert_eq!(
             first.ino(),
             second.ino(),
-            "an existing blob already holds exactly these bytes",
+            "a blob of the right name and length already holds these bytes",
+        );
+    }
+
+    #[test]
+    fn a_blob_of_the_wrong_length_is_rewritten_rather_than_trusted() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        // An orphan left by an interrupted write: the right name, the wrong
+        // bytes. Trusting the name here loses the user's file, because `record`
+        // returns `Ok` and the target is overwritten straight afterwards.
+        ensure_dir(&dir.restore(), Mode::PRIVATE_DIR).expect("restore dir");
+        let blob = dir
+            .restore()
+            .join(ContentHash::of(b"the user wrote this").to_hex());
+        std::fs::write(&blob, b"").expect("seed an empty orphan");
+
+        let stored = ledger
+            .record(
+                entry("~/.bashrc", b"bx wrote this").with_prior(PriorBytes::Bytes {
+                    bytes: b"the user wrote this".to_vec(),
+                    mode: Mode::DEFAULT_FILE,
+                }),
+            )
+            .expect("record");
+        let Prior::Existed(reference) = stored.prior.clone() else {
+            panic!("expected a snapshot");
+        };
+
+        assert_eq!(
+            std::fs::read(&blob).expect("read"),
+            b"the user wrote this",
+            "the blob must be repaired before `record` returns Ok",
+        );
+        assert_eq!(
+            ledger.restore_bytes(&dir, &reference).expect("restore"),
+            b"the user wrote this",
+        );
+    }
+
+    #[test]
+    fn a_truncated_blob_is_repaired_by_the_next_record_of_those_bytes() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let prior = PriorBytes::Bytes {
+            bytes: b"the user wrote all of this".to_vec(),
+            mode: Mode::DEFAULT_FILE,
+        };
+        ledger
+            .record(entry("~/a", b"x").with_prior(prior.clone()))
+            .expect("first");
+        let blob = dir
+            .restore()
+            .join(ContentHash::of(b"the user wrote all of this").to_hex());
+        std::fs::write(&blob, b"the user wrote").expect("truncate");
+
+        ledger
+            .record(entry("~/b", b"y").with_prior(prior))
+            .expect("second");
+        assert_eq!(
+            std::fs::read(&blob).expect("read"),
+            b"the user wrote all of this",
         );
     }
 

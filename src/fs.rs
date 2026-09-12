@@ -231,6 +231,16 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_mode_becomes_the_mode_bx_writes() {
+        let declared = crate::config::target::Mode::parse_octal("0600").expect("a valid mode");
+        assert_eq!(Mode::from(declared), Mode::PRIVATE_FILE);
+        assert_eq!(
+            Mode::from(crate::config::target::Mode::DEFAULT_DIR),
+            Mode::DEFAULT_DIR,
+        );
+    }
+
+    #[test]
     fn a_mode_round_trips_through_messagepack() {
         let bytes = rmp_serde::to_vec_named(&Mode::PRIVATE_FILE).expect("encode");
         let back: Mode = rmp_serde::from_slice(&bytes).expect("decode");

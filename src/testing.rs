@@ -273,21 +273,74 @@ mod tests {
         check_is_a_throwaway_home(&candidate, Some(&real_home));
     }
 
+    /// How a forbidden needle is matched.
+    #[derive(Clone, Copy)]
+    enum Rule {
+        /// Anywhere in the text, boundaries included.
+        ///
+        /// For a **path** fragment. A path cannot occur inside an English word,
+        /// so it needs no leading word boundary — and demanding one is what made
+        /// this guard miss the very spelling it was written to catch: the real
+        /// directory is `/var/<fragment>`, where the fragment is preceded by
+        /// `r`, so the canonical path was not reported.
+        Anywhere,
+        /// Only where it is not preceded by an alphanumeric character.
+        ///
+        /// For an **account name**, which does occur inside ordinary words.
+        WholeWord,
+    }
+
+    /// Every user-specific needle, with the rule that matches it.
+    ///
+    /// Assembled from fragments at runtime so this file is not its own
+    /// counter-example.
+    fn user_specific_needles() -> Vec<(String, Rule)> {
+        vec![
+            (["/m", "nt/sc", "ratch/go", "lem"].concat(), Rule::Anywhere),
+            (["jus", "tin"].concat(), Rule::WholeWord),
+            (["jus", "ty"].concat(), Rule::WholeWord),
+            (["go", "lem"].concat(), Rule::WholeWord),
+        ]
+    }
+
+    /// Every forbidden needle `text` names. `text` is expected lowercased.
+    fn user_specific_offences(text: &str) -> Vec<String> {
+        user_specific_needles()
+            .into_iter()
+            .filter(|(needle, rule)| match rule {
+                Rule::Anywhere => text.contains(needle.as_str()),
+                Rule::WholeWord => contains_token(text, needle),
+            })
+            .map(|(needle, _)| needle)
+            .collect()
+    }
+
+    #[test]
+    fn a_user_specific_path_is_an_offence_wherever_it_appears() {
+        let fragment = ["/m", "nt/sc", "ratch/go", "lem"].concat();
+        let account = ["go", "lem"].concat();
+
+        // The canonical spelling on the machine this repository lives on. The
+        // fragment is preceded by `r`, so the word-boundary rule exempted it and
+        // the primary case went unreported.
+        assert!(!user_specific_offences(&format!("/var{fragment}/dev/x")).is_empty());
+        assert!(!user_specific_offences(&format!("{fragment}/dev/x")).is_empty());
+        // The bare account name, which was not a needle at all.
+        assert!(!user_specific_offences(&format!("/home/{account}")).is_empty());
+        assert!(!user_specific_offences(&format!("home = {account}")).is_empty());
+        // And an account name inside an ordinary word still is not an offence.
+        assert!(user_specific_offences(&format!("an amal{account} of prose")).is_empty());
+    }
+
     /// Invariant 5 has no exception, and a one-time fix without a regression
-    /// guard is not enforcement. The needles are assembled from fragments at
-    /// runtime so this file is not its own counter-example, and this file is
-    /// skipped for the same reason.
+    /// guard is not enforcement. This file is skipped, because the needles it
+    /// hunts for have to appear in it somewhere.
     ///
     /// The blast radius is `src/` only. `Cargo.toml`'s `authors` field names a
     /// person on purpose: authorship metadata is a legitimate exception, and a
     /// guard that fired on it would be deleted rather than obeyed.
     #[test]
     fn no_user_specific_literal_survives_under_src() {
-        let needles = [
-            ["/m", "nt/sc", "ratch/go", "lem"].concat(),
-            ["jus", "tin"].concat(),
-            ["jus", "ty"].concat(),
-        ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let self_path = root.join("testing.rs");
 
@@ -299,10 +352,8 @@ mod tests {
             let text = std::fs::read_to_string(&file)
                 .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()))
                 .to_ascii_lowercase();
-            for needle in &needles {
-                if contains_token(&text, needle) {
-                    offences.push(format!("{} names {needle}", file.display()));
-                }
+            for needle in user_specific_offences(&text) {
+                offences.push(format!("{} names {needle}", file.display()));
             }
         }
 

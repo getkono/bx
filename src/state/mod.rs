@@ -15,10 +15,12 @@
 //! value to honour passes it to [`StateDir::resolve_in`].
 
 mod dir;
+mod hash;
 
 use std::path::PathBuf;
 
 pub use dir::StateDir;
+pub use hash::ContentHash;
 
 /// Everything that can go wrong in the state directory.
 #[derive(Debug, thiserror::Error)]

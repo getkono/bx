@@ -21,7 +21,9 @@
 //! together, and a silent no-op is the failure mode this tool exists to end.
 
 pub mod layers;
+pub mod merge;
 pub mod origin;
+pub mod resolve;
 pub mod target;
 pub mod values;
 
@@ -58,6 +60,16 @@ pub struct Config {
     pub values: Vec<ValueDecl>,
     /// `[values]`, in document order. Parsed, never resolved.
     pub value_assignments: Vec<ValueAssignment>,
+    /// List entries that restate only their natural key and `enabled`.
+    ///
+    /// A **toggle**: it flips the flag on an entry an earlier layer introduced
+    /// and leaves every other field alone, so opting out of a target costs three
+    /// lines in `local.toml` rather than a copy of the whole target — body
+    /// included — that the account wants gone. One list serves every keyed
+    /// section, each toggle carrying the section it came from.
+    ///
+    /// Always empty after [`merge::merge`], which consumes them.
+    pub toggles: Vec<merge::Toggle>,
 }
 
 /// One layer file and what it says.
@@ -216,16 +228,32 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
         match name {
             "target" => {
                 for table in entries(root, name, item, file, text)? {
-                    config
-                        .targets
-                        .push(target::parse_target(table, file, text)?);
+                    // A table whose only keys are `path` and `enabled` is a
+                    // toggle, not a target with no body: it flips a flag on an
+                    // entry an earlier layer introduced.
+                    match merge::toggle_of(table, "target", "path", target::SECTION, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config
+                            .targets
+                            .push(target::parse_target(table, file, text)?),
+                    }
                 }
             }
             "value" => {
                 for table in entries(root, name, item, file, text)? {
-                    config
-                        .values
-                        .push(values::parse_value_decl(table, file, text)?);
+                    match merge::toggle_of(
+                        table,
+                        "value",
+                        "name",
+                        values::DECL_SECTION,
+                        file,
+                        text,
+                    )? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config
+                            .values
+                            .push(values::parse_value_decl(table, file, text)?),
+                    }
                 }
             }
             "values" => {
@@ -246,12 +274,16 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
         }
     }
 
+    // Toggles are checked alongside the entries they flip, so one layer cannot
+    // both restate an entry and toggle it — which would leave the outcome
+    // depending on the order the two were applied in.
     check_unique(
         "target",
         config
             .targets
             .iter()
             .map(|t| (t.path.as_str(), &t.origin))
+            .chain(toggles_in(&config, "target"))
             .collect(),
     )?;
     check_unique(
@@ -260,10 +292,24 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
             .values
             .iter()
             .map(|v| (v.name.as_str(), &v.origin))
+            .chain(toggles_in(&config, "value"))
             .collect(),
     )?;
 
     Ok(config)
+}
+
+/// The toggles in `config` that belong to one section, as `check_unique` wants
+/// them.
+fn toggles_in<'a>(
+    config: &'a Config,
+    section: &'static str,
+) -> impl Iterator<Item = (&'a str, &'a Origin)> {
+    config
+        .toggles
+        .iter()
+        .filter(move |toggle| toggle.section == section)
+        .map(|toggle| (toggle.key.as_str(), &toggle.origin))
 }
 
 /// The elements of an array-of-tables section.
@@ -812,6 +858,28 @@ mod tests {
         );
         assert!(message.contains("first declared at bx.toml:1"), "{message}");
         assert!(message.contains("bx.toml:5"), "{message}");
+    }
+
+    #[test]
+    fn a_duplicate_target_path_spelled_differently_is_rejected() {
+        // The natural key is the normalised Portable, not the bytes a human
+        // typed. Without that, one file quietly acquires two ledger rows.
+        for second in ["~/.ssh/./config", "~/.ssh//config", "~/.ssh/keys/../config"] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nfile = \"a\"\n\n\
+                 [[target]]\npath = \"{second}\"\nfile = \"b\"\n"
+            );
+            assert!(
+                message(&text).contains("duplicate target `~/.ssh/config`"),
+                "{second} should collide with ~/.ssh/config"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_path_that_climbs_out_of_home_is_rejected() {
+        let text = "[[target]]\npath = \"~/../../etc/passwd\"\nfile = \"a\"\n";
+        assert!(message(text).contains("climb out of the home"));
     }
 
     #[test]

@@ -62,7 +62,7 @@ use super::{Ctx, Error, Origin};
 use crate::paths;
 
 /// The `[[value]]` section header, as messages spell it.
-const DECL_SECTION: &str = "[[value]]";
+pub(crate) const DECL_SECTION: &str = "[[value]]";
 
 /// The `[values]` section header, as messages spell it.
 const ASSIGN_SECTION: &str = "[values]";
@@ -1659,6 +1659,22 @@ mod tests {
         let values = resolve(vec![decl], &[assignment]).unwrap();
 
         assert_eq!(values.get("is_desktop").unwrap().text, "true");
+    }
+
+    #[test]
+    fn an_answer_for_a_value_no_layer_declares_is_ignored() {
+        // Deliberately not fatal. An account's `local.toml` outlives the repo
+        // that declared what it answers, so a repo update that drops a
+        // declaration must not stop that account applying anything at all. It is
+        // detectable rather than silent — the value the account meant to answer
+        // is still reported as unset — and listing the leftovers is doctor's.
+        let mut decl = a_decl("scratch_root", ValueKind::Path);
+        decl.required = true;
+
+        let values = resolve(vec![decl], &[answer("scratch_roott", "/var/mnt/x")]).unwrap();
+
+        assert_eq!(values.unset_required_names(), ["scratch_root"]);
+        assert!(values.get("scratch_roott").is_none());
     }
 
     #[test]

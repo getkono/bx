@@ -136,6 +136,23 @@ pub enum Error {
         /// The `~`-rooted spelling to write instead.
         portable: String,
     },
+    /// A stored value that is not the normalised spelling of itself.
+    ///
+    /// Only deserialisation can produce this: every constructor normalises what
+    /// it is given, so a value that round-trips through one is already a fixed
+    /// point. A decoded `~/.ssh/./config` is a *second* key for `~/.ssh/config`,
+    /// and the whole point of normalising at construction is that one file has
+    /// one key.
+    #[error(
+        "a stored path must already be normalised, and {raw} is not; \
+         its normal form is {normalised}"
+    )]
+    NotNormalised {
+        /// The value as it was decoded.
+        raw: String,
+        /// The spelling it normalises to.
+        normalised: String,
+    },
     /// A path, or a home, that is not valid UTF-8.
     ///
     /// A [`Portable`] is stored, compared, hashed and serialised as text, so a
@@ -323,9 +340,58 @@ pub fn config_root() -> Result<PathBuf, Error> {
 ///   normalisation `~/../../etc/passwd` is "under home" and renders to a path
 ///   the kernel resolves to `/etc/passwd`, so a caller gating a write on it
 ///   gates on nothing.
+/// # Deserialisation goes through the same checks
+///
+/// A derived `Deserialize` would take the inner string verbatim, so
+/// [`Portable::parse_in`] and [`Portable::from_path`] would not in fact be the
+/// only constructors: entry A4's ledger and entry A6's journal are `rmp-serde`
+/// documents, and a truncated, restored or hand-edited one would decode
+/// `~/../../etc/passwd` — the value named above as the one that must never
+/// exist — or a `~other/…` that renders to a *relative* path, so `bx rm` would
+/// write into whatever directory bx was invoked from rather than restoring the
+/// file. CLAUDE.md's rule for those files is that a corrupt one degrades to
+/// recomputation; a corrupt one that is *believed* is the failure that rule
+/// exists to prevent.
+///
+/// So `Deserialize` is routed through `TryFrom<String>`, which applies the same
+/// root and normalisation rules as the constructors and rejects anything that
+/// is not already a fixed point. `Serialize` goes through `Into<String>`, which
+/// emits the bare string — byte-identical to the transparent form.
+///
+/// One rule has no channel through serde: [`Error::AbsoluteUnderHome`] needs a
+/// home, and a decoder has none. [`Portable::check_against`] is that rule,
+/// exposed for the loader of any stored document to call.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct Portable(String);
+
+impl TryFrom<String> for Portable {
+    type Error = Error;
+
+    /// The deserialisation entry point: accept exactly what a constructor
+    /// would have produced.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotPortable`], [`Error::UnknownRoot`] and
+    /// [`Error::EscapesRoot`] for a value no constructor would have built, and
+    /// [`Error::NotNormalised`] for one that is well-rooted but not its own
+    /// normal form.
+    fn try_from(raw: String) -> Result<Self, Error> {
+        let normalised = normalise(&raw)?;
+        if normalised == raw {
+            Ok(Self(normalised))
+        } else {
+            Err(Error::NotNormalised { raw, normalised })
+        }
+    }
+}
+
+impl From<Portable> for String {
+    fn from(portable: Portable) -> Self {
+        portable.0
+    }
+}
 
 impl Portable {
     /// Make `path` portable against `home`.
@@ -427,6 +493,37 @@ impl Portable {
     #[must_use]
     pub fn render(&self, home: &Path) -> PathBuf {
         render(&self.0, home)
+    }
+
+    /// Reject an absolute value that names a file under `home`.
+    ///
+    /// The one [`Portable::parse_in`] rule deserialisation cannot apply, because
+    /// a decoder is handed bytes and no home. `/var/home/example/.gitconfig`
+    /// decodes as a well-formed absolute `Portable`, but on the account whose
+    /// home is `/var/home/example` it is a second key for `~/.gitconfig` — one
+    /// file with two ledger rows, which is Invariant 4 failing at the key.
+    ///
+    /// **For entry A4 and entry A6**: call this on every key you load from a
+    /// stored document, against the home the document was written under. A key
+    /// that fails it is a corrupt document, to be degraded to recomputation
+    /// rather than believed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AbsoluteUnderHome`], naming the `~/…` spelling to use instead,
+    /// and [`Error::HomeNotAbsolute`] or [`Error::NotUtf8`] if `home` is not a
+    /// home this crate can answer for.
+    pub fn check_against(&self, home: &Path) -> Result<(), Error> {
+        let home = home_str(home)?;
+        let folded = fold_under_home(&self.0, &home);
+        if folded == self.0 {
+            Ok(())
+        } else {
+            Err(Error::AbsoluteUnderHome {
+                raw: self.0.clone(),
+                portable: folded,
+            })
+        }
     }
 
     /// Whether this path lies under the invoking user's home.
@@ -1083,5 +1180,121 @@ mod tests {
         let decoded: Portable = rmp_serde::from_slice(&encoded).unwrap();
 
         assert_eq!(decoded, portable);
+        // The wire form is unchanged by routing through String: a MessagePack
+        // string, and nothing else, exactly as `serde(transparent)` produced.
+        assert_eq!(rmp_serde::to_vec("~/.ssh/config").unwrap(), encoded);
+    }
+
+    /// Deserialisation is a constructor, and it applies the constructors' rules.
+    ///
+    /// Every row here is a value `parse_in` refuses. A derived `Deserialize`
+    /// took the inner string verbatim and accepted all of them, so a ledger
+    /// truncated by an interrupted apply, restored from a backup, or hand-edited
+    /// decoded a key that renders *relative* -- `bx rm` then writing into
+    /// whatever directory bx was invoked from rather than restoring the file.
+    #[test]
+    fn a_stored_portable_no_constructor_would_build_is_refused() {
+        for (raw, expected) in [
+            // The value Portable's own doc names as the one that must never
+            // exist: decoded whole it claimed under_home() and rendered to a
+            // path the kernel resolves to /etc/passwd.
+            (
+                "~/../../etc/passwd",
+                Error::EscapesRoot("~/../../etc/passwd".to_string()),
+            ),
+            // A root `render` does not expand, so it reached the filesystem as
+            // a relative path.
+            (
+                "~other/.ssh/authorized_keys",
+                Error::UnknownRoot("~other/.ssh/authorized_keys".to_string()),
+            ),
+            (
+                "~.config/starship.toml",
+                Error::UnknownRoot("~.config/starship.toml".to_string()),
+            ),
+            (
+                "relative/oops",
+                Error::NotPortable("relative/oops".to_string()),
+            ),
+            ("", Error::NotPortable(String::new())),
+            // Well-rooted, but a second key for ~/.ssh/config.
+            (
+                "~/.ssh/./config",
+                Error::NotNormalised {
+                    raw: "~/.ssh/./config".to_string(),
+                    normalised: "~/.ssh/config".to_string(),
+                },
+            ),
+        ] {
+            let encoded = rmp_serde::to_vec(raw).unwrap();
+            let decoded = rmp_serde::from_slice::<Portable>(&encoded);
+            assert!(
+                decoded.is_err(),
+                "decoding {raw:?} must fail, got {decoded:?}"
+            );
+            assert_eq!(
+                Portable::try_from(raw.to_string()),
+                Err(expected),
+                "the rule applied to {raw:?}"
+            );
+        }
+    }
+
+    /// The one row of that table serde has no channel for.
+    ///
+    /// `AbsoluteUnderHome` needs a home and a decoder has none, so the rule is
+    /// `check_against`, which A4's ledger and A6's journal call on load.
+    #[test]
+    fn a_stored_absolute_path_under_the_home_is_caught_by_check_against() {
+        let encoded = rmp_serde::to_vec("/var/home/example/.gitconfig").unwrap();
+        let decoded: Portable =
+            rmp_serde::from_slice(&encoded).expect("well-rooted and normalised");
+
+        assert_eq!(
+            decoded.check_against(&home()),
+            Err(Error::AbsoluteUnderHome {
+                raw: "/var/home/example/.gitconfig".to_string(),
+                portable: "~/.gitconfig".to_string(),
+            }),
+            "a second key for ~/.gitconfig on this account"
+        );
+        // A path genuinely outside the home passes, and so does the ~/ spelling.
+        assert_eq!(
+            Portable::parse_in("/usr/bin/sccache", &home())
+                .unwrap()
+                .check_against(&home()),
+            Ok(())
+        );
+        assert_eq!(
+            Portable::parse_in("~/.gitconfig", &home())
+                .unwrap()
+                .check_against(&home()),
+            Ok(())
+        );
+        // And it answers for its home the same way every other rule here does.
+        assert_eq!(
+            decoded.check_against(Path::new("relative/home")),
+            Err(Error::HomeNotAbsolute(PathBuf::from("relative/home")))
+        );
+    }
+
+    #[test]
+    fn every_value_a_constructor_builds_survives_deserialisation() {
+        // The constructors and TryFrom agree about what is admissible, so
+        // nothing bx writes can fail to load back.
+        for raw in [
+            "~",
+            "~/.gitconfig",
+            "~/.ssh/config.d/10-hosts.conf",
+            "/usr/bin/sccache",
+            "/",
+        ] {
+            let built = Portable::parse_in(raw, &home()).expect(raw);
+            let encoded = rmp_serde::to_vec(&built).unwrap();
+            assert_eq!(
+                rmp_serde::from_slice::<Portable>(&encoded).expect(raw),
+                built
+            );
+        }
     }
 }

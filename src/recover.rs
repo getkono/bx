@@ -253,6 +253,14 @@ impl Outcome {
 /// to `journal.mpk.corrupt`, which is the degradation `CLAUDE.md` requires of
 /// every machine-owned file.
 ///
+/// It takes **no lock**, deliberately, so `plan` stays usable while an `apply`
+/// runs — and that means a journal it finds may belong to a session that is in
+/// flight right now rather than to one that died. The two are told apart by the
+/// state directory's lock, not by the journal: a caller that wants to say "an
+/// apply is in progress" rather than "an apply was interrupted" asks
+/// [`crate::state::SharedLock::try_acquire`] first and reports the `None` case
+/// as the live one.
+///
 /// # Errors
 ///
 /// [`Error::Journal`] when the journal cannot be read and [`Error::Write`] when

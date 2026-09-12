@@ -9,8 +9,9 @@
 //! 2. a temporary file **in the destination directory**, so the later `rename`
 //!    is same-filesystem and therefore atomic. A `/tmp` on another mount would
 //!    turn it into a copy-then-delete with a visible half-written window.
-//! 3. the mode set with `fchmod` **before any content is written**.
-//! 4. the content written, then `fsync`ed.
+//! 3. the mode set with `fchmod` **before any content is written** — all of it
+//!    but a declared setuid or setgid bit, which a write would clear.
+//! 4. the content written, the set-id bits added if declared, then `fsync`ed.
 //! 5. the prior state recorded — [`Filled::new_entry`] assembles it and
 //!    [`crate::state::Ledger::record`] makes it durable — **before** the
 //!    rename, so a crash after the rename still has a recoverable prior state.
@@ -33,6 +34,15 @@
 //! there. `fchmod(2)` is not masked. `tempfile` creates at `0600` and a `umask`
 //! can only narrow that, so the temporary file is never *wider* than its final
 //! mode at any instant either.
+//!
+//! The one exception is a declared setuid or setgid bit. The kernel clears
+//! both on a write by a process without `CAP_FSETID`, so a set-id bit set
+//! before the content would be gone after it: the second `plan` would read
+//! `Modify`, and the ledger would record a mode that is not on disk. [`stage`]
+//! sets every other bit, and [`Staged::fill`] adds the set-id bits after the
+//! content and before the `fsync`. The empty file is therefore *narrower* than
+//! its declared mode, never wider, and the content is at exactly that mode
+//! before it is durable or visible at the destination.
 //!
 //! # Why the write is staged rather than one call
 //!
@@ -544,6 +554,9 @@ impl Pending {
 /// Begin a write: a temporary file in the destination directory, at `mode`,
 /// with no content.
 ///
+/// A declared setuid or setgid bit is the exception: it is left off until
+/// [`Staged::fill`] has written the content, because the write would clear it.
+///
 /// Missing parent directories are created at [`Mode::DEFAULT_DIR`] — a target
 /// deep under `~/.config` must not need a directory declaration for every
 /// component. An *existing* directory is never chmod'd: it is the user's. When
@@ -598,9 +611,10 @@ pub fn stage(dest: &Path, mode: Mode) -> Result<Staged, Error> {
         })?;
 
     // Before any content. `tempfile` creates at 0600 and `fchmod` is not masked
-    // by the umask, so the file is at its final mode while it is still empty and
-    // was never wider than that at any instant.
-    fchmod(temp.as_file(), mode, temp.path())?;
+    // by the umask, so the file is at its final permission bits while it is
+    // still empty and was never wider than them at any instant. The set-id bits
+    // wait for `fill`: the write clears them — see `SET_ID`.
+    fchmod(temp.as_file(), without_set_id(mode), temp.path())?;
 
     Ok(Staged(Pending {
         temp,
@@ -624,7 +638,10 @@ impl Staged {
         self.0.temp_path()
     }
 
-    /// The mode the temporary file already has.
+    /// The mode this write declares.
+    ///
+    /// The temporary file already has it, except for a setuid or setgid bit,
+    /// which [`Staged::fill`] adds after the content.
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.0.mode
@@ -649,6 +666,13 @@ impl Staged {
             source,
         };
         self.0.temp.write_all(bytes).map_err(&fail)?;
+        // After the content and before the sync, so the sync covers it. A
+        // set-id bit set earlier would already be gone: the kernel clears
+        // S_ISUID, and S_ISGID alongside group execute, on a write by a process
+        // without CAP_FSETID.
+        if self.0.mode.bits() & SET_ID != 0 {
+            fchmod(self.0.temp.as_file(), self.0.mode, &temp_path)?;
+        }
         durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(&fail)?;
         let written = ContentHash::of(bytes);
         Ok(Filled {
@@ -1175,6 +1199,22 @@ fn create_dir_at(path: &Path, mode: Mode) -> Result<bool, Error> {
     Ok(true)
 }
 
+/// The setuid and setgid bits.
+///
+/// The only mode bits a write can take away. The kernel clears S_ISUID, and
+/// S_ISGID when group execute is set, on the first write to a file by a process
+/// without `CAP_FSETID`, so a set-id mode applied before the content is gone
+/// once the content lands. [`stage`] leaves them off the empty file and
+/// [`Staged::fill`] adds them after the content and before the `fsync`, which
+/// keeps both promises: never wider than the declared mode while empty, and
+/// exactly the declared mode by the time anything can see the content.
+const SET_ID: u32 = 0o6000;
+
+/// `mode` without its setuid and setgid bits — see [`SET_ID`].
+const fn without_set_id(mode: Mode) -> Mode {
+    Mode::from_bits(mode.bits() & !SET_ID)
+}
+
 /// `fchmod`, so the mode is the declared one and not the declared one masked by
 /// the process `umask`.
 fn fchmod(file: &std::fs::File, mode: Mode, path: &Path) -> Result<(), Error> {
@@ -1577,6 +1617,40 @@ mod tests {
         assert_eq!(mode_of_path(filled.temp_path()), Mode::from_bits(0o400));
         filled.publish().expect("publish");
         assert_eq!(mode_of_path(&home.child("secret")), Mode::from_bits(0o400));
+    }
+
+    #[test]
+    fn a_declared_setuid_or_setgid_bit_survives_the_write_that_fills_the_file() {
+        // The kernel clears S_ISUID, and S_ISGID alongside group execute, on the
+        // first write to a file by a process without CAP_FSETID. A mode set
+        // before the content therefore loses those bits the moment the content
+        // lands: the second plan reads `Modify`, and the ledger records a mode
+        // that is not on disk. Under root the bits survive either way, so this
+        // cannot fail there — which is not a reason to skip it.
+        for bits in [0o4755, 0o2755, 0o6755] {
+            let home = guarded_home();
+            let dest = home.child("tool");
+            let mode = Mode::from_bits(bits);
+
+            let staged = stage(&dest, mode).expect("stage");
+            assert_eq!(
+                mode_of_path(staged.temp_path()).bits() & !mode.bits(),
+                0,
+                "{mode}: the empty temporary file is never wider than the declared mode",
+            );
+            let filled = staged.fill(b"#!/bin/sh\nexit 0\n").expect("fill");
+            assert_eq!(mode_of_path(filled.temp_path()), mode, "{mode}: after fill");
+            assert_eq!(filled.mode(), mode);
+            filled.publish().expect("publish");
+
+            assert_eq!(mode_of_path(&dest), mode, "{mode}: on disk");
+            let observed = observe(&dest).expect("observe");
+            assert_eq!(
+                compare(&observed, &desired(b"#!/bin/sh\nexit 0\n", mode)).action,
+                Action::Unchanged,
+                "{mode}: the second plan is empty",
+            );
+        }
     }
 
     #[test]

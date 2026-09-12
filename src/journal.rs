@@ -15,9 +15,8 @@
 //!    at the final mode, with no content. The destination is untouched.
 //! 2. [`crate::fs::Staged::fill`] writes the content and `fsync`s it. The
 //!    destination is still untouched.
-//! 3. [`crate::state::Ledger::record`] copies the **prior** bytes into
-//!    `restore/` and `fsync`s them, so the bytes a rollback needs are durable
-//!    before anything can displace them.
+//! 3. the **prior** bytes are copied into `restore/` and `fsync`ed, so the
+//!    bytes a rollback needs are durable before anything can displace them.
 //! 4. the [`Intent`] frame is appended and `fsync`ed.
 //! 5. **only then** [`crate::fs::Filled::publish`] renames the temporary file
 //!    into place and `fsync`s the directory.
@@ -34,13 +33,23 @@
 //!
 //! # The on-disk ledger does not move until the session ends
 //!
-//! [`crate::state::Ledger::record`] makes the displaced bytes durable but only
-//! mutates the ledger in memory; [`Session::finish`] is the sole caller of
-//! [`crate::state::Ledger::save`]. So for a session's whole life the *saved*
-//! ledger still describes the state the destinations are being rolled back to,
-//! and a rollback has no bookkeeping to repair. The one window left is between
-//! the [`End`] frame and the save, and [`crate::recover`] closes it by
-//! rebuilding the entries from the journal's own intents.
+//! [`crate::state::Ledger::record`] only mutates the ledger in memory, and
+//! [`Session::finish`] is the sole caller of [`crate::state::Ledger::save`]. So
+//! for a session's whole life the *saved* ledger still describes the state the
+//! destinations are being rolled back to, and a rollback has no bookkeeping to
+//! repair. The one window left is between the [`End`] frame and the save, and
+//! [`crate::recover`] closes it by rebuilding the entries from the journal's own
+//! intents.
+//!
+//! # The rollback snapshot is not the ledger's snapshot
+//!
+//! The ledger keeps the **first** prior it was ever given for a target, because
+//! what `bx rm` owes the user is the file as it was before bx ever touched it. A
+//! rollback owes them something else: whatever was on disk a moment ago, which
+//! for a target bx already manages is bx's own previous output. So the session
+//! stores the snapshot recovery needs itself — see [`store_prior`] — and the
+//! two never contend. Both are content-addressed under the same
+//! `restore/<digest>` name, so identical bytes are one file.
 //!
 //! # Why explicit framing on top of MessagePack
 //!
@@ -70,10 +79,11 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{Mode as RawMode, OFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::fs::{self, Mode};
+use crate::fs::{self, Mode, Observed};
 use crate::paths::Portable;
 use crate::state::{
-    ContentHash, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior, StateDir,
+    ContentHash, ExclusiveLock, Ledger, LedgerView, Mechanism, Prior, PriorBytes, RestoreRef,
+    StateDir,
 };
 
 /// The seven bytes every journal starts with.
@@ -614,7 +624,7 @@ impl Session {
             return Err(Error::InProgress { path });
         }
 
-        let ledger = Ledger::open(state, &lock).value;
+        let ledger = Ledger::open(state, &lock)?.value;
         let mut journal = Journal::create(&path)?;
         journal.append(&Record::Begin(Begin {
             kind,
@@ -720,24 +730,22 @@ impl Session {
         self.crash.reached(index, Phase::AfterFill);
 
         let created_dirs = filled.created_dirs().to_vec();
+        // Durable before the Intent frame that names it, and therefore before
+        // anything can displace it.
+        let before = store_prior(&self.state, filled.prior())?;
         let mechanism = match ownership {
-            Ownership::Owned(mechanism) => Some(mechanism.clone()),
-            Ownership::Released => None,
+            Ownership::Owned(mechanism) => {
+                self.ledger
+                    .record(filled.new_entry(&self.home, mechanism.clone()))?;
+                Some(mechanism.clone())
+            }
+            // The restore half of `bx rm`: bx is handing the target back, so
+            // there is nothing left for it to own.
+            Ownership::Released => {
+                self.ledger.forget(&target);
+                None
+            }
         };
-        // Recorded whatever the ownership: it is `record` that copies the
-        // displaced bytes into `restore/` and fsyncs them, and those are the
-        // bytes a rollback reads. A released target's entry is dropped again
-        // below, which leaves the blob — content-addressed bytes cost far less
-        // than a rollback that cannot complete. The mechanism a released entry
-        // carries is never read, for the same reason.
-        let before = self
-            .ledger
-            .record(filled.new_entry(&self.home, mechanism.clone().unwrap_or(Mechanism::Own)))?
-            .prior
-            .clone();
-        if mechanism.is_none() {
-            self.ledger.forget(&target);
-        }
 
         self.journal.append(&Record::Intent(Intent {
             target: target.clone(),
@@ -778,22 +786,9 @@ impl Session {
             .into());
         }
 
-        // Same reason as in `write`: `record` is what makes the displaced bytes
-        // durable. The `written` digest and mode here describe an entry that is
-        // dropped on the next line and never read.
-        let before = self
-            .ledger
-            .record(
-                NewEntry::new(
-                    target.clone(),
-                    ContentHash::of(&[]),
-                    Mode::PRIVATE_FILE,
-                    Mechanism::Own,
-                )
-                .with_prior(observed.prior_bytes()),
-            )?
-            .prior
-            .clone();
+        // Same as in `write`: the bytes the removal is about to displace are
+        // made durable before the Intent frame that names them.
+        let before = store_prior(&self.state, &observed)?;
         self.ledger.forget(&target);
 
         self.journal.append(&Record::Intent(Intent {
@@ -935,6 +930,54 @@ impl Crash {
             Phase::AfterDone => "after-done",
         }
     }
+}
+
+/// Copy the bytes a write is about to displace into `restore/`, durably, and
+/// describe where they went.
+///
+/// Deliberately **not** [`crate::state::Ledger::record`], which answers a
+/// different question. The ledger keeps the *first* prior it was ever given for
+/// a target, and that is right: what `bx rm` owes the user is the file as it was
+/// before bx ever touched it. A rollback owes them something else — whatever was
+/// on disk a moment ago, which for a target bx already manages is bx's own
+/// previous output. Asking `record` for that would hand back the original and
+/// leave recovery comparing the destination against a state it has not been in
+/// since the first `apply`, so every repeat write would look like a conflict
+/// after a crash.
+///
+/// Nothing is duplicated on disk. Both copies are content-addressed under the
+/// same `restore/<digest>` name, so identical bytes are one file, and a write
+/// that displaces bytes the ledger already holds stores nothing at all.
+///
+/// # Errors
+///
+/// [`Error::Write`] when the snapshot cannot be stored. It is `fsync`ed, along
+/// with the directory entry naming it, before this returns.
+fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
+    let PriorBytes::Bytes { bytes, mode } = observed.prior_bytes() else {
+        return Ok(Prior::Absent);
+    };
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let reference = RestoreRef {
+        digest: ContentHash::of(&bytes),
+        mode,
+        len,
+    };
+    let path = state.restore().join(reference.blob_name());
+    // The same test the ledger's own blob store makes: a content-addressed name
+    // holding the right number of bytes already holds these bytes.
+    if blob_len(&path) != Some(len) {
+        fs::write_atomically(&path, &bytes, Mode::PRIVATE_FILE)?;
+    }
+    Ok(Prior::Existed(reference))
+}
+
+/// The length of an existing restore blob, or `None` if there is no file there.
+fn blob_len(path: &Path) -> Option<u64> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.len())
 }
 
 /// Remove `path` if it is there, and `fsync` the directory it was in.
@@ -1244,7 +1287,7 @@ pub(crate) mod tests {
 
         assert!(!state.journal().exists(), "unlinked last");
         assert_eq!(load(&state.journal()).expect("load"), Loaded::Absent);
-        let ledger = LedgerView::read(&state).value;
+        let ledger = LedgerView::read(&state).expect("read the ledger").value;
         let (portable, _) = target(home.path(), ".conf");
         assert_eq!(
             ledger.get(&portable).expect("an entry").mode,
@@ -1452,6 +1495,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_repeat_write_records_the_bytes_it_displaced_not_the_ledgers_first_prior() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        plant_file(&home.child(".conf"), "the user's\n", Mode::DEFAULT_FILE);
+        let (portable, _) = target(home.path(), ".conf");
+
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first
+            .apply(write_to(home.path(), ".conf", "one\n", Mode::DEFAULT_FILE))
+            .expect("apply");
+        first.finish().expect("finish");
+
+        let mut second =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        second
+            .apply(write_to(home.path(), ".conf", "two\n", Mode::DEFAULT_FILE))
+            .expect("apply");
+        drop(second);
+
+        // The ledger answers "what did the user have before bx?" and keeps the
+        // first prior. The journal answers "what was on disk a moment ago?" and
+        // must not, or a rollback would compare the destination against a state
+        // it has not been in since the first apply.
+        let entry = LedgerView::read(&state)
+            .expect("read")
+            .value
+            .get(&portable)
+            .cloned()
+            .expect("managed");
+        let Prior::Existed(first_prior) = &entry.prior else {
+            panic!("the ledger keeps the user's original")
+        };
+        assert_eq!(first_prior.digest, ContentHash::of(b"the user's\n"));
+
+        let loaded = load(&state.journal()).expect("load");
+        let Prior::Existed(displaced) = &loaded.intents().next().expect("one intent").before else {
+            panic!("the second write displaced a file")
+        };
+        assert_eq!(
+            displaced.digest,
+            ContentHash::of(b"one\n"),
+            "the rollback snapshot is bx's own previous output",
+        );
+        assert!(
+            state.restore().join(displaced.blob_name()).is_file(),
+            "and it is durable, whatever the ledger decided to keep",
+        );
+    }
+
+    #[test]
     fn a_released_target_leaves_its_prior_bytes_behind_but_no_ledger_entry() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -1472,7 +1566,13 @@ pub(crate) mod tests {
         assert!(session.ledger().get(&portable).is_none());
         session.finish().expect("finish");
 
-        assert!(LedgerView::read(&state).value.get(&portable).is_none());
+        assert!(
+            LedgerView::read(&state)
+                .expect("read the ledger")
+                .value
+                .get(&portable)
+                .is_none()
+        );
         assert!(
             state
                 .restore()

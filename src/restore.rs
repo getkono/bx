@@ -326,7 +326,11 @@ mod tests {
 
     /// The ledger entry for `portable`, as it stands on disk.
     fn entry_for(state: &StateDir, portable: &Portable) -> Option<crate::state::LedgerEntry> {
-        LedgerView::read(state).value.get(portable).cloned()
+        LedgerView::read(state)
+            .expect("read the ledger")
+            .value
+            .get(portable)
+            .cloned()
     }
 
     #[test]
@@ -609,6 +613,7 @@ mod tests {
             panic!("a displaced file is reverted")
         };
         let bytes = LedgerView::read(&state)
+            .expect("read the ledger")
             .value
             .restore_bytes(&state, &reference)
             .expect("the snapshot");
@@ -732,7 +737,7 @@ mod tests {
             Mode::DEFAULT_FILE,
         );
 
-        let ledger = LedgerView::read(&state).value;
+        let ledger = LedgerView::read(&state).expect("read the ledger").value;
         let plan_for = |portable: &Portable| {
             plan_restore(ledger.get(portable).expect("managed"), home.path()).expect("plan")
         };

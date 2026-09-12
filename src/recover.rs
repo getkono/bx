@@ -358,7 +358,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         Loaded::Unterminated(_) => false,
     };
 
-    let mut ledger = Ledger::open(state, lock).value;
+    let mut ledger = Ledger::open(state, lock)?.value;
     let mut conflicts = Vec::new();
     let mut resolved = 0_usize;
 
@@ -868,6 +868,48 @@ mod tests {
             (b"old\n".to_vec(), Mode::DEFAULT_FILE),
         );
         assert!(!state.journal().exists(), "the journal is unlinked last");
+    }
+
+    #[test]
+    fn a_second_write_to_the_same_target_rolls_back_to_what_it_actually_displaced() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "the user's\n", Mode::DEFAULT_FILE);
+
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first
+            .apply(write_to(home.path(), ".conf", "one\n", Mode::DEFAULT_FILE))
+            .expect("apply");
+        first.finish().expect("finish");
+
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "two\n", Mode::DEFAULT_FILE)],
+        );
+
+        // Not "the user's", which is what the ledger's first-prior rule keeps:
+        // a rollback returns the destination to the state the last *finished*
+        // run left it in, so the next plan is computed against what the user
+        // last saw converge.
+        let interruption = pending(&state).expect("pending").expect("interrupted");
+        assert_eq!(interruption.unfinished[0].standing, Standing::Written);
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { undone: 1 },
+        );
+        assert_eq!(peek(&dest).expect("rolled back").0, b"one\n");
+
+        // And `bx rm` still hands back what the user had before bx existed.
+        assert!(matches!(
+            crate::restore::restore(&state, home.path(), &[target(home.path(), ".conf").0])
+                .expect("restore")
+                .as_slice(),
+            [crate::restore::Restored::Reverted { .. }],
+        ));
+        assert_eq!(peek(&dest).expect("restored").0, b"the user's\n");
     }
 
     #[test]
@@ -1388,7 +1430,7 @@ mod tests {
             "no destination is touched: only the machine's own bookkeeping",
         );
 
-        let ledger = LedgerView::read(&state).value;
+        let ledger = LedgerView::read(&state).expect("read the ledger").value;
         let modified = ledger
             .get(&target(home.path(), ".conf").0)
             .expect("the modify");
@@ -1442,7 +1484,13 @@ mod tests {
             recover(&state).expect("recover"),
             Outcome::Recorded { entries: 1 },
         );
-        assert!(LedgerView::read(&state).value.get(&portable).is_none());
+        assert!(
+            LedgerView::read(&state)
+                .expect("read the ledger")
+                .value
+                .get(&portable)
+                .is_none()
+        );
     }
 
     #[test]

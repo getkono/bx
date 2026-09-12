@@ -323,7 +323,7 @@ pub fn config_root() -> Result<PathBuf, Error> {
 /// **rejected**, because [`render`] expands only `~` and `~/` — storing one
 /// would leave a value that renders to a bare relative path, and a relative
 /// destination depends on the directory bx happened to be invoked from. That is
-/// the same reason [`Portable::parse`] rejects a relative path outright.
+/// the same reason [`Portable::parse_in`] rejects a relative path outright.
 ///
 /// # Every `Portable` is lexically normalised
 ///

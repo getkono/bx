@@ -142,10 +142,12 @@ fn is_module_name(path: &Path) -> bool {
 
 /// What is at `path`, following symlinks: `None` when nothing is there.
 ///
-/// `None` only for a clean absence — `stat` says `ENOENT` and so does `lstat`.
-/// A dangling symlink is `ENOENT` to `stat` and present to `lstat`, and is an
-/// error rather than an absence, because a layer someone linked in and broke
-/// is not a layer nobody wrote.
+/// `lstat` first, so each outcome has exactly one meaning. `None` only when
+/// `lstat` says `ENOENT`: nothing, not even a link, is at the path. A symlink is
+/// then followed with `stat`, and `ENOENT` there is a **dangling** link, which
+/// is an error rather than an absence, because a layer someone linked in and
+/// broke is not a layer nobody wrote. Every other failure of either call —
+/// `EACCES`, `ELOOP` — is an error carrying the call's own `errno`.
 ///
 /// # Errors
 ///
@@ -155,17 +157,21 @@ fn examine(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
         path: path.to_path_buf(),
         source,
     };
+    let link = match std::fs::symlink_metadata(path) {
+        Ok(link) => link,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io(source)),
+    };
+    if !link.file_type().is_symlink() {
+        return Ok(Some(link));
+    }
     match std::fs::metadata(path) {
-        Ok(meta) => Ok(Some(meta)),
+        Ok(target) => Ok(Some(target)),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(path) {
-                Err(again) if again.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(again) => Err(io(again)),
-                Ok(_) => Err(io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "a dangling symlink: what it points at does not exist",
-                ))),
-            }
+            Err(io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "a dangling symlink: what it points at does not exist",
+            )))
         }
         Err(source) => Err(io(source)),
     }
@@ -849,6 +855,23 @@ mod tests {
         let message = layer_files(dir.path()).expect_err("dangling").to_string();
         assert!(message.contains("20-off.toml"), "{message}");
         assert!(message.contains("dangling symlink"), "{message}");
+    }
+
+    /// A symlink loop is reported as the loop, not as a dangling link.
+    ///
+    /// `ELOOP` comes from following the link, after `lstat` found it. Reading
+    /// every failure there as "dangling" would name the wrong fault, and nothing
+    /// else distinguishes the two branches.
+    #[test]
+    fn a_module_symlink_loop_is_an_error_naming_the_loop() {
+        let dir = repo(&[("bx.toml", "")]);
+        std::fs::create_dir(dir.path().join(MODULES_DIR)).expect("mkdir");
+        let looped = dir.path().join("modules/loop.toml");
+        std::os::unix::fs::symlink(&looped, &looped).expect("a symlink to itself");
+
+        let source = io_error_naming(dir.path(), &looped);
+        assert_ne!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
+        assert!(!source.to_string().contains("dangling"), "{source}");
     }
 
     /// A dangling `bx.toml` is an error, not a repo without a global layer.

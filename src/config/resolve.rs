@@ -196,7 +196,19 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Error
     };
 
     let body = match &target.body {
-        Body::File(path) => Body::File(sub(&path.to_string_lossy())?.into()),
+        // Through the parser's own rule, not straight into the target. A `file`
+        // is the one substituted field whose validator the parse-time check
+        // cannot stand in for: `cfg/{{account}}/gitconfig` is a legal body file
+        // as written, and an `account` answered `../../../../etc` makes it read
+        // a file off the machine and write it into a target.
+        Body::File(path) => Body::File(
+            super::target::confine_to_repo("file", &sub(&path.to_string_lossy())?).map_err(
+                |message| Error::BadValue {
+                    origin: origin.clone(),
+                    message: format!("target `{}`: {message}", target.path),
+                },
+            )?,
+        ),
         Body::Inline(text) => Body::Inline(sub(text)?),
         other => other.clone(),
     };
@@ -357,6 +369,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(ready(&resolved, 0).path.as_str(), "~/.config/bx/dark.toml");
+    }
+
+    #[test]
+    fn a_substituted_body_file_is_confined_to_the_config_repo() {
+        // An account-varying `file` is the natural spelling for a per-account
+        // body, and it is the one substituted field the parse-time check cannot
+        // stand in for: what the parser saw was `cfg/{{account}}/gitconfig`, and
+        // what reaches `repo.join` is whatever the answer made of it.
+        const LAYER: &str = "[[value]]\n\
+                             name = \"account\"\n\
+                             kind = \"string\"\n\
+                             [[target]]\n\
+                             path = \"~/.gitconfig\"\n\
+                             file = \"cfg/{{account}}/gitconfig\"\n";
+
+        let message = resolved(LAYER, Some("[values]\naccount = \"../../../../etc\"\n"))
+            .expect_err("a climbing answer is a repo escape");
+        assert!(
+            message.contains("may not climb out of the config repo"),
+            "{message}"
+        );
+        assert!(message.contains("~/.gitconfig"), "{message}");
+
+        // A `file` that *opens* with a value, answered absolutely, would discard
+        // the repo root the moment it reached `repo.join`.
+        const ROOTED: &str = "[[value]]\n\
+                              name = \"account\"\n\
+                              kind = \"string\"\n\
+                              [[target]]\n\
+                              path = \"~/.gitconfig\"\n\
+                              file = \"{{account}}/gitconfig\"\n";
+
+        let message = resolved(ROOTED, Some("[values]\naccount = \"/etc\"\n"))
+            .expect_err("an absolute answer discards the repo root");
+        assert!(message.contains("relative to the repo root"), "{message}");
+
+        let ordinary = resolved(LAYER, Some("[values]\naccount = \"work\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig")),
+            "the case this spelling exists for still resolves"
+        );
     }
 
     #[test]

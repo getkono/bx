@@ -13,17 +13,21 @@
 //! and a `/tmp` on a different mount would turn the atomic rename into a
 //! copy-then-delete with a visible half-written window.
 //!
-//! [`Mode`] is the crate's single permission type. It carries the twelve
-//! meaningful bits of a POSIX mode and nothing else — no file type, no `umask`
-//! interaction — so a mode read from a ledger entry means the same thing as a
-//! mode written into one.
+//! [`Mode`] is the crate's single permission type, and [`Kind`] is what a
+//! destination turned out to be. Both live in [`mode`] and are re-exported
+//! here, so `bx::fs::Mode` names the one file mode in the crate wherever it is
+//! used — including from `config::target`, which re-exports it again under the
+//! name architecture §4 fixed.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode as RawMode, OFlags};
-use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
+
+pub mod mode;
+
+pub use mode::{Kind, Mode, ModeError};
 
 /// Everything that can go wrong writing a file.
 #[derive(Debug, thiserror::Error)]
@@ -51,62 +55,6 @@ impl Error {
         match self {
             Self::NoParent(path) | Self::Write { path, .. } => path,
         }
-    }
-}
-
-/// A POSIX file mode: the permission and set-id bits, and nothing else.
-///
-/// Constructed from raw bits, compared by value, and rendered as four octal
-/// digits so an error message reads the way `chmod` does. The file-type bits a
-/// `stat` returns are deliberately not carried: bx sets permissions, it never
-/// changes what a path *is*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Mode(u32);
-
-impl Mode {
-    /// `0644` — the mode bx gives a generated file with no mode of its own.
-    pub const DEFAULT_FILE: Self = Self(0o644);
-    /// `0755` — the mode bx gives a directory it creates for a target.
-    pub const DEFAULT_DIR: Self = Self(0o755);
-    /// `0600` — owner-only. Every file bx writes inside the state directory.
-    pub const PRIVATE_FILE: Self = Self(0o600);
-    /// `0700` — owner-only. The state directory and everything under it.
-    pub const PRIVATE_DIR: Self = Self(0o700);
-
-    /// A mode from raw bits. Anything above the twelve permission bits is
-    /// discarded, so a `stat` result can be handed over directly.
-    #[must_use]
-    pub const fn from_bits(bits: u32) -> Self {
-        Self(bits & 0o7777)
-    }
-
-    /// The twelve permission bits.
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0 & 0o7777
-    }
-
-    /// Whether any group or other bit is set.
-    ///
-    /// The question the state directory asks before tightening itself: a
-    /// directory holding prior copies of the user's private files must not be
-    /// readable by anyone else.
-    #[must_use]
-    pub const fn is_shared(self) -> bool {
-        self.bits() & 0o077 != 0
-    }
-}
-
-impl std::fmt::Display for Mode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:04o}", self.bits())
-    }
-}
-
-impl From<Mode> for RawMode {
-    fn from(mode: Mode) -> Self {
-        Self::from_bits_truncate(mode.bits())
     }
 }
 
@@ -185,35 +133,6 @@ mod tests {
 
     fn mode_of(path: &Path) -> Mode {
         Mode::from_bits(std::fs::metadata(path).expect("stat").permissions().mode())
-    }
-
-    #[test]
-    fn a_mode_keeps_only_the_permission_bits() {
-        // 0o100644 is what `stat` reports for a regular file at 0644.
-        assert_eq!(Mode::from_bits(0o100_644), Mode::DEFAULT_FILE);
-        assert_eq!(Mode::DEFAULT_FILE.bits(), 0o644);
-    }
-
-    #[test]
-    fn a_mode_renders_as_four_octal_digits() {
-        assert_eq!(Mode::PRIVATE_FILE.to_string(), "0600");
-        assert_eq!(Mode::DEFAULT_DIR.to_string(), "0755");
-        assert_eq!(Mode::from_bits(0o7).to_string(), "0007");
-    }
-
-    #[test]
-    fn a_mode_knows_whether_anyone_else_can_reach_it() {
-        assert!(!Mode::PRIVATE_DIR.is_shared());
-        assert!(!Mode::PRIVATE_FILE.is_shared());
-        assert!(Mode::DEFAULT_DIR.is_shared());
-        assert!(Mode::from_bits(0o710).is_shared());
-    }
-
-    #[test]
-    fn a_mode_round_trips_through_messagepack() {
-        let bytes = rmp_serde::to_vec_named(&Mode::PRIVATE_FILE).expect("encode");
-        let back: Mode = rmp_serde::from_slice(&bytes).expect("decode");
-        assert_eq!(back, Mode::PRIVATE_FILE);
     }
 
     #[test]

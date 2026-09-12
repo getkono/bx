@@ -71,9 +71,20 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 /// is the hole Invariant 5 exists to close; [`stray_local`] is how it gets
 /// reported instead of silently ignored.
 ///
+/// # Only a clean answer skips the local layer
+///
+/// `local.toml` is examined the way [`super::layer_files`] examines a global
+/// layer: `lstat` first. It is left out only when nothing is at the path, or
+/// when what is there is not a regular file. A dangling symlink, `EACCES`,
+/// `ELOOP`, or a state directory that is not a directory is an [`Error::Io`]
+/// naming `local.toml`. `Path::is_file` answers `false` for all of those, and
+/// an account whose layer is silently dropped gets every other account's
+/// configuration with nothing saying why.
+///
 /// # Errors
 ///
-/// Whatever [`super::layer_files`] returns.
+/// Whatever [`super::layer_files`] returns, and [`Error::Io`] naming
+/// `local.toml` when it cannot be examined.
 pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut paths: Vec<PathBuf> = super::layer_files(repo)?
         .into_iter()
@@ -81,7 +92,7 @@ pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error>
         .collect();
 
     let local = local_layer_path(state_dir);
-    if local.is_file() {
+    if super::examine(&local)?.is_some_and(|meta| meta.is_file()) {
         paths.push(local);
     }
 
@@ -124,11 +135,33 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
 ///
 /// Both the repo root and `modules/` are checked, because either would be
 /// picked up by a `git add .`.
-#[must_use]
-pub fn stray_local(repo: &Path) -> Option<PathBuf> {
-    [repo.join(LOCAL_FILE), repo.join("modules").join(LOCAL_FILE)]
-        .into_iter()
-        .find(|candidate| candidate.is_file())
+///
+/// Each place is examined the way [`super::layer_files`] examines it, so the two
+/// agree about what is there: a repo root or `modules/` that is absent or not a
+/// directory holds no stray, and a `local.toml` that is absent or not a regular
+/// file is not one. Anything that cannot be examined, such as a dangling
+/// symlink, `EACCES` or `ELOOP`, is an error rather than `None`, because `None`
+/// tells `bx doctor` the repo is clean.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming the path that could not be examined.
+pub fn stray_local(repo: &Path) -> Result<Option<PathBuf>, Error> {
+    if !super::examine(repo)?.is_some_and(|meta| meta.is_dir()) {
+        return Ok(None);
+    }
+    let root = repo.join(LOCAL_FILE);
+    if super::examine(&root)?.is_some_and(|meta| meta.is_file()) {
+        return Ok(Some(root));
+    }
+    let modules = repo.join(super::MODULES_DIR);
+    if !super::examine(&modules)?.is_some_and(|meta| meta.is_dir()) {
+        return Ok(None);
+    }
+    let nested = modules.join(LOCAL_FILE);
+    Ok(super::examine(&nested)?
+        .is_some_and(|meta| meta.is_file())
+        .then_some(nested))
 }
 
 #[cfg(test)]
@@ -234,7 +267,7 @@ mod tests {
         let (repo, _) = repo_and_state(&home);
         let stray = home.write(".config/bx/local.toml", "");
 
-        assert_eq!(stray_local(&repo), Some(stray));
+        assert_eq!(stray_local(&repo).unwrap(), Some(stray));
     }
 
     #[test]
@@ -244,7 +277,7 @@ mod tests {
         home.write(".config/bx/bx.toml", "");
         let stray = home.write(".config/bx/modules/local.toml", "");
 
-        assert_eq!(stray_local(&repo), Some(stray));
+        assert_eq!(stray_local(&repo).unwrap(), Some(stray));
     }
 
     #[test]
@@ -254,7 +287,11 @@ mod tests {
         home.write(".config/bx/bx.toml", "");
         home.write(".local/state/bx/local.toml", "");
 
-        assert_eq!(stray_local(&repo), None, "the state directory is its home");
+        assert_eq!(
+            stray_local(&repo).unwrap(),
+            None,
+            "the state directory is its home"
+        );
     }
 
     #[test]
@@ -372,5 +409,173 @@ mod tests {
         let error = layer_paths(&repo, &state).expect_err("no repo at all");
 
         assert!(matches!(error, Error::RepoMissing(_)), "{error}");
+    }
+
+    // --- a local layer that cannot be examined ------------------------------
+
+    /// The `Error::Io` `result` must be, naming `expected`; its source.
+    fn io_error_naming<T: std::fmt::Debug>(
+        result: Result<T, Error>,
+        expected: &Path,
+    ) -> std::io::Error {
+        match result {
+            Err(Error::Io { path, source }) => {
+                assert_eq!(path, expected);
+                source
+            }
+            other => panic!(
+                "expected an io error naming {}, got {other:?}",
+                expected.display()
+            ),
+        }
+    }
+
+    /// A dangling `local.toml` is an error, not an account that answered nothing.
+    ///
+    /// Under `is_file()` this returned `Ok([bx.toml])`: the account's layer,
+    /// with its values, its added targets and its `enabled = false` opt-outs,
+    /// silently did not apply.
+    #[test]
+    fn a_dangling_local_layer_is_an_error_naming_it() {
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        std::fs::create_dir_all(&state).expect("mkdir");
+        let local = local_layer_path(&state);
+        std::os::unix::fs::symlink(state.join("nowhere.toml"), &local).expect("symlink");
+
+        let source = io_error_naming(layer_paths(&repo, &state), &local);
+        assert!(source.to_string().contains("dangling"), "{source}");
+        io_error_naming(load_layer_set(&repo, &state, home.path()), &local);
+    }
+
+    /// A `local.toml` that links to itself is an error carrying `ELOOP`.
+    #[test]
+    fn a_local_layer_symlink_loop_is_an_error_naming_it() {
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        std::fs::create_dir_all(&state).expect("mkdir");
+        let local = local_layer_path(&state);
+        std::os::unix::fs::symlink(&local, &local).expect("a symlink to itself");
+
+        let source = io_error_naming(layer_paths(&repo, &state), &local);
+        assert_ne!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
+        assert!(!source.to_string().contains("dangling"), "{source}");
+    }
+
+    /// A state directory that can be listed but not searched is an error.
+    ///
+    /// At mode 0644 every `stat` inside fails with `EACCES`, which `is_file()`
+    /// read as "no local layer".
+    #[test]
+    fn a_state_directory_that_cannot_be_searched_is_an_error_naming_the_local_layer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        let local = home.write(".local/state/bx/local.toml", "");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+
+        // A process that can stat inside an unsearchable directory -- root, or
+        // one holding CAP_DAC_READ_SEARCH -- cannot construct this case.
+        let constructible = std::fs::metadata(&local).is_err();
+        let result = layer_paths(&repo, &state);
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755))
+            .expect("restore, so the tempdir can be removed");
+
+        if !constructible {
+            eprintln!(
+                "skipped: this process can stat inside a 0644 directory, so EACCES cannot be \
+                 constructed here"
+            );
+            return;
+        }
+        let source = io_error_naming(result, &local);
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// A state directory that is a regular file is an error naming `local.toml`.
+    ///
+    /// The state directory is not a layer candidate that may be of the wrong
+    /// kind; it is where the account's layer has to be, so `ENOTDIR` is not a
+    /// clean absence.
+    #[test]
+    fn a_state_directory_that_is_a_file_is_an_error_naming_the_local_layer() {
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        home.write(".local/state/bx", "not a directory");
+
+        io_error_naming(layer_paths(&repo, &state), &local_layer_path(&state));
+    }
+
+    /// Guards against over-reach: a clean answer still skips or loads.
+    ///
+    /// A directory named `local.toml` is not a layer, exactly as a directory
+    /// named `x.toml` in `modules/` is not; a `local.toml` symlinked to a
+    /// regular file is the account's layer.
+    #[test]
+    fn a_local_layer_of_the_wrong_kind_is_skipped_and_a_linked_one_is_loaded() {
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        let local = local_layer_path(&state);
+        std::fs::create_dir_all(&local).expect("a directory named local.toml");
+
+        assert_eq!(layer_paths(&repo, &state).unwrap(), [repo.join("bx.toml")]);
+
+        std::fs::remove_dir(&local).expect("rmdir");
+        let real = home.write("elsewhere/local.toml", "[values]\n");
+        std::os::unix::fs::symlink(&real, &local).expect("symlink");
+
+        assert_eq!(
+            layer_paths(&repo, &state).unwrap(),
+            [repo.join("bx.toml"), local]
+        );
+    }
+
+    /// `stray_local` does not answer "clean" about a path it could not examine.
+    ///
+    /// Under `is_file()` a dangling `local.toml` symlink in the repo, at the
+    /// root or under `modules/`, was `None`: `bx doctor` would report a clean
+    /// repo while a commit of the whole tree picked up the link.
+    #[test]
+    fn stray_local_on_a_dangling_symlink_is_an_error_naming_it() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config/bx/modules/10-a.toml", "");
+
+        let nested = repo.join("modules").join(LOCAL_FILE);
+        std::os::unix::fs::symlink(repo.join("nowhere.toml"), &nested).expect("symlink");
+        let source = io_error_naming(stray_local(&repo), &nested);
+        assert!(source.to_string().contains("dangling"), "{source}");
+
+        let root = repo.join(LOCAL_FILE);
+        std::os::unix::fs::symlink(&root, &root).expect("a symlink to itself");
+        let source = io_error_naming(stray_local(&repo), &root);
+        assert_ne!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
+    }
+
+    /// Guards against over-reach: `stray_local` skips what `layer_files` skips.
+    ///
+    /// No repo, a repo that is a file, a `modules` that is a file, and a
+    /// directory named `local.toml` are each a clean `None`, not an `ENOTDIR`.
+    #[test]
+    fn stray_local_skips_what_is_cleanly_not_a_stray() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+
+        assert_eq!(stray_local(&repo).unwrap(), None, "no repo");
+
+        home.write(".config/bx", "a file, not a repo");
+        assert_eq!(stray_local(&repo).unwrap(), None, "a repo that is a file");
+
+        std::fs::remove_file(&repo).expect("rm");
+        home.write(".config/bx/modules", "a file, not a directory");
+        std::fs::create_dir(repo.join(LOCAL_FILE)).expect("a directory named local.toml");
+        assert_eq!(stray_local(&repo).unwrap(), None, "wrong kinds throughout");
     }
 }

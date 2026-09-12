@@ -13,11 +13,12 @@
 //! attach     = "own"                            # own | region | include; default own
 //! comment    = "#"                              # required iff attach = "region"
 //! include    = "Include ~/.ssh/config.d/*.conf" # required iff attach = "include"
-//!                                               #   one non-empty line; no body key
+//!                                               #   one line, not blank; no body key
 //!                                               #   beside it, the line *is* the body
 //! direction  = "apply"                          # apply | track; default apply
 //! format     = "opaque"                         # opaque | jsonc | env.d; default opaque
-//! owns       = ["agent.default_model"]          # permitted iff format = "jsonc"
+//!                                               #   jsonc and env.d need attach = "own"
+//! owns       = ["agent.default_model"]          # required and non-empty iff format = "jsonc"
 //! requires   = ["starship"]                     # default []
 //! references = ["~/.gitconfig.local"]           # default []
 //! enabled    = true                             # default true
@@ -306,6 +307,20 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
     let direction = parse_direction(&ctx, table)?;
     let format = parse_format(&ctx, table)?;
 
+    if body != Body::Dir && matches!(path.as_str(), "~" | "/") {
+        // The home and the filesystem root are directories. A file body at
+        // either is an `own` claim on a directory as if it were a file, which
+        // no writer can honour; every spelling normalises to one of these two.
+        return Err(ctx.bad(
+            table,
+            "path",
+            format!(
+                "path = {raw_path:?} is a root directory itself, so only a `dir = true` \
+                 target may name it; a file target names a file beneath it"
+            ),
+        ));
+    }
+
     if body == Body::Dir {
         // The same rule the flat discriminant keys already follow elsewhere: a
         // companion key that cannot mean anything is an error, not a key that is
@@ -326,6 +341,39 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
                 "a directory target has no content, so `format` has nothing to describe",
             ));
         }
+    }
+
+    if matches!(&format, Format::Jsonc { owns } if owns.is_empty()) {
+        // `Jsonc { owns: [] }` says bx manages part of a file and names no part:
+        // every run a silent no-op. Checked here rather than in `parse_format`
+        // so a directory target's more specific message above still wins.
+        return Err(ctx.bad(
+            table,
+            "format",
+            "format = \"jsonc\" claims only the keys `owns` lists, so it needs at least \
+             one key in `owns`; with none the target claims nothing",
+        ));
+    }
+
+    if format != Format::Opaque && attach != Attach::Own {
+        // `Format` says how much of the file a target's `path` names bx claims:
+        // `jsonc` the listed keys of a whole JSON document, `env.d` a whole
+        // fragment. A region is a delimited span inside a file the user also
+        // writes and an include is one line in it; neither is a JSON document or
+        // a fragment, so the pair would claim two contradictory things about one
+        // file and entry A5 would have to drop one of them silently. The raw
+        // spellings are re-read because both keys have already been validated.
+        let kind = ctx.str_at(table, "format")?.unwrap_or("opaque");
+        let how = ctx.str_at(table, "attach")?.unwrap_or("own");
+        return Err(ctx.bad(
+            table,
+            "format",
+            format!(
+                "format = {kind:?} describes a whole file bx owns, so it needs attach = \"own\"; \
+                 this target is attached as {how:?}, which is part of a file the user also \
+                 writes. Use format = \"opaque\", or attach = \"own\""
+            ),
+        ));
     }
 
     let requires = ctx.str_array_at(table, "requires")?;
@@ -383,14 +431,19 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
             // again, so the region stops delimiting anything: bx appends a
             // fresh region on every run, which is Invariant 3, or writes
             // outside the one it meant to, which is Invariant 1. A whitespace
-            // comment character is the same defect with a subtler spelling.
-            if comment.is_whitespace() || comment.is_control() {
+            // comment character is the same defect with a subtler spelling, and
+            // so is an invisible one: U+200B ZERO WIDTH SPACE is neither
+            // whitespace nor a control character, and a delimiter nobody can see
+            // in an editor is one a human deletes. Every comment character a
+            // real config syntax uses is visible ASCII, so that is the rule.
+            if !comment.is_ascii_graphic() {
                 return Err(ctx.bad(
                     table,
                     "comment",
                     format!(
                         "`comment` starts the delimiter lines bx has to find again, so it \
-                         may not be whitespace or a control character; got {raw:?}"
+                         must be a visible ASCII character: not whitespace or a control \
+                         character, and nothing outside ASCII; got {raw:?}"
                     ),
                 ));
             }
@@ -411,7 +464,9 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
             // not one line, so no line-wise search finds it whole; a multi-line
             // insertion is `attach = "region"`, which has delimiters for
             // exactly that reason.
-            if line.is_empty() || line.contains(['\n', '\r']) {
+            // A line of only spaces or tabs is the empty line with a subtler
+            // spelling: it matches every blank line too.
+            if line.trim().is_empty() || line.contains(['\n', '\r']) {
                 return Err(ctx.bad(
                     table,
                     "include",
@@ -634,7 +689,7 @@ fn parse_direction(ctx: &Ctx, table: &Table) -> Result<Direction, Error> {
     }
 }
 
-/// `format`, and the `owns` list only `jsonc` may carry.
+/// `format`, and the `owns` list that `jsonc` must carry and nothing else may.
 fn parse_format(ctx: &Ctx, table: &Table) -> Result<Format, Error> {
     let kind = ctx.str_at(table, "format")?.unwrap_or("opaque");
     let owns_declared = table.contains_key("owns");
@@ -885,6 +940,38 @@ mod tests {
         assert!(message.contains("~/.gitconfig.local"), "{message}");
     }
 
+    /// A bare root is a directory, and only a directory target may name it.
+    ///
+    /// `path = "~"` and `path = "/"` with `content` parsed as whole-file
+    /// targets: an `attach = "own"` claim on the home directory, or on `/`, as
+    /// if it were a file. Every spelling that normalises to one of the two is the
+    /// same claim, and every kind of file body is the same mistake.
+    #[test]
+    fn a_bare_root_is_refused_as_a_file_target() {
+        for path in ["~", "~/", "~/.", "/", "//", "/.."] {
+            for body in [
+                "content = \"x\"\n",
+                "file = \"files/x\"\n",
+                "attach = \"region\"\ncomment = \"#\"\ncontent = \"x\"\n",
+                "attach = \"include\"\ninclude = \"x\"\n",
+            ] {
+                let text = format!("[[target]]\npath = \"{path}\"\n{body}");
+                let message = message(&text);
+                assert!(
+                    message.contains("a root directory itself"),
+                    "{path:?} with {body:?}: {message}"
+                );
+                assert!(message.contains("bx.toml:2"), "{path:?}: {message}");
+            }
+        }
+
+        // The home's own mode is a real thing to manage, so a directory target
+        // may still name it.
+        let target = parse("[[target]]\npath = \"~\"\ndir = true\nmode = \"0700\"\n").unwrap();
+        assert_eq!(target.body, Body::Dir);
+        assert_eq!(target.path.as_str(), "~");
+    }
+
     #[test]
     fn an_absolute_target_path_outside_home_is_kept() {
         let target = parse("[[target]]\npath = \"/etc/hosts\"\nfile = \"f\"\n").unwrap();
@@ -1039,8 +1126,13 @@ mod tests {
     /// `attach = "region"`, which carries delimiters for that purpose.
     #[test]
     fn an_include_line_that_is_not_one_line_is_rejected() {
+        // `" "` and `"\t"` passed an `is_empty` check and are the same defect as
+        // `""`: a blank line, which every blank line in the file matches.
         for raw in [
             "",
+            " ",
+            "\\t",
+            " \\t  ",
             "[include]\\n\\tpath = ~/.gitconfig.bx",
             "Include a\\r\\nInclude b",
         ] {
@@ -1070,6 +1162,21 @@ mod tests {
             let message = message(&text);
             assert!(
                 message.contains("whitespace or a control character"),
+                "comment = {raw:?}: {message}"
+            );
+        }
+        // Invisible or non-ASCII characters passed the whitespace-and-control
+        // check: U+200B ZERO WIDTH SPACE and U+00AD SOFT HYPHEN are neither, and
+        // a delimiter nobody can see in an editor is one a human will delete.
+        // The body is present so the comment rule is the only thing to refuse.
+        for raw in ["\\u200b", "\\u00ad", "é", "\\u007f"] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"region\"\n\
+                 comment = \"{raw}\"\ncontent = \"x\"\n"
+            );
+            let message = message(&text);
+            assert!(
+                message.contains("a visible ASCII character"),
                 "comment = {raw:?}: {message}"
             );
         }
@@ -1147,6 +1254,69 @@ mod tests {
             Format::EnvD
         );
         assert!(message(&with("format = \"envd\"\n")).contains("\"env.d\""));
+    }
+
+    /// A structured format describes a file bx owns whole, so it needs `own`.
+    ///
+    /// All four parsed. `Format` says how much of the file a target claims:
+    /// `jsonc` claims the listed keys of a whole JSON document, and `env.d` claims
+    /// a whole fragment. A region is a delimited span inside someone else's file,
+    /// and an include is one line in it. Neither is a JSON document or a
+    /// fragment, so each combination claims two contradictory things about one
+    /// file, and entry A5 would have to pick one silently.
+    #[test]
+    fn a_structured_format_needs_attach_own() {
+        let region = "attach = \"region\"\ncomment = \"#\"\ncontent = \"x\"\n";
+        let include = "attach = \"include\"\ninclude = \"Include x\"\n";
+        let jsonc = "format = \"jsonc\"\nowns = [\"a.b\"]\n";
+        let env_d = "format = \"env.d\"\n";
+
+        for (attach, format) in [
+            (region, jsonc),
+            (region, env_d),
+            (include, jsonc),
+            (include, env_d),
+        ] {
+            let text = format!("[[target]]\npath = \"~/.config/x\"\n{attach}{format}");
+            let message = message(&text);
+            assert!(
+                message.contains("needs attach = \"own\""),
+                "{attach}{format}: {message}"
+            );
+            assert!(message.contains("bx.toml:"), "{attach}{format}: {message}");
+        }
+
+        // Opaque is the one format every attachment can carry.
+        for attach in [region, include] {
+            let text = format!("[[target]]\npath = \"~/.config/x\"\n{attach}format = \"opaque\"\n");
+            parse(&text).unwrap_or_else(|e| panic!("{attach}: {e}"));
+        }
+    }
+
+    /// `format = "jsonc"` with no owned key claims nothing.
+    ///
+    /// It parsed as `Jsonc { owns: [] }`: a target that says bx manages part of
+    /// a file and names no part, so every run is a silent no-op.
+    #[test]
+    fn jsonc_without_an_owned_key_is_rejected() {
+        for owns in ["", "owns = []\n"] {
+            let message = message(&with(&format!("format = \"jsonc\"\n{owns}")));
+            assert!(
+                message.contains("at least one key in `owns`"),
+                "{owns:?}: {message}"
+            );
+        }
+    }
+
+    /// `dir` counts as a body key when two are declared.
+    #[test]
+    fn a_directory_target_that_also_declares_a_body_has_two_bodies() {
+        for body in ["file = \"f\"", "content = \"x\""] {
+            let text = format!("[[target]]\npath = \"~/.ssh\"\ndir = true\n{body}\n");
+            let message = message(&text);
+            assert!(message.contains("exactly one body"), "{body}: {message}");
+            assert!(message.contains("`dir`"), "{body}: {message}");
+        }
     }
 
     #[test]

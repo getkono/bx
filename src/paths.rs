@@ -545,11 +545,22 @@ impl Portable {
 ///
 /// [`Error::HomeNotAbsolute`] when `home` is not an absolute path. An absolute
 /// path always normalises — it clamps at `/` — so that is the only failure.
+///
+/// [`normalise`] succeeds for a `~`-rooted string as well as a `/`-rooted one,
+/// so normalising alone rejected only a home that was neither. A `~`-rooted
+/// home was accepted: `parse_in("~/x", Path::new("~/nested"))` returned `Ok`,
+/// and rendering the result against that home produced a **relative** path.
+/// Hence the explicit root check — the documented contract is `absolute`.
 fn home_str(home: &Path) -> Result<String, Error> {
     let raw = home
         .to_str()
         .ok_or_else(|| Error::NotUtf8(home.to_path_buf()))?;
-    normalise(raw).map_err(|_| Error::HomeNotAbsolute(home.to_path_buf()))
+    let normalised = normalise(raw).map_err(|_| Error::HomeNotAbsolute(home.to_path_buf()))?;
+    if normalised.starts_with('/') {
+        Ok(normalised)
+    } else {
+        Err(Error::HomeNotAbsolute(home.to_path_buf()))
+    }
 }
 
 /// Rewrite an already-normalised rooted path as `~`-relative when it is under
@@ -1124,6 +1135,22 @@ mod tests {
             Portable::from_path(Path::new("/etc/hosts"), Path::new("relative/home")),
             Err(Error::HomeNotAbsolute(PathBuf::from("relative/home")))
         );
+        // A `~`-rooted home normalises, so normalising alone accepted it: the
+        // only home rejected was one that was neither `~`- nor `/`-rooted,
+        // while the doc claims every non-absolute home is refused. The value
+        // that got through then rendered to a *relative* path.
+        for home in ["~", "~/nested"] {
+            assert_eq!(
+                Portable::from_path(Path::new("/etc/hosts"), Path::new(home)),
+                Err(Error::HomeNotAbsolute(PathBuf::from(home))),
+                "a ~-rooted home is not an absolute path"
+            );
+            assert_eq!(
+                Portable::parse_in("~/x", Path::new(home)),
+                Err(Error::HomeNotAbsolute(PathBuf::from(home))),
+                "and parse_in answers for its home the same way"
+            );
+        }
     }
 
     #[test]

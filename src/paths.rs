@@ -11,12 +11,16 @@
 //! so rendering can never corrupt a file's body. That restriction is what lets
 //! bx avoid a template language entirely.
 //!
-//! This module also holds the crate's **one** home-resolution mechanism.
-//! [`home`] is the only function that reads `$HOME`, and [`xdg_base`] is the
-//! whole XDG base-directory rule in one place, taking its environment as an
-//! argument so it is testable and so a caller that already knows the home does
-//! not read the process environment a second time. Every other module that
-//! needs a base directory calls [`xdg_base`]; nothing adds a second resolver.
+//! This module also holds the crate's **one** home-resolution mechanism. Every
+//! rule in it takes its environment as an argument — [`home_in`], [`xdg_base`],
+//! [`config_root_in`] — and [`home`] and [`config_root`] are one-line wrappers
+//! that read the process environment and nothing more. The crate never *writes*
+//! to the process environment: `std::env::set_var` is `unsafe` in edition 2024
+//! because its precondition is process-wide, and under `cargo test` no code can
+//! establish it. Design-by-parameter is how the rules stay testable without it.
+//!
+//! Every other module that needs a base directory calls [`xdg_base`]; nothing
+//! adds a second resolver.
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -94,24 +98,85 @@ pub enum Error {
     /// `/`-rooted.
     #[error("a portable path must start with `~` or `/`, got {0}")]
     NotPortable(String),
+    /// A `~`-rooted path whose `..` segments climb out of the home it is
+    /// relative to.
+    #[error("a portable path may not climb out of the home it is rooted in: {0}")]
+    EscapesRoot(String),
 }
 
-/// The invoking user's home directory, from `$HOME`.
+/// Normalise a rooted path lexically, without touching the filesystem.
 ///
-/// The **only** read of `$HOME` in the crate. bx does not fall back to
-/// `getpwuid`: `$HOME` is what every shell, every tool bx configures, and the
-/// user's own dotfiles already agree on, and silently disagreeing with them is
-/// exactly the surprise this tool exists to prevent.
+/// Collapses `//` and `.`, and resolves `..` textually. Lexical and not
+/// `canonicalize`, because a portable path names a destination that need not
+/// exist yet, and because resolving symlinks would make the result depend on the
+/// machine — which is the one thing a *portable* path may not do.
 ///
-/// An empty `$HOME` is treated as unset, because an empty home would make every
+/// An absolute path clamps at `/`, as the kernel does: `/a/../..` is `/`. A
+/// `~`-rooted path does not clamp, because `~/..` is a real location outside the
+/// home and silently reading it as the home would be the surprise.
+fn normalise(raw: &str) -> Result<String, Error> {
+    let Some((root, rest)) = split_root(raw) else {
+        return Err(Error::NotPortable(raw.to_string()));
+    };
+
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() && !root.is_empty() {
+                    return Err(Error::EscapesRoot(raw.to_string()));
+                }
+            }
+            named => parts.push(named),
+        }
+    }
+
+    Ok(match (root, parts.is_empty()) {
+        ("", _) => format!("/{}", parts.join("/")),
+        (root, true) => root.to_string(),
+        (root, false) => format!("{root}/{}", parts.join("/")),
+    })
+}
+
+/// Split a rooted path into its root token and the rest.
+///
+/// The root is `""` for an absolute path, `"~"` for the invoking user's home, or
+/// `"~name"` for someone else's. `None` for anything relative.
+fn split_root(raw: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = raw.strip_prefix('/') {
+        return Some(("", rest));
+    }
+    if raw.starts_with('~') {
+        let split_at = raw.find('/').unwrap_or(raw.len());
+        let (root, rest) = raw.split_at(split_at);
+        return Some((root, rest.strip_prefix('/').unwrap_or(rest)));
+    }
+    None
+}
+
+/// The home-directory rule, given what `$HOME` holds.
+///
+/// The whole of the rule lives here rather than in [`home`], so a test can
+/// exercise an unset, empty or relative home by passing one rather than by
+/// mutating the process environment. `std::env::set_var` is `unsafe` in edition
+/// 2024 because its precondition is process-wide — no other thread reading the
+/// environment, including through `getenv` inside libc — and `cargo test` cannot
+/// establish that. Design-by-parameter is how this crate avoids needing to.
+///
+/// bx does not fall back to `getpwuid`: `$HOME` is what every shell, every tool
+/// bx configures, and the user's own dotfiles already agree on, and silently
+/// disagreeing with them is exactly the surprise this tool exists to prevent.
+///
+/// An empty value is treated as unset, because an empty home would make every
 /// `~`-rooted path resolve to a bare relative path.
 ///
 /// # Errors
 ///
-/// [`Error::HomeUnset`] when `$HOME` is absent or empty, and
-/// [`Error::HomeNotAbsolute`] when it is set to a relative path.
-pub fn home() -> Result<PathBuf, Error> {
-    let raw = std::env::var_os("HOME").ok_or(Error::HomeUnset)?;
+/// [`Error::HomeUnset`] when `raw` is `None` or empty, and
+/// [`Error::HomeNotAbsolute`] when it is a relative path.
+pub fn home_in(raw: Option<&OsStr>) -> Result<PathBuf, Error> {
+    let raw = raw.ok_or(Error::HomeUnset)?;
     if raw.is_empty() {
         return Err(Error::HomeUnset);
     }
@@ -120,6 +185,19 @@ pub fn home() -> Result<PathBuf, Error> {
         return Err(Error::HomeNotAbsolute(home));
     }
     Ok(home)
+}
+
+/// The invoking user's home directory, from `$HOME`.
+///
+/// The **only** read of `$HOME` in the crate, and a read is all it is: nothing
+/// here or anywhere in this crate writes to the process environment. The rule it
+/// applies is [`home_in`]'s.
+///
+/// # Errors
+///
+/// Whatever [`home_in`] returns for the current `$HOME`.
+pub fn home() -> Result<PathBuf, Error> {
+    home_in(std::env::var_os("HOME").as_deref())
 }
 
 /// Resolve one XDG base directory.
@@ -174,6 +252,22 @@ pub fn config_root() -> Result<PathBuf, Error> {
 /// manages the invoking user's environment, and resolving someone else's home
 /// would be a surprise. [`Portable::under_home`] is how a caller asks whether a
 /// portable path is one of the invoking user's.
+///
+/// # Every `Portable` is lexically normalised
+///
+/// `//` and `.` are collapsed and `..` is resolved when the value is built, and
+/// a `~`-rooted path that climbs out of `~` is rejected outright. Two things
+/// depend on that and neither is optional:
+///
+/// * Its `Ord` and `Hash` are over the stored string, and it is the key of a
+///   target, of entry A4's ledger and of entry A6's journal. Without
+///   normalisation `~/.ssh/config` and `~/.ssh/./config` are two keys for one
+///   file, so one file acquires two ledger rows and Invariant 4 fails at the key
+///   rather than at the writer.
+/// * [`Portable::under_home`] is a claim about *location*. Without
+///   normalisation `~/../../etc/passwd` is "under home" and renders to a path
+///   the kernel resolves to `/etc/passwd`, so a caller gating a write on it
+///   gates on nothing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Portable(String);
@@ -181,27 +275,38 @@ pub struct Portable(String);
 impl Portable {
     /// Make `path` portable against `home`.
     ///
+    /// Both arguments are normalised lexically first, so a `..` inside `path`
+    /// is resolved *before* the home prefix is stripped — otherwise
+    /// `/home/a/../../etc` under home `/home/a` would become the escaping
+    /// `~/../../etc`.
+    ///
     /// `path` is expected to be absolute. [`to_portable`] leaves anything
     /// outside `home` exactly as it was, so a relative `path` yields a relative
     /// `Portable`; use [`Portable::parse`] when the input is untrusted.
     #[must_use]
     pub fn from_path(path: &Path, home: &Path) -> Self {
-        Self(to_portable(path, home))
+        let path = normalised_or_given(path);
+        let home = normalised_or_given(home);
+        Self(to_portable(Path::new(&path), Path::new(&home)))
     }
 
     /// Parse a portable path written by a human.
+    ///
+    /// The result is lexically normalised: `//` and `.` collapse and `..`
+    /// resolves, so one file has exactly one spelling.
     ///
     /// # Errors
     ///
     /// [`Error::NotPortable`] if `raw` is neither `~`- nor `/`-rooted. A
     /// relative path has no defined meaning in a config repo: it would depend on
     /// the working directory bx happened to be invoked from.
+    ///
+    /// [`Error::EscapesRoot`] if `raw` is `~`-rooted and its `..` segments climb
+    /// out of the home. `~/../x` is not a home-relative path, and treating it as
+    /// one is how a check on [`Portable::under_home`] becomes a check on
+    /// nothing.
     pub fn parse(raw: &str) -> Result<Self, Error> {
-        if raw.starts_with('~') || raw.starts_with('/') {
-            Ok(Self(raw.to_string()))
-        } else {
-            Err(Error::NotPortable(raw.to_string()))
-        }
+        normalise(raw).map(Self)
     }
 
     /// The stored string.
@@ -218,11 +323,21 @@ impl Portable {
 
     /// Whether this path lies under the invoking user's home.
     ///
-    /// `~user/...` is not: it is another account's home, and bx never expands it.
+    /// A true statement about location, because a `Portable` is normalised when
+    /// it is built and one that climbs out of `~` never exists.
+    ///
+    /// `~user/...` is not under home: it is another account's home, and bx never
+    /// expands it.
     #[must_use]
     pub fn under_home(&self) -> bool {
         self.0 == "~" || self.0.starts_with("~/")
     }
+}
+
+/// Normalise a path lexically, keeping it as it was if it has no root.
+fn normalised_or_given(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    normalise(&raw).unwrap_or_else(|_| raw.into_owned())
 }
 
 impl std::fmt::Display for Portable {
@@ -277,7 +392,6 @@ pub fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::guarded_home;
 
     fn home() -> PathBuf {
         // A deliberately non-standard home: nothing here may name a real
@@ -461,31 +575,13 @@ mod tests {
         );
     }
 
-    // --- reading the process environment ---------------------------------
-
-    #[test]
-    fn the_config_root_is_read_from_the_process_environment() {
-        let guard = guarded_home();
-
-        assert_eq!(super::home().unwrap(), guard.path());
-        assert_eq!(config_root().unwrap(), guard.child(".config/bx"));
-
-        let explicit = guard.child("xdg-config");
-        guard.set("XDG_CONFIG_HOME", Some(explicit.as_os_str()));
-        assert_eq!(config_root().unwrap(), explicit.join("bx"));
-    }
+    // --- the home rule, and reading it from the environment ---------------
 
     #[test]
     fn an_unset_home_is_an_error() {
-        let guard = guarded_home();
-
-        guard.set("HOME", None);
-        assert_eq!(super::home(), Err(Error::HomeUnset));
-        assert_eq!(config_root(), Err(Error::HomeUnset));
-
-        guard.set("HOME", Some(OsStr::new("")));
+        assert_eq!(home_in(None), Err(Error::HomeUnset));
         assert_eq!(
-            super::home(),
+            home_in(Some(OsStr::new(""))),
             Err(Error::HomeUnset),
             "an empty HOME would make every ~ path relative"
         );
@@ -493,12 +589,60 @@ mod tests {
 
     #[test]
     fn a_relative_home_is_an_error() {
-        let guard = guarded_home();
-
-        guard.set("HOME", Some(OsStr::new("not/absolute")));
         assert_eq!(
-            super::home(),
+            home_in(Some(OsStr::new("not/absolute"))),
             Err(Error::HomeNotAbsolute(PathBuf::from("not/absolute")))
+        );
+        assert_eq!(
+            home_in(Some(OsStr::new("."))),
+            Err(Error::HomeNotAbsolute(PathBuf::from(".")))
+        );
+    }
+
+    #[test]
+    fn an_absolute_home_is_taken_as_given() {
+        assert_eq!(home_in(Some(OsStr::new("/var/home/example"))), Ok(home()));
+    }
+
+    #[test]
+    fn a_non_utf8_home_is_honoured() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"/var/home/exa\xffmple");
+        assert_eq!(home_in(Some(raw)), Ok(PathBuf::from(raw)));
+    }
+
+    #[test]
+    fn the_process_home_is_read_and_never_written() {
+        // The wrapper is one line, and this pins it without mutating anything:
+        // reading $HOME agrees with the rule applied to $HOME. Mutating the
+        // environment here would be unsound -- see `home_in` and `testing`.
+        let raw = std::env::var_os("HOME");
+        let before = raw.clone();
+
+        assert_eq!(super::home(), home_in(raw.as_deref()));
+        assert_eq!(
+            std::env::var_os("HOME"),
+            before,
+            "resolving a home must not change one"
+        );
+    }
+
+    #[test]
+    fn the_config_root_is_read_from_the_process_environment() {
+        let expected = super::home()
+            .map(|home| config_root_in(&home, std::env::var_os("XDG_CONFIG_HOME").as_deref()));
+
+        assert_eq!(config_root(), expected);
+    }
+
+    #[test]
+    fn the_config_root_fails_exactly_when_the_home_does() {
+        // `config_root` is `home` composed with `config_root_in`, so its error
+        // path is the composition's and is pinned at the parameterised end.
+        assert_eq!(
+            home_in(None).map(|home| config_root_in(&home, None)),
+            Err(Error::HomeUnset)
         );
     }
 
@@ -576,6 +720,106 @@ mod tests {
 
         let rendered: Vec<&str> = paths.iter().map(Portable::as_str).collect();
         assert_eq!(rendered, ["/usr/bin/sccache", "~/.config/bx", "~/.zshrc"]);
+    }
+
+    #[test]
+    fn a_portable_is_lexically_normalised() {
+        // One file, one spelling. Ord and Hash are over this string, and it is
+        // the key of a target, of the ledger and of the journal.
+        for (written, stored) in [
+            ("~/.ssh/./config", "~/.ssh/config"),
+            ("~/.ssh//config", "~/.ssh/config"),
+            ("~/.ssh/", "~/.ssh"),
+            ("~/.ssh/keys/../config", "~/.ssh/config"),
+            ("~/./", "~"),
+            ("/usr//bin/./sccache", "/usr/bin/sccache"),
+            ("~other//.linuxbrew/", "~other/.linuxbrew"),
+        ] {
+            assert_eq!(
+                Portable::parse(written).unwrap().as_str(),
+                stored,
+                "{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn differently_spelled_paths_are_one_key() {
+        use std::collections::HashSet;
+
+        let spellings = ["~/.ssh/config", "~/.ssh/./config", "~/.ssh//config"];
+        let keys: HashSet<Portable> = spellings
+            .iter()
+            .map(|raw| Portable::parse(raw).unwrap())
+            .collect();
+
+        assert_eq!(keys.len(), 1, "one file must not acquire three ledger rows");
+    }
+
+    #[test]
+    fn a_portable_that_climbs_out_of_home_is_rejected() {
+        // under_home() is a claim about location, so this may not parse.
+        for escaping in [
+            "~/..",
+            "~/../../etc/passwd",
+            "~/.ssh/../../etc",
+            "~other/..",
+        ] {
+            assert_eq!(
+                Portable::parse(escaping),
+                Err(Error::EscapesRoot(escaping.to_string())),
+                "{escaping}"
+            );
+        }
+        assert_eq!(
+            Error::EscapesRoot("~/..".to_string()).to_string(),
+            "a portable path may not climb out of the home it is rooted in: ~/.."
+        );
+    }
+
+    #[test]
+    fn an_absolute_portable_clamps_at_the_root() {
+        // The kernel resolves /.. to /, and so does this.
+        assert_eq!(Portable::parse("/..").unwrap().as_str(), "/");
+        assert_eq!(Portable::parse("/a/../..").unwrap().as_str(), "/");
+        assert_eq!(Portable::parse("/a/../b").unwrap().as_str(), "/b");
+        assert_eq!(Portable::parse("/").unwrap().as_str(), "/");
+    }
+
+    #[test]
+    fn from_path_normalises_before_it_makes_portable() {
+        // Stripping the home prefix first would turn this into `~/../../etc`,
+        // which is exactly the escaping value parse() refuses.
+        let portable = Portable::from_path(
+            Path::new("/var/home/example/.ssh/../../../../etc/passwd"),
+            &home(),
+        );
+
+        assert_eq!(portable.as_str(), "/etc/passwd");
+        assert!(!portable.under_home());
+        assert_eq!(portable.render(&home()), Path::new("/etc/passwd"));
+    }
+
+    #[test]
+    fn from_path_collapses_redundant_segments() {
+        assert_eq!(
+            Portable::from_path(Path::new("/var/home/example/.ssh/./config"), &home()).as_str(),
+            "~/.ssh/config"
+        );
+        assert_eq!(
+            Portable::from_path(Path::new("/var/home/example/a/../b"), &home()).as_str(),
+            "~/b"
+        );
+    }
+
+    #[test]
+    fn from_path_leaves_a_relative_path_alone() {
+        // Documented fallback: a relative input has no root to normalise
+        // against, and parse() is what a caller uses on untrusted input.
+        assert_eq!(
+            Portable::from_path(Path::new("files/starship.toml"), &home()).as_str(),
+            "files/starship.toml"
+        );
     }
 
     #[test]

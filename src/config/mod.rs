@@ -861,6 +861,28 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_target_path_spelled_differently_is_rejected() {
+        // The natural key is the normalised Portable, not the bytes a human
+        // typed. Without that, one file quietly acquires two ledger rows.
+        for second in ["~/.ssh/./config", "~/.ssh//config", "~/.ssh/keys/../config"] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nfile = \"a\"\n\n\
+                 [[target]]\npath = \"{second}\"\nfile = \"b\"\n"
+            );
+            assert!(
+                message(&text).contains("duplicate target `~/.ssh/config`"),
+                "{second} should collide with ~/.ssh/config"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_path_that_climbs_out_of_home_is_rejected() {
+        let text = "[[target]]\npath = \"~/../../etc/passwd\"\nfile = \"a\"\n";
+        assert!(message(text).contains("climb out of the home"));
+    }
+
+    #[test]
     fn a_duplicate_value_name_in_one_layer_is_rejected() {
         let text = "[[value]]\nname = \"scratch_root\"\nkind = \"path\"\n\n\
                     [[value]]\nname = \"scratch_root\"\nkind = \"string\"\n";

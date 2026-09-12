@@ -416,13 +416,37 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
     Ok(attach)
 }
 
-/// Exactly one body key, or none for an `include` target.
+/// Exactly one body key — and for an `include` target, none, because its body
+/// *is* its line.
 fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> {
     let declared: Vec<&str> = BODY_KEYS
         .iter()
         .copied()
         .filter(|key| table.contains_key(key))
         .collect();
+
+    // The same rule the other companion keys follow: a key that cannot mean
+    // anything is an error, not a key that is quietly ignored. An include
+    // target's body *is* its `include` line, so a `content`, `file` or
+    // `generated` beside it is a second body nothing reads. Taken silently, an
+    // author who edits an include target into an own-file target and forgets to
+    // change `attach` gets a target whose forty lines of content entry A5 must
+    // either drop or insert into a file bx does not own.
+    //
+    // `dir` is excluded because it already has a stricter rule, applied in
+    // `parse_target`: a directory target's only admissible attachment is `own`,
+    // whatever else it declares, and that message says so.
+    let unreachable = declared.iter().find(|key| **key != "dir");
+    if let (Attach::Include { .. }, Some(first)) = (attach, unreachable) {
+        return Err(ctx.bad(
+            table,
+            first,
+            format!(
+                "attach = \"include\" already declares the only line bx writes, so `{first}` \
+                 would never be read; drop it, or set `attach` to \"own\" or \"region\""
+            ),
+        ));
+    }
 
     match declared.as_slice() {
         [] => match attach {
@@ -902,13 +926,41 @@ mod tests {
     #[test]
     fn an_include_carries_its_line() {
         let text = "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
-                    include = \"Include ~/.ssh/config.d/*.conf\"\ncontent = \"x\"\n";
+                    include = \"Include ~/.ssh/config.d/*.conf\"\n";
         assert_eq!(
             parse(text).unwrap().attach,
             Attach::Include {
                 line: "Include ~/.ssh/config.d/*.conf".to_string()
             }
         );
+    }
+
+    /// An include target's body is its line; a second body is unreachable.
+    ///
+    /// `parse_body` synthesised `Body::Inline(include_line)` only when *no* body
+    /// key was declared, so with one alongside the body key was taken and
+    /// nothing compared it against the include line -- the target parsed as an
+    /// `Include` carrying a line *and* an `Inline` carrying something else
+    /// entirely. An author editing an include target into an own-file target and
+    /// forgetting to change `attach` got forty lines A5 must either drop
+    /// silently or insert into a file bx does not own.
+    #[test]
+    fn an_include_target_may_not_also_declare_a_body() {
+        for body in [
+            "content = \"something else entirely\"",
+            "file = \"files/config\"",
+            "generated = \"shell-init\"",
+        ] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
+                 include = \"Include ~/.ssh/config.d/*.conf\"\n{body}\n"
+            );
+            let message = message(&text);
+            assert!(
+                message.contains("would never be read"),
+                "`{body}` beside an include line: {message}"
+            );
+        }
     }
 
     #[test]

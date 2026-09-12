@@ -213,12 +213,6 @@ impl<T: Keyed> Merged<T> {
         self.entries.into_iter().filter(Keyed::enabled).collect()
     }
 
-    /// Every entry, disabled ones included.
-    #[must_use]
-    pub fn entries(&self) -> &[T] {
-        &self.entries
-    }
-
     /// Where `key` sits, if it is present.
     fn position(&self, key: &str) -> Option<usize> {
         self.entries.iter().position(|entry| entry.key() == key)

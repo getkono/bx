@@ -324,7 +324,15 @@ mod tests {
             .next()
             .expect("the non-test half");
 
-        for forbidden in ["std::fs", "File::", "OpenOptions", "write("] {
+        for forbidden in [
+            "std::fs",
+            "std::io",
+            "File::",
+            "OpenOptions",
+            "write(",
+            "tempfile",
+            "rustix",
+        ] {
             assert!(
                 !body.contains(forbidden),
                 "`{forbidden}` appeared: persisting a document belongs to the atomic writer"

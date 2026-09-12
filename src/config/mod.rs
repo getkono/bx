@@ -294,10 +294,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
 
 /// The toggles in `config` that belong to one section, as `check_unique` wants
 /// them.
-fn toggles_in(
-    config: &Config,
-    section: merge::Section,
-) -> impl Iterator<Item = (&str, &Origin)> {
+fn toggles_in(config: &Config, section: merge::Section) -> impl Iterator<Item = (&str, &Origin)> {
     config
         .toggles
         .iter()

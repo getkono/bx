@@ -934,19 +934,44 @@ mod tests {
         // It is structural because `std::env::set_var` is `unsafe` in edition
         // 2024 and process-global, so a test that mutated the environment would
         // race every other test in this binary.
+        //
+        // `layers.rs` is here because it is the module whose own doc asserts
+        // "nothing here reads the environment" — it takes both the home and the
+        // `XDG_STATE_HOME` override as arguments — which is the claim this test
+        // is quoted as proving.
         for (name, source) in [
+            ("layers.rs", include_str!("layers.rs")),
             ("merge.rs", include_str!("merge.rs")),
             ("values.rs", include_str!("values.rs")),
             ("resolve.rs", include_str!("resolve.rs")),
             ("values/local.rs", include_str!("values/local.rs")),
         ] {
-            // The non-test half only: this very test names the strings it
-            // forbids, and `include_str!` cannot see that distinction.
-            let body = source
+            // The non-test half, minus its prose. This very test names the
+            // strings it forbids, and `layers.rs` documents what the *binary*
+            // passes in by naming the call the library itself may not make — a
+            // textual scan cannot tell a description from a call, so whole-line
+            // comments are dropped and code is what is scanned.
+            let body: String = source
                 .split("#[cfg(test)]")
                 .next()
-                .expect("the non-test half");
-            for forbidden in ["env::var", "var_os", "env!(", "canonicalize("] {
+                .expect("the non-test half")
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // `paths::home(` is the likeliest real regression: a resolution
+            // module calling the crate's own home resolver — which does read
+            // `$HOME` — instead of threading the argument through, which would
+            // read as innocuous at the call site and make the merge impure.
+            for forbidden in [
+                "env::var",
+                "var_os",
+                "env!(",
+                "option_env!",
+                "canonicalize(",
+                "current_dir(",
+                "paths::home(",
+            ] {
                 assert!(
                     !body.contains(forbidden),
                     "{name} contains `{forbidden}`: resolution is a pure function of \

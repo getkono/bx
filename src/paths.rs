@@ -683,6 +683,11 @@ mod tests {
     #[test]
     fn an_absolute_home_is_taken_as_given() {
         assert_eq!(home_in(Some(OsStr::new("/var/home/example"))), Ok(home()));
+        assert_eq!(
+            home_in(Some(OsStr::new("/var/home/example/"))),
+            Ok(home()),
+            "a trailing slash is a spelling of the same directory, not a second home"
+        );
     }
 
     #[test]
@@ -904,6 +909,8 @@ mod tests {
             ("~/.ssh/", "~/.ssh"),
             ("~/.ssh/keys/../config", "~/.ssh/config"),
             ("~/./", "~"),
+            ("~/", "~"),
+            ("~//a", "~/a"),
             ("/usr//bin/./sccache", "/usr/bin/sccache"),
         ] {
             assert_eq!(
@@ -930,7 +937,12 @@ mod tests {
     #[test]
     fn a_portable_that_climbs_out_of_home_is_rejected() {
         // under_home() is a claim about location, so this may not parse.
-        for escaping in ["~/..", "~/../../etc/passwd", "~/.ssh/../../etc"] {
+        for escaping in [
+            "~/..",
+            "~/../../etc/passwd",
+            "~/.ssh/../../etc",
+            "~/a/../..",
+        ] {
             assert_eq!(
                 Portable::parse_in(escaping, &home()),
                 Err(Error::EscapesRoot(escaping.to_string())),
@@ -956,6 +968,11 @@ mod tests {
             "/b"
         );
         assert_eq!(Portable::parse_in("/", &home()).unwrap().as_str(), "/");
+        assert_eq!(
+            Portable::parse_in("/a/../../b", &home()).unwrap().as_str(),
+            "/b",
+            "climbing past the root clamps there and carries on"
+        );
     }
 
     #[test]

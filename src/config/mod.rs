@@ -566,6 +566,90 @@ mod tests {
         parse_str(text, Path::new("bx.toml"), home())
     }
 
+    /// A `[[target]]` entry built in memory, with no spans anywhere.
+    ///
+    /// Entry A3 parses a single entry out of a layer it is merging without
+    /// going through a whole document, which is the case these tests cover.
+    fn in_memory_target(extra: &[(&str, toml_edit::Item)]) -> Table {
+        let mut table = Table::new();
+        table.insert("path", toml_edit::value("~/.gitconfig"));
+        table.insert("file", toml_edit::value("files/gitconfig"));
+        for (key, item) in extra {
+            table.insert(key, item.clone());
+        }
+        table
+    }
+
+    #[test]
+    fn an_entry_with_no_span_degrades_to_an_unknown_origin() {
+        // `Ctx::new` asks `toml_edit` for the entry header's span, and a table
+        // nothing parsed has none. Line 0 says "this file, position unknown"
+        // rather than pretending it is line 1 -- and rather than panicking on
+        // an `expect`, which is what a caller like entry A3 would hit.
+        let file = Path::new("bx.toml");
+        let target = target::parse_target(&in_memory_target(&[]), file, "", home()).unwrap();
+
+        assert_eq!(target.origin, Origin::unknown(file));
+        assert_eq!(target.origin.to_string(), "bx.toml:0");
+    }
+
+    #[test]
+    fn a_key_with_no_span_falls_back_to_its_entry() {
+        // `Ctx::key_origin` positions an error at the offending key. With no
+        // span it falls back to the entry's own origin, which for an in-memory
+        // table is itself unknown.
+        let file = Path::new("bx.toml");
+        let table = in_memory_target(&[("nope", toml_edit::value(1))]);
+        let error = target::parse_target(&table, file, "", home()).expect_err("unknown key");
+
+        assert!(error.to_string().starts_with("bx.toml:0:"), "{error}");
+        assert!(error.to_string().contains("`nope`"), "{error}");
+    }
+
+    #[test]
+    fn a_section_key_with_no_span_degrades_to_an_unknown_origin() {
+        // The third fallback. Unreachable from `parse_str`, because every key
+        // in a parsed document has a span -- including the implicit one in
+        // `[nope.deep]` -- so it is exercised where it lives.
+        let mut root = Table::new();
+        root.insert("target", toml_edit::value(1));
+
+        assert_eq!(
+            section_origin(&root, "target", Path::new("bx.toml"), ""),
+            Origin::unknown(Path::new("bx.toml"))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_modules_directory_names_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = repo(&[("bx.toml", ""), ("modules/a.toml", "")]);
+        let modules = dir.path().join(MODULES_DIR);
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        // A process that can read a 0000 directory -- root, or one holding
+        // CAP_DAC_READ_SEARCH -- cannot construct this case at all. Say so
+        // rather than assert something else and call it covered.
+        let reachable = std::fs::read_dir(&modules).is_err();
+        let result = layer_files(dir.path());
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
+            .expect("restore, so the tempdir can be removed");
+
+        assert!(
+            reachable,
+            "this process can read a 0000 directory, so the io error cannot be reached"
+        );
+        match result {
+            Err(Error::Io { path, .. }) => assert_eq!(path, modules),
+            other => panic!(
+                "expected an io error naming {}, got {other:?}",
+                modules.display()
+            ),
+        }
+    }
+
     fn message(text: &str) -> String {
         parse(text)
             .expect_err("should have been rejected")

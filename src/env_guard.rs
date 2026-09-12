@@ -886,6 +886,29 @@ mod tests {
     }
 
     #[test]
+    fn a_root_inside_another_root_admits_what_each_of_them_admits() {
+        // Overlapping declarations are ordinary — a scratch mount and a
+        // directory inside it — and `contains` is an `any`, so the narrower one
+        // neither shadows nor narrows the wider.
+        let inner = format!("{ROOT}/cache");
+        let roots = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from(ROOT), PathBuf::from(&inner)],
+        );
+        assert!(roots.contains(Path::new(&inner)));
+        assert!(roots.contains(Path::new("/var/mnt/scratch/example/cache/cargo")));
+        assert!(roots.contains(Path::new("/var/mnt/scratch/example/other")));
+        assert!(!roots.contains(Path::new("/var/mnt/scratch/elsewhere")));
+        // Declared the other way round, the same set.
+        let reversed = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from(&inner), PathBuf::from(ROOT)],
+        );
+        assert!(reversed.contains(Path::new("/var/mnt/scratch/example/other")));
+        assert!(!reversed.contains(Path::new("/var/mnt/scratch/elsewhere")));
+    }
+
+    #[test]
     fn a_root_written_with_a_tilde_expands_against_home() {
         let roots = RootSet::new(Path::new(HOME), &[PathBuf::from("~/scratch")]);
         assert!(roots.contains(Path::new("/var/home/example/scratch/cargo")));
@@ -1280,19 +1303,45 @@ mod tests {
     // environment.
 
     #[test]
-    fn scan_is_scan_with_no_roots_declared() {
-        // Backward compatibility as a property, not by inspection.
-        for content in [
-            "export EDITOR=nvim\n",
-            "export CARGO_HOME=$HOME/x\n",
-            "# export CARGO_HOME=/x\n",
-            "export XDG_CONFIG_HOME=/a\nexport EDITOR=nvim\nexport RUSTUP_HOME=/b\n",
-            "setenv GOPATH /x\nsource ~/.cargo/env\n",
-            OPERATOR_FRAGMENT,
+    fn scan_denies_every_relocation_and_nothing_else() {
+        // What the strict guard actually returns, written out. Comparing
+        // `scan` against `scan_with(_, &RootSet::strict())` is `scan`'s own
+        // definition and cannot fail, so it shows nothing.
+        //
+        // This is not the name-based guard's output either: six widened names
+        // are denied here that it allowed. What survives from it is the
+        // direction — with no root declared, every relocating assignment is
+        // refused and nothing else is touched.
+        for (content, expected) in [
+            ("export EDITOR=nvim\n", vec![]),
+            ("export SCCACHE_CACHE_SIZE=100G\n", vec![]),
+            ("# export CARGO_HOME=/x\n", vec![]),
+            ("source ~/.cargo/env\n", vec![]),
+            ("export CARGO_HOME=$HOME/x\n", vec![(1, "CARGO_HOME")]),
+            (
+                "setenv GOPATH /x\nsource ~/.cargo/env\n",
+                vec![(1, "GOPATH")],
+            ),
+            // Widened: the name-based guard let this one through unchecked.
+            ("export GOCACHE=/x\n", vec![(1, "GOCACHE")]),
+            (
+                "export XDG_CONFIG_HOME=/a\nexport EDITOR=nvim\nexport RUSTUP_HOME=/b\n",
+                vec![(1, "XDG_CONFIG_HOME"), (3, "RUSTUP_HOME")],
+            ),
         ] {
+            let found = scan(content);
             assert_eq!(
-                scan(content),
-                scan_with(content, &RootSet::strict()),
+                found
+                    .iter()
+                    .map(|violation| (violation.line, violation.name.as_str()))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{content}"
+            );
+            assert!(
+                found
+                    .iter()
+                    .all(|violation| violation.reason == Reason::NoRootsDeclared),
                 "{content}"
             );
         }
@@ -1479,6 +1528,60 @@ mod tests {
         let found = scan_with(content, &rooted());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].reason, Reason::UnresolvedReference);
+    }
+
+    #[test]
+    fn two_values_that_refer_to_each_other_do_not_resolve() {
+        // A true two-node cycle, which the self-reference case does not cover:
+        // the value never grows, so the length bound never fires and only the
+        // hop limit ends it. Neither `A` nor `B` relocates anything, so the
+        // cycle reaches the guard through the value that does.
+        let content = concat!("A=$B\n", "B=$A\n", "export CARGO_HOME=$A/cargo\n");
+        let found = scan_with(content, &rooted());
+        assert_eq!(
+            found
+                .iter()
+                .map(|violation| (violation.line, violation.reason))
+                .collect::<Vec<_>>(),
+            vec![(3, Reason::UnresolvedReference)]
+        );
+    }
+
+    #[test]
+    fn an_inline_comment_after_a_value_is_part_of_the_value() {
+        // The scanner does not understand a trailing comment, and this is what
+        // that costs. The comment becomes part of the last path component, so
+        // a value inside a root stays inside it and the line is allowed —
+        // where the name-based guard denied it on the name alone. Deliberate,
+        // documented on `scan_with`, and pinned here because it is a change of
+        // verdict rather than of wording.
+        assert_eq!(
+            scan_with(
+                "export CARGO_HOME=/var/mnt/scratch/example/cargo # written by bx\n",
+                &rooted()
+            ),
+            vec![]
+        );
+        // The value still has to be inside a root: the comment buys nothing.
+        assert_eq!(
+            scan_with("export CARGO_HOME=/var/cache/elsewhere # bx\n", &rooted())
+                .iter()
+                .map(|violation| violation.reason)
+                .collect::<Vec<_>>(),
+            vec![Reason::OutsideDeclaredRoots]
+        );
+        // A comment carrying an assignment is refused rather than half-judged,
+        // because nothing here can tell it from a second export.
+        assert_eq!(
+            scan_with(
+                "export CARGO_HOME=/var/mnt/scratch/example/cargo # GOPATH=/etc\n",
+                &rooted()
+            )
+            .iter()
+            .map(|violation| violation.reason)
+            .collect::<Vec<_>>(),
+            vec![Reason::MultipleAssignments]
+        );
     }
 
     #[test]

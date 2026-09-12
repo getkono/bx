@@ -51,6 +51,8 @@
 //! reference it and lets the rest of the apply proceed. [`Unresolved`] is the
 //! type that keeps the two apart.
 
+pub mod local;
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 

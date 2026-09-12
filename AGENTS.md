@@ -29,9 +29,14 @@ wrong even if it passes CI.
 
 1. **Additive only.** Never delete or rewrite a byte the user wrote. Writes land
    in delimited managed regions, or in files bx owns because the user said so.
-2. **Native locations only.** Never point a tool at a bx-owned directory. Never
-   emit an env var that relocates a tool's config, data, or cache — `env_guard`
-   enforces this and every generated shell fragment must pass through it.
+2. **Native locations unless the configuration declares otherwise.** Never point
+   a tool at a bx-owned directory. Never move a tool's config, data, or cache
+   outside a root the configuration declares. `env_guard` enforces this on the
+   **value** a variable is given, never on the variable's name, and every
+   generated shell fragment must pass through it. Declare no root and no
+   relocation is allowed at all. Containment is decided lexically, never by
+   touching the filesystem, because invariant 3 forbids a verdict that depends
+   on what happens to exist.
 3. **Idempotent.** `apply` twice must produce an empty second `plan`, and
    generated files must be byte-identical between runs: no timestamps, no
    nondeterministic iteration order.

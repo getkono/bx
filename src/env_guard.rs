@@ -5,20 +5,31 @@
 //! and `RUSTC_WRAPPER` are the motivating cases, since sccache is configured
 //! entirely by environment.
 //!
-//! bx *may never* write a variable that relocates a tool's config, data, or
-//! cache. Doing so makes the tool depend on bx having run: open a shell that
-//! bx did not initialise — a login shell, a `systemd-run` unit, an SSH command,
-//! a container — and the tool silently reads a different directory.
+//! bx *may never* write a variable that moves a tool's config, data, or cache
+//! **outside a root the configuration declares**. Doing so makes the tool
+//! depend on bx having run: open a shell that bx did not initialise — a login
+//! shell, a `systemd-run` unit, an SSH command, a container — and the tool
+//! silently reads a different directory. Inside a declared root the user has
+//! said where those directories live and has accepted that consequence, which
+//! is why a machine that puts its toolchain caches on a scratch mount is a
+//! configuration bx serves rather than one it refuses.
+//!
+//! The rule is therefore about the **value** a variable is given, never about
+//! the variable's name. [`is_relocating`] only decides whether a value has to be
+//! looked at; [`check`] is the verdict, and [`RootSet`] is what it is judged
+//! against. Declare no root — [`RootSet::strict`], which is what [`scan`] uses —
+//! and nothing may be relocated anywhere.
 //!
 //! This module is that rule as code. Anything bx generates for a shell is run
-//! through [`scan`] before it is written, and the check is covered by tests
+//! through [`scan_with`] before it is written, and the check is covered by tests
 //! rather than left to review.
 
 use std::path::{Path, PathBuf};
 
 use crate::paths;
 
-/// Exact variable names bx must never assign.
+/// Exact variable names whose assigned value must be checked against the
+/// declared roots.
 const DENIED_EXACT: &[&str] = &[
     // XDG roots — relocating any of these moves every tool at once.
     "XDG_CONFIG_HOME",
@@ -61,8 +72,8 @@ const DENIED_EXACT: &[&str] = &[
     "SCCACHE_DIR",
 ];
 
-/// Prefixes whose variables are, as a family, about relocating a tool's
-/// directories. Matched against the whole name, so `MISE_DATA_DIR` is denied
+/// Prefixes whose variables are, as a family, about where a tool's directories
+/// live. Matched against the whole name, so `MISE_DATA_DIR` is value-checked
 /// while `MISE_VERBOSE` is not.
 const DENIED_PREFIXES: &[&str] = &["NPM_CONFIG_", "UV_", "MISE_", "ASDF_", "PIP_"];
 
@@ -77,11 +88,23 @@ const DENIED_SUFFIXES: &[&str] = &[
     "_STORE_DIR",
 ];
 
-/// Names that match a denied prefix or suffix but are legitimate: they
-/// configure behaviour bx is allowed to set, not a location.
+/// Names that match a prefix or suffix above but carry no path at all: they
+/// configure behaviour, so their value must not be checked against a root.
 const ALLOWED_EXCEPTIONS: &[&str] = &["UV_SYSTEM_PYTHON", "MISE_VERBOSE", "PIP_REQUIRE_VIRTUALENV"];
 
-/// Whether bx is forbidden from assigning `name`.
+/// Whether assigning `name` requires its **value** to be checked against the
+/// declared roots.
+///
+/// This used to be the verdict itself: a matching name was a denial. It is now
+/// only the question. A matching name is one that names a location, so *where*
+/// that location is decides whether bx may write it, and [`check`] is what
+/// decides. The three lists above are therefore no longer a deny-list.
+///
+/// Because a wider list now means more checking rather than more denial, the
+/// list can afford to be wide — but it is still widened only by evidence. A
+/// generic `_DIR` or `_PATH` suffix is deliberately absent: `_PATH` would
+/// capture colon-separated lists such as `LD_LIBRARY_PATH`, which are not
+/// single paths and would be rejected for not being absolute.
 ///
 /// The check is case-sensitive: environment variable names are, and a tool that
 /// reads `CARGO_HOME` does not read `cargo_home`.
@@ -1050,7 +1073,7 @@ mod tests {
             "XDG_CACHE_HOME",
             "XDG_STATE_HOME",
         ] {
-            assert!(is_relocating(name), "{name} should be denied");
+            assert!(is_relocating(name), "{name} should be value-checked");
         }
     }
 
@@ -1063,7 +1086,7 @@ mod tests {
             "GH_CONFIG_DIR",
             "KUBECONFIG",
         ] {
-            assert!(is_relocating(name), "{name} should be denied");
+            assert!(is_relocating(name), "{name} should be value-checked");
         }
     }
 
@@ -1076,7 +1099,7 @@ mod tests {
             "ASDF_DIR",
             "PIP_TARGET",
         ] {
-            assert!(is_relocating(name), "{name} should be denied");
+            assert!(is_relocating(name), "{name} should be value-checked");
         }
     }
 
@@ -1084,7 +1107,7 @@ mod tests {
     fn location_suffixes_are_value_checked_generically() {
         // The point of the suffix rule is catching tools bx has never heard of.
         for name in ["SOMETOOL_CONFIG_DIR", "OTHERTOOL_HOME", "THIRD_CACHE_DIR"] {
-            assert!(is_relocating(name), "{name} should be denied");
+            assert!(is_relocating(name), "{name} should be value-checked");
         }
     }
 

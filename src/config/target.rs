@@ -13,6 +13,8 @@
 //! attach     = "own"                            # own | region | include; default own
 //! comment    = "#"                              # required iff attach = "region"
 //! include    = "Include ~/.ssh/config.d/*.conf" # required iff attach = "include"
+//!                                               #   one non-empty line; no body key
+//!                                               #   beside it, the line *is* the body
 //! direction  = "apply"                          # apply | track; default apply
 //! format     = "opaque"                         # opaque | jsonc | env.d; default opaque
 //! owns       = ["agent.default_model"]          # permitted iff format = "jsonc"
@@ -366,8 +368,8 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
                 )
             })?;
             let mut chars = raw.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => Attach::Region { comment: c },
+            let comment = match (chars.next(), chars.next()) {
+                (Some(c), None) => c,
                 _ => {
                     return Err(ctx.bad(
                         table,
@@ -375,7 +377,24 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
                         format!("`comment` must be a single character, got {raw:?}"),
                     ));
                 }
+            };
+            // Type-checked is not value-checked. `comment = "\n"` is a single
+            // character and produced region delimiters that cannot be found
+            // again, so the region stops delimiting anything: bx appends a
+            // fresh region on every run, which is Invariant 3, or writes
+            // outside the one it meant to, which is Invariant 1. A whitespace
+            // comment character is the same defect with a subtler spelling.
+            if comment.is_whitespace() || comment.is_control() {
+                return Err(ctx.bad(
+                    table,
+                    "comment",
+                    format!(
+                        "`comment` starts the delimiter lines bx has to find again, so it \
+                         may not be whitespace or a control character; got {raw:?}"
+                    ),
+                ));
             }
+            Attach::Region { comment }
         }
         "include" => {
             let line = include.ok_or_else(|| {
@@ -385,6 +404,24 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
                     "attach = \"include\" needs an `include` line to insert",
                 )
             })?;
+            // The key is called `include` and holds one *line*: entry A5 finds
+            // it again by looking for it in the file. An empty line matches
+            // every blank line in `~/.ssh/config`, or is appended on every run
+            // — Invariant 3 either way. A value bearing a line terminator is
+            // not one line, so no line-wise search finds it whole; a multi-line
+            // insertion is `attach = "region"`, which has delimiters for
+            // exactly that reason.
+            if line.is_empty() || line.contains(['\n', '\r']) {
+                return Err(ctx.bad(
+                    table,
+                    "include",
+                    format!(
+                        "`include` is the single line bx inserts and finds again, so it may \
+                         not be empty or span lines; for a multi-line insertion use \
+                         attach = \"region\". Got {line:?}"
+                    ),
+                ));
+            }
             Attach::Include {
                 line: line.to_string(),
             }
@@ -975,14 +1012,67 @@ mod tests {
 
     #[test]
     fn an_include_body_defaults_to_its_line() {
-        let text = "[[target]]\npath = \"~/.gitconfig\"\nattach = \"include\"\n\
-                    include = \"[include]\\n\\tpath = ~/.gitconfig.bx\"\n";
+        let text = "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
+                    include = \"Include ~/.ssh/config.d/*.conf\"\n";
         let target = parse(text).unwrap();
 
         assert_eq!(
             target.body,
-            Body::Inline("[include]\n\tpath = ~/.gitconfig.bx".to_string()),
+            Body::Inline("Include ~/.ssh/config.d/*.conf".to_string()),
         );
+    }
+
+    /// An `include` line is type-checked and now value-checked.
+    ///
+    /// Both values here parsed. An empty line makes A5's idempotence check
+    /// match every blank line in the file, or append one on every run --
+    /// Invariant 3 either way. A value bearing a terminator is not one line, so
+    /// nothing line-wise finds it again; a multi-line insertion is
+    /// `attach = "region"`, which carries delimiters for that purpose.
+    #[test]
+    fn an_include_line_that_is_not_one_line_is_rejected() {
+        for raw in [
+            "",
+            "[include]\\n\\tpath = ~/.gitconfig.bx",
+            "Include a\\r\\nInclude b",
+        ] {
+            let text = format!(
+                "[[target]]\npath = \"~/.gitconfig\"\nattach = \"include\"\ninclude = \"{raw}\"\n"
+            );
+            let message = message(&text);
+            assert!(
+                message.contains("not be empty or span lines"),
+                "include = {raw:?}: {message}"
+            );
+        }
+    }
+
+    /// A `comment` character is type-checked and now value-checked.
+    ///
+    /// `comment = "\n"` is a single character and parsed. It produces region
+    /// delimiters that cannot be found again, so the region stops delimiting
+    /// anything: a fresh region on every run, which is Invariant 3, or a write
+    /// outside the one bx meant, which is Invariant 1.
+    #[test]
+    fn a_comment_character_that_cannot_start_a_delimiter_is_rejected() {
+        for raw in ["\\n", "\\t", " ", "\\u0000"] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"region\"\ncomment = \"{raw}\"\n"
+            );
+            let message = message(&text);
+            assert!(
+                message.contains("whitespace or a control character"),
+                "comment = {raw:?}: {message}"
+            );
+        }
+        // The characters real config syntaxes actually use still parse.
+        for raw in ["#", ";", "%", "\\\"", "/"] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"region\"\n\
+                 comment = \"{raw}\"\ncontent = \"x\"\n"
+            );
+            parse(&text).unwrap_or_else(|e| panic!("comment = {raw:?}: {e}"));
+        }
     }
 
     #[test]

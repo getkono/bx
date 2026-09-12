@@ -14,6 +14,12 @@
 //! is why a machine that puts its toolchain caches on a scratch mount is a
 //! configuration bx serves rather than one it refuses.
 //!
+//! bx *may never* point a tool at a directory **bx itself owns**, and that one
+//! is unconditional: it holds inside a declared root too, because bx's state
+//! directory holds the record that makes an uninstall exact, and a tool writing
+//! among those files would make `bx rm` destructive. [`RootSet::owns`] is that
+//! exclusion, and it is checked before containment.
+//!
 //! The rule is therefore about the **value** a variable is given, never about
 //! the variable's name. [`is_relocating`] only decides whether a value has to be
 //! looked at; [`check`] is the verdict, and [`RootSet`] is what it is judged
@@ -26,6 +32,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::config::layers;
 use crate::config::values::ResolvedValues;
 use crate::paths;
 
@@ -137,6 +144,11 @@ pub fn is_relocating(name: &str) -> bool {
 /// initialise as relocating it anywhere else. A user who wants their home to be
 /// a root declares a root whose value is `~`.
 ///
+/// It also carries the directories **bx itself owns**, which are an exclusion
+/// rather than a root: invariant 2's first sentence — never point a tool at a
+/// bx-owned directory — is unconditional, so it holds even inside a declared
+/// root and even when the declared root is the home. See [`RootSet::owns`].
+///
 /// Containment is decided **lexically**, never by touching the filesystem.
 /// `canonicalize` would make the verdict depend on what exists and on what is
 /// mounted, so the same `plan` would differ between two machines and between
@@ -150,6 +162,7 @@ pub fn is_relocating(name: &str) -> bool {
 pub struct RootSet {
     home: Option<PathBuf>,
     roots: Vec<PathBuf>,
+    owned: Vec<PathBuf>,
 }
 
 impl RootSet {
@@ -163,6 +176,7 @@ impl RootSet {
         Self {
             home: None,
             roots: Vec::new(),
+            owned: Vec::new(),
         }
     }
 
@@ -186,9 +200,11 @@ impl RootSet {
                 admissible_root(declared, &root).then_some(root)
             })
             .collect();
+        let owned = vec![paths::normalize(&layers::state_dir(&home, None))];
         Self {
             home: Some(home),
             roots,
+            owned,
         }
     }
 
@@ -206,6 +222,35 @@ impl RootSet {
     #[must_use]
     pub fn from_values(values: &ResolvedValues) -> Self {
         Self::new(values.home(), &values.roots())
+    }
+
+    /// The same set, additionally owning `dirs`.
+    ///
+    /// [`RootSet::new`] derives bx's state directory from the home, which is
+    /// where it is unless `XDG_STATE_HOME` is set — and nothing on a pure
+    /// resolution path may read the environment (invariant 3), so a caller that
+    /// *has* read it passes the directory it found here. Adding, never
+    /// replacing: the home-derived directory stays owned, because a fragment
+    /// pointing at it is wrong on any machine where that override is absent.
+    #[must_use]
+    pub fn owning(mut self, dirs: &[PathBuf]) -> Self {
+        self.owned
+            .extend(dirs.iter().map(|dir| paths::normalize(dir)));
+        self
+    }
+
+    /// Whether `path` is a directory bx owns, or lies inside one.
+    ///
+    /// bx's state directory holds the ledger, the fingerprints and the journal:
+    /// the record that makes invariant 4 true. A tool pointed into it writes
+    /// among those files, and `bx rm` would then restore a home by deleting a
+    /// directory another tool believes is its own. So this is checked **before**
+    /// containment and outranks it — a user may declare their home a root, and
+    /// `XDG_STATE_HOME=~/.local/state/bx` is still refused.
+    #[must_use]
+    pub fn owns(&self, path: &Path) -> bool {
+        let normalised = paths::normalize(path);
+        self.owned.iter().any(|dir| normalised.starts_with(dir))
     }
 
     /// Whether `path` lies inside some declared root.
@@ -284,16 +329,20 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 
 /// Why a relocating assignment was rejected.
 ///
-/// The four are four different user actions — declare a root, move the value,
-/// write an absolute path, define the referenced variable earlier — so a caller
-/// that only knew *which* variable was rejected could not say what to do about
-/// it. The messages name no data: the caller already holds the value and the
-/// root set, and prints them itself.
+/// Each names a different user action — declare a root, move the value out of
+/// bx's own directory, move it inside a declared one, write an absolute path,
+/// define the referenced variable earlier — so a caller that only knew *which*
+/// variable was rejected could not say what to do about it. The messages name
+/// no data: the caller already holds the value and the root set, and prints
+/// them itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Reason {
     /// Nothing was declared, so nothing may be relocated.
     #[error("no root is declared, so nothing may be relocated")]
     NoRootsDeclared,
+    /// It points at a directory bx owns, whatever the roots say.
+    #[error("points inside a directory bx owns")]
+    BxOwnedDirectory,
     /// It resolves to a path, but not one inside any declared root.
     #[error("resolves outside every declared root")]
     OutsideDeclaredRoots,
@@ -444,6 +493,11 @@ fn evaluate(name: &str, value: &str, seen: &Assignments, roots: &RootSet) -> Opt
     let path = paths::render(&resolved, home);
     if !path.is_absolute() {
         return Some(Reason::NotAbsolute);
+    }
+    // Before the root test, and therefore ahead of any declaration: a root the
+    // user declared widens where tools may live, never who owns bx's own state.
+    if roots.owns(&path) {
+        return Some(Reason::BxOwnedDirectory);
     }
     if roots.contains(&path) {
         None
@@ -992,6 +1046,75 @@ mod tests {
     }
 
     #[test]
+    fn bxs_own_state_directory_is_refused_even_inside_a_declared_root() {
+        // The configuration that makes this reachable is the supported one:
+        // the user declared their home a root, so containment alone would
+        // allow it. `~/.local/state/bx` is where the ledger, the fingerprints
+        // and the journal live; a tool pointed there writes among the files
+        // that make `bx rm` exact.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for value in [
+            "/var/home/example/.local/state/bx",
+            "/var/home/example/.local/state/bx/ledger",
+            "~/.local/state/bx",
+            "$HOME/.local/state/bx/journal",
+        ] {
+            assert_eq!(
+                reason_of(&check("XDG_STATE_HOME", value, &home_rooted)),
+                Some(Reason::BxOwnedDirectory),
+                "{value}"
+            );
+        }
+        // The parent, and a sibling whose name merely extends it, are not bx's.
+        assert_eq!(
+            check("XDG_STATE_HOME", "~/.local/state", &home_rooted),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            check("XDG_STATE_HOME", "~/.local/state/bxtra", &home_rooted),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn a_state_directory_moved_by_the_environment_is_owned_when_it_is_declared() {
+        // `RootSet::new` derives the state directory from the home, because a
+        // resolution path may not read `XDG_STATE_HOME` itself. A caller that
+        // did read it says so, and the derived one stays owned as well.
+        let moved = PathBuf::from("/var/mnt/scratch/example/state/bx");
+        let roots = rooted().owning(std::slice::from_ref(&moved));
+        assert_eq!(
+            reason_of(&check(
+                "XDG_STATE_HOME",
+                "/var/mnt/scratch/example/state/bx",
+                &roots
+            )),
+            Some(Reason::BxOwnedDirectory)
+        );
+        // Inside the declared root, and still refused - the exclusion outranks
+        // the root test rather than being overridden by it.
+        assert!(roots.contains(&moved));
+        // And the home-derived directory is owned too, though this set's own
+        // root does not contain it.
+        assert!(roots.owns(Path::new("/var/home/example/.local/state/bx")));
+    }
+
+    #[test]
+    fn a_variable_that_does_not_relocate_may_still_name_bxs_directory() {
+        // The exclusion is part of the relocation verdict, not a second rule
+        // over every value: a tool told where bx's own state is has not been
+        // moved there.
+        assert_eq!(
+            check(
+                "EDITOR",
+                "/var/home/example/.local/state/bx/editor",
+                &rooted()
+            ),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
     fn the_reasons_render_as_sentences() {
         // The messages name no data: a caller prints the value and the roots.
         assert_eq!(
@@ -1001,6 +1124,10 @@ mod tests {
         assert_eq!(
             Reason::OutsideDeclaredRoots.to_string(),
             "resolves outside every declared root"
+        );
+        assert_eq!(
+            Reason::BxOwnedDirectory.to_string(),
+            "points inside a directory bx owns"
         );
         assert_eq!(Reason::NotAbsolute.to_string(), "is not an absolute path");
         assert_eq!(

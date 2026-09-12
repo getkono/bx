@@ -22,7 +22,7 @@
 //! the document. Here spans are irrelevant: the result is rendered to text and
 //! re-parsed on the next load, so the mutable document is the right one.
 
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table, Value, value};
 
 /// The table an account's answers live in.
 const VALUES: &str = "values";
@@ -48,11 +48,30 @@ pub fn empty() -> DocumentMut {
 
 /// Set `name` to `answer`, creating the `[values]` table when it is absent.
 ///
-/// Only the value of an existing key is replaced; its position, its decoration
-/// and every comment around it stay exactly as they were. A new key is appended
-/// to the table.
+/// Only the *text* of an existing value is replaced; its position, the spacing
+/// around its `=` and anything after it on the line — a trailing comment above
+/// all — stay exactly as they were. A new key is appended to the table.
+///
+/// Assigning a fresh item over the old one would drop all of that. A comment
+/// *above* a key is that key's own prefix decoration and survived either way,
+/// but a comment *after* the value is the value's, and an account annotating its
+/// own answers is the archetypal many-accounts note. This module exists because
+/// commands and hand-editing have to be the same operation, which is false the
+/// moment a command silently deletes what a person wrote next to the thing it
+/// changed.
 pub fn set(doc: &mut DocumentMut, name: &str, answer: &str) {
-    values_table(doc)[name] = value(answer);
+    let table = values_table(doc);
+    match table.get_mut(name).and_then(Item::as_value_mut) {
+        Some(existing) => {
+            let mut replacement = Value::from(answer);
+            *replacement.decor_mut() = existing.decor().clone();
+            *existing = replacement;
+        }
+        // Absent, or present as something that is not a value at all — a
+        // `[values.name]` sub-table, say. Neither has decoration worth carrying
+        // onto a bare answer.
+        None => table[name] = value(answer),
+    }
 }
 
 /// Remove `name`, reporting whether it was there.
@@ -129,6 +148,65 @@ mod tests {
              scratch_root = \"/var/mnt/scratch/two\"\n\
              git_name = \"Someone\"\n",
             "the comment, the position and the sibling key all survive"
+        );
+    }
+
+    #[test]
+    fn setting_a_value_keeps_the_note_the_account_wrote_beside_it() {
+        // An account annotating its own answers is the archetypal many-accounts
+        // note, and a trailing comment belongs to the value, not to the key.
+        let mut document = doc("[values]\n\
+             # the fast disk\n\
+             scratch_root   = \"/var/mnt/scratch/one\"  # nvme, not the array\n\
+             git_name = \"Someone\"\n");
+
+        set(&mut document, "scratch_root", "/var/mnt/scratch/two");
+
+        assert_eq!(
+            document.to_string(),
+            "[values]\n\
+             # the fast disk\n\
+             scratch_root   = \"/var/mnt/scratch/two\"  # nvme, not the array\n\
+             git_name = \"Someone\"\n",
+            "the note, the alignment and the sibling key all survive"
+        );
+    }
+
+    #[test]
+    fn setting_over_a_key_that_is_not_a_value_replaces_it() {
+        // A `[values.scratch_root]` sub-table is not something to edit around,
+        // and it has no decoration worth carrying onto a bare answer.
+        let mut document = doc("[values]\n[values.scratch_root]\nx = 1\n");
+
+        set(&mut document, "scratch_root", "/var/mnt/scratch/one");
+
+        assert_eq!(
+            parse_str(&document.to_string(), Path::new("local.toml"))
+                .expect("it loads")
+                .value_assignments
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unsetting_a_key_takes_the_comments_that_are_its_own() {
+        // The other half of the same rule: what belongs to the key goes with the
+        // key, and what belongs to a sibling stays.
+        let mut document = doc("[values]\n\
+             # the fast disk\n\
+             scratch_root = \"/var/mnt/scratch/one\"  # nvme\n\
+             # who this account is\n\
+             git_name = \"Someone\"\n");
+
+        assert!(unset(&mut document, "scratch_root"));
+
+        assert_eq!(
+            document.to_string(),
+            "[values]\n\
+             # who this account is\n\
+             git_name = \"Someone\"\n",
+            "the removed answer takes its own two comments and leaves the rest"
         );
     }
 

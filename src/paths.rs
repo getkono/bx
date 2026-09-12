@@ -98,6 +98,61 @@ pub enum Error {
     /// `/`-rooted.
     #[error("a portable path must start with `~` or `/`, got {0}")]
     NotPortable(String),
+    /// A `~`-rooted path whose `..` segments climb out of the home it is
+    /// relative to.
+    #[error("a portable path may not climb out of the home it is rooted in: {0}")]
+    EscapesRoot(String),
+}
+
+/// Normalise a rooted path lexically, without touching the filesystem.
+///
+/// Collapses `//` and `.`, and resolves `..` textually. Lexical and not
+/// `canonicalize`, because a portable path names a destination that need not
+/// exist yet, and because resolving symlinks would make the result depend on the
+/// machine — which is the one thing a *portable* path may not do.
+///
+/// An absolute path clamps at `/`, as the kernel does: `/a/../..` is `/`. A
+/// `~`-rooted path does not clamp, because `~/..` is a real location outside the
+/// home and silently reading it as the home would be the surprise.
+fn normalise(raw: &str) -> Result<String, Error> {
+    let Some((root, rest)) = split_root(raw) else {
+        return Err(Error::NotPortable(raw.to_string()));
+    };
+
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() && !root.is_empty() {
+                    return Err(Error::EscapesRoot(raw.to_string()));
+                }
+            }
+            named => parts.push(named),
+        }
+    }
+
+    Ok(match (root, parts.is_empty()) {
+        ("", _) => format!("/{}", parts.join("/")),
+        (root, true) => root.to_string(),
+        (root, false) => format!("{root}/{}", parts.join("/")),
+    })
+}
+
+/// Split a rooted path into its root token and the rest.
+///
+/// The root is `""` for an absolute path, `"~"` for the invoking user's home, or
+/// `"~name"` for someone else's. `None` for anything relative.
+fn split_root(raw: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = raw.strip_prefix('/') {
+        return Some(("", rest));
+    }
+    if raw.starts_with('~') {
+        let split_at = raw.find('/').unwrap_or(raw.len());
+        let (root, rest) = raw.split_at(split_at);
+        return Some((root, rest.strip_prefix('/').unwrap_or(rest)));
+    }
+    None
 }
 
 /// The home-directory rule, given what `$HOME` holds.
@@ -197,6 +252,22 @@ pub fn config_root() -> Result<PathBuf, Error> {
 /// manages the invoking user's environment, and resolving someone else's home
 /// would be a surprise. [`Portable::under_home`] is how a caller asks whether a
 /// portable path is one of the invoking user's.
+///
+/// # Every `Portable` is lexically normalised
+///
+/// `//` and `.` are collapsed and `..` is resolved when the value is built, and
+/// a `~`-rooted path that climbs out of `~` is rejected outright. Two things
+/// depend on that and neither is optional:
+///
+/// * Its `Ord` and `Hash` are over the stored string, and it is the key of a
+///   target, of entry A4's ledger and of entry A6's journal. Without
+///   normalisation `~/.ssh/config` and `~/.ssh/./config` are two keys for one
+///   file, so one file acquires two ledger rows and Invariant 4 fails at the key
+///   rather than at the writer.
+/// * [`Portable::under_home`] is a claim about *location*. Without
+///   normalisation `~/../../etc/passwd` is "under home" and renders to a path
+///   the kernel resolves to `/etc/passwd`, so a caller gating a write on it
+///   gates on nothing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Portable(String);
@@ -204,27 +275,38 @@ pub struct Portable(String);
 impl Portable {
     /// Make `path` portable against `home`.
     ///
+    /// Both arguments are normalised lexically first, so a `..` inside `path`
+    /// is resolved *before* the home prefix is stripped — otherwise
+    /// `/home/a/../../etc` under home `/home/a` would become the escaping
+    /// `~/../../etc`.
+    ///
     /// `path` is expected to be absolute. [`to_portable`] leaves anything
     /// outside `home` exactly as it was, so a relative `path` yields a relative
     /// `Portable`; use [`Portable::parse`] when the input is untrusted.
     #[must_use]
     pub fn from_path(path: &Path, home: &Path) -> Self {
-        Self(to_portable(path, home))
+        let path = normalised_or_given(path);
+        let home = normalised_or_given(home);
+        Self(to_portable(Path::new(&path), Path::new(&home)))
     }
 
     /// Parse a portable path written by a human.
+    ///
+    /// The result is lexically normalised: `//` and `.` collapse and `..`
+    /// resolves, so one file has exactly one spelling.
     ///
     /// # Errors
     ///
     /// [`Error::NotPortable`] if `raw` is neither `~`- nor `/`-rooted. A
     /// relative path has no defined meaning in a config repo: it would depend on
     /// the working directory bx happened to be invoked from.
+    ///
+    /// [`Error::EscapesRoot`] if `raw` is `~`-rooted and its `..` segments climb
+    /// out of the home. `~/../x` is not a home-relative path, and treating it as
+    /// one is how a check on [`Portable::under_home`] becomes a check on
+    /// nothing.
     pub fn parse(raw: &str) -> Result<Self, Error> {
-        if raw.starts_with('~') || raw.starts_with('/') {
-            Ok(Self(raw.to_string()))
-        } else {
-            Err(Error::NotPortable(raw.to_string()))
-        }
+        normalise(raw).map(Self)
     }
 
     /// The stored string.
@@ -241,11 +323,21 @@ impl Portable {
 
     /// Whether this path lies under the invoking user's home.
     ///
-    /// `~user/...` is not: it is another account's home, and bx never expands it.
+    /// A true statement about location, because a `Portable` is normalised when
+    /// it is built and one that climbs out of `~` never exists.
+    ///
+    /// `~user/...` is not under home: it is another account's home, and bx never
+    /// expands it.
     #[must_use]
     pub fn under_home(&self) -> bool {
         self.0 == "~" || self.0.starts_with("~/")
     }
+}
+
+/// Normalise a path lexically, keeping it as it was if it has no root.
+fn normalised_or_given(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    normalise(&raw).unwrap_or_else(|_| raw.into_owned())
 }
 
 impl std::fmt::Display for Portable {
@@ -585,6 +677,106 @@ mod tests {
 
         let rendered: Vec<&str> = paths.iter().map(Portable::as_str).collect();
         assert_eq!(rendered, ["/usr/bin/sccache", "~/.config/bx", "~/.zshrc"]);
+    }
+
+    #[test]
+    fn a_portable_is_lexically_normalised() {
+        // One file, one spelling. Ord and Hash are over this string, and it is
+        // the key of a target, of the ledger and of the journal.
+        for (written, stored) in [
+            ("~/.ssh/./config", "~/.ssh/config"),
+            ("~/.ssh//config", "~/.ssh/config"),
+            ("~/.ssh/", "~/.ssh"),
+            ("~/.ssh/keys/../config", "~/.ssh/config"),
+            ("~/./", "~"),
+            ("/usr//bin/./sccache", "/usr/bin/sccache"),
+            ("~other//.linuxbrew/", "~other/.linuxbrew"),
+        ] {
+            assert_eq!(
+                Portable::parse(written).unwrap().as_str(),
+                stored,
+                "{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn differently_spelled_paths_are_one_key() {
+        use std::collections::HashSet;
+
+        let spellings = ["~/.ssh/config", "~/.ssh/./config", "~/.ssh//config"];
+        let keys: HashSet<Portable> = spellings
+            .iter()
+            .map(|raw| Portable::parse(raw).unwrap())
+            .collect();
+
+        assert_eq!(keys.len(), 1, "one file must not acquire three ledger rows");
+    }
+
+    #[test]
+    fn a_portable_that_climbs_out_of_home_is_rejected() {
+        // under_home() is a claim about location, so this may not parse.
+        for escaping in [
+            "~/..",
+            "~/../../etc/passwd",
+            "~/.ssh/../../etc",
+            "~other/..",
+        ] {
+            assert_eq!(
+                Portable::parse(escaping),
+                Err(Error::EscapesRoot(escaping.to_string())),
+                "{escaping}"
+            );
+        }
+        assert_eq!(
+            Error::EscapesRoot("~/..".to_string()).to_string(),
+            "a portable path may not climb out of the home it is rooted in: ~/.."
+        );
+    }
+
+    #[test]
+    fn an_absolute_portable_clamps_at_the_root() {
+        // The kernel resolves /.. to /, and so does this.
+        assert_eq!(Portable::parse("/..").unwrap().as_str(), "/");
+        assert_eq!(Portable::parse("/a/../..").unwrap().as_str(), "/");
+        assert_eq!(Portable::parse("/a/../b").unwrap().as_str(), "/b");
+        assert_eq!(Portable::parse("/").unwrap().as_str(), "/");
+    }
+
+    #[test]
+    fn from_path_normalises_before_it_makes_portable() {
+        // Stripping the home prefix first would turn this into `~/../../etc`,
+        // which is exactly the escaping value parse() refuses.
+        let portable = Portable::from_path(
+            Path::new("/var/home/example/.ssh/../../../../etc/passwd"),
+            &home(),
+        );
+
+        assert_eq!(portable.as_str(), "/etc/passwd");
+        assert!(!portable.under_home());
+        assert_eq!(portable.render(&home()), Path::new("/etc/passwd"));
+    }
+
+    #[test]
+    fn from_path_collapses_redundant_segments() {
+        assert_eq!(
+            Portable::from_path(Path::new("/var/home/example/.ssh/./config"), &home()).as_str(),
+            "~/.ssh/config"
+        );
+        assert_eq!(
+            Portable::from_path(Path::new("/var/home/example/a/../b"), &home()).as_str(),
+            "~/b"
+        );
+    }
+
+    #[test]
+    fn from_path_leaves_a_relative_path_alone() {
+        // Documented fallback: a relative input has no root to normalise
+        // against, and parse() is what a caller uses on untrusted input.
+        assert_eq!(
+            Portable::from_path(Path::new("files/starship.toml"), &home()).as_str(),
+            "files/starship.toml"
+        );
     }
 
     #[test]

@@ -389,12 +389,21 @@ mod tests {
     use crate::config::parse_str;
     use std::path::PathBuf;
 
+    /// The home every fixture here is parsed against.
+    ///
+    /// A layer is parsed *against* a home, because a target path under it has
+    /// one spelling. Nothing in this module reads one from the environment.
+    fn home() -> PathBuf {
+        PathBuf::from("/var/home/example")
+    }
+
     /// A layer parsed from `text`, named `file`.
     fn layer(file: &str, kind: LayerKind, text: &str) -> Layer {
         Layer {
             file: PathBuf::from(file),
             kind,
-            config: parse_str(text, Path::new(file)).unwrap_or_else(|e| panic!("{file}: {e}")),
+            config: parse_str(text, Path::new(file), &home())
+                .unwrap_or_else(|e| panic!("{file}: {e}")),
         }
     }
 
@@ -640,6 +649,7 @@ mod tests {
         let broken = parse_str(
             "[[target]]\npath = \"~/.a\"\nenabled = \"false\"\n",
             Path::new("local.toml"),
+            &home(),
         )
         .expect_err("a string is not a boolean")
         .to_string();

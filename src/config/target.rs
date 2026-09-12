@@ -142,10 +142,13 @@ impl Mode {
 
     /// Parse the quoted octal form a config file uses.
     ///
-    /// **A bare TOML integer is not accepted.** TOML has no octal literal, so
-    /// `mode = 600` is decimal 600 and means nothing at all; only `mode = "0600"`
-    /// parses. One to four octal digits, so the setuid, setgid and sticky bits
-    /// are expressible and a fifth digit is a typo.
+    /// **A bare TOML integer is not accepted.** `mode = 600` is decimal 600 and
+    /// means nothing at all, and while TOML *does* have an octal literal it is
+    /// spelled `0o600`, which is not how a mode is written anywhere else a user
+    /// meets one. Only the quoted `mode = "0600"` parses — one spelling, and the
+    /// one `chmod`, `ls -l` and every other tool already use. One to four octal
+    /// digits, so the setuid, setgid and sticky bits are expressible and a fifth
+    /// digit is a typo.
     ///
     /// # Errors
     ///
@@ -222,7 +225,12 @@ pub enum Format {
         /// The key paths bx owns. Everything else in the file is the user's.
         owns: Vec<KeyPath>,
     },
-    /// A `conf.d`-style directory of environment fragments.
+    /// One fragment file in a `conf.d`-style directory of environment settings.
+    ///
+    /// A `Format` describes the file a target's `path` names, so this is the
+    /// fragment, not the directory holding it: bx owns the whole fragment and
+    /// says nothing about its neighbours. What the fragment's syntax is, and
+    /// how the directory is assembled, belong to the entry that generates one.
     EnvD,
 }
 
@@ -273,17 +281,22 @@ pub enum KeyPathError {
 /// Exposed for entry A3, which parses a single entry out of a layer it is
 /// merging without going through a whole document.
 ///
-/// `text` is the whole layer file, because spans index into it.
+/// `text` is the whole layer file, because spans index into it. `home` is the
+/// account's home directory: a target path is parsed against it so that a file
+/// under the home has exactly one spelling, `~/…`, and cannot acquire a second
+/// key by being written absolutely somewhere else in the layer set. See
+/// [`Portable::parse_in`].
 ///
 /// # Errors
 ///
 /// Any [`Error`] the entry's own keys can produce. Every one carries an origin.
-pub fn parse_target(table: &Table, file: &Path, text: &str) -> Result<Target, Error> {
+pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Result<Target, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);
     ctx.reject_unknown_keys(table, &KEYS)?;
 
     let raw_path = ctx.required_str(table, "path")?;
-    let path = Portable::parse(raw_path).map_err(|e| ctx.bad(table, "path", e.to_string()))?;
+    let path =
+        Portable::parse_in(raw_path, home).map_err(|e| ctx.bad(table, "path", e.to_string()))?;
 
     let attach = parse_attach(&ctx, table)?;
     let body = parse_body(&ctx, table, &attach)?;
@@ -317,7 +330,7 @@ pub fn parse_target(table: &Table, file: &Path, text: &str) -> Result<Target, Er
     let references = ctx
         .str_array_at(table, "references")?
         .iter()
-        .map(|raw| Portable::parse(raw))
+        .map(|raw| Portable::parse_in(raw, home))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ctx.bad(table, "references", e.to_string()))?;
 
@@ -535,8 +548,9 @@ fn parse_mode(ctx: &Ctx, table: &Table) -> Result<Option<Mode>, Error> {
         return Err(ctx.bad(
             table,
             "mode",
-            "`mode` is a quoted octal string: TOML has no octal literal, so \
-             mode = 600 is decimal 600. Write mode = \"0600\".",
+            "`mode` is a quoted octal string: mode = 600 is decimal 600, and \
+             TOML's own octal literal is spelled 0o600, which is not how a mode \
+             is written anywhere else. Write mode = \"0600\".",
         ));
     }
 
@@ -598,6 +612,14 @@ mod tests {
     use super::*;
     use toml_edit::Document;
 
+    /// The account's home every test in this module parses against.
+    ///
+    /// Deliberately not `/home/<user>`: nothing here may name a real account,
+    /// and nothing here may assume where a home lives.
+    fn home() -> &'static Path {
+        Path::new("/var/home/example")
+    }
+
     /// Parse the first `[[target]]` out of a document.
     fn parse(text: &str) -> Result<Target, Error> {
         let doc = Document::parse(text).expect("valid TOML");
@@ -609,7 +631,7 @@ mod tests {
             .expect("an array of tables")
             .get(0)
             .expect("one element");
-        parse_target(table, Path::new("bx.toml"), text)
+        parse_target(table, Path::new("bx.toml"), text, home())
     }
 
     /// A minimal valid target, plus whatever else the test needs.
@@ -642,7 +664,7 @@ mod tests {
     fn the_natural_key_is_the_path() {
         assert_eq!(
             parse(&with("")).unwrap().path,
-            Portable::parse("~/.gitconfig").unwrap()
+            Portable::parse_in("~/.gitconfig", home()).unwrap()
         );
     }
 
@@ -777,6 +799,37 @@ mod tests {
     fn a_relative_target_path_is_rejected() {
         let text = "[[target]]\npath = \"files/gitconfig\"\nfile = \"f\"\n";
         assert!(message(text).contains("must start with `~` or `/`"));
+    }
+
+    #[test]
+    fn an_absolute_target_path_under_home_is_rejected_with_its_line() {
+        // A layer is parsed against a home so that a file under it has exactly
+        // one spelling. Accepting both would let one file acquire two keys that
+        // `check_unique` cannot see.
+        let text = "[[target]]\npath = \"/var/home/example/.gitconfig\"\nfile = \"f\"\n";
+        let message = message(text);
+
+        assert!(message.contains("~/.gitconfig"), "{message}");
+        assert!(message.contains("bx.toml:2"), "{message}");
+    }
+
+    #[test]
+    fn an_absolute_reference_under_home_is_rejected_too() {
+        // `references` is the other place a target carries a portable path, and
+        // entry A7 reports drift keyed on it.
+        let message = message(&with(
+            "references = [\"/var/home/example/.gitconfig.local\"]\n",
+        ));
+
+        assert!(message.contains("~/.gitconfig.local"), "{message}");
+    }
+
+    #[test]
+    fn an_absolute_target_path_outside_home_is_kept() {
+        let target = parse("[[target]]\npath = \"/etc/hosts\"\nfile = \"f\"\n").unwrap();
+
+        assert_eq!(target.path.as_str(), "/etc/hosts");
+        assert!(!target.path.under_home());
     }
 
     #[test]
@@ -971,7 +1024,7 @@ mod tests {
 
         assert_eq!(
             target.references,
-            [Portable::parse("~/.gitconfig.local").unwrap()]
+            [Portable::parse_in("~/.gitconfig.local", home()).unwrap()]
         );
         assert!(
             message(&with("references = [\"relative/path\"]\n"))

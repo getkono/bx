@@ -176,10 +176,10 @@ fn filename_bytes(path: &Path) -> &[u8] {
 /// # Errors
 ///
 /// Whatever [`layer_files`] and [`load_layer`] return.
-pub fn load_layers(repo: &Path) -> Result<Vec<Layer>, Error> {
+pub fn load_layers(repo: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
     layer_files(repo)?
         .iter()
-        .map(|path| load_layer(path))
+        .map(|path| load_layer(path, home))
         .collect()
 }
 
@@ -190,7 +190,7 @@ pub fn load_layers(repo: &Path) -> Result<Vec<Layer>, Error> {
 /// # Errors
 ///
 /// [`Error::Io`] if the file cannot be read, and whatever [`parse_str`] returns.
-pub fn load_layer(path: &Path) -> Result<Layer, Error> {
+pub fn load_layer(path: &Path, home: &Path) -> Result<Layer, Error> {
     tracing::debug!(file = %path.display(), "reading configuration layer");
     let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -202,7 +202,7 @@ pub fn load_layer(path: &Path) -> Result<Layer, Error> {
         // The repo loader only ever reads committed material. `layers::load_layer_set`
         // is what marks the one layer that came from the state directory.
         kind: LayerKind::Global,
-        config: parse_str(&text, path)?,
+        config: parse_str(&text, path, home)?,
     })
 }
 
@@ -211,12 +211,17 @@ pub fn load_layer(path: &Path) -> Result<Layer, Error> {
 /// `file` is used for provenance only; nothing is read from disk. Entry order
 /// inside each section is document order, which `toml_edit` preserves.
 ///
+/// `home` is the account's home directory. A layer is parsed *against* a home
+/// because a target path under it has exactly one spelling — `~/…` — and
+/// recognising the absolute spelling as the same file is what stops `bx.toml`
+/// and a module holding two keys for one file. See [`crate::paths::Portable`].
+///
 /// # Errors
 ///
 /// [`Error::Syntax`] for invalid TOML, [`Error::UnknownSection`] for a section
 /// this version of `bx` does not know, [`Error::Duplicate`] for two entries in
 /// one layer sharing a natural key, and whatever the per-entry parsers return.
-pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
+pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> {
     let doc = Document::parse(text).map_err(|source| Error::Syntax {
         file: file.to_path_buf(),
         source: Box::new(source),
@@ -235,7 +240,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .targets
-                            .push(target::parse_target(table, file, text)?),
+                            .push(target::parse_target(table, file, text, home)?),
                     }
                 }
             }
@@ -610,8 +615,97 @@ mod tests {
             .collect()
     }
 
+    /// The account's home every test in this module parses against.
+    fn home() -> &'static Path {
+        Path::new("/var/home/example")
+    }
+
     fn parse(text: &str) -> Result<Config, Error> {
-        parse_str(text, Path::new("bx.toml"))
+        parse_str(text, Path::new("bx.toml"), home())
+    }
+
+    /// A `[[target]]` entry built in memory, with no spans anywhere.
+    ///
+    /// Entry A3 parses a single entry out of a layer it is merging without
+    /// going through a whole document, which is the case these tests cover.
+    fn in_memory_target(extra: &[(&str, toml_edit::Item)]) -> Table {
+        let mut table = Table::new();
+        table.insert("path", toml_edit::value("~/.gitconfig"));
+        table.insert("file", toml_edit::value("files/gitconfig"));
+        for (key, item) in extra {
+            table.insert(key, item.clone());
+        }
+        table
+    }
+
+    #[test]
+    fn an_entry_with_no_span_degrades_to_an_unknown_origin() {
+        // `Ctx::new` asks `toml_edit` for the entry header's span, and a table
+        // nothing parsed has none. Line 0 says "this file, position unknown"
+        // rather than pretending it is line 1 -- and rather than panicking on
+        // an `expect`, which is what a caller like entry A3 would hit.
+        let file = Path::new("bx.toml");
+        let target = target::parse_target(&in_memory_target(&[]), file, "", home()).unwrap();
+
+        assert_eq!(target.origin, Origin::unknown(file));
+        assert_eq!(target.origin.to_string(), "bx.toml:0");
+    }
+
+    #[test]
+    fn a_key_with_no_span_falls_back_to_its_entry() {
+        // `Ctx::key_origin` positions an error at the offending key. With no
+        // span it falls back to the entry's own origin, which for an in-memory
+        // table is itself unknown.
+        let file = Path::new("bx.toml");
+        let table = in_memory_target(&[("nope", toml_edit::value(1))]);
+        let error = target::parse_target(&table, file, "", home()).expect_err("unknown key");
+
+        assert!(error.to_string().starts_with("bx.toml:0:"), "{error}");
+        assert!(error.to_string().contains("`nope`"), "{error}");
+    }
+
+    #[test]
+    fn a_section_key_with_no_span_degrades_to_an_unknown_origin() {
+        // The third fallback. Unreachable from `parse_str`, because every key
+        // in a parsed document has a span -- including the implicit one in
+        // `[nope.deep]` -- so it is exercised where it lives.
+        let mut root = Table::new();
+        root.insert("target", toml_edit::value(1));
+
+        assert_eq!(
+            section_origin(&root, "target", Path::new("bx.toml"), ""),
+            Origin::unknown(Path::new("bx.toml"))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_modules_directory_names_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = repo(&[("bx.toml", ""), ("modules/a.toml", "")]);
+        let modules = dir.path().join(MODULES_DIR);
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        // A process that can read a 0000 directory -- root, or one holding
+        // CAP_DAC_READ_SEARCH -- cannot construct this case at all. Say so
+        // rather than assert something else and call it covered.
+        let reachable = std::fs::read_dir(&modules).is_err();
+        let result = layer_files(dir.path());
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
+            .expect("restore, so the tempdir can be removed");
+
+        assert!(
+            reachable,
+            "this process can read a 0000 directory, so the io error cannot be reached"
+        );
+        match result {
+            Err(Error::Io { path, .. }) => assert_eq!(path, modules),
+            other => panic!(
+                "expected an io error naming {}, got {other:?}",
+                modules.display()
+            ),
+        }
     }
 
     fn message(text: &str) -> String {
@@ -745,7 +839,7 @@ mod tests {
                 "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"overridden\"\n",
             ),
         ]);
-        let layers = load_layers(dir.path()).expect("loading");
+        let layers = load_layers(dir.path(), home()).expect("loading");
 
         assert_eq!(layers.len(), 2);
         assert_eq!(layers[0].file, dir.path().join("bx.toml"));
@@ -761,7 +855,7 @@ mod tests {
             "modules/git.toml",
             "# a module\n\n[[target]]\npath = \"~/.gitconfig\"\nfile = \"f\"\n",
         )]);
-        let layers = load_layers(dir.path()).expect("loading");
+        let layers = load_layers(dir.path(), home()).expect("loading");
         let origin = &layers[0].config.targets[0].origin;
 
         assert_eq!(origin.file, dir.path().join("modules/git.toml"));
@@ -773,7 +867,7 @@ mod tests {
         let dir = repo(&[]);
         let missing = dir.path().join("bx.toml");
 
-        let error = load_layer(&missing).expect_err("should be an error");
+        let error = load_layer(&missing, home()).expect_err("should be an error");
         assert!(matches!(error, Error::Io { .. }));
         assert!(error.to_string().contains("bx.toml"));
     }
@@ -827,7 +921,7 @@ mod tests {
 
     #[test]
     fn a_syntax_error_names_the_file_and_position() {
-        let error = parse_str("[[target]\n", Path::new("/repo/bx.toml"))
+        let error = parse_str("[[target]\n", Path::new("/repo/bx.toml"), home())
             .expect_err("should be a syntax error");
 
         assert!(matches!(error, Error::Syntax { .. }));
@@ -864,6 +958,23 @@ mod tests {
                 "{second} should collide with ~/.ssh/config"
             );
         }
+    }
+
+    #[test]
+    fn the_absolute_spelling_of_a_home_file_never_becomes_a_second_key() {
+        // check_unique compares the stored strings, so it cannot see that
+        // `/var/home/example/.ssh/config` and `~/.ssh/config` are one file. The
+        // parser refuses the absolute spelling instead, which is what keeps one
+        // file from acquiring two `attach = "own"` targets in one layer set.
+        let text = "[[target]]\npath = \"~/.ssh/config\"\nfile = \"a\"\n\n\
+                    [[target]]\npath = \"/var/home/example/.ssh/config\"\nfile = \"b\"\n";
+        let message = message(text);
+
+        assert!(message.contains("~/.ssh/config"), "{message}");
+        assert!(
+            message.contains("bx.toml:6"),
+            "the caret must land on the offending `path` key: {message}"
+        );
     }
 
     #[test]

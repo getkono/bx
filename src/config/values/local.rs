@@ -181,10 +181,14 @@ mod tests {
         set(&mut document, "scratch_root", "/var/mnt/scratch/one");
 
         assert_eq!(
-            parse_str(&document.to_string(), Path::new("local.toml"))
-                .expect("it loads")
-                .value_assignments
-                .len(),
+            parse_str(
+                &document.to_string(),
+                Path::new("local.toml"),
+                Path::new("/var/home/example")
+            )
+            .expect("it loads")
+            .value_assignments
+            .len(),
             1
         );
     }
@@ -276,8 +280,12 @@ mod tests {
         let mut document = empty();
         set(&mut document, "scratch_root", "/var/mnt/scratch/one");
 
-        let config = parse_str(&document.to_string(), Path::new("local.toml"))
-            .expect("the rendered document loads");
+        let config = parse_str(
+            &document.to_string(),
+            Path::new("local.toml"),
+            Path::new("/var/home/example"),
+        )
+        .expect("the rendered document loads");
 
         assert_eq!(config.value_assignments.len(), 1);
         assert_eq!(config.value_assignments[0].name, "scratch_root");
@@ -292,7 +300,12 @@ mod tests {
         set(&mut document, "git_email", "someone@example.invalid");
 
         let rendered = document.to_string();
-        let config = parse_str(&rendered, Path::new("local.toml")).expect("it loads");
+        let config = parse_str(
+            &rendered,
+            Path::new("local.toml"),
+            Path::new("/var/home/example"),
+        )
+        .expect("it loads");
 
         let answered: Vec<(&str, String)> = config
             .value_assignments

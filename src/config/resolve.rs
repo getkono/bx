@@ -213,7 +213,10 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Error
         })
     };
     let portable = |text: &str| -> Result<Portable, Error> {
-        Portable::parse(&sub(text)?).map_err(|source| Error::BadValue {
+        // Against the home the values were resolved against, never a re-derived
+        // one: `Portable::parse_in` rejects an absolute path under the home, and
+        // a different home would make that judgement about a different file.
+        Portable::parse_in(&sub(text)?, values.home()).map_err(|source| Error::BadValue {
             origin: origin.clone(),
             message: format!("target `{}`: {source}", target.path),
         })
@@ -316,7 +319,8 @@ mod tests {
         Ok(Layer {
             file: PathBuf::from(file),
             kind,
-            config: parse_str(text, Path::new(file)).map_err(|e| format!("{file}: {e}"))?,
+            config: parse_str(text, Path::new(file), &home())
+                .map_err(|e| format!("{file}: {e}"))?,
         })
     }
 

@@ -93,16 +93,21 @@ pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error>
 /// Each layer knows whether it is [`LayerKind::Global`] — committed, and so
 /// forbidden from carrying a `[values]` table — or [`LayerKind::Local`].
 ///
+/// `home` is threaded in, never read here: it is what a target path is parsed
+/// against, so that `~/.gitconfig` in one layer and the absolute spelling in
+/// another are one key rather than two. It is the same `home` [`state_dir`]
+/// takes, so a caller that found the state directory already holds it.
+///
 /// # Errors
 ///
 /// Whatever [`layer_paths`] and [`super::load_layer`] return.
-pub fn load_layer_set(repo: &Path, state_dir: &Path) -> Result<Vec<Layer>, Error> {
+pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
     let local = local_layer_path(state_dir);
 
     layer_paths(repo, state_dir)?
         .iter()
         .map(|path| {
-            let mut layer = load_layer(path)?;
+            let mut layer = load_layer(path, home)?;
             if *path == local {
                 layer.kind = LayerKind::Local;
             }
@@ -260,7 +265,7 @@ mod tests {
         home.write(".config/bx/modules/10-shell.toml", "");
         home.write(".local/state/bx/local.toml", "");
 
-        let kinds: Vec<LayerKind> = load_layer_set(&repo, &state)
+        let kinds: Vec<LayerKind> = load_layer_set(&repo, &state, home.path())
             .unwrap()
             .iter()
             .map(|layer| layer.kind)
@@ -287,7 +292,7 @@ mod tests {
             "[values]\nscratch_root = \"/var/mnt/scratch/one\"\n",
         );
 
-        let layers = load_layer_set(&repo, &state).unwrap();
+        let layers = load_layer_set(&repo, &state, home.path()).unwrap();
 
         assert_eq!(layers[0].config.values[0].name, "scratch_root");
         assert!(layers[0].config.value_assignments.is_empty());
@@ -313,7 +318,7 @@ mod tests {
             "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"from ten\"\n",
         );
 
-        let layers = load_layer_set(&repo, &state).unwrap();
+        let layers = load_layer_set(&repo, &state, home.path()).unwrap();
         let merged = crate::config::merge::merge(&layers).unwrap();
 
         assert_eq!(merged.targets.len(), 1, "one key, one entry");

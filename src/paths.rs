@@ -31,6 +31,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// Paths outside `home` are returned unchanged: they are genuinely absolute
 /// (`/usr/bin/sccache`), and pretending otherwise would break them.
+///
+/// Non-UTF-8 bytes go through `to_string_lossy`. [`Portable`] is the checked
+/// entry point and refuses such a path outright, so nothing bx *stores* is ever
+/// renamed by this function.
 #[must_use]
 pub fn to_portable(path: &Path, home: &Path) -> String {
     let raw = path.to_string_lossy();
@@ -48,6 +52,11 @@ pub fn to_portable(path: &Path, home: &Path) -> String {
 /// Only a leading `~` or `~/` is expanded. `~user` is *not*: bx manages the
 /// invoking user's environment, and silently resolving another user's home
 /// would be a surprise of exactly the kind this tool exists to prevent.
+///
+/// Anything else is returned exactly as written, which for an unrooted string
+/// means a **relative** path. [`Portable`] is the checked entry point and can
+/// never hold such a value — it rejects every root this function cannot expand
+/// — so [`Portable::render`] never reaches that arm.
 #[must_use]
 pub fn render(portable: &str, home: &Path) -> PathBuf {
     match portable {
@@ -102,6 +111,43 @@ pub enum Error {
     /// relative to.
     #[error("a portable path may not climb out of the home it is rooted in: {0}")]
     EscapesRoot(String),
+    /// A `~`-prefixed string whose root is neither `~` nor `~/` — `~other`, or
+    /// a `~.config/x` that lost its slash.
+    ///
+    /// [`render`] expands only `~` and `~/`, so such a value would reach the
+    /// filesystem verbatim and resolve against whatever directory bx happened
+    /// to be invoked from.
+    #[error(
+        "bx expands only `~` and `~/…`, so {0} would resolve against whatever directory \
+         bx was invoked from; write `~/…` or an absolute path"
+    )]
+    UnknownRoot(String),
+    /// An absolute path that names a file under the home it was parsed against.
+    ///
+    /// Such a file has two spellings, and only `~/…` means the same file on the
+    /// next account. Accepting both would give one file two keys.
+    #[error(
+        "{raw} is inside the home, so it names a different file on every account; \
+         write {portable}"
+    )]
+    AbsoluteUnderHome {
+        /// The path as it was written.
+        raw: String,
+        /// The `~`-rooted spelling to write instead.
+        portable: String,
+    },
+    /// A path, or a home, that is not valid UTF-8.
+    ///
+    /// A [`Portable`] is stored, compared, hashed and serialised as text, so a
+    /// path it cannot represent is **refused**, not substituted. Passing such a
+    /// path through `to_string_lossy` would put `U+FFFD` in the key and silently
+    /// point it at a different file.
+    #[error(
+        "a path bx stores must be valid UTF-8, and {} is not; \
+         bx would otherwise rename it rather than manage it",
+        .0.display()
+    )]
+    NotUtf8(PathBuf),
 }
 
 /// Normalise a **rooted** path lexically, without touching the filesystem.
@@ -127,7 +173,11 @@ pub enum Error {
 /// [`Error::EscapesRoot`] if it is `~`-rooted and climbs out of that root.
 pub fn normalize_rooted(raw: &str) -> Result<String, Error> {
     let Some((root, rest)) = split_root(raw) else {
-        return Err(Error::NotPortable(raw.to_string()));
+        return Err(if raw.starts_with('~') {
+            Error::UnknownRoot(raw.to_string())
+        } else {
+            Error::NotPortable(raw.to_string())
+        });
     };
 
     // `rest` is relative, so `normalize` keeps a leading `..` that has nothing
@@ -156,18 +206,22 @@ pub fn normalize_rooted(raw: &str) -> Result<String, Error> {
 
 /// Split a rooted path into its root token and the rest.
 ///
-/// The root is `""` for an absolute path, `"~"` for the invoking user's home, or
-/// `"~name"` for someone else's. `None` for anything relative.
+/// The root is `""` for an absolute path and `"~"` for the invoking user's home.
+/// Those are the only two roots [`render`] expands, so they are the only two a
+/// [`Portable`] may hold; `None` for anything else, a `~name` token included.
+///
+/// Treating every `~`-prefixed string as rooted, with the bytes up to the first
+/// `/` as its root, is what let `~.config/starship.toml` — one missing slash —
+/// parse as a root named `~.config` that `render` then handed to the filesystem
+/// as a relative path.
 fn split_root(raw: &str) -> Option<(&str, &str)> {
     if let Some(rest) = raw.strip_prefix('/') {
         return Some(("", rest));
     }
-    if raw.starts_with('~') {
-        let split_at = raw.find('/').unwrap_or(raw.len());
-        let (root, rest) = raw.split_at(split_at);
-        return Some((root, rest.strip_prefix('/').unwrap_or(rest)));
+    if raw == "~" {
+        return Some(("~", ""));
     }
-    None
+    raw.strip_prefix("~/").map(|rest| ("~", rest))
 }
 
 /// The home-directory rule, given what `$HOME` holds.
@@ -263,10 +317,11 @@ pub fn config_root() -> Result<PathBuf, Error> {
 /// derives `Ord`, `Hash` and serde here rather than being newtyped again in
 /// each of them.
 ///
-/// A `~user` string is *accepted* and never expanded, matching [`render`]: bx
-/// manages the invoking user's environment, and resolving someone else's home
-/// would be a surprise. [`Portable::under_home`] is how a caller asks whether a
-/// portable path is one of the invoking user's.
+/// There are exactly two shapes: `~`-rooted, and absolute. A `~name` string is
+/// **rejected**, because [`render`] expands only `~` and `~/` — storing one
+/// would leave a value that renders to a bare relative path, and a relative
+/// destination depends on the directory bx happened to be invoked from. That is
+/// the same reason [`Portable::parse`] rejects a relative path outright.
 ///
 /// # Every `Portable` is lexically normalised
 ///
@@ -295,20 +350,55 @@ impl Portable {
     /// `/home/a/../../etc` under home `/home/a` would become the escaping
     /// `~/../../etc`.
     ///
-    /// `path` is expected to be absolute. [`to_portable`] leaves anything
-    /// outside `home` exactly as it was, so a relative `path` yields a relative
-    /// `Portable`; use [`Portable::parse`] when the input is untrusted.
-    #[must_use]
-    pub fn from_path(path: &Path, home: &Path) -> Self {
-        let path = normalised_or_given(path);
-        let home = normalised_or_given(home);
-        Self(to_portable(Path::new(&path), Path::new(&home)))
+    /// # Errors
+    ///
+    /// [`Error::NotPortable`] if `path` is not absolute. A relative path has no
+    /// root to resolve `..` against, so there is no answer to give.
+    ///
+    /// [`Error::HomeNotAbsolute`] if `home` is not absolute.
+    ///
+    /// [`Error::NotUtf8`] if either argument is not valid UTF-8. A `Portable`
+    /// is stored as text, and substituting `U+FFFD` for a byte would silently
+    /// make the key name a different file. The environment side of this module
+    /// *honours* a non-UTF-8 `$HOME` and `$XDG_CONFIG_HOME`; the key side
+    /// refuses to rename one, so the two agree about where the support boundary
+    /// is rather than one of them moving it quietly.
+    ///
+    /// [`Error::EscapesRoot`] is **propagated**, never swallowed. An earlier
+    /// shape of this function fell back to the string it was given whenever
+    /// normalisation failed, so `~/../../etc/passwd` came back whole, claiming
+    /// `under_home() == true` and rendering to a path the kernel resolves to
+    /// `/etc/passwd` — the value this type's own documentation cites by name as
+    /// one that must never exist. The natural first caller is a `bx add <path>`
+    /// handing a command-line argument straight through, so the fallback is
+    /// gone rather than documented.
+    pub fn from_path(path: &Path, home: &Path) -> Result<Self, Error> {
+        let home = home_str(home)?;
+        let raw = path
+            .to_str()
+            .ok_or_else(|| Error::NotUtf8(path.to_path_buf()))?;
+        if !path.is_absolute() {
+            return Err(Error::NotPortable(raw.to_string()));
+        }
+        let normalised = normalize_rooted(raw)?;
+        Ok(Self(fold_under_home(&normalised, &home)))
     }
 
-    /// Parse a portable path written by a human.
+    /// Parse a portable path written by a human, against `home`.
     ///
     /// The result is lexically normalised: `//` and `.` collapse and `..`
     /// resolves, so one file has exactly one spelling.
+    ///
+    /// # Why this takes a home
+    ///
+    /// The value it accepts is exactly a fixed point of [`Portable::from_path`]
+    /// under the same `home`. Without the home there is no way to tell that
+    /// `/var/home/me/.gitconfig` and `~/.gitconfig` name one file, so `bx.toml`
+    /// saying one and a module saying the other would be two keys that
+    /// `check_unique` cannot see — two `attach = "own"` targets for one file,
+    /// written twice, and a `bx rm` that restores the intermediate body. That is
+    /// Invariant 4 failing at the key, by the same route lexical normalisation
+    /// was introduced to close.
     ///
     /// # Errors
     ///
@@ -316,12 +406,30 @@ impl Portable {
     /// relative path has no defined meaning in a config repo: it would depend on
     /// the working directory bx happened to be invoked from.
     ///
+    /// [`Error::UnknownRoot`] if `raw` is `~`-prefixed but not `~` or `~/…`.
+    ///
     /// [`Error::EscapesRoot`] if `raw` is `~`-rooted and its `..` segments climb
     /// out of the home. `~/../x` is not a home-relative path, and treating it as
     /// one is how a check on [`Portable::under_home`] becomes a check on
     /// nothing.
-    pub fn parse(raw: &str) -> Result<Self, Error> {
-        normalize_rooted(raw).map(Self)
+    ///
+    /// [`Error::AbsoluteUnderHome`] if `raw` resolves to a file under `home`.
+    /// The message names the `~/…` spelling to write instead — rejecting rather
+    /// than folding, because an absolute home path in a *committed* repo is an
+    /// account-specific literal that would mean a different file on the next
+    /// account, and Invariant 5 says such a value must be loud.
+    pub fn parse_in(raw: &str, home: &Path) -> Result<Self, Error> {
+        let home = home_str(home)?;
+        let normalised = normalize_rooted(raw)?;
+        let folded = fold_under_home(&normalised, &home);
+        if folded == normalised {
+            Ok(Self(normalised))
+        } else {
+            Err(Error::AbsoluteUnderHome {
+                raw: raw.to_string(),
+                portable: folded,
+            })
+        }
     }
 
     /// The stored string.
@@ -341,18 +449,34 @@ impl Portable {
     /// A true statement about location, because a `Portable` is normalised when
     /// it is built and one that climbs out of `~` never exists.
     ///
-    /// `~user/...` is not under home: it is another account's home, and bx never
-    /// expands it.
+    /// The two shapes are exhaustive: a `Portable` is `~`-rooted, and under the
+    /// home, or absolute, and not.
     #[must_use]
     pub fn under_home(&self) -> bool {
         self.0 == "~" || self.0.starts_with("~/")
     }
 }
 
-/// Normalise a path lexically, keeping it as it was if it has no root.
-fn normalised_or_given(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    normalize_rooted(&raw).unwrap_or_else(|_| raw.into_owned())
+/// The normalised string form of a home directory.
+///
+/// # Errors
+///
+/// [`Error::HomeNotAbsolute`] when `home` is not an absolute path. An absolute
+/// path always normalises — it clamps at `/` — so that is the only failure.
+fn home_str(home: &Path) -> Result<String, Error> {
+    let raw = home
+        .to_str()
+        .ok_or_else(|| Error::NotUtf8(home.to_path_buf()))?;
+    normalize_rooted(raw).map_err(|_| Error::HomeNotAbsolute(home.to_path_buf()))
+}
+
+/// Rewrite an already-normalised rooted path as `~`-relative when it is under
+/// the already-normalised `home`.
+///
+/// The one place the two constructors share, so they cannot disagree about
+/// which spelling a file has.
+fn fold_under_home(normalised: &str, home: &str) -> String {
+    to_portable(Path::new(normalised), Path::new(home))
 }
 
 impl std::fmt::Display for Portable {
@@ -624,6 +748,11 @@ mod tests {
     #[test]
     fn an_absolute_home_is_taken_as_given() {
         assert_eq!(home_in(Some(OsStr::new("/var/home/example"))), Ok(home()));
+        assert_eq!(
+            home_in(Some(OsStr::new("/var/home/example/"))),
+            Ok(home()),
+            "a trailing slash is a spelling of the same directory, not a second home"
+        );
     }
 
     #[test]
@@ -679,6 +808,12 @@ mod tests {
             Error::NotPortable("rel/x".to_string()).to_string(),
             "a portable path must start with `~` or `/`, got rel/x"
         );
+        let unknown_root = Error::UnknownRoot("~.config/x".to_string()).to_string();
+        assert!(unknown_root.contains("~.config/x"), "{unknown_root}");
+        assert!(
+            unknown_root.contains("expands only"),
+            "the message must say what bx does expand: {unknown_root}"
+        );
     }
 
     // --- Portable ---------------------------------------------------------
@@ -686,7 +821,7 @@ mod tests {
     #[test]
     fn a_portable_round_trips_through_the_newtype() {
         let original = Path::new("/var/home/example/.config/starship.toml");
-        let portable = Portable::from_path(original, &home());
+        let portable = Portable::from_path(original, &home()).unwrap();
 
         assert_eq!(portable.as_str(), "~/.config/starship.toml");
         assert_eq!(portable.to_string(), "~/.config/starship.toml");
@@ -696,7 +831,7 @@ mod tests {
 
     #[test]
     fn a_portable_outside_home_stays_absolute_and_is_not_under_home() {
-        let portable = Portable::from_path(Path::new("/usr/bin/sccache"), &home());
+        let portable = Portable::from_path(Path::new("/usr/bin/sccache"), &home()).unwrap();
 
         assert_eq!(portable.as_str(), "/usr/bin/sccache");
         assert!(!portable.under_home());
@@ -704,26 +839,111 @@ mod tests {
     }
 
     #[test]
-    fn another_users_home_is_portable_but_not_under_home() {
-        let portable = Portable::parse("~other/.linuxbrew").unwrap();
+    fn a_tilde_root_bx_cannot_expand_is_rejected() {
+        // `render` expands `~` and `~/` and nothing else, so any other `~` root
+        // would be handed to the filesystem verbatim -- that is, relative to
+        // whatever directory bx was invoked from. `~.config/starship.toml` is
+        // the realistic one: a config author dropping a single slash would
+        // otherwise get a directory literally named `~.config` created wherever
+        // `bx apply` ran, and `bx rm` from elsewhere would restore a different
+        // file.
+        for raw in [
+            "~.config/starship.toml",
+            "~other/x",
+            "~other/.linuxbrew",
+            "~other",
+            "~~/x",
+            "~ /x",
+        ] {
+            assert_eq!(
+                Portable::parse_in(raw, &home()),
+                Err(Error::UnknownRoot(raw.to_string())),
+                "{raw}"
+            );
+        }
+    }
 
-        assert!(!portable.under_home());
-        assert_eq!(portable.render(&home()), Path::new("~other/.linuxbrew"));
+    #[test]
+    fn a_portable_always_renders_to_an_absolute_path() {
+        // The property the rejection above exists to establish: no value this
+        // type can hold renders to a path that depends on the working
+        // directory.
+        for raw in ["~", "~/.ssh/config", "/usr/bin/sccache", "/", "/a/../b"] {
+            let rendered = Portable::parse_in(raw, &home()).unwrap().render(&home());
+            assert!(
+                rendered.is_absolute(),
+                "{raw} rendered {}",
+                rendered.display()
+            );
+        }
     }
 
     #[test]
     fn a_bare_tilde_is_under_home() {
-        assert!(Portable::parse("~").unwrap().under_home());
+        assert!(Portable::parse_in("~", &home()).unwrap().under_home());
+    }
+
+    #[test]
+    fn an_absolute_path_under_home_names_the_tilde_spelling() {
+        // Two spellings of one file is two keys, which check_unique cannot see:
+        // bx.toml saying `~/.gitconfig` and a module saying the absolute form
+        // would both become `attach = "own"` targets for the same file, so it
+        // is written twice and `bx rm` restores the intermediate body.
+        for (written, expected) in [
+            ("/var/home/example/.gitconfig", "~/.gitconfig"),
+            ("/var/home/example/.ssh//config", "~/.ssh/config"),
+            ("/var/home/example/a/../.bashrc", "~/.bashrc"),
+            ("/var/home/example", "~"),
+        ] {
+            assert_eq!(
+                Portable::parse_in(written, &home()),
+                Err(Error::AbsoluteUnderHome {
+                    raw: written.to_string(),
+                    portable: expected.to_string(),
+                }),
+                "{written}"
+            );
+        }
+
+        let message = Portable::parse_in("/var/home/example/.gitconfig", &home())
+            .expect_err("under home")
+            .to_string();
+        assert!(
+            message.contains("~/.gitconfig"),
+            "the message must name the spelling to write: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_and_from_path_agree_on_every_key() {
+        // The finding this closes: the two constructors produced unequal keys
+        // for the same file. They agree by construction now -- `parse_in`
+        // accepts exactly the fixed points of `from_path` -- and this is what
+        // says so.
+        for absolute in [
+            "/var/home/example/.gitconfig",
+            "/var/home/example/.ssh/config",
+            "/var/home/example",
+            "/usr/bin/sccache",
+            "/etc/hosts",
+        ] {
+            let built = Portable::from_path(Path::new(absolute), &home()).unwrap();
+            assert_eq!(
+                Portable::parse_in(built.as_str(), &home()),
+                Ok(built.clone()),
+                "{absolute} does not parse back to itself"
+            );
+        }
     }
 
     #[test]
     fn a_relative_portable_is_rejected() {
         assert_eq!(
-            Portable::parse("files/starship.toml"),
+            Portable::parse_in("files/starship.toml", &home()),
             Err(Error::NotPortable("files/starship.toml".to_string()))
         );
         assert_eq!(
-            Portable::parse(""),
+            Portable::parse_in("", &home()),
             Err(Error::NotPortable(String::new())),
             "an empty path is not a path"
         );
@@ -734,9 +954,9 @@ mod tests {
         // Target's natural key is its path, so the ordering has to be total and
         // has to be the obvious one.
         let mut paths = [
-            Portable::parse("~/.zshrc").unwrap(),
-            Portable::parse("/usr/bin/sccache").unwrap(),
-            Portable::parse("~/.config/bx").unwrap(),
+            Portable::parse_in("~/.zshrc", &home()).unwrap(),
+            Portable::parse_in("/usr/bin/sccache", &home()).unwrap(),
+            Portable::parse_in("~/.config/bx", &home()).unwrap(),
         ];
         paths.sort();
 
@@ -754,11 +974,12 @@ mod tests {
             ("~/.ssh/", "~/.ssh"),
             ("~/.ssh/keys/../config", "~/.ssh/config"),
             ("~/./", "~"),
+            ("~/", "~"),
+            ("~//a", "~/a"),
             ("/usr//bin/./sccache", "/usr/bin/sccache"),
-            ("~other//.linuxbrew/", "~other/.linuxbrew"),
         ] {
             assert_eq!(
-                Portable::parse(written).unwrap().as_str(),
+                Portable::parse_in(written, &home()).unwrap().as_str(),
                 stored,
                 "{written}"
             );
@@ -772,7 +993,7 @@ mod tests {
         let spellings = ["~/.ssh/config", "~/.ssh/./config", "~/.ssh//config"];
         let keys: HashSet<Portable> = spellings
             .iter()
-            .map(|raw| Portable::parse(raw).unwrap())
+            .map(|raw| Portable::parse_in(raw, &home()).unwrap())
             .collect();
 
         assert_eq!(keys.len(), 1, "one file must not acquire three ledger rows");
@@ -828,10 +1049,10 @@ mod tests {
             "~/..",
             "~/../../etc/passwd",
             "~/.ssh/../../etc",
-            "~other/..",
+            "~/a/../..",
         ] {
             assert_eq!(
-                Portable::parse(escaping),
+                Portable::parse_in(escaping, &home()),
                 Err(Error::EscapesRoot(escaping.to_string())),
                 "{escaping}"
             );
@@ -845,10 +1066,21 @@ mod tests {
     #[test]
     fn an_absolute_portable_clamps_at_the_root() {
         // The kernel resolves /.. to /, and so does this.
-        assert_eq!(Portable::parse("/..").unwrap().as_str(), "/");
-        assert_eq!(Portable::parse("/a/../..").unwrap().as_str(), "/");
-        assert_eq!(Portable::parse("/a/../b").unwrap().as_str(), "/b");
-        assert_eq!(Portable::parse("/").unwrap().as_str(), "/");
+        assert_eq!(Portable::parse_in("/..", &home()).unwrap().as_str(), "/");
+        assert_eq!(
+            Portable::parse_in("/a/../..", &home()).unwrap().as_str(),
+            "/"
+        );
+        assert_eq!(
+            Portable::parse_in("/a/../b", &home()).unwrap().as_str(),
+            "/b"
+        );
+        assert_eq!(Portable::parse_in("/", &home()).unwrap().as_str(), "/");
+        assert_eq!(
+            Portable::parse_in("/a/../../b", &home()).unwrap().as_str(),
+            "/b",
+            "climbing past the root clamps there and carries on"
+        );
     }
 
     #[test]
@@ -858,7 +1090,8 @@ mod tests {
         let portable = Portable::from_path(
             Path::new("/var/home/example/.ssh/../../../../etc/passwd"),
             &home(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(portable.as_str(), "/etc/passwd");
         assert!(!portable.under_home());
@@ -868,29 +1101,92 @@ mod tests {
     #[test]
     fn from_path_collapses_redundant_segments() {
         assert_eq!(
-            Portable::from_path(Path::new("/var/home/example/.ssh/./config"), &home()).as_str(),
+            Portable::from_path(Path::new("/var/home/example/.ssh/./config"), &home())
+                .unwrap()
+                .as_str(),
             "~/.ssh/config"
         );
         assert_eq!(
-            Portable::from_path(Path::new("/var/home/example/a/../b"), &home()).as_str(),
+            Portable::from_path(Path::new("/var/home/example/a/../b"), &home())
+                .unwrap()
+                .as_str(),
             "~/b"
         );
     }
 
     #[test]
-    fn from_path_leaves_a_relative_path_alone() {
-        // Documented fallback: a relative input has no root to normalise
-        // against, and parse() is what a caller uses on untrusted input.
+    fn from_path_rejects_a_path_it_cannot_answer_for() {
+        // The fallback this replaces returned the string it was given whenever
+        // normalisation failed. `~/../../etc/passwd` therefore came back whole,
+        // claiming under_home() == true and rendering to a path the kernel
+        // resolves to /etc/passwd -- the value this type's own doc names as one
+        // that must never exist. The natural first caller is `bx add <path>`
+        // handing a command-line argument straight through.
         assert_eq!(
-            Portable::from_path(Path::new("files/starship.toml"), &home()).as_str(),
-            "files/starship.toml"
+            Portable::from_path(Path::new("~/../../etc/passwd"), &home()),
+            Err(Error::NotPortable("~/../../etc/passwd".to_string()))
         );
+        assert_eq!(
+            Portable::from_path(Path::new("files/starship.toml"), &home()),
+            Err(Error::NotPortable("files/starship.toml".to_string())),
+            "a relative path has no root to resolve `..` against"
+        );
+        assert_eq!(
+            Portable::from_path(Path::new("/etc/hosts"), Path::new("relative/home")),
+            Err(Error::HomeNotAbsolute(PathBuf::from("relative/home")))
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_path_is_refused_rather_than_renamed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // The support boundary has to be one boundary. `a_non_utf8_home_is_honoured`
+        // and `a_non_utf8_xdg_config_home_is_honoured` pin that the environment
+        // side takes such a value as given; this pins that the key side refuses
+        // it. Going through `to_string_lossy` would put U+FFFD in the stored
+        // string, so the key would name a different file than the one it came
+        // from -- a rename, dressed as support.
+        let path = Path::new(OsStr::from_bytes(b"/var/home/example/.ssh/conf\xffig"));
+        assert_eq!(
+            Portable::from_path(path, &home()),
+            Err(Error::NotUtf8(path.to_path_buf()))
+        );
+
+        let odd_home = Path::new(OsStr::from_bytes(b"/var/home/exa\xffmple"));
+        assert_eq!(
+            Portable::from_path(Path::new("/etc/hosts"), odd_home),
+            Err(Error::NotUtf8(odd_home.to_path_buf())),
+            "a home bx cannot spell cannot be stripped from a key either"
+        );
+
+        let message = Error::NotUtf8(PathBuf::from("/x")).to_string();
+        assert!(message.contains("valid UTF-8"), "{message}");
+    }
+
+    #[test]
+    fn from_path_never_answers_with_a_value_parse_would_refuse() {
+        // The fallback is unreachable, so there is no input for which the two
+        // constructors disagree about whether a value is admissible.
+        for raw in [
+            "/var/home/example/.ssh/../../../../etc/passwd",
+            "/var/home/example/../example/.gitconfig",
+            "/",
+            "/usr/bin/sccache",
+        ] {
+            let built = Portable::from_path(Path::new(raw), &home()).unwrap();
+            assert_eq!(
+                Portable::parse_in(built.as_str(), &home()),
+                Ok(built),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
     fn a_portable_survives_a_serde_round_trip() {
         // A4's ledger and A6's journal are keyed on it, in MessagePack.
-        let portable = Portable::parse("~/.ssh/config").unwrap();
+        let portable = Portable::parse_in("~/.ssh/config", &home()).unwrap();
         let encoded = rmp_serde::to_vec(&portable).unwrap();
         let decoded: Portable = rmp_serde::from_slice(&encoded).unwrap();
 

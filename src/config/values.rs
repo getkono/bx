@@ -1330,6 +1330,12 @@ mod tests {
         );
         assert_eq!(parsed[1].value, AssignedValue::Bool(true));
         assert_eq!(
+            parsed[1].value.to_string(),
+            "true",
+            "a boolean renders as a boolean; entry A3 reports an assignment by \
+             its rendered value and must not print `Bool(true)`"
+        );
+        assert_eq!(
             parsed[2].value.to_string(),
             "hello {{git_email}}",
             "substitution is A3's, so the braces survive"

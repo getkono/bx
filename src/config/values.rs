@@ -984,13 +984,26 @@ impl ResolvedValues {
     /// # Errors
     ///
     /// [`AnswerError::Reference`] when the answer's own references cannot be
-    /// resolved — including [`Unresolved::Undeclared`] when no enabled
-    /// declaration carries `name` — and [`AnswerError::Kind`] when the resolved
-    /// text is not of the declared kind.
+    /// resolved — including [`Unresolved::Undeclared`] when no layer declares
+    /// `name`, and [`Unresolved::Disabled`] when one does but a layer switched
+    /// it off — and [`AnswerError::Kind`] when the resolved text is not of the
+    /// declared kind.
+    ///
+    /// A switched-off declaration is refused rather than validated: the loader
+    /// never reads an answer for it, so accepting one would have `bx init` write
+    /// a line that does nothing. It is its own arm rather than `Undeclared`
+    /// because the act that clears it is re-enabling the declaration, not
+    /// declaring it.
     pub fn check_answer(&self, name: &str, answer: &str) -> Result<String, AnswerError> {
         let Some(index) = self.index_of(name) else {
             return Err(Unresolved::Undeclared(name.to_string()).into());
         };
+        if !self.decls[index].enabled {
+            return Err(Unresolved::Disabled {
+                names: vec![name.to_string()],
+            }
+            .into());
+        }
         let declared: Vec<String> = self.decls.iter().map(|decl| decl.name.clone()).collect();
         self.validate(&self.decls[index], index, answer, &declared)
     }
@@ -2444,6 +2457,24 @@ mod tests {
         assert!(
             message.contains("no layer declares the value `nowhere`"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_for_a_switched_off_value_says_so() {
+        // A declaration a layer switched off is not one of this account's
+        // values: the loader never reads an answer for it, so a prompt that
+        // accepted one would write a line that does nothing.
+        let mut scratch = a_decl("scratch", ValueKind::Path);
+        scratch.enabled = false;
+        let values = ResolvedValues::resolve(vec![scratch], &[], &a_home()).unwrap();
+
+        assert_eq!(
+            values.check_answer("scratch", "/var/mnt/other"),
+            Err(AnswerError::Reference(Unresolved::Disabled {
+                names: vec!["scratch".to_string()]
+            })),
+            "switched off, which is cleared by a different act than undeclared"
         );
     }
 

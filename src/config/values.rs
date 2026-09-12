@@ -345,6 +345,33 @@ pub enum ValueError {
         /// What would have been accepted.
         expected: &'static str,
     },
+    /// A `path` answer that expanded to something relative.
+    ///
+    /// Only reachable through a home that is itself relative. A `path` value is
+    /// joined, substituted into content and compared against the `env_guard`
+    /// root set, and every one of those reads it as absolute.
+    #[error(
+        "a `path` value must resolve to an absolute path; {answer:?} against home {home} does not"
+    )]
+    NotAbsolute {
+        /// What was written.
+        answer: String,
+        /// The home it was expanded against.
+        home: String,
+    },
+    /// An `is_root` answer that resolves to the filesystem root.
+    ///
+    /// A declared root is a place bx is permitted to point a tool at, so `/`
+    /// admits every destination there is and Invariant 2's only enforcement
+    /// mechanism is off — invisibly, because `plan` shows nothing unusual.
+    #[error(
+        "a root value may not be `/`: it would admit every destination on the \
+         filesystem and turn the relocation guard off; got {answer:?}"
+    )]
+    RootIsFilesystem {
+        /// What was written.
+        answer: String,
+    },
 }
 
 impl ValueKind {
@@ -379,14 +406,33 @@ impl ValueKind {
 
         match self {
             Self::Path => {
-                if !(answer.starts_with('~') || answer.starts_with('/')) {
+                if !(answer == "~" || answer.starts_with("~/") || answer.starts_with('/')) {
                     // A relative path would resolve against whatever directory
                     // bx happened to be invoked from, which is not a property of
-                    // the account at all.
-                    return Err(malformed("be absolute or start with `~`"));
+                    // the account at all. `~user` is refused because nothing
+                    // expands it: `render` leaves it alone, so `~scratch/one` —
+                    // a plausible typo for `~/scratch/one` — would become a
+                    // *relative* value that the root set can never match.
+                    return Err(malformed(
+                        "be `~`, start with `~/`, or be absolute; bx never expands another \
+                         account's `~user`",
+                    ));
                 }
-                let rendered = paths::render(answer, home);
-                Ok(paths::normalize(&rendered).to_string_lossy().into_owned())
+                // Through the one normaliser, which refuses a `~`-rooted climb
+                // rather than clamping it. Clamping would let `~/../../..`
+                // resolve to `/`, and an `is_root` value answered that way
+                // widens the guard to the whole filesystem with nothing on
+                // screen to say so.
+                let rooted = paths::normalize_rooted(answer)
+                    .map_err(|_| malformed("not climb out of the home it is rooted in"))?;
+                let rendered = paths::normalize(&paths::render(&rooted, home));
+                if !rendered.is_absolute() {
+                    return Err(ValueError::NotAbsolute {
+                        answer: answer.to_string(),
+                        home: home.display().to_string(),
+                    });
+                }
+                Ok(rendered.to_string_lossy().into_owned())
             }
             Self::String => Ok(answer.to_string()),
             Self::Bool => match answer {
@@ -799,7 +845,7 @@ impl ResolvedValues {
                 // position: expand against the values declared before it, then
                 // check the result against the kind.
                 Some(raw) => {
-                    match resolved.validate(decl.kind, resolved.decls.len(), &raw, &declared) {
+                    match resolved.validate(&decl, resolved.decls.len(), &raw, &declared) {
                         Ok(canonical) => Answer {
                             value: Some(Value {
                                 text: canonical,
@@ -840,13 +886,20 @@ impl ResolvedValues {
     /// disagrees with the loader for any answer carrying a brace pair.
     fn validate(
         &self,
-        kind: ValueKind,
+        decl: &ValueDecl,
         horizon: usize,
         answer: &str,
         declared: &[String],
     ) -> Result<String, AnswerError> {
         let text = self.expand_before(answer, horizon, declared)?;
-        Ok(kind.check(&text, &self.home)?)
+        let canonical = decl.kind.check(&text, &self.home)?;
+        if decl.is_root && canonical == "/" {
+            return Err(ValueError::RootIsFilesystem {
+                answer: answer.to_string(),
+            }
+            .into());
+        }
+        Ok(canonical)
     }
 
     /// Validate an answer for `name` exactly as loading it from `local.toml`
@@ -869,7 +922,7 @@ impl ResolvedValues {
             return Err(Unresolved::Undeclared(name.to_string()).into());
         };
         let declared: Vec<String> = self.decls.iter().map(|decl| decl.name.clone()).collect();
-        self.validate(self.decls[index].kind, index, answer, &declared)
+        self.validate(&self.decls[index], index, answer, &declared)
     }
 
     /// Expand `text` against the values declared before `horizon`.
@@ -1304,6 +1357,11 @@ mod tests {
         );
         assert_eq!(check(ValueKind::Path, "~").unwrap(), "/var/home/example");
         assert_eq!(
+            check(ValueKind::Path, "~/").unwrap(),
+            "/var/home/example",
+            "a trailing separator is folded by the same rule"
+        );
+        assert_eq!(
             check(ValueKind::Path, "/var/mnt//scratch/one/").unwrap(),
             "/var/mnt/scratch/one"
         );
@@ -1314,11 +1372,80 @@ mod tests {
         // It would resolve against whatever directory bx was invoked from,
         // which is not a property of the account.
         let message = check(ValueKind::Path, "scratch/one").unwrap_err();
+        assert!(message.contains("be `~`, start with `~/`"), "{message}");
+        assert!(check(ValueKind::Path, "").is_err());
+    }
+
+    #[test]
+    fn another_accounts_home_is_not_a_path_value() {
+        // Nothing expands `~user`, so `~scratch/one` — a plausible typo for
+        // `~/scratch/one` — would be canonicalised to a *relative* string. The
+        // env_guard compares absolute destinations against it, so every
+        // relocating variable the account meant to permit would be refused with
+        // nothing naming the cause.
+        for other in ["~user/x", "~x", "~root/.ssh", "~scratch/one"] {
+            let message = check(ValueKind::Path, other)
+                .expect_err(&format!("{other} was accepted as a path value"));
+            assert!(
+                message.contains("never expands another account"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_value_may_not_climb_out_of_the_home() {
+        // Clamped, `~/../../..` is `/`, and an `is_root` value answered that way
+        // makes every destination on the filesystem admissible with nothing on
+        // screen to say so.
+        for climbing in ["~/..", "~/../../..", "~/.ssh/../../etc"] {
+            let message =
+                check(ValueKind::Path, climbing).expect_err(&format!("{climbing} was accepted"));
+            assert!(message.contains("not climb out of"), "{message}");
+        }
+        assert_eq!(
+            check(ValueKind::Path, "~/.cache/../scratch").unwrap(),
+            "/var/home/example/scratch",
+            "a `..` that stays inside the home is ordinary"
+        );
+    }
+
+    #[test]
+    fn a_root_value_may_not_be_the_whole_filesystem() {
+        // The guard's only enforcement mechanism, switched off invisibly.
+        let mut root = a_decl("scratch_root", ValueKind::Path);
+        root.is_root = true;
+
+        let message = resolve(vec![root.clone()], &[answer("scratch_root", "/")]).unwrap_err();
+        assert!(message.contains("may not be `/`"), "{message}");
+
+        // The same answer through the prompt, because one entry point validates
+        // both and a prompt that accepted it would write a file that fails to
+        // load.
+        let values = ResolvedValues::resolve(vec![root], &[], &a_home()).unwrap();
+        let message = values.check_answer("scratch_root", "/a/../..").unwrap_err();
+        assert!(message.to_string().contains("may not be `/`"), "{message}");
+
+        // A value that is not a root is unaffected: it names a location, and
+        // nothing is admitted on the strength of it.
+        let plain = a_decl("brew_prefix", ValueKind::Path);
+        assert!(resolve(vec![plain], &[answer("brew_prefix", "/")]).is_ok());
+    }
+
+    #[test]
+    fn a_path_value_expanded_against_a_relative_home_is_an_error() {
+        // Held by the caller everywhere in the product — `paths::home_in`
+        // refuses a relative home — but a `path` value is joined, substituted
+        // into content and compared against the root set, and all three read it
+        // as absolute, so it is asserted here rather than assumed.
+        let message = ValueKind::Path
+            .check("~/scratch", Path::new("relative/home"))
+            .expect_err("a relative home cannot produce an absolute value");
+
         assert!(
-            message.contains("be absolute or start with `~`"),
+            message.to_string().contains("must resolve to an absolute"),
             "{message}"
         );
-        assert!(check(ValueKind::Path, "").is_err());
     }
 
     #[test]

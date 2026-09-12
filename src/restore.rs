@@ -337,6 +337,158 @@ mod tests {
             .cloned()
     }
 
+    /// Every blob in `restore/`, and every blob the ledger references.
+    fn blobs_on_disk_and_referenced(
+        state: &StateDir,
+        home: &Path,
+    ) -> (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ) {
+        let on_disk = std::fs::read_dir(state.restore())
+            .map(|entries| {
+                entries
+                    .map(|entry| {
+                        entry
+                            .expect("entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let referenced = LedgerView::read(state, home)
+            .expect("read the ledger")
+            .value
+            .iter()
+            .flat_map(|(_, entry)| {
+                let prior = match &entry.prior {
+                    Prior::Existed(reference) => Some(reference.blob_name()),
+                    Prior::Absent => None,
+                };
+                prior.into_iter().chain(
+                    entry
+                        .superseded
+                        .iter()
+                        .map(crate::state::RestoreRef::blob_name),
+                )
+            })
+            .collect();
+        (on_disk, referenced)
+    }
+
+    /// Apply `rel` in a session that dies between its `End` frame and its
+    /// ledger save, then let recovery rebuild the ledger from the journal.
+    fn applied_through_recovery(state: &StateDir, home: &Path, rel: &str, bytes: &str) {
+        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
+        session
+            .apply(write_to(home, rel, bytes, Mode::DEFAULT_FILE))
+            .expect("apply");
+        drop(session);
+        crate::journal::tests::seal(&state.journal(), 1);
+        assert_eq!(
+            crate::recover::recover(state).expect("recover"),
+            crate::recover::Outcome::Recorded { entries: 1 },
+        );
+    }
+
+    /// Two applies and an `rm`: the file and every directory bx created go.
+    fn two_applies_then_rm_leaves_nothing(through_recovery: bool) {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let rel = ".config/newdir/x.conf";
+        assert!(!home.child(".config").exists(), "bx creates ~/.config here");
+
+        let portable = managed(&state, home.path(), rel, "x = 1\n", Mode::DEFAULT_FILE);
+        if through_recovery {
+            applied_through_recovery(&state, home.path(), rel, "x = 1\n");
+        } else {
+            managed(&state, home.path(), rel, "x = 1\n", Mode::DEFAULT_FILE);
+        }
+        assert_eq!(
+            entry_for(&state, home.path(), &portable)
+                .expect("managed")
+                .created_dirs
+                .iter()
+                .map(Portable::as_str)
+                .collect::<Vec<_>>(),
+            ["~/.config/newdir", "~/.config"],
+            "the second apply created no directory, and forgot none",
+        );
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(restored.as_slice(), [Restored::Removed { .. }]),
+            "{restored:?}"
+        );
+        assert!(!home.child(rel).exists(), "x.conf is gone");
+        assert!(!home.child(".config/newdir").exists(), "newdir is gone");
+        assert!(
+            !home.child(".config").exists(),
+            "~/.config, which bx created, is gone"
+        );
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+    }
+
+    #[test]
+    fn two_applies_then_rm_removes_the_file_and_every_directory_bx_created() {
+        two_applies_then_rm_leaves_nothing(false);
+    }
+
+    #[test]
+    fn two_applies_then_rm_removes_every_directory_bx_created_after_a_rebuild() {
+        two_applies_then_rm_leaves_nothing(true);
+    }
+
+    /// bx creates `~/.foo`, the user replaces it, a second session writes over
+    /// it, and `rm` must hand back the user's bytes, not unlink them.
+    fn rm_restores_a_file_the_user_put_over_bxs(through_recovery: bool) {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".foo");
+
+        let portable = managed(&state, home.path(), ".foo", "bx one\n", Mode::DEFAULT_FILE);
+        plant_file(&dest, "the user's own\n", Mode::PRIVATE_FILE);
+        if through_recovery {
+            applied_through_recovery(&state, home.path(), ".foo", "bx two\n");
+        } else {
+            managed(&state, home.path(), ".foo", "bx two\n", Mode::DEFAULT_FILE);
+        }
+
+        let entry = entry_for(&state, home.path(), &portable).expect("managed");
+        let Prior::Existed(reference) = &entry.prior else {
+            panic!("the user's bytes must be the prior, got {:?}", entry.prior);
+        };
+        assert_eq!(reference.digest, ContentHash::of(b"the user's own\n"));
+        // Nothing the sessions stored is an orphan the ledger cannot name.
+        let (on_disk, referenced) = blobs_on_disk_and_referenced(&state, home.path());
+        assert_eq!(on_disk, referenced, "every blob in restore/ is indexed");
+        assert!(on_disk.contains(&reference.blob_name()));
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(restored.as_slice(), [Restored::Reverted { .. }]),
+            "restored, not removed: {restored:?}"
+        );
+        assert_eq!(
+            peek(&dest),
+            Some((b"the user's own\n".to_vec(), Mode::PRIVATE_FILE)),
+            "the user's bytes and mode are back",
+        );
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+    }
+
+    #[test]
+    fn rm_restores_bytes_the_user_put_over_a_file_bx_created() {
+        rm_restores_a_file_the_user_put_over_bxs(false);
+    }
+
+    #[test]
+    fn rm_restores_bytes_the_user_put_over_a_file_bx_created_after_a_rebuild() {
+        rm_restores_a_file_the_user_put_over_bxs(true);
+    }
+
     #[test]
     fn restore_puts_back_the_exact_bytes_and_the_exact_mode() {
         let home = guarded_home();

@@ -156,6 +156,15 @@ pub struct NewEntry {
 
 impl NewEntry {
     /// A new entry for a target bx created where nothing existed.
+    ///
+    /// The prior defaults to [`PriorBytes::Absent`] — *there was no file* —
+    /// which is only true for a target bx created. Use
+    /// [`NewEntry::with_prior`] whenever there were bytes to displace.
+    ///
+    /// Defaulting is safe on a re-record: [`Ledger::record`] keeps the prior
+    /// already stored for a path and ignores the one on the incoming entry, so
+    /// an omitted prior can never overwrite the user's snapshot with
+    /// "unlink it".
     #[must_use]
     pub fn new(
         path: crate::paths::Portable,
@@ -314,7 +323,23 @@ impl Ledger {
         &self.dir
     }
 
-    /// Record a target, replacing any entry for the same path.
+    /// Record a target, replacing any entry for the same path — **except its
+    /// prior, which is kept.**
+    ///
+    /// # First prior wins
+    ///
+    /// When an entry already exists for `entry.path`, the [`Prior`] stored on
+    /// it is kept and `entry.prior` is ignored — no blob is written for it. The
+    /// first prior is the only one that answers Invariant 4's question: it is
+    /// what the *user* had before bx ever touched the file. On every later
+    /// apply the bytes on disk are bx's own previous output, so a second
+    /// snapshot would record bx's generated content as the thing `bx rm`
+    /// restores, and `PriorBytes::Absent` — what [`NewEntry::new`] defaults to —
+    /// would rewrite "restore the user's file" into "unlink it".
+    ///
+    /// Re-adoption, when a target genuinely has a new prior worth snapshotting,
+    /// is [`Ledger::forget`] followed by `record`: two calls, so discarding a
+    /// prior is always something a caller asked for.
     ///
     /// The prior bytes are written to `restore/` and **fsynced, along with the
     /// directory entry naming them, before this returns** — so by the time the
@@ -331,19 +356,13 @@ impl Ledger {
     /// [`Error::CreateDir`] or [`Error::Write`] if the snapshot cannot be
     /// stored. The ledger is left unchanged when that happens.
     pub fn record(&mut self, entry: NewEntry) -> Result<&LedgerEntry, Error> {
-        let prior = match entry.prior {
-            PriorBytes::Absent => Prior::Absent,
-            PriorBytes::Bytes { bytes, mode } => {
-                let digest = ContentHash::of(&bytes);
-                self.store_blob(digest, &bytes)?;
-                Prior::Existed(RestoreRef {
-                    digest,
-                    mode,
-                    len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                })
-            }
-        };
         let key = entry.path.clone();
+        let prior = match self.view.entries.get(&key) {
+            // First prior wins. The incoming prior is dropped without being
+            // stored, so re-recording never leaves an orphan blob behind.
+            Some(existing) => existing.prior.clone(),
+            None => self.store_prior(entry.prior)?,
+        };
         self.view.entries.insert(
             key.clone(),
             LedgerEntry {
@@ -360,11 +379,31 @@ impl Ledger {
 
     /// Drop a target from the ledger, returning the entry that was there.
     ///
+    /// This is also half of re-adoption: `forget` then [`Ledger::record`] is
+    /// how a caller deliberately replaces a prior that [`Ledger::record`] alone
+    /// would have kept.
+    ///
     /// The restore blob is deliberately left in place: it may be shared with
     /// another entry, and content-addressed bytes cost far less than a wrong
     /// deletion. Reclaiming unreferenced blobs is not implemented.
     pub fn forget(&mut self, path: &crate::paths::Portable) -> Option<LedgerEntry> {
         self.view.entries.remove(path)
+    }
+
+    /// Turn caller-supplied prior bytes into a durable [`Prior`].
+    fn store_prior(&self, prior: PriorBytes) -> Result<Prior, Error> {
+        match prior {
+            PriorBytes::Absent => Ok(Prior::Absent),
+            PriorBytes::Bytes { bytes, mode } => {
+                let digest = ContentHash::of(&bytes);
+                self.store_blob(digest, &bytes)?;
+                Ok(Prior::Existed(RestoreRef {
+                    digest,
+                    mode,
+                    len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                }))
+            }
+        }
     }
 
     /// Write the ledger out, atomically.
@@ -485,19 +524,126 @@ mod tests {
     }
 
     #[test]
-    fn recording_the_same_path_twice_replaces_in_place() {
+    fn re_recording_a_target_replaces_in_place_and_keeps_the_first_prior() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let mut ledger = Ledger::open(&dir, &lock).value;
-        ledger.record(entry("~/.bashrc", b"first")).expect("first");
+        // Apply #1: the user's own file is displaced and snapshotted.
+        ledger
+            .record(entry("~/.bashrc", b"first").with_prior(PriorBytes::Bytes {
+                bytes: b"the user wrote this".to_vec(),
+                mode: Mode::DEFAULT_FILE,
+            }))
+            .expect("first");
+        // Apply #2: the natural call, with no prior — what is on disk now is
+        // bx's own output from apply #1, so there is nothing to snapshot.
         ledger
             .record(entry("~/.bashrc", b"second"))
             .expect("second");
+
         assert_eq!(ledger.len(), 1);
+        let stored = ledger.get(&target("~/.bashrc")).expect("entry");
+        assert_eq!(stored.written, ContentHash::of(b"second"));
+        let Prior::Existed(reference) = &stored.prior else {
+            panic!(
+                "the first prior must survive a re-record, got {:?}",
+                stored.prior
+            );
+        };
+        assert_eq!(reference.digest, ContentHash::of(b"the user wrote this"));
         assert_eq!(
-            ledger.get(&target("~/.bashrc")).expect("entry").written,
-            ContentHash::of(b"second"),
+            ledger.restore_bytes(&dir, reference).expect("restore"),
+            b"the user wrote this",
         );
+    }
+
+    #[test]
+    fn a_re_record_neither_stores_nor_adopts_the_incoming_prior() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).value;
+        ledger
+            .record(entry("~/.bashrc", b"first").with_prior(PriorBytes::Bytes {
+                bytes: b"the user wrote this".to_vec(),
+                mode: Mode::DEFAULT_FILE,
+            }))
+            .expect("first");
+        ledger
+            .record(entry("~/.bashrc", b"second").with_prior(PriorBytes::Bytes {
+                bytes: b"bx generated this".to_vec(),
+                mode: Mode::DEFAULT_FILE,
+            }))
+            .expect("second");
+
+        let stored = ledger.get(&target("~/.bashrc")).expect("entry");
+        let Prior::Existed(reference) = &stored.prior else {
+            panic!("expected the first prior");
+        };
+        assert_eq!(reference.digest, ContentHash::of(b"the user wrote this"));
+        // The ignored prior is never written, so re-recording leaves no orphan.
+        let blobs: Vec<_> = std::fs::read_dir(dir.restore())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            blobs,
+            vec![std::ffi::OsString::from(
+                ContentHash::of(b"the user wrote this").to_hex()
+            )],
+        );
+    }
+
+    #[test]
+    fn forget_then_record_re_adopts_a_target_with_a_new_prior() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).value;
+        ledger
+            .record(entry("~/.bashrc", b"first").with_prior(PriorBytes::Bytes {
+                bytes: b"the user wrote this".to_vec(),
+                mode: Mode::DEFAULT_FILE,
+            }))
+            .expect("first");
+        let dropped = ledger.forget(&target("~/.bashrc")).expect("forget");
+        assert_eq!(dropped.written, ContentHash::of(b"first"));
+
+        ledger
+            .record(entry("~/.bashrc", b"second").with_prior(PriorBytes::Bytes {
+                bytes: b"and then the user wrote that".to_vec(),
+                mode: Mode::DEFAULT_FILE,
+            }))
+            .expect("re-adopt");
+        let stored = ledger.get(&target("~/.bashrc")).expect("entry");
+        let Prior::Existed(reference) = &stored.prior else {
+            panic!("expected the re-adopted prior");
+        };
+        assert_eq!(
+            reference.digest,
+            ContentHash::of(b"and then the user wrote that"),
+        );
+    }
+
+    #[test]
+    fn a_re_record_cannot_turn_a_snapshot_into_an_unlink() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).value;
+        ledger
+            .record(entry("~/.bashrc", b"first").with_prior(PriorBytes::Bytes {
+                bytes: b"the user wrote this".to_vec(),
+                mode: Mode::DEFAULT_FILE,
+            }))
+            .expect("first");
+        for _ in 0..3 {
+            ledger
+                .record(entry("~/.bashrc", b"again"))
+                .expect("re-record");
+            assert_ne!(
+                ledger.get(&target("~/.bashrc")).expect("entry").prior,
+                Prior::Absent,
+                "re-recording must never rewrite a restore into an unlink",
+            );
+        }
     }
 
     #[test]

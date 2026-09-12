@@ -2338,6 +2338,41 @@ mod tests {
         assert!(matches!(err, Error::NoParent(_)), "{err:?}");
     }
 
+    #[test]
+    fn an_entry_that_cannot_be_made_portable_is_refused_not_recorded() {
+        // `Portable::from_path` refuses rather than renaming a path it cannot
+        // represent, so the entry is an error rather than a ledger key that
+        // names a different file.
+        let home = guarded_home();
+        let dest = home.child(".config/tool/x.conf");
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"x")
+            .expect("fill");
+
+        let err = filled
+            .new_entry(Path::new("relative/home"), Mechanism::Own)
+            .expect_err("a relative home makes nothing portable");
+        assert!(
+            matches!(
+                &err,
+                Error::NotPortable {
+                    source: crate::paths::Error::HomeNotAbsolute(_),
+                    ..
+                }
+            ),
+            "{err:?}",
+        );
+        assert_eq!(err.path(), dest);
+        assert!(err.to_string().contains("cannot be recorded"), "{err}");
+
+        // Under the real home the same write yields its entry.
+        let entry = filled
+            .new_entry(home.path(), Mechanism::Own)
+            .expect("portable under the real home");
+        assert_eq!(entry.path.as_str(), "~/.config/tool/x.conf");
+    }
+
     /// A locked, writable ledger for a guarded home.
     fn ledger_for(home: &GuardedHome) -> (StateDir, ExclusiveLock, Ledger) {
         let dir = StateDir::resolve(home.path());

@@ -45,6 +45,29 @@
 //! and it cannot let a test observe the mode of the temporary file while it is
 //! still empty. [`Staged::commit`] is the shorthand for callers with nothing to
 //! interpose.
+//!
+//! # What the tests here do and do not establish
+//!
+//! The *observable* half is pinned throughout: the temporary file is in the
+//! destination directory and at its final mode while still empty, an abandoned
+//! or failed write leaves the previous file and no temporary behind, a
+//! published one leaves only the destination, and the prior state a reversal
+//! needs is in the ledger before the rename.
+//!
+//! The **durability half is not pinned at all**. Not merely its failure paths:
+//! nothing establishes that `sync_all` at the end of [`Staged::fill`] or the
+//! `fsync` inside `fsync_dir` *happen*. Delete either call and the whole suite
+//! still passes, because their only effect is visible to a reader that survives
+//! a power loss. Steps 4 and 7 of the sequence above, and the ordering between
+//! them and the `rename`, are therefore held by code order, by this paragraph
+//! and by review — not by a test. So `bx`'s crash-safety claim for a single
+//! write is **asserted, not established**, and it should not be counted as
+//! Invariant 4 being enforced by the suite.
+//!
+//! Closing it needs a harness that observes the syscalls rather than their
+//! results: an `LD_PRELOAD` shim, `strace -e` over a child process, or a fault
+//! injector between the write and the rename. None is cheap, and none belongs
+//! to this entry; the honest record is that the gap is open.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -2025,6 +2048,61 @@ mod tests {
         write_atomically(&dest, &bytes, reference.mode).expect("restore");
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host old\n");
         assert_eq!(mode_of_path(&dest), Mode::from_bits(0o640));
+    }
+
+    #[test]
+    fn re_applying_after_an_edit_still_restores_the_user_s_original_file() {
+        // The ordinary case, not an edge one: a user applies, edits the result,
+        // and applies again. If the second `record` snapshotted what it found,
+        // `bx rm` would restore bx's own previous output; if it defaulted to
+        // `PriorBytes::Absent` — which is what a writer over an *absent*
+        // destination supplies — it would unlink a file the user had before bx
+        // ever ran. Both turn Invariant 4 into its opposite, and the writer is
+        // the side that supplies the prior, so the writer's tests are a place
+        // this has to be pinned.
+        let home = guarded_home();
+        let (dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host theirs\n", Mode::from_bits(0o640));
+
+        for content in [b"Host v1\n", b"Host v2\n"] {
+            let filled = stage(&dest, Mode::PRIVATE_FILE)
+                .expect("stage")
+                .fill(content)
+                .expect("fill");
+            ledger
+                .record(filled.new_entry(home.path(), Mechanism::Own))
+                .expect("record");
+            filled.publish().expect("publish");
+            // The user edits what bx wrote, so the second apply's `observe`
+            // finds neither the user's original nor bx's output.
+            std::fs::write(&dest, b"Host edited\n").expect("the user edits it");
+        }
+
+        let recorded = ledger
+            .record(
+                NewEntry::new(
+                    Portable::from_path(&dest, home.path()),
+                    ContentHash::of(b"Host v2\n"),
+                    Mode::PRIVATE_FILE,
+                    Mechanism::Own,
+                )
+                .with_prior(PriorBytes::Absent),
+            )
+            .expect("record")
+            .clone();
+
+        let Prior::Existed(reference) = &recorded.prior else {
+            panic!("the first prior must survive, got {:?}", recorded.prior);
+        };
+        assert_eq!(reference.mode, Mode::from_bits(0o640));
+        let bytes = ledger
+            .restore_bytes(&dir, reference)
+            .expect("restore bytes");
+        assert_eq!(
+            bytes, b"Host theirs\n",
+            "the prior is what the user had before bx ever touched the file",
+        );
     }
 
     #[test]

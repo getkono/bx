@@ -151,11 +151,9 @@ impl Mode {
     ///
     /// [`ModeError::Invalid`] for anything else.
     pub fn parse_octal(raw: &str) -> Result<Self, ModeError> {
-        let usable = !raw.is_empty()
-            && raw.len() <= 4
-            && raw
-                .bytes()
-                .all(|b| b.is_ascii_digit() && b != b'8' && b != b'9');
+        // `from_str_radix` alone is not enough: it accepts a leading `+`, and it
+        // has no opinion about how many digits a mode may have.
+        let usable = (1..=4).contains(&raw.len()) && raw.bytes().all(|b| matches!(b, b'0'..=b'7'));
 
         u32::from_str_radix(raw, 8)
             .ok()
@@ -664,6 +662,10 @@ mod tests {
         assert!(
             Mode::parse_octal("").is_err(),
             "an empty mode is not a mode"
+        );
+        assert!(
+            Mode::parse_octal("+644").is_err(),
+            "a sign is not an octal digit"
         );
     }
 

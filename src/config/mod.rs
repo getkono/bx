@@ -20,6 +20,7 @@
 //! binary through one install channel, so a repo and a binary are versioned
 //! together, and a silent no-op is the failure mode this tool exists to end.
 
+pub mod layers;
 pub mod origin;
 pub mod target;
 pub mod values;
@@ -64,8 +65,26 @@ pub struct Config {
 pub struct Layer {
     /// The file it was read from.
     pub file: PathBuf,
+    /// Whether the file is committed material or this account's own.
+    pub kind: LayerKind,
     /// What that file says, on its own.
     pub config: Config,
+}
+
+/// Which of the two roots a layer came from.
+///
+/// The distinction is not decoration: only [`LayerKind::Local`] may carry a
+/// `[values]` table. A committed layer that answered a value would be putting
+/// account content into a git working tree meant to be published, and Invariant
+/// 5 has no exception clause. The mechanism for a global answer already exists
+/// and is `default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LayerKind {
+    /// From the config repo: committed, publishable, account-independent.
+    #[default]
+    Global,
+    /// This account's `local.toml`, from the state directory.
+    Local,
 }
 
 /// The global layer files in a config repo, in merge order.
@@ -168,6 +187,9 @@ pub fn load_layer(path: &Path) -> Result<Layer, Error> {
 
     Ok(Layer {
         file: path.to_path_buf(),
+        // The repo loader only ever reads committed material. `layers::load_layer_set`
+        // is what marks the one layer that came from the state directory.
+        kind: LayerKind::Global,
         config: parse_str(&text, path)?,
     })
 }

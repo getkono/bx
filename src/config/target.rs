@@ -136,6 +136,12 @@ pub fn parse_generated(_name: &str) -> Option<Gen> {
 /// and the mode the ledger records are one type, so a mode a config author wrote
 /// means the same thing as a mode `stat` reported. `parse_octal`, `ModeError`
 /// and the four-digit `Display` are unchanged by the move.
+///
+/// One type does not mean one encoding. Deserialising a `[[target]]` accepts
+/// only the **quoted** octal form, `mode = "0600"`; a bare `mode = 600` is
+/// refused with the decimal it would have meant. The bare-integer encoding the
+/// ledger writes is reachable only from a non-human-readable format, and never
+/// from a config file.
 pub use crate::fs::mode::{Mode, ModeError};
 
 /// How bx attaches to a file.

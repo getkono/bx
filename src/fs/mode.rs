@@ -22,8 +22,26 @@ use serde::{Deserialize, Serialize};
 /// message reads the way `chmod` does. The file-type bits a `stat` returns are
 /// deliberately not carried: bx sets permissions, it never changes what a path
 /// *is*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+///
+/// # Two codecs, because there are two audiences
+///
+/// One type serves the config schema — where `config::target::Mode` names it —
+/// and machine-owned state, where the ledger records what bx wrote. They want
+/// opposite encodings, and the serde format says which is which:
+///
+/// * **not human-readable** (MessagePack, in `ledger.mpk`): a bare `u32`.
+///   Length-prefixed, exact, and byte-identical to what the state directory
+///   already wrote before this type was collapsed into one.
+/// * **human-readable** (TOML, in `bx.toml`): the quoted octal string
+///   `"0600"`, parsed by [`Mode::parse_octal`]. A bare TOML integer is refused
+///   with the reason, because TOML has no octal literal: `mode = 600` would be
+///   decimal 600, which is `0o1130` — setgid set, and the owner unable to read
+///   their own file.
+///
+/// Without the split, the transparent `u32` codec the ledger needs would also
+/// be the config schema's, and `mode = 600` would deserialise silently into
+/// exactly that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Mode(u32);
 
 impl Mode {
@@ -53,11 +71,12 @@ impl Mode {
 
     /// Parse the quoted octal form a config file uses.
     ///
-    /// **A bare TOML integer is not accepted**, and this function never sees
-    /// one: TOML has no octal literal, so `mode = 600` is decimal 600 and means
-    /// nothing at all; only `mode = "0600"` parses. One to four octal digits, so
-    /// the setuid, setgid and sticky bits are expressible and a fifth digit is a
-    /// typo rather than a silently truncated mode.
+    /// **A bare TOML integer is not accepted**: TOML has no octal literal, so
+    /// `mode = 600` is decimal 600 and means nothing at all; only
+    /// `mode = "0600"` parses. The [`Deserialize`] impl refuses an integer
+    /// before it reaches here, naming the decimal it would have meant. One to
+    /// four octal digits, so the setuid, setgid and sticky bits are expressible
+    /// and a fifth digit is a typo rather than a silently truncated mode.
     ///
     /// # Errors
     ///
@@ -149,6 +168,61 @@ impl From<Mode> for RawMode {
     fn from(mode: Mode) -> Self {
         Self::from_bits_truncate(mode.bits())
     }
+}
+
+impl Serialize for Mode {
+    /// A quoted octal string for a human-readable format, a bare `u32`
+    /// otherwise. See the type's documentation for why there are two.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_string())
+        } else {
+            serializer.serialize_u32(self.bits())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    /// A quoted octal string from a human-readable format, a bare `u32`
+    /// otherwise. See the type's documentation for why there are two.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(DeclaredMode)
+        } else {
+            u32::deserialize(deserializer).map(Self::from_bits)
+        }
+    }
+}
+
+/// Reads the form a config author writes, and refuses the form they meant.
+struct DeclaredMode;
+
+impl serde::de::Visitor<'_> for DeclaredMode {
+    type Value = Mode;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("one to four octal digits in quotes, like \"0600\"")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Mode, E> {
+        Mode::parse_octal(raw).map_err(E::custom)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Mode, E> {
+        Err(E::custom(unquoted(&value.to_string())))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Mode, E> {
+        Err(E::custom(unquoted(&value.to_string())))
+    }
+}
+
+/// The message an unquoted mode gets: what it would have meant, and the fix.
+fn unquoted(digits: &str) -> String {
+    format!(
+        "a mode must be quoted: TOML has no octal literal, so `mode = {digits}` is decimal \
+         {digits}. Write `mode = \"{digits}\"` if {digits} is the octal you meant"
+    )
 }
 
 /// A mode that could not be read.
@@ -297,6 +371,64 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&Mode::PRIVATE_FILE).expect("encode");
         let back: Mode = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(back, Mode::PRIVATE_FILE);
+    }
+
+    #[test]
+    fn the_messagepack_encoding_is_the_bare_integer_the_ledger_already_holds() {
+        // The machine-owned half of the split codec, pinned as bytes rather
+        // than as a round trip: a `ledger.mpk` written before this type carried
+        // a config-facing `Deserialize` must still decode, so the encoding is
+        // exactly what a bare `u32` produces and nothing else.
+        assert_eq!(
+            rmp_serde::to_vec_named(&Mode::PRIVATE_FILE).expect("encode"),
+            rmp_serde::to_vec_named(&0o600_u32).expect("encode a bare u32"),
+        );
+        let from_bare: Mode =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&0o600_u32).expect("encode"))
+                .expect("a bare integer decodes as a mode");
+        assert_eq!(from_bare, Mode::PRIVATE_FILE);
+    }
+
+    /// The shape a `[[target]]` table has where `mode` appears.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Declared {
+        mode: Mode,
+    }
+
+    #[test]
+    fn a_declared_mode_is_read_from_the_quoted_octal_form() {
+        let declared: Declared =
+            toml_edit::de::from_str("mode = \"0600\"").expect("a quoted octal mode");
+        assert_eq!(declared.mode, Mode::PRIVATE_FILE);
+
+        // And back out the same way, so a config bx writes is a config bx
+        // reads.
+        let toml = toml_edit::ser::to_string(&declared).expect("serialise");
+        assert_eq!(toml.trim(), "mode = \"0600\"");
+    }
+
+    #[test]
+    fn a_bare_integer_mode_is_refused_at_the_serde_layer() {
+        // `mode = 600` is decimal 600, which is 0o1130: setgid set, owner --x,
+        // group -wx, other -w-. The transparent `u32` codec the ledger needs
+        // would have accepted it silently, which is why the codec is split.
+        let err = toml_edit::de::from_str::<Declared>("mode = 600").expect_err("must be refused");
+        let message = err.to_string();
+        assert!(message.contains("must be quoted"), "{message}");
+        assert!(message.contains("decimal 600"), "{message}");
+        assert!(message.contains("mode = \"600\""), "{message}");
+    }
+
+    #[test]
+    fn the_four_parser_rejections_survive_the_serde_layer() {
+        for raw in ["8", "0688", "+644", "00644"] {
+            let err = toml_edit::de::from_str::<Declared>(&format!("mode = \"{raw}\""))
+                .expect_err("must be refused");
+            assert!(
+                err.to_string().contains("one to four octal digits"),
+                "{raw:?}: {err}",
+            );
+        }
     }
 
     #[test]

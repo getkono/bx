@@ -559,6 +559,9 @@ type Assignments = std::collections::HashMap<String, String>;
 /// How many substitution passes an expansion may take before the value is
 /// treated as unresolvable.
 ///
+/// Eight passes is **seven** substitutions: the last pass has to find nothing
+/// left to substitute, because that is how the expander knows it is done.
+///
 /// This is one of the two bounds that keep the expander from growing into a
 /// shell. More than one pass is genuinely needed — `GOMODCACHE=$GOPATH/pkg/mod`
 /// where `GOPATH` was itself written as `$CACHE_DIR/go` takes two — but the
@@ -606,7 +609,16 @@ fn substitute_once(value: &str, seen: &Assignments, home: &str) -> Result<(Strin
     let mut substituted = false;
     let mut rest = value;
 
-    while let Some(at) = rest.find('$') {
+    // This pass's own bound, and the reason it is a `for` rather than a
+    // `while`: every iteration consumes at least the `$` it found, so `rest`
+    // strictly shrinks and there can be no more iterations than the value has
+    // bytes. The expander's other two bounds are both in `expand`, which a
+    // pass in progress never returns to — so without this one, a refactor that
+    // stopped consuming the `$` (`&rest[at..]` for `&rest[at + 1..]`) would
+    // spin here forever and hang `bx plan`, rather than return a wrong answer
+    // a test can see.
+    for _ in 0..value.len() {
+        let Some(at) = rest.find('$') else { break };
         out.push_str(&rest[..at]);
         let after = &rest[at + 1..];
 
@@ -1412,6 +1424,47 @@ mod tests {
             "export GOMODCACHE=$GOPATH/pkg/mod\n",
         );
         assert_eq!(scan_with(content, &rooted()), vec![]);
+    }
+
+    #[test]
+    fn several_references_in_one_value_are_all_substituted() {
+        // One pass substitutes every reference in the value, so this resolves
+        // in one hop however many there are. It is also what pins the pass's
+        // own bound: a bound too small to visit them all leaves a `$` behind,
+        // and the value stops resolving.
+        let content = concat!(
+            "A=/var/mnt/scratch/example\n",
+            "B=cache\n",
+            "C=cargo\n",
+            "export CARGO_HOME=$A/$B/$C/$B/$C/$B\n",
+        );
+        assert_eq!(scan_with(content, &rooted()), vec![]);
+    }
+
+    #[test]
+    fn the_hop_limit_allows_seven_substitutions_and_no_more() {
+        // `X0` is the literal root and each link refers to the one below it, so
+        // `$X{n}` takes n + 1 substitutions and then one pass that finds
+        // nothing left — n + 2 passes against a bound of 8.
+        fn chain(links: usize) -> String {
+            let mut content = format!("X0={ROOT}\n");
+            for link in 1..=links {
+                content.push_str(&format!("X{link}=$X{}\n", link - 1));
+            }
+            content.push_str(&format!("export CARGO_HOME=$X{links}/cargo\n"));
+            content
+        }
+        // Written as literals rather than against MAX_EXPANSION_HOPS: written
+        // against the constant they would follow it down and pin nothing.
+        assert_eq!(scan_with(&chain(6), &rooted()), vec![]);
+        let found = scan_with(&chain(7), &rooted());
+        assert_eq!(
+            found
+                .iter()
+                .map(|violation| violation.reason)
+                .collect::<Vec<_>>(),
+            vec![Reason::UnresolvedReference]
+        );
     }
 
     #[test]

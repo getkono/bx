@@ -145,10 +145,10 @@ fn filename_bytes(path: &Path) -> &[u8] {
 /// # Errors
 ///
 /// Whatever [`layer_files`] and [`load_layer`] return.
-pub fn load_layers(repo: &Path) -> Result<Vec<Layer>, Error> {
+pub fn load_layers(repo: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
     layer_files(repo)?
         .iter()
-        .map(|path| load_layer(path))
+        .map(|path| load_layer(path, home))
         .collect()
 }
 
@@ -159,7 +159,7 @@ pub fn load_layers(repo: &Path) -> Result<Vec<Layer>, Error> {
 /// # Errors
 ///
 /// [`Error::Io`] if the file cannot be read, and whatever [`parse_str`] returns.
-pub fn load_layer(path: &Path) -> Result<Layer, Error> {
+pub fn load_layer(path: &Path, home: &Path) -> Result<Layer, Error> {
     tracing::debug!(file = %path.display(), "reading configuration layer");
     let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -168,7 +168,7 @@ pub fn load_layer(path: &Path) -> Result<Layer, Error> {
 
     Ok(Layer {
         file: path.to_path_buf(),
-        config: parse_str(&text, path)?,
+        config: parse_str(&text, path, home)?,
     })
 }
 
@@ -177,12 +177,17 @@ pub fn load_layer(path: &Path) -> Result<Layer, Error> {
 /// `file` is used for provenance only; nothing is read from disk. Entry order
 /// inside each section is document order, which `toml_edit` preserves.
 ///
+/// `home` is the account's home directory. A layer is parsed *against* a home
+/// because a target path under it has exactly one spelling — `~/…` — and
+/// recognising the absolute spelling as the same file is what stops `bx.toml`
+/// and a module holding two keys for one file. See [`crate::paths::Portable`].
+///
 /// # Errors
 ///
 /// [`Error::Syntax`] for invalid TOML, [`Error::UnknownSection`] for a section
 /// this version of `bx` does not know, [`Error::Duplicate`] for two entries in
 /// one layer sharing a natural key, and whatever the per-entry parsers return.
-pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
+pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> {
     let doc = Document::parse(text).map_err(|source| Error::Syntax {
         file: file.to_path_buf(),
         source: Box::new(source),
@@ -196,7 +201,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
                 for table in entries(root, name, item, file, text)? {
                     config
                         .targets
-                        .push(target::parse_target(table, file, text)?);
+                        .push(target::parse_target(table, file, text, home)?);
                 }
             }
             "value" => {
@@ -552,8 +557,13 @@ mod tests {
             .collect()
     }
 
+    /// The account's home every test in this module parses against.
+    fn home() -> &'static Path {
+        Path::new("/var/home/example")
+    }
+
     fn parse(text: &str) -> Result<Config, Error> {
-        parse_str(text, Path::new("bx.toml"))
+        parse_str(text, Path::new("bx.toml"), home())
     }
 
     fn message(text: &str) -> String {
@@ -687,7 +697,7 @@ mod tests {
                 "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"overridden\"\n",
             ),
         ]);
-        let layers = load_layers(dir.path()).expect("loading");
+        let layers = load_layers(dir.path(), home()).expect("loading");
 
         assert_eq!(layers.len(), 2);
         assert_eq!(layers[0].file, dir.path().join("bx.toml"));
@@ -703,7 +713,7 @@ mod tests {
             "modules/git.toml",
             "# a module\n\n[[target]]\npath = \"~/.gitconfig\"\nfile = \"f\"\n",
         )]);
-        let layers = load_layers(dir.path()).expect("loading");
+        let layers = load_layers(dir.path(), home()).expect("loading");
         let origin = &layers[0].config.targets[0].origin;
 
         assert_eq!(origin.file, dir.path().join("modules/git.toml"));
@@ -715,7 +725,7 @@ mod tests {
         let dir = repo(&[]);
         let missing = dir.path().join("bx.toml");
 
-        let error = load_layer(&missing).expect_err("should be an error");
+        let error = load_layer(&missing, home()).expect_err("should be an error");
         assert!(matches!(error, Error::Io { .. }));
         assert!(error.to_string().contains("bx.toml"));
     }
@@ -769,7 +779,7 @@ mod tests {
 
     #[test]
     fn a_syntax_error_names_the_file_and_position() {
-        let error = parse_str("[[target]\n", Path::new("/repo/bx.toml"))
+        let error = parse_str("[[target]\n", Path::new("/repo/bx.toml"), home())
             .expect_err("should be a syntax error");
 
         assert!(matches!(error, Error::Syntax { .. }));
@@ -806,6 +816,23 @@ mod tests {
                 "{second} should collide with ~/.ssh/config"
             );
         }
+    }
+
+    #[test]
+    fn the_absolute_spelling_of_a_home_file_never_becomes_a_second_key() {
+        // check_unique compares the stored strings, so it cannot see that
+        // `/var/home/example/.ssh/config` and `~/.ssh/config` are one file. The
+        // parser refuses the absolute spelling instead, which is what keeps one
+        // file from acquiring two `attach = "own"` targets in one layer set.
+        let text = "[[target]]\npath = \"~/.ssh/config\"\nfile = \"a\"\n\n\
+                    [[target]]\npath = \"/var/home/example/.ssh/config\"\nfile = \"b\"\n";
+        let message = message(text);
+
+        assert!(message.contains("~/.ssh/config"), "{message}");
+        assert!(
+            message.contains("bx.toml:6"),
+            "the caret must land on the offending `path` key: {message}"
+        );
     }
 
     #[test]

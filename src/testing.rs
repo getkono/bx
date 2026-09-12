@@ -338,6 +338,20 @@ mod tests {
         assert!(!user_specific_offences(&format!("home = {account}")).is_empty());
         // And an account name inside an ordinary word still is not an offence.
         assert!(user_specific_offences(&format!("an amal{account} of prose")).is_empty());
+
+        // The path rule needs a negative case of its own, or a rule that
+        // reported every string would pass this test and still be useless. A
+        // path sharing the fragment's leading directories, but not the
+        // account-specific tail, is not an offence.
+        let prefix = ["/m", "nt/sc", "ratch/"].concat();
+        assert!(
+            user_specific_offences(&format!("{prefix}shared/dev/x")).is_empty(),
+            "only the account-specific tail makes the path a literal"
+        );
+        assert!(
+            user_specific_offences("/var/home/example/.ssh/config").is_empty(),
+            "the placeholder home every test in this crate uses is not an offence"
+        );
     }
 
     /// Invariant 5 has no exception, and a one-time fix without a regression

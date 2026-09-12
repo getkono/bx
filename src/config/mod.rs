@@ -919,6 +919,45 @@ mod tests {
         );
     }
 
+    /// `load_layers` parses against the home it is *given*.
+    ///
+    /// Nothing pinned that. Mutating `load_layers` to forward a hard-coded
+    /// `/nonexistent/mutated/home` left every test in this module passing,
+    /// because they all spell target paths `~/…`, which `parse_in` accepts
+    /// identically under any home; the tests that do depend on the home call
+    /// `parse_str` or `parse_target` directly and never reach the loader. So the
+    /// home threads through five call sites and the first two — `load_layers`
+    /// into `load_layer`, `load_layer` into `parse_str` — were unpinned, and
+    /// `load_layers` is the function entry A3's merge and every later entry read
+    /// a config repo through.
+    ///
+    /// An **absolutely** spelled target path is the discriminating input: it is
+    /// admissible under one home and refused under another, so the error can
+    /// only arrive if this exact home reached `Portable::parse_in`.
+    #[test]
+    fn load_layers_parses_against_the_home_it_is_given() {
+        let dir = repo(&[(
+            "modules/ssh.toml",
+            "[[target]]\npath = \"/var/home/example/.ssh/config\"\nfile = \"files/ssh\"\n",
+        )]);
+
+        let error = load_layers(dir.path(), home()).expect_err("absolute, and under this home");
+        let message = error.to_string();
+        assert!(
+            message.contains("write ~/.ssh/config"),
+            "the message must name the `~/…` spelling for *this* home: {message}"
+        );
+
+        // The same repo under a home the path is not inside parses, and keeps
+        // the absolute spelling: the rule is about this home, not about the
+        // string.
+        let layers = load_layers(dir.path(), Path::new("/var/home/other")).expect("outside");
+        assert_eq!(
+            layers[0].config.targets[0].path.as_str(),
+            "/var/home/example/.ssh/config"
+        );
+    }
+
     #[test]
     fn a_target_path_that_climbs_out_of_home_is_rejected() {
         let text = "[[target]]\npath = \"~/../../etc/passwd\"\nfile = \"a\"\n";

@@ -5,11 +5,11 @@
 //!
 //! ```toml
 //! [[value]]
-//! name        = "scratch_root"
+//! name        = "scratch_root"  # [a-z][a-z0-9_]*, here and as a [values] key
 //! description = "Root of this account's scratch storage"
 //! kind        = "path"     # path | string | bool | email | ssh-key | age-recipient
 //! required    = true       # default false
-//! is_root     = true       # default false; joins the env_guard root set
+//! is_root     = true       # default false; joins the env_guard root set; path only
 //! default     = "…"        # optional; a string or a boolean
 //! ```
 //!
@@ -175,6 +175,9 @@ pub fn parse_value_decl(table: &Table, file: &Path, text: &str) -> Result<ValueD
     ctx.reject_unknown_keys(table, &DECL_KEYS)?;
 
     let name = ctx.required_str(table, "name")?.to_string();
+    if !is_value_name(&name) {
+        return Err(ctx.bad(table, "name", bad_name_message(&name)));
+    }
 
     let raw_kind = ctx.required_str(table, "kind")?;
     let kind = ValueKind::parse(raw_kind).ok_or_else(|| {
@@ -206,12 +209,27 @@ pub fn parse_value_decl(table: &Table, file: &Path, text: &str) -> Result<ValueD
         })?),
     };
 
+    let is_root = ctx.bool_at(table, "is_root")?.unwrap_or(false);
+    if is_root && kind != ValueKind::Path {
+        // `is_root` names a directory the guard will admit a relocating variable
+        // into, so it has to be a directory. Accepting it on any other kind
+        // would widen the guard on the strength of something that is not a path.
+        return Err(ctx.bad(
+            table,
+            "is_root",
+            format!(
+                "`is_root` declares a directory the env_guard root set admits, \
+                 so it is only legal on `kind = \"path\"`; `{name}` is `{kind}`"
+            ),
+        ));
+    }
+
     Ok(ValueDecl {
         name,
         description: ctx.str_at(table, "description")?.map(str::to_string),
         kind,
         required: ctx.bool_at(table, "required")?.unwrap_or(false),
-        is_root: ctx.bool_at(table, "is_root")?.unwrap_or(false),
+        is_root,
         default,
         origin: ctx.origin().clone(),
     })
@@ -221,7 +239,8 @@ pub fn parse_value_decl(table: &Table, file: &Path, text: &str) -> Result<ValueD
 ///
 /// # Errors
 ///
-/// [`Error::BadValue`] for an assignment that is neither a string nor a boolean.
+/// [`Error::BadValue`] for a key that is not a value name, and for an assignment
+/// that is neither a string nor a boolean.
 pub fn parse_assignments(
     table: &Table,
     file: &Path,
@@ -232,6 +251,13 @@ pub fn parse_assignments(
     table
         .iter()
         .map(|(name, item)| {
+            // Both sides of the vocabulary, checked by one predicate. A
+            // declaration is held to `[a-z][a-z0-9_]*`, so a key outside it —
+            // `""`, `"a.b"`, `"a{{b}}"` — names something no layer can ever
+            // have declared.
+            if !is_value_name(name) {
+                return Err(ctx.bad(table, name, bad_name_message(name)));
+            }
             let value = assigned_value(item).ok_or_else(|| {
                 ctx.bad(
                     table,
@@ -249,6 +275,28 @@ pub fn parse_assignments(
             })
         })
         .collect()
+}
+
+/// Whether `name` is a usable value name: `[a-z][a-z0-9_]*`.
+///
+/// Deliberately narrow. One spelling has to work as a TOML bare key in
+/// `[values]`, as a `{{name}}` reference, and as a `bx init` prompt label, and a
+/// name that needed quoting in one of the three would be a trap.
+#[must_use]
+pub fn is_value_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// What to say about a name that is not `[a-z][a-z0-9_]*`.
+fn bad_name_message(name: &str) -> String {
+    format!(
+        "`{name}` is not a value name: a name starts with a lowercase letter and \
+         holds only lowercase letters, digits and underscores"
+    )
 }
 
 /// Read a TOML item as an assignable value.
@@ -477,5 +525,73 @@ mod tests {
     #[test]
     fn an_empty_values_table_assigns_nothing() {
         assert!(assignments("[values]\n").unwrap().is_empty());
+    }
+
+    /// A value name is `[a-z][a-z0-9_]*`, in a declaration and in `[values]`.
+    ///
+    /// `""`, `"a b"` and `"{{x}}"` all parsed as declaration names. One name is
+    /// written three ways, as a `[values]` bare key, inside a `{{name}}`
+    /// reference and as a `bx init` prompt label, and a name that needs quoting
+    /// in any of them, or carries the substitution braces itself, can never be
+    /// referenced.
+    #[test]
+    fn a_value_name_must_be_an_identifier() {
+        for bad in [
+            "",
+            "a b",
+            "{{x}}",
+            "A",
+            "1st",
+            "_x",
+            "git-email",
+            "a.b",
+            "é",
+            "a\\tb",
+        ] {
+            let text = format!("[[value]]\nname = \"{bad}\"\nkind = \"string\"\n");
+            let declared = message(decl(&text));
+            assert!(
+                declared.contains("is not a value name"),
+                "{bad:?}: {declared}"
+            );
+            assert!(declared.contains("bx.toml:2"), "{bad:?}: {declared}");
+
+            let text = format!("[values]\n\"{bad}\" = \"x\"\n");
+            let assigned = message(assignments(&text));
+            assert!(
+                assigned.contains("is not a value name"),
+                "[values] {bad:?}: {assigned}"
+            );
+        }
+        for good in ["a", "git_email", "scratch_root2", "a_1_b"] {
+            let text = format!("[[value]]\nname = \"{good}\"\nkind = \"string\"\n");
+            assert_eq!(decl(&text).unwrap().name, good);
+            let text = format!("[values]\n{good} = true\n");
+            assert_eq!(assignments(&text).unwrap()[0].name, good);
+        }
+    }
+
+    /// `is_root` is only legal on a path.
+    ///
+    /// `is_root = true` on `kind = "bool"` parsed. The flag admits a directory
+    /// into the env_guard root set, so on any other kind it would widen the
+    /// guard on the strength of a value that is not a directory.
+    #[test]
+    fn is_root_is_only_legal_on_a_path() {
+        for kind in ["string", "bool", "email", "ssh-key", "age-recipient"] {
+            let text = format!("[[value]]\nname = \"v\"\nkind = \"{kind}\"\nis_root = true\n");
+            let message = message(decl(&text));
+            assert!(
+                message.contains("only legal on `kind = \"path\"`"),
+                "{kind}: {message}"
+            );
+            assert!(message.contains("bx.toml:4"), "{kind}: {message}");
+
+            // `false` claims nothing, so it is allowed on every kind.
+            let text = format!("[[value]]\nname = \"v\"\nkind = \"{kind}\"\nis_root = false\n");
+            assert!(!decl(&text).unwrap().is_root, "{kind}");
+        }
+        let text = "[[value]]\nname = \"v\"\nkind = \"path\"\nis_root = true\n";
+        assert!(decl(text).unwrap().is_root);
     }
 }

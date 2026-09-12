@@ -307,6 +307,20 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
     let direction = parse_direction(&ctx, table)?;
     let format = parse_format(&ctx, table)?;
 
+    if body != Body::Dir && matches!(path.as_str(), "~" | "/") {
+        // The home and the filesystem root are directories. A file body at
+        // either is an `own` claim on a directory as if it were a file, which
+        // no writer can honour; every spelling normalises to one of these two.
+        return Err(ctx.bad(
+            table,
+            "path",
+            format!(
+                "path = {raw_path:?} is a root directory itself, so only a `dir = true` \
+                 target may name it; a file target names a file beneath it"
+            ),
+        ));
+    }
+
     if body == Body::Dir {
         // The same rule the flat discriminant keys already follow elsewhere: a
         // companion key that cannot mean anything is an error, not a key that is
@@ -916,6 +930,38 @@ mod tests {
         ));
 
         assert!(message.contains("~/.gitconfig.local"), "{message}");
+    }
+
+    /// A bare root is a directory, and only a directory target may name it.
+    ///
+    /// `path = "~"` and `path = "/"` with `content` parsed as whole-file
+    /// targets: an `attach = "own"` claim on the home directory, or on `/`, as
+    /// if it were a file. Every spelling that normalises to one of the two is the
+    /// same claim, and every kind of file body is the same mistake.
+    #[test]
+    fn a_bare_root_is_refused_as_a_file_target() {
+        for path in ["~", "~/", "~/.", "/", "//", "/.."] {
+            for body in [
+                "content = \"x\"\n",
+                "file = \"files/x\"\n",
+                "attach = \"region\"\ncomment = \"#\"\ncontent = \"x\"\n",
+                "attach = \"include\"\ninclude = \"x\"\n",
+            ] {
+                let text = format!("[[target]]\npath = \"{path}\"\n{body}");
+                let message = message(&text);
+                assert!(
+                    message.contains("a root directory itself"),
+                    "{path:?} with {body:?}: {message}"
+                );
+                assert!(message.contains("bx.toml:2"), "{path:?}: {message}");
+            }
+        }
+
+        // The home's own mode is a real thing to manage, so a directory target
+        // may still name it.
+        let target = parse("[[target]]\npath = \"~\"\ndir = true\nmode = \"0700\"\n").unwrap();
+        assert_eq!(target.body, Body::Dir);
+        assert_eq!(target.path.as_str(), "~");
     }
 
     #[test]

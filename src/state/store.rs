@@ -104,7 +104,7 @@ impl Health {
 /// Loading never fails, so the health travels with the value rather than in a
 /// `Result`. A caller that wants to tell the user "your ledger was corrupt and
 /// has been reset" reads [`Loaded::health`]; a caller that only wants the value
-/// calls [`Loaded::value`] and ignores it.
+/// reads the `value` field and ignores it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded<T> {
     /// The loaded — or default — value.
@@ -114,12 +114,6 @@ pub struct Loaded<T> {
 }
 
 impl<T> Loaded<T> {
-    /// The value, discarding the health.
-    #[must_use]
-    pub fn value(self) -> T {
-        self.value
-    }
-
     /// Apply `f` to the value, keeping the health.
     pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Loaded<U> {
         Loaded {
@@ -519,6 +513,6 @@ mod tests {
         let mapped = loaded.map(|v| v + 1);
         assert_eq!(mapped.value, 2);
         assert_eq!(mapped.health, Health::Reset(Damage::Malformed));
-        assert_eq!(mapped.value(), 2);
+        assert_eq!(mapped.value, 2);
     }
 }

@@ -340,6 +340,7 @@ pub fn config_root() -> Result<PathBuf, Error> {
 ///   normalisation `~/../../etc/passwd` is "under home" and renders to a path
 ///   the kernel resolves to `/etc/passwd`, so a caller gating a write on it
 ///   gates on nothing.
+///
 /// # Deserialisation goes through the same checks
 ///
 /// A derived `Deserialize` would take the inner string verbatim, so

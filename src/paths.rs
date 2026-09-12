@@ -11,12 +11,16 @@
 //! so rendering can never corrupt a file's body. That restriction is what lets
 //! bx avoid a template language entirely.
 //!
-//! This module also holds the crate's **one** home-resolution mechanism.
-//! [`home`] is the only function that reads `$HOME`, and [`xdg_base`] is the
-//! whole XDG base-directory rule in one place, taking its environment as an
-//! argument so it is testable and so a caller that already knows the home does
-//! not read the process environment a second time. Every other module that
-//! needs a base directory calls [`xdg_base`]; nothing adds a second resolver.
+//! This module also holds the crate's **one** home-resolution mechanism. Every
+//! rule in it takes its environment as an argument — [`home_in`], [`xdg_base`],
+//! [`config_root_in`] — and [`home`] and [`config_root`] are one-line wrappers
+//! that read the process environment and nothing more. The crate never *writes*
+//! to the process environment: `std::env::set_var` is `unsafe` in edition 2024
+//! because its precondition is process-wide, and under `cargo test` no code can
+//! establish it. Design-by-parameter is how the rules stay testable without it.
+//!
+//! Every other module that needs a base directory calls [`xdg_base`]; nothing
+//! adds a second resolver.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -96,22 +100,28 @@ pub enum Error {
     NotPortable(String),
 }
 
-/// The invoking user's home directory, from `$HOME`.
+/// The home-directory rule, given what `$HOME` holds.
 ///
-/// The **only** read of `$HOME` in the crate. bx does not fall back to
-/// `getpwuid`: `$HOME` is what every shell, every tool bx configures, and the
-/// user's own dotfiles already agree on, and silently disagreeing with them is
-/// exactly the surprise this tool exists to prevent.
+/// The whole of the rule lives here rather than in [`home`], so a test can
+/// exercise an unset, empty or relative home by passing one rather than by
+/// mutating the process environment. `std::env::set_var` is `unsafe` in edition
+/// 2024 because its precondition is process-wide — no other thread reading the
+/// environment, including through `getenv` inside libc — and `cargo test` cannot
+/// establish that. Design-by-parameter is how this crate avoids needing to.
 ///
-/// An empty `$HOME` is treated as unset, because an empty home would make every
+/// bx does not fall back to `getpwuid`: `$HOME` is what every shell, every tool
+/// bx configures, and the user's own dotfiles already agree on, and silently
+/// disagreeing with them is exactly the surprise this tool exists to prevent.
+///
+/// An empty value is treated as unset, because an empty home would make every
 /// `~`-rooted path resolve to a bare relative path.
 ///
 /// # Errors
 ///
-/// [`Error::HomeUnset`] when `$HOME` is absent or empty, and
-/// [`Error::HomeNotAbsolute`] when it is set to a relative path.
-pub fn home() -> Result<PathBuf, Error> {
-    let raw = std::env::var_os("HOME").ok_or(Error::HomeUnset)?;
+/// [`Error::HomeUnset`] when `raw` is `None` or empty, and
+/// [`Error::HomeNotAbsolute`] when it is a relative path.
+pub fn home_in(raw: Option<&OsStr>) -> Result<PathBuf, Error> {
+    let raw = raw.ok_or(Error::HomeUnset)?;
     if raw.is_empty() {
         return Err(Error::HomeUnset);
     }
@@ -120,6 +130,19 @@ pub fn home() -> Result<PathBuf, Error> {
         return Err(Error::HomeNotAbsolute(home));
     }
     Ok(home)
+}
+
+/// The invoking user's home directory, from `$HOME`.
+///
+/// The **only** read of `$HOME` in the crate, and a read is all it is: nothing
+/// here or anywhere in this crate writes to the process environment. The rule it
+/// applies is [`home_in`]'s.
+///
+/// # Errors
+///
+/// Whatever [`home_in`] returns for the current `$HOME`.
+pub fn home() -> Result<PathBuf, Error> {
+    home_in(std::env::var_os("HOME").as_deref())
 }
 
 /// Resolve one XDG base directory.
@@ -234,7 +257,6 @@ impl std::fmt::Display for Portable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::guarded_home;
 
     fn home() -> PathBuf {
         // A deliberately non-standard home: nothing here may name a real
@@ -418,31 +440,13 @@ mod tests {
         );
     }
 
-    // --- reading the process environment ---------------------------------
-
-    #[test]
-    fn the_config_root_is_read_from_the_process_environment() {
-        let guard = guarded_home();
-
-        assert_eq!(super::home().unwrap(), guard.path());
-        assert_eq!(config_root().unwrap(), guard.child(".config/bx"));
-
-        let explicit = guard.child("xdg-config");
-        guard.set("XDG_CONFIG_HOME", Some(explicit.as_os_str()));
-        assert_eq!(config_root().unwrap(), explicit.join("bx"));
-    }
+    // --- the home rule, and reading it from the environment ---------------
 
     #[test]
     fn an_unset_home_is_an_error() {
-        let guard = guarded_home();
-
-        guard.set("HOME", None);
-        assert_eq!(super::home(), Err(Error::HomeUnset));
-        assert_eq!(config_root(), Err(Error::HomeUnset));
-
-        guard.set("HOME", Some(OsStr::new("")));
+        assert_eq!(home_in(None), Err(Error::HomeUnset));
         assert_eq!(
-            super::home(),
+            home_in(Some(OsStr::new(""))),
             Err(Error::HomeUnset),
             "an empty HOME would make every ~ path relative"
         );
@@ -450,12 +454,60 @@ mod tests {
 
     #[test]
     fn a_relative_home_is_an_error() {
-        let guard = guarded_home();
-
-        guard.set("HOME", Some(OsStr::new("not/absolute")));
         assert_eq!(
-            super::home(),
+            home_in(Some(OsStr::new("not/absolute"))),
             Err(Error::HomeNotAbsolute(PathBuf::from("not/absolute")))
+        );
+        assert_eq!(
+            home_in(Some(OsStr::new("."))),
+            Err(Error::HomeNotAbsolute(PathBuf::from(".")))
+        );
+    }
+
+    #[test]
+    fn an_absolute_home_is_taken_as_given() {
+        assert_eq!(home_in(Some(OsStr::new("/var/home/example"))), Ok(home()));
+    }
+
+    #[test]
+    fn a_non_utf8_home_is_honoured() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"/var/home/exa\xffmple");
+        assert_eq!(home_in(Some(raw)), Ok(PathBuf::from(raw)));
+    }
+
+    #[test]
+    fn the_process_home_is_read_and_never_written() {
+        // The wrapper is one line, and this pins it without mutating anything:
+        // reading $HOME agrees with the rule applied to $HOME. Mutating the
+        // environment here would be unsound -- see `home_in` and `testing`.
+        let raw = std::env::var_os("HOME");
+        let before = raw.clone();
+
+        assert_eq!(super::home(), home_in(raw.as_deref()));
+        assert_eq!(
+            std::env::var_os("HOME"),
+            before,
+            "resolving a home must not change one"
+        );
+    }
+
+    #[test]
+    fn the_config_root_is_read_from_the_process_environment() {
+        let expected = super::home()
+            .map(|home| config_root_in(&home, std::env::var_os("XDG_CONFIG_HOME").as_deref()));
+
+        assert_eq!(config_root(), expected);
+    }
+
+    #[test]
+    fn the_config_root_fails_exactly_when_the_home_does() {
+        // `config_root` is `home` composed with `config_root_in`, so its error
+        // path is the composition's and is pinned at the parameterised end.
+        assert_eq!(
+            home_in(None).map(|home| config_root_in(&home, None)),
+            Err(Error::HomeUnset)
         );
     }
 

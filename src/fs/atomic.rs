@@ -93,6 +93,20 @@ pub enum Error {
         .0.display()
     )]
     Symlink(PathBuf),
+    /// The destination's parent is on the filesystem but does not resolve to a
+    /// directory: a dangling symlink, a symlink loop, or a non-directory.
+    ///
+    /// Distinct from a parent that is simply missing, which bx creates.
+    /// `mkdir` cannot create a directory through a dangling link, so this is
+    /// announced as a [`Action::Conflict`] by `compare` rather than left for
+    /// `apply` to discover as an `ENOENT` naming a temporary file.
+    #[error("{reason}")]
+    UnusableParent {
+        /// The parent directory, as it was named.
+        path: PathBuf,
+        /// What is wrong with it, in the same words `plan` prints.
+        reason: String,
+    },
     /// A read failed.
     #[error("reading {}: {source}", .path.display())]
     Read {
@@ -122,6 +136,7 @@ impl Error {
             Self::NoParent(path)
             | Self::Symlink(path)
             | Self::NotAFile { path, .. }
+            | Self::UnusableParent { path, .. }
             | Self::Read { path, .. }
             | Self::Write { path, .. } => path,
         }
@@ -185,13 +200,58 @@ impl Observed {
 /// before it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parent {
-    /// The directory.
+    /// The directory, as it was named. Not canonicalised.
     pub path: PathBuf,
-    /// Its mode, or — when it does not exist yet — the mode bx would create it
-    /// at.
-    pub mode: Mode,
-    /// Whether it exists.
-    pub exists: bool,
+    /// What resolving it found.
+    pub state: ParentState,
+}
+
+/// What a destination's parent turned out to be.
+///
+/// "Absent" and "there but unresolvable" are separated deliberately. They look
+/// identical to a single `metadata` call — both report `ENOENT` — and treating
+/// them alike made `plan` announce a `Create` that `apply` could not perform,
+/// because `mkdir` cannot create a directory through a dangling symlink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParentState {
+    /// A directory, at this mode. A symlinked parent reports the mode of the
+    /// directory it resolves to — see [`observe_parent`].
+    Present(Mode),
+    /// Nothing is on the path at all. bx would create it at this mode.
+    Absent(Mode),
+    /// Something is on the path and it does not resolve to a directory: a
+    /// dangling symlink, a symlink loop, or a non-directory. The string is the
+    /// cause, in the words `plan` prints and the error message `apply` returns.
+    Unusable(String),
+}
+
+impl Parent {
+    /// The mode that governs a file in this directory, once there is one.
+    ///
+    /// `None` when the parent does not resolve, because there is then no
+    /// directory whose mode could govern anything.
+    #[must_use]
+    pub const fn mode(&self) -> Option<Mode> {
+        match self.state {
+            ParentState::Present(mode) | ParentState::Absent(mode) => Some(mode),
+            ParentState::Unusable(_) => None,
+        }
+    }
+
+    /// Whether the directory is already there.
+    #[must_use]
+    pub const fn exists(&self) -> bool {
+        matches!(self.state, ParentState::Present(_))
+    }
+
+    /// Why the parent cannot be written into, when it cannot.
+    #[must_use]
+    pub fn unusable(&self) -> Option<&str> {
+        match &self.state {
+            ParentState::Unusable(reason) => Some(reason),
+            _ => None,
+        }
+    }
 }
 
 /// Read what is at `dest`, following no symlink.
@@ -206,7 +266,21 @@ pub struct Parent {
 /// when the destination or its parent exists but cannot be read.
 pub fn observe(dest: &Path) -> Result<Observed, Error> {
     let dir = parent_of(dest)?;
-    let parent = Some(observe_parent(dir)?);
+    let observed_parent = observe_parent(dir)?;
+
+    // A parent that does not resolve leaves nothing to learn from the
+    // destination: stat'ing it would fail with the parent's error rather than
+    // the file's, and the verdict is the parent's either way.
+    if observed_parent.unusable().is_some() {
+        return Ok(Observed {
+            path: dest.to_path_buf(),
+            kind: Kind::Absent,
+            mode: None,
+            bytes: None,
+            parent: Some(observed_parent),
+        });
+    }
+    let parent = Some(observed_parent);
 
     let Some(meta) = optional_metadata(dest)? else {
         return Ok(Observed {
@@ -290,23 +364,35 @@ pub struct Outcome {
 ///   not a regular file.
 #[must_use]
 pub fn compare(observed: &Observed, desired: &Desired<'_>) -> Outcome {
-    let parent_note = observed
-        .parent
-        .as_ref()
-        .filter(|parent| parent.mode.is_wider_than(desired.mode))
-        .map(|parent| {
-            let verb = if parent.exists {
-                "is"
-            } else {
-                "will be created at"
-            };
-            format!(
-                "{} {verb} {}, wider than the {} this file declares",
-                parent.path.display(),
-                parent.mode,
-                desired.mode,
-            )
-        });
+    // A parent that does not resolve settles the verdict on its own: there is
+    // no directory to write into and none bx can create, so announcing
+    // anything but a conflict would announce work `apply` cannot do.
+    if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
+        return Outcome {
+            action: Action::Conflict,
+            content_drift: false,
+            mode_drift: None,
+            note: Some(reason.to_string()),
+            parent_note: None,
+        };
+    }
+
+    let parent_note = observed.parent.as_ref().and_then(|parent| {
+        let mode = parent.mode()?;
+        if !mode.is_wider_than(desired.mode) {
+            return None;
+        }
+        let verb = if parent.exists() {
+            "is"
+        } else {
+            "will be created at"
+        };
+        Some(format!(
+            "{} {verb} {mode}, wider than the {} this file declares",
+            parent.path.display(),
+            desired.mode,
+        ))
+    });
 
     let (action, content_drift, mode_drift, note) = match observed.kind {
         Kind::Absent => (Action::Create, true, None, None),
@@ -416,6 +502,16 @@ impl Pending {
 /// the temporary file cannot be made.
 pub fn stage(dest: &Path, mode: Mode) -> Result<Staged, Error> {
     let prior = observe(dest)?;
+    // The parent first: it is the verdict `compare` announced, and refusing
+    // here is what keeps `apply` from doing anything `plan` did not say.
+    if let Some(parent) = prior.parent.as_ref()
+        && let Some(reason) = parent.unusable()
+    {
+        return Err(Error::UnusableParent {
+            path: parent.path.clone(),
+            reason: reason.to_string(),
+        });
+    }
     if !prior.kind.is_writable_destination() {
         return Err(match prior.kind {
             Kind::Symlink => Error::Symlink(dest.to_path_buf()),
@@ -731,21 +827,6 @@ fn optional_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
     }
 }
 
-/// `metadata`, with "nothing resolves there" as a value rather than an error.
-///
-/// Follows symlinks — see [`observe_parent`], the only caller, for why the
-/// parent is resolved and the destination is not.
-fn optional_resolved_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
-    match std::fs::metadata(path) {
-        Ok(meta) => Ok(Some(meta)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(Error::Read {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
 /// The mode bits out of a `stat` result.
 fn mode_of(meta: &std::fs::Metadata) -> Mode {
     use std::os::unix::fs::PermissionsExt as _;
@@ -771,16 +852,74 @@ fn mode_of(meta: &std::fs::Metadata) -> Mode {
 /// a dotfiles symlink as world-writable, and report it identically to a
 /// genuinely world-writable one.
 fn observe_parent(dir: &Path) -> Result<Parent, Error> {
-    let (mode, exists) = match optional_resolved_metadata(dir)? {
-        Some(meta) => (mode_of(&meta), true),
-        // Not there yet, so the mode it will have is the one bx creates it at.
-        None => (Mode::DEFAULT_DIR, false),
-    };
     Ok(Parent {
         path: dir.to_path_buf(),
-        mode,
-        exists,
+        state: parent_state(dir)?,
     })
+}
+
+/// Resolve `dir`, separating "nothing is there" from "something is there that
+/// does not resolve to a directory".
+///
+/// The separation is the point. `metadata` reports `ENOENT` for both a path
+/// with nothing on it and a path that ends at a dangling symlink, and a
+/// directory bx can create from one it cannot are not the same announcement.
+fn parent_state(dir: &Path) -> Result<ParentState, Error> {
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => return Ok(ParentState::Present(mode_of(&meta))),
+        Ok(_) => {
+            return Ok(ParentState::Unusable(format!(
+                "{} is not a directory, so bx cannot write a file inside it",
+                dir.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            // The kernel refused to resolve the path — a symlink loop, most
+            // often. If the component is readable as a link then the defect is
+            // bx's to report; otherwise the failure is a genuine read error.
+            return match std::fs::symlink_metadata(dir) {
+                Ok(_) => Ok(ParentState::Unusable(format!(
+                    "{} does not resolve to a directory ({source}), so bx cannot write a file inside it",
+                    dir.display()
+                ))),
+                Err(_) => Err(Error::Read {
+                    path: dir.to_path_buf(),
+                    source,
+                }),
+            };
+        }
+    }
+
+    // Nothing resolves at `dir`. That is ordinarily a directory bx will create,
+    // but it is also what a dangling symlink anywhere along the path reports,
+    // and `mkdir` cannot create a directory through one. The deepest component
+    // that is present at all settles which of the two it is.
+    for ancestor in dir.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(Error::Read {
+                    path: ancestor.to_path_buf(),
+                    source,
+                });
+            }
+            Ok(_) => {
+                let resolves_to_a_directory =
+                    std::fs::metadata(ancestor).is_ok_and(|meta| meta.is_dir());
+                return if resolves_to_a_directory {
+                    Ok(ParentState::Absent(Mode::DEFAULT_DIR))
+                } else {
+                    Ok(ParentState::Unusable(format!(
+                        "{} does not resolve to a directory, so bx cannot create {} inside it",
+                        ancestor.display(),
+                        dir.display(),
+                    )))
+                };
+            }
+        }
+    }
+    Ok(ParentState::Absent(Mode::DEFAULT_DIR))
 }
 
 /// Create every missing component of `dir`: the ancestors bx had to invent at
@@ -1051,8 +1190,8 @@ mod tests {
         let observed = observe(&home.child(".ssh/config")).expect("observe");
         let parent = observed.parent.as_ref().expect("a parent");
         assert_eq!(
-            parent.mode,
-            Mode::PRIVATE_DIR,
+            parent.state,
+            ParentState::Present(Mode::PRIVATE_DIR),
             "the resolved directory's 0700, not the link's own 0777",
         );
 
@@ -1076,6 +1215,99 @@ mod tests {
         let note = outcome.parent_note.expect("the parent must be reported");
         assert!(note.contains("is 0755"), "{note}");
         assert!(note.contains("wider than the 0600"), "{note}");
+    }
+
+    #[test]
+    fn a_dangling_symlink_parent_is_a_conflict_rather_than_a_create() {
+        let home = guarded_home();
+        // ~/.config is a link into a dotfiles repository that is not checked
+        // out yet. `metadata` reports ENOENT for it exactly as it would for a
+        // directory that is simply missing.
+        std::os::unix::fs::symlink("nowhere", home.child(".config")).expect("symlink");
+
+        let outcome = outcome_for(&home, ".config/f", b"x", Mode::DEFAULT_FILE);
+        assert_eq!(
+            outcome.action,
+            Action::Conflict,
+            "a create bx cannot perform is not a create",
+        );
+        let note = outcome.note.expect("the cause must be named");
+        assert!(note.contains(".config"), "{note}");
+        assert!(note.contains("does not resolve to a directory"), "{note}");
+        assert_eq!(outcome.parent_note, None);
+
+        // And `apply` refuses the same way, naming the parent rather than a
+        // temporary path the user cannot interpret.
+        let err = write_atomically(&home.child(".config/f"), b"x", Mode::DEFAULT_FILE)
+            .expect_err("must refuse");
+        let Error::UnusableParent { path, .. } = &err else {
+            panic!("expected UnusableParent, got {err:?}");
+        };
+        assert_eq!(path, &home.child(".config"));
+        assert_eq!(err.to_string(), note);
+        assert!(
+            std::fs::symlink_metadata(home.child("nowhere")).is_err(),
+            "nothing was created at the far end",
+        );
+    }
+
+    #[test]
+    fn a_dangling_symlink_above_the_parent_is_a_conflict_too() {
+        let home = guarded_home();
+        std::os::unix::fs::symlink("nowhere", home.child(".config")).expect("symlink");
+
+        // The link is two components up, so the immediate parent is absent for
+        // a second reason and `mkdir` cannot reach it either.
+        let outcome = outcome_for(&home, ".config/bx/init.sh", b"x", Mode::DEFAULT_FILE);
+        assert_eq!(outcome.action, Action::Conflict);
+        let note = outcome.note.expect("the cause must be named");
+        assert!(note.contains(".config"), "{note}");
+
+        let err = write_atomically(&home.child(".config/bx/init.sh"), b"x", Mode::DEFAULT_FILE)
+            .expect_err("must refuse");
+        assert!(matches!(err, Error::UnusableParent { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_symlink_loop_at_a_parent_is_a_conflict() {
+        let home = guarded_home();
+        std::os::unix::fs::symlink("loop", home.child("loop")).expect("symlink");
+
+        let outcome = outcome_for(&home, "loop/f", b"x", Mode::DEFAULT_FILE);
+        assert_eq!(outcome.action, Action::Conflict);
+        let note = outcome.note.expect("the cause must be named");
+        assert!(note.contains("loop"), "{note}");
+        assert!(note.contains("does not resolve to a directory"), "{note}");
+
+        let err =
+            write_atomically(&home.child("loop/f"), b"x", Mode::DEFAULT_FILE).expect_err("refuse");
+        assert!(matches!(err, Error::UnusableParent { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_parent_that_is_a_regular_file_is_a_conflict() {
+        let home = guarded_home();
+        seed(&home.child("notadir"), b"a file", Mode::DEFAULT_FILE);
+
+        let outcome = outcome_for(&home, "notadir/f", b"x", Mode::DEFAULT_FILE);
+        assert_eq!(outcome.action, Action::Conflict);
+        assert!(
+            outcome
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("is not a directory")),
+            "{:?}",
+            outcome.note,
+        );
+
+        let err = write_atomically(&home.child("notadir/f"), b"x", Mode::DEFAULT_FILE)
+            .expect_err("must refuse");
+        assert!(matches!(err, Error::UnusableParent { .. }), "{err:?}");
+        assert_eq!(
+            std::fs::read(home.child("notadir")).expect("read"),
+            b"a file",
+            "the file that was in the way is untouched",
+        );
     }
 
     #[test]

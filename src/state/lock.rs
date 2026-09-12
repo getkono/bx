@@ -1,0 +1,503 @@
+//! The advisory lock over the whole state directory.
+//!
+//! Two mutating `bx` processes must not interleave: one would record a ledger
+//! entry the other has already replaced, and an interrupted `apply` would become
+//! unrecoverable. A single `flock(2)` on `<state>/lock` prevents it.
+//!
+//! `flock`, not `fcntl` record locks. A POSIX record lock is associated with the
+//! *process* and is released when **any** descriptor on the file is closed
+//! anywhere in it — a trap for a tool that opens many files under the directory
+//! it just locked. `flock` is associated with the open file description: it is
+//! released when the last descriptor of that description closes, and the kernel
+//! releases it when the process dies, which is exactly the crash behaviour bx
+//! needs.
+//!
+//! Acquisition never blocks. A CLI that hangs with no output is worse than one
+//! that says who holds the lock, so a refused exclusive acquisition reports the
+//! holder's pid and program, read from the lock file's body.
+
+use std::fmt;
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
+
+use rustix::fs::{FlockOperation, Mode as RawMode, OFlags};
+use rustix::io::Errno;
+
+use super::Error;
+use super::dir::{StateDir, ensure_dir};
+use crate::fs::Mode;
+
+/// How much of the lock file's body is read when reporting a holder.
+const BODY: usize = 256;
+
+/// Whoever holds the lock, as far as the lock file's body says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    /// The holder's process id, or `0` when the body could not be read.
+    pub pid: i32,
+    /// The holder's program name, or a placeholder.
+    pub program: String,
+}
+
+impl Holder {
+    /// The holder bx reports when the lock file says nothing usable.
+    ///
+    /// A stale, empty or unreadable body is not an error: the kernel is the
+    /// authority on who holds the lock, and the body is only a courtesy.
+    fn unknown() -> Self {
+        Self {
+            pid: 0,
+            program: "another bx process".to_string(),
+        }
+    }
+
+    /// Parse the one line [`identify`] writes.
+    fn parse(body: &str) -> Self {
+        let mut parts = body.split_whitespace();
+        match (parts.next().and_then(|p| p.parse().ok()), parts.next()) {
+            (Some(pid), Some(program)) => Self {
+                pid,
+                program: program.to_string(),
+            },
+            _ => Self::unknown(),
+        }
+    }
+}
+
+impl fmt::Display for Holder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.pid == 0 {
+            f.write_str(&self.program)
+        } else {
+            write!(f, "pid {} ({})", self.pid, self.program)
+        }
+    }
+}
+
+/// An exclusive lock on the state directory, held for as long as this lives.
+///
+/// Only one of these exists across all processes at a time. Holding one is the
+/// precondition for every write to the state directory, and
+/// [`super::Ledger::open`] demands a reference to one so that `&mut Ledger` is
+/// itself the proof the lock was taken.
+#[derive(Debug)]
+pub struct ExclusiveLock {
+    /// Kept open for the lock's lifetime; closing it releases the lock.
+    fd: OwnedFd,
+    /// The lock file, for error messages.
+    path: PathBuf,
+}
+
+/// A shared lock on the state directory, held for as long as this lives.
+///
+/// Readers take one so that they can *notice* an apply in progress, not because
+/// they need it for correctness: every state file is replaced by `rename`, so a
+/// reader sees a whole file or the previous whole file, never a torn one. A
+/// `plan` printed while an `apply` runs is stale the moment it is printed, and
+/// printing it without saying so is the kind of surprise bx exists to prevent.
+#[derive(Debug)]
+pub struct SharedLock {
+    /// Kept open for the lock's lifetime; closing it releases the lock.
+    fd: OwnedFd,
+    /// The lock file, for error messages.
+    path: PathBuf,
+}
+
+impl ExclusiveLock {
+    /// Take the exclusive lock, or report who has it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Locked`], naming the holder, when another process holds either
+    /// lock. [`Error::CreateDir`] or [`Error::Lock`] if the lock file cannot be
+    /// created or locked.
+    pub fn acquire(dir: &StateDir) -> Result<Self, Error> {
+        let path = dir.lock();
+        let fd = open_lock_file(dir, &path)?;
+        take(&fd, &path, FlockOperation::NonBlockingLockExclusive)?;
+        identify(&fd);
+        Ok(Self { fd, path })
+    }
+
+    /// Take the exclusive lock, or return `None` if it is held.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExclusiveLock::acquire`], minus [`Error::Locked`].
+    pub fn try_acquire(dir: &StateDir) -> Result<Option<Self>, Error> {
+        optional(Self::acquire(dir))
+    }
+
+    /// The lock file this guard holds.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl SharedLock {
+    /// Take a shared lock, or report who holds the exclusive one.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExclusiveLock::acquire`].
+    pub fn acquire(dir: &StateDir) -> Result<Self, Error> {
+        let path = dir.lock();
+        let fd = open_lock_file(dir, &path)?;
+        take(&fd, &path, FlockOperation::NonBlockingLockShared)?;
+        Ok(Self { fd, path })
+    }
+
+    /// Take a shared lock, or return `None` while an apply holds the directory.
+    ///
+    /// This is the call `plan` and `doctor` make: `None` means "an apply is in
+    /// progress", which they report and then carry on read-only.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExclusiveLock::acquire`], minus [`Error::Locked`].
+    pub fn try_acquire(dir: &StateDir) -> Result<Option<Self>, Error> {
+        optional(Self::acquire(dir))
+    }
+
+    /// The lock file this guard holds.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Turn a refusal into `None`, keeping every other failure.
+fn optional<T>(result: Result<T, Error>) -> Result<Option<T>, Error> {
+    match result {
+        Ok(lock) => Ok(Some(lock)),
+        Err(Error::Locked { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Open — creating if needed — the lock file at `0600`.
+fn open_lock_file(dir: &StateDir, path: &Path) -> Result<OwnedFd, Error> {
+    ensure_dir(dir.root(), Mode::PRIVATE_DIR)?;
+    rustix::fs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC,
+        Mode::PRIVATE_FILE.into(),
+    )
+    .map_err(|source| Error::Lock {
+        path: path.to_path_buf(),
+        source: source.into(),
+    })
+}
+
+/// Attempt one non-blocking `flock`.
+fn take(fd: &OwnedFd, path: &Path, operation: FlockOperation) -> Result<(), Error> {
+    match rustix::fs::flock(fd, operation) {
+        Ok(()) => Ok(()),
+        Err(Errno::WOULDBLOCK) => Err(Error::Locked {
+            holder: read_holder(path),
+            path: path.to_path_buf(),
+        }),
+        Err(source) => Err(Error::Lock {
+            path: path.to_path_buf(),
+            source: source.into(),
+        }),
+    }
+}
+
+/// Write this process's identity into the lock file's body.
+///
+/// Plain text, one line, `"<pid> <program>\n"` — a human-facing diagnostic to be
+/// read with `cat` during an incident, so not MessagePack. Best effort: failing
+/// to write it costs a better error message and nothing else, and the lock is
+/// already held by the time it runs.
+fn identify(fd: &OwnedFd) {
+    let program = std::env::args()
+        .next()
+        .and_then(|arg0| {
+            Path::new(&arg0)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "bx".to_string());
+    let line = format!("{} {program}\n", rustix::process::getpid().as_raw_nonzero());
+    let _ = rustix::fs::ftruncate(fd, 0);
+    let _ = rustix::io::pwrite(fd, line.as_bytes(), 0);
+}
+
+/// Read the holder's identity out of the lock file, best effort.
+fn read_holder(path: &Path) -> Holder {
+    // Opened separately rather than through the refused descriptor: this runs
+    // on the error path, where clarity beats saving one `open`.
+    let Ok(fd) = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, RawMode::empty()) else {
+        return Holder::unknown();
+    };
+    let mut buf = [0_u8; BODY];
+    let Ok(read) = rustix::io::pread(fd, &mut buf[..], 0) else {
+        return Holder::unknown();
+    };
+    match std::str::from_utf8(&buf[..read]) {
+        Ok(body) => Holder::parse(body),
+        Err(_) => Holder::unknown(),
+    }
+}
+
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        // Closing the descriptor would release it anyway; the explicit unlock
+        // makes the release immediate and independent of any dup that may exist.
+        // A failure here has nowhere to go and nothing to fix.
+        let _ = rustix::fs::flock(&self.fd, FlockOperation::Unlock);
+    }
+}
+
+impl Drop for SharedLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.fd, FlockOperation::Unlock);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+
+    use crate::testing::guarded_home;
+
+    /// Run this test binary again, in a new process, attempting the lock.
+    fn child(dir: &StateDir) -> String {
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = Command::new(exe)
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "state::lock::tests::child_attempts_the_lock",
+            ])
+            .env("BX_TEST_LOCK_DIR", dir.root())
+            .output()
+            .expect("spawn the child");
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The child half of the cross-process lock tests.
+    ///
+    /// Ignored, so an ordinary `cargo test` never runs it, and a bare
+    /// `cargo test -- --ignored` finds no `BX_TEST_LOCK_DIR` and returns.
+    #[test]
+    #[ignore = "spawned by the cross-process lock tests"]
+    fn child_attempts_the_lock() {
+        let Some(root) = std::env::var_os("BX_TEST_LOCK_DIR") else {
+            return;
+        };
+        let dir = StateDir::new(PathBuf::from(root));
+        match ExclusiveLock::acquire(&dir) {
+            Ok(lock) => {
+                println!("acquired");
+                // Leak the guard: the process is about to exit, and the point
+                // of the test is that the *kernel* releases the lock when it
+                // does, not that `Drop` ran.
+                std::mem::forget(lock);
+            }
+            Err(Error::Locked { holder, .. }) => {
+                println!("busy pid={} {}", holder.pid, holder.program)
+            }
+            Err(e) => panic!("unexpected failure: {e}"),
+        }
+    }
+
+    #[test]
+    fn the_lock_file_is_created_at_0600() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        let mode = Mode::from_bits(
+            std::fs::metadata(lock.path())
+                .expect("stat")
+                .permissions()
+                .mode(),
+        );
+        assert_eq!(mode, Mode::PRIVATE_FILE);
+        assert_eq!(lock.path(), dir.lock());
+    }
+
+    #[test]
+    fn acquiring_creates_the_state_directory() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        assert!(!dir.root().exists());
+        let _lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        assert!(dir.root().is_dir());
+    }
+
+    #[test]
+    fn a_second_exclusive_acquisition_is_refused() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let _first = ExclusiveLock::acquire(&dir).expect("first");
+        let err = ExclusiveLock::acquire(&dir).expect_err("second must be refused");
+        assert!(matches!(err, Error::Locked { .. }), "got {err}");
+        assert!(ExclusiveLock::try_acquire(&dir).expect("try").is_none());
+    }
+
+    #[test]
+    fn a_refusal_names_the_pid_and_program_of_the_holder() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let _held = ExclusiveLock::acquire(&dir).expect("acquire");
+        let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
+        let Error::Locked { holder, path } = &err else {
+            panic!("got {err}")
+        };
+        assert_eq!(
+            holder.pid,
+            i32::try_from(std::process::id()).expect("a pid fits in i32"),
+        );
+        assert!(!holder.program.is_empty());
+        assert_eq!(path, &dir.lock());
+        assert!(err.to_string().contains(&holder.pid.to_string()));
+    }
+
+    #[test]
+    fn an_unreadable_lock_body_still_yields_a_usable_message() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let held = ExclusiveLock::acquire(&dir).expect("acquire");
+        // Overwrite the identity line with something that is not one.
+        std::fs::write(held.path(), b"\xff\xfe not utf-8").expect("clobber");
+        let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
+        let Error::Locked { holder, .. } = &err else {
+            panic!("got {err}")
+        };
+        assert_eq!(holder, &Holder::unknown());
+        assert!(err.to_string().contains("another bx process"));
+    }
+
+    #[test]
+    fn an_empty_lock_body_still_yields_a_usable_message() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let held = ExclusiveLock::acquire(&dir).expect("acquire");
+        std::fs::write(held.path(), b"").expect("clobber");
+        let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
+        assert!(err.to_string().contains("another bx process"), "got {err}");
+    }
+
+    #[test]
+    fn a_holder_line_is_parsed_and_rendered() {
+        assert_eq!(
+            Holder::parse("1234 bx\n"),
+            Holder {
+                pid: 1234,
+                program: "bx".to_string(),
+            },
+        );
+        assert_eq!(Holder::parse("1234 bx\n").to_string(), "pid 1234 (bx)");
+        assert_eq!(Holder::parse("not-a-pid bx"), Holder::unknown());
+        assert_eq!(Holder::parse("1234"), Holder::unknown());
+        assert_eq!(Holder::unknown().to_string(), "another bx process");
+    }
+
+    #[test]
+    fn releasing_the_lock_lets_the_next_acquisition_succeed() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let first = ExclusiveLock::acquire(&dir).expect("first");
+        drop(first);
+        let _second = ExclusiveLock::acquire(&dir).expect("second");
+    }
+
+    #[test]
+    fn two_readers_share_the_lock() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let _a = SharedLock::acquire(&dir).expect("first reader");
+        let b = SharedLock::acquire(&dir).expect("second reader");
+        assert_eq!(b.path(), dir.lock());
+        assert!(SharedLock::try_acquire(&dir).expect("try").is_some());
+    }
+
+    #[test]
+    fn a_reader_does_not_block_on_a_writer_and_reports_the_holder() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let _writer = ExclusiveLock::acquire(&dir).expect("writer");
+        assert!(SharedLock::try_acquire(&dir).expect("try").is_none());
+        let err = SharedLock::acquire(&dir).expect_err("must be refused");
+        assert!(matches!(err, Error::Locked { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_writer_is_refused_while_a_reader_holds_the_lock() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let _reader = SharedLock::acquire(&dir).expect("reader");
+        let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
+        assert!(matches!(err, Error::Locked { .. }), "got {err}");
+    }
+
+    #[test]
+    fn the_lock_is_exclusive_across_two_processes() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let held = ExclusiveLock::acquire(&dir).expect("acquire");
+
+        let refused = child(&dir);
+        assert!(
+            refused.contains(&format!("busy pid={}", std::process::id())),
+            "the child should have been refused, got: {refused}",
+        );
+
+        drop(held);
+        let taken = child(&dir);
+        assert!(
+            taken.contains("acquired"),
+            "the child should have acquired the released lock, got: {taken}",
+        );
+    }
+
+    #[test]
+    fn a_lock_held_by_a_dead_process_is_acquirable() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        // The child acquires and leaks the guard, so nothing in user space
+        // releases the lock: only the kernel, when the process exits.
+        let taken = child(&dir);
+        assert!(taken.contains("acquired"), "got: {taken}");
+        let _mine = ExclusiveLock::acquire(&dir).expect("the dead holder's lock must be free");
+    }
+
+    #[test]
+    fn the_lock_file_is_never_unlinked() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let path = dir.lock();
+        {
+            let _lock = ExclusiveLock::acquire(&dir).expect("acquire");
+            assert!(path.exists());
+        }
+        assert!(
+            path.exists(),
+            "unlinking races: another process may hold a descriptor on the old inode",
+        );
+    }
+
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_reported() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        // A directory where the lock file goes: `open` with O_RDWR fails.
+        std::fs::create_dir(dir.lock()).expect("occupy");
+        let err = ExclusiveLock::acquire(&dir).expect_err("must fail");
+        assert!(matches!(err, Error::Lock { .. }), "got {err}");
+        assert!(ExclusiveLock::try_acquire(&dir).is_err());
+    }
+}

@@ -5,8 +5,9 @@
 //! shell fragment naming a binary. That output does not degrade gracefully when
 //! the binary is absent: `RUSTC_WRAPPER=/usr/bin/sccache` on a machine without
 //! sccache breaks every `cargo build`, not just sccache's own behaviour.
-//! [`env_guard`](crate::env_guard) cannot catch it, because it checks the name
-//! being assigned and never the value.
+//! [`env_guard`](crate::env_guard) cannot catch it: it checks *where* a value
+//! points, never *whether what it points at exists*, because a verdict that
+//! consulted the filesystem would not be reproducible.
 //!
 //! Resolution is by `stat` and `access` alone. bx never runs `tool --version`
 //! to find out whether a tool is there: spawning a process to answer a question

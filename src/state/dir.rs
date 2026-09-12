@@ -7,10 +7,6 @@ use rustix::io::Errno;
 
 use super::Error;
 use crate::fs::Mode;
-use crate::paths::xdg_base;
-
-/// The directory name under the XDG state base.
-const DIR_NAME: &str = "bx";
 
 /// `$XDG_STATE_HOME/bx` — bx's machine-owned half.
 ///
@@ -41,13 +37,14 @@ impl StateDir {
 
     /// The state directory for `home`, honouring an `$XDG_STATE_HOME` value.
     ///
-    /// The XDG rule — honour the variable only when it is non-empty and
-    /// absolute, else fall back to `~/.local/state` — is
-    /// [`crate::paths::xdg_base`]'s, not this module's. bx has one XDG resolver
-    /// and this is a caller of it.
+    /// The resolution itself is [`crate::config::layers::state_dir`]'s, not this
+    /// module's, and this delegates to it rather than repeating the XDG rule.
+    /// The local layer and the ledger have to agree about which directory they
+    /// are in; two resolvers that agree today are two resolvers that can
+    /// disagree tomorrow.
     #[must_use]
     pub fn resolve_in(home: &Path, xdg_state_home: Option<&OsStr>) -> Self {
-        Self::new(xdg_base(xdg_state_home, home, ".local/state").join(DIR_NAME))
+        Self::new(crate::config::layers::state_dir(home, xdg_state_home))
     }
 
     /// A state directory at an already-known path.
@@ -62,10 +59,13 @@ impl StateDir {
         &self.root
     }
 
-    /// `local.toml` — this account's overrides, which are never committed.
+    /// `local.toml` — this account's own layer, which is never committed.
+    ///
+    /// Delegates to [`crate::config::layers::local_layer_path`], so the layer
+    /// loader and the state directory cannot name two different files.
     #[must_use]
     pub fn local_toml(&self) -> PathBuf {
-        self.root.join("local.toml")
+        crate::config::layers::local_layer_path(&self.root)
     }
 
     /// `ledger.mpk` — what bx wrote, and what it displaced.
@@ -105,6 +105,18 @@ impl StateDir {
     #[must_use]
     pub fn lock(&self) -> PathBuf {
         self.root.join("lock")
+    }
+
+    /// The quarantine path for a damaged state file: `<name>.corrupt`.
+    ///
+    /// A fixed name, deliberately. A timestamped or numbered quarantine would
+    /// be nondeterministic and would grow without bound; this one holds the
+    /// most recent damage and nothing more.
+    #[must_use]
+    pub(crate) fn quarantine(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".corrupt");
+        PathBuf::from(name)
     }
 
     /// Create the state directory and its subdirectories, at `0700`.
@@ -236,6 +248,23 @@ mod tests {
         for bogus in ["", "relative/state"] {
             let dir = StateDir::resolve_in(Path::new("/home/someone"), Some(OsStr::new(bogus)));
             assert_eq!(dir.root(), Path::new("/home/someone/.local/state/bx"));
+        }
+    }
+
+    #[test]
+    fn the_layer_loader_and_the_state_directory_agree() {
+        // The local layer and the ledger must be in the same directory, and
+        // `local.toml` must be one file with one name. Both are delegated
+        // rather than repeated; this is the test that says so.
+        let home = Path::new("/home/someone");
+        for xdg in [None, Some(OsStr::new("/srv/state"))] {
+            let dir = StateDir::resolve_in(home, xdg);
+            let resolved = crate::config::layers::state_dir(home, xdg);
+            assert_eq!(dir.root(), resolved);
+            assert_eq!(
+                dir.local_toml(),
+                crate::config::layers::local_layer_path(&resolved),
+            );
         }
     }
 
@@ -377,6 +406,14 @@ mod tests {
         let dir = StateDir::resolve(home.path());
         let err = dir.ensure().expect_err("must fail");
         assert!(matches!(err, Error::CreateDir { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_quarantine_name_appends_rather_than_replacing_the_extension() {
+        assert_eq!(
+            StateDir::quarantine(Path::new("/s/bx/ledger.mpk")),
+            PathBuf::from("/s/bx/ledger.mpk.corrupt"),
+        );
     }
 
     #[test]

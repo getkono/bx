@@ -151,6 +151,17 @@ impl From<Mode> for RawMode {
     }
 }
 
+impl From<crate::config::target::Mode> for Mode {
+    /// The config schema's mode, as the mode bx writes with.
+    ///
+    /// Temporary. `config::target::Mode` is a second declaration of this type,
+    /// and the next commit collapses it into this one — at which point this
+    /// conversion is between a type and itself and goes away with it.
+    fn from(mode: crate::config::target::Mode) -> Self {
+        Self::from_bits(mode.bits())
+    }
+}
+
 /// A mode that could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModeError {
@@ -276,6 +287,16 @@ mod tests {
         assert_eq!(Mode::DEFAULT_FILE.to_string(), "0644");
         assert_eq!(Mode::DEFAULT_DIR.to_string(), "0755");
         assert_eq!(Mode::from_bits(0o7).to_string(), "0007");
+    }
+
+    #[test]
+    fn a_declared_mode_converts_to_the_mode_bx_writes_with() {
+        let declared = crate::config::target::Mode::parse_octal("0600").expect("a valid mode");
+        assert_eq!(Mode::from(declared), Mode::PRIVATE_FILE);
+        assert_eq!(
+            Mode::from(crate::config::target::Mode::DEFAULT_DIR),
+            Mode::DEFAULT_DIR,
+        );
     }
 
     #[test]

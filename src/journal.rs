@@ -95,7 +95,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode as RawMode, OFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::fs::{self, Mode, Observed};
@@ -641,13 +640,17 @@ impl Journal {
     }
 
     /// Write bytes at the end of the journal and `fsync` the file.
+    ///
+    /// The `fsync` goes through [`crate::fs::durable::sync_file`], so a test can
+    /// see that it happens, and where it falls against the rename or unlink the
+    /// frame announces.
     fn emit(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let fail = |source| Error::Io {
             path: self.path.clone(),
             source,
         };
         self.file.write_all(bytes).map_err(fail)?;
-        self.file.sync_all().map_err(fail)
+        crate::fs::durable::sync_file(&self.file, &self.path).map_err(fail)
     }
 }
 
@@ -1177,7 +1180,7 @@ fn blob_len(path: &Path) -> Option<u64> {
 ///
 /// [`Error::Io`] wrapping the failing `unlink` or `fsync`.
 pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
-    match std::fs::remove_file(path) {
+    match crate::fs::durable::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
@@ -1236,17 +1239,14 @@ pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
 ///
 /// [`Error::Io`] wrapping the failing `open` or `fsync`.
 pub(crate) fn fsync_dir(dir: &Path) -> Result<(), Error> {
-    let fail = |source: rustix::io::Errno| Error::Io {
+    let fail = |source: std::io::Error| Error::Io {
         path: dir.to_path_buf(),
-        source: source.into(),
+        source,
     };
-    let fd = rustix::fs::open(
-        dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        RawMode::empty(),
-    )
-    .map_err(fail)?;
-    rustix::fs::fsync(&fd).map_err(fail)
+    crate::fs::durable::Dir::open(dir)
+        .map_err(fail)?
+        .sync()
+        .map_err(fail)
 }
 
 #[cfg(test)]
@@ -1903,6 +1903,110 @@ pub(crate) mod tests {
             matches!(err, Error::Write(fs::Error::NotAFile { .. })),
             "got {err}",
         );
+    }
+
+    #[test]
+    fn the_intent_is_synced_before_the_destination_is_renamed_over() {
+        // The whole ordering rule, observed rather than asserted: the frame that
+        // announces a write is durable before the rename makes the write, and
+        // the frame that says it landed comes after.
+        use crate::fs::durable::{Event, recording};
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+        let journal = state.journal();
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let (applied, events) = recording(|| {
+            session.apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
+        });
+        applied.expect("apply");
+        session.finish().expect("finish");
+
+        let journal_syncs: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, Event::SyncFile(path) if *path == journal))
+            .map(|(at, _)| at)
+            .collect();
+        let rename = events
+            .iter()
+            .position(|event| matches!(event, Event::Rename { to, .. } if *to == dest))
+            .expect("the destination is renamed over");
+        assert_eq!(
+            journal_syncs.len(),
+            2,
+            "the Intent and the Done frames are each synced: {events:#?}",
+        );
+        assert!(
+            journal_syncs[0] < rename,
+            "the Intent is durable before the rename: {events:#?}",
+        );
+        assert!(
+            journal_syncs[1] > rename,
+            "the Done frame follows the rename: {events:#?}",
+        );
+    }
+
+    #[test]
+    fn the_intent_is_synced_before_a_removal_unlinks_the_destination() {
+        use crate::fs::durable::{Event, recording};
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let rel = ".config/made/x.conf";
+        let dest = home.child(rel);
+        let journal = state.journal();
+
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first
+            .apply(write_to(home.path(), rel, "x\n", Mode::DEFAULT_FILE))
+            .expect("apply");
+        first.finish().expect("finish");
+
+        let mut second =
+            Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+        let (removed, events) = recording(|| {
+            second.apply(Request {
+                target: target(home.path(), rel).0,
+                dest: dest.clone(),
+                content: Content::Absent {
+                    created_dirs: vec![home.child(".config/made"), home.child(".config")],
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Released,
+            })
+        });
+        removed.expect("remove");
+        second.finish().expect("finish");
+
+        let intent_sync = events
+            .iter()
+            .position(|event| matches!(event, Event::SyncFile(path) if *path == journal))
+            .expect("the Intent frame is synced");
+        let unlink = events
+            .iter()
+            .position(|event| matches!(event, Event::Unlink(path) if *path == dest))
+            .expect("the destination is unlinked");
+        let parent_sync = events
+            .iter()
+            .position(
+                |event| matches!(event, Event::SyncDir(dir) if *dir == home.child(".config/made")),
+            )
+            .expect("the unlink is made durable");
+        assert!(
+            intent_sync < unlink,
+            "the Intent is durable before the unlink: {events:#?}",
+        );
+        assert!(
+            unlink < parent_sync,
+            "the directory is synced after the unlink: {events:#?}",
+        );
+        assert!(!dest.exists());
     }
 
     #[test]

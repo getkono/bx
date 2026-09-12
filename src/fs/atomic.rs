@@ -11,7 +11,9 @@
 //!    turn it into a copy-then-delete with a visible half-written window.
 //! 3. the mode set with `fchmod` **before any content is written**.
 //! 4. the content written, then `fsync`ed.
-//! 5. the prior state recorded, so the write is reversible.
+//! 5. the prior state recorded — [`Filled::new_entry`] assembles it and
+//!    [`crate::state::Ledger::record`] makes it durable — **before** the
+//!    rename, so a crash after the rename still has a recoverable prior state.
 //! 6. `rename`.
 //! 7. an `fsync` of the **destination directory**, so the rename itself
 //!    survives a power loss. This is the step implementations omit, and without
@@ -52,7 +54,9 @@ use rustix::io::Errno;
 use tempfile::NamedTempFile;
 
 use super::mode::{Kind, Mode};
+use crate::paths::Portable;
 use crate::report::Action;
+use crate::state::{ContentHash, Mechanism, NewEntry, PriorBytes};
 
 /// The prefix every temporary file bx creates in a destination directory
 /// carries.
@@ -141,6 +145,37 @@ pub struct Observed {
     pub bytes: Option<Vec<u8>>,
     /// The destination's immediate parent directory.
     pub parent: Option<Parent>,
+}
+
+impl Observed {
+    /// The prior state, in the shape [`crate::state::Ledger::record`] takes.
+    ///
+    /// The conversion lives here rather than in the ledger because this is the
+    /// only place that knows how the prior state was captured — one
+    /// `symlink_metadata` and one read, before anything was touched.
+    ///
+    /// Anything that is not a regular file becomes [`PriorBytes::Absent`]. That
+    /// is not a loss: a write only ever proceeds over a regular file or nothing
+    /// at all, so the other kinds never reach a `record` call.
+    #[must_use]
+    pub fn prior_bytes(&self) -> PriorBytes {
+        match (&self.bytes, self.mode) {
+            (Some(bytes), Some(mode)) => PriorBytes::Bytes {
+                bytes: bytes.clone(),
+                mode,
+            },
+            _ => PriorBytes::Absent,
+        }
+    }
+
+    /// The digest of the bytes that are there now, for a regular file.
+    ///
+    /// What a mode-only change records as `written`: the content is not being
+    /// replaced, so the bytes bx leaves behind are the bytes already there.
+    #[must_use]
+    pub fn digest(&self) -> Option<ContentHash> {
+        self.bytes.as_deref().map(ContentHash::of)
+    }
 }
 
 /// A destination's immediate parent directory.
@@ -337,6 +372,11 @@ struct Pending {
     dest: PathBuf,
     mode: Mode,
     prior: Observed,
+    /// Parent directories this write invented, deepest first, so a reversal can
+    /// remove them in order and leave nothing behind.
+    created_dirs: Vec<PathBuf>,
+    /// The digest of the bytes written, once they have been.
+    written: Option<ContentHash>,
 }
 
 impl Pending {
@@ -373,7 +413,7 @@ pub fn stage(dest: &Path, mode: Mode) -> Result<Staged, Error> {
     }
 
     let dir = parent_of(dest)?;
-    create_missing_dirs(dir, Mode::DEFAULT_DIR)?;
+    let created_dirs = create_missing_dirs(dir, Mode::DEFAULT_DIR)?;
 
     let temp = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
@@ -393,6 +433,8 @@ pub fn stage(dest: &Path, mode: Mode) -> Result<Staged, Error> {
         dest: dest.to_path_buf(),
         mode,
         prior,
+        created_dirs,
+        written: None,
     }))
 }
 
@@ -435,6 +477,7 @@ impl Staged {
         };
         self.0.temp.write_all(bytes).map_err(&fail)?;
         self.0.temp.as_file().sync_all().map_err(&fail)?;
+        self.0.written = Some(ContentHash::of(bytes));
         Ok(Filled(self.0))
     }
 
@@ -480,6 +523,56 @@ impl Filled {
     #[must_use]
     pub const fn prior(&self) -> &Observed {
         &self.0.prior
+    }
+
+    /// The digest of the bytes now in the temporary file.
+    ///
+    /// Computed while filling rather than re-read afterwards, so the ledger
+    /// records the digest of what was actually written rather than the digest of
+    /// whatever is at the path by the time somebody looks.
+    #[must_use]
+    pub fn written(&self) -> ContentHash {
+        self.0
+            .written
+            .expect("a Filled write always has a digest; `fill` sets it")
+    }
+
+    /// The parent directories this write invented, deepest first.
+    ///
+    /// Empty when every component already existed. A reversal removes these in
+    /// order, so a target that created `~/.config/a/b` leaves nothing behind.
+    #[must_use]
+    pub fn created_dirs(&self) -> &[PathBuf] {
+        &self.0.created_dirs
+    }
+
+    /// The ledger entry for this write, assembled from what the writer knows.
+    ///
+    /// The writer supplies the prior bytes and their mode, the digest of what it
+    /// wrote, the mode it set, and the directories it invented. The caller
+    /// supplies the two facts only it has: the home directory to make the paths
+    /// portable against, and how bx attached to the file.
+    ///
+    /// Call it **before** [`Filled::publish`] and hand the result to
+    /// [`crate::state::Ledger::record`], which fsyncs the prior bytes into
+    /// `restore/` before it returns. A crash after the rename is then
+    /// recoverable, because the bytes that were displaced are already durable.
+    #[must_use]
+    pub fn new_entry(&self, home: &Path, mechanism: Mechanism) -> NewEntry {
+        NewEntry::new(
+            Portable::from_path(&self.0.dest, home),
+            self.written(),
+            self.0.mode,
+            mechanism,
+        )
+        .with_prior(self.0.prior.prior_bytes())
+        .with_created_dirs(
+            self.0
+                .created_dirs
+                .iter()
+                .map(|dir| Portable::from_path(dir, home))
+                .collect(),
+        )
     }
 
     /// `rename` the temporary file onto the destination, then `fsync` the
@@ -642,15 +735,19 @@ fn observe_parent(dir: &Path) -> Result<Parent, Error> {
 
 /// Create every missing component of `dir`: the ancestors bx had to invent at
 /// [`Mode::DEFAULT_DIR`], and `dir` itself at `leaf_mode`.
-fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<(), Error> {
-    // `ancestors` yields deepest first, so collecting the missing prefix and
-    // reversing it gives shallowest-first creation order.
-    let missing: Vec<&Path> = dir
+///
+/// Returns what it created, **deepest first**, which is the order a reversal
+/// removes them in.
+fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<Vec<PathBuf>, Error> {
+    // `ancestors` yields deepest first, so the collected prefix is already in
+    // removal order; reversing it gives shallowest-first creation order.
+    let missing: Vec<PathBuf> = dir
         .ancestors()
         .take_while(|path| matches!(optional_metadata(path), Ok(None)))
+        .map(Path::to_path_buf)
         .collect();
 
-    for path in missing.into_iter().rev() {
+    for path in missing.iter().rev() {
         let mode = if path == dir {
             leaf_mode
         } else {
@@ -658,7 +755,7 @@ fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<(), Error> {
         };
         create_dir_at(path, mode)?;
     }
-    Ok(())
+    Ok(missing)
 }
 
 /// `mkdir` one directory at exactly `mode`.
@@ -709,8 +806,19 @@ mod tests {
 
     use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt as _;
+    use std::sync::Mutex;
 
+    use crate::state::{ExclusiveLock, Ledger, Prior, StateDir};
     use crate::testing::{GuardedHome, guarded_home};
+
+    /// Serialises the one test that mutates the process `umask`.
+    ///
+    /// Held in addition to whatever lock the home guard takes, so the
+    /// serialisation does not depend on the guard continuing to take one.
+    /// Nothing else in the suite depends on the `umask` anyway — every write
+    /// `fchmod`s and every directory bx creates is `chmod`'d — so a leak could
+    /// not flip another assertion even without this.
+    static UMASK: Mutex<()> = Mutex::new(());
 
     /// The mode on disk, following no symlink.
     fn mode_of_path(path: &Path) -> Mode {
@@ -949,11 +1057,10 @@ mod tests {
 
     #[test]
     fn a_declared_mode_beats_the_process_umask() {
+        let _serialised = UMASK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = guarded_home();
-        // The guarded home holds a process-wide lock, so this umask change is
-        // serialised against every other home-touching test. Nothing in the
-        // suite depends on the umask anyway: every write fchmods and every
-        // directory bx creates is chmod'd.
         let previous = rustix::process::umask(Mode::from_bits(0o077).into());
 
         let dest = home.child("wide/f");
@@ -1402,5 +1509,161 @@ mod tests {
     fn observe_refuses_a_path_with_no_parent() {
         let err = observe(Path::new("/")).expect_err("must fail");
         assert!(matches!(err, Error::NoParent(_)), "{err:?}");
+    }
+
+    /// A locked, writable ledger for a guarded home.
+    fn ledger_for(home: &GuardedHome) -> (StateDir, ExclusiveLock, Ledger) {
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure the state directory");
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire the lock");
+        let ledger = Ledger::open(&dir, &lock).value;
+        (dir, lock, ledger)
+    }
+
+    #[test]
+    fn the_prior_bytes_are_recordable_before_the_rename_and_restore_exactly() {
+        let home = guarded_home();
+        let (dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host old\n", Mode::from_bits(0o640));
+
+        let filled = stage(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host new\n")
+            .expect("fill");
+
+        // The recording point: the new content is durable, the destination is
+        // still the old content, and the entry describes both.
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host old\n");
+        let recorded = ledger
+            .record(filled.new_entry(home.path(), Mechanism::Own))
+            .expect("record")
+            .clone();
+        filled.publish().expect("publish");
+
+        assert_eq!(recorded.path.as_str(), "~/.ssh/config");
+        assert_eq!(recorded.written, ContentHash::of(b"Host new\n"));
+        assert_eq!(recorded.mode, Mode::PRIVATE_FILE);
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host new\n");
+        assert_eq!(mode_of_path(&dest), Mode::PRIVATE_FILE);
+
+        // Reversibility: the ledger alone reproduces the displaced file, byte
+        // for byte and mode for mode.
+        let Prior::Existed(reference) = &recorded.prior else {
+            panic!("the prior state must be Existed, got {:?}", recorded.prior);
+        };
+        assert_eq!(reference.mode, Mode::from_bits(0o640));
+        assert_eq!(reference.len, 9);
+        let bytes = ledger
+            .restore_bytes(&dir, reference)
+            .expect("the blob is durable by the time record returns");
+        write_atomically(&dest, &bytes, reference.mode).expect("restore");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host old\n");
+        assert_eq!(mode_of_path(&dest), Mode::from_bits(0o640));
+    }
+
+    #[test]
+    fn a_prior_mode_is_recordable_for_a_mode_only_change() {
+        let home = guarded_home();
+        let (_dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host *\n", Mode::DEFAULT_FILE);
+
+        // The one read, shared by the comparison and the record.
+        let observed = observe(&dest).expect("observe");
+        let outcome = compare(&observed, &desired(b"Host *\n", Mode::PRIVATE_FILE));
+        assert_eq!(outcome.action, Action::Modify);
+        assert!(!outcome.content_drift);
+
+        let recorded = ledger
+            .record(
+                NewEntry::new(
+                    Portable::from_path(&dest, home.path()),
+                    observed.digest().expect("a regular file has a digest"),
+                    Mode::PRIVATE_FILE,
+                    Mechanism::Own,
+                )
+                .with_prior(observed.prior_bytes()),
+            )
+            .expect("record")
+            .clone();
+        set_mode(&dest, Mode::PRIVATE_FILE).expect("close the drift");
+
+        let Prior::Existed(reference) = &recorded.prior else {
+            panic!("the prior state must be Existed, got {:?}", recorded.prior);
+        };
+        assert_eq!(reference.mode, Mode::DEFAULT_FILE);
+        assert_eq!(
+            recorded.written,
+            ContentHash::of(b"Host *\n"),
+            "a mode-only change leaves the content it found",
+        );
+
+        // Reversing it is a chmod back, and the content never moved.
+        set_mode(&dest, reference.mode).expect("reverse");
+        assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host *\n");
+    }
+
+    #[test]
+    fn the_directories_a_write_invented_are_recorded_deepest_first() {
+        let home = guarded_home();
+        let dest = home.child(".config/a/b/f");
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"x")
+            .expect("fill");
+
+        assert_eq!(
+            filled.created_dirs(),
+            [
+                home.child(".config/a/b"),
+                home.child(".config/a"),
+                home.child(".config"),
+            ],
+            "deepest first, which is the order a reversal removes them in",
+        );
+        let entry = filled.new_entry(home.path(), Mechanism::Own);
+        assert_eq!(
+            entry
+                .created_dirs
+                .iter()
+                .map(Portable::as_str)
+                .collect::<Vec<_>>(),
+            ["~/.config/a/b", "~/.config/a", "~/.config"],
+        );
+        assert_eq!(
+            entry.prior,
+            PriorBytes::Absent,
+            "nothing was displaced, and that is not the same as empty bytes",
+        );
+        filled.publish().expect("publish");
+    }
+
+    #[test]
+    fn a_write_over_nothing_records_that_nothing_was_there() {
+        let home = guarded_home();
+        let dest = home.child("f");
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"x")
+            .expect("fill");
+        assert_eq!(filled.prior().prior_bytes(), PriorBytes::Absent);
+        assert_eq!(filled.prior().digest(), None);
+        assert!(filled.created_dirs().is_empty());
+        assert_eq!(filled.written(), ContentHash::of(b"x"));
+    }
+
+    #[test]
+    fn a_non_file_destination_has_no_prior_bytes_to_record() {
+        let home = guarded_home();
+        std::fs::create_dir(home.child("d")).expect("mkdir");
+        std::os::unix::fs::symlink("d", home.child("l")).expect("symlink");
+
+        for rel in ["d", "l"] {
+            let observed = observe(&home.child(rel)).expect("observe");
+            assert_eq!(observed.prior_bytes(), PriorBytes::Absent, "{rel}");
+            assert_eq!(observed.digest(), None, "{rel}");
+        }
     }
 }

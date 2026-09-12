@@ -24,7 +24,7 @@
 //! through [`scan_with`] before it is written, and the check is covered by tests
 //! rather than left to review.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::values::ResolvedValues;
 use crate::paths;
@@ -171,12 +171,20 @@ impl RootSet {
     /// Each root is `~`-expanded with [`paths::render`] and lexically
     /// normalised with [`paths::normalize`], so that a root and a value being
     /// compared have been through the same rules.
+    ///
+    /// A root that does not clear [`admissible_root`] is **dropped** here, with
+    /// a warning, rather than honoured. Dropping fails closed: the set is
+    /// narrower than the declaration asked for, and a set left empty by
+    /// dropping is [`RootSet::strict`], which permits nothing.
     #[must_use]
     pub fn new(home: &Path, roots: &[PathBuf]) -> Self {
         let home = paths::normalize(home);
         let roots = roots
             .iter()
-            .map(|root| paths::normalize(&paths::render(&root.to_string_lossy(), &home)))
+            .filter_map(|declared| {
+                let root = paths::normalize(&paths::render(&declared.to_string_lossy(), &home));
+                admissible_root(declared, &root).then_some(root)
+            })
             .collect();
         Self {
             home: Some(home),
@@ -223,6 +231,55 @@ impl RootSet {
     pub fn home(&self) -> Option<&Path> {
         self.home.as_deref()
     }
+}
+
+/// Whether a declared root may widen the guard at all.
+///
+/// The floor under every root, whatever declared it. A root must be an absolute
+/// path that names at least one directory, and must not climb.
+///
+/// The case this exists for is a root that normalises to `/`. Written as `/`,
+/// as `/..`, or as `~/../../..`, it makes `starts_with` true for every absolute
+/// path, so every tool may be relocated anywhere and every fragment scans clean
+/// — the guard turns itself off and says nothing. A guard may fail loudly; it
+/// may not fail open in silence. The configuration layer rejects such a value
+/// too, and this is the second line of defence behind that: a root arriving
+/// through [`RootSet::new`], which any caller may reach and no layer guards, is
+/// held to the same floor.
+///
+/// `..` is rejected *before* normalisation as well, on the shape rather than
+/// the result: a declared root that climbs is anomalous by construction — the
+/// module doc says so where it accepts lexical normalisation — and admitting
+/// one would mean admitting a root whose meaning changes across a symlink.
+fn admissible_root(declared: &Path, normalised: &Path) -> bool {
+    if declared
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        tracing::warn!(
+            root = %declared.display(),
+            "ignoring a declared root that climbs out of itself"
+        );
+        return false;
+    }
+    if !normalised.is_absolute() {
+        tracing::warn!(
+            root = %declared.display(),
+            "ignoring a declared root that is not an absolute path"
+        );
+        return false;
+    }
+    if !normalised
+        .components()
+        .any(|component| matches!(component, Component::Normal(_)))
+    {
+        tracing::warn!(
+            root = %declared.display(),
+            "ignoring a declared root that is the filesystem root itself"
+        );
+        return false;
+    }
+    true
 }
 
 /// Why a relocating assignment was rejected.
@@ -583,6 +640,73 @@ mod tests {
         // `/..` is `/`, and `/` is not inside any declared root here.
         assert!(!rooted().contains(Path::new("/..")));
         assert!(!rooted().contains(Path::new("/../../..")));
+    }
+
+    #[test]
+    fn a_root_that_normalises_to_the_filesystem_root_is_dropped() {
+        // The one failure a guard may not have. `/` makes `starts_with` true
+        // for every absolute path, so every tool could be relocated anywhere
+        // and every fragment would still scan clean. The three spellings all
+        // normalise to `/`; all three are dropped, leaving the strict set.
+        for declared in ["/", "/..", "~/../../..", "/var/home/example/../../.."] {
+            let roots = RootSet::new(Path::new(HOME), &[PathBuf::from(declared)]);
+            assert!(roots.is_empty(), "{declared}");
+            assert!(!roots.contains(Path::new("/etc")), "{declared}");
+            assert_eq!(
+                reason_of(&check("XDG_CONFIG_HOME", "/etc", &roots)),
+                Some(Reason::NoRootsDeclared),
+                "{declared}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_root_that_climbs_is_dropped_even_where_it_lands_somewhere_real() {
+        // This one normalises to `/var/mnt/scratch`, a perfectly real
+        // directory, and is still refused: a declared root that climbs is
+        // anomalous by construction, and lexical `..` folding is the thing the
+        // module accepts as unsound across a symlink.
+        let roots = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from("/var/mnt/scratch/example/..")],
+        );
+        assert!(roots.is_empty());
+        assert!(!roots.contains(Path::new("/var/mnt/scratch/other")));
+    }
+
+    #[test]
+    fn a_relative_root_is_dropped() {
+        // `RootSet::new` is public and no configuration layer stands in front
+        // of it. A relative root can contain no absolute value, so keeping one
+        // would only make `is_empty` say a root was declared when nothing
+        // usable was.
+        let roots = RootSet::new(Path::new(HOME), &[PathBuf::from("cache/cargo")]);
+        assert!(roots.is_empty());
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/mnt/scratch/example/cargo",
+                &roots
+            )),
+            Some(Reason::NoRootsDeclared)
+        );
+    }
+
+    #[test]
+    fn an_inadmissible_root_does_not_take_the_roots_declared_beside_it_with_it() {
+        // Dropping is per root: the admissible one still admits what it covers.
+        let roots = RootSet::new(
+            Path::new(HOME),
+            &[
+                PathBuf::from("/"),
+                PathBuf::from(ROOT),
+                PathBuf::from("~/.."),
+            ],
+        );
+        assert!(!roots.is_empty());
+        assert!(roots.contains(Path::new("/var/mnt/scratch/example/cache")));
+        assert!(!roots.contains(Path::new("/etc")));
+        assert!(!roots.contains(Path::new("/var/home")));
     }
 
     #[test]

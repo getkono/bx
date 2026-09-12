@@ -48,6 +48,17 @@ const DENIED_EXACT: &[&str] = &[
     "GH_CONFIG_DIR",
     "DOCKER_CONFIG",
     "KUBECONFIG",
+    // Caches the prefix and suffix rules below do not reach. Each of these was
+    // observed relocating a real toolchain cache while matching no rule: the
+    // guard was letting them through silently.
+    "GOCACHE",
+    "NUGET_HTTP_CACHE_PATH",
+    "HOMEBREW_CACHE",
+    "HOMEBREW_LOGS",
+    "HOMEBREW_TEMP",
+    // `_CACHE_DIR` requires the underscore, and `SCCACHE_DIR` ends in
+    // `CCACHE_DIR`, so it matched nothing either.
+    "SCCACHE_DIR",
 ];
 
 /// Prefixes whose variables are, as a family, about relocating a tool's
@@ -63,6 +74,7 @@ const DENIED_SUFFIXES: &[&str] = &[
     "_CACHE_DIR",
     "_STATE_DIR",
     "_CONFIG_FILE",
+    "_STORE_DIR",
 ];
 
 /// Names that match a denied prefix or suffix but are legitimate: they
@@ -943,6 +955,87 @@ mod tests {
         "export MISE_DATA_DIR=\"$DATA_DIR/mise\"\n",
         "export MISE_CACHE_DIR=\"$CACHE_DIR/mise\"\n",
     );
+
+    #[test]
+    fn the_six_names_that_used_to_leak_are_now_checked() {
+        // Each of these relocates a real toolchain cache and matched no rule in
+        // the name list, so the guard let it through unexamined. This is the
+        // regression test for that defect: they are checked now, and checking
+        // means allowed inside a declared root and rejected outside every one.
+        for name in [
+            "PNPM_CONFIG_STORE_DIR",
+            "GOCACHE",
+            "NUGET_HTTP_CACHE_PATH",
+            "HOMEBREW_CACHE",
+            "HOMEBREW_LOGS",
+            "HOMEBREW_TEMP",
+        ] {
+            assert!(is_relocating(name), "{name} should be value-checked");
+            assert_eq!(
+                check(name, "/var/mnt/scratch/example/x", &rooted()),
+                Verdict::Allowed,
+                "{name}"
+            );
+            assert_eq!(
+                reason_of(&check(name, "/var/cache/elsewhere", &rooted())),
+                Some(Reason::OutsideDeclaredRoots),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_sccache_directory_is_value_checked() {
+        // The motivating case for the root set being a *set*: an sccache
+        // directory may legitimately live outside the scratch root, and must
+        // then be covered by a root of its own rather than waved through.
+        assert!(is_relocating("SCCACHE_DIR"));
+        // The behaviour variables that share its prefix still are not.
+        assert!(!is_relocating("SCCACHE_CACHE_SIZE"));
+        assert!(!is_relocating("SCCACHE_SERVER_UDS"));
+
+        let roots = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from(ROOT), PathBuf::from("/var/cache/sccache")],
+        );
+        assert_eq!(
+            check("SCCACHE_DIR", "/var/cache/sccache/objects", &roots),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            reason_of(&check(
+                "SCCACHE_DIR",
+                "/var/cache/sccache/objects",
+                &rooted()
+            )),
+            Some(Reason::OutsideDeclaredRoots)
+        );
+    }
+
+    #[test]
+    fn widening_the_list_did_not_capture_a_colon_separated_list() {
+        // A generic `_PATH` or `_DIR` suffix would have. Those lists are not
+        // single paths and would be rejected for not being absolute, which is
+        // why the list is widened by observed evidence and nothing else.
+        for name in ["LD_LIBRARY_PATH", "PATH", "MANPATH", "PKG_CONFIG_PATH"] {
+            assert!(!is_relocating(name), "{name} should not be value-checked");
+        }
+    }
+
+    #[test]
+    fn the_same_fragment_is_all_violations_with_no_root_declared() {
+        // A user who declares no root gets the strict guard, and the strict
+        // guard denies every relocation. `CACHE_DIR` and `DATA_DIR` are not
+        // relocating names, so 25 assignments yield 23 violations — and 23 is
+        // the whole relocating set, six of which reach this count only because
+        // the name list was widened.
+        let found = scan(OPERATOR_FRAGMENT);
+        assert_eq!(found.len(), 23);
+        assert!(found.iter().all(|v| v.reason == Reason::NoRootsDeclared));
+        assert!(found.windows(2).all(|w| w[0].line < w[1].line));
+        assert!(!found.iter().any(|v| v.name == "CACHE_DIR"));
+        assert!(!found.iter().any(|v| v.name == "DATA_DIR"));
+    }
 
     #[test]
     fn the_operator_fragment_scans_clean_under_its_declared_root() {

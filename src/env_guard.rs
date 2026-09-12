@@ -26,6 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::config::values::ResolvedValues;
 use crate::paths;
 
 /// Exact variable names whose assigned value must be checked against the
@@ -181,6 +182,22 @@ impl RootSet {
             home: Some(home),
             roots,
         }
+    }
+
+    /// The roots a resolved configuration declares.
+    ///
+    /// Every value declared `is_root = true` and actually answered, in
+    /// declaration order, resolved against the same home the values themselves
+    /// were resolved against. A declaration nobody filled in contributes no
+    /// root, and `is_root` is validated at load to imply `kind = "path"`, so
+    /// there is nothing to filter here.
+    ///
+    /// The home travels inside the values rather than being read from the
+    /// environment, which is what keeps the guard's verdict a pure function of
+    /// the configuration (invariant 3).
+    #[must_use]
+    pub fn from_values(values: &ResolvedValues) -> Self {
+        Self::new(values.home(), &values.roots())
     }
 
     /// Whether `path` lies inside some declared root.
@@ -592,6 +609,94 @@ mod tests {
         let roots = RootSet::new(Path::new(HOME), &[PathBuf::from("~/scratch")]);
         assert!(roots.contains(Path::new("/var/home/example/scratch/cargo")));
         assert!(!roots.contains(Path::new("/var/home/example/other")));
+    }
+
+    #[test]
+    fn a_root_set_is_built_from_the_values_the_configuration_declares() {
+        use crate::config::Origin;
+        use crate::config::values::{
+            AssignedValue, ResolvedValues, ValueAssignment, ValueDecl, ValueKind,
+        };
+
+        let origin = Origin::unknown(Path::new("bx.toml"));
+        let declare = |name: &str, is_root: bool| ValueDecl {
+            name: name.into(),
+            description: None,
+            kind: ValueKind::Path,
+            required: false,
+            is_root,
+            default: None,
+            enabled: true,
+            origin: origin.clone(),
+        };
+        let answer = |name: &str, text: &str| ValueAssignment {
+            name: name.into(),
+            value: AssignedValue::String(text.into()),
+            origin: origin.clone(),
+        };
+
+        let values = ResolvedValues::resolve(
+            vec![
+                declare("scratch_root", true),
+                declare("brew_prefix", false),
+                declare("sccache_dir", true),
+            ],
+            &[
+                answer("scratch_root", ROOT),
+                answer("brew_prefix", "/home/linuxbrew/.linuxbrew"),
+                answer("sccache_dir", "/var/cache/sccache"),
+            ],
+            Path::new(HOME),
+        )
+        .expect("the values resolve");
+
+        let roots = RootSet::from_values(&values);
+        assert_eq!(roots, RootSet::new(Path::new(HOME), &values.roots()));
+        assert_eq!(roots.home(), Some(Path::new(HOME)));
+        assert!(roots.contains(Path::new("/var/mnt/scratch/example/cache/cargo")));
+        assert!(roots.contains(Path::new("/var/cache/sccache/objects")));
+        // A `path` value that was not declared a root does not become one.
+        assert!(!roots.contains(Path::new("/home/linuxbrew/.linuxbrew/lib")));
+        assert_eq!(
+            check("CARGO_HOME", "/var/mnt/scratch/example/cache/cargo", &roots),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "/home/linuxbrew/.linuxbrew/x", &roots)),
+            Some(Reason::OutsideDeclaredRoots)
+        );
+    }
+
+    #[test]
+    fn an_unanswered_root_declaration_widens_nothing() {
+        use crate::config::Origin;
+        use crate::config::values::{ResolvedValues, ValueDecl, ValueKind};
+
+        // A declaration nobody filled in must not widen the guard on the
+        // strength of an intention — so a configuration whose only root is
+        // unanswered is the strict guard.
+        let values = ResolvedValues::resolve(
+            vec![ValueDecl {
+                name: "scratch_root".into(),
+                description: None,
+                kind: ValueKind::Path,
+                required: false,
+                is_root: true,
+                default: None,
+                enabled: true,
+                origin: Origin::unknown(Path::new("bx.toml")),
+            }],
+            &[],
+            Path::new(HOME),
+        )
+        .expect("the values resolve");
+
+        let roots = RootSet::from_values(&values);
+        assert!(roots.is_empty());
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", ROOT, &roots)),
+            Some(Reason::NoRootsDeclared)
+        );
     }
 
     #[test]

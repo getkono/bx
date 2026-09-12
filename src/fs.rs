@@ -142,6 +142,22 @@ impl From<Mode> for RawMode {
 /// directories, because the decision of what mode a new directory gets belongs
 /// to the caller that knows what the directory is for.
 ///
+/// # What the tests here do and do not establish
+///
+/// The *observable* half is tested: the temporary file is created in the
+/// destination directory, a failed write leaves the previous file and no
+/// temporary behind, and a successful one leaves only the destination.
+///
+/// The durability half — that `sync_all` happens before the `rename` and that
+/// the directory `fsync` happens after it — is **not** pinned by any test. Both
+/// calls could be deleted, or reordered after `persist`, and the suite would
+/// still pass, because their effect is only visible to a reader that survives a
+/// power loss. Closing it needs a harness that observes the syscalls rather than
+/// their results: an `LD_PRELOAD` shim, `strace -e` over a child, or a fault
+/// injector between the write and the rename. Until then the ordering is held by
+/// this comment and by review, and the crash-safety claim for this function is
+/// asserted rather than established.
+///
 /// # Errors
 ///
 /// [`Error::NoParent`] if `path` has no parent component, and [`Error::Write`]

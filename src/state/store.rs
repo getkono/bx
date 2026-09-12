@@ -436,6 +436,66 @@ mod tests {
     }
 
     #[test]
+    fn quarantining_a_symlinked_state_file_moves_the_link_not_its_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A state file that is a symlink to somewhere else — a hand-made link,
+        // or a restored backup. What it points at may be a file the user wrote,
+        // so the degradation must not reach through it.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"whatever is at the far end").expect("seed");
+        let path = dir.path().join("v.mpk");
+        std::os::unix::fs::symlink(&elsewhere, &path).expect("symlink");
+
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
+
+        // `rename` acts on the link itself, never on what it names.
+        assert_eq!(
+            std::fs::read(&elsewhere).expect("read"),
+            b"whatever is at the far end",
+        );
+        assert!(std::fs::symlink_metadata(&path).is_err(), "the link moved");
+        let quarantine = StateDir::quarantine(&path);
+        assert!(
+            std::fs::symlink_metadata(&quarantine)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the quarantined entry is the link, not a copy of the target",
+        );
+        assert_eq!(
+            std::fs::read_link(&quarantine).expect("readlink"),
+            elsewhere
+        );
+    }
+
+    #[test]
+    fn saving_over_a_symlinked_state_file_replaces_the_link_not_its_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"the user wrote this").expect("seed");
+        let path = dir.path().join("v.mpk");
+        std::os::unix::fs::symlink(&elsewhere, &path).expect("symlink");
+
+        save(&path, KIND, VERSION, &sample()).expect("save");
+
+        // Invariant 1: the atomic write renames over the link, so nothing is
+        // written through it to a file bx does not own.
+        assert_eq!(
+            std::fs::read(&elsewhere).expect("read"),
+            b"the user wrote this",
+        );
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+        );
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        assert_eq!(loaded.value, sample());
+    }
+
+    #[test]
     fn a_second_quarantine_reuses_the_same_fixed_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");

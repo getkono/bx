@@ -213,6 +213,17 @@ impl<T: Keyed> Merged<T> {
         self.entries.into_iter().filter(Keyed::enabled).collect()
     }
 
+    /// Every entry, disabled ones included, in order.
+    ///
+    /// For a list whose entries are referred to **by name** from elsewhere in
+    /// the configuration. Dropping a disabled one would make a reference to it
+    /// indistinguishable from a reference to a name no layer ever declared,
+    /// which is a different fault with a different outcome.
+    #[must_use]
+    pub fn into_entries(self) -> Vec<T> {
+        self.entries
+    }
+
     /// Where `key` sits, if it is present.
     fn position(&self, key: &str) -> Option<usize> {
         self.entries.iter().position(|entry| entry.key() == key)
@@ -257,7 +268,15 @@ pub fn merge(layers: &[Layer]) -> Result<Config, Error> {
 
     Ok(Config {
         targets: targets.into_enabled(),
-        values: values.into_enabled(),
+        // Values keep their disabled entries and targets do not, and the
+        // asymmetry is the point: nothing refers to a target except by being
+        // one, so a disabled target simply is not written. A value is referred
+        // to by name from every string field in the configuration, so a
+        // declaration an account switched off has to stay visible to resolution
+        // — otherwise `{{git_email}}` reads as a repo typo, which is fatal, and
+        // the three-line toggle an account is invited to write stops the whole
+        // load with a message naming a committed file it cannot edit.
+        values: values.into_entries(),
         value_assignments: assignments,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
@@ -738,10 +757,35 @@ mod tests {
         ])
         .unwrap();
 
+        assert_eq!(merged.values.len(), 1, "by name, so it is one declaration");
         assert!(
-            merged.values.is_empty(),
-            "an account with no such slice stops being asked about it"
+            !merged.values[0].enabled,
+            "the flag is flipped, not the declaration dropped: a target still \
+             referring to it has to be distinguishable from one referring to a \
+             name no layer ever declared"
         );
+    }
+
+    #[test]
+    fn a_disabled_declaration_survives_the_merge_and_a_disabled_target_does_not() {
+        // The asymmetry, stated once: nothing refers to a target except by being
+        // one, and every string field in the configuration refers to a value by
+        // name.
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[[target]]\npath = \"~/.a\"\ncontent = \"a\"\n\
+                 [[value]]\nname = \"agent_slice\"\nkind = \"string\"\n",
+            ),
+            local(
+                "[[target]]\npath = \"~/.a\"\nenabled = false\n\
+                 [[value]]\nname = \"agent_slice\"\nenabled = false\n",
+            ),
+        ])
+        .unwrap();
+
+        assert!(merged.targets.is_empty());
+        assert_eq!(merged.values.len(), 1);
     }
 
     #[test]

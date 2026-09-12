@@ -661,6 +661,17 @@ pub enum Unresolved {
     /// The text is not a well-formed template.
     #[error(transparent)]
     Malformed(#[from] PlaceholderError),
+    /// Declared, but a layer set `enabled = false` on the declaration.
+    ///
+    /// An account's own refusal, so it blocks what depends on it rather than
+    /// failing the load — the same degradation an unanswered value gets. It is
+    /// kept apart from [`Unresolved::Unset`] because the two are cleared by
+    /// different acts: one is answered, and the other is switched back on.
+    #[error("no enabled declaration of {}", .names.join(", "))]
+    Disabled {
+        /// The declarations that are switched off, in declaration order.
+        names: Vec<String>,
+    },
     /// A reference to a value no layer declares — a repo typo.
     #[error("no layer declares the value `{0}`")]
     Undeclared(String),
@@ -695,6 +706,8 @@ enum Lookup<'a> {
     Answered(&'a str),
     /// Declared and unanswered; these are the names that need answering.
     Unset(&'a [String]),
+    /// Declared, but switched off by a layer; these are the names to re-enable.
+    Disabled(&'a [String]),
     /// Declared after the point being expanded, or by the same declaration.
     Forward,
     /// Not declared by any layer.
@@ -709,26 +722,36 @@ enum Lookup<'a> {
 fn expand<'a>(text: &str, lookup: &impl Fn(&str) -> Lookup<'a>) -> Result<String, Unresolved> {
     let pieces = scan(text)?;
     let mut unset: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
     let mut out = String::with_capacity(text.len());
+
+    let record = |causes: &[String], into: &mut Vec<String>| {
+        for cause in causes {
+            if !into.contains(cause) {
+                into.push(cause.clone());
+            }
+        }
+    };
 
     for piece in pieces {
         match piece {
             Piece::Literal(literal) => out.push_str(literal),
             Piece::Name(name) => match lookup(name) {
                 Lookup::Answered(answer) => out.push_str(answer),
-                Lookup::Unset(causes) => {
-                    for cause in causes {
-                        if !unset.contains(cause) {
-                            unset.push(cause.clone());
-                        }
-                    }
-                }
+                Lookup::Unset(causes) => record(causes, &mut unset),
+                Lookup::Disabled(causes) => record(causes, &mut disabled),
                 Lookup::Forward => return Err(Unresolved::Forward(name.to_string())),
                 Lookup::Undeclared => return Err(Unresolved::Undeclared(name.to_string())),
             },
         }
     }
 
+    // A switched-off declaration is reported ahead of an unanswered one: it is
+    // the more specific statement, and telling an account to answer a value it
+    // has itself refused would be advice it cannot follow.
+    if !disabled.is_empty() {
+        return Err(Unresolved::Disabled { names: disabled });
+    }
     if unset.is_empty() {
         Ok(out)
     } else {
@@ -750,6 +773,19 @@ pub fn init_hint(names: &[&str]) -> String {
     }
 }
 
+/// What to do about an entry blocked by a declaration a layer switched off.
+///
+/// Not a `bx init` invocation: `bx init` does not prompt for a declaration that
+/// is switched off, so telling an account to run it would be advice that does
+/// nothing. The two acts that clear this are both edits to a layer.
+#[must_use]
+pub fn disabled_hint(names: &[&str]) -> String {
+    format!(
+        "re-enable {} where a layer sets `enabled = false`, or disable this entry too",
+        names.join(", ")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
@@ -766,15 +802,30 @@ pub struct Value {
 
 /// A resolved answer, or the reason there is none.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Answer {
-    /// The answer, when there is one.
-    value: Option<Value>,
-    /// When there is not: the names that actually need answering.
+enum Answer {
+    /// Answered, by the local layer or by a `default`.
+    Given(Value),
+    /// Unanswered, and these are the names that actually need answering.
     ///
     /// Usually the declaration's own name. When a `default` could not resolve
     /// because an *earlier* value is unanswered, it is that earlier value —
     /// reporting the name the user can act on rather than the derived one.
-    cause: Vec<String>,
+    Unset(Vec<String>),
+    /// Switched off by a layer, or derived from one that is.
+    ///
+    /// Not the same state as unanswered: no answer would help, and what clears
+    /// it is switching the declaration back on.
+    Disabled(Vec<String>),
+}
+
+impl Answer {
+    /// The answer, when there is one.
+    fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Given(value) => Some(value),
+            Self::Unset(_) | Self::Disabled(_) => None,
+        }
+    }
 }
 
 /// Every declared value, in declaration order, with whatever answered it.
@@ -834,36 +885,42 @@ impl ResolvedValues {
                 ),
             };
 
-            let answer = match raw {
-                // Nothing answered it and it has no default. The cause is
-                // itself: this is the name `bx init` will prompt for.
-                None => Answer {
-                    value: None,
-                    cause: vec![decl.name.clone()],
-                },
-                // The same function `bx init` calls, at this declaration's own
-                // position: expand against the values declared before it, then
-                // check the result against the kind.
-                Some(raw) => {
-                    match resolved.validate(&decl, resolved.decls.len(), &raw, &declared) {
-                        Ok(canonical) => Answer {
-                            value: Some(Value {
+            let answer = if !decl.enabled {
+                // A layer switched the declaration off. It stays in the list so
+                // a reference to it is distinguishable from a reference to a
+                // name no layer ever declared, which is a repo typo and fatal.
+                Answer::Disabled(vec![decl.name.clone()])
+            } else {
+                match raw {
+                    // Nothing answered it and it has no default. The cause is
+                    // itself: this is the name `bx init` will prompt for.
+                    None => Answer::Unset(vec![decl.name.clone()]),
+                    // The same function `bx init` calls, at this declaration's
+                    // own position: expand against the values declared before
+                    // it, then check the result against the kind.
+                    Some(raw) => {
+                        match resolved.validate(&decl, resolved.decls.len(), &raw, &declared) {
+                            Ok(canonical) => Answer::Given(Value {
                                 text: canonical,
                                 origin,
                             }),
-                            cause: Vec::new(),
-                        },
-                        // An earlier value is unanswered, so this one is too — and it
-                        // carries the earlier name, which is the one to act on.
-                        Err(AnswerError::Reference(Unresolved::Unset { names })) => Answer {
-                            value: None,
-                            cause: names,
-                        },
-                        Err(other) => {
-                            return Err(Error::BadValue {
-                                origin,
-                                message: format!("value `{}`: {other}", decl.name),
-                            });
+                            // An earlier value is unanswered, so this one is too
+                            // — and it carries the earlier name, which is the
+                            // one to act on.
+                            Err(AnswerError::Reference(Unresolved::Unset { names })) => {
+                                Answer::Unset(names)
+                            }
+                            // Derived from a declaration somebody switched off,
+                            // and cleared by switching that one back on.
+                            Err(AnswerError::Reference(Unresolved::Disabled { names })) => {
+                                Answer::Disabled(names)
+                            }
+                            Err(other) => {
+                                return Err(Error::BadValue {
+                                    origin,
+                                    message: format!("value `{}`: {other}", decl.name),
+                                });
+                            }
                         }
                     }
                 }
@@ -948,10 +1005,9 @@ impl ResolvedValues {
     /// How the value at `index` answers a reference.
     fn lookup_at(&self, index: usize) -> Lookup<'_> {
         match &self.answers[index] {
-            Answer {
-                value: Some(value), ..
-            } => Lookup::Answered(&value.text),
-            Answer { cause, .. } => Lookup::Unset(cause),
+            Answer::Given(value) => Lookup::Answered(&value.text),
+            Answer::Unset(causes) => Lookup::Unset(causes),
+            Answer::Disabled(causes) => Lookup::Disabled(causes),
         }
     }
 
@@ -977,6 +1033,9 @@ impl ResolvedValues {
             Err(Unresolved::Unset { names }) => Err(Unresolved::Unset {
                 names: self.in_declaration_order(names),
             }),
+            Err(Unresolved::Disabled { names }) => Err(Unresolved::Disabled {
+                names: self.in_declaration_order(names),
+            }),
             other => other,
         }
     }
@@ -993,7 +1052,7 @@ impl ResolvedValues {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.index_of(name)
-            .and_then(|index| self.answers[index].value.as_ref())
+            .and_then(|index| self.answers[index].value())
     }
 
     /// The declaration of `name`, if any layer declares it.
@@ -1002,15 +1061,19 @@ impl ResolvedValues {
         self.index_of(name).map(|index| &self.decls[index])
     }
 
-    /// Every declaration, in declaration order.
+    /// Every **enabled** declaration, in declaration order.
     ///
-    /// The order `bx init` walks.
+    /// The order `bx init` walks. A declaration a layer switched off is not one
+    /// of this account's values, so it is absent here and is never prompted for;
+    /// it is still findable by [`ResolvedValues::decl`], which is what keeps a
+    /// reference to it distinguishable from a reference to a name no layer ever
+    /// declared.
     #[must_use]
-    pub fn decls(&self) -> &[ValueDecl] {
-        &self.decls
+    pub fn decls(&self) -> Vec<&ValueDecl> {
+        self.decls.iter().filter(|decl| decl.enabled).collect()
     }
 
-    /// Every declaration with no answer, in declaration order.
+    /// Every enabled declaration with no answer, in declaration order.
     ///
     /// What `bx doctor` lists.
     #[must_use]
@@ -1018,7 +1081,7 @@ impl ResolvedValues {
         self.decls
             .iter()
             .zip(&self.answers)
-            .filter(|(_, answer)| answer.value.is_none())
+            .filter(|(decl, answer)| decl.enabled && answer.value().is_none())
             .map(|(decl, _)| decl)
             .collect()
     }
@@ -1060,7 +1123,7 @@ impl ResolvedValues {
             .iter()
             .zip(&self.answers)
             .filter(|(decl, _)| decl.is_root)
-            .filter_map(|(_, answer)| answer.value.as_ref())
+            .filter_map(|(_, answer)| answer.value())
             .map(|value| PathBuf::from(&value.text))
             .collect()
     }

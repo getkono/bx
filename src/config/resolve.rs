@@ -55,6 +55,15 @@ pub enum BlockReason {
         /// The values that need answering, in declaration order.
         names: Vec<String>,
     },
+    /// One or more declared values this entry references are switched off.
+    ///
+    /// Kept apart from [`BlockReason::UnsetValue`] because the two are cleared
+    /// by different acts, and a note that told an account to answer a value it
+    /// has itself refused would be advice it cannot follow.
+    DisabledValue {
+        /// The declarations to re-enable, in declaration order.
+        names: Vec<String>,
+    },
 }
 
 /// An entry that was held back, and what it would take to release it.
@@ -107,6 +116,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
 /// Substitute one target, or explain why it cannot be.
 fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution<Target>, Error> {
     let mut unset: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
     let mut bad: Option<Unresolved> = None;
 
     // One pass to find out whether it can be resolved at all, so a blocked
@@ -114,6 +124,7 @@ fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution
     let mut probe = |text: &str| match values.substitute(text) {
         Ok(_) => {}
         Err(Unresolved::Unset { names }) => unset.extend(names),
+        Err(Unresolved::Disabled { names }) => disabled.extend(names),
         Err(other) => bad = bad.take().or(Some(other)),
     };
     for_each_string(target, &mut probe);
@@ -125,15 +136,28 @@ fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution
         });
     }
 
+    let block = |reason, hint| {
+        Ok(Resolution::Blocked(BlockedEntry {
+            key: target.path.to_string(),
+            origin: target.origin.clone(),
+            reason,
+            hint,
+        }))
+    };
+
+    // A switched-off declaration is reported ahead of an unanswered one: it is
+    // the more specific statement about what this target is waiting for.
+    if !disabled.is_empty() {
+        let names = in_declaration_order(values, disabled);
+        let hint =
+            super::values::disabled_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        return block(BlockReason::DisabledValue { names }, hint);
+    }
+
     if !unset.is_empty() {
         let names = in_declaration_order(values, unset);
         let hint = super::values::init_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
-        return Ok(Resolution::Blocked(BlockedEntry {
-            key: target.path.to_string(),
-            origin: target.origin.clone(),
-            reason: BlockReason::UnsetValue { names },
-            hint,
-        }));
+        return block(BlockReason::UnsetValue { names }, hint);
     }
 
     substituted(target, values).map(Resolution::Ready)
@@ -429,6 +453,88 @@ mod tests {
         .unwrap_err();
 
         assert!(message.contains("must start with `~` or `/`"), "{message}");
+    }
+
+    #[test]
+    fn disabling_a_declaration_blocks_its_targets_and_nothing_else() {
+        // The sanctioned three-line toggle. It used to fail the whole load with
+        // "no layer declares the value git_email" -- a statement that is not
+        // true, pointing at a committed file the account cannot edit.
+        let resolved = resolved(
+            "[[value]]\nname = \"git_email\"\nkind = \"email\"\nrequired = true\n\
+             [[target]]\npath = \"~/.gitconfig.d/id\"\ncontent = \"email = {{git_email}}\"\n\
+             [[target]]\npath = \"~/.config/starship.toml\"\ncontent = \"format = \\\"x\\\"\"\n",
+            Some("[[value]]\nname = \"git_email\"\nenabled = false\n"),
+        )
+        .unwrap();
+
+        let entry = blocked(&resolved, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::DisabledValue {
+                names: vec!["git_email".to_string()]
+            }
+        );
+        assert!(
+            entry.hint.contains("re-enable git_email"),
+            "a note telling the account to run `bx init` for a value it has \
+             itself switched off is advice it cannot follow: {}",
+            entry.hint
+        );
+        assert!(!entry.hint.contains("bx init"), "{}", entry.hint);
+
+        assert_eq!(
+            keys(&resolved),
+            ["~/.gitconfig.d/id", "~/.config/starship.toml"],
+            "one target is held back, in its own position, and the rest apply"
+        );
+        ready(&resolved, 1);
+    }
+
+    #[test]
+    fn a_value_derived_from_a_disabled_one_blocks_by_the_same_reason() {
+        // The cause travels: `sccache_dir` is unanswerable because the account
+        // switched off what its default derives from, and switching that back on
+        // is what clears both.
+        let resolved = resolved(
+            "[[value]]\nname = \"scratch_root\"\nkind = \"path\"\n\
+             [[value]]\nname = \"sccache_dir\"\nkind = \"path\"\n\
+             default = \"{{scratch_root}}/sccache\"\n\
+             [[target]]\npath = \"~/.config/env\"\ncontent = \"SCCACHE_DIR={{sccache_dir}}\"\n",
+            Some(
+                "[[value]]\nname = \"scratch_root\"\nenabled = false\n\
+                 [values]\nscratch_root = \"/var/mnt/scratch/one\"\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&resolved, 0).reason,
+            BlockReason::DisabledValue {
+                names: vec!["scratch_root".to_string()]
+            },
+            "the name reported is the one to act on, not the derived one"
+        );
+    }
+
+    #[test]
+    fn a_disabled_declaration_is_not_prompted_for() {
+        // The other half of the same decision: an account that switched a value
+        // off is not asked about it, so the blocked note may not say `bx init`.
+        let resolved = resolved(
+            "[[value]]\nname = \"agent_slice\"\nkind = \"string\"\nrequired = true\n",
+            Some("[[value]]\nname = \"agent_slice\"\nenabled = false\n"),
+        )
+        .unwrap();
+
+        assert!(resolved.values.unset_required_names().is_empty());
+        assert!(resolved.values.unset().is_empty());
+        assert!(resolved.values.decls().is_empty());
+        assert!(
+            resolved.values.decl("agent_slice").is_some(),
+            "still findable, which is what keeps a reference to it apart from a \
+             reference to a name no layer declares"
+        );
     }
 
     #[test]

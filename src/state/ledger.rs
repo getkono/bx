@@ -601,7 +601,7 @@ mod tests {
     use crate::testing::{GuardedHome, guarded_home};
 
     fn target(name: &str) -> Portable {
-        Portable::parse(name).expect("a portable path")
+        Portable::try_from(name.to_string()).expect("a portable path")
     }
 
     fn locked(home: &GuardedHome) -> (StateDir, ExclusiveLock) {

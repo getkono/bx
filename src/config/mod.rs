@@ -111,23 +111,34 @@ pub enum LayerKind {
 /// A missing `bx.toml` and a missing `modules/` are both empty results, not
 /// errors — a repo may hold either, both, or neither.
 ///
+/// # Only a clean answer skips a file
+///
+/// A candidate is skipped only when it is **cleanly** not a layer: its name is
+/// dot-prefixed or does not end in `.toml` (decided from the name, before
+/// anything is stat'ed), it does not exist, or it exists and is not a regular
+/// file. Every other outcome of looking is an [`Error::Io`] naming the path:
+/// a dangling symlink, `EACCES` from a `modules/` that can be listed but not
+/// searched, `ELOOP`. `Path::is_file` answers `false` for all of those, and a
+/// skipped module is a silent no-op — the module that says `enabled = false`
+/// quietly never applies.
+///
 /// # Errors
 ///
-/// [`Error::RepoMissing`] if `repo` is not a directory, and [`Error::Io`] if
-/// `modules/` cannot be read.
+/// [`Error::RepoMissing`] if `repo` does not exist or is not a directory, and
+/// [`Error::Io`] naming the path for any candidate that cannot be examined.
 pub fn layer_files(repo: &Path) -> Result<Vec<PathBuf>, Error> {
-    if !repo.is_dir() {
+    if !examine(repo)?.is_some_and(|meta| meta.is_dir()) {
         return Err(Error::RepoMissing(repo.to_path_buf()));
     }
 
     let mut files = Vec::new();
     let global = repo.join(GLOBAL_LAYER);
-    if global.is_file() {
+    if examine(&global)?.is_some_and(|meta| meta.is_file()) {
         files.push(global);
     }
 
     let modules = repo.join(MODULES_DIR);
-    if modules.is_dir() {
+    if examine(&modules)?.is_some_and(|meta| meta.is_dir()) {
         let mut found = Vec::new();
         let entries = std::fs::read_dir(&modules).map_err(|source| Error::Io {
             path: modules.clone(),
@@ -140,7 +151,7 @@ pub fn layer_files(repo: &Path) -> Result<Vec<PathBuf>, Error> {
                     source,
                 })?
                 .path();
-            if is_module_file(&path) {
+            if is_module_name(&path) && examine(&path)?.is_some_and(|meta| meta.is_file()) {
                 found.push(path);
             }
         }
@@ -151,10 +162,50 @@ pub fn layer_files(repo: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(files)
 }
 
-/// Whether a `modules/` entry is a layer.
-fn is_module_file(path: &Path) -> bool {
+/// Whether a `modules/` entry's *name* makes it a candidate layer.
+///
+/// Decided from the name alone, so a dangling `README.md` or an editor's
+/// `.#x.toml` lock symlink is never stat'ed and never becomes an error.
+fn is_module_name(path: &Path) -> bool {
     let bytes = filename_bytes(path);
-    bytes.first() != Some(&b'.') && bytes.ends_with(b".toml") && path.is_file()
+    bytes.first() != Some(&b'.') && bytes.ends_with(b".toml")
+}
+
+/// What is at `path`, following symlinks: `None` when nothing is there.
+///
+/// `lstat` first, so each outcome has exactly one meaning. `None` only when
+/// `lstat` says `ENOENT`: nothing, not even a link, is at the path. A symlink is
+/// then followed with `stat`, and `ENOENT` there is a **dangling** link, which
+/// is an error rather than an absence, because a layer someone linked in and
+/// broke is not a layer nobody wrote. Every other failure of either call —
+/// `EACCES`, `ELOOP` — is an error carrying the call's own `errno`.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming `path` for anything but a clean answer.
+fn examine(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
+    let io = |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let link = match std::fs::symlink_metadata(path) {
+        Ok(link) => link,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io(source)),
+    };
+    if !link.file_type().is_symlink() {
+        return Ok(Some(link));
+    }
+    match std::fs::metadata(path) {
+        Ok(target) => Ok(Some(target)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "a dangling symlink: what it points at does not exist",
+            )))
+        }
+        Err(source) => Err(io(source)),
+    }
 }
 
 /// A path's filename as raw bytes.
@@ -337,6 +388,15 @@ fn section_origin(root: &Table, name: &str, file: &Path, text: &str) -> Origin {
 /// Replacing an entry in place across layers is entry A3's merge rule. Twice in
 /// one file is a typo, and silently keeping one of them is how a config stops
 /// meaning what it says.
+///
+/// Keys are compared as stored strings. For a target that string is a
+/// [`crate::paths::Portable`], which is normalised and refuses an absolute
+/// spelling textually under the home, so `~/.ssh/./config` and
+/// `<home>/.ssh/config` both collide with `~/.ssh/config`. A spelling that
+/// reaches the same file only **through a symlink**, such as `/home/u/.gitconfig`
+/// where `/home` links to `var/home` and the home is `/var/home/u`, is a
+/// different string and is not caught. See the lexical-matching section of
+/// [`crate::paths::Portable::parse_in`] for why that is the recorded limit.
 fn check_unique(kind: &'static str, entries: Vec<(&str, &Origin)>) -> Result<(), Error> {
     let mut seen: BTreeMap<&str, &Origin> = BTreeMap::new();
     for (key, origin) in entries {
@@ -821,6 +881,172 @@ mod tests {
     fn a_nested_directory_is_not_searched() {
         let dir = repo(&[("modules/keep.toml", ""), ("modules/sub/deep.toml", "")]);
         assert_eq!(names(dir.path()), ["keep.toml"]);
+    }
+
+    /// The io error `layer_files` returned for `repo`, which must name `expected`.
+    fn io_error_naming(repo: &Path, expected: &Path) -> std::io::Error {
+        match layer_files(repo) {
+            Err(Error::Io { path, source }) => {
+                assert_eq!(path, expected);
+                source
+            }
+            other => panic!(
+                "expected an io error naming {}, got {other:?}",
+                expected.display()
+            ),
+        }
+    }
+
+    /// A module that is a dangling symlink is an error, not an absent layer.
+    ///
+    /// `is_file()` answers `false` for every failed `stat`, so a dangling
+    /// `modules/20-off.toml` -- the module that says `enabled = false` -- was
+    /// dropped and `Ok([bx.toml, 10-a.toml])` came back. The target it disables
+    /// then applies, and nothing says why.
+    #[test]
+    fn a_dangling_module_symlink_is_an_error_naming_it() {
+        let dir = repo(&[("bx.toml", ""), ("modules/10-a.toml", "")]);
+        let dangling = dir.path().join("modules/20-off.toml");
+        std::os::unix::fs::symlink(dir.path().join("nowhere.toml"), &dangling).expect("symlink");
+
+        io_error_naming(dir.path(), &dangling);
+        let message = layer_files(dir.path()).expect_err("dangling").to_string();
+        assert!(message.contains("20-off.toml"), "{message}");
+        assert!(message.contains("dangling symlink"), "{message}");
+    }
+
+    /// A symlink loop is reported as the loop, not as a dangling link.
+    ///
+    /// `ELOOP` comes from following the link, after `lstat` found it. Reading
+    /// every failure there as "dangling" would name the wrong fault, and nothing
+    /// else distinguishes the two branches.
+    #[test]
+    fn a_module_symlink_loop_is_an_error_naming_the_loop() {
+        let dir = repo(&[("bx.toml", "")]);
+        std::fs::create_dir(dir.path().join(MODULES_DIR)).expect("mkdir");
+        let looped = dir.path().join("modules/loop.toml");
+        std::os::unix::fs::symlink(&looped, &looped).expect("a symlink to itself");
+
+        let source = io_error_naming(dir.path(), &looped);
+        assert_ne!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
+        assert!(!source.to_string().contains("dangling"), "{source}");
+    }
+
+    /// A dangling `bx.toml` is an error, not a repo without a global layer.
+    ///
+    /// Under `is_file()` this returned `Ok([10-a.toml])`: every module, and
+    /// silently not the layer they are all meant to sit on top of.
+    #[test]
+    fn a_dangling_bx_toml_is_an_error_naming_it() {
+        let dir = repo(&[("modules/10-a.toml", "")]);
+        let global = dir.path().join(GLOBAL_LAYER);
+        std::os::unix::fs::symlink(dir.path().join("nowhere.toml"), &global).expect("symlink");
+
+        io_error_naming(dir.path(), &global);
+    }
+
+    /// A dangling `modules` is an error, not a repo without modules.
+    #[test]
+    fn a_dangling_modules_directory_is_an_error_naming_it() {
+        let dir = repo(&[("bx.toml", "")]);
+        let modules = dir.path().join(MODULES_DIR);
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &modules).expect("symlink");
+
+        io_error_naming(dir.path(), &modules);
+    }
+
+    /// A `modules/` that can be listed but not searched is an error.
+    ///
+    /// At mode 0644 `read_dir` succeeds, because listing needs only `r`, and
+    /// every `stat` inside fails with `EACCES`, because that needs `x`. Under
+    /// `is_file()` every module was dropped and `Ok([bx.toml])` came back.
+    #[test]
+    fn a_modules_directory_that_cannot_be_searched_names_the_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = repo(&[("bx.toml", ""), ("modules/10-a.toml", "")]);
+        let modules = dir.path().join(MODULES_DIR);
+        let module = modules.join("10-a.toml");
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+
+        // A process that can stat inside an unsearchable directory -- root, or
+        // one holding CAP_DAC_READ_SEARCH -- cannot construct this case.
+        let constructible = std::fs::metadata(&module).is_err();
+        let result = layer_files(dir.path());
+        std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
+            .expect("restore, so the tempdir can be removed");
+
+        if !constructible {
+            eprintln!(
+                "skipped: this process can stat inside a 0644 directory, so EACCES cannot be \
+                 constructed here"
+            );
+            return;
+        }
+        match result {
+            Err(Error::Io { path, source }) => {
+                assert_eq!(path, module);
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!(
+                "expected an io error naming {}, got {other:?}",
+                module.display()
+            ),
+        }
+    }
+
+    /// A name that is not a layer is filtered out before it is ever stat'ed.
+    ///
+    /// Otherwise a dangling `README.md`, or the `.#keep.toml` lock Emacs leaves
+    /// as a dangling symlink, would become an error about a file bx never meant
+    /// to read.
+    #[test]
+    fn a_dangling_name_that_is_not_a_layer_is_never_examined() {
+        let dir = repo(&[("modules/keep.toml", "")]);
+        let modules = dir.path().join(MODULES_DIR);
+        for name in [".#keep.toml", "README.md", "notes.toml.bak"] {
+            std::os::unix::fs::symlink(dir.path().join("nowhere"), modules.join(name))
+                .expect("symlink");
+        }
+
+        assert_eq!(names(dir.path()), ["keep.toml"]);
+    }
+
+    /// A symlink to a regular file is a layer, as it was under `is_file()`.
+    #[test]
+    fn a_module_symlinked_to_a_regular_file_is_a_layer() {
+        let dir = repo(&[("elsewhere/real.toml", ""), ("bx.toml", "")]);
+        std::fs::create_dir(dir.path().join(MODULES_DIR)).expect("mkdir");
+        std::os::unix::fs::symlink(
+            dir.path().join("elsewhere/real.toml"),
+            dir.path().join("modules/linked.toml"),
+        )
+        .expect("symlink");
+
+        assert_eq!(names(dir.path()), ["bx.toml", "linked.toml"]);
+    }
+
+    /// A `bx.toml` or `modules` that exists as the wrong kind of file is a
+    /// clean "not a layer", not an error.
+    #[test]
+    fn a_global_layer_or_modules_of_the_wrong_kind_is_skipped() {
+        let dir = repo(&[("modules", "a regular file, not a directory")]);
+        std::fs::create_dir(dir.path().join(GLOBAL_LAYER)).expect("mkdir");
+
+        assert!(layer_files(dir.path()).unwrap().is_empty());
+    }
+
+    /// A repo that is a regular file is missing; a dangling one is an error.
+    #[test]
+    fn a_repo_that_is_a_file_is_missing_and_a_dangling_one_is_an_error() {
+        let dir = repo(&[("file", "")]);
+        let file = dir.path().join("file");
+        assert!(matches!(layer_files(&file), Err(Error::RepoMissing(ref p)) if *p == file));
+
+        let dangling = dir.path().join("repo");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).expect("symlink");
+        io_error_naming(&dangling, &dangling);
     }
 
     // --- loading ----------------------------------------------------------

@@ -119,6 +119,14 @@ impl<T> Loaded<T> {
     pub fn value(self) -> T {
         self.value
     }
+
+    /// Apply `f` to the value, keeping the health.
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Loaded<U> {
+        Loaded {
+            value: f(self.value),
+            health: self.health,
+        }
+    }
 }
 
 /// Read a state file, degrading to `T::default()` for any damage.
@@ -500,5 +508,17 @@ mod tests {
             matches!(&err, Error::NotADirectory { path } if *path == occupied),
             "got {err}",
         );
+    }
+
+    #[test]
+    fn a_loaded_value_can_be_mapped_without_losing_its_health() {
+        let loaded = Loaded {
+            value: 1_u32,
+            health: Health::Reset(Damage::Malformed),
+        };
+        let mapped = loaded.map(|v| v + 1);
+        assert_eq!(mapped.value, 2);
+        assert_eq!(mapped.health, Health::Reset(Damage::Malformed));
+        assert_eq!(mapped.value(), 2);
     }
 }

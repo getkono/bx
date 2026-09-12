@@ -6,6 +6,16 @@
 //! needs to know about this account — what bx wrote, what it replaced, and what
 //! it can skip recomputing.
 //!
+//! Three things live here, and this module builds all three:
+//!
+//! * [`Ledger`] — what bx last wrote to each target, the digest of those bytes,
+//!   and the prior bytes it displaced. This is what makes `bx rm` exact, and
+//!   what lets `bx plan` tell *modified by bx* from *modified by someone else*.
+//! * [`Fingerprints`] — an opaque cache keyed by an opaque string, so expensive
+//!   work is skipped when its inputs have not changed.
+//! * [`ExclusiveLock`] / [`SharedLock`] — one advisory `flock` over the whole
+//!   directory, so two mutating `bx` processes cannot interleave.
+//!
 //! # Every file here is reconstructible
 //!
 //! A machine-owned file that becomes an error the user cannot clear is a defect,
@@ -15,13 +25,6 @@
 //! writes a clean file. The damaged bytes are kept, never deleted, so a human or
 //! `bx doctor` can still look at them. See [`Damage`] and [`Health`].
 //!
-//! # A note on network filesystems
-//!
-//! The lock is `flock(2)`. On a home directory mounted over NFS with `nolock`,
-//! `flock` silently provides no exclusion at all. bx's state directory is
-//! per-account local storage by design, so this is documented rather than
-//! handled.
-//!
 //! # Resolution takes an explicit home
 //!
 //! [`StateDir::resolve`] takes the home directory as an argument and reads no
@@ -29,10 +32,18 @@
 //! independent state directories. The XDG rule itself lives in exactly one place
 //! — [`crate::paths::xdg_base`] — and a caller that has an `$XDG_STATE_HOME`
 //! value to honour passes it to [`StateDir::resolve_in`].
+//!
+//! # A note on network filesystems
+//!
+//! The lock is `flock(2)`. On a home directory mounted over NFS with `nolock`,
+//! `flock` silently provides no exclusion at all. bx's state directory is
+//! per-account local storage by design, so this is documented rather than
+//! handled.
 
 mod dir;
 mod fingerprint;
 mod hash;
+mod ledger;
 mod lock;
 mod store;
 
@@ -41,6 +52,8 @@ use std::path::PathBuf;
 pub use dir::StateDir;
 pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
+pub use ledger::RestoreRef;
+pub use ledger::{Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes};
 pub use lock::{ExclusiveLock, Holder, SharedLock};
 pub use store::{Damage, Health, Loaded};
 
@@ -57,6 +70,15 @@ pub enum Error {
     #[error("creating {}: {source}", .path.display())]
     CreateDir {
         /// The directory that could not be created.
+        path: PathBuf,
+        /// The underlying failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A read failed.
+    #[error("reading {}: {source}", .path.display())]
+    Read {
+        /// The path being read.
         path: PathBuf,
         /// The underlying failure.
         #[source]
@@ -92,13 +114,20 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    /// A read failed.
-    #[error("reading {}: {source}", .path.display())]
-    Read {
-        /// The path being read.
+    /// A ledger entry references a restore snapshot that is not on disk.
+    #[error("the restore snapshot {digest} is missing from {}", .path.display())]
+    RestoreMissing {
+        /// The digest the ledger recorded.
+        digest: ContentHash,
+        /// Where the snapshot should have been.
         path: PathBuf,
-        /// The underlying failure.
-        #[source]
-        source: std::io::Error,
+    },
+    /// A restore snapshot's bytes do not hash to the digest that named them.
+    #[error("the restore snapshot {} does not match its digest {digest}", .path.display())]
+    RestoreCorrupt {
+        /// The digest the ledger recorded.
+        digest: ContentHash,
+        /// The snapshot that failed to match it.
+        path: PathBuf,
     },
 }

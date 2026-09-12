@@ -55,6 +55,7 @@ pub mod local;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::slice;
 
 use toml_edit::Table;
 
@@ -1086,15 +1087,32 @@ impl ResolvedValues {
             .collect()
     }
 
-    /// Every **required** declaration with no answer, in declaration order.
+    /// Every **required** declaration that needs an answer of its own, in
+    /// declaration order.
     ///
-    /// What `bx init` prompts for, each carrying its `description` for the prompt
-    /// and its `default` for the pre-fill.
+    /// What `bx init` prompts for, each carrying its `description` for the
+    /// prompt and its `default` for the pre-fill.
+    ///
+    /// A declaration whose `default` merely failed to resolve is **not** here.
+    /// With `root` unanswered and `cache` defaulting to `{{root}}/cache`, both
+    /// are unanswered but only `root` can be acted on: prompting for `cache`
+    /// would pre-fill the literal `{{root}}/cache` and then ask the twenty-four
+    /// questions that deriving a default exists to avoid. The blocked entry
+    /// already names only `root`, and this agrees with it.
+    ///
+    /// [`ResolvedValues::unset`] is unaffected — doctor lists everything that
+    /// has no answer, whatever the reason.
     #[must_use]
     pub fn unset_required(&self) -> Vec<&ValueDecl> {
-        self.unset()
-            .into_iter()
-            .filter(|decl| decl.required)
+        self.decls
+            .iter()
+            .zip(&self.answers)
+            .filter(|(decl, answer)| {
+                decl.enabled
+                    && decl.required
+                    && matches!(answer, Answer::Unset(names) if names == slice::from_ref(&decl.name))
+            })
+            .map(|(decl, _)| decl)
             .collect()
     }
 
@@ -1810,6 +1828,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["scratch_root", "agent_slice"],
             "doctor lists every unanswered value, required or not"
+        );
+    }
+
+    #[test]
+    fn a_derived_value_is_not_prompted_for_in_its_own_right() {
+        // `cache` cannot be answered usefully: `bx init` would pre-fill the
+        // literal `{{root}}/cache`, which its own validator then rejects. The
+        // blocked entry names only `root`, and the prompt list agrees with it.
+        let mut root = a_decl("root", ValueKind::Path);
+        root.required = true;
+        let mut cache = a_decl("cache", ValueKind::Path);
+        cache.required = true;
+        cache.default = Some(AssignedValue::String("{{root}}/cache".to_string()));
+
+        let values = resolve(vec![root, cache], &[]).unwrap();
+
+        assert_eq!(
+            values.unset_required_names(),
+            ["root"],
+            "one question, not two, and the one that can be answered"
+        );
+        assert_eq!(
+            values
+                .unset()
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            ["root", "cache"],
+            "doctor still lists everything with no answer, whatever the reason"
+        );
+        assert_eq!(
+            values.substitute("{{cache}}").unwrap_err(),
+            Unresolved::Unset {
+                names: vec!["root".to_string()]
+            },
+            "which is what the blocked entry already said"
         );
     }
 

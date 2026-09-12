@@ -2394,15 +2394,22 @@ mod tests {
     }
 
     #[test]
-    fn re_applying_after_an_edit_still_restores_the_user_s_original_file() {
+    fn re_applying_after_an_edit_keeps_every_byte_the_user_wrote() {
         // The ordinary case, not an edge one: a user applies, edits the result,
-        // and applies again. If the second `record` snapshotted what it found,
-        // `bx rm` would restore bx's own previous output; if it defaulted to
-        // `PriorBytes::Absent` — which is what a writer over an *absent*
-        // destination supplies — it would unlink a file the user had before bx
-        // ever ran. Both turn Invariant 4 into its opposite, and the writer is
-        // the side that supplies the prior, so the writer's tests are a place
-        // this has to be pinned.
+        // and applies again. The second apply displaces the user's edit, so the
+        // edit is what the user last had and becomes the prior `bx rm` restores
+        // (#7, decision 13); the original file it replaces as the prior is not
+        // dropped but kept in `superseded`. Losing either set of bytes, or
+        // letting a later `PriorBytes::Absent` — which is what a writer over an
+        // *absent* destination supplies — turn the prior into "unlink it",
+        // turns Invariant 4 into its opposite, and the writer is the side that
+        // supplies the prior, so the writer's tests are a place this has to be
+        // pinned.
+        //
+        // This test used to be `..._still_restores_the_user_s_original_file`
+        // and assert decision 7's first-prior-wins rule, under which rm wrote
+        // `Host theirs` over the user's `Host edited` and the edit existed
+        // nowhere.
         let home = guarded_home();
         let (dir, _lock, mut ledger) = ledger_for(&home);
         let dest = home.child(".ssh/config");
@@ -2440,15 +2447,35 @@ mod tests {
             .clone();
 
         let Prior::Existed(reference) = &recorded.prior else {
-            panic!("the first prior must survive, got {:?}", recorded.prior);
+            panic!(
+                "an absent incoming prior may not turn a snapshot into an unlink, got {:?}",
+                recorded.prior
+            );
         };
-        assert_eq!(reference.mode, Mode::from_bits(0o640));
-        let bytes = ledger
-            .restore_bytes(&dir, reference)
-            .expect("restore bytes");
+        // The edit was written over bx's 0600 output, so it carries that mode.
+        assert_eq!(reference.mode, Mode::PRIVATE_FILE);
         assert_eq!(
-            bytes, b"Host theirs\n",
-            "the prior is what the user had before bx ever touched the file",
+            ledger
+                .restore_bytes(&dir, reference)
+                .expect("restore bytes"),
+            b"Host edited\n",
+            "the prior is what the user last had: the edit the second apply displaced",
+        );
+
+        assert_eq!(
+            recorded.superseded.len(),
+            1,
+            "the original is kept, once: {:?}",
+            recorded.superseded,
+        );
+        let original = &recorded.superseded[0];
+        assert_eq!(original.mode, Mode::from_bits(0o640));
+        assert_eq!(
+            ledger
+                .restore_bytes(&dir, original)
+                .expect("restore the original"),
+            b"Host theirs\n",
+            "the file the user had before bx ever touched it is still restorable",
         );
     }
 

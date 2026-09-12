@@ -508,6 +508,26 @@ pub enum Error {
         /// Where it was first declared.
         first: Origin,
     },
+
+    /// This account's layer would be read from inside the config repo.
+    ///
+    /// The state directory lies inside the repo — `XDG_STATE_HOME` set to
+    /// `XDG_CONFIG_HOME`, for one — so `local.toml` would be account content
+    /// in a publishable git tree. Refused rather than skipped, because an
+    /// account whose layer is silently dropped gets every other account's
+    /// configuration with nothing saying why.
+    #[error(
+        "{}: this account's local layer is inside the config repo {}, a git working \
+         tree meant to be published; set XDG_STATE_HOME to a directory outside it",
+        .local.display(),
+        .repo.display()
+    )]
+    LocalInRepo {
+        /// Where the local layer would be read from.
+        local: PathBuf,
+        /// The config repo it lies inside.
+        repo: PathBuf,
+    },
 }
 
 /// The file, the bytes, and the entry being parsed out of them.
@@ -1397,6 +1417,15 @@ mod tests {
 
         assert_eq!(rendered[0], "no bx config repo at /repo");
         assert_eq!(rendered[1], "/repo/bx.toml: broken");
+        assert_eq!(
+            Error::LocalInRepo {
+                local: PathBuf::from("/repo/local.toml"),
+                repo: PathBuf::from("/repo"),
+            }
+            .to_string(),
+            "/repo/local.toml: this account's local layer is inside the config repo /repo, a \
+             git working tree meant to be published; set XDG_STATE_HOME to a directory outside it"
+        );
         for message in &rendered[2..] {
             assert!(
                 message.starts_with("bx.toml:7: "),

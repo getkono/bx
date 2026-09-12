@@ -28,6 +28,11 @@
 //! `rename`, `fsync` the directory — the one comparison `plan` and `apply`
 //! share, and the one type that carries a file mode.
 //!
+//! [`journal`] is the durability layer between the two: the write-ahead log and
+//! the session every byte bx writes passes through, which records each write
+//! before it is made and unlinks the log only once the session has ended, so a
+//! run that stops halfway leaves a record of everything it may have touched.
+//!
 //! [`testing`] is the tempdir-`$HOME` guard every home-touching test in this
 //! crate runs behind. It is compiled unconditionally, and hidden from the docs,
 //! so an integration test can reach it too.
@@ -36,6 +41,7 @@ pub mod config;
 pub mod detect;
 pub mod env_guard;
 pub mod fs;
+pub mod journal;
 pub mod paths;
 pub mod report;
 pub mod state;

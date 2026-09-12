@@ -12,10 +12,14 @@
 //! on this machine, and [`report`] holds the vocabulary `plan` and `apply`
 //! share, including the fact that an additive-only tool has no destroy action.
 //!
+//! [`config`] is what a config repo says — the layers, the targets, the declared
+//! values, and the file and line each of them came from.
+//!
 //! [`testing`] is the tempdir-`$HOME` guard every home-touching test in this
 //! crate runs behind. It is compiled unconditionally, and hidden from the docs,
 //! so an integration test can reach it too.
 
+pub mod config;
 pub mod detect;
 pub mod env_guard;
 pub mod paths;

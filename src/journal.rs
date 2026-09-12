@@ -499,11 +499,53 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
         }
     }
 
+    if let Some(why) = foreign_path(&records) {
+        return Ok(Err(why));
+    }
+
     Ok(Ok(if matches!(records.last(), Some(Record::End(_))) {
         Loaded::Terminated(records)
     } else {
         Loaded::Unterminated(records)
     }))
+}
+
+/// Why the journal stores a path its own session could not have written, if it
+/// does.
+///
+/// Decoding a [`Portable`] applies every rule that needs no home. The one that
+/// does cannot run in a decoder: `/<home>/.gitconfig` is well-formed, and on
+/// the account whose home that is, a second key for `~/.gitconfig`. The home a
+/// journal was written under is its [`Begin`]'s, so every stored `Portable` —
+/// the `Begin`'s scope, each [`Intent`]'s target and each [`Done`]'s — goes
+/// through [`Portable::check_against`] with it, as does the home itself. A
+/// journal that fails is bytes bx never wrote, and the caller treats it as
+/// unreadable: [`load`] leaves it in place and [`load_exclusive`] sets it
+/// aside. It is never believed, so it can never drive a rollback.
+///
+/// A journal with no `Begin` has no home to check against. Recovery already
+/// refuses the one kind of those that would need one (a terminated journal
+/// with no header), and a rollback acts on the rendered destinations alone.
+fn foreign_path(records: &[Record]) -> Option<&'static str> {
+    let begin = records.iter().find_map(|record| match record {
+        Record::Begin(begin) => Some(begin),
+        _ => None,
+    })?;
+    if let Err(error) = Portable::parse_in("~", &begin.home) {
+        tracing::warn!(%error, "the journal's session header names an unusable home");
+        return Some("its session header names a home that is not an absolute UTF-8 path");
+    }
+    let refused = records
+        .iter()
+        .flat_map(|record| match record {
+            Record::Begin(begin) => begin.scope.iter().collect::<Vec<_>>(),
+            Record::Intent(intent) => vec![&intent.target],
+            Record::Done(done) => vec![&done.target],
+            Record::End(_) => Vec::new(),
+        })
+        .find_map(|portable| portable.check_against(&begin.home).err())?;
+    tracing::warn!(error = %refused, "a journal record stores a path its session's home refuses");
+    Some("it records a path that is not portable against its session's home")
 }
 
 /// Why there is no whole record at an offset.
@@ -2007,6 +2049,124 @@ pub(crate) mod tests {
             "the directory is synced after the unlink: {events:#?}",
         );
         assert!(!dest.exists());
+    }
+
+    /// A journal header for a session under `home`.
+    fn begin_under(home: &Path, scope: Vec<Portable>) -> Record {
+        Record::Begin(Begin {
+            kind: SessionKind::Apply,
+            home: home.to_path_buf(),
+            scope,
+        })
+    }
+
+    /// `rel` under `home`, spelled absolutely: well-formed, so it decodes.
+    fn absolute_under(home: &Path, rel: &str) -> Portable {
+        Portable::from_path(&home.join(rel), Path::new("/nonexistent/other/home"))
+            .expect("an absolute portable path")
+    }
+
+    #[test]
+    fn a_journal_naming_an_absolute_path_under_its_home_never_drives_a_rollback() {
+        // #4's decision R3-1, for the journal. Believed, this journal says bx
+        // created `.gitconfig` and the file there is bx's: an unterminated
+        // session, so recovery would unlink the user's file.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let dest = home.child(".gitconfig");
+        plant_file(&dest, "[user]\n", Mode::DEFAULT_FILE);
+        let path = state.journal();
+        let foreign = absolute_under(home.path(), ".gitconfig");
+        raw_journal(
+            &path,
+            &[
+                begin_under(home.path(), Vec::new()),
+                Record::Intent(Intent {
+                    target: foreign,
+                    dest: dest.clone(),
+                    temp: None,
+                    before: Prior::Absent,
+                    after: Written::Present {
+                        digest: ContentHash::of(b"[user]\n"),
+                        mode: Mode::DEFAULT_FILE,
+                    },
+                    created_dirs: Vec::new(),
+                    mechanism: Some(Mechanism::Own),
+                }),
+            ],
+        );
+        let bytes = std::fs::read(&path).expect("the journal");
+
+        // Unlocked: unreadable, and left exactly where it is.
+        assert_eq!(
+            load(&path).expect("load"),
+            Loaded::Unreadable { moved_to: None }
+        );
+        assert_eq!(std::fs::read(&path).expect("still there"), bytes);
+        assert!(crate::recover::pending(&state).expect("pending").is_none());
+
+        // Under the lock: set aside with its bytes kept, and nothing rolled back.
+        assert_eq!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::Nothing,
+        );
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&path)).expect("kept, not deleted"),
+            bytes
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            peek(&dest),
+            Some((b"[user]\n".to_vec(), Mode::DEFAULT_FILE)),
+            "the user's file is untouched",
+        );
+    }
+
+    #[test]
+    fn every_stored_path_in_a_journal_is_checked_against_its_home() {
+        let home = guarded_home();
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let path = dir.path().join("journal.mpk");
+        let ours = target(home.path(), ".conf").0;
+        let foreign = absolute_under(home.path(), ".conf");
+
+        for (why, records) in [
+            (
+                "a scope entry",
+                vec![begin_under(home.path(), vec![foreign.clone()])],
+            ),
+            (
+                "a Done target",
+                vec![
+                    begin_under(home.path(), Vec::new()),
+                    Record::Done(Done {
+                        target: foreign.clone(),
+                    }),
+                ],
+            ),
+            (
+                "the header's own home",
+                vec![begin_under(Path::new("relative/home"), vec![ours.clone()])],
+            ),
+        ] {
+            raw_journal(&path, &records);
+            assert_eq!(
+                load(&path).expect("load"),
+                Loaded::Unreadable { moved_to: None },
+                "{why}",
+            );
+        }
+
+        // A path genuinely outside the home, and the ~/ spelling, still load.
+        let outside = Portable::try_from("/etc/bx-example.conf".to_string()).expect("absolute");
+        let records = vec![
+            begin_under(home.path(), vec![ours.clone(), outside.clone()]),
+            Record::Done(Done { target: outside }),
+            Record::Done(Done { target: ours }),
+        ];
+        raw_journal(&path, &records);
+        assert_eq!(load(&path).expect("load"), Loaded::Unterminated(records));
     }
 
     #[test]

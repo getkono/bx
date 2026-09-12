@@ -11,7 +11,7 @@
 //! so rendering can never corrupt a file's body. That restriction is what lets
 //! bx avoid a template language entirely.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Rewrite `path` as `~`-relative if it lies under `home`.
 ///
@@ -69,6 +69,49 @@ pub fn render_content(content: &str, home: &Path) -> String {
         }
     }
     out
+}
+
+/// Normalise a path **lexically**: no `.`, no `..`, no repeated or trailing
+/// separator — and without touching the filesystem.
+///
+/// The filesystem is deliberately not consulted. `plan` must describe the same
+/// change whether or not the paths it names exist yet, so `canonicalize` — which
+/// fails on a missing path and resolves symlinks against whatever happens to be
+/// mounted — is not available here. The architecture fixes that rule for the
+/// `env_guard` root comparison, and a declared `path` value is normalised with
+/// this same function so that a root and a value can be compared at all.
+///
+/// `..` never walks above the root: `/..` is `/`, because on Linux the root's
+/// parent is the root. In a *relative* path a leading `..` is preserved, since
+/// there is no earlier component for it to cancel and dropping it would change
+/// which directory the path names.
+///
+/// An empty result normalises to `.`, the shortest path naming the same place.
+#[must_use]
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            // `Components` already elides an interior `.`; a *leading* one in a
+            // relative path survives, and is what this arm removes.
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `/..` is `/`. Anything else — an empty stack, or one whose
+                // last entry is itself a `..` — has nothing to cancel, so the
+                // `..` is kept.
+                Some(Component::RootDir) => {}
+                _ => out.push(component),
+            },
+            other => out.push(other),
+        }
+    }
+    if out.is_empty() {
+        return PathBuf::from(".");
+    }
+    out.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -195,5 +238,58 @@ mod tests {
     #[test]
     fn empty_content_stays_empty() {
         assert_eq!(render_content("", &home()), "");
+    }
+
+    #[test]
+    fn normalize_removes_dot_and_dotdot() {
+        assert_eq!(
+            normalize(Path::new("/var/mnt/scratch/./one/../example/cache")),
+            Path::new("/var/mnt/scratch/example/cache")
+        );
+        assert_eq!(normalize(Path::new("./a/b")), Path::new("a/b"));
+    }
+
+    #[test]
+    fn normalize_collapses_repeated_and_trailing_slashes() {
+        assert_eq!(
+            normalize(Path::new("/var//mnt///scratch/")),
+            Path::new("/var/mnt/scratch")
+        );
+    }
+
+    #[test]
+    fn normalize_does_not_walk_above_the_root() {
+        // The root's parent is the root, so a `..` chain cannot escape it and
+        // cannot be used to smuggle a path out of a declared root.
+        assert_eq!(normalize(Path::new("/../../..")), Path::new("/"));
+        assert_eq!(normalize(Path::new("/a/../../b")), Path::new("/b"));
+    }
+
+    #[test]
+    fn normalize_keeps_a_leading_dotdot_in_a_relative_path() {
+        // Nothing precedes it, so dropping it would name a different directory.
+        assert_eq!(normalize(Path::new("../../a")), Path::new("../../a"));
+        assert_eq!(normalize(Path::new("a/../../b")), Path::new("../b"));
+    }
+
+    #[test]
+    fn normalize_reduces_an_empty_result_to_dot() {
+        assert_eq!(normalize(Path::new("")), Path::new("."));
+        assert_eq!(normalize(Path::new(".")), Path::new("."));
+        assert_eq!(normalize(Path::new("a/..")), Path::new("."));
+    }
+
+    #[test]
+    fn normalize_never_touches_the_filesystem() {
+        // Normalising a path that does not exist succeeds and leaves it alone,
+        // which `canonicalize` could not do.
+        let absent = Path::new("/var/mnt/scratch/example/does/not/exist");
+        assert_eq!(normalize(absent), absent);
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        let once = normalize(Path::new("/a/./b/../c//d/"));
+        assert_eq!(normalize(&once), once);
     }
 }

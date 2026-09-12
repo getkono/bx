@@ -32,6 +32,9 @@
 //! the session every byte bx writes passes through, which records each write
 //! before it is made and unlinks the log only once the session has ended, so a
 //! run that stops halfway leaves a record of everything it may have touched.
+//! [`recover`] is what a later run does with a log that is still there:
+//! detection and a report in a read-only command, an automatic roll back in a
+//! writing one. Between them they are the second half of Invariant 4.
 //!
 //! [`testing`] is the tempdir-`$HOME` guard every home-touching test in this
 //! crate runs behind. It is compiled unconditionally, and hidden from the docs,
@@ -43,6 +46,7 @@ pub mod env_guard;
 pub mod fs;
 pub mod journal;
 pub mod paths;
+pub mod recover;
 pub mod report;
 pub mod state;
 #[doc(hidden)]

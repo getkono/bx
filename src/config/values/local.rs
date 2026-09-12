@@ -8,12 +8,18 @@
 //!
 //! # Nothing here performs I/O
 //!
-//! Every function takes a document and returns a document. That is deliberate,
-//! and it is what makes this entry's additivity claim true rather than
-//! aspirational: this entry opens no file for writing anywhere. Persisting the
-//! rendered document belongs to `bx init` (entry A8) through the atomic writer
-//! (entry A5), which is the only writer in the product that records the prior
-//! bytes and can therefore satisfy Invariants 1 and 4.
+//! Every function takes a document and returns a document, and this entry opens
+//! no file for writing anywhere. Persisting the rendered document belongs to
+//! `bx init` (entry A8) through the atomic writer (entry A5), which is the only
+//! writer in the product that records the prior bytes and can therefore satisfy
+//! Invariants 1 and 4.
+//!
+//! So **Invariant 1 is not established here**, and saying otherwise would be a
+//! comment rather than a test: an entry with no write path has nothing to be
+//! additive about. What is established is narrower and is what the writer will
+//! be handed — the transform loses no byte of the document it is given, pinned
+//! by `setting_a_value_keeps_the_note_the_account_wrote_beside_it` and its
+//! siblings.
 //!
 //! # Why `DocumentMut` here and `Document` there
 //!

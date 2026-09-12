@@ -19,10 +19,11 @@
 //! name the architecture fixed for a target's declared mode.
 
 pub mod atomic;
+pub(crate) mod durable;
 pub mod mode;
 
 pub use atomic::{
     Desired, Error, Filled, Observed, Outcome, Parent, ParentState, Staged, TEMP_PREFIX, compare,
-    ensure_dir, observe, set_mode, stage, write_atomically,
+    compare_dir, ensure_dir, observe, set_mode, stage, write_atomically,
 };
 pub use mode::{Kind, Mode, ModeError};

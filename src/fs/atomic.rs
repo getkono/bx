@@ -54,28 +54,28 @@
 //! published one leaves only the destination, and the prior state a reversal
 //! needs is in the ledger before the rename.
 //!
-//! The **durability half is not pinned at all**. Not merely its failure paths:
-//! nothing establishes that `sync_all` at the end of [`Staged::fill`] or the
-//! `fsync` inside `fsync_dir` *happen*. Delete either call and the whole suite
-//! still passes, because their only effect is visible to a reader that survives
-//! a power loss. Steps 4 and 7 of the sequence above, and the ordering between
-//! them and the `rename`, are therefore held by code order, by this paragraph
-//! and by review — not by a test. So `bx`'s crash-safety claim for a single
-//! write is **asserted, not established**, and it should not be counted as
-//! Invariant 4 being enforced by the suite.
+//! The **durability half** has no observable result — an `fsync`'s only
+//! witness is a reader that survives a power loss — so it is pinned through
+//! the calls instead. Every `fsync` and the `rename` go through
+//! `fs::durable`, which notes each call to a per-thread recorder in the
+//! test build only. The tests assert that [`Staged::fill`] syncs the temporary
+//! file before it returns, and that [`Filled::publish`] opens the directory,
+//! renames, and only then syncs the directory, in that order. Deleting either
+//! sync, or moving it across the rename, fails a test.
 //!
-//! Closing it needs a harness that observes the syscalls rather than their
-//! results: an `LD_PRELOAD` shim, `strace -e` over a child process, or a fault
-//! injector between the write and the rename. None is cheap, and none belongs
-//! to this entry; the honest record is that the gap is open.
+//! What remains held by review is the one-line body of each function in
+//! `durable` — that `sync_file` really calls `sync_all` — because nothing in
+//! a unit test observes the kernel. That is a far smaller claim than "every
+//! call site remembered to sync", and it is not one a change to this file can
+//! break.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode as RawMode, OFlags};
 use rustix::io::Errno;
 use tempfile::NamedTempFile;
 
+use super::durable;
 use super::mode::{Kind, Mode};
 use crate::paths::Portable;
 use crate::report::Action;
@@ -227,6 +227,15 @@ pub struct Parent {
     pub path: PathBuf,
     /// What resolving it found.
     pub state: ParentState,
+    /// Where the directory really is, when `path` itself is a symlink to it.
+    ///
+    /// Only for reporting. bx writes *through* a symlinked parent but will not
+    /// chmod a directory through one — [`ensure_dir`] refuses a link — so the
+    /// only remedy for a wide one is to change the directory at the far end,
+    /// and a report that does not name it gives the user nothing to act on.
+    /// `None` for a parent that is not a link, and for one that does not
+    /// resolve.
+    pub resolved: Option<PathBuf>,
 }
 
 /// What a destination's parent turned out to be.
@@ -369,7 +378,10 @@ pub struct Outcome {
     ///
     /// Reported, never corrected: an existing directory is the user's, and bx
     /// surfaces drift rather than resolving it behind their back. The remedy is
-    /// to declare the directory as a target with the mode it should have.
+    /// to declare the directory as a target with the mode it should have —
+    /// except when the parent is a symlink, which a directory target refuses.
+    /// Then the note names the directory the link resolves to and says to
+    /// `chmod` that directory itself.
     pub parent_note: Option<String>,
 }
 
@@ -404,6 +416,18 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>) -> Outcome {
         let mode = parent.mode()?;
         if !mode.is_wider_than(desired.mode) {
             return None;
+        }
+        if let Some(resolved) = &parent.resolved {
+            // Declaring the link as a directory target would be refused, so
+            // the report names the directory that can actually be narrowed.
+            return Some(format!(
+                "{} is a symlink to {}, which is {mode}, wider than the {} this file declares; \
+                 bx will not chmod a directory through a link, so chmod {} itself",
+                parent.path.display(),
+                resolved.display(),
+                desired.mode,
+                resolved.display(),
+            ));
         }
         let verb = if parent.exists() {
             "is"
@@ -509,7 +533,9 @@ impl Pending {
 /// deep under `~/.config` must not need a directory declaration for every
 /// component. An *existing* directory is never chmod'd: it is the user's. When
 /// that leaves a parent wider than the declared mode, [`compare`] reports it,
-/// and the remedy is to declare the directory as a target of its own.
+/// and the remedy is to declare the directory as a target of its own — or, for
+/// a parent that is a symlink, to `chmod` the directory it resolves to, which
+/// the report names.
 ///
 /// A directory created here and then abandoned — because the temporary file
 /// could not be made, or because the write was never committed — is left in
@@ -608,7 +634,7 @@ impl Staged {
             source,
         };
         self.0.temp.write_all(bytes).map_err(&fail)?;
-        self.0.temp.as_file().sync_all().map_err(&fail)?;
+        durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(&fail)?;
         let written = ContentHash::of(bytes);
         Ok(Filled {
             pending: self.0,
@@ -716,10 +742,18 @@ impl Filled {
     /// content. That is inherent to an atomic rename and is why a mode-only
     /// change goes through [`set_mode`] instead.
     ///
+    /// The destination directory is opened **before** the rename and `fsync`ed
+    /// after it. Opening a directory needs read permission on it and renaming
+    /// into it does not, so in a `0300` directory an open placed after the
+    /// rename would fail with the new content already in place. Opened first,
+    /// that failure happens while the destination is still untouched, which is
+    /// what [`write_atomically`]'s contract promises for an `Err`.
+    ///
     /// # Errors
     ///
-    /// [`Error::Write`] wrapping the failing `rename` or `fsync`. The temporary
-    /// file is removed either way.
+    /// [`Error::Write`] wrapping the failing `open` of the directory, `rename`,
+    /// or `fsync`. The temporary file is removed either way. Only a failing
+    /// `fsync` of the directory is returned after the destination was replaced.
     pub fn publish(self) -> Result<(), Error> {
         let Self {
             pending: Pending {
@@ -729,11 +763,16 @@ impl Filled {
         } = self;
 
         let dir = parent_of(&dest)?;
-        temp.persist(&dest).map_err(|e| Error::Write {
+        let dir_fail = |source| Error::Write {
+            path: dir.to_path_buf(),
+            source,
+        };
+        let handle = durable::Dir::open(dir).map_err(dir_fail)?;
+        durable::rename(temp, &dest).map_err(|e| Error::Write {
             path: dest.clone(),
             source: e.error,
         })?;
-        fsync_dir(dir)?;
+        handle.sync().map_err(dir_fail)?;
 
         tracing::debug!(dest = %dest.display(), %mode, "wrote a file atomically");
         Ok(())
@@ -796,33 +835,87 @@ pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
     Ok(())
 }
 
-/// Make sure `path` is a directory at `mode`, creating it if it is absent.
+/// Compare what is at a **declared directory** target with the mode bx wants
+/// it at — the `plan` half of a directory target.
 ///
-/// The entry point for a **declared** directory target. Missing ancestors are
-/// created at [`Mode::DEFAULT_DIR`]; `path` itself is created at `mode`.
+/// Reads nothing, exactly like [`compare`]: `plan` for a directory target is
+/// [`observe`] then this, and nothing on disk changes. The parent is classified
+/// by the same [`ParentState`] a file's is, so a dangling symlink, a loop or a
+/// non-directory anywhere above the path is a conflict here, not an `ENOENT`
+/// for `apply` to discover.
 ///
-/// An existing directory whose mode differs is reported as
-/// [`Action::Modify`] and **is not changed here**: `plan` announces it and
-/// `apply` closes it with [`set_mode`], so the two never disagree. A directory
-/// bx did not create is the user's, and a mode it did not ask for is not
-/// silently taken from it.
+/// * [`Action::Unchanged`] — a directory at `mode`.
+/// * [`Action::Create`] — nothing is there; `path` will be created at `mode`
+///   and any missing ancestor at [`Mode::DEFAULT_DIR`].
+/// * [`Action::Modify`] — a directory at another mode, closed by [`set_mode`].
+///   The note reads exactly `mode 0755 -> 0700`, as for a file.
+/// * [`Action::Conflict`] — anything that is not a directory, including a
+///   symlink to one: bx does not chmod a directory through a link.
+#[must_use]
+pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
+    if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
+        return Outcome {
+            action: Action::Conflict,
+            content_drift: false,
+            mode_drift: None,
+            note: Some(reason.to_string()),
+            parent_note: None,
+        };
+    }
+
+    let conflict = |note: &str| (Action::Conflict, None, Some(note.to_string()));
+    let (action, mode_drift, note) = match observed.kind {
+        Kind::Absent => (Action::Create, None, None),
+        Kind::Dir => match observed.mode.filter(|found| *found != mode) {
+            None => (Action::Unchanged, None, None),
+            Some(found) => (
+                Action::Modify,
+                Some((found, mode)),
+                Some(format!("mode {found} -> {mode}")),
+            ),
+        },
+        Kind::File => conflict("a file, where the target declares a directory"),
+        Kind::Symlink => conflict("a symlink; bx will not change a directory through a link"),
+        Kind::Other => conflict("not a directory"),
+    };
+
+    Outcome {
+        action,
+        // A directory has no content to drift.
+        content_drift: false,
+        mode_drift,
+        note,
+        parent_note: None,
+    }
+}
+
+/// Make `path` the directory at `mode` that [`compare_dir`] announced — the
+/// `apply` half of a declared directory target.
+///
+/// It observes, runs [`compare_dir`], and performs **exactly** the action that
+/// comparison returns, which it also returns: nothing for `Unchanged`; `mkdir`
+/// for `Create`, with `path` at `mode` and missing ancestors at
+/// [`Mode::DEFAULT_DIR`]; [`set_mode`] for `Modify`; and nothing at all for
+/// `Conflict`, which is reported rather than raised because it is a verdict
+/// `plan` already printed. It never does work the comparison did not name, so
+/// `plan` must use [`observe`] + [`compare_dir`], not this.
 ///
 /// # Errors
 ///
-/// [`Error::Write`] when a directory cannot be created, and [`Error::Read`]
-/// when `path` cannot be stat'd.
+/// [`Error::Read`] when the path or its parent cannot be stat'd, and
+/// [`Error::Write`] when a directory cannot be created or chmod'd.
 pub fn ensure_dir(path: &Path, mode: Mode) -> Result<Action, Error> {
-    let Some(meta) = optional_metadata(path)? else {
-        create_missing_dirs(path, mode)?;
-        tracing::debug!(path = %path.display(), %mode, "created a directory");
-        return Ok(Action::Create);
-    };
-
-    match Kind::from(meta.file_type()) {
-        Kind::Dir if mode_of(&meta) == mode => Ok(Action::Unchanged),
-        Kind::Dir => Ok(Action::Modify),
-        _ => Ok(Action::Conflict),
+    let observed = observe(path)?;
+    let outcome = compare_dir(&observed, mode);
+    match outcome.action {
+        Action::Create => {
+            create_missing_dirs(path, mode)?;
+            tracing::debug!(path = %path.display(), %mode, "created a directory");
+        }
+        Action::Modify => set_mode(path, mode)?,
+        _ => {}
     }
+    Ok(outcome.action)
 }
 
 /// The directory `path` will be written into.
@@ -850,6 +943,17 @@ fn optional_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
     }
 }
 
+/// Whether a failed lookup means "this path does not lead anywhere" — nothing
+/// there, a non-directory in the way, or a symlink loop — rather than "bx was
+/// not allowed to look".
+fn unresolvable_path(e: &std::io::Error) -> bool {
+    // By errno rather than `ErrorKind`: `ErrorKind::FilesystemLoop` is not
+    // stable, and one comparison for all three keeps them visibly alike.
+    [Errno::NOENT, Errno::NOTDIR, Errno::LOOP]
+        .iter()
+        .any(|errno| e.raw_os_error() == Some(errno.raw_os_error()))
+}
+
 /// The mode bits out of a `stat` result.
 fn mode_of(meta: &std::fs::Metadata) -> Mode {
     use std::os::unix::fs::PermissionsExt as _;
@@ -875,9 +979,23 @@ fn mode_of(meta: &std::fs::Metadata) -> Mode {
 /// a dotfiles symlink as world-writable, and report it identically to a
 /// genuinely world-writable one.
 fn observe_parent(dir: &Path) -> Result<Parent, Error> {
+    let state = parent_state(dir)?;
+    // Resolved only for a parent that is itself a link to a directory. The
+    // verdict never depends on it — `state` is already settled — so a
+    // `realpath` that races and fails costs the report its far-end name and
+    // nothing else.
+    let resolved = match state {
+        ParentState::Present(_)
+            if std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()) =>
+        {
+            std::fs::canonicalize(dir).ok()
+        }
+        _ => None,
+    };
     Ok(Parent {
         path: dir.to_path_buf(),
-        state: parent_state(dir)?,
+        state,
+        resolved,
     })
 }
 
@@ -900,27 +1018,37 @@ fn parent_state(dir: &Path) -> Result<ParentState, Error> {
         Err(source) => {
             // The kernel refused to resolve the path — a symlink loop, most
             // often. If the component is readable as a link then the defect is
-            // bx's to report; otherwise the failure is a genuine read error.
-            return match std::fs::symlink_metadata(dir) {
-                Ok(_) => Ok(ParentState::Unusable(format!(
-                    "{} does not resolve to a directory ({source}), so bx cannot write a file inside it",
-                    dir.display()
-                ))),
-                Err(_) => Err(Error::Read {
-                    path: dir.to_path_buf(),
-                    source,
-                }),
-            };
+            // bx's to report. If it is not, the refusal may come from a
+            // component further up, which the walk below finds; anything else
+            // is a genuine read error.
+            match std::fs::symlink_metadata(dir) {
+                Ok(_) => {
+                    return Ok(ParentState::Unusable(format!(
+                        "{} does not resolve to a directory ({source}), so bx cannot write a file inside it",
+                        dir.display()
+                    )));
+                }
+                Err(e) if unresolvable_path(&e) => {}
+                Err(_) => {
+                    return Err(Error::Read {
+                        path: dir.to_path_buf(),
+                        source,
+                    });
+                }
+            }
         }
     }
 
     // Nothing resolves at `dir`. That is ordinarily a directory bx will create,
-    // but it is also what a dangling symlink anywhere along the path reports,
-    // and `mkdir` cannot create a directory through one. The deepest component
-    // that is present at all settles which of the two it is.
+    // but it is also what a dangling symlink, a symlink loop or a non-directory
+    // anywhere along the path reports, and `mkdir` cannot create a directory
+    // through any of them. The deepest component that is present at all
+    // settles which it is. `ENOTDIR` and `ELOOP` on a component mean the
+    // obstruction is further up, so the walk continues past them exactly as it
+    // does past `ENOENT`.
     for ancestor in dir.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if unresolvable_path(&e) => {}
             Err(source) => {
                 return Err(Error::Read {
                     path: ancestor.to_path_buf(),
@@ -1028,21 +1156,6 @@ fn fchmod(file: &std::fs::File, mode: Mode, path: &Path) -> Result<(), Error> {
         path: path.to_path_buf(),
         source: source.into(),
     })
-}
-
-/// `fsync` a directory, so a rename inside it survives a power loss.
-fn fsync_dir(dir: &Path) -> Result<(), Error> {
-    let fail = |source: Errno| Error::Write {
-        path: dir.to_path_buf(),
-        source: source.into(),
-    };
-    let fd = rustix::fs::open(
-        dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        RawMode::empty(),
-    )
-    .map_err(fail)?;
-    rustix::fs::fsync(&fd).map_err(fail)
 }
 
 #[cfg(test)]
@@ -1931,8 +2044,13 @@ mod tests {
         assert_eq!(err.path(), home.child("nope"));
     }
 
+    /// The `plan` verdict for a declared directory target.
+    fn dir_outcome_for(home: &GuardedHome, rel: &str, mode: Mode) -> Outcome {
+        compare_dir(&observe(&home.child(rel)).expect("observe"), mode)
+    }
+
     #[test]
-    fn ensure_dir_creates_at_the_declared_mode_and_reports_drift() {
+    fn ensure_dir_creates_at_the_declared_mode_and_closes_the_drift_plan_announced() {
         let home = guarded_home();
         let dir = home.child(".ssh");
 
@@ -1949,23 +2067,194 @@ mod tests {
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
 
-        // Drift is reported and not resolved behind the user's back.
+        // Drift is announced by plan, which changes nothing...
         set_mode(&dir, Mode::DEFAULT_DIR).expect("widen");
+        let planned = dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR);
+        assert_eq!(planned.action, Action::Modify);
+        assert_eq!(planned.note.as_deref(), Some("mode 0755 -> 0700"));
         assert_eq!(
-            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("drift"),
-            Action::Modify,
+            planned.mode_drift,
+            Some((Mode::DEFAULT_DIR, Mode::PRIVATE_DIR))
         );
+        assert!(!planned.content_drift);
         assert_eq!(
             mode_of_path(&dir),
             Mode::DEFAULT_DIR,
-            "ensure_dir reports the drift; apply closes it with set_mode",
+            "plan changed nothing"
         );
 
-        set_mode(&dir, Mode::PRIVATE_DIR).expect("close the drift");
+        // ...and closed by apply, which does exactly that and nothing else.
         assert_eq!(
-            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("converged"),
-            Action::Unchanged,
+            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("drift"),
+            planned.action,
         );
+        assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
+        assert_eq!(
+            dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).action,
+            Action::Unchanged,
+            "the second plan is empty",
+        );
+    }
+
+    #[test]
+    fn planning_a_directory_target_creates_nothing() {
+        let home = guarded_home();
+
+        let outcome = dir_outcome_for(&home, "declared/dir", Mode::PRIVATE_DIR);
+        assert_eq!(outcome.action, Action::Create);
+        assert_eq!(outcome.note, None);
+        assert_eq!(outcome.parent_note, None);
+        assert!(!outcome.content_drift);
+        assert_eq!(
+            names_in(home.path()),
+            Vec::<OsString>::new(),
+            "neither the directory nor its missing ancestor exists after plan",
+        );
+
+        // And apply performs the create plan announced.
+        assert_eq!(
+            ensure_dir(&home.child("declared/dir"), Mode::PRIVATE_DIR).expect("apply"),
+            outcome.action,
+        );
+        assert_eq!(mode_of_path(&home.child("declared/dir")), Mode::PRIVATE_DIR);
+        assert_eq!(mode_of_path(&home.child("declared")), Mode::DEFAULT_DIR);
+    }
+
+    #[test]
+    fn a_dangling_link_above_a_directory_target_is_a_conflict_at_plan_time() {
+        let home = guarded_home();
+        std::os::unix::fs::symlink("nowhere", home.child("d")).expect("symlink");
+
+        let outcome = dir_outcome_for(&home, "d/a", Mode::PRIVATE_DIR);
+        assert_eq!(outcome.action, Action::Conflict);
+        let note = outcome.note.expect("the cause must be named");
+        assert!(note.contains("does not resolve to a directory"), "{note}");
+
+        // A dangling link *at* the path is a link, and a conflict too.
+        assert_eq!(
+            dir_outcome_for(&home, "d", Mode::PRIVATE_DIR).action,
+            Action::Conflict,
+        );
+        assert_eq!(
+            ensure_dir(&home.child("d"), Mode::PRIVATE_DIR).expect("a verdict"),
+            Action::Conflict,
+        );
+        assert!(std::fs::symlink_metadata(home.child("nowhere")).is_err());
+    }
+
+    #[test]
+    fn a_directory_target_occupied_by_something_else_names_what_is_there() {
+        let home = guarded_home();
+        seed(&home.child("f"), b"x", Mode::DEFAULT_FILE);
+        std::fs::create_dir(home.child("real")).expect("mkdir");
+        std::os::unix::fs::symlink("real", home.child("link")).expect("symlink");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            home.child("fifo"),
+            rustix::fs::FileType::Fifo,
+            Mode::PRIVATE_FILE.into(),
+            0,
+        )
+        .expect("mkfifo");
+
+        for (rel, expected) in [
+            ("f", "a file, where the target declares a directory"),
+            (
+                "link",
+                "a symlink; bx will not change a directory through a link",
+            ),
+            ("fifo", "not a directory"),
+        ] {
+            let outcome = dir_outcome_for(&home, rel, Mode::PRIVATE_DIR);
+            assert_eq!(outcome.action, Action::Conflict, "{rel}");
+            assert_eq!(outcome.note.as_deref(), Some(expected), "{rel}");
+        }
+    }
+
+    #[test]
+    fn fill_syncs_the_temporary_file_before_it_returns() {
+        let home = guarded_home();
+        let staged = stage(&home.child("f"), Mode::DEFAULT_FILE).expect("stage");
+        let temp = staged.temp_path().to_path_buf();
+
+        let (filled, events) = durable::recording(|| staged.fill(b"x"));
+        let filled = filled.expect("fill");
+
+        assert_eq!(
+            events,
+            [durable::Event::SyncFile(temp)],
+            "the content is fsynced inside fill, so a journal recording its intent \
+             after fill returns is recording durable bytes",
+        );
+        filled.abandon();
+    }
+
+    #[test]
+    fn publish_syncs_the_directory_only_after_the_rename() {
+        let home = guarded_home();
+        let dest = home.child(".config/f");
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"x")
+            .expect("fill");
+        let temp = filled.temp_path().to_path_buf();
+
+        let (published, events) = durable::recording(|| filled.publish());
+        published.expect("publish");
+
+        let dir = home.child(".config");
+        assert_eq!(
+            events,
+            [
+                durable::Event::OpenDir(dir.clone()),
+                durable::Event::Rename {
+                    from: temp,
+                    to: dest.clone(),
+                },
+                durable::Event::SyncDir(dir),
+            ],
+            "the directory is opened before the rename and fsynced after it",
+        );
+    }
+
+    #[test]
+    fn write_atomically_makes_every_durability_call_in_order() {
+        let home = guarded_home();
+        let dest = home.child("f");
+        seed(&dest, b"v1", Mode::DEFAULT_FILE);
+
+        let (result, events) =
+            durable::recording(|| write_atomically(&dest, b"v2", Mode::DEFAULT_FILE));
+        result.expect("write");
+
+        let [
+            durable::Event::SyncFile(synced),
+            durable::Event::OpenDir(opened),
+            durable::Event::Rename { from, to },
+            durable::Event::SyncDir(dir_synced),
+        ] = events.as_slice()
+        else {
+            panic!("expected sync, open, rename, sync; got {events:?}");
+        };
+        assert_eq!(synced, from, "the file synced is the file renamed");
+        assert_eq!(to, &dest);
+        assert_eq!(opened, home.path());
+        assert_eq!(dir_synced, home.path());
+    }
+
+    #[test]
+    fn a_failed_rename_syncs_no_directory() {
+        let home = guarded_home();
+        let dest = home.child("f");
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"x")
+            .expect("fill");
+        std::fs::create_dir(&dest).expect("occupy");
+
+        let (published, events) = durable::recording(|| filled.publish());
+        published.expect_err("a directory is in the way");
+        assert_eq!(events, [durable::Event::OpenDir(home.path().to_path_buf())]);
     }
 
     #[test]
@@ -2260,5 +2549,91 @@ mod tests {
             assert_eq!(observed.prior_bytes(), PriorBytes::Absent, "{rel}");
             assert_eq!(observed.digest(), None, "{rel}");
         }
+    }
+
+    #[test]
+    fn ensure_dir_under_a_dangling_link_is_a_conflict_not_a_write_error() {
+        let home = guarded_home();
+        std::os::unix::fs::symlink("nowhere", home.child("d")).expect("symlink");
+
+        assert_eq!(
+            ensure_dir(&home.child("d/a"), Mode::PRIVATE_DIR).expect("a verdict, not an error"),
+            Action::Conflict,
+        );
+        assert!(
+            std::fs::symlink_metadata(home.child("nowhere")).is_err(),
+            "nothing was created at the far end",
+        );
+    }
+
+    #[test]
+    fn a_non_directory_further_up_is_a_conflict_not_a_read_error() {
+        let home = guarded_home();
+        seed(&home.child("f"), b"a file", Mode::DEFAULT_FILE);
+        std::os::unix::fs::symlink("loop", home.child("loop")).expect("symlink");
+        std::os::unix::fs::symlink("f", home.child("l")).expect("symlink");
+
+        for (rel, culprit) in [("f/sub/x", "f"), ("loop/a/x", "loop"), ("l/a/x", "l")] {
+            let outcome = outcome_for(&home, rel, b"x", Mode::DEFAULT_FILE);
+            assert_eq!(outcome.action, Action::Conflict, "{rel}");
+            let note = outcome.note.expect("the cause must be named");
+            assert!(
+                note.contains(&home.child(culprit).display().to_string()),
+                "{rel}: {note}",
+            );
+
+            let err = write_atomically(&home.child(rel), b"x", Mode::DEFAULT_FILE)
+                .expect_err("must refuse");
+            assert!(
+                matches!(err, Error::UnusableParent { .. }),
+                "{rel}: {err:?}"
+            );
+        }
+        assert_eq!(std::fs::read(home.child("f")).expect("read"), b"a file");
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_opened_for_its_fsync_fails_before_the_rename() {
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so there is nothing to assert.
+            return;
+        }
+        let home = guarded_home();
+        let dir = home.child("dropbox");
+        let dest = dir.join("f");
+        seed(&dest, b"v1", Mode::DEFAULT_FILE);
+        // Write and search, no read: a temporary file can be created and renamed
+        // here, and the directory cannot be opened to fsync the rename.
+        set_mode(&dir, Mode::from_bits(0o300)).expect("chmod");
+
+        let result = write_atomically(&dest, b"v2", Mode::DEFAULT_FILE);
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for cleanup");
+
+        let err = result.expect_err("the rename cannot be made durable");
+        assert!(matches!(err, Error::Write { .. }), "{err:?}");
+        assert_eq!(err.path(), dir);
+        assert_eq!(
+            std::fs::read(&dest).expect("read"),
+            b"v1",
+            "an Err means the destination holds exactly what it held before",
+        );
+        assert_eq!(names_in(&dir), vec![OsString::from("f")]);
+    }
+
+    #[test]
+    fn a_wide_symlinked_parent_names_the_directory_to_chmod() {
+        let home = guarded_home();
+        std::fs::create_dir_all(home.child("dotfiles/dot_ssh")).expect("mkdir");
+        set_mode(&home.child("dotfiles/dot_ssh"), Mode::DEFAULT_DIR).expect("chmod");
+        std::os::unix::fs::symlink("dotfiles/dot_ssh", home.child(".ssh")).expect("symlink");
+
+        let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
+        let note = outcome.parent_note.expect("the parent must be reported");
+        let resolved = std::fs::canonicalize(home.child("dotfiles/dot_ssh")).expect("realpath");
+        assert!(
+            note.contains(&resolved.display().to_string()),
+            "the note names the directory the link resolves to: {note}",
+        );
+        assert!(note.contains("chmod"), "{note}");
     }
 }

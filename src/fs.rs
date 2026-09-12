@@ -60,6 +60,17 @@ impl Error {
 /// digits so an error message reads the way `chmod` does. The file-type bits a
 /// `stat` returns are deliberately not carried: bx sets permissions, it never
 /// changes what a path *is*.
+///
+/// # This is the address, not yet the only definition
+///
+/// [`crate::config::target::Mode`] is the same concept, declared where the
+/// config schema needed it first, and its own documentation names `bx::fs::Mode`
+/// as the address its body is to be relocated to. This is that address. The two
+/// cannot be collapsed from here: `config::target::Mode`'s field is private to
+/// its module, so no constructor from raw `stat` bits and no `Deserialize` can
+/// be written outside it — and the ledger needs both. The collapse belongs to
+/// the entry that owns `config/target.rs`, and until it happens nothing may
+/// re-export one of these as the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Mode(u32);
@@ -101,6 +112,16 @@ impl Mode {
 impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:04o}", self.bits())
+    }
+}
+
+impl From<crate::config::target::Mode> for Mode {
+    /// The config schema's mode, as the mode bx writes with.
+    ///
+    /// The one direction that is expressible from here, and the one the pipeline
+    /// needs: a target declares a mode, and the writer and the ledger record it.
+    fn from(mode: crate::config::target::Mode) -> Self {
+        Self::from_bits(mode.bits())
     }
 }
 

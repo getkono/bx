@@ -288,7 +288,8 @@ fn bad_name_message(name: &str) -> String {
 ///
 /// # Errors
 ///
-/// [`Error::BadValue`] for an assignment that is neither a string nor a boolean.
+/// [`Error::BadValue`] for a key that is not a value name, and for an assignment
+/// that is neither a string nor a boolean.
 pub fn parse_assignments(
     table: &Table,
     file: &Path,
@@ -299,6 +300,17 @@ pub fn parse_assignments(
     table
         .iter()
         .map(|(name, item)| {
+            // Both sides of the vocabulary, checked by one predicate. A
+            // declaration is already held to `[a-z][a-z0-9_]*` and so is a
+            // `{{name}}` reference, so a key outside it — `""`, `"a.b"`,
+            // `"a{{b}}"` — names something no layer can ever have declared. It
+            // is not the case the ignore-an-unknown-answer rule protects: that
+            // exists so an account's `local.toml` outlives the repo revision
+            // that declared what it answers, and every name that revision could
+            // have declared is inside this vocabulary.
+            if !is_value_name(name) {
+                return Err(ctx.bad(table, name, bad_name_message(name)));
+            }
             let value = assigned_value(item).ok_or_else(|| {
                 ctx.bad(
                     table,
@@ -1380,6 +1392,22 @@ mod tests {
     }
 
     // --- declaration-time validation this entry adds ------------------------
+
+    #[test]
+    fn an_assignment_key_must_be_a_value_name_too() {
+        // One vocabulary, enforced wherever a name is written: a declaration, a
+        // `{{name}}` reference, and the key of an answer.
+        for bad in ["", "a.b", "a{{b}}", "Scratch", "scratch-root", "1st"] {
+            let text = format!("[values]\n\"{bad}\" = \"x\"\n");
+            let message = message(assignments(&text));
+            assert!(message.contains("is not a value name"), "{bad}: {message}");
+            assert!(message.contains("local.toml:2"), "{bad}: {message}");
+        }
+        for good in ["a", "scratch_root", "x2"] {
+            let text = format!("[values]\n{good} = \"x\"\n");
+            assert!(assignments(&text).is_ok(), "{good} should be accepted");
+        }
+    }
 
     #[test]
     fn a_value_name_must_be_lowercase_snake_case() {

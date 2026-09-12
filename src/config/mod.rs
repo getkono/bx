@@ -23,6 +23,7 @@
 pub mod layers;
 pub mod merge;
 pub mod origin;
+pub mod resolve;
 pub mod target;
 pub mod values;
 

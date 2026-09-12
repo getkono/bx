@@ -795,6 +795,7 @@ mod tests {
         for (name, source) in [
             ("merge.rs", include_str!("merge.rs")),
             ("values.rs", include_str!("values.rs")),
+            ("resolve.rs", include_str!("resolve.rs")),
             ("values/local.rs", include_str!("values/local.rs")),
         ] {
             // The non-test half only: this very test names the strings it

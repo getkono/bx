@@ -104,32 +104,47 @@ pub enum Error {
     EscapesRoot(String),
 }
 
-/// Normalise a rooted path lexically, without touching the filesystem.
+/// Normalise a **rooted** path lexically, without touching the filesystem.
 ///
-/// Collapses `//` and `.`, and resolves `..` textually. Lexical and not
-/// `canonicalize`, because a portable path names a destination that need not
-/// exist yet, and because resolving symlinks would make the result depend on the
-/// machine — which is the one thing a *portable* path may not do.
+/// The one entry point that knows what a root means. It delegates the `.`, `//`
+/// and `..` folding to [`normalize`] — there is one implementation of that rule
+/// in this crate, because two that disagreed would let a value land outside the
+/// root that was meant to admit it — and adds the only thing a root contributes:
+/// what a `..` with nothing left to cancel does.
 ///
-/// An absolute path clamps at `/`, as the kernel does: `/a/../..` is `/`. A
-/// `~`-rooted path does not clamp, because `~/..` is a real location outside the
-/// home and silently reading it as the home would be the surprise.
-fn normalise(raw: &str) -> Result<String, Error> {
+/// An absolute path **clamps** at `/`, as the kernel does: `/a/../..` is `/`. A
+/// `~`-rooted one is **refused** with [`Error::EscapesRoot`], because `~/..` is
+/// a real location outside the home and silently reading it as the home would be
+/// the surprise.
+///
+/// Lexical and never `canonicalize`: a portable path names a destination that
+/// need not exist yet, and resolving symlinks would make the result depend on
+/// the machine, which is the one thing a *portable* path may not do.
+///
+/// # Errors
+///
+/// [`Error::NotPortable`] if `raw` is neither `~`- nor `/`-rooted;
+/// [`Error::EscapesRoot`] if it is `~`-rooted and climbs out of that root.
+pub fn normalize_rooted(raw: &str) -> Result<String, Error> {
     let Some((root, rest)) = split_root(raw) else {
         return Err(Error::NotPortable(raw.to_string()));
     };
 
-    let mut parts: Vec<&str> = Vec::new();
-    for part in rest.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                if parts.pop().is_none() && !root.is_empty() {
-                    return Err(Error::EscapesRoot(raw.to_string()));
-                }
-            }
-            named => parts.push(named),
+    // `rest` is relative, so `normalize` keeps a leading `..` that has nothing
+    // to cancel — which is exactly the climb the root then rules on.
+    let folded = normalize(Path::new(rest));
+    let folded = folded.to_string_lossy();
+    let mut parts: Vec<&str> = folded
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+
+    if root.is_empty() {
+        while parts.first() == Some(&"..") {
+            parts.remove(0);
         }
+    } else if parts.first() == Some(&"..") {
+        return Err(Error::EscapesRoot(raw.to_string()));
     }
 
     Ok(match (root, parts.is_empty()) {
@@ -306,7 +321,7 @@ impl Portable {
     /// one is how a check on [`Portable::under_home`] becomes a check on
     /// nothing.
     pub fn parse(raw: &str) -> Result<Self, Error> {
-        normalise(raw).map(Self)
+        normalize_rooted(raw).map(Self)
     }
 
     /// The stored string.
@@ -337,7 +352,7 @@ impl Portable {
 /// Normalise a path lexically, keeping it as it was if it has no root.
 fn normalised_or_given(path: &Path) -> String {
     let raw = path.to_string_lossy();
-    normalise(&raw).unwrap_or_else(|_| raw.into_owned())
+    normalize_rooted(&raw).unwrap_or_else(|_| raw.into_owned())
 }
 
 impl std::fmt::Display for Portable {
@@ -362,6 +377,13 @@ impl std::fmt::Display for Portable {
 /// which directory the path names.
 ///
 /// An empty result normalises to `.`, the shortest path naming the same place.
+///
+/// This is the crate's **only** implementation of the lexical rule.
+/// [`normalize_rooted`] is the same rule with a root's policy on top, and
+/// [`Portable`] is built through that, so a declared `path` value, a portable
+/// path and `env_guard`'s root comparison cannot disagree about what a `..`
+/// means. Two normalisers that disagreed would let a value land outside the root
+/// that was meant to admit it.
 #[must_use]
 pub fn normalize(path: &Path) -> PathBuf {
     let mut out: Vec<Component<'_>> = Vec::new();
@@ -754,6 +776,49 @@ mod tests {
             .collect();
 
         assert_eq!(keys.len(), 1, "one file must not acquire three ledger rows");
+    }
+
+    #[test]
+    fn both_normalisers_fold_by_one_rule() {
+        // The collision this branch had to resolve: a rooted path and a bare
+        // path must agree about what `.`, `//` and `..` mean, or a value can be
+        // normalised into one shape for the env_guard root set and another for
+        // the target it is written into.
+        for rest in [
+            "a/./b",
+            "a//b",
+            "a/b/../c",
+            "a/../b",
+            "a/b/",
+            ".",
+            "",
+            "a/../../b",
+        ] {
+            let folded = normalize(Path::new(rest));
+            let folded = folded.to_string_lossy();
+
+            let absolute = normalize_rooted(&format!("/{rest}")).expect("absolute always folds");
+            let tilde = normalize_rooted(&format!("~/{rest}"));
+
+            if folded.starts_with("..") {
+                // The root's own policy, and the only thing that differs: an
+                // absolute path clamps the climb away, as the kernel does, and a
+                // `~`-rooted one is refused outright.
+                let clamped = folded.trim_start_matches("..").trim_start_matches('/');
+                assert_eq!(absolute, format!("/{clamped}"), "{rest}");
+                assert_eq!(
+                    tilde,
+                    Err(Error::EscapesRoot(format!("~/{rest}"))),
+                    "{rest}"
+                );
+            } else if folded == "." {
+                assert_eq!(absolute, "/", "/{rest}");
+                assert_eq!(tilde.unwrap(), "~", "{rest}");
+            } else {
+                assert_eq!(absolute, format!("/{folded}"), "{rest}");
+                assert_eq!(tilde.unwrap(), format!("~/{folded}"), "{rest}");
+            }
+        }
     }
 
     #[test]

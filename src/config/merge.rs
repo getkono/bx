@@ -93,14 +93,70 @@ impl Keyed for ValueDecl {
     }
 }
 
+/// Which keyed list an entry belongs to.
+///
+/// An enum rather than the section's name, because [`Toggle`], [`Config`],
+/// [`Layer`] and [`merge`] are all public: a section string with no arm in the
+/// merge would panic a library call, and a `&str` match has no exhaustiveness
+/// checking to stop one being written. The later entries that add keyed sections
+/// are exactly the callers that would have hit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    /// `[[target]]`, keyed by `path`.
+    Target,
+    /// `[[value]]`, keyed by `name`.
+    Value,
+}
+
+impl Section {
+    /// The TOML key the section is written under.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Target => "target",
+            Self::Value => "value",
+        }
+    }
+
+    /// The section header, as messages spell it.
+    #[must_use]
+    pub fn header(self) -> &'static str {
+        match self {
+            Self::Target => super::target::SECTION,
+            Self::Value => super::values::DECL_SECTION,
+        }
+    }
+
+    /// The natural key an entry in this section merges by.
+    #[must_use]
+    pub fn natural_key(self) -> &'static str {
+        match self {
+            Self::Target => "path",
+            Self::Value => "name",
+        }
+    }
+
+    /// What a *full* entry in this section still needs.
+    ///
+    /// For the one message that has to cover both readings of a toggle-shaped
+    /// table: a toggle naming an entry nothing introduced, or an entry somebody
+    /// meant to write in full and left incomplete.
+    fn a_full_entry_needs(self) -> &'static str {
+        match self {
+            Self::Target => "one of `file`, `content`, `generated` or `dir`",
+            Self::Value => "a `kind`",
+        }
+    }
+}
+
 /// A list entry that restates only its key and its `enabled` flag.
 ///
-/// Parsed rather than resolved: which list it belongs to is carried as the
-/// section name so one representation serves every keyed section.
+/// Parsed rather than resolved: which list it belongs to is carried as a
+/// [`Section`] so one representation serves every keyed section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toggle {
-    /// The section it appeared in — `"target"`, `"value"`.
-    pub section: &'static str,
+    /// The section it appeared in.
+    pub section: Section,
     /// The natural key of the entry it flips.
     pub key: String,
     /// What to flip it to.
@@ -122,18 +178,17 @@ pub struct Toggle {
 /// boolean.
 pub(crate) fn toggle_of(
     table: &Table,
-    section: &'static str,
-    natural_key: &'static str,
-    display_section: &'static str,
+    section: Section,
     file: &Path,
     text: &str,
 ) -> Result<Option<Toggle>, Error> {
+    let natural_key = section.natural_key();
     let keys: Vec<&str> = table.iter().map(|(key, _)| key).collect();
     if keys.len() != 2 || !keys.contains(&natural_key) || !keys.contains(&"enabled") {
         return Ok(None);
     }
 
-    let ctx = Ctx::new(table, file, text, display_section);
+    let ctx = Ctx::new(table, file, text, section.header());
     let key = ctx.required_str(table, natural_key)?;
     let enabled = ctx
         .bool_at(table, "enabled")?
@@ -191,12 +246,20 @@ impl<T: Keyed> Merged<T> {
     /// no-op here is how an account ends up with a file it explicitly refused.
     pub fn toggle(&mut self, toggle: &Toggle) -> Result<(), Error> {
         let Some(index) = self.position(&toggle.key) else {
+            // Both readings, because nothing here can tell them apart: a table
+            // holding only the natural key and `enabled` is a toggle wherever it
+            // appears, so in the first layer an entry somebody meant to write in
+            // full and left incomplete arrives here too.
             return Err(Error::BadValue {
                 origin: toggle.origin.clone(),
                 message: format!(
-                    "`{}` toggles `{}`, which no earlier layer declares; a toggle \
-                     may only flip an entry that already exists",
-                    toggle.section, toggle.key
+                    "`{}` toggles `{}`, which no earlier layer declares; a toggle — an \
+                     entry with only `{}` and `enabled` — may only flip an entry that \
+                     already exists, and a new entry needs {}",
+                    toggle.section.header(),
+                    toggle.key,
+                    toggle.section.natural_key(),
+                    toggle.section.a_full_entry_needs(),
                 ),
             });
         };
@@ -252,12 +315,11 @@ pub fn merge(layers: &[Layer]) -> Result<Config, Error> {
         values.absorb(layer.config.values.iter().cloned());
 
         for toggle in &layer.config.toggles {
+            // Exhaustive over `Section`, so a keyed list added later is a
+            // compile error here rather than a panic in a library call.
             match toggle.section {
-                "target" => targets.toggle(toggle)?,
-                "value" => values.toggle(toggle)?,
-                // Every section that produces a toggle has an arm; a new one
-                // without an arm is a compile-time hole, not a runtime surprise.
-                other => unreachable!("no keyed list is named `{other}`"),
+                Section::Target => targets.toggle(toggle)?,
+                Section::Value => values.toggle(toggle)?,
             }
         }
 
@@ -528,6 +590,48 @@ mod tests {
         );
         assert!(message.contains("interfase.ini"), "{message}");
         assert!(message.contains("local.toml:1"), "{message}");
+    }
+
+    #[test]
+    fn the_toggle_error_covers_both_readings_of_a_two_key_entry() {
+        // A table holding only the natural key and `enabled` is a toggle
+        // wherever it appears, so in the *first* layer an entry somebody meant
+        // to write in full and left incomplete arrives at the same place. No
+        // valid entry has exactly those two keys, so nothing real is swallowed
+        // — but the message has to name both readings or the second one reads
+        // as nonsense.
+        let message = failure(&[global(
+            "bx.toml",
+            "[[target]]\npath = \"~/.gitconfig\"\nenabled = true\n",
+        )]);
+
+        assert!(message.contains("no earlier layer declares"), "{message}");
+        assert!(
+            message.contains("`file`, `content`, `generated` or `dir`"),
+            "{message}"
+        );
+
+        let message = failure(&[global(
+            "bx.toml",
+            "[[value]]\nname = \"agent_slice\"\nenabled = true\n",
+        )]);
+
+        assert!(message.contains("needs a `kind`"), "{message}");
+    }
+
+    #[test]
+    fn every_keyed_section_is_a_variant_with_its_own_names() {
+        // `Toggle`, `Config`, `Layer` and `merge` are all public, so a section
+        // with no arm in the merge would panic a library call. It is an enum,
+        // and the match over it is exhaustive.
+        for (section, key, header, natural) in [
+            (Section::Target, "target", "[[target]]", "path"),
+            (Section::Value, "value", "[[value]]", "name"),
+        ] {
+            assert_eq!(section.key(), key);
+            assert_eq!(section.header(), header);
+            assert_eq!(section.natural_key(), natural);
+        }
     }
 
     #[test]

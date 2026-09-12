@@ -231,7 +231,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
                     // A table whose only keys are `path` and `enabled` is a
                     // toggle, not a target with no body: it flips a flag on an
                     // entry an earlier layer introduced.
-                    match merge::toggle_of(table, "target", "path", target::SECTION, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Target, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .targets
@@ -241,14 +241,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
             }
             "value" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(
-                        table,
-                        "value",
-                        "name",
-                        values::DECL_SECTION,
-                        file,
-                        text,
-                    )? {
+                    match merge::toggle_of(table, merge::Section::Value, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .values
@@ -283,7 +276,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
             .targets
             .iter()
             .map(|t| (t.path.as_str(), &t.origin))
-            .chain(toggles_in(&config, "target"))
+            .chain(toggles_in(&config, merge::Section::Target))
             .collect(),
     )?;
     check_unique(
@@ -292,7 +285,7 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
             .values
             .iter()
             .map(|v| (v.name.as_str(), &v.origin))
-            .chain(toggles_in(&config, "value"))
+            .chain(toggles_in(&config, merge::Section::Value))
             .collect(),
     )?;
 
@@ -301,10 +294,10 @@ pub fn parse_str(text: &str, file: &Path) -> Result<Config, Error> {
 
 /// The toggles in `config` that belong to one section, as `check_unique` wants
 /// them.
-fn toggles_in<'a>(
-    config: &'a Config,
-    section: &'static str,
-) -> impl Iterator<Item = (&'a str, &'a Origin)> {
+fn toggles_in(
+    config: &Config,
+    section: merge::Section,
+) -> impl Iterator<Item = (&str, &Origin)> {
     config
         .toggles
         .iter()

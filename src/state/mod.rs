@@ -16,14 +16,25 @@
 //! * [`ExclusiveLock`] / [`SharedLock`] — one advisory `flock` over the whole
 //!   directory, so two mutating `bx` processes cannot interleave.
 //!
-//! # Every file here is reconstructible
+//! # Every file here is reconstructible from bad bytes — not from no bytes
 //!
 //! A machine-owned file that becomes an error the user cannot clear is a defect,
-//! so damage is never fatal. A truncated, garbled, wrong-kind or
+//! so damaged *contents* are never fatal. A truncated, garbled, wrong-kind or
 //! future-versioned file is moved aside to a fixed `<name>.corrupt`, reported
 //! through `tracing::warn!`, and replaced by the empty default; the next save
 //! writes a clean file. The damaged bytes are kept, never deleted, so a human or
 //! `bx doctor` can still look at them. See [`Damage`] and [`Health`].
+//!
+//! A file that **cannot be read** is a different thing and is handled the
+//! opposite way. `EACCES` left behind by a `sudo bx`, `EIO` from a failing
+//! disk, `EMFILE` from fd exhaustion — in none of those is anything known about
+//! the file's contents, and the bytes a quarantine would move aside may be a
+//! perfectly good ledger. So nothing is renamed, nothing is replaced, and
+//! [`Error::Read`] is returned: [`Ledger::open`], [`LedgerView::read`] and
+//! [`Fingerprints::read`] are fallible for exactly this reason. The ledger is
+//! the one state file recomputation cannot rebuild — discarding it loses the
+//! prior bytes `bx rm` restores, permanently — so an access failure has to stop
+//! bx rather than silently reset it.
 //!
 //! # Resolution takes an explicit home
 //!

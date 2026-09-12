@@ -109,17 +109,26 @@ pub struct Fingerprints {
 impl Fingerprints {
     /// Read the cache without taking a lock.
     ///
-    /// Never fails: a damaged `fingerprints.mpk` is quarantined and this returns
-    /// an empty cache. Losing a cache costs a recomputation, which is exactly
-    /// what a cache is allowed to cost.
-    #[must_use]
-    pub fn read(dir: &StateDir) -> Loaded<Self> {
+    /// A damaged `fingerprints.mpk` is quarantined and this returns an empty
+    /// cache. Losing a cache costs a recomputation, which is exactly what a
+    /// cache is allowed to cost.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Read`] if `fingerprints.mpk` exists and cannot be read. A file
+    /// whose bytes were never seen is not damaged and is never quarantined; a
+    /// caller is free to treat the failure as a cache miss, but it has to
+    /// decide that itself rather than have a rename decide it.
+    pub fn read(dir: &StateDir) -> Result<Loaded<Self>, Error> {
         store::load(&dir.fingerprints(), KIND, VERSION)
     }
 
     /// Read the cache for writing, under the exclusive lock.
-    #[must_use]
-    pub fn open(dir: &StateDir, _lock: &ExclusiveLock) -> Loaded<Self> {
+    ///
+    /// # Errors
+    ///
+    /// As [`Fingerprints::read`].
+    pub fn open(dir: &StateDir, _lock: &ExclusiveLock) -> Result<Loaded<Self>, Error> {
         Self::read(dir)
     }
 
@@ -238,13 +247,13 @@ mod tests {
         let dir = StateDir::resolve(home.path());
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
 
-        let mut fingerprints = Fingerprints::open(&dir, &lock).value;
+        let mut fingerprints = Fingerprints::open(&dir, &lock).expect("open").value;
         for key in ["activation:uv", "activation:mise", "activation:rustup"] {
             fingerprints.set(key, Fingerprint::hashed(key.as_bytes()));
         }
         fingerprints.save(&dir).expect("save");
 
-        let reloaded = Fingerprints::read(&dir);
+        let reloaded = Fingerprints::read(&dir).expect("read");
         assert_eq!(reloaded.health, Health::Loaded);
         let keys: Vec<_> = reloaded.value.iter().map(|(key, _)| key.as_str()).collect();
         assert_eq!(
@@ -293,7 +302,7 @@ mod tests {
         dir.ensure().expect("ensure");
         std::fs::write(dir.fingerprints(), b"\x00\x01 not an envelope").expect("seed");
 
-        let loaded = Fingerprints::read(&dir);
+        let loaded = Fingerprints::read(&dir).expect("read");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
         assert!(dir.root().join("fingerprints.mpk.corrupt").exists());
@@ -301,7 +310,10 @@ mod tests {
         // The point of a cache: the next save writes a clean file and nothing
         // the user has to clear is left behind.
         loaded.value.save(&dir).expect("save");
-        assert_eq!(Fingerprints::read(&dir).health, Health::Loaded);
+        assert_eq!(
+            Fingerprints::read(&dir).expect("read").health,
+            Health::Loaded
+        );
     }
 
     #[test]
@@ -319,7 +331,7 @@ mod tests {
         )
         .expect("seed");
 
-        let loaded = Fingerprints::read(&dir);
+        let loaded = Fingerprints::read(&dir).expect("read");
         assert_eq!(
             loaded.health,
             Health::Reset(Damage::WrongKind {

@@ -3,9 +3,26 @@
 //! `CLAUDE.md` requires every machine-owned file to be *reconstructible*, so a
 //! corrupt one degrades to recomputation rather than to an error the user cannot
 //! clear. That requirement is met here, once, for every file in the state
-//! directory: [`load`] never fails. It returns the stored value, or — for any
-//! damage at all — the empty default, having first moved the damaged bytes aside
-//! to `<name>.corrupt` and warned about it.
+//! directory: [`load`] returns the stored value, or — for damaged *contents* —
+//! the empty default, having first moved the damaged bytes aside to
+//! `<name>.corrupt` and warned about it.
+//!
+//! # Damage is a decode failure, never an access failure
+//!
+//! The degradation applies to a file whose **bytes were read and are bad**. A
+//! file that could not be read at all — `EACCES` because a `sudo bx` left the
+//! ledger root-owned, `EIO` from a failing disk, `EMFILE` from fd exhaustion —
+//! is not damaged: nothing whatever is known about its contents, and the
+//! quarantined bytes would be a perfectly good ledger. [`load`] therefore
+//! returns [`Error::Read`] for an access failure and **never renames a file
+//! whose bytes it has not read**.
+//!
+//! That distinction is load-bearing for Invariant 4 rather than cosmetic. The
+//! ledger is the one state file that is *not* reconstructible by recomputation:
+//! nothing can recover the prior bytes of a target once the record of them is
+//! discarded, so silently degrading to an empty ledger would make `bx rm`
+//! restore bx's own generated content over the user's files. Losing a cache is
+//! a delay; losing the ledger is permanent.
 
 use std::path::Path;
 
@@ -32,11 +49,13 @@ struct Envelope<T> {
     payload: T,
 }
 
-/// What was wrong with a state file that had to be discarded.
+/// What was wrong with the *contents* of a state file that had to be discarded.
+///
+/// Every variant is a decode failure: the bytes were read, and they are not a
+/// usable envelope. A file that could not be read is not represented here —
+/// see [`Error::Read`] and the module documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Damage {
-    /// The file exists but could not be read.
-    Unreadable,
     /// The bytes are not a well-formed envelope.
     Malformed,
     /// A whole envelope decoded, and then there were more bytes.
@@ -58,7 +77,6 @@ pub enum Damage {
 impl std::fmt::Display for Damage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unreadable => f.write_str("it could not be read"),
             Self::Malformed => f.write_str("it is not valid MessagePack"),
             Self::TrailingBytes => f.write_str("it has unexpected bytes after the end"),
             Self::WrongKind { found } => write!(f, "it is a {found} file"),
@@ -101,10 +119,12 @@ impl Health {
 
 /// A value, and how it came to be.
 ///
-/// Loading never fails, so the health travels with the value rather than in a
-/// `Result`. A caller that wants to tell the user "your ledger was corrupt and
+/// Damage is not a failure, so it travels with the value rather than in the
+/// `Err` arm: a caller that wants to tell the user "your ledger was corrupt and
 /// has been reset" reads [`Loaded::health`]; a caller that only wants the value
-/// reads the `value` field and ignores it.
+/// reads the `value` field and ignores it. The `Err` arm is reserved for a file
+/// that could not be read, where there is no value to return and no health to
+/// describe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded<T> {
     /// The loaded — or default — value.
@@ -123,33 +143,48 @@ impl<T> Loaded<T> {
     }
 }
 
-/// Read a state file, degrading to `T::default()` for any damage.
+/// Read a state file, degrading to `T::default()` for damaged contents.
 ///
-/// Never fails. Any damage moves the file to `<name>.corrupt`, emits a
-/// `tracing::warn!`, and yields the default; the next [`save`] writes a clean
-/// file over the original name, so the condition clears itself.
+/// A missing file is [`Health::Fresh`]. Damaged contents move the file to
+/// `<name>.corrupt`, emit a `tracing::warn!`, and yield the default; the next
+/// [`save`] writes a clean file over the original name, so the condition clears
+/// itself.
+///
+/// # Errors
+///
+/// [`Error::Read`] if the file exists and cannot be read. That is an access
+/// failure, not damage: the bytes were never seen, so they are neither
+/// quarantined nor discarded, and the caller must treat it as fatal rather than
+/// carry on against an empty default.
 pub(crate) fn load<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
     version: u16,
-) -> Loaded<T> {
+) -> Result<Loaded<T>, Error> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Loaded {
+            return Ok(Loaded {
                 value: T::default(),
                 health: Health::Fresh,
-            };
+            });
         }
-        Err(_) => return reset(path, &Damage::Unreadable),
+        Err(source) => {
+            return Err(Error::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
     };
 
     match decode::<T>(&bytes, kind, version) {
-        Ok(value) => Loaded {
+        Ok(value) => Ok(Loaded {
             value,
             health: Health::Loaded,
-        },
-        Err(damage) => reset(path, &damage),
+        }),
+        // Quarantine happens only here: after `read` succeeded and `decode`
+        // failed, so the bytes being moved aside are known to be unusable.
+        Err(damage) => Ok(reset(path, &damage)),
     }
 }
 
@@ -269,7 +304,8 @@ mod tests {
     #[test]
     fn a_missing_file_loads_as_fresh_and_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let loaded: Loaded<Value> = load(&dir.path().join("nope.mpk"), KIND, VERSION);
+        let loaded: Loaded<Value> =
+            load(&dir.path().join("nope.mpk"), KIND, VERSION).expect("load");
         assert_eq!(loaded.health, Health::Fresh);
         assert!(loaded.value.is_empty());
         assert!(!loaded.health.is_reset());
@@ -281,7 +317,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         save(&path, KIND, VERSION, &sample()).expect("save");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert_eq!(loaded.health, Health::Loaded);
         assert_eq!(loaded.value, sample());
     }
@@ -315,7 +351,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, encoded(KIND, VERSION - 1, &sample())).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert_eq!(loaded.health, Health::Loaded);
         assert_eq!(loaded.value, sample());
     }
@@ -326,7 +362,7 @@ mod tests {
         let path = dir.path().join("v.mpk");
         let bytes = encoded(KIND, VERSION, &sample());
         std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
     }
@@ -336,7 +372,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"this is certainly not MessagePack").expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
     }
@@ -348,7 +384,7 @@ mod tests {
         let mut bytes = encoded(KIND, VERSION, &sample());
         bytes.extend_from_slice(b"\x00\x00leftovers");
         std::fs::write(&path, &bytes).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert_eq!(loaded.health, Health::Reset(Damage::TrailingBytes));
         assert!(loaded.value.is_empty());
     }
@@ -358,7 +394,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, encoded(KIND, VERSION + 5, &sample())).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert_eq!(
             loaded.health,
             Health::Reset(Damage::FutureVersion {
@@ -377,7 +413,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, encoded(OTHER, VERSION, &sample())).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert_eq!(
             loaded.health,
             Health::Reset(Damage::WrongKind {
@@ -393,7 +429,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"garbage").expect("seed");
-        let _: Loaded<Value> = load(&path, KIND, VERSION);
+        let _: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert!(!path.exists(), "the damaged file must be moved aside");
         let quarantine = StateDir::quarantine(&path);
         assert_eq!(std::fs::read(&quarantine).expect("read"), b"garbage");
@@ -404,9 +440,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"first").expect("seed");
-        let _: Loaded<Value> = load(&path, KIND, VERSION);
+        let _: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         std::fs::write(&path, b"second").expect("seed again");
-        let _: Loaded<Value> = load(&path, KIND, VERSION);
+        let _: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
 
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read_dir")
@@ -424,25 +460,59 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"garbage").expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert!(loaded.health.is_reset());
 
         save(&path, KIND, VERSION, &sample()).expect("save");
-        let again: Loaded<Value> = load(&path, KIND, VERSION);
+        let again: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert_eq!(again.health, Health::Loaded);
         assert_eq!(again.value, sample());
     }
 
     #[test]
-    fn an_unreadable_file_degrades_rather_than_failing() {
+    fn a_file_that_cannot_be_read_is_an_error_not_damage() {
         let dir = tempfile::tempdir().expect("tempdir");
         // A directory where a file should be: `read` fails with EISDIR, which
-        // is neither NotFound nor decodable.
+        // is neither NotFound nor a statement about any bytes.
         let path = dir.path().join("v.mpk");
         std::fs::create_dir(&path).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
-        assert_eq!(loaded.health, Health::Reset(Damage::Unreadable));
-        assert!(loaded.value.is_empty());
+        let err = load::<Value>(&path, KIND, VERSION).expect_err("must fail");
+        assert!(
+            matches!(&err, Error::Read { path: at, .. } if *at == path),
+            "got {err}",
+        );
+    }
+
+    #[test]
+    fn an_intact_file_that_cannot_be_read_is_left_exactly_where_it_is() {
+        if rustix::process::geteuid().is_root() {
+            // `0000` denies nothing to root, so the condition cannot be staged.
+            // The root-independent half of this property is pinned by
+            // `a_file_that_cannot_be_read_is_an_error_not_damage`.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        save(&path, KIND, VERSION, &sample()).expect("save");
+        let intact = std::fs::read(&path).expect("read");
+        // What a `sudo bx` leaves behind: a perfectly good state file this
+        // account cannot open. Nothing is known about its bytes, so nothing may
+        // be renamed and nothing may be reset.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let err = load::<Value>(&path, KIND, VERSION).expect_err("must fail");
+        assert!(matches!(err, Error::Read { .. }), "got {err}");
+        assert!(path.exists(), "the file must not be moved aside");
+        assert!(
+            !StateDir::quarantine(&path).exists(),
+            "a file whose bytes were never read must never be quarantined",
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("restore");
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        assert_eq!(loaded.health, Health::Loaded);
+        assert_eq!(loaded.value, sample());
+        assert_eq!(std::fs::read(&path).expect("read"), intact);
     }
 
     #[test]
@@ -457,7 +527,7 @@ mod tests {
         std::fs::create_dir(&quarantine).expect("occupy");
         std::fs::write(quarantine.join("keep"), b"x").expect("occupy");
 
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION);
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
         assert!(loaded.health.is_reset());
         assert!(loaded.value.is_empty());
         assert!(path.exists(), "the damaged bytes survive a failed rename");

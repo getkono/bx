@@ -1024,6 +1024,70 @@ mod tests {
     }
 
     #[test]
+    fn written_is_the_whole_file_for_a_shared_file_not_bxs_contribution() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+
+        // Under `Own` these two are the same bytes by construction, so the
+        // property is only visible for a mechanism where bx writes part of a
+        // file the user also writes.
+        let users_line = "export EDITOR=hx\n";
+        let region = "# >>> bx >>>\nexport PATH=\"$HOME/.local/bin:$PATH\"\n# <<< bx <<<\n";
+        let whole = format!("{users_line}{region}");
+        let include = "source ~/.local/state/bx/shell/init.zsh\n";
+        let whole_with_include = format!("{users_line}{include}");
+
+        for (name, mechanism, contents, contribution) in [
+            (
+                "~/.bashrc",
+                Mechanism::Region { comment: '#' },
+                whole.as_str(),
+                region,
+            ),
+            (
+                "~/.zshrc",
+                Mechanism::Include {
+                    line: include.trim_end().to_string(),
+                },
+                whole_with_include.as_str(),
+                include,
+            ),
+        ] {
+            let mut new = NewEntry::new(
+                target(name),
+                ContentHash::of(contents.as_bytes()),
+                Mode::DEFAULT_FILE,
+                mechanism,
+            );
+            new = new.with_prior(PriorBytes::Bytes {
+                bytes: users_line.as_bytes().to_vec(),
+                mode: Mode::DEFAULT_FILE,
+            });
+            let stored = ledger.record(new).expect("record");
+            assert_eq!(stored.written, ContentHash::of(contents.as_bytes()));
+            assert_ne!(
+                stored.written,
+                ContentHash::of(contribution.as_bytes()),
+                "`written` must cover the user's bytes too, or `plan` cannot \
+                 tell a file the user edited from one only bx wrote",
+            );
+        }
+        ledger.save().expect("save");
+
+        // The distinction has to survive the round trip, because `plan` reads
+        // it back rather than recomputing it.
+        let reloaded = LedgerView::read(&dir).expect("read").value;
+        let bashrc = reloaded.get(&target("~/.bashrc")).expect("entry");
+        assert_eq!(bashrc.written, ContentHash::of(whole.as_bytes()));
+        assert_eq!(bashrc.mechanism, Mechanism::Region { comment: '#' });
+        assert_eq!(
+            reloaded.get(&target("~/.zshrc")).expect("entry").written,
+            ContentHash::of(whole_with_include.as_bytes()),
+        );
+    }
+
+    #[test]
     fn the_ledger_survives_a_save_and_reload() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);

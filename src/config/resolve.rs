@@ -22,6 +22,11 @@
 //! identity values become declared values, and their absence blocks the one
 //! target that needs them.
 //!
+//! The same holds for a value whose committed `default` this account's legal
+//! answers make invalid — `{{prefix}}/cache` as a `path` with `prefix` answered
+//! `scratch`. It blocks the targets that reference it, and the note names the
+//! `local.toml` line that caused it.
+//!
 //! A defect in the **committed** repo is not blocked but fatal — a malformed
 //! placeholder, or a reference to a value no layer declares, cannot be fixed by
 //! answering a prompt.
@@ -64,6 +69,16 @@ pub enum BlockReason {
         /// The declarations to re-enable, in declaration order.
         names: Vec<String>,
     },
+    /// One or more declared values this entry references have no usable text,
+    /// because this account's answers made a committed `default` invalid.
+    ///
+    /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
+    /// unanswered: the answer that needs changing is already written, and the
+    /// hint names its line.
+    InvalidValue {
+        /// The declarations whose text is invalid, in declaration order.
+        names: Vec<String>,
+    },
 }
 
 /// An entry that was held back, and what it would take to release it.
@@ -75,7 +90,8 @@ pub struct BlockedEntry {
     pub origin: Origin,
     /// Why it is blocked.
     pub reason: BlockReason,
-    /// What the user should run. Spelled by `values::init_hint`, in one place.
+    /// What the user should do. Spelled in `values` — `init_hint`,
+    /// `disabled_hint` or `ResolvedValues::invalid_hint` — never at a call site.
     pub hint: String,
 }
 
@@ -100,7 +116,8 @@ pub struct Resolved {
 ///
 /// [`Error::BadValue`] for a defect in the committed repo: a malformed
 /// placeholder, a reference to a value no layer declares, a `default` that
-/// references a later value, or an answer that is not of its declared kind.
+/// references a later value, an answer that is not of its declared kind, or a
+/// `default` that is not of its kind with no account answer involved.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -117,6 +134,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
 fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution<Target>, Error> {
     let mut unset: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
     let mut bad: Option<Unresolved> = None;
 
     // One pass to find out whether it can be resolved at all, so a blocked
@@ -125,6 +143,7 @@ fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution
         Ok(_) => {}
         Err(Unresolved::Unset { names }) => unset.extend(names),
         Err(Unresolved::Disabled { names }) => disabled.extend(names),
+        Err(Unresolved::Invalid { names }) => invalid.extend(names),
         Err(other) => bad = bad.take().or(Some(other)),
     };
     for_each_string(target, &mut probe);
@@ -152,6 +171,13 @@ fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution
         let hint =
             super::values::disabled_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
         return block(BlockReason::DisabledValue { names }, hint);
+    }
+
+    // An invalid value ahead of an unanswered one: answering would not clear it.
+    if !invalid.is_empty() {
+        let names = in_declaration_order(values, invalid);
+        let hint = values.invalid_hint(&names);
+        return block(BlockReason::InvalidValue { names }, hint);
     }
 
     if !unset.is_empty() {
@@ -703,6 +729,36 @@ mod tests {
             ["git_name", "git_email", "git_signingkey"],
             "the unreferenced third value is listed but blocks nothing"
         );
+    }
+
+    #[test]
+    fn a_legal_answer_that_breaks_a_derived_default_blocks_only_its_dependents() {
+        // `prefix = "scratch"` is a perfectly good `string`. It makes `cache`'s
+        // default expand to `scratch/cache`, which is not a `path` — but that is
+        // this account's answer interacting with a committed default, not a repo
+        // defect, so it may not take `~/.zshrc` down with it, and the note has
+        // to name the local.toml line that caused it rather than the committed
+        // declaration the account may not edit.
+        let resolved = resolved(
+            "[[value]]\nname = \"prefix\"\nkind = \"string\"\n\
+             [[value]]\nname = \"cache\"\nkind = \"path\"\ndefault = \"{{prefix}}/cache\"\n\
+             [[target]]\npath = \"~/.config/env\"\ncontent = \"CACHE={{cache}}\"\n\
+             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+            Some("# this account's answers\n[values]\nprefix = \"scratch\"\n"),
+        )
+        .expect("an account's legal answer does not fail the load");
+
+        ready(&resolved, 1);
+        let entry = blocked(&resolved, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["cache".to_string()]
+            }
+        );
+        assert!(entry.hint.contains("local.toml:3"), "{}", entry.hint);
+        assert!(entry.hint.contains("prefix"), "{}", entry.hint);
+        assert!(entry.hint.contains("\"scratch/cache\""), "{}", entry.hint);
     }
 
     #[test]

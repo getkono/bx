@@ -685,6 +685,19 @@ pub enum Unresolved {
         /// The declarations that are switched off, in declaration order.
         names: Vec<String>,
     },
+    /// Declared, but this account's answers made its text invalid for its kind.
+    ///
+    /// A committed `default` that expands, through an answer the account gave,
+    /// to text its kind refuses: `{{prefix}}/cache` as a `path`, with `prefix`
+    /// answered `scratch`. The answer is legal for its own declaration, so this
+    /// blocks what depends on the value rather than failing the load. A
+    /// `default` that is invalid with no account answer involved is a defect in
+    /// the committed repo, and still fails it.
+    #[error("no usable value for {}", .names.join(", "))]
+    Invalid {
+        /// The declarations whose text is invalid, in declaration order.
+        names: Vec<String>,
+    },
     /// A reference to a value no layer declares — a repo typo.
     #[error("no layer declares the value `{0}`")]
     Undeclared(String),
@@ -721,6 +734,9 @@ enum Lookup<'a> {
     Unset(&'a [String]),
     /// Declared, but switched off by a layer; these are the names to re-enable.
     Disabled(&'a [String]),
+    /// Declared, but answered into text its kind refuses; these are the
+    /// declarations whose text is invalid.
+    Invalid(&'a [String]),
     /// Declared after the point being expanded, or by the same declaration.
     Forward,
     /// Not declared by any layer.
@@ -736,6 +752,7 @@ fn expand<'a>(text: &str, lookup: &impl Fn(&str) -> Lookup<'a>) -> Result<String
     let pieces = scan(text)?;
     let mut unset: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
+    let mut invalid: Vec<String> = Vec::new();
     let mut out = String::with_capacity(text.len());
 
     let record = |causes: &[String], into: &mut Vec<String>| {
@@ -753,6 +770,7 @@ fn expand<'a>(text: &str, lookup: &impl Fn(&str) -> Lookup<'a>) -> Result<String
                 Lookup::Answered(answer) => out.push_str(answer),
                 Lookup::Unset(causes) => record(causes, &mut unset),
                 Lookup::Disabled(causes) => record(causes, &mut disabled),
+                Lookup::Invalid(causes) => record(causes, &mut invalid),
                 Lookup::Forward => return Err(Unresolved::Forward(name.to_string())),
                 Lookup::Undeclared => return Err(Unresolved::Undeclared(name.to_string())),
             },
@@ -764,6 +782,11 @@ fn expand<'a>(text: &str, lookup: &impl Fn(&str) -> Lookup<'a>) -> Result<String
     // has itself refused would be advice it cannot follow.
     if !disabled.is_empty() {
         return Err(Unresolved::Disabled { names: disabled });
+    }
+    // An invalid value is reported ahead of an unanswered one: answering the
+    // unanswered one would still leave this text unusable.
+    if !invalid.is_empty() {
+        return Err(Unresolved::Invalid { names: invalid });
     }
     if unset.is_empty() {
         Ok(out)
@@ -799,6 +822,33 @@ pub fn disabled_hint(names: &[&str]) -> String {
     )
 }
 
+/// Why a committed `default` has no usable text for this account.
+///
+/// Names each answer that went into it with the line it was written on, which
+/// is the file the account can edit, as well as the declaration, which it
+/// cannot. `causes` come from the account's answers, so each has an assignment.
+fn broken_default_why(
+    decl: &ValueDecl,
+    default: &str,
+    error: &ValueError,
+    causes: &[String],
+    assignments: &[ValueAssignment],
+) -> String {
+    let answers = causes
+        .iter()
+        .filter_map(|name| assignments.iter().find(|a| &a.name == name))
+        .map(|a| format!("the answer to `{}` at {}", a.name, a.origin))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "value `{name}` has no usable value: its default `{default}` at {origin} is \
+         built from {answers}, and {error}; change that answer, or answer `{name}` \
+         itself",
+        name = decl.name,
+        origin = decl.origin,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
@@ -817,7 +867,15 @@ pub struct Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Answer {
     /// Answered, by the local layer or by a `default`.
-    Given(Value),
+    Given {
+        /// The canonical text and the layer that supplied it.
+        value: Value,
+        /// The account answers this text was built from: the declaration's own
+        /// name when the local layer answered it, and every name carried by the
+        /// values its references reached. Empty for text built from committed
+        /// defaults alone.
+        from_account: Vec<String>,
+    },
     /// Unanswered, and these are the names that actually need answering.
     ///
     /// Usually the declaration's own name. When a `default` could not resolve
@@ -829,14 +887,27 @@ enum Answer {
     /// Not the same state as unanswered: no answer would help, and what clears
     /// it is switching the declaration back on.
     Disabled(Vec<String>),
+    /// This account's answers made the text invalid for its kind.
+    ///
+    /// Not a load failure: the answers are legal for their own declarations,
+    /// and what they broke is a committed default, so it blocks what depends
+    /// on this value and nothing else.
+    Invalid {
+        /// The declarations whose text is invalid: this one's own name where
+        /// its default broke, or the names carried from a reference.
+        names: Vec<String>,
+        /// Set on the declaration whose default broke, naming the answers and
+        /// the lines that broke it.
+        why: Option<String>,
+    },
 }
 
 impl Answer {
     /// The answer, when there is one.
     fn value(&self) -> Option<&Value> {
         match self {
-            Self::Given(value) => Some(value),
-            Self::Unset(_) | Self::Disabled(_) => None,
+            Self::Given { value, .. } => Some(value),
+            Self::Unset(_) | Self::Disabled(_) | Self::Invalid { .. } => None,
         }
     }
 }
@@ -872,7 +943,13 @@ impl ResolvedValues {
     /// # Errors
     ///
     /// [`Error::BadValue`] for a malformed template, a reference to an
-    /// undeclared or later value, or an answer that is not of its declared kind.
+    /// undeclared or later value, an answer that is not of its declared kind,
+    /// or a `default` that is not of its kind with no account answer involved.
+    ///
+    /// A `default` that only this account's answers make invalid is **not** an
+    /// error. The answers are legal for their own declarations, so the value
+    /// becomes [`Unresolved::Invalid`] and blocks only what references it, and
+    /// [`ResolvedValues::invalid_hint`] names the `local.toml` lines responsible.
     pub fn resolve(
         decls: Vec<ValueDecl>,
         assignments: &[ValueAssignment],
@@ -913,10 +990,24 @@ impl ResolvedValues {
                     // it, then check the result against the kind.
                     Some(raw) => {
                         match resolved.validate(&decl, resolved.decls.len(), &raw, &declared) {
-                            Ok(canonical) => Answer::Given(Value {
-                                text: canonical,
-                                origin,
-                            }),
+                            Ok(canonical) => {
+                                let mut from_account = Vec::new();
+                                if supplied.is_some() {
+                                    from_account.push(decl.name.clone());
+                                }
+                                for input in resolved.account_inputs(&raw) {
+                                    if !from_account.contains(&input) {
+                                        from_account.push(input);
+                                    }
+                                }
+                                Answer::Given {
+                                    value: Value {
+                                        text: canonical,
+                                        origin,
+                                    },
+                                    from_account,
+                                }
+                            }
                             // An earlier value is unanswered, so this one is too
                             // — and it carries the earlier name, which is the
                             // one to act on.
@@ -927,6 +1018,31 @@ impl ResolvedValues {
                             // and cleared by switching that one back on.
                             Err(AnswerError::Reference(Unresolved::Disabled { names })) => {
                                 Answer::Disabled(names)
+                            }
+                            // Derived from a value this account's answers broke,
+                            // and cleared by fixing that one.
+                            Err(AnswerError::Reference(Unresolved::Invalid { names })) => {
+                                Answer::Invalid { names, why: None }
+                            }
+                            // A committed default that expanded fine and failed
+                            // its kind. If an account answer went into it, the
+                            // account's legal answer broke it: block what
+                            // depends on it and name the lines. If none did, no
+                            // answer could fix it, and it is a repo defect.
+                            Err(AnswerError::Kind(error)) if supplied.is_none() => {
+                                let causes = resolved.account_inputs(&raw);
+                                if causes.is_empty() {
+                                    return Err(Error::BadValue {
+                                        origin,
+                                        message: format!("value `{}`: {error}", decl.name),
+                                    });
+                                }
+                                let why =
+                                    broken_default_why(&decl, &raw, &error, &causes, assignments);
+                                Answer::Invalid {
+                                    names: vec![decl.name.clone()],
+                                    why: Some(why),
+                                }
                             }
                             Err(other) => {
                                 return Err(Error::BadValue {
@@ -1031,10 +1147,52 @@ impl ResolvedValues {
     /// How the value at `index` answers a reference.
     fn lookup_at(&self, index: usize) -> Lookup<'_> {
         match &self.answers[index] {
-            Answer::Given(value) => Lookup::Answered(&value.text),
+            Answer::Given { value, .. } => Lookup::Answered(&value.text),
             Answer::Unset(causes) => Lookup::Unset(causes),
             Answer::Disabled(causes) => Lookup::Disabled(causes),
+            Answer::Invalid { names, .. } => Lookup::Invalid(names),
         }
+    }
+
+    /// The account answers the `{{name}}` references in `text` were built from.
+    ///
+    /// Consults only the values resolved so far, which is every value a text
+    /// that expanded can reference. Deduplicated, in the order reached.
+    fn account_inputs(&self, text: &str) -> Vec<String> {
+        let mut inputs: Vec<String> = Vec::new();
+        let reached = placeholders(text)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|name| self.index_of(name))
+            .filter_map(|index| match self.answers.get(index) {
+                Some(Answer::Given { from_account, .. }) => Some(from_account),
+                _ => None,
+            })
+            .flatten();
+        for input in reached {
+            if !inputs.contains(input) {
+                inputs.push(input.clone());
+            }
+        }
+        inputs
+    }
+
+    /// What to do about an entry blocked by [`Unresolved::Invalid`] on `names`.
+    ///
+    /// Each declaration whose default broke says which answers, on which lines,
+    /// broke it — the file the account can edit, rather than the committed
+    /// declaration it cannot. Not a `bx init` invocation: the answer that needs
+    /// changing is already written, so `bx init` would not prompt for it.
+    #[must_use]
+    pub fn invalid_hint(&self, names: &[String]) -> String {
+        names
+            .iter()
+            .filter_map(|name| match self.index_of(name).map(|i| &self.answers[i]) {
+                Some(Answer::Invalid { why: Some(why), .. }) => Some(why.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// The declaration index of `name`.
@@ -1060,6 +1218,9 @@ impl ResolvedValues {
                 names: self.in_declaration_order(names),
             }),
             Err(Unresolved::Disabled { names }) => Err(Unresolved::Disabled {
+                names: self.in_declaration_order(names),
+            }),
+            Err(Unresolved::Invalid { names }) => Err(Unresolved::Invalid {
                 names: self.in_declaration_order(names),
             }),
             other => other,
@@ -1799,6 +1960,102 @@ mod tests {
         assert!(message.contains("local.toml:2"), "{message}");
         assert!(message.contains("git_email"), "{message}");
         assert!(message.contains("exactly one `@`"), "{message}");
+    }
+
+    #[test]
+    fn a_default_an_answer_makes_invalid_blocks_rather_than_failing() {
+        // `prefix = "scratch"` is a legal `string`. The committed default of
+        // `cache` it feeds becomes `scratch/cache`, which is not a `path` — but
+        // the account's line is right for its own declaration, so this blocks
+        // what references `cache` instead of failing every target.
+        let prefix = a_decl("prefix", ValueKind::String);
+        let mut cache = a_decl("cache", ValueKind::Path);
+        cache.required = true;
+        cache.default = Some(AssignedValue::String("{{prefix}}/cache".to_string()));
+        let mut sub = a_decl("sub", ValueKind::Path);
+        sub.default = Some(AssignedValue::String("{{cache}}/sub".to_string()));
+        let note = a_decl("note", ValueKind::String);
+
+        let values = resolve(
+            vec![prefix, cache, sub, note],
+            &[answer("prefix", "scratch")],
+        )
+        .expect("a legal answer does not fail the load");
+
+        let invalid = Unresolved::Invalid {
+            names: vec!["cache".to_string()],
+        };
+        assert!(values.get("cache").is_none());
+        assert_eq!(values.substitute("{{cache}}"), Err(invalid.clone()));
+        assert_eq!(
+            values.substitute("{{sub}}"),
+            Err(invalid.clone()),
+            "the cause travels to what derives from it"
+        );
+        assert_eq!(
+            values.check_answer("note", "{{cache}}"),
+            Err(AnswerError::Reference(invalid))
+        );
+        assert!(
+            values.unset_required_names().is_empty(),
+            "no prompt would help: the answer that needs changing is written"
+        );
+        assert_eq!(
+            values
+                .unset()
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            ["cache", "sub", "note"],
+            "doctor still lists everything with no usable answer"
+        );
+
+        let hint = values.invalid_hint(&["cache".to_string()]);
+        assert!(hint.contains("value `cache`"), "{hint}");
+        assert!(hint.contains("`prefix` at local.toml:2"), "{hint}");
+        assert!(hint.contains("\"scratch/cache\""), "{hint}");
+    }
+
+    #[test]
+    fn a_default_names_every_answer_it_was_built_from() {
+        // An answer that is itself built from another answer carries both, so
+        // the note names every line that could be changed to fix it.
+        let prefix = a_decl("prefix", ValueKind::String);
+        let mid = a_decl("mid", ValueKind::String);
+        let mut cache = a_decl("cache", ValueKind::Path);
+        cache.default = Some(AssignedValue::String("{{prefix}}{{mid}}/c".to_string()));
+
+        let values = resolve(
+            vec![prefix, mid, cache],
+            &[answer("prefix", "a"), answer("mid", "{{prefix}}b")],
+        )
+        .unwrap();
+
+        let hint = values.invalid_hint(&["cache".to_string()]);
+        assert!(hint.contains("`prefix` at"), "{hint}");
+        assert!(hint.contains("`mid` at"), "{hint}");
+    }
+
+    #[test]
+    fn a_default_invalid_without_an_account_answer_is_still_a_load_error() {
+        // No answer caused it and none can fix it, so it is a defect in the
+        // committed repo, and the declaration is the right thing to name.
+        let mut cache = a_decl("cache", ValueKind::Path);
+        cache.default = Some(AssignedValue::String("relative/cache".to_string()));
+
+        let message = resolve(vec![cache], &[]).unwrap_err();
+        assert!(message.contains("bx.toml"), "{message}");
+        assert!(message.contains("value `cache`"), "{message}");
+
+        // Nor is it the account's doing when what it derives from is itself a
+        // committed default.
+        let mut prefix = a_decl("prefix", ValueKind::String);
+        prefix.default = Some(AssignedValue::String("scratch".to_string()));
+        let mut cache = a_decl("cache", ValueKind::Path);
+        cache.default = Some(AssignedValue::String("{{prefix}}/cache".to_string()));
+
+        let message = resolve(vec![prefix, cache], &[]).unwrap_err();
+        assert!(message.contains("\"scratch/cache\""), "{message}");
     }
 
     #[test]

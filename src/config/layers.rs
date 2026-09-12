@@ -319,7 +319,7 @@ mod tests {
         );
 
         let layers = load_layer_set(&repo, &state, home.path()).unwrap();
-        let merged = crate::config::merge::merge(&layers).unwrap();
+        let merged = crate::config::merge::merge(&layers, home.path()).unwrap();
 
         assert_eq!(merged.targets.len(), 1, "one key, one entry");
         assert_eq!(

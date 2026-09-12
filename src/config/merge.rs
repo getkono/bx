@@ -12,6 +12,23 @@
 //! nobody can read off the files, and `bx plan` printing one origin per entry
 //! would then be a lie.
 //!
+//! # A target's key is the file it names
+//!
+//! A target's `path` may carry a `{{name}}`, so the text as written is not the
+//! file. Targets are compared **after substitution**, against the values this
+//! account ends up with: `~/.config/{{acct}}/settings.json` in `bx.toml` and
+//! `~/.config/one/settings.json` in `local.toml`, with `acct` answered `one`,
+//! are one target, and the later one replaces or toggles the earlier. Compared
+//! as written they were two targets owning one file — two ledger rows for it,
+//! so `rm` restores the wrong prior, and two writers, so the second `plan` is
+//! never empty.
+//!
+//! So the merge resolves the values first, and a target's key is its
+//! substituted, normalised path. A path waiting on a value with no usable
+//! answer names no file yet; it is keyed by its spelling, and a toggle reaches
+//! it by that spelling. One layer naming one file twice, under any two
+//! spellings, is an error, as it is under one.
+//!
 //! # Toggles: how an account opts out cheaply
 //!
 //! A list entry whose only keys are its natural key and `enabled` is a
@@ -32,7 +49,8 @@
 //!
 //! # Determinism
 //!
-//! The merge is a pure function of the layer files' bytes. It reads no
+//! The merge is a pure function of the layer files' bytes and the home threaded
+//! in. It reads no
 //! environment variable, calls no `canonicalize`, spawns nothing, and iterates
 //! no hash map: entries live in a `Vec` in insertion order and lookup is a
 //! linear scan. Invariant 3 says two `plan` runs a week apart on an unchanged
@@ -44,8 +62,9 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::target::Target;
-use super::values::{ValueAssignment, ValueDecl};
+use super::values::{ResolvedValues, ValueAssignment, ValueDecl};
 use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
+use crate::paths::Portable;
 
 /// A list entry that merges by a natural key.
 ///
@@ -54,6 +73,9 @@ use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 /// a list type implements this and writes no merge logic of its own.
 pub trait Keyed {
     /// The natural key: `path` for a target, `name` for a value.
+    ///
+    /// As written. A target is merged by the file this names once substituted,
+    /// which is not a function of the entry alone; see [`merge`].
     fn key(&self) -> &str;
     /// The layer and line that last set this entry.
     fn origin(&self) -> &Origin;
@@ -212,12 +234,16 @@ pub(crate) fn toggle_of(
 /// Insertion-ordered. Lookup is a linear scan, which is right for a list a few
 /// dozen entries long and is the only lookup with no iteration order to get
 /// wrong.
+///
+/// Each entry is held beside the key it merges by. For a value that is its name
+/// as written; for a target it is the file its path names once substituted,
+/// which is not a function of the entry alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Merged<T> {
-    entries: Vec<T>,
+pub struct Merged<T, K = String> {
+    entries: Vec<(K, T)>,
 }
 
-impl<T> Default for Merged<T> {
+impl<T, K> Default for Merged<T, K> {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
@@ -226,54 +252,46 @@ impl<T> Default for Merged<T> {
 }
 
 impl<T: Keyed> Merged<T> {
-    /// Fold one later layer's entries in.
+    /// Fold one later layer's entries in, keyed by their natural key as written.
     ///
     /// A known key is replaced **wholesale and in place**; a new key appends.
     pub fn absorb(&mut self, later: impl IntoIterator<Item = T>) {
         for entry in later {
-            match self.position(entry.key()) {
-                Some(index) => self.entries[index] = entry,
-                None => self.entries.push(entry),
+            let key = entry.key().to_string();
+            match self.position(&key) {
+                Some(index) => self.entries[index] = (key, entry),
+                None => self.entries.push((key, entry)),
             }
         }
     }
 
-    /// Apply one toggle.
+    /// Apply one toggle, matched by its natural key as written.
     ///
     /// # Errors
     ///
     /// [`Error::BadValue`] when no earlier layer introduced the key. A silent
     /// no-op here is how an account ends up with a file it explicitly refused.
     pub fn toggle(&mut self, toggle: &Toggle) -> Result<(), Error> {
-        let Some(index) = self.position(&toggle.key) else {
-            // Both readings, because nothing here can tell them apart: a table
-            // holding only the natural key and `enabled` is a toggle wherever it
-            // appears, so in the first layer an entry somebody meant to write in
-            // full and left incomplete arrives here too.
-            return Err(Error::BadValue {
-                origin: toggle.origin.clone(),
-                message: format!(
-                    "`{}` toggles `{}`, which no earlier layer declares; a toggle — an \
-                     entry with only `{}` and `enabled` — may only flip an entry that \
-                     already exists, and a new entry needs {}",
-                    toggle.section.header(),
-                    toggle.key,
-                    toggle.section.natural_key(),
-                    toggle.section.a_full_entry_needs(),
-                ),
-            });
-        };
-        self.entries[index].set_enabled(toggle.enabled);
+        let index = self
+            .position(&toggle.key)
+            .ok_or_else(|| unknown_toggle(toggle, ""))?;
+        self.entries[index].1.set_enabled(toggle.enabled);
         Ok(())
     }
+}
 
+impl<T: Keyed, K: PartialEq> Merged<T, K> {
     /// The entries that survive, in order.
     ///
     /// Disabled entries stay in the list until this point, so a disable in one
     /// layer followed by a re-enable in a later one keeps the original position.
     #[must_use]
     pub fn into_enabled(self) -> Vec<T> {
-        self.entries.into_iter().filter(Keyed::enabled).collect()
+        self.entries
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .filter(Keyed::enabled)
+            .collect()
     }
 
     /// Every entry, disabled ones included, in order.
@@ -284,42 +302,198 @@ impl<T: Keyed> Merged<T> {
     /// which is a different fault with a different outcome.
     #[must_use]
     pub fn into_entries(self) -> Vec<T> {
-        self.entries
+        self.entries.into_iter().map(|(_, entry)| entry).collect()
     }
 
     /// Where `key` sits, if it is present.
-    fn position(&self, key: &str) -> Option<usize> {
-        self.entries.iter().position(|entry| entry.key() == key)
+    fn position(&self, key: &K) -> Option<usize> {
+        self.entries.iter().position(|(held, _)| held == key)
     }
+}
+
+/// The message for a toggle that matches nothing.
+///
+/// Both readings, because nothing here can tell them apart: a table holding
+/// only the natural key and `enabled` is a toggle wherever it appears, so in the
+/// first layer an entry somebody meant to write in full and left incomplete
+/// arrives here too. `more` is appended, for a section with something further
+/// to say about which spelling would have matched.
+fn unknown_toggle(toggle: &Toggle, more: &str) -> Error {
+    Error::BadValue {
+        origin: toggle.origin.clone(),
+        message: format!(
+            "`{}` toggles `{}`, which no earlier layer declares; a toggle — an \
+             entry with only `{}` and `enabled` — may only flip an entry that \
+             already exists, and a new entry needs {}{more}",
+            toggle.section.header(),
+            toggle.key,
+            toggle.section.natural_key(),
+            toggle.section.a_full_entry_needs(),
+        ),
+    }
+}
+
+/// What a target merges by: the file it names, for this account.
+///
+/// Compared **after substitution**, so `~/.config/{{acct}}/settings.json` with
+/// `acct` answered `one` and `~/.config/one/settings.json` are one key.
+/// `Portable` is what the ledger and the journal are written against, and two
+/// targets for one file would give `rm` two priors to restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetKey {
+    /// The substituted, normalised path.
+    File(String),
+    /// The path as written: it waits on a value with no usable answer, or it
+    /// substitutes to something that is not a portable path, which resolution
+    /// reports. Two of these match only when they are spelled identically.
+    AsWritten(String),
+}
+
+impl TargetKey {
+    /// The key of a path spelled `raw`.
+    fn of(raw: &str, values: &ResolvedValues) -> Self {
+        values
+            .substitute(raw)
+            .ok()
+            .and_then(|text| Portable::parse_in(&text, values.home()).ok())
+            .map_or_else(
+                || Self::AsWritten(raw.to_string()),
+                |path| Self::File(path.as_str().to_string()),
+            )
+    }
+}
+
+impl Merged<Target, TargetKey> {
+    /// Fold one layer's targets and target toggles in, keyed by the file each
+    /// one names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadValue`] when a toggle names a file no earlier layer declares,
+    /// or when this one layer names one file twice under two spellings — the
+    /// parser's own duplicate check compares spellings, and cannot see that
+    /// `~/{{acct}}/x` and `~/one/x` are one file.
+    fn absorb_layer(&mut self, layer: &Layer, values: &ResolvedValues) -> Result<(), Error> {
+        // The positions this layer has set. A later layer replacing an entry is
+        // the mechanism; one layer setting a file twice is a conflict whose
+        // outcome would depend on an order nothing in the file states.
+        let mut set_here: Vec<usize> = Vec::new();
+
+        for target in &layer.config.targets {
+            let key = TargetKey::of(target.path.as_str(), values);
+            let index = match self.position(&key) {
+                Some(index) => {
+                    let earlier = &self.entries[index].1;
+                    refuse_twice(
+                        &set_here,
+                        index,
+                        earlier,
+                        target.path.as_str(),
+                        &target.origin,
+                    )?;
+                    self.entries[index] = (key, target.clone());
+                    index
+                }
+                None => {
+                    self.entries.push((key, target.clone()));
+                    self.entries.len() - 1
+                }
+            };
+            set_here.push(index);
+        }
+
+        for toggle in &layer.config.toggles {
+            // Exhaustive over `Section`, so a keyed list added later is a
+            // compile error here rather than a panic in a library call.
+            match toggle.section {
+                Section::Target => {
+                    let key = TargetKey::of(&toggle.key, values);
+                    let index = self
+                        .position(&key)
+                        .ok_or_else(|| unknown_toggle(toggle, &self.as_written_note()))?;
+                    let earlier = &self.entries[index].1;
+                    refuse_twice(&set_here, index, earlier, &toggle.key, &toggle.origin)?;
+                    self.entries[index].1.set_enabled(toggle.enabled);
+                    set_here.push(index);
+                }
+                Section::Value => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Which spelling reaches a target whose file is not known yet, if any is.
+    ///
+    /// Without it, a toggle by the path `plan` would show once the value is
+    /// answered reads as naming an entry that does not exist.
+    fn as_written_note(&self) -> String {
+        self.entries
+            .iter()
+            .find_map(|(key, target)| match key {
+                TargetKey::AsWritten(_) => Some(format!(
+                    "; a target whose `path` waits on a value with no usable answer is \
+                     matched by the spelling it was declared with, such as `{}` at {}",
+                    target.path, target.origin
+                )),
+                TargetKey::File(_) => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Refuse a second entry for one file from one layer.
+fn refuse_twice(
+    set_here: &[usize],
+    index: usize,
+    earlier: &Target,
+    spelling: &str,
+    origin: &Origin,
+) -> Result<(), Error> {
+    if !set_here.contains(&index) {
+        return Ok(());
+    }
+    Err(Error::BadValue {
+        origin: origin.clone(),
+        message: format!(
+            "`[[target]]` `{spelling}` names the same file as `{}` at {} in this same \
+             layer; one layer may name a file once, and a later layer replaces it",
+            earlier.path, earlier.origin
+        ),
+    })
 }
 
 /// Fold the ordered layer set into one configuration.
 ///
-/// The result is one of the base's own `Config` values, still **unresolved**: no
-/// value is checked against its kind and no `{{name}}` is substituted, which is
-/// [`super::resolve`]'s work.
+/// The result is one of the base's own `Config` values, still **unresolved**:
+/// every entry is returned as written, and substituting it is
+/// [`super::resolve`]'s work. The values are resolved once here, against
+/// `home`, only so that a target can be keyed by the file it names.
 ///
 /// # Errors
 ///
-/// [`Error::BadValue`] when a committed layer carries a `[values]` table, or
-/// when a toggle names a key no earlier layer introduced.
-pub fn merge(layers: &[Layer]) -> Result<Config, Error> {
-    let mut targets: Merged<Target> = Merged::default();
+/// [`Error::BadValue`] when a committed layer carries a `[values]` table, when a
+/// toggle names a key no earlier layer introduced, when one layer names one
+/// file twice, or for any defect [`ResolvedValues::resolve`] reports.
+pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut values: Merged<ValueDecl> = Merged::default();
     let mut assignments: Vec<ValueAssignment> = Vec::new();
 
+    // Values first, across every layer. A value never depends on a target, and
+    // a target's key depends on the values — the final ones, because the file a
+    // target is written to is decided by the answers this account ends up with,
+    // not by the answers known when its own layer was read.
     for layer in layers {
         refuse_committed_answers(layer)?;
 
-        targets.absorb(layer.config.targets.iter().cloned());
         values.absorb(layer.config.values.iter().cloned());
 
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
             // compile error here rather than a panic in a library call.
             match toggle.section {
-                Section::Target => targets.toggle(toggle)?,
                 Section::Value => values.toggle(toggle)?,
+                Section::Target => {}
             }
         }
 
@@ -328,17 +502,25 @@ pub fn merge(layers: &[Layer]) -> Result<Config, Error> {
         }
     }
 
+    // Values keep their disabled entries and targets do not, and the asymmetry
+    // is the point: nothing refers to a target except by being one, so a
+    // disabled target simply is not written. A value is referred to by name
+    // from every string field in the configuration, so a declaration an account
+    // switched off has to stay visible to resolution — otherwise
+    // `{{git_email}}` reads as a repo typo, which is fatal, and the three-line
+    // toggle an account is invited to write stops the whole load with a message
+    // naming a committed file it cannot edit.
+    let values = values.into_entries();
+    let resolved = ResolvedValues::resolve(values.clone(), &assignments, home)?;
+
+    let mut targets: Merged<Target, TargetKey> = Merged::default();
+    for layer in layers {
+        targets.absorb_layer(layer, &resolved)?;
+    }
+
     Ok(Config {
         targets: targets.into_enabled(),
-        // Values keep their disabled entries and targets do not, and the
-        // asymmetry is the point: nothing refers to a target except by being
-        // one, so a disabled target simply is not written. A value is referred
-        // to by name from every string field in the configuration, so a
-        // declaration an account switched off has to stay visible to resolution
-        // — otherwise `{{git_email}}` reads as a repo typo, which is fatal, and
-        // the three-line toggle an account is invited to write stops the whole
-        // load with a message naming a committed file it cannot edit.
-        values: values.into_entries(),
+        values,
         value_assignments: assignments,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
@@ -395,6 +577,11 @@ mod tests {
     /// one spelling. Nothing in this module reads one from the environment.
     fn home() -> PathBuf {
         PathBuf::from("/var/home/example")
+    }
+
+    /// The merge, against the fixtures' home.
+    fn merge(layers: &[Layer]) -> Result<Config, Error> {
+        super::merge(layers, &home())
     }
 
     /// A layer parsed from `text`, named `file`.
@@ -916,6 +1103,120 @@ mod tests {
             message.contains("which no earlier layer declares"),
             "{message}"
         );
+    }
+
+    /// A committed layer declaring `acct`, and a target whose path uses it.
+    fn acct_layer(default: Option<&str>) -> Layer {
+        let default = default.map_or_else(String::new, |d| format!("default = \"{d}\"\n"));
+        global(
+            "bx.toml",
+            &format!(
+                "[[value]]\nname = \"acct\"\nkind = \"string\"\n{default}{}",
+                target_toml("~/.config/{{acct}}/settings.json", "GLOBAL")
+            ),
+        )
+    }
+
+    #[test]
+    fn a_later_layer_replaces_a_target_by_the_file_its_path_names() {
+        // `plan` shows `~/.config/one/settings.json`, so that is the spelling an
+        // account overrides by. Compared as written, the two were two targets
+        // owning one file.
+        let merged = merge(&[
+            acct_layer(Some("one")),
+            local(&target_toml("~/.config/one/settings.json", "LOCAL")),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            paths(&merged),
+            ["~/.config/one/settings.json"],
+            "one file, one target"
+        );
+        assert_eq!(merged.targets[0].origin.file, Path::new("local.toml"));
+    }
+
+    #[test]
+    fn a_toggle_reaches_a_target_by_the_file_its_path_names() {
+        // Keyed against the values this account ends up with: `acct` is answered
+        // by the same last layer that toggles, not by the committed default.
+        let merged = merge(&[
+            acct_layer(Some("one")),
+            local(
+                "[values]\nacct = \"two\"\n\
+                 [[target]]\npath = \"~/.config/two/settings.json\"\nenabled = false\n",
+            ),
+        ])
+        .unwrap();
+        assert!(merged.targets.is_empty(), "{:?}", paths(&merged));
+
+        let merged = merge(&[
+            acct_layer(Some("one")),
+            local("[[target]]\npath = \"~/.config/{{acct}}/settings.json\"\nenabled = false\n"),
+        ])
+        .unwrap();
+        assert!(
+            merged.targets.is_empty(),
+            "the declared spelling still reaches it"
+        );
+    }
+
+    #[test]
+    fn one_layer_may_not_name_one_file_twice_under_two_spellings() {
+        // The parser's duplicate check compares spellings, so it cannot see this.
+        let message = failure(&[global(
+            "bx.toml",
+            &format!(
+                "[[value]]\nname = \"acct\"\nkind = \"string\"\ndefault = \"one\"\n{}{}",
+                target_toml("~/.config/{{acct}}/settings.json", "a"),
+                target_toml("~/.config/one/settings.json", "b"),
+            ),
+        )]);
+        assert!(
+            message
+                .contains("names the same file as `~/.config/{{acct}}/settings.json` at bx.toml:"),
+            "{message}"
+        );
+
+        // A toggle and a full entry in one layer are the same conflict.
+        let message = failure(&[
+            acct_layer(Some("one")),
+            local(&format!(
+                "{}[[target]]\npath = \"~/.config/one/settings.json\"\nenabled = false\n",
+                target_toml("~/.config/{{acct}}/settings.json", "LOCAL")
+            )),
+        ]);
+        assert!(message.contains("in this same layer"), "{message}");
+        assert!(message.starts_with("local.toml:"), "{message}");
+    }
+
+    #[test]
+    fn a_toggle_for_a_target_waiting_on_a_value_names_the_declared_spelling() {
+        // With `acct` unanswered the file is not known, so the spelling `plan`
+        // would show once it is answered cannot reach it. The message says which
+        // spelling will, rather than that the entry does not exist.
+        let message = failure(&[
+            acct_layer(None),
+            local("[[target]]\npath = \"~/.config/one/settings.json\"\nenabled = false\n"),
+        ]);
+        assert!(
+            message.contains("which no earlier layer declares"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "matched by the spelling it was declared with, such as \
+                 `~/.config/{{acct}}/settings.json` at bx.toml:"
+            ),
+            "{message}"
+        );
+
+        let merged = merge(&[
+            acct_layer(None),
+            local("[[target]]\npath = \"~/.config/{{acct}}/settings.json\"\nenabled = false\n"),
+        ])
+        .unwrap();
+        assert!(merged.targets.is_empty());
     }
 
     #[test]

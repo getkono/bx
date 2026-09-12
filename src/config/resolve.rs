@@ -117,7 +117,8 @@ pub struct Resolved {
 /// [`Error::BadValue`] for a defect in the committed repo: a malformed
 /// placeholder, a reference to a value no layer declares, a `default` that
 /// references a later value, an answer that is not of its declared kind, or a
-/// `default` that is not of its kind with no account answer involved.
+/// `default` that is not of its kind with no account answer involved; and for
+/// two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -127,7 +128,42 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         .map(|target| resolve_target(target, &values))
         .collect::<Result<Vec<_>, Error>>()?;
 
+    refuse_shared_files(&targets)?;
+
     Ok(Resolved { values, targets })
+}
+
+/// Refuse two ready targets that write one file.
+///
+/// The merge keys targets by the file they name, so a configuration that came
+/// through it cannot trip this. [`resolve`] takes any [`Config`], though, and
+/// `Portable` is the key the ledger and the journal are written against: two
+/// targets for one file would give `rm` two priors to restore and `apply` two
+/// writers, so the second `plan` would never be empty.
+fn refuse_shared_files(targets: &[Resolution<Target>]) -> Result<(), Error> {
+    let ready: Vec<&Target> = targets
+        .iter()
+        .filter_map(|resolution| match resolution {
+            Resolution::Ready(target) => Some(target),
+            Resolution::Blocked(_) => None,
+        })
+        .collect();
+
+    for (index, later) in ready.iter().enumerate() {
+        if let Some(earlier) = ready[..index]
+            .iter()
+            .find(|earlier| earlier.path.as_str() == later.path.as_str())
+        {
+            return Err(Error::BadValue {
+                origin: later.origin.clone(),
+                message: format!(
+                    "target `{}` is the same file as the target at {}; one file has one target",
+                    later.path, earlier.origin
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Substitute one target, or explain why it cannot be.
@@ -356,7 +392,7 @@ mod tests {
         if let Some(local) = local {
             layers.push(layer("local.toml", LayerKind::Local, local)?);
         }
-        let merged = merge(&layers).map_err(|e| e.to_string())?;
+        let merged = merge(&layers, &home()).map_err(|e| e.to_string())?;
         resolve(&merged, &home()).map_err(|e| e.to_string())
     }
 
@@ -759,6 +795,65 @@ mod tests {
         assert!(entry.hint.contains("local.toml:3"), "{}", entry.hint);
         assert!(entry.hint.contains("prefix"), "{}", entry.hint);
         assert!(entry.hint.contains("\"scratch/cache\""), "{}", entry.hint);
+    }
+
+    #[test]
+    fn an_account_overrides_a_placeholder_pathed_target_by_the_path_it_resolves_to() {
+        // End to end: this used to produce two `Ready` targets with
+        // byte-identical keys — one file with two owners.
+        let resolved = resolved(
+            "[[value]]\nname = \"acct\"\nkind = \"string\"\ndefault = \"one\"\n\
+             [[target]]\npath = \"~/.config/{{acct}}/settings.json\"\ncontent = \"GLOBAL\"\n",
+            Some("[[target]]\npath = \"~/.config/one/settings.json\"\ncontent = \"LOCAL\"\n"),
+        )
+        .unwrap();
+
+        assert_eq!(keys(&resolved), ["~/.config/one/settings.json"]);
+        assert_eq!(ready(&resolved, 0).body, Body::Inline("LOCAL".to_string()));
+    }
+
+    #[test]
+    fn an_account_opts_out_of_a_placeholder_pathed_target_by_the_path_it_resolves_to() {
+        // The three-line opt-out, by the path `plan` shows. It used to fail the
+        // whole load saying no earlier layer declares an entry `plan` lists.
+        let resolved = resolved(
+            "[[value]]\nname = \"acct\"\nkind = \"string\"\ndefault = \"one\"\n\
+             [[target]]\npath = \"~/.config/{{acct}}/settings.json\"\ncontent = \"GLOBAL\"\n\
+             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+            Some("[[target]]\npath = \"~/.config/one/settings.json\"\nenabled = false\n"),
+        )
+        .expect("the opt-out reaches the target");
+
+        assert_eq!(keys(&resolved), ["~/.zshrc"]);
+    }
+
+    #[test]
+    fn two_ready_targets_for_one_file_are_refused_even_unmerged() {
+        // `resolve` takes any `Config`, and one that did not come through the
+        // merge can still carry two spellings of one file.
+        let global = layer(
+            "bx.toml",
+            LayerKind::Global,
+            "[[value]]\nname = \"acct\"\nkind = \"string\"\ndefault = \"one\"\n\
+             [[target]]\npath = \"~/.config/{{acct}}/settings.json\"\ncontent = \"GLOBAL\"\n",
+        )
+        .unwrap();
+        let local = layer(
+            "local.toml",
+            LayerKind::Local,
+            "[[target]]\npath = \"~/.config/one/settings.json\"\ncontent = \"LOCAL\"\n",
+        )
+        .unwrap();
+        let mut config = global.config;
+        config.targets.extend(local.config.targets);
+
+        let message = resolve(&config, &home()).unwrap_err().to_string();
+
+        assert!(message.contains("local.toml:1"), "{message}");
+        assert!(
+            message.contains("same file as the target at bx.toml:"),
+            "{message}"
+        );
     }
 
     #[test]

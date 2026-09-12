@@ -1,9 +1,10 @@
 //! Home-relative paths, so a config repo moves between machines.
 //!
-//! This machine's `$HOME` is `/mnt/scratch/golem`, not `/home/<user>`. Any
-//! absolute path committed to a config repo therefore breaks the moment the
-//! repo is used anywhere else. bx stores paths *portably* — `~`-prefixed — and
-//! renders them against the local `$HOME` at apply time.
+//! A home directory is not necessarily `/home/<user>`: an ostree system puts it
+//! under `/var/home`, and an account whose home lives on scratch storage puts it
+//! somewhere else again. Any absolute path committed to a config repo therefore
+//! breaks the moment the repo is used anywhere else. bx stores paths *portably*
+//! — `~`-prefixed — and renders them against the local `$HOME` at apply time.
 //!
 //! Substitution is **leading-position only**. A `~` in the middle of a line is
 //! ordinary content (a shell glob, a backup filename, prose) and is left alone,
@@ -75,14 +76,15 @@ mod tests {
     use super::*;
 
     fn home() -> PathBuf {
-        // The real, non-standard home on the machine this was designed against.
-        PathBuf::from("/mnt/scratch/golem")
+        // A deliberately non-standard home: nothing here may name a real
+        // account, and nothing here may assume `/home/<user>`.
+        PathBuf::from("/var/home/example")
     }
 
     #[test]
     fn a_path_under_home_becomes_tilde_relative() {
         assert_eq!(
-            to_portable(Path::new("/mnt/scratch/golem/.gitconfig"), &home()),
+            to_portable(Path::new("/var/home/example/.gitconfig"), &home()),
             "~/.gitconfig"
         );
     }
@@ -91,7 +93,7 @@ mod tests {
     fn a_nested_path_keeps_its_tail() {
         assert_eq!(
             to_portable(
-                Path::new("/mnt/scratch/golem/.ssh/config.d/10-hosts.conf"),
+                Path::new("/var/home/example/.ssh/config.d/10-hosts.conf"),
                 &home()
             ),
             "~/.ssh/config.d/10-hosts.conf"
@@ -113,16 +115,16 @@ mod tests {
 
     #[test]
     fn a_prefix_that_is_not_a_path_component_does_not_match() {
-        // /mnt/scratch/golem-backup is not inside /mnt/scratch/golem.
+        // /var/home/example-backup is not inside /var/home/example.
         assert_eq!(
-            to_portable(Path::new("/mnt/scratch/golem-backup/x"), &home()),
-            "/mnt/scratch/golem-backup/x"
+            to_portable(Path::new("/var/home/example-backup/x"), &home()),
+            "/var/home/example-backup/x"
         );
     }
 
     #[test]
     fn rendering_reverses_portability() {
-        let original = Path::new("/mnt/scratch/golem/.config/starship.toml");
+        let original = Path::new("/var/home/example/.config/starship.toml");
         assert_eq!(render(&to_portable(original, &home()), &home()), original);
     }
 
@@ -130,12 +132,12 @@ mod tests {
     fn the_same_repo_renders_against_a_different_home() {
         // The whole point: one repo, two machines.
         assert_eq!(
-            render("~/.gitconfig", Path::new("/home/justin")),
-            Path::new("/home/justin/.gitconfig")
+            render("~/.gitconfig", Path::new("/home/other")),
+            Path::new("/home/other/.gitconfig")
         );
         assert_eq!(
             render("~/.gitconfig", &home()),
-            Path::new("/mnt/scratch/golem/.gitconfig")
+            Path::new("/var/home/example/.gitconfig")
         );
     }
 
@@ -155,8 +157,8 @@ mod tests {
     #[test]
     fn another_users_home_is_never_expanded() {
         assert_eq!(
-            render("~justy/.linuxbrew", &home()),
-            Path::new("~justy/.linuxbrew")
+            render("~other/.linuxbrew", &home()),
+            Path::new("~other/.linuxbrew")
         );
     }
 
@@ -165,14 +167,14 @@ mod tests {
         let rendered = render_content("~/.cargo/bin\n~/.local/bin\n", &home());
         assert_eq!(
             rendered,
-            "/mnt/scratch/golem/.cargo/bin\n/mnt/scratch/golem/.local/bin\n"
+            "/var/home/example/.cargo/bin\n/var/home/example/.local/bin\n"
         );
     }
 
     #[test]
     fn content_preserves_indentation() {
         let rendered = render_content("  ~/.ssh/config.d/*.conf\n", &home());
-        assert_eq!(rendered, "  /mnt/scratch/golem/.ssh/config.d/*.conf\n");
+        assert_eq!(rendered, "  /var/home/example/.ssh/config.d/*.conf\n");
     }
 
     #[test]
@@ -186,7 +188,7 @@ mod tests {
     fn content_without_a_trailing_newline_is_preserved() {
         assert_eq!(
             render_content("~/.gitconfig", &home()),
-            "/mnt/scratch/golem/.gitconfig"
+            "/var/home/example/.gitconfig"
         );
     }
 

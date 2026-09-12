@@ -319,14 +319,29 @@ impl Portable {
     /// `/home/a/../../etc` under home `/home/a` would become the escaping
     /// `~/../../etc`.
     ///
-    /// `path` is expected to be absolute. [`to_portable`] leaves anything
-    /// outside `home` exactly as it was, so a relative `path` yields a relative
-    /// `Portable`; use [`Portable::parse_in`] when the input is untrusted.
-    #[must_use]
-    pub fn from_path(path: &Path, home: &Path) -> Self {
-        let path = normalised_or_given(path);
-        let home = normalised_or_given(home);
-        Self(to_portable(Path::new(&path), Path::new(&home)))
+    /// # Errors
+    ///
+    /// [`Error::NotPortable`] if `path` is not absolute. A relative path has no
+    /// root to resolve `..` against, so there is no answer to give.
+    ///
+    /// [`Error::HomeNotAbsolute`] if `home` is not absolute.
+    ///
+    /// [`Error::EscapesRoot`] is **propagated**, never swallowed. An earlier
+    /// shape of this function fell back to the string it was given whenever
+    /// normalisation failed, so `~/../../etc/passwd` came back whole, claiming
+    /// `under_home() == true` and rendering to a path the kernel resolves to
+    /// `/etc/passwd` — the value this type's own documentation cites by name as
+    /// one that must never exist. The natural first caller is a `bx add <path>`
+    /// handing a command-line argument straight through, so the fallback is
+    /// gone rather than documented.
+    pub fn from_path(path: &Path, home: &Path) -> Result<Self, Error> {
+        let home = home_str(home)?;
+        let raw = path.to_string_lossy();
+        if !path.is_absolute() {
+            return Err(Error::NotPortable(raw.into_owned()));
+        }
+        let normalised = normalise(&raw)?;
+        Ok(Self(fold_under_home(&normalised, &home)))
     }
 
     /// Parse a portable path written by a human, against `home`.
@@ -364,14 +379,15 @@ impl Portable {
     /// account-specific literal that would mean a different file on the next
     /// account, and Invariant 5 says such a value must be loud.
     pub fn parse_in(raw: &str, home: &Path) -> Result<Self, Error> {
+        let home = home_str(home)?;
         let normalised = normalise(raw)?;
-        let folded = Self::from_path(Path::new(&normalised), home);
-        if folded.0 == normalised {
+        let folded = fold_under_home(&normalised, &home);
+        if folded == normalised {
             Ok(Self(normalised))
         } else {
             Err(Error::AbsoluteUnderHome {
                 raw: raw.to_string(),
-                portable: folded.0,
+                portable: folded,
             })
         }
     }
@@ -401,10 +417,24 @@ impl Portable {
     }
 }
 
-/// Normalise a path lexically, keeping it as it was if it has no root.
-fn normalised_or_given(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    normalise(&raw).unwrap_or_else(|_| raw.into_owned())
+/// The normalised string form of a home directory.
+///
+/// # Errors
+///
+/// [`Error::HomeNotAbsolute`] when `home` is not an absolute path. An absolute
+/// path always normalises — it clamps at `/` — so that is the only failure.
+fn home_str(home: &Path) -> Result<String, Error> {
+    let raw = home.to_string_lossy();
+    normalise(&raw).map_err(|_| Error::HomeNotAbsolute(home.to_path_buf()))
+}
+
+/// Rewrite an already-normalised rooted path as `~`-relative when it is under
+/// the already-normalised `home`.
+///
+/// The one place the two constructors share, so they cannot disagree about
+/// which spelling a file has.
+fn fold_under_home(normalised: &str, home: &str) -> String {
+    to_portable(Path::new(normalised), Path::new(home))
 }
 
 impl std::fmt::Display for Portable {
@@ -694,7 +724,7 @@ mod tests {
     #[test]
     fn a_portable_round_trips_through_the_newtype() {
         let original = Path::new("/var/home/example/.config/starship.toml");
-        let portable = Portable::from_path(original, &home());
+        let portable = Portable::from_path(original, &home()).unwrap();
 
         assert_eq!(portable.as_str(), "~/.config/starship.toml");
         assert_eq!(portable.to_string(), "~/.config/starship.toml");
@@ -704,7 +734,7 @@ mod tests {
 
     #[test]
     fn a_portable_outside_home_stays_absolute_and_is_not_under_home() {
-        let portable = Portable::from_path(Path::new("/usr/bin/sccache"), &home());
+        let portable = Portable::from_path(Path::new("/usr/bin/sccache"), &home()).unwrap();
 
         assert_eq!(portable.as_str(), "/usr/bin/sccache");
         assert!(!portable.under_home());
@@ -800,7 +830,7 @@ mod tests {
             "/usr/bin/sccache",
             "/etc/hosts",
         ] {
-            let built = Portable::from_path(Path::new(absolute), &home());
+            let built = Portable::from_path(Path::new(absolute), &home()).unwrap();
             assert_eq!(
                 Portable::parse_in(built.as_str(), &home()),
                 Ok(built.clone()),
@@ -908,7 +938,8 @@ mod tests {
         let portable = Portable::from_path(
             Path::new("/var/home/example/.ssh/../../../../etc/passwd"),
             &home(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(portable.as_str(), "/etc/passwd");
         assert!(!portable.under_home());
@@ -918,23 +949,59 @@ mod tests {
     #[test]
     fn from_path_collapses_redundant_segments() {
         assert_eq!(
-            Portable::from_path(Path::new("/var/home/example/.ssh/./config"), &home()).as_str(),
+            Portable::from_path(Path::new("/var/home/example/.ssh/./config"), &home())
+                .unwrap()
+                .as_str(),
             "~/.ssh/config"
         );
         assert_eq!(
-            Portable::from_path(Path::new("/var/home/example/a/../b"), &home()).as_str(),
+            Portable::from_path(Path::new("/var/home/example/a/../b"), &home())
+                .unwrap()
+                .as_str(),
             "~/b"
         );
     }
 
     #[test]
-    fn from_path_leaves_a_relative_path_alone() {
-        // Documented fallback: a relative input has no root to normalise
-        // against, and parse() is what a caller uses on untrusted input.
+    fn from_path_rejects_a_path_it_cannot_answer_for() {
+        // The fallback this replaces returned the string it was given whenever
+        // normalisation failed. `~/../../etc/passwd` therefore came back whole,
+        // claiming under_home() == true and rendering to a path the kernel
+        // resolves to /etc/passwd -- the value this type's own doc names as one
+        // that must never exist. The natural first caller is `bx add <path>`
+        // handing a command-line argument straight through.
         assert_eq!(
-            Portable::from_path(Path::new("files/starship.toml"), &home()).as_str(),
-            "files/starship.toml"
+            Portable::from_path(Path::new("~/../../etc/passwd"), &home()),
+            Err(Error::NotPortable("~/../../etc/passwd".to_string()))
         );
+        assert_eq!(
+            Portable::from_path(Path::new("files/starship.toml"), &home()),
+            Err(Error::NotPortable("files/starship.toml".to_string())),
+            "a relative path has no root to resolve `..` against"
+        );
+        assert_eq!(
+            Portable::from_path(Path::new("/etc/hosts"), Path::new("relative/home")),
+            Err(Error::HomeNotAbsolute(PathBuf::from("relative/home")))
+        );
+    }
+
+    #[test]
+    fn from_path_never_answers_with_a_value_parse_would_refuse() {
+        // The fallback is unreachable, so there is no input for which the two
+        // constructors disagree about whether a value is admissible.
+        for raw in [
+            "/var/home/example/.ssh/../../../../etc/passwd",
+            "/var/home/example/../example/.gitconfig",
+            "/",
+            "/usr/bin/sccache",
+        ] {
+            let built = Portable::from_path(Path::new(raw), &home()).unwrap();
+            assert_eq!(
+                Portable::parse_in(built.as_str(), &home()),
+                Ok(built),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

@@ -22,10 +22,11 @@
 //! identity values become declared values, and their absence blocks the one
 //! target that needs them.
 //!
-//! The same holds for a value whose committed `default` this account's legal
-//! answers make invalid — `{{prefix}}/cache` as a `path` with `prefix` answered
-//! `scratch`. It blocks the targets that reference it, and the note names the
-//! `local.toml` line that caused it.
+//! The same holds for a value this account made unusable: an answer its kind
+//! refuses, such as `scratch_root = "/"` for a root, or a legal answer that
+//! makes a committed `default` invalid — `{{prefix}}/cache` as a `path` with
+//! `prefix` answered `scratch`. It blocks the targets that reference it, and the
+//! note names the `local.toml` line that caused it.
 //!
 //! A defect in the **committed** repo is not blocked but fatal — a malformed
 //! placeholder, or a reference to a value no layer declares, cannot be fixed by
@@ -70,7 +71,8 @@ pub enum BlockReason {
         names: Vec<String>,
     },
     /// One or more declared values this entry references have no usable text,
-    /// because this account's answers made a committed `default` invalid.
+    /// because of an answer in this account's layer: one its kind refuses, or
+    /// one that made a committed `default` invalid.
     ///
     /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
     /// unanswered: the answer that needs changing is already written, and the
@@ -116,9 +118,8 @@ pub struct Resolved {
 ///
 /// [`Error::BadValue`] for a defect in the committed repo: a malformed
 /// placeholder, a reference to a value no layer declares, a `default` that
-/// references a later value, an answer that is not of its declared kind, or a
-/// `default` that is not of its kind with no account answer involved; and for
-/// two ready targets that name one file.
+/// references a later value, or a `default` that is not of its kind with no
+/// account answer involved; and for two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -765,6 +766,40 @@ mod tests {
             ["git_name", "git_email", "git_signingkey"],
             "the unreferenced third value is listed but blocks nothing"
         );
+    }
+
+    #[test]
+    fn a_root_answered_as_the_filesystem_blocks_only_what_references_it() {
+        // End to end through the merge: the account's own local.toml line is
+        // refused and named, a target that references no value still applies,
+        // and nothing is admitted to the root set.
+        for spelling in ["/", "//", "/./", "/.."] {
+            let resolved = resolved(
+                &format!(
+                    "{SCRATCH}[[target]]\npath = \"~/.config/env\"\n\
+                     content = \"CACHE={{{{scratch_root}}}}/cache\"\n\
+                     [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n"
+                ),
+                Some(format!("[values]\nscratch_root = \"{spelling}\"\n").as_str()),
+            )
+            .unwrap_or_else(|e| panic!("{spelling:?} failed the whole load: {e}"));
+
+            let entry = blocked(&resolved, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["scratch_root".to_string()]
+                },
+                "{spelling:?}"
+            );
+            assert!(
+                entry.hint.contains("local.toml:2"),
+                "{spelling:?}: {}",
+                entry.hint
+            );
+            ready(&resolved, 1);
+            assert!(resolved.values.roots().is_empty(), "{spelling:?}");
+        }
     }
 
     #[test]

@@ -685,11 +685,12 @@ pub enum Unresolved {
         /// The declarations that are switched off, in declaration order.
         names: Vec<String>,
     },
-    /// Declared, but this account's answers made its text invalid for its kind.
+    /// Declared, but its text is not of its kind, and the cause is this account's.
     ///
-    /// A committed `default` that expands, through an answer the account gave,
-    /// to text its kind refuses: `{{prefix}}/cache` as a `path`, with `prefix`
-    /// answered `scratch`. The answer is legal for its own declaration, so this
+    /// Either an answer the account wrote that its kind refuses —
+    /// `scratch_root = "/"` for a root — or a committed `default` an account
+    /// answer turned into such text: `{{prefix}}/cache` as a `path`, with
+    /// `prefix` answered `scratch`. Both are the account's to fix, so this
     /// blocks what depends on the value rather than failing the load. A
     /// `default` that is invalid with no account answer involved is a defect in
     /// the committed repo, and still fails it.
@@ -822,6 +823,20 @@ pub fn disabled_hint(names: &[&str]) -> String {
     )
 }
 
+/// Why an answer the account wrote has no usable text.
+///
+/// Names the line, which is in the file the account can edit. Blocking rather
+/// than failing the load is the degradation an unanswered value gets: the
+/// answer is the account's, so it costs the targets that reference it.
+fn broken_answer_why(decl: &ValueDecl, assignment: &ValueAssignment, error: &ValueError) -> String {
+    format!(
+        "value `{name}` has no usable value: the answer at {origin} is refused, because \
+         {error}; change that answer",
+        name = decl.name,
+        origin = assignment.origin,
+    )
+}
+
 /// Why a committed `default` has no usable text for this account.
 ///
 /// Names each answer that went into it with the line it was written on, which
@@ -887,17 +902,16 @@ enum Answer {
     /// Not the same state as unanswered: no answer would help, and what clears
     /// it is switching the declaration back on.
     Disabled(Vec<String>),
-    /// This account's answers made the text invalid for its kind.
+    /// The text is not of its kind, and an account answer is the cause.
     ///
-    /// Not a load failure: the answers are legal for their own declarations,
-    /// and what they broke is a committed default, so it blocks what depends
-    /// on this value and nothing else.
+    /// Not a load failure: the answer is the account's to change, so it blocks
+    /// what depends on this value and nothing else.
     Invalid {
-        /// The declarations whose text is invalid: this one's own name where
-        /// its default broke, or the names carried from a reference.
+        /// The declarations whose text is invalid: this one's own name, or the
+        /// names carried from a reference.
         names: Vec<String>,
-        /// Set on the declaration whose default broke, naming the answers and
-        /// the lines that broke it.
+        /// Set on the declaration whose text broke, naming the answers and the
+        /// lines responsible.
         why: Option<String>,
     },
 }
@@ -943,13 +957,14 @@ impl ResolvedValues {
     /// # Errors
     ///
     /// [`Error::BadValue`] for a malformed template, a reference to an
-    /// undeclared or later value, an answer that is not of its declared kind,
-    /// or a `default` that is not of its kind with no account answer involved.
+    /// undeclared or later value, or a `default` that is not of its kind with
+    /// no account answer involved.
     ///
-    /// A `default` that only this account's answers make invalid is **not** an
-    /// error. The answers are legal for their own declarations, so the value
-    /// becomes [`Unresolved::Invalid`] and blocks only what references it, and
-    /// [`ResolvedValues::invalid_hint`] names the `local.toml` lines responsible.
+    /// Text that is not of its kind **because of this account** is not an error:
+    /// an answer the account wrote, or a `default` an answer went into. The
+    /// value becomes [`Unresolved::Invalid`] and blocks only what references it,
+    /// and [`ResolvedValues::invalid_hint`] names the `local.toml` lines
+    /// responsible.
     pub fn resolve(
         decls: Vec<ValueDecl>,
         assignments: &[ValueAssignment],
@@ -1024,21 +1039,25 @@ impl ResolvedValues {
                             Err(AnswerError::Reference(Unresolved::Invalid { names })) => {
                                 Answer::Invalid { names, why: None }
                             }
-                            // A committed default that expanded fine and failed
-                            // its kind. If an account answer went into it, the
-                            // account's legal answer broke it: block what
-                            // depends on it and name the lines. If none did, no
-                            // answer could fix it, and it is a repo defect.
-                            Err(AnswerError::Kind(error)) if supplied.is_none() => {
-                                let causes = resolved.account_inputs(&raw);
-                                if causes.is_empty() {
-                                    return Err(Error::BadValue {
-                                        origin,
-                                        message: format!("value `{}`: {error}", decl.name),
-                                    });
-                                }
-                                let why =
-                                    broken_default_why(&decl, &raw, &error, &causes, assignments);
+                            // Text that expanded fine and failed its kind. An
+                            // answer the account wrote, or a committed default an
+                            // account answer went into, is the account's to fix:
+                            // block what depends on it and name the lines. A
+                            // default no answer went into is a repo defect that
+                            // no answer could fix.
+                            Err(AnswerError::Kind(error)) => {
+                                let why = if let Some(assignment) = supplied {
+                                    broken_answer_why(&decl, assignment, &error)
+                                } else {
+                                    let causes = resolved.account_inputs(&raw);
+                                    if causes.is_empty() {
+                                        return Err(Error::BadValue {
+                                            origin,
+                                            message: format!("value `{}`: {error}", decl.name),
+                                        });
+                                    }
+                                    broken_default_why(&decl, &raw, &error, &causes, assignments)
+                                };
                                 Answer::Invalid {
                                     names: vec![decl.name.clone()],
                                     why: Some(why),
@@ -1705,12 +1724,12 @@ mod tests {
         let mut root = a_decl("scratch_root", ValueKind::Path);
         root.is_root = true;
 
-        let message = resolve(vec![root.clone()], &[answer("scratch_root", "/")]).unwrap_err();
-        assert!(message.contains("may not be `/`"), "{message}");
+        let values = resolve(vec![root.clone()], &[answer("scratch_root", "/")]).unwrap();
+        assert!(values.roots().is_empty(), "refused, and admits nothing");
 
         // The same answer through the prompt, because one entry point validates
-        // both and a prompt that accepted it would write a file that fails to
-        // load.
+        // both and a prompt that accepted it would write a line that holds back
+        // every target referencing the root.
         let values = ResolvedValues::resolve(vec![root], &[], &a_home()).unwrap();
         let message = values.check_answer("scratch_root", "/a/../..").unwrap_err();
         assert!(message.to_string().contains("may not be `/`"), "{message}");
@@ -1719,6 +1738,48 @@ mod tests {
         // nothing is admitted on the strength of it.
         let plain = a_decl("brew_prefix", ValueKind::Path);
         assert!(resolve(vec![plain], &[answer("brew_prefix", "/")]).is_ok());
+    }
+
+    #[test]
+    fn a_root_answered_as_the_filesystem_blocks_and_admits_nothing() {
+        // `/` as a root puts every destination inside the declared roots. A
+        // local.toml line that says so is refused at load however it is spelled,
+        // and names that line. It holds back what references the root rather
+        // than every target, and it never reaches `roots()`.
+        let mut root = a_decl("scratch_root", ValueKind::Path);
+        root.is_root = true;
+
+        for spelling in ["/", "//", "/./", "/..", "/a/../.."] {
+            let values = resolve(vec![root.clone()], &[answer("scratch_root", spelling)])
+                .unwrap_or_else(|e| panic!("{spelling:?} failed the whole load: {e}"));
+
+            assert!(values.get("scratch_root").is_none(), "{spelling:?}");
+            assert!(
+                values.roots().is_empty(),
+                "{spelling:?} widened the root set"
+            );
+            assert_eq!(
+                values.substitute("{{scratch_root}}"),
+                Err(Unresolved::Invalid {
+                    names: vec!["scratch_root".to_string()]
+                }),
+                "{spelling:?}"
+            );
+            let hint = values.invalid_hint(&["scratch_root".to_string()]);
+            assert!(hint.contains("local.toml:2"), "{spelling:?}: {hint}");
+            assert!(hint.contains("may not be `/`"), "{spelling:?}: {hint}");
+        }
+
+        let values = resolve(
+            vec![root],
+            &[answer("scratch_root", "/var/mnt/scratch/one")],
+        )
+        .unwrap();
+        assert_eq!(
+            values.roots(),
+            [PathBuf::from("/var/mnt/scratch/one")],
+            "an ordinary absolute root is still a root"
+        );
     }
 
     #[test]
@@ -1952,14 +2013,19 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_that_is_not_of_its_kind_is_a_load_error_naming_its_origin() {
+    fn an_answer_that_is_not_of_its_kind_blocks_its_dependents_naming_its_line() {
+        // The line is wrong on its own terms, and it is the account's: it costs
+        // what references `git_email`, not the load, and the note names it.
         let decl = a_decl("git_email", ValueKind::Email);
 
-        let message = resolve(vec![decl], &[answer("git_email", "not an address")]).unwrap_err();
+        let values = resolve(vec![decl], &[answer("git_email", "not an address")])
+            .expect("an account's own bad line does not fail the load");
 
-        assert!(message.contains("local.toml:2"), "{message}");
-        assert!(message.contains("git_email"), "{message}");
-        assert!(message.contains("exactly one `@`"), "{message}");
+        assert!(values.get("git_email").is_none());
+        let hint = values.invalid_hint(&["git_email".to_string()]);
+        assert!(hint.contains("local.toml:2"), "{hint}");
+        assert!(hint.contains("git_email"), "{hint}");
+        assert!(hint.contains("exactly one `@`"), "{hint}");
     }
 
     #[test]
@@ -2587,7 +2653,10 @@ mod tests {
             vec![a_decl("scratch_root", ValueKind::Path), a_decl("v", kind)],
             &[answer("scratch_root", SCRATCH), answer("v", answer_text)],
         )?;
-        Ok(values.get("v").expect("answered").text.clone())
+        values
+            .get("v")
+            .map(|value| value.text.clone())
+            .ok_or_else(|| values.invalid_hint(&["v".to_string()]))
     }
 
     /// Every kind, with an answer it accepts and one it does not.

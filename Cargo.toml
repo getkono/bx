@@ -26,6 +26,24 @@ path = "src/main.rs"
 # No feature gates. The whole binary is one product with one install path;
 # gating it would only create configurations that CI never builds.
 
+[lints.rust]
+# bx contains no `unsafe`, and the reason is specific rather than stylistic.
+# `std::env::set_var` and `remove_var` are `unsafe` in edition 2024 because
+# their precondition is *process-wide*: no other thread may read or write the
+# environment, including through `getenv` inside libc and inside `std` itself.
+# `cargo test` runs every test in threads of one process, `env::temp_dir()`
+# reads TMPDIR on every `TempDir::new()`, and `detect` reads PATH, so no mutex
+# this crate owns can establish it. A test that reached for
+# `unsafe { set_var("HOME", …) }` would reintroduce a race whose symptom is a
+# flaky failure somewhere else entirely; the environment is taken as a
+# parameter instead (see `paths::home_in` and `testing`).
+#
+# `forbid` rather than `deny`, so no module can re-allow it, and declared here
+# rather than as a crate attribute so it covers the library, the binary,
+# `build.rs` and anything under `tests/` alike — which is exactly where someone
+# would reach for it.
+unsafe_code = "forbid"
+
 [dependencies]
 # CLI surface + dynamic completions (values come from `bx __complete`).
 clap = { version = "4.6.6", features = ["derive", "cargo", "wrap_help"] }

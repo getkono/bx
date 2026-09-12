@@ -35,6 +35,14 @@
 //!   *child* process a home, pass it per-command — `Command::env("HOME", …)` —
 //!   which mutates nothing here.
 //!
+//! That last rule is not a convention: `Cargo.toml` sets
+//! `[lints.rust] unsafe_code = "forbid"`, which the compiler applies to the
+//! library, the binary, `build.rs` and every integration test in `tests/`, and
+//! which no module can re-allow. An earlier shape of this rule was a test that
+//! grepped `src/` for the keyword; it covered neither `tests/` — where someone
+//! reaching for `set_var` would actually write it — nor `build.rs`, it exempted
+//! a file it could not read, and it could be defeated by a line break.
+//!
 //! A guard mutates nothing global, so taking two of them, or nesting them, is
 //! fine and a shared fixture helper may take one of its own.
 //!
@@ -395,84 +403,5 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !c.is_ascii_alphanumeric())
         })
-    }
-
-    /// `haystack` contains `needle` as a whole identifier.
-    ///
-    /// Stricter than [`contains_token`] at the far end, because a keyword search
-    /// must not fire on `an_unsafe_block` in a name while still firing on the
-    /// keyword itself.
-    fn contains_word(haystack: &str, needle: &str) -> bool {
-        let part_of_an_identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        haystack.match_indices(needle).any(|(at, _)| {
-            haystack[..at]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !part_of_an_identifier(c))
-                && haystack[at + needle.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| !part_of_an_identifier(c))
-        })
-    }
-
-    #[test]
-    fn a_username_inside_an_ordinary_word_is_not_an_offence() {
-        assert!(!contains_token("adjusting the margin", "justin"));
-        assert!(contains_token("home = justin", "justin"));
-        assert!(contains_token("justin", "justin"));
-        assert!(contains_token("/home/justin", "justin"));
-        // A username with a suffix is still the username.
-        assert!(contains_token("/var/home/justin13888", "justin"));
-    }
-
-    #[test]
-    fn a_keyword_inside_an_identifier_is_not_the_keyword() {
-        let needle = ["uns", "afe"].concat();
-
-        // Every subject is built from `needle`, so no line in this file carries
-        // the bare keyword and the scan above stays honest about its own source.
-        assert!(!contains_word(
-            &format!("fn an_{needle}_block() {{"),
-            &needle
-        ));
-        assert!(!contains_word(&format!("let {needle}ly = 1;"), &needle));
-        assert!(contains_word(&format!("    {needle} {{"), &needle));
-        assert!(contains_word(&format!("pub {needle} fn f() {{}}"), &needle));
-        assert!(contains_word(&needle, &needle));
-    }
-
-    #[test]
-    fn no_source_file_under_src_declares_an_unsafe_block() {
-        // The crate's only `unsafe` was a process-wide environment mutation,
-        // which is unsound under `cargo test` and was removed rather than
-        // serialised. The reason is not obvious from reading the code that
-        // replaced it, so this fails if one comes back. Comment lines are
-        // exempt, because explaining the hazard is how it stays explained, and
-        // the needle is assembled at runtime so this file is not its own
-        // counter-example.
-        let needle = ["uns", "afe"].concat();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-
-        let offenders: Vec<String> = rust_sources(&root)
-            .into_iter()
-            .filter(|file| {
-                std::fs::read_to_string(file)
-                    .unwrap_or_default()
-                    .lines()
-                    .any(|line| {
-                        let code = line.trim_start();
-                        !code.starts_with("//") && contains_word(code, &needle)
-                    })
-            })
-            .map(|file| file.display().to_string())
-            .collect();
-
-        assert!(
-            offenders.is_empty(),
-            "process-wide environment mutation is unsound under `cargo test`; \
-             take the environment as a parameter instead:\n  {}",
-            offenders.join("\n  ")
-        );
     }
 }

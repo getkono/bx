@@ -254,7 +254,12 @@ pub struct Desired<'a> {
 pub struct Outcome {
     /// What bx will do.
     pub action: Action,
-    /// Whether the bytes differ.
+    /// Whether the bytes on disk differ from the bytes bx wants there.
+    ///
+    /// `true` for an absent destination, including when the desired content is
+    /// empty: "there is no file" and "there is an empty file" are different
+    /// states and the ledger records them differently, so they are not equal
+    /// here either. `false` for a conflict, where there are no comparable bytes.
     pub content_drift: bool,
     /// The mode found and the mode wanted, when they differ.
     pub mode_drift: Option<(Mode, Mode)>,
@@ -363,7 +368,12 @@ pub struct Staged(Pending);
 /// is already the new content. Dropping this removes the temporary file and
 /// leaves the destination exactly as it was.
 #[derive(Debug)]
-pub struct Filled(Pending);
+pub struct Filled {
+    pending: Pending,
+    /// The digest of the bytes now in the temporary file. Not optional: a
+    /// `Filled` cannot exist without them, so no accessor on it can fail.
+    written: ContentHash,
+}
 
 /// The state both phases carry. Deliberately not public: the phase is the API.
 #[derive(Debug)]
@@ -375,8 +385,6 @@ struct Pending {
     /// Parent directories this write invented, deepest first, so a reversal can
     /// remove them in order and leave nothing behind.
     created_dirs: Vec<PathBuf>,
-    /// The digest of the bytes written, once they have been.
-    written: Option<ContentHash>,
 }
 
 impl Pending {
@@ -393,6 +401,12 @@ impl Pending {
 /// component. An *existing* directory is never chmod'd: it is the user's. When
 /// that leaves a parent wider than the declared mode, [`compare`] reports it,
 /// and the remedy is to declare the directory as a target of its own.
+///
+/// A directory created here and then abandoned — because the temporary file
+/// could not be made, or because the write was never committed — is left in
+/// place. It is empty and at the mode a `mkdir` would have given it, the next
+/// attempt reuses it, and removing it would race any other write that had
+/// already begun using it.
 ///
 /// # Errors
 ///
@@ -434,7 +448,6 @@ pub fn stage(dest: &Path, mode: Mode) -> Result<Staged, Error> {
         mode,
         prior,
         created_dirs,
-        written: None,
     }))
 }
 
@@ -477,8 +490,11 @@ impl Staged {
         };
         self.0.temp.write_all(bytes).map_err(&fail)?;
         self.0.temp.as_file().sync_all().map_err(&fail)?;
-        self.0.written = Some(ContentHash::of(bytes));
-        Ok(Filled(self.0))
+        let written = ContentHash::of(bytes);
+        Ok(Filled {
+            pending: self.0,
+            written,
+        })
     }
 
     /// Fill and publish in one step, for a caller with nothing to interpose.
@@ -501,7 +517,7 @@ impl Filled {
     /// The destination this write will replace.
     #[must_use]
     pub fn dest(&self) -> &Path {
-        &self.0.dest
+        &self.pending.dest
     }
 
     /// The temporary file, holding the final content at the final mode.
@@ -510,19 +526,19 @@ impl Filled {
     /// crash is identifiable as this write's rather than some other one's.
     #[must_use]
     pub fn temp_path(&self) -> &Path {
-        self.0.temp_path()
+        self.pending.temp_path()
     }
 
     /// The mode the content is already at.
     #[must_use]
     pub const fn mode(&self) -> Mode {
-        self.0.mode
+        self.pending.mode
     }
 
     /// What was at the destination before this write.
     #[must_use]
     pub const fn prior(&self) -> &Observed {
-        &self.0.prior
+        &self.pending.prior
     }
 
     /// The digest of the bytes now in the temporary file.
@@ -531,10 +547,8 @@ impl Filled {
     /// records the digest of what was actually written rather than the digest of
     /// whatever is at the path by the time somebody looks.
     #[must_use]
-    pub fn written(&self) -> ContentHash {
-        self.0
-            .written
-            .expect("a Filled write always has a digest; `fill` sets it")
+    pub const fn written(&self) -> ContentHash {
+        self.written
     }
 
     /// The parent directories this write invented, deepest first.
@@ -543,7 +557,7 @@ impl Filled {
     /// order, so a target that created `~/.config/a/b` leaves nothing behind.
     #[must_use]
     pub fn created_dirs(&self) -> &[PathBuf] {
-        &self.0.created_dirs
+        &self.pending.created_dirs
     }
 
     /// The ledger entry for this write, assembled from what the writer knows.
@@ -560,14 +574,14 @@ impl Filled {
     #[must_use]
     pub fn new_entry(&self, home: &Path, mechanism: Mechanism) -> NewEntry {
         NewEntry::new(
-            Portable::from_path(&self.0.dest, home),
+            Portable::from_path(&self.pending.dest, home),
             self.written(),
-            self.0.mode,
+            self.pending.mode,
             mechanism,
         )
-        .with_prior(self.0.prior.prior_bytes())
+        .with_prior(self.pending.prior.prior_bytes())
         .with_created_dirs(
-            self.0
+            self.pending
                 .created_dirs
                 .iter()
                 .map(|dir| Portable::from_path(dir, home))
@@ -588,9 +602,12 @@ impl Filled {
     /// [`Error::Write`] wrapping the failing `rename` or `fsync`. The temporary
     /// file is removed either way.
     pub fn publish(self) -> Result<(), Error> {
-        let Self(Pending {
-            temp, dest, mode, ..
-        }) = self;
+        let Self {
+            pending: Pending {
+                temp, dest, mode, ..
+            },
+            ..
+        } = self;
 
         let dir = parent_of(&dest)?;
         temp.persist(&dest).map_err(|e| Error::Write {
@@ -1316,6 +1333,24 @@ mod tests {
                 "{rel} is an implicit parent, created at 0755",
             );
         }
+    }
+
+    #[test]
+    fn a_parent_created_for_an_abandoned_write_is_left_in_place() {
+        let home = guarded_home();
+        let dest = home.child(".ssh/config");
+        let staged = stage(&dest, Mode::PRIVATE_FILE).expect("stage");
+        let temp = staged.temp_path().to_path_buf();
+        staged.abandon();
+
+        // Documented behaviour, not an oversight: the directory is empty and at
+        // the mode a mkdir would have given it, the next attempt reuses it, and
+        // removing it would race any other write already using it.
+        assert!(home.child(".ssh").is_dir());
+        assert_eq!(mode_of_path(&home.child(".ssh")), Mode::DEFAULT_DIR);
+        assert_eq!(names_in(&home.child(".ssh")), Vec::<OsString>::new());
+        assert!(!temp.exists());
+        assert!(!dest.exists());
     }
 
     #[test]

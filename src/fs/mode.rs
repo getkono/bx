@@ -223,8 +223,9 @@ impl serde::de::Visitor<'_> for DeclaredMode {
 /// The message an unquoted mode gets: what it would have meant, and the fix.
 fn unquoted(digits: &str) -> String {
     format!(
-        "a mode must be quoted: TOML has no octal literal, so `mode = {digits}` is decimal \
-         {digits}. Write `mode = \"{digits}\"` if {digits} is the octal you meant"
+        "a mode must be quoted: `mode = {digits}` is decimal {digits}, and TOML's own octal \
+         literal (0o{digits}) is not how a mode is written anywhere else. Write \
+         `mode = \"{digits}\"` if {digits} is the octal you meant"
     )
 }
 
@@ -420,6 +421,10 @@ mod tests {
         assert!(message.contains("must be quoted"), "{message}");
         assert!(message.contains("decimal 600"), "{message}");
         assert!(message.contains("mode = \"600\""), "{message}");
+        // TOML has an octal literal; the message may not tell the user it does
+        // not (the base corrected the same claim in `config::target`).
+        assert!(!message.contains("no octal literal"), "{message}");
+        assert!(message.contains("0o600"), "{message}");
     }
 
     #[test]

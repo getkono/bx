@@ -653,29 +653,29 @@ mod tests {
 
     #[test]
     fn a_relocating_variable_inside_a_declared_root_is_allowed() {
-        assert_eq!(
-            check(
-                "CARGO_HOME",
-                "/var/mnt/scratch/example/cache/cargo",
-                &rooted()
-            ),
-            Verdict::Allowed
+        let verdict = check(
+            "CARGO_HOME",
+            "/var/mnt/scratch/example/cache/cargo",
+            &rooted(),
         );
+        assert_eq!(verdict, Verdict::Allowed);
+        assert_eq!(reason_of(&verdict), None);
     }
 
     #[test]
     fn a_relocating_variable_outside_every_root_is_a_violation() {
-        let verdict = check("CARGO_HOME", "/var/cache/elsewhere", &rooted());
-        assert_eq!(reason_of(&verdict), Some(Reason::OutsideDeclaredRoots));
-        // The violation carries what a diagnostic needs to say what to do.
-        let Verdict::Violation(violation) = verdict else {
-            panic!("expected a violation");
-        };
-        assert_eq!(violation.name, "CARGO_HOME");
-        assert_eq!(violation.value, "/var/cache/elsewhere");
-        // `check` judges one assignment outside any content, so there is no
-        // line to report.
-        assert_eq!(violation.line, 0);
+        // The violation carries everything a diagnostic needs to say what to
+        // do about it. `check` judges one assignment outside any content, so
+        // there is no line to report.
+        assert_eq!(
+            check("CARGO_HOME", "/var/cache/elsewhere", &rooted()),
+            Verdict::Violation(Violation {
+                line: 0,
+                name: "CARGO_HOME".into(),
+                value: "/var/cache/elsewhere".into(),
+                reason: Reason::OutsideDeclaredRoots,
+            })
+        );
     }
 
     #[test]
@@ -844,6 +844,24 @@ mod tests {
         let found = scan_with(content, &rooted());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].reason, Reason::UnresolvedReference);
+    }
+
+    #[test]
+    fn an_expansion_that_grows_past_the_length_bound_is_unresolvable() {
+        // The two bounds are not the same bound. A value that doubles on every
+        // pass exhausts the length limit long before the eighth hop, and it is
+        // the length limit that keeps each pass from doing unbounded work.
+        let long = format!("{ROOT}/{}", "a".repeat(MAX_EXPANDED_LEN / 2));
+        let content = format!("X={long}\nY=$X$X\nexport CARGO_HOME=$Y/cargo\n");
+        let found = scan_with(&content, &rooted());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].reason, Reason::UnresolvedReference);
+
+        // The identical shape, under the bound, resolves — so the assertion
+        // above pins the bound and not the shape.
+        let short = format!("{ROOT}/{}", "a".repeat(16));
+        let content = format!("X={short}\nY=$X$X\nexport CARGO_HOME=$Y/cargo\n");
+        assert_eq!(scan_with(&content, &rooted()), vec![]);
     }
 
     #[test]

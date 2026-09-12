@@ -718,8 +718,25 @@ fn parent_of(path: &Path) -> Result<&Path, Error> {
 }
 
 /// `symlink_metadata`, with "nothing is there" as a value rather than an error.
+///
+/// Follows no symlink: for a destination, a link is a thing in its own right.
 fn optional_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
     match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// `metadata`, with "nothing resolves there" as a value rather than an error.
+///
+/// Follows symlinks — see [`observe_parent`], the only caller, for why the
+/// parent is resolved and the destination is not.
+fn optional_resolved_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
+    match std::fs::metadata(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(Error::Read {
@@ -737,8 +754,24 @@ fn mode_of(meta: &std::fs::Metadata) -> Mode {
 }
 
 /// The destination's parent, and the mode it has or would be created at.
+///
+/// Stat'd with `metadata`, which **follows symlinks** — deliberately the
+/// opposite of the `symlink_metadata` [`observe`] uses for the destination
+/// itself. The asymmetry is the policy rather than an oversight, and each half
+/// follows from what bx does at that component:
+///
+/// * a symlink at the **final** component is refused, so the link itself is
+///   what bx is deciding about and its own bits are the ones to report;
+/// * a symlink at a **parent** component is written *through* — decision 2 —
+///   so the directory that actually governs the write is the one the link
+///   resolves to.
+///
+/// A symlink's own mode is always `0777` on Linux, so stat'ing the parent
+/// without following would report a correctly hardened `~/.ssh` reached through
+/// a dotfiles symlink as world-writable, and report it identically to a
+/// genuinely world-writable one.
 fn observe_parent(dir: &Path) -> Result<Parent, Error> {
-    let (mode, exists) = match optional_metadata(dir)? {
+    let (mode, exists) = match optional_resolved_metadata(dir)? {
         Some(meta) => (mode_of(&meta), true),
         // Not there yet, so the mode it will have is the one bx creates it at.
         None => (Mode::DEFAULT_DIR, false),
@@ -1003,6 +1036,46 @@ mod tests {
         assert_eq!(outcome.action, Action::Create);
         let note = outcome.parent_note.expect("the parent must be reported");
         assert!(note.contains("will be created at 0755"), "{note}");
+    }
+
+    #[test]
+    fn a_symlinked_parent_reports_the_directory_it_resolves_to() {
+        let home = guarded_home();
+        // The mainstream dotfiles layout: ~/.ssh is a link into a repository,
+        // and the directory at the far end is already hardened.
+        std::fs::create_dir_all(home.child("dotfiles/dot_ssh")).expect("mkdir");
+        set_mode(&home.child("dotfiles/dot_ssh"), Mode::PRIVATE_DIR).expect("chmod");
+        std::os::unix::fs::symlink("dotfiles/dot_ssh", home.child(".ssh")).expect("symlink");
+        seed(&home.child(".ssh/config"), b"Host *\n", Mode::PRIVATE_FILE);
+
+        let observed = observe(&home.child(".ssh/config")).expect("observe");
+        let parent = observed.parent.as_ref().expect("a parent");
+        assert_eq!(
+            parent.mode,
+            Mode::PRIVATE_DIR,
+            "the resolved directory's 0700, not the link's own 0777",
+        );
+
+        let outcome = compare(&observed, &desired(b"Host *\n", Mode::PRIVATE_FILE));
+        assert_eq!(outcome.parent_note, None, "a hardened parent is no finding");
+
+        // The asymmetry, stated as an assertion: the *destination* is still
+        // stat'd without following, so a link there is a link.
+        assert_eq!(mode_of_path(&home.child(".ssh")).bits(), 0o777);
+    }
+
+    #[test]
+    fn a_symlinked_parent_that_is_genuinely_wide_is_still_reported() {
+        let home = guarded_home();
+        std::fs::create_dir_all(home.child("dotfiles/dot_ssh")).expect("mkdir");
+        set_mode(&home.child("dotfiles/dot_ssh"), Mode::DEFAULT_DIR).expect("chmod");
+        std::os::unix::fs::symlink("dotfiles/dot_ssh", home.child(".ssh")).expect("symlink");
+        seed(&home.child(".ssh/config"), b"Host *\n", Mode::PRIVATE_FILE);
+
+        let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
+        let note = outcome.parent_note.expect("the parent must be reported");
+        assert!(note.contains("is 0755"), "{note}");
+        assert!(note.contains("wider than the 0600"), "{note}");
     }
 
     #[test]

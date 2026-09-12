@@ -1551,7 +1551,7 @@ mod tests {
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("ensure the state directory");
         let lock = ExclusiveLock::acquire(&dir).expect("acquire the lock");
-        let ledger = Ledger::open(&dir, &lock).value;
+        let ledger = Ledger::open(&dir, &lock).expect("open").value;
         (dir, lock, ledger)
     }
 

@@ -943,7 +943,7 @@ mod tests {
     fn an_include_line_is_substituted() {
         let resolved = resolved(
             "[[value]]\nname = \"ssh_dir\"\nkind = \"path\"\n\
-             [[target]]\npath = \"~/.ssh/config\"\ncontent = \"Host x\"\n\
+             [[target]]\npath = \"~/.ssh/config\"\n\
              attach = \"include\"\ninclude = \"Include {{ssh_dir}}/config.d/*.conf\"\n",
             Some("[values]\nssh_dir = \"~/.ssh\"\n"),
         )

@@ -306,6 +306,19 @@ mod tests {
     }
 
     #[test]
+    fn a_guard_names_its_tempdir_when_debugged() {
+        // Later entries assert against a guard in `expect` messages.
+        let home = guarded_home();
+        let rendered = format!("{home:?}");
+
+        assert!(rendered.contains("GuardedHome"), "{rendered}");
+        assert!(
+            rendered.contains(&home.path().display().to_string()),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn the_guard_writes_children_with_their_parents() {
         let home = guarded_home();
         let written = home.write(".config/bx/bx.toml", "# empty\n");

@@ -13,7 +13,7 @@
 //! attach     = "own"                            # own | region | include; default own
 //! comment    = "#"                              # required iff attach = "region"
 //! include    = "Include ~/.ssh/config.d/*.conf" # required iff attach = "include"
-//!                                               #   one non-empty line; no body key
+//!                                               #   one line, not blank; no body key
 //!                                               #   beside it, the line *is* the body
 //! direction  = "apply"                          # apply | track; default apply
 //! format     = "opaque"                         # opaque | jsonc | env.d; default opaque
@@ -417,14 +417,19 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
             // again, so the region stops delimiting anything: bx appends a
             // fresh region on every run, which is Invariant 3, or writes
             // outside the one it meant to, which is Invariant 1. A whitespace
-            // comment character is the same defect with a subtler spelling.
-            if comment.is_whitespace() || comment.is_control() {
+            // comment character is the same defect with a subtler spelling, and
+            // so is an invisible one: U+200B ZERO WIDTH SPACE is neither
+            // whitespace nor a control character, and a delimiter nobody can see
+            // in an editor is one a human deletes. Every comment character a
+            // real config syntax uses is visible ASCII, so that is the rule.
+            if !comment.is_ascii_graphic() {
                 return Err(ctx.bad(
                     table,
                     "comment",
                     format!(
                         "`comment` starts the delimiter lines bx has to find again, so it \
-                         may not be whitespace or a control character; got {raw:?}"
+                         must be a visible ASCII character: not whitespace or a control \
+                         character, and nothing outside ASCII; got {raw:?}"
                     ),
                 ));
             }
@@ -445,7 +450,9 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
             // not one line, so no line-wise search finds it whole; a multi-line
             // insertion is `attach = "region"`, which has delimiters for
             // exactly that reason.
-            if line.is_empty() || line.contains(['\n', '\r']) {
+            // A line of only spaces or tabs is the empty line with a subtler
+            // spelling: it matches every blank line too.
+            if line.trim().is_empty() || line.contains(['\n', '\r']) {
                 return Err(ctx.bad(
                     table,
                     "include",
@@ -1065,8 +1072,13 @@ mod tests {
     /// `attach = "region"`, which carries delimiters for that purpose.
     #[test]
     fn an_include_line_that_is_not_one_line_is_rejected() {
+        // `" "` and `"\t"` passed an `is_empty` check and are the same defect as
+        // `""`: a blank line, which every blank line in the file matches.
         for raw in [
             "",
+            " ",
+            "\\t",
+            " \\t  ",
             "[include]\\n\\tpath = ~/.gitconfig.bx",
             "Include a\\r\\nInclude b",
         ] {
@@ -1096,6 +1108,21 @@ mod tests {
             let message = message(&text);
             assert!(
                 message.contains("whitespace or a control character"),
+                "comment = {raw:?}: {message}"
+            );
+        }
+        // Invisible or non-ASCII characters passed the whitespace-and-control
+        // check: U+200B ZERO WIDTH SPACE and U+00AD SOFT HYPHEN are neither, and
+        // a delimiter nobody can see in an editor is one a human will delete.
+        // The body is present so the comment rule is the only thing to refuse.
+        for raw in ["\\u200b", "\\u00ad", "é", "\\u007f"] {
+            let text = format!(
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"region\"\n\
+                 comment = \"{raw}\"\ncontent = \"x\"\n"
+            );
+            let message = message(&text);
+            assert!(
+                message.contains("a visible ASCII character"),
                 "comment = {raw:?}: {message}"
             );
         }

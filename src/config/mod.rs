@@ -880,6 +880,38 @@ mod tests {
     }
 
     #[test]
+    fn one_layer_may_not_both_restate_an_entry_and_toggle_it() {
+        // The silent no-op the toggle mechanism exists to prevent, at its
+        // sharpest: which of the two wins would depend on the order the merge
+        // happens to apply them in, and nothing in the file says what that order
+        // is. The uniqueness check sees toggles alongside the entries they flip
+        // for exactly this.
+        let text = "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n\n\
+                    [[target]]\npath = \"~/.gitconfig\"\nenabled = false\n";
+        let message = message(text);
+
+        assert!(
+            message.contains("duplicate target `~/.gitconfig`"),
+            "{message}"
+        );
+        assert!(message.contains("first declared at bx.toml:1"), "{message}");
+        assert!(message.contains("bx.toml:5"), "{message}");
+    }
+
+    #[test]
+    fn a_toggle_before_the_entry_it_flips_is_the_same_ambiguity() {
+        // Order within the file makes no difference: it is the pair that is
+        // ambiguous, not the direction.
+        let text = "[[target]]\npath = \"~/.gitconfig\"\nenabled = false\n\n\
+                    [[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n";
+        assert!(message(text).contains("duplicate target `~/.gitconfig`"));
+
+        let text = "[[value]]\nname = \"agent_slice\"\nkind = \"string\"\n\n\
+                    [[value]]\nname = \"agent_slice\"\nenabled = false\n";
+        assert!(message(text).contains("duplicate value `agent_slice`"));
+    }
+
+    #[test]
     fn the_same_path_in_two_layers_is_not_a_duplicate() {
         // It is a replacement, and A3 performs it.
         let a = parse("[[target]]\npath = \"~/a\"\nfile = \"a\"\n").unwrap();

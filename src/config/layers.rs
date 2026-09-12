@@ -295,6 +295,41 @@ mod tests {
     }
 
     #[test]
+    fn the_byte_sorted_later_module_wins_a_conflicting_key() {
+        // End to end, off the disk, because the ordering property is only worth
+        // anything if it survives the composition: `read_dir` order is the
+        // filesystem's, and Invariant 3 admits none of it. `10-a.toml` sorts
+        // *before* `9-a.toml` by raw filename bytes and after it numerically, so
+        // this fails under either a numeric sort or a naive `read_dir` order.
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        home.write(
+            ".config/bx/modules/9-a.toml",
+            "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"from nine\"\n",
+        );
+        home.write(
+            ".config/bx/modules/10-a.toml",
+            "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"from ten\"\n",
+        );
+
+        let layers = load_layer_set(&repo, &state).unwrap();
+        let merged = crate::config::merge::merge(&layers).unwrap();
+
+        assert_eq!(merged.targets.len(), 1, "one key, one entry");
+        assert_eq!(
+            merged.targets[0].body,
+            crate::config::target::Body::Inline("from nine".to_string()),
+            "`9-a.toml` sorts after `10-a.toml` by raw filename bytes"
+        );
+        assert_eq!(
+            merged.targets[0].origin.file.file_name().unwrap(),
+            OsStr::new("9-a.toml"),
+            "and the surviving entry says which layer set it"
+        );
+    }
+
+    #[test]
     fn a_missing_repo_is_an_error() {
         let home = guarded_home();
         let (repo, state) = repo_and_state(&home);

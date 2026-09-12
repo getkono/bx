@@ -438,6 +438,79 @@ mod tests {
     }
 
     #[test]
+    fn a_substitution_that_breaks_a_portable_path_is_a_load_error() {
+        // Every substituted field is re-validated, because substitution can turn
+        // a legal value into an illegal one. A path that climbs out of the home
+        // is the case that matters: `under_home` is a claim about location, and
+        // a `Portable` that escaped it would make a later entry's write gate on
+        // nothing.
+        let message = resolved(
+            "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{leaf}}\"\ncontent = \"x\"\n",
+            Some("[values]\nleaf = \"../../etc/passwd\"\n"),
+        )
+        .expect_err("the substituted path climbs out of the home");
+        assert!(message.contains("climb out of the home"), "{message}");
+
+        let message = resolved(
+            "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n\
+             references = [\"~/{{leaf}}\"]\n",
+            Some("[values]\nleaf = \"../../etc/passwd\"\n"),
+        )
+        .expect_err("a reference is a portable path too");
+        assert!(message.contains("climb out of the home"), "{message}");
+    }
+
+    #[test]
+    fn a_substitution_that_breaks_a_key_path_is_a_load_error() {
+        let message = resolved(
+            "[[value]]\nname = \"setting\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/zed/settings.json\"\ncontent = \"{{{{}}\"\n\
+             format = \"jsonc\"\nowns = [\"editor.{{setting}}\"]\n",
+            Some("[values]\nsetting = \"\"\n"),
+        )
+        .expect_err("`editor.` has an empty segment");
+
+        assert!(message.contains("empty segment"), "{message}");
+    }
+
+    #[test]
+    fn a_directory_target_resolves_with_nothing_to_substitute() {
+        // A directory has no body to visit, and a body-less target must still
+        // have its path and its other string fields substituted.
+        let resolved = resolved(
+            "[[value]]\nname = \"flavour\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{flavour}}.d\"\ndir = true\n\
+             requires = [\"{{flavour}}-tool\"]\n",
+            Some("[values]\nflavour = \"dark\"\n"),
+        )
+        .unwrap();
+
+        let target = ready(&resolved, 0);
+        assert_eq!(target.path.as_str(), "~/.config/dark.d");
+        assert_eq!(target.body, Body::Dir);
+        assert_eq!(target.requires, ["dark-tool"]);
+    }
+
+    #[test]
+    fn a_directory_target_is_blocked_on_an_unset_value_like_any_other() {
+        let resolved = resolved(
+            "[[value]]\nname = \"flavour\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{flavour}}.d\"\ndir = true\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&resolved, 0).reason,
+            BlockReason::UnsetValue {
+                names: vec!["flavour".to_string()]
+            }
+        );
+    }
+
+    #[test]
     fn a_target_path_may_not_open_with_a_placeholder() {
         // `Portable` is the natural key of a target and the key the ledger and
         // the journal are written against, so it is `~`- or `/`-rooted by

@@ -39,7 +39,7 @@ use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
 
 /// The section header, as messages spell it.
-const SECTION: &str = "[[target]]";
+pub(crate) const SECTION: &str = "[[target]]";
 
 /// Every key a `[[target]]` entry may carry.
 const KEYS: [&str; 15] = [
@@ -291,6 +291,28 @@ pub fn parse_target(table: &Table, file: &Path, text: &str) -> Result<Target, Er
     let direction = parse_direction(&ctx, table)?;
     let format = parse_format(&ctx, table)?;
 
+    if body == Body::Dir {
+        // The same rule the flat discriminant keys already follow elsewhere: a
+        // companion key that cannot mean anything is an error, not a key that is
+        // quietly ignored. `parse_attach` rejects `comment` without a region and
+        // `parse_format` rejects `owns` without jsonc; this is the third pair.
+        if attach != Attach::Own {
+            return Err(ctx.bad(
+                table,
+                "attach",
+                "a directory target is always attached as `own`: there is no content \
+                 to delimit a region in and no file to insert a line into",
+            ));
+        }
+        if format != Format::Opaque {
+            return Err(ctx.bad(
+                table,
+                "format",
+                "a directory target has no content, so `format` has nothing to describe",
+            ));
+        }
+    }
+
     let requires = ctx.str_array_at(table, "requires")?;
     let references = ctx
         .str_array_at(table, "references")?
@@ -415,10 +437,62 @@ fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> 
     }
 }
 
+/// A body file is named relative to the config repo root, and stays inside it.
+///
+/// `path` and `references` are portable paths and are validated as such; `file`
+/// is the third path a target carries and needs its own rule. An absolute value
+/// would silently discard the repo root the moment it reached `repo.join`, and a
+/// climbing one would read a file the repo does not contain — a config repo is
+/// meant to be publishable and self-contained, and neither value can be.
+///
+/// The stored form is normalised, so `files/./a` and `files/a` are one body.
+fn repo_relative(ctx: &Ctx, table: &Table, key: &str, raw: &str) -> Result<PathBuf, Error> {
+    if raw.starts_with('/') || raw.starts_with('~') {
+        return Err(ctx.bad(
+            table,
+            key,
+            format!(
+                "`{key}` names a file inside the config repo, so it is relative to the \
+                 repo root; got {raw:?}"
+            ),
+        ));
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err(ctx.bad(
+                        table,
+                        key,
+                        format!("`{key}` may not climb out of the config repo; got {raw:?}"),
+                    ));
+                }
+            }
+            named => parts.push(named),
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(ctx.bad(
+            table,
+            key,
+            format!("`{key}` must name a file in the config repo; got {raw:?}"),
+        ));
+    }
+
+    Ok(PathBuf::from(parts.join("/")))
+}
+
 /// The body one declared key names.
 fn body_from(ctx: &Ctx, table: &Table, key: &str) -> Result<Body, Error> {
     match key {
-        "file" => Ok(Body::File(PathBuf::from(ctx.required_str(table, "file")?))),
+        "file" => {
+            let raw = ctx.required_str(table, "file")?;
+            Ok(Body::File(repo_relative(ctx, table, "file", raw)?))
+        }
         "content" => Ok(Body::Inline(
             ctx.required_str(table, "content")?.to_string(),
         )),
@@ -612,6 +686,70 @@ mod tests {
 
         assert_eq!(target.body, Body::Dir);
         assert_eq!(target.mode, Some(Mode::parse_octal("0700").unwrap()));
+    }
+
+    #[test]
+    fn a_body_file_must_be_relative_to_the_config_repo() {
+        // `repo.join` on an absolute path discards the base, so an absolute
+        // `file` would read anywhere on the machine.
+        for escaping in ["/etc/shadow", "~/.ssh/id_ed25519", "~other/secrets"] {
+            let text = format!("[[target]]\npath = \"~/a\"\nfile = \"{escaping}\"\n");
+            assert!(
+                message(&text).contains("relative to the repo root"),
+                "{escaping} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_file_may_not_climb_out_of_the_config_repo() {
+        for escaping in ["../../../etc/shadow", "..", "files/../../outside"] {
+            let text = format!("[[target]]\npath = \"~/a\"\nfile = \"{escaping}\"\n");
+            assert!(
+                message(&text).contains("climb out of the config repo"),
+                "{escaping} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_file_must_name_something() {
+        assert!(message("[[target]]\npath = \"~/a\"\nfile = \"\"\n").contains("must name a file"));
+        assert!(
+            message("[[target]]\npath = \"~/a\"\nfile = \"./\"\n").contains("must name a file")
+        );
+    }
+
+    #[test]
+    fn a_body_file_is_normalised() {
+        let target =
+            parse("[[target]]\npath = \"~/a\"\nfile = \"files/./sub//starship.toml\"\n").unwrap();
+
+        assert_eq!(
+            target.body,
+            Body::File(PathBuf::from("files/sub/starship.toml"))
+        );
+    }
+
+    #[test]
+    fn a_directory_target_has_no_attachment_but_its_own() {
+        let text = "[[target]]\npath = \"~/.ssh\"\ndir = true\n\
+                    attach = \"region\"\ncomment = \"#\"\n";
+        assert!(message(text).contains("always attached as `own`"));
+
+        let text = "[[target]]\npath = \"~/.ssh\"\ndir = true\n\
+                    attach = \"include\"\ninclude = \"x\"\n";
+        assert!(message(text).contains("always attached as `own`"));
+    }
+
+    #[test]
+    fn a_directory_target_has_no_format() {
+        let text = "[[target]]\npath = \"~/.config/zed\"\ndir = true\nformat = \"jsonc\"\n";
+        assert!(message(text).contains("no content, so `format` has nothing to describe"));
+
+        let text = "[[target]]\npath = \"~/.config/environment.d\"\ndir = true\n\
+                    format = \"env.d\"\n";
+        assert!(message(text).contains("no content, so `format` has nothing to describe"));
     }
 
     #[test]

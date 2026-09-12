@@ -5,11 +5,11 @@
 //!
 //! ```toml
 //! [[value]]
-//! name        = "scratch_root"
+//! name        = "scratch_root"  # [a-z][a-z0-9_]*, here and as a [values] key
 //! description = "Root of this account's scratch storage"
 //! kind        = "path"     # path | string | bool | email | ssh-key | age-recipient
 //! required    = true       # default false
-//! is_root     = true       # default false; joins the env_guard root set
+//! is_root     = true       # default false; joins the env_guard root set; path only
 //! default     = "…"        # optional; a string or a boolean
 //! ```
 //!
@@ -2824,5 +2824,73 @@ mod tests {
                 names: vec!["scratch_root".to_string()]
             }))
         );
+    }
+
+    /// A value name is `[a-z][a-z0-9_]*`, in a declaration and in `[values]`.
+    ///
+    /// `""`, `"a b"` and `"{{x}}"` all parsed as declaration names. One name is
+    /// written three ways, as a `[values]` bare key, inside a `{{name}}`
+    /// reference and as a `bx init` prompt label, and a name that needs quoting
+    /// in any of them, or carries the substitution braces itself, can never be
+    /// referenced.
+    #[test]
+    fn a_value_name_must_be_an_identifier() {
+        for bad in [
+            "",
+            "a b",
+            "{{x}}",
+            "A",
+            "1st",
+            "_x",
+            "git-email",
+            "a.b",
+            "é",
+            "a\\tb",
+        ] {
+            let text = format!("[[value]]\nname = \"{bad}\"\nkind = \"string\"\n");
+            let declared = message(decl(&text));
+            assert!(
+                declared.contains("is not a value name"),
+                "{bad:?}: {declared}"
+            );
+            assert!(declared.contains("bx.toml:2"), "{bad:?}: {declared}");
+
+            let text = format!("[values]\n\"{bad}\" = \"x\"\n");
+            let assigned = message(assignments(&text));
+            assert!(
+                assigned.contains("is not a value name"),
+                "[values] {bad:?}: {assigned}"
+            );
+        }
+        for good in ["a", "git_email", "scratch_root2", "a_1_b"] {
+            let text = format!("[[value]]\nname = \"{good}\"\nkind = \"string\"\n");
+            assert_eq!(decl(&text).unwrap().name, good);
+            let text = format!("[values]\n{good} = true\n");
+            assert_eq!(assignments(&text).unwrap()[0].name, good);
+        }
+    }
+
+    /// `is_root` is only legal on a path.
+    ///
+    /// `is_root = true` on `kind = "bool"` parsed. The flag admits a directory
+    /// into the env_guard root set, so on any other kind it would widen the
+    /// guard on the strength of a value that is not a directory.
+    #[test]
+    fn is_root_is_only_legal_on_a_path() {
+        for kind in ["string", "bool", "email", "ssh-key", "age-recipient"] {
+            let text = format!("[[value]]\nname = \"v\"\nkind = \"{kind}\"\nis_root = true\n");
+            let message = message(decl(&text));
+            assert!(
+                message.contains("only legal on `kind = \"path\"`"),
+                "{kind}: {message}"
+            );
+            assert!(message.contains("bx.toml:4"), "{kind}: {message}");
+
+            // `false` claims nothing, so it is allowed on every kind.
+            let text = format!("[[value]]\nname = \"v\"\nkind = \"{kind}\"\nis_root = false\n");
+            assert!(!decl(&text).unwrap().is_root, "{kind}");
+        }
+        let text = "[[value]]\nname = \"v\"\nkind = \"path\"\nis_root = true\n";
+        assert!(decl(text).unwrap().is_root);
     }
 }

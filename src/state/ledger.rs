@@ -233,14 +233,53 @@ impl LedgerView {
     /// A damaged `ledger.mpk` is quarantined and this returns an empty ledger,
     /// with [`super::Health::Reset`] saying so.
     ///
+    /// # Every stored path is checked against `home`
+    ///
+    /// Decoding a [`crate::paths::Portable`] refuses everything that needs no
+    /// home to refuse. It cannot refuse `/var/home/me/.gitconfig`, which is
+    /// well-formed and on this account a second key for `~/.gitconfig`: one file
+    /// with two entries, two priors, and a `bx rm` that restores whichever it
+    /// meets last. So every stored path — each key, each entry's `path`, and
+    /// each of its `created_dirs` — goes through
+    /// [`crate::paths::Portable::check_against`], and a ledger holding one that
+    /// fails is damaged ([`super::Damage::ForeignPath`]) and quarantined like
+    /// any other, never believed.
+    ///
     /// # Errors
     ///
     /// [`Error::Read`] if `ledger.mpk` exists and cannot be read. An unreadable
     /// ledger is not a damaged one: the reversibility record may be perfectly
     /// intact behind the failure, so it is neither quarantined nor replaced,
     /// and the caller must stop rather than proceed against an empty ledger.
-    pub fn read(dir: &StateDir) -> Result<Loaded<Self>, Error> {
-        store::load(&dir.ledger(), KIND, VERSION)
+    ///
+    /// [`Error::Home`] if `home` is not absolute or not UTF-8. That is checked
+    /// before the file is touched, so a bad home never quarantines a ledger.
+    pub fn read(dir: &StateDir, home: &Path) -> Result<Loaded<Self>, Error> {
+        crate::paths::Portable::parse_in("~", home).map_err(|source| Error::Home {
+            home: home.to_path_buf(),
+            source,
+        })?;
+        store::load_checked(&dir.ledger(), KIND, VERSION, |view: &Self| {
+            view.check_paths(home)
+        })
+    }
+
+    /// Refuse a ledger holding a path this account could not have written.
+    ///
+    /// `home` has already been accepted, so the only failure left is
+    /// [`crate::paths::Error::AbsoluteUnderHome`].
+    fn check_paths(&self, home: &Path) -> Result<(), super::Damage> {
+        for (key, entry) in &self.entries {
+            for stored in [key, &entry.path].into_iter().chain(&entry.created_dirs) {
+                stored
+                    .check_against(home)
+                    .map_err(|reason| super::Damage::ForeignPath {
+                        stored: stored.as_str().to_string(),
+                        reason: reason.to_string(),
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// The entry for `path`, if bx has written it.
@@ -342,9 +381,12 @@ impl Ledger {
     /// empty because it could not be read would record bx's own output as every
     /// target's prior and discard the user's, so the failure is returned rather
     /// than degraded.
-    pub fn open(dir: &StateDir, _lock: &ExclusiveLock) -> Result<Loaded<Self>, Error> {
+    ///
+    /// [`Error::Home`], as [`LedgerView::read`], which checks every stored path
+    /// against `home` the same way.
+    pub fn open(dir: &StateDir, _lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
         let dir = dir.clone();
-        Ok(LedgerView::read(&dir)?.map(|view| Self { dir, view }))
+        Ok(LedgerView::read(&dir, home)?.map(|view| Self { dir, view }))
     }
 
     /// The state directory this ledger was opened from.
@@ -628,7 +670,7 @@ mod tests {
     fn recording_a_target_stores_the_digest_mode_mechanism_and_prior_snapshot() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let stored = ledger
             .record(
                 entry("~/.config/tool.toml", b"new")
@@ -661,7 +703,7 @@ mod tests {
     fn the_prior_blob_is_durable_before_record_returns() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/.bashrc", b"new").with_prior(PriorBytes::Bytes {
                 bytes: b"prior bytes".to_vec(),
@@ -680,7 +722,7 @@ mod tests {
     fn re_recording_a_target_replaces_in_place_and_keeps_the_first_prior() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         // Apply #1: the user's own file is displaced and snapshotted.
         ledger
             .record(entry("~/.bashrc", b"first").with_prior(PriorBytes::Bytes {
@@ -714,7 +756,7 @@ mod tests {
     fn a_re_record_over_bxs_own_output_neither_stores_nor_adopts_it() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/.bashrc", b"first").with_prior(PriorBytes::Bytes {
                 bytes: b"the user wrote this".to_vec(),
@@ -752,7 +794,7 @@ mod tests {
     fn forget_then_record_re_adopts_a_target_with_a_new_prior() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/.bashrc", b"first").with_prior(PriorBytes::Bytes {
                 bytes: b"the user wrote this".to_vec(),
@@ -782,7 +824,7 @@ mod tests {
     fn a_re_record_cannot_turn_a_snapshot_into_an_unlink() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/.bashrc", b"first").with_prior(PriorBytes::Bytes {
                 bytes: b"the user wrote this".to_vec(),
@@ -829,7 +871,7 @@ mod tests {
     /// What `bx rm` does with an entry, reduced to the prior: unlink for
     /// `Absent`, write the snapshot back for `Existed`.
     fn simulate_rm(dir: &StateDir, home: &GuardedHome, name: &str) {
-        let view = LedgerView::read(dir).expect("read").value;
+        let view = LedgerView::read(dir, home.path()).expect("read").value;
         let stored = view.get(&target(name)).expect("entry");
         let dest = stored.path.render(home.path());
         match &stored.prior {
@@ -853,7 +895,7 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => PriorBytes::Absent,
             Err(e) => panic!("observing {}: {e}", dest.display()),
         };
-        let mut ledger = Ledger::open(dir, lock).expect("open").value;
+        let mut ledger = Ledger::open(dir, lock, home.path()).expect("open").value;
         ledger
             .record(entry(&format!("~/{rel}"), body).with_prior(observed))
             .expect("record");
@@ -910,7 +952,7 @@ mod tests {
             "rm restores what the user last had, not what bx displaced first",
         );
         assert!(has_blob(&dir, b"Host theirs\n"), "the original is kept too");
-        let view = LedgerView::read(&dir).expect("read").value;
+        let view = LedgerView::read(&dir, home.path()).expect("read").value;
         let stored = view.get(&target("~/.ssh/config")).expect("entry");
         assert_eq!(stored.superseded.len(), 1, "the original stays indexed");
         assert_eq!(
@@ -939,7 +981,7 @@ mod tests {
         std::fs::write(home.child(rel), b"edit 2\n").expect("edit");
         apply(&dir, &lock, &home, rel, b"bx 3\n");
 
-        let view = LedgerView::read(&dir).expect("read").value;
+        let view = LedgerView::read(&dir, home.path()).expect("read").value;
         let stored = view.get(&target("~/.gitconfig")).expect("entry");
         assert_eq!(
             stored.prior,
@@ -956,7 +998,7 @@ mod tests {
         // The user puts the first edit back; it is the prior again, not history.
         std::fs::write(home.child(rel), b"edit 1\n").expect("edit");
         apply(&dir, &lock, &home, rel, b"bx 4\n");
-        let view = LedgerView::read(&dir).expect("read").value;
+        let view = LedgerView::read(&dir, home.path()).expect("read").value;
         let stored = view.get(&target("~/.gitconfig")).expect("entry");
         assert_eq!(stored.prior, Prior::Existed(reference(b"edit 1\n", 0o644)));
         assert_eq!(
@@ -998,7 +1040,7 @@ mod tests {
     fn run_cell(stored: Stored, incoming: Incoming) -> (LedgerEntry, Vec<String>) {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let first = match stored {
             Stored::Absent => entry("~/t", BX_V1),
             Stored::Existed => entry("~/t", BX_V1).with_prior(prior(ORIGINAL, 0o640)),
@@ -1013,7 +1055,7 @@ mod tests {
         };
         let stored = ledger.record(second).expect("second").clone();
         ledger.save().expect("save");
-        let reloaded = LedgerView::read(&dir).expect("read").value;
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
         assert_eq!(reloaded.get(&target("~/t")), Some(&stored), "round trip");
         (stored, blob_names(&dir))
     }
@@ -1115,7 +1157,7 @@ mod tests {
     fn a_file_bx_created_records_explicit_non_existence() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let stored = ledger.record(entry("~/.config/new", b"x")).expect("record");
         assert_eq!(stored.prior, Prior::Absent);
     }
@@ -1124,7 +1166,7 @@ mod tests {
     fn an_empty_prior_file_is_distinguishable_from_no_prior_file() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/empty", b"x").with_prior(PriorBytes::Bytes {
                 bytes: Vec::new(),
@@ -1150,7 +1192,7 @@ mod tests {
     fn prior_bytes_round_trip_byte_identically() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let body: Vec<u8> = (0..=255_u8)
             .chain(b"\n\0trailing".iter().copied())
             .collect();
@@ -1162,7 +1204,7 @@ mod tests {
             .expect("record");
         ledger.save().expect("save");
 
-        let reloaded = LedgerView::read(&dir).expect("read").value;
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
         let Prior::Existed(reference) = &reloaded.get(&target("~/.binary")).expect("entry").prior
         else {
             panic!("expected a snapshot")
@@ -1177,7 +1219,7 @@ mod tests {
     fn a_prior_mode_survives_the_round_trip() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         // `~/.ssh/config` at 0600 is the case this exists for: restoring it at
         // 0644 would be a security regression dressed up as a restore.
         ledger
@@ -1188,7 +1230,7 @@ mod tests {
             .expect("record");
         ledger.save().expect("save");
 
-        let reloaded = LedgerView::read(&dir).expect("read").value;
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
         let Prior::Existed(reference) = &reloaded.get(&target("~/.ssh/config")).expect("e").prior
         else {
             panic!("expected a snapshot")
@@ -1201,7 +1243,7 @@ mod tests {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let path = home.write(".config/untouched", "as bx left it");
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/.config/untouched", b"as bx left it"))
             .expect("record");
@@ -1221,7 +1263,7 @@ mod tests {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let path = home.write(".config/edited", "as bx left it");
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/.config/edited", b"as bx left it"))
             .expect("record");
@@ -1241,7 +1283,7 @@ mod tests {
     fn two_targets_with_identical_prior_bytes_share_one_blob() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         for name in ["~/a", "~/b"] {
             ledger
                 .record(entry(name, b"x").with_prior(PriorBytes::Bytes {
@@ -1261,7 +1303,7 @@ mod tests {
     fn recording_the_same_prior_bytes_twice_writes_the_blob_once() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let prior = PriorBytes::Bytes {
             bytes: b"unchanged".to_vec(),
             mode: Mode::DEFAULT_FILE,
@@ -1289,7 +1331,7 @@ mod tests {
     fn a_blob_of_the_wrong_length_is_rewritten_rather_than_trusted() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         // An orphan left by an interrupted write: the right name, the wrong
         // bytes. Trusting the name here loses the user's file, because `record`
         // returns `Ok` and the target is overwritten straight afterwards.
@@ -1326,7 +1368,7 @@ mod tests {
     fn a_truncated_blob_is_repaired_by_the_next_record_of_those_bytes() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let prior = PriorBytes::Bytes {
             bytes: b"the user wrote all of this".to_vec(),
             mode: Mode::DEFAULT_FILE,
@@ -1352,7 +1394,7 @@ mod tests {
     fn a_tampered_restore_blob_is_refused_rather_than_returned() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/a", b"x").with_prior(PriorBytes::Bytes {
                 bytes: b"original".to_vec(),
@@ -1375,7 +1417,7 @@ mod tests {
     fn a_missing_restore_blob_is_reported_by_digest() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/a", b"x").with_prior(PriorBytes::Bytes {
                 bytes: b"gone".to_vec(),
@@ -1399,7 +1441,7 @@ mod tests {
     fn an_unreadable_restore_blob_is_reported() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/a", b"x").with_prior(PriorBytes::Bytes {
                 bytes: b"body".to_vec(),
@@ -1432,7 +1474,7 @@ mod tests {
                 line: "source ~/.local/state/bx/shell/init.zsh".to_string(),
             },
         ];
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         for (index, mechanism) in mechanisms.iter().enumerate() {
             let mut new = entry(&format!("~/m{index}"), b"x");
             new.mechanism = mechanism.clone();
@@ -1440,7 +1482,7 @@ mod tests {
         }
         ledger.save().expect("save");
 
-        let reloaded = LedgerView::read(&dir).expect("read").value;
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
         for (index, mechanism) in mechanisms.iter().enumerate() {
             assert_eq!(
                 &reloaded
@@ -1456,7 +1498,7 @@ mod tests {
     fn written_is_the_whole_file_for_a_shared_file_not_bxs_contribution() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
 
         // Under `Own` these two are the same bytes by construction, so the
         // property is only visible for a mechanism where bx writes part of a
@@ -1506,7 +1548,7 @@ mod tests {
 
         // The distinction has to survive the round trip, because `plan` reads
         // it back rather than recomputing it.
-        let reloaded = LedgerView::read(&dir).expect("read").value;
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
         let bashrc = reloaded.get(&target("~/.bashrc")).expect("entry");
         assert_eq!(bashrc.written, ContentHash::of(whole.as_bytes()));
         assert_eq!(bashrc.mechanism, Mechanism::Region { comment: '#' });
@@ -1520,11 +1562,11 @@ mod tests {
     fn the_ledger_survives_a_save_and_reload() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger.record(entry("~/a", b"x")).expect("record");
         ledger.save().expect("save");
 
-        let reopened = Ledger::open(&dir, &lock).expect("open");
+        let reopened = Ledger::open(&dir, &lock, home.path()).expect("open");
         assert_eq!(reopened.health, Health::Loaded);
         assert_eq!(reopened.value.len(), 1);
         assert_eq!(reopened.value.dir(), &dir);
@@ -1534,7 +1576,7 @@ mod tests {
     fn saving_the_ledger_twice_produces_identical_bytes() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger.record(entry("~/b", b"x")).expect("record");
         ledger.record(entry("~/a", b"y")).expect("record");
         ledger.save().expect("first");
@@ -1547,7 +1589,7 @@ mod tests {
     fn entries_iterate_in_ascending_portable_order() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         for name in ["~/z", "~/a", "~/m"] {
             ledger.record(entry(name, b"x")).expect("record");
         }
@@ -1559,7 +1601,7 @@ mod tests {
     fn forgetting_a_target_leaves_its_restore_blob_in_place() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/a", b"x").with_prior(PriorBytes::Bytes {
                 bytes: b"kept".to_vec(),
@@ -1581,14 +1623,14 @@ mod tests {
     fn directories_bx_created_are_recorded_deepest_first() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let dirs = vec![target("~/.config/tool/sub"), target("~/.config/tool")];
         ledger
             .record(entry("~/.config/tool/sub/f", b"x").with_created_dirs(dirs.clone()))
             .expect("record");
         ledger.save().expect("save");
 
-        let reloaded = LedgerView::read(&dir).expect("read").value;
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
         assert_eq!(
             reloaded
                 .get(&target("~/.config/tool/sub/f"))
@@ -1602,7 +1644,7 @@ mod tests {
     fn a_re_record_keeps_the_directories_an_earlier_apply_created() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let file = "~/.config/newdir/x.conf";
         let dirs = vec![target("~/.config/newdir"), target("~/.config")];
 
@@ -1625,7 +1667,7 @@ mod tests {
         assert_eq!(ledger.get(&target(file)).expect("entry").created_dirs, dirs);
 
         ledger.save().expect("save");
-        let reloaded = LedgerView::read(&dir).expect("read").value;
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
         assert_eq!(
             reloaded.get(&target(file)).expect("entry").created_dirs,
             dirs
@@ -1636,7 +1678,7 @@ mod tests {
     fn directories_merged_across_re_records_stay_deepest_first() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let file = "~/.config/newdir/x.conf";
 
         // Apply #1 invents only `~/.config`; `newdir` was there already.
@@ -1687,7 +1729,7 @@ mod tests {
         );
         store::save(&dir.ledger(), KIND, VERSION, &OldView { entries }).expect("save");
 
-        let loaded = LedgerView::read(&dir).expect("read");
+        let loaded = LedgerView::read(&dir, home.path()).expect("read");
         assert_eq!(loaded.health, Health::Loaded);
         assert!(
             loaded
@@ -1712,12 +1754,12 @@ mod tests {
     fn a_read_only_view_opens_with_no_lock_held() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger.record(entry("~/a", b"x")).expect("record");
         ledger.save().expect("save");
 
         // The exclusive lock is still held, and the reader is unaffected.
-        let view = LedgerView::read(&dir).expect("read");
+        let view = LedgerView::read(&dir, home.path()).expect("read");
         assert_eq!(view.health, Health::Loaded);
         assert_eq!(view.value.len(), 1);
     }
@@ -1729,10 +1771,161 @@ mod tests {
         dir.ensure().expect("ensure");
         std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
 
-        let loaded = Ledger::open(&dir, &lock).expect("open");
+        let loaded = Ledger::open(&dir, &lock, home.path()).expect("open");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
         assert!(dir.root().join("ledger.mpk.corrupt").exists());
+    }
+
+    /// `home/<rel>` as the absolute `Portable` a hand-edited or foreign ledger
+    /// would hold: well-formed, so it decodes, and under this home.
+    fn absolute_under(home: &GuardedHome, rel: &str) -> Portable {
+        Portable::from_path(&home.child(rel), Path::new("/nonexistent/other/home"))
+            .expect("an absolute portable path")
+    }
+
+    /// A one-entry ledger for `key`, saved without going through `record`.
+    fn seed_ledger(dir: &StateDir, key: Portable, created_dirs: Vec<Portable>) -> Vec<u8> {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            key.clone(),
+            LedgerEntry {
+                path: key,
+                written: ContentHash::of(b"bx wrote this"),
+                mode: Mode::DEFAULT_FILE,
+                mechanism: Mechanism::Own,
+                prior: Prior::Absent,
+                created_dirs,
+                superseded: Vec::new(),
+            },
+        );
+        store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
+        std::fs::read(dir.ledger()).expect("read the seed")
+    }
+
+    #[test]
+    fn a_ledger_keyed_by_an_absolute_path_under_the_home_is_not_trusted() {
+        // Decision R3-1 of #4: `/…/home/.gitconfig` decodes, because a decoder
+        // has no home, and on this account it is a second key for
+        // `~/.gitconfig`. The loader is where the home is, so the loader refuses.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let key = absolute_under(&home, ".gitconfig");
+        assert!(key.as_str().starts_with('/'), "{key}");
+        let seeded = seed_ledger(&dir, key.clone(), Vec::new());
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        let Health::Reset(Damage::ForeignPath { stored, reason }) = &view.health else {
+            panic!("a foreign key must not load, got {:?}", view.health);
+        };
+        assert_eq!(stored, key.as_str());
+        assert!(reason.contains("~/.gitconfig"), "{reason}");
+        assert!(
+            view.value.is_empty(),
+            "nothing from that ledger is believed"
+        );
+        assert!(
+            view.health
+                .damage()
+                .expect("damage")
+                .to_string()
+                .contains(key.as_str()),
+            "the warning names the path",
+        );
+        // Quarantined like any other damage: the bytes are kept, not deleted.
+        let quarantine = dir.root().join("ledger.mpk.corrupt");
+        assert_eq!(std::fs::read(&quarantine).expect("quarantined"), seeded);
+
+        // Opening for writing goes through the same check.
+        seed_ledger(&dir, key, Vec::new());
+        let ledger = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert!(
+            matches!(ledger.health, Health::Reset(Damage::ForeignPath { .. })),
+            "{:?}",
+            ledger.health,
+        );
+        assert!(ledger.value.is_empty());
+    }
+
+    #[test]
+    fn a_created_directory_spelled_absolutely_under_the_home_is_not_trusted() {
+        // Every stored Portable, not only the keys: `bx rm` removes these.
+        let home = guarded_home();
+        let (dir, _lock) = locked(&home);
+        seed_ledger(
+            &dir,
+            target("~/.config/tool/x.conf"),
+            vec![target("~/.config/tool"), absolute_under(&home, ".config")],
+        );
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert!(
+            matches!(
+                &view.health,
+                Health::Reset(Damage::ForeignPath { stored, .. })
+                    if *stored == absolute_under(&home, ".config").as_str()
+            ),
+            "{:?}",
+            view.health,
+        );
+        assert!(view.value.is_empty());
+    }
+
+    #[test]
+    fn an_entry_whose_path_disagrees_with_a_home_relative_key_is_not_trusted() {
+        // The key and the entry's own `path` are both stored, and both checked.
+        let home = guarded_home();
+        let (dir, _lock) = locked(&home);
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            target("~/.gitconfig"),
+            LedgerEntry {
+                path: absolute_under(&home, ".gitconfig"),
+                written: ContentHash::of(b"x"),
+                mode: Mode::DEFAULT_FILE,
+                mechanism: Mechanism::Own,
+                prior: Prior::Absent,
+                created_dirs: Vec::new(),
+                superseded: Vec::new(),
+            },
+        );
+        store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert!(
+            matches!(view.health, Health::Reset(Damage::ForeignPath { .. })),
+            "{:?}",
+            view.health,
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_outside_the_home_is_still_trusted() {
+        let home = guarded_home();
+        let (dir, _lock) = locked(&home);
+        let outside = Portable::try_from("/etc/bx-example.conf".to_string()).expect("absolute");
+        seed_ledger(&dir, outside.clone(), vec![target("~/.config")]);
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(view.health, Health::Loaded);
+        assert!(view.value.get(&outside).is_some());
+    }
+
+    #[test]
+    fn a_home_the_ledger_cannot_be_checked_against_quarantines_nothing() {
+        // A bad home is the caller's defect. Reading it as damage would move an
+        // intact ledger aside and let the next apply record over nothing.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let seeded = seed_ledger(&dir, target("~/.gitconfig"), Vec::new());
+
+        let err = LedgerView::read(&dir, Path::new("relative/home")).expect_err("must fail");
+        assert!(matches!(err, Error::Home { .. }), "got {err}");
+        assert!(err.to_string().contains("relative/home"), "{err}");
+        let err = Ledger::open(&dir, &lock, Path::new("relative/home")).expect_err("must fail");
+        assert!(matches!(err, Error::Home { .. }), "got {err}");
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
+        assert_eq!(std::fs::read(dir.ledger()).expect("intact"), seeded);
     }
 
     #[test]
@@ -1743,7 +1936,7 @@ mod tests {
         }
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(
                 entry("~/.bashrc", b"bx wrote this").with_prior(PriorBytes::Bytes {
@@ -1761,9 +1954,12 @@ mod tests {
         // Opening for writing must fail. Degrading here would record bx's own
         // output as every target's prior on the next apply, and `bx rm` would
         // then write bx's generated content over the user's files.
-        let err = Ledger::open(&dir, &lock).expect_err("must fail");
+        let err = Ledger::open(&dir, &lock, home.path()).expect_err("must fail");
         assert!(matches!(err, Error::Read { .. }), "got {err}");
-        assert!(LedgerView::read(&dir).is_err(), "the reader must fail too");
+        assert!(
+            LedgerView::read(&dir, home.path()).is_err(),
+            "the reader must fail too"
+        );
         assert!(
             !dir.root().join("ledger.mpk.corrupt").exists(),
             "an unreadable ledger must never be quarantined",
@@ -1772,7 +1968,7 @@ mod tests {
         std::fs::set_permissions(dir.ledger(), std::fs::Permissions::from_mode(0o600))
             .expect("restore");
         assert_eq!(std::fs::read(dir.ledger()).expect("read"), intact);
-        let reopened = Ledger::open(&dir, &lock).expect("open");
+        let reopened = Ledger::open(&dir, &lock, home.path()).expect("open");
         assert_eq!(reopened.health, Health::Loaded);
         let stored = reopened.value.get(&target("~/.bashrc")).expect("entry");
         let Prior::Existed(reference) = &stored.prior else {
@@ -1789,7 +1985,7 @@ mod tests {
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("ensure");
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
-        let mut ledger = Ledger::open(&dir, &lock).expect("open").value;
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
             .record(entry("~/.bashrc", b"x").with_prior(PriorBytes::Bytes {
                 bytes: b"prior".to_vec(),

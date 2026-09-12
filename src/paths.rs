@@ -31,6 +31,10 @@ use serde::{Deserialize, Serialize};
 ///
 /// Paths outside `home` are returned unchanged: they are genuinely absolute
 /// (`/usr/bin/sccache`), and pretending otherwise would break them.
+///
+/// Non-UTF-8 bytes go through `to_string_lossy`. [`Portable`] is the checked
+/// entry point and refuses such a path outright, so nothing bx *stores* is ever
+/// renamed by this function.
 #[must_use]
 pub fn to_portable(path: &Path, home: &Path) -> String {
     let raw = path.to_string_lossy();
@@ -132,6 +136,18 @@ pub enum Error {
         /// The `~`-rooted spelling to write instead.
         portable: String,
     },
+    /// A path, or a home, that is not valid UTF-8.
+    ///
+    /// A [`Portable`] is stored, compared, hashed and serialised as text, so a
+    /// path it cannot represent is **refused**, not substituted. Passing such a
+    /// path through `to_string_lossy` would put `U+FFFD` in the key and silently
+    /// point it at a different file.
+    #[error(
+        "a path bx stores must be valid UTF-8, and {} is not; \
+         bx would otherwise rename it rather than manage it",
+        .0.display()
+    )]
+    NotUtf8(PathBuf),
 }
 
 /// Normalise a rooted path lexically, without touching the filesystem.
@@ -326,6 +342,13 @@ impl Portable {
     ///
     /// [`Error::HomeNotAbsolute`] if `home` is not absolute.
     ///
+    /// [`Error::NotUtf8`] if either argument is not valid UTF-8. A `Portable`
+    /// is stored as text, and substituting `U+FFFD` for a byte would silently
+    /// make the key name a different file. The environment side of this module
+    /// *honours* a non-UTF-8 `$HOME` and `$XDG_CONFIG_HOME`; the key side
+    /// refuses to rename one, so the two agree about where the support boundary
+    /// is rather than one of them moving it quietly.
+    ///
     /// [`Error::EscapesRoot`] is **propagated**, never swallowed. An earlier
     /// shape of this function fell back to the string it was given whenever
     /// normalisation failed, so `~/../../etc/passwd` came back whole, claiming
@@ -336,11 +359,13 @@ impl Portable {
     /// gone rather than documented.
     pub fn from_path(path: &Path, home: &Path) -> Result<Self, Error> {
         let home = home_str(home)?;
-        let raw = path.to_string_lossy();
+        let raw = path
+            .to_str()
+            .ok_or_else(|| Error::NotUtf8(path.to_path_buf()))?;
         if !path.is_absolute() {
-            return Err(Error::NotPortable(raw.into_owned()));
+            return Err(Error::NotPortable(raw.to_string()));
         }
-        let normalised = normalise(&raw)?;
+        let normalised = normalise(raw)?;
         Ok(Self(fold_under_home(&normalised, &home)))
     }
 
@@ -424,8 +449,10 @@ impl Portable {
 /// [`Error::HomeNotAbsolute`] when `home` is not an absolute path. An absolute
 /// path always normalises — it clamps at `/` — so that is the only failure.
 fn home_str(home: &Path) -> Result<String, Error> {
-    let raw = home.to_string_lossy();
-    normalise(&raw).map_err(|_| Error::HomeNotAbsolute(home.to_path_buf()))
+    let raw = home
+        .to_str()
+        .ok_or_else(|| Error::NotUtf8(home.to_path_buf()))?;
+    normalise(raw).map_err(|_| Error::HomeNotAbsolute(home.to_path_buf()))
 }
 
 /// Rewrite an already-normalised rooted path as `~`-relative when it is under
@@ -983,6 +1010,33 @@ mod tests {
             Portable::from_path(Path::new("/etc/hosts"), Path::new("relative/home")),
             Err(Error::HomeNotAbsolute(PathBuf::from("relative/home")))
         );
+    }
+
+    #[test]
+    fn a_non_utf8_path_is_refused_rather_than_renamed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // The support boundary has to be one boundary. `a_non_utf8_home_is_honoured`
+        // and `a_non_utf8_xdg_config_home_is_honoured` pin that the environment
+        // side takes such a value as given; this pins that the key side refuses
+        // it. Going through `to_string_lossy` would put U+FFFD in the stored
+        // string, so the key would name a different file than the one it came
+        // from -- a rename, dressed as support.
+        let path = Path::new(OsStr::from_bytes(b"/var/home/example/.ssh/conf\xffig"));
+        assert_eq!(
+            Portable::from_path(path, &home()),
+            Err(Error::NotUtf8(path.to_path_buf()))
+        );
+
+        let odd_home = Path::new(OsStr::from_bytes(b"/var/home/exa\xffmple"));
+        assert_eq!(
+            Portable::from_path(Path::new("/etc/hosts"), odd_home),
+            Err(Error::NotUtf8(odd_home.to_path_buf())),
+            "a home bx cannot spell cannot be stripped from a key either"
+        );
+
+        let message = Error::NotUtf8(PathBuf::from("/x")).to_string();
+        assert!(message.contains("valid UTF-8"), "{message}");
     }
 
     #[test]

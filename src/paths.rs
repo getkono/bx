@@ -48,6 +48,11 @@ pub fn to_portable(path: &Path, home: &Path) -> String {
 /// Only a leading `~` or `~/` is expanded. `~user` is *not*: bx manages the
 /// invoking user's environment, and silently resolving another user's home
 /// would be a surprise of exactly the kind this tool exists to prevent.
+///
+/// Anything else is returned exactly as written, which for an unrooted string
+/// means a **relative** path. [`Portable`] is the checked entry point and can
+/// never hold such a value — it rejects every root this function cannot expand
+/// — so [`Portable::render`] never reaches that arm.
 #[must_use]
 pub fn render(portable: &str, home: &Path) -> PathBuf {
     match portable {
@@ -102,6 +107,17 @@ pub enum Error {
     /// relative to.
     #[error("a portable path may not climb out of the home it is rooted in: {0}")]
     EscapesRoot(String),
+    /// A `~`-prefixed string whose root is neither `~` nor `~/` — `~other`, or
+    /// a `~.config/x` that lost its slash.
+    ///
+    /// [`render`] expands only `~` and `~/`, so such a value would reach the
+    /// filesystem verbatim and resolve against whatever directory bx happened
+    /// to be invoked from.
+    #[error(
+        "bx expands only `~` and `~/…`, so {0} would resolve against whatever directory \
+         bx was invoked from; write `~/…` or an absolute path"
+    )]
+    UnknownRoot(String),
 }
 
 /// Normalise a rooted path lexically, without touching the filesystem.
@@ -116,7 +132,11 @@ pub enum Error {
 /// home and silently reading it as the home would be the surprise.
 fn normalise(raw: &str) -> Result<String, Error> {
     let Some((root, rest)) = split_root(raw) else {
-        return Err(Error::NotPortable(raw.to_string()));
+        return Err(if raw.starts_with('~') {
+            Error::UnknownRoot(raw.to_string())
+        } else {
+            Error::NotPortable(raw.to_string())
+        });
     };
 
     let mut parts: Vec<&str> = Vec::new();
@@ -141,18 +161,22 @@ fn normalise(raw: &str) -> Result<String, Error> {
 
 /// Split a rooted path into its root token and the rest.
 ///
-/// The root is `""` for an absolute path, `"~"` for the invoking user's home, or
-/// `"~name"` for someone else's. `None` for anything relative.
+/// The root is `""` for an absolute path and `"~"` for the invoking user's home.
+/// Those are the only two roots [`render`] expands, so they are the only two a
+/// [`Portable`] may hold; `None` for anything else, a `~name` token included.
+///
+/// Treating every `~`-prefixed string as rooted, with the bytes up to the first
+/// `/` as its root, is what let `~.config/starship.toml` — one missing slash —
+/// parse as a root named `~.config` that `render` then handed to the filesystem
+/// as a relative path.
 fn split_root(raw: &str) -> Option<(&str, &str)> {
     if let Some(rest) = raw.strip_prefix('/') {
         return Some(("", rest));
     }
-    if raw.starts_with('~') {
-        let split_at = raw.find('/').unwrap_or(raw.len());
-        let (root, rest) = raw.split_at(split_at);
-        return Some((root, rest.strip_prefix('/').unwrap_or(rest)));
+    if raw == "~" {
+        return Some(("~", ""));
     }
-    None
+    raw.strip_prefix("~/").map(|rest| ("~", rest))
 }
 
 /// The home-directory rule, given what `$HOME` holds.
@@ -248,10 +272,11 @@ pub fn config_root() -> Result<PathBuf, Error> {
 /// derives `Ord`, `Hash` and serde here rather than being newtyped again in
 /// each of them.
 ///
-/// A `~user` string is *accepted* and never expanded, matching [`render`]: bx
-/// manages the invoking user's environment, and resolving someone else's home
-/// would be a surprise. [`Portable::under_home`] is how a caller asks whether a
-/// portable path is one of the invoking user's.
+/// There are exactly two shapes: `~`-rooted, and absolute. A `~name` string is
+/// **rejected**, because [`render`] expands only `~` and `~/` — storing one
+/// would leave a value that renders to a bare relative path, and a relative
+/// destination depends on the directory bx happened to be invoked from. That is
+/// the same reason [`Portable::parse`] rejects a relative path outright.
 ///
 /// # Every `Portable` is lexically normalised
 ///
@@ -326,8 +351,8 @@ impl Portable {
     /// A true statement about location, because a `Portable` is normalised when
     /// it is built and one that climbs out of `~` never exists.
     ///
-    /// `~user/...` is not under home: it is another account's home, and bx never
-    /// expands it.
+    /// The two shapes are exhaustive: a `Portable` is `~`-rooted, and under the
+    /// home, or absolute, and not.
     #[must_use]
     pub fn under_home(&self) -> bool {
         self.0 == "~" || self.0.starts_with("~/")
@@ -614,6 +639,12 @@ mod tests {
             Error::NotPortable("rel/x".to_string()).to_string(),
             "a portable path must start with `~` or `/`, got rel/x"
         );
+        let unknown_root = Error::UnknownRoot("~.config/x".to_string()).to_string();
+        assert!(unknown_root.contains("~.config/x"), "{unknown_root}");
+        assert!(
+            unknown_root.contains("expands only"),
+            "the message must say what bx does expand: {unknown_root}"
+        );
     }
 
     // --- Portable ---------------------------------------------------------
@@ -639,11 +670,43 @@ mod tests {
     }
 
     #[test]
-    fn another_users_home_is_portable_but_not_under_home() {
-        let portable = Portable::parse("~other/.linuxbrew").unwrap();
+    fn a_tilde_root_bx_cannot_expand_is_rejected() {
+        // `render` expands `~` and `~/` and nothing else, so any other `~` root
+        // would be handed to the filesystem verbatim -- that is, relative to
+        // whatever directory bx was invoked from. `~.config/starship.toml` is
+        // the realistic one: a config author dropping a single slash would
+        // otherwise get a directory literally named `~.config` created wherever
+        // `bx apply` ran, and `bx rm` from elsewhere would restore a different
+        // file.
+        for raw in [
+            "~.config/starship.toml",
+            "~other/x",
+            "~other/.linuxbrew",
+            "~other",
+            "~~/x",
+            "~ /x",
+        ] {
+            assert_eq!(
+                Portable::parse(raw),
+                Err(Error::UnknownRoot(raw.to_string())),
+                "{raw}"
+            );
+        }
+    }
 
-        assert!(!portable.under_home());
-        assert_eq!(portable.render(&home()), Path::new("~other/.linuxbrew"));
+    #[test]
+    fn a_portable_always_renders_to_an_absolute_path() {
+        // The property the rejection above exists to establish: no value this
+        // type can hold renders to a path that depends on the working
+        // directory.
+        for raw in ["~", "~/.ssh/config", "/usr/bin/sccache", "/", "/a/../b"] {
+            let rendered = Portable::parse(raw).unwrap().render(&home());
+            assert!(
+                rendered.is_absolute(),
+                "{raw} rendered {}",
+                rendered.display()
+            );
+        }
     }
 
     #[test]
@@ -690,7 +753,6 @@ mod tests {
             ("~/.ssh/keys/../config", "~/.ssh/config"),
             ("~/./", "~"),
             ("/usr//bin/./sccache", "/usr/bin/sccache"),
-            ("~other//.linuxbrew/", "~other/.linuxbrew"),
         ] {
             assert_eq!(
                 Portable::parse(written).unwrap().as_str(),
@@ -716,12 +778,7 @@ mod tests {
     #[test]
     fn a_portable_that_climbs_out_of_home_is_rejected() {
         // under_home() is a claim about location, so this may not parse.
-        for escaping in [
-            "~/..",
-            "~/../../etc/passwd",
-            "~/.ssh/../../etc",
-            "~other/..",
-        ] {
+        for escaping in ["~/..", "~/../../etc/passwd", "~/.ssh/../../etc"] {
             assert_eq!(
                 Portable::parse(escaping),
                 Err(Error::EscapesRoot(escaping.to_string())),

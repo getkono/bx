@@ -129,59 +129,14 @@ pub fn parse_generated(_name: &str) -> Option<Gen> {
 ///
 /// **This is the file mode, not the plan/apply mode.** Entry A7 declares its own
 /// `Mode { Plan, Apply }` in its own module; the two are never re-exported into
-/// one scope. This type depends on nothing else in `config`, so entry A5 can
-/// relocate its body to `bx::fs::Mode` and leave a `pub use` behind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Mode(u32);
-
-impl Mode {
-    /// The mode a file gets when the target does not say.
-    pub const DEFAULT_FILE: Self = Self(0o644);
-    /// The mode a directory gets when the target does not say.
-    pub const DEFAULT_DIR: Self = Self(0o755);
-
-    /// Parse the quoted octal form a config file uses.
-    ///
-    /// **A bare TOML integer is not accepted.** TOML has no octal literal, so
-    /// `mode = 600` is decimal 600 and means nothing at all; only `mode = "0600"`
-    /// parses. One to four octal digits, so the setuid, setgid and sticky bits
-    /// are expressible and a fifth digit is a typo.
-    ///
-    /// # Errors
-    ///
-    /// [`ModeError::Invalid`] for anything else.
-    pub fn parse_octal(raw: &str) -> Result<Self, ModeError> {
-        // `from_str_radix` alone is not enough: it accepts a leading `+`, and it
-        // has no opinion about how many digits a mode may have.
-        let usable = (1..=4).contains(&raw.len()) && raw.bytes().all(|b| matches!(b, b'0'..=b'7'));
-
-        u32::from_str_radix(raw, 8)
-            .ok()
-            .filter(|_| usable)
-            .map(Self)
-            .ok_or_else(|| ModeError::Invalid(raw.to_string()))
-    }
-
-    /// The bit pattern.
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Display for Mode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:04o}", self.0)
-    }
-}
-
-/// A mode that could not be read.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ModeError {
-    /// Not one to four octal digits.
-    #[error("a mode must be one to four octal digits in quotes, like \"0600\"; got {0:?}")]
-    Invalid(String),
-}
+/// one scope.
+///
+/// Declared once, in [`crate::fs::mode`], and named here because that is where
+/// the config schema needs it: a target's `mode` key, the mode the writer sets,
+/// and the mode the ledger records are one type, so a mode a config author wrote
+/// means the same thing as a mode `stat` reported. `parse_octal`, `ModeError`
+/// and the four-digit `Display` are unchanged by the move.
+pub use crate::fs::mode::{Mode, ModeError};
 
 /// How bx attaches to a file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

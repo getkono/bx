@@ -28,6 +28,13 @@
 //! `prefix` answered `scratch`. It blocks the targets that reference it, and the
 //! note names the `local.toml` line that caused it.
 //!
+//! So does a legal answer that makes a **target's own field** invalid once
+//! substituted: `acct = "../../.."` into `~/.config/{{acct}}/settings.json`
+//! climbs out of the home, and `seg = ""` into `owns = ["a.{{seg}}"]` leaves an
+//! empty key segment. The target is blocked naming the answer's line, and
+//! nothing is written for it. The same field broken with no account answer in
+//! it — a committed `default` alone — is the repo's defect and fails the load.
+//!
 //! A defect in the **committed** repo is not blocked but fatal — a malformed
 //! placeholder, or a reference to a value no layer declares, cannot be fixed by
 //! answering a prompt.
@@ -70,15 +77,19 @@ pub enum BlockReason {
         /// The declarations to re-enable, in declaration order.
         names: Vec<String>,
     },
-    /// One or more declared values this entry references have no usable text,
-    /// because of an answer in this account's layer: one its kind refuses, or
-    /// one that made a committed `default` invalid.
+    /// One or more answers in this account's layer leave this entry unusable:
+    /// an answer its kind refuses, one that made a committed `default` invalid,
+    /// or one that, substituted into this entry, makes a field invalid — a path
+    /// that climbs out of the home, a `file` that climbs out of the repo, an
+    /// owned key with an empty segment.
     ///
     /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
     /// unanswered: the answer that needs changing is already written, and the
-    /// hint names its line.
+    /// hint names its line. Every case is cleared by the same act, changing
+    /// that answer, which is why they share one variant.
     InvalidValue {
-        /// The declarations whose text is invalid, in declaration order.
+        /// The values to change, in declaration order: the declarations whose
+        /// text is invalid, or the answers that went into the invalid field.
         names: Vec<String>,
     },
 }
@@ -93,7 +104,8 @@ pub struct BlockedEntry {
     /// Why it is blocked.
     pub reason: BlockReason,
     /// What the user should do. Spelled in `values` — `init_hint`,
-    /// `disabled_hint` or `ResolvedValues::invalid_hint` — never at a call site.
+    /// `disabled_hint`, `ResolvedValues::invalid_hint` or
+    /// `ResolvedValues::answers_hint` — never at a call site.
     pub hint: String,
 }
 
@@ -118,8 +130,9 @@ pub struct Resolved {
 ///
 /// [`Error::BadValue`] for a defect in the committed repo: a malformed
 /// placeholder, a reference to a value no layer declares, a `default` that
-/// references a later value, or a `default` that is not of its kind with no
-/// account answer involved; and for two ready targets that name one file.
+/// references a later value, a `default` that is not of its kind with no
+/// account answer involved, or a target field that substitution makes invalid
+/// with no account answer in it; and for two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -223,7 +236,40 @@ fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution
         return block(BlockReason::UnsetValue { names }, hint);
     }
 
-    substituted(target, values).map(Resolution::Ready)
+    match substituted(target, values) {
+        Ok(target) => Ok(Resolution::Ready(target)),
+        Err(Broken::Defect(error)) => Err(error),
+        // A field substitution made invalid. With an account answer in it, the
+        // answer is the account's to change, so it costs this target and names
+        // the line; nothing is written either way. With none, the committed
+        // repo wrote it, and no answer could fix it.
+        Err(Broken::Field { raw, problem }) => {
+            let problem = format!("target `{}`: {problem}", target.path);
+            let causes = values.account_inputs(&raw);
+            if causes.is_empty() {
+                return Err(Error::BadValue {
+                    origin: target.origin.clone(),
+                    message: problem,
+                });
+            }
+            let names = in_declaration_order(values, causes);
+            let hint = values.answers_hint(&problem, &names);
+            block(BlockReason::InvalidValue { names }, hint)
+        }
+    }
+}
+
+/// Why [`substituted`] could not rebuild a target.
+enum Broken {
+    /// A defect no answer could fix, already worded as a load error.
+    Defect(Error),
+    /// A substituted field that is no longer valid.
+    Field {
+        /// The field as written, so the caller can ask which answers went in.
+        raw: String,
+        /// What is wrong with what it became.
+        problem: String,
+    },
 }
 
 /// Every string field of a target that substitution applies to.
@@ -265,24 +311,29 @@ fn for_each_string(target: &Target, visit: &mut impl FnMut(&str)) {
 ///
 /// Only called once every reference is known to be answered, so a substitution
 /// here cannot fail for want of an answer; it can still fail because a
-/// substituted string is no longer a valid portable path or key path, which is
-/// a configuration defect and is reported as one.
-fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Error> {
+/// substituted string is no longer a valid portable path, repo file or key
+/// path. That is [`Broken::Field`], carrying the text as written, and
+/// [`resolve_target`] decides whose it is from the answers that went in.
+fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broken> {
     let origin = &target.origin;
-    let sub = |text: &str| -> Result<String, Error> {
-        values.substitute(text).map_err(|defect| Error::BadValue {
-            origin: origin.clone(),
-            message: format!("target `{}`: {defect}", target.path),
+    let sub = |text: &str| -> Result<String, Broken> {
+        values.substitute(text).map_err(|defect| {
+            Broken::Defect(Error::BadValue {
+                origin: origin.clone(),
+                message: format!("target `{}`: {defect}", target.path),
+            })
         })
     };
-    let portable = |text: &str| -> Result<Portable, Error> {
+    let field = |raw: &str, problem: String| Broken::Field {
+        raw: raw.to_string(),
+        problem,
+    };
+    let portable = |text: &str| -> Result<Portable, Broken> {
         // Against the home the values were resolved against, never a re-derived
         // one: `Portable::parse_in` rejects an absolute path under the home, and
         // a different home would make that judgement about a different file.
-        Portable::parse_in(&sub(text)?, values.home()).map_err(|source| Error::BadValue {
-            origin: origin.clone(),
-            message: format!("target `{}`: {source}", target.path),
-        })
+        Portable::parse_in(&sub(text)?, values.home())
+            .map_err(|source| field(text, source.to_string()))
     };
 
     let body = match &target.body {
@@ -291,14 +342,13 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Error
         // cannot stand in for: `cfg/{{account}}/gitconfig` is a legal body file
         // as written, and an `account` answered `../../../../etc` makes it read
         // a file off the machine and write it into a target.
-        Body::File(path) => Body::File(
-            super::target::confine_to_repo("file", &sub(&path.to_string_lossy())?).map_err(
-                |message| Error::BadValue {
-                    origin: origin.clone(),
-                    message: format!("target `{}`: {message}", target.path),
-                },
-            )?,
-        ),
+        Body::File(path) => {
+            let raw = path.to_string_lossy();
+            Body::File(
+                super::target::confine_to_repo("file", &sub(&raw)?)
+                    .map_err(|message| field(&raw, message))?,
+            )
+        }
         Body::Inline(text) => Body::Inline(sub(text)?),
         other => other.clone(),
     };
@@ -313,12 +363,10 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Error
             owns: owns
                 .iter()
                 .map(|key| {
-                    KeyPath::parse(&sub(&key.to_string())?).map_err(|source| Error::BadValue {
-                        origin: origin.clone(),
-                        message: format!("target `{}`: {source}", target.path),
-                    })
+                    let raw = key.to_string();
+                    KeyPath::parse(&sub(&raw)?).map_err(|source| field(&raw, source.to_string()))
                 })
-                .collect::<Result<Vec<_>, Error>>()?,
+                .collect::<Result<Vec<_>, Broken>>()?,
         },
         other => other.clone(),
     };
@@ -334,12 +382,12 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Error
             .requires
             .iter()
             .map(|tool| sub(tool))
-            .collect::<Result<Vec<_>, Error>>()?,
+            .collect::<Result<Vec<_>, Broken>>()?,
         references: target
             .references
             .iter()
             .map(|reference| portable(reference.as_str()))
-            .collect::<Result<Vec<_>, Error>>()?,
+            .collect::<Result<Vec<_>, Broken>>()?,
         enabled: target.enabled,
         origin: target.origin.clone(),
     })
@@ -475,13 +523,23 @@ mod tests {
                              path = \"~/.gitconfig\"\n\
                              file = \"cfg/{{account}}/gitconfig\"\n";
 
-        let message = resolved(LAYER, Some("[values]\naccount = \"../../../../etc\"\n"))
-            .expect_err("a climbing answer is a repo escape");
-        assert!(
-            message.contains("may not climb out of the config repo"),
-            "{message}"
+        // An account's answer that climbs is refused and blocks this target
+        // only; nothing is read and nothing is written.
+        let climbing = resolved(LAYER, Some("[values]\naccount = \"../../../../etc\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&climbing, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["account".to_string()]
+            }
         );
-        assert!(message.contains("~/.gitconfig"), "{message}");
+        assert!(
+            entry.hint.contains("may not climb out of the config repo"),
+            "{}",
+            entry.hint
+        );
+        assert!(entry.hint.contains("local.toml:2"), "{}", entry.hint);
 
         // A `file` that *opens* with a value, answered absolutely, would discard
         // the repo root the moment it reached `repo.join`.
@@ -492,9 +550,29 @@ mod tests {
                               path = \"~/.gitconfig\"\n\
                               file = \"{{account}}/gitconfig\"\n";
 
-        let message = resolved(ROOTED, Some("[values]\naccount = \"/etc\"\n"))
-            .expect_err("an absolute answer discards the repo root");
-        assert!(message.contains("relative to the repo root"), "{message}");
+        let rooted = resolved(ROOTED, Some("[values]\naccount = \"/etc\"\n"))
+            .expect("an absolute answer blocks its target");
+        let entry = blocked(&rooted, 0);
+        assert!(
+            entry.hint.contains("relative to the repo root"),
+            "{}",
+            entry.hint
+        );
+
+        // With no account answer in it, the same escape is the repo's own defect.
+        let message = resolved(
+            &LAYER.replace(
+                "kind = \"string\"\n",
+                "kind = \"string\"\ndefault = \"../../../../etc\"\n",
+            ),
+            None,
+        )
+        .expect_err("a committed default that climbs is a repo defect");
+        assert!(
+            message.contains("may not climb out of the config repo"),
+            "{message}"
+        );
+        assert!(message.contains("~/.gitconfig"), "{message}");
 
         let ordinary = resolved(LAYER, Some("[values]\naccount = \"work\"\n")).unwrap();
         assert_eq!(
@@ -505,28 +583,96 @@ mod tests {
     }
 
     #[test]
-    fn a_substitution_that_breaks_a_portable_path_is_a_load_error() {
+    fn a_substitution_that_breaks_a_portable_path_blocks_or_fails_by_whose_input_it_is() {
         // Every substituted field is re-validated, because substitution can turn
         // a legal value into an illegal one. A path that climbs out of the home
         // is the case that matters: `under_home` is a claim about location, and
         // a `Portable` that escaped it would make a later entry's write gate on
-        // nothing.
-        let message = resolved(
-            "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
-             [[target]]\npath = \"~/.config/{{leaf}}\"\ncontent = \"x\"\n",
-            Some("[values]\nleaf = \"../../etc/passwd\"\n"),
-        )
-        .expect_err("the substituted path climbs out of the home");
-        assert!(message.contains("climb out of the home"), "{message}");
+        // nothing. An account's answer costs the account's target; a committed
+        // default with no answer in it is a repo defect.
+        const PATH: &str = "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
+                            [[target]]\npath = \"~/.config/{{leaf}}\"\ncontent = \"x\"\n\
+                            [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        const REFERENCE: &str = "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
+                                 [[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n\
+                                 references = [\"~/{{leaf}}\"]\n\
+                                 [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
 
-        let message = resolved(
-            "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
-             [[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n\
-             references = [\"~/{{leaf}}\"]\n",
-            Some("[values]\nleaf = \"../../etc/passwd\"\n"),
+        for (layer, what) in [(PATH, "a path"), (REFERENCE, "a reference")] {
+            let answered = resolved(layer, Some("[values]\nleaf = \"../../etc/passwd\"\n"))
+                .unwrap_or_else(|e| panic!("{what}: an answer failed the whole load: {e}"));
+            let entry = blocked(&answered, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["leaf".to_string()]
+                },
+                "{what}"
+            );
+            assert!(
+                entry.hint.contains("climb out of the home"),
+                "{what}: {}",
+                entry.hint
+            );
+            assert!(
+                entry.hint.contains("the answer to `leaf` at local.toml:2"),
+                "{what}: {}",
+                entry.hint
+            );
+            assert_eq!(ready(&answered, 1).path.as_str(), "~/.zshrc", "{what}");
+
+            let message = resolved(
+                &layer.replace(
+                    "kind = \"string\"\n",
+                    "kind = \"string\"\ndefault = \"../../etc/passwd\"\n",
+                ),
+                None,
+            )
+            .expect_err("a committed default with no answer in it is a repo defect");
+            assert!(
+                message.contains("climb out of the home"),
+                "{what}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legal_answer_that_makes_a_substituted_field_invalid_blocks_only_its_target() {
+        // The panel's falsifier: a climbing answer in a target path, and an
+        // empty answer in a `jsonc` owned key, each failed the whole load naming
+        // the committed file, and took `~/.zshrc` with them.
+        let resolved = resolved(
+            "[[value]]\nname = \"acct\"\nkind = \"string\"\n\
+             [[value]]\nname = \"seg\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{acct}}/settings.json\"\ncontent = \"x\"\n\
+             [[target]]\npath = \"~/.config/zed/settings.json\"\ncontent = \"{{{{}}\"\n\
+             format = \"jsonc\"\nowns = [\"a.{{seg}}\"]\n\
+             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+            Some("# this account's answers\n[values]\nacct = \"../../..\"\nseg = \"\"\n"),
         )
-        .expect_err("a reference is a portable path too");
-        assert!(message.contains("climb out of the home"), "{message}");
+        .expect("an account's legal answers do not fail the load");
+
+        let acct = blocked(&resolved, 0);
+        assert_eq!(
+            acct.reason,
+            BlockReason::InvalidValue {
+                names: vec!["acct".to_string()]
+            }
+        );
+        assert!(acct.hint.contains("local.toml:3"), "{}", acct.hint);
+        assert!(acct.hint.contains("climb out of the home"), "{}", acct.hint);
+
+        let seg = blocked(&resolved, 1);
+        assert_eq!(
+            seg.reason,
+            BlockReason::InvalidValue {
+                names: vec!["seg".to_string()]
+            }
+        );
+        assert!(seg.hint.contains("local.toml:4"), "{}", seg.hint);
+        assert!(seg.hint.contains("empty segment"), "{}", seg.hint);
+
+        assert_eq!(ready(&resolved, 2).path.as_str(), "~/.zshrc");
     }
 
     #[test]
@@ -543,15 +689,23 @@ mod tests {
     }
 
     #[test]
-    fn a_substitution_that_breaks_a_key_path_is_a_load_error() {
-        let message = resolved(
-            "[[value]]\nname = \"setting\"\nkind = \"string\"\n\
-             [[target]]\npath = \"~/.config/zed/settings.json\"\ncontent = \"{{{{}}\"\n\
-             format = \"jsonc\"\nowns = [\"editor.{{setting}}\"]\n",
-            Some("[values]\nsetting = \"\"\n"),
-        )
-        .expect_err("`editor.` has an empty segment");
+    fn a_substitution_that_breaks_a_key_path_blocks_or_fails_by_whose_input_it_is() {
+        const LAYER: &str = "[[value]]\nname = \"setting\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
+                             content = \"{{{{}}\"\n\
+                             format = \"jsonc\"\nowns = [\"editor.{{setting}}\"]\n";
 
+        let answered = resolved(LAYER, Some("[values]\nsetting = \"\"\n"))
+            .expect("an account's empty answer blocks its target");
+        let entry = blocked(&answered, 0);
+        assert!(entry.hint.contains("empty segment"), "{}", entry.hint);
+        assert!(entry.hint.contains("local.toml:2"), "{}", entry.hint);
+
+        let message = resolved(
+            &LAYER.replace("kind = \"string\"\n", "kind = \"string\"\ndefault = \"\"\n"),
+            None,
+        )
+        .expect_err("`editor.` from a committed default is a repo defect");
         assert!(message.contains("empty segment"), "{message}");
     }
 

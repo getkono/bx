@@ -2188,6 +2188,28 @@ mod tests {
     }
 
     #[test]
+    fn a_quarantine_orphaned_by_a_crash_before_the_save_stays_visible() {
+        // Review round 4's falsifier: `Ledger::open` quarantined a damaged
+        // ledger, bx stopped before `save`, and the next reader and writer saw
+        // `Health::Fresh` with the `.corrupt` file reported nowhere.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
+        let first = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert!(first.health.is_reset());
+        let aside = vec![StateDir::quarantine(&dir.ledger())];
+        assert_eq!(first.quarantined, aside);
+        drop(first);
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(view.health, Health::Fresh);
+        assert_eq!(view.quarantined, aside);
+        let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert_eq!(opened.health, Health::Fresh);
+        assert_eq!(opened.quarantined, aside);
+    }
+
+    #[test]
     fn a_second_damaged_ledger_never_replaces_the_first_quarantine() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);

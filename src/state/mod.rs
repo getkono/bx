@@ -26,6 +26,10 @@
 //! nothing ([`Health::Damaged`]): a rename by path could move aside a file a
 //! writer saved after the read. The damaged bytes are kept, never deleted, so a
 //! human or `bx doctor` can still look at them. See [`Damage`] and [`Health`].
+//! Every load lists the quarantines present in [`Loaded::quarantined`],
+//! whatever its health, so a run that quarantined a file and stopped before its
+//! save does not leave the next one looking at [`Health::Fresh`] and nothing
+//! else.
 //!
 //! A stored value refused for a reason that says nothing about its bytes — a
 //! ledger checked against a home spelled differently from the one it was

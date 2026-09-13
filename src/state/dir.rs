@@ -228,6 +228,48 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
     }
 }
 
+/// Every quarantine of `path` present now, in the order [`move_aside`] makes
+/// them: `<name>.corrupt`, then `<name>.corrupt.1`, `<name>.corrupt.2`, ….
+///
+/// Found by listing the directory, not by probing names until one is missing,
+/// so a gap — `.corrupt` deleted, `.corrupt.1` kept — hides nothing after it.
+/// Only a name [`StateDir::quarantine_nth`] would give is counted.
+///
+/// # Errors
+///
+/// [`Error::Read`] if the directory exists and cannot be listed: an empty list
+/// there would be a guess.
+pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, Error> {
+    let (Some(root), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
+        return Ok(Vec::new());
+    };
+    let unlistable = |source| Error::Read {
+        path: root.to_path_buf(),
+        source,
+    };
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(unlistable(source)),
+    };
+    let prefix = format!("{name}.corrupt");
+    let mut found = Vec::new();
+    for entry in entries {
+        let file = entry.map_err(unlistable)?.file_name();
+        let Some(rest) = file.to_str().and_then(|file| file.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let n = match rest.strip_prefix('.').map(str::parse::<u64>) {
+            None if rest.is_empty() => 0,
+            Some(Ok(n)) if n > 0 && rest == format!(".{n}") => n,
+            _ => continue,
+        };
+        found.push((n, StateDir::quarantine_nth(path, n)));
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, aside)| aside).collect())
+}
+
 /// Refuse `lock` unless it is the lock of the state directory holding `path`.
 ///
 /// Every operation that demands an [`ExclusiveLock`] demands it for one

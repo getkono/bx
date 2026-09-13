@@ -56,13 +56,13 @@
 //! restore bx's own generated content over the user's files. Losing a cache is
 //! a delay; losing the ledger is permanent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Error;
-use super::dir::{check_lock, ensure_dir, move_aside};
+use super::dir::{check_lock, ensure_dir, move_aside, quarantines};
 use super::lock::ExclusiveLock;
 use crate::fs::{Mode, write_atomically};
 
@@ -233,6 +233,16 @@ pub struct Loaded<T> {
     pub value: T,
     /// Where it came from.
     pub health: Health,
+    /// Every quarantine of this file in the state directory now, in the order
+    /// they were made — `<name>.corrupt`, `<name>.corrupt.1`, … — including
+    /// one this load made.
+    ///
+    /// Independent of [`Loaded::health`]. A run that quarantined the file and
+    /// stopped before its save leaves the next load [`Health::Fresh`], and this
+    /// is what still shows that damaged bytes were set aside. They may be the
+    /// only index there is to the user's restore blobs, so `plan` and `doctor`
+    /// should name every one until a human moves it; bx never deletes them.
+    pub quarantined: Vec<PathBuf>,
 }
 
 impl<T> Loaded<T> {
@@ -241,6 +251,7 @@ impl<T> Loaded<T> {
         Loaded {
             value: f(self.value),
             health: self.health,
+            quarantined: self.quarantined,
         }
     }
 }
@@ -294,6 +305,22 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
     lock: Option<&ExclusiveLock>,
     check: impl FnOnce(&T) -> Result<(), Rejected>,
 ) -> Result<Loaded<T>, Error> {
+    let mut loaded = judge(path, kind, version, loss, lock, check)?;
+    // Listed after any quarantine this load made, and whatever the health: an
+    // earlier run's quarantine must not hide behind `Fresh`.
+    loaded.quarantined = quarantines(path)?;
+    Ok(loaded)
+}
+
+/// [`load_checked`], less the listing of quarantines.
+fn judge<T: DeserializeOwned + Default>(
+    path: &Path,
+    kind: &'static str,
+    version: u16,
+    loss: Loss,
+    lock: Option<&ExclusiveLock>,
+    check: impl FnOnce(&T) -> Result<(), Rejected>,
+) -> Result<Loaded<T>, Error> {
     // A lock presented for another directory guards nothing here, and is
     // refused before anything is read.
     if let Some(lock) = lock {
@@ -319,6 +346,7 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
             return Ok(Loaded {
                 value: T::default(),
                 health: Health::Fresh,
+                quarantined: Vec::new(),
             });
         }
         Err(source) => {
@@ -336,6 +364,7 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
         Ok(value) => Ok(Loaded {
             value,
             health: Health::Loaded,
+            quarantined: Vec::new(),
         }),
         // A newer format of a file nothing can rebuild is not believed and not
         // discarded: it is intact as far as anyone knows.
@@ -399,6 +428,7 @@ fn degrade<T: Default>(path: &Path, damage: Damage, lock: Option<&ExclusiveLock>
         return Loaded {
             value: T::default(),
             health: Health::Damaged(damage),
+            quarantined: Vec::new(),
         };
     };
     match move_aside(path, lock) {
@@ -418,6 +448,7 @@ fn degrade<T: Default>(path: &Path, damage: Damage, lock: Option<&ExclusiveLock>
     Loaded {
         value: T::default(),
         health: Health::Reset(damage),
+        quarantined: Vec::new(),
     }
 }
 
@@ -792,6 +823,87 @@ mod tests {
     }
 
     #[test]
+    fn a_quarantine_left_by_an_earlier_run_is_reported_on_every_load() {
+        // Review round 4: a quarantine followed by a crash before the save left
+        // the next reader and writer looking at `Health::Fresh`, with the
+        // `.corrupt` file orphaned and reported nowhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let first = StateDir::quarantine(&path);
+
+        let absent: Loaded<Value> = load(
+            &dir.path().join("absent/v.mpk"),
+            KIND,
+            VERSION,
+            Loss::Recomputable,
+            None,
+        )
+        .expect("a missing directory lists nothing");
+        assert!(absent.quarantined.is_empty());
+
+        std::fs::write(&path, b"garbage").expect("seed");
+        let reset: Loaded<Value> = locked_load(&path).expect("load");
+        assert!(reset.health.is_reset());
+        assert_eq!(
+            reset.quarantined,
+            vec![first.clone()],
+            "the quarantining load"
+        );
+
+        // The crash: no save. The next reader and writer both see Fresh, and
+        // both are told what was set aside.
+        let lockless: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, None).expect("load");
+        assert_eq!(lockless.health, Health::Fresh);
+        assert_eq!(lockless.quarantined, vec![first.clone()]);
+        let writer: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(writer.health, Health::Fresh);
+        assert_eq!(writer.quarantined, vec![first.clone()]);
+
+        // A clean save does not hide it either. A gap hides nothing after it,
+        // and names that are not this file's quarantines are not listed.
+        save(&path, KIND, VERSION, &sample()).expect("save");
+        let third = StateDir::quarantine_nth(&path, 2);
+        std::fs::write(&third, b"after a gap").expect("seed");
+        for decoy in [
+            "v.mpk.corrupt.01",
+            "v.mpk.corrupt.+3",
+            "v.mpk.corrupt.x",
+            "v.mpk.corrupt.",
+            "v.mpk.corrupted",
+            "w.mpk.corrupt",
+        ] {
+            std::fs::write(dir.path().join(decoy), b"not a quarantine").expect("decoy");
+        }
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(loaded.health, Health::Loaded);
+        assert_eq!(loaded.quarantined, vec![first, third]);
+    }
+
+    #[test]
+    fn a_state_directory_that_cannot_be_listed_is_an_error_not_an_empty_list() {
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("state");
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("v.mpk");
+        save(&path, KIND, VERSION, &sample()).expect("seed");
+        // Searchable, so the file itself reads; not readable, so it cannot be
+        // listed. Reporting no quarantines there would be a guess.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+        let result = load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        let err = result.expect_err("an unlistable directory is not an empty one");
+        assert!(
+            matches!(&err, Error::Read { path: at, .. } if *at == root),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn a_lockless_reader_reports_damage_and_moves_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
@@ -1007,10 +1119,12 @@ mod tests {
         let loaded = Loaded {
             value: 1_u32,
             health: Health::Reset(Damage::Malformed),
+            quarantined: vec![PathBuf::from("/s/v.mpk.corrupt")],
         };
         let mapped = loaded.map(|v| v + 1);
         assert_eq!(mapped.value, 2);
         assert_eq!(mapped.health, Health::Reset(Damage::Malformed));
+        assert_eq!(mapped.quarantined, vec![PathBuf::from("/s/v.mpk.corrupt")]);
         assert_eq!(mapped.value, 2);
     }
 }

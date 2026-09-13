@@ -88,6 +88,17 @@
 //! enough. A journal written to mislead is refused by what it says, not by how
 //! it is framed.
 //!
+//! A checksum of the frame alone would validate a frame from any journal, and
+//! after a power loss the unsynced tail of this one can hold blocks of an
+//! earlier, deleted one. So every journal's header carries a nonce chosen when
+//! the session opens, and the hash covers it too: a frame another session wrote
+//! never validates here, so a stale frame in a damaged tail cannot pass for a
+//! whole frame bx wrote after the damage.
+//!
+//! A journal in a *newer* format is not damage at all. It is refused as
+//! [`Error::FutureVersion`], and nothing is rolled back or set aside, because
+//! only the bx that wrote it can recover it.
+//!
 //! # Created through [`crate::fs::atomic`], appended to in place
 //!
 //! A journal comes into existence whole. Its header and its [`Begin`] frame are
@@ -134,8 +145,11 @@ const MAGIC: &[u8; 7] = b"BXJRNL\0";
 /// The newest journal format this build writes and understands.
 const FORMAT: u8 = 1;
 
-/// The header's width: [`MAGIC`] plus one version byte.
-const HEADER: usize = MAGIC.len() + 1;
+/// The width of the per-session nonce every frame's checksum covers.
+const NONCE: usize = 16;
+
+/// The header's width: [`MAGIC`], one version byte, and the session's nonce.
+const HEADER: usize = MAGIC.len() + 1 + NONCE;
 
 /// The width of a frame's checksum. See the module documentation.
 const CHECK: usize = 4;
@@ -173,6 +187,27 @@ pub enum Error {
     FrameTooLarge {
         /// How big it was.
         len: usize,
+    },
+    /// The journal was written in a newer format than this build understands.
+    ///
+    /// Not damage: the likeliest cause is an older bx run after a newer one was
+    /// interrupted, and the journal is intact in a format this build cannot
+    /// read. Setting it aside would discard the rollback only the newer bx can
+    /// make, so it is refused wherever it is read: nothing is rolled back, set
+    /// aside or changed.
+    #[error(
+        "{} was written by a newer bx: it is journal format {found}, and this bx understands \
+         up to {supported}. Nothing was rolled back, set aside or changed; run a bx at least as \
+         new as the one that wrote it",
+        .path.display()
+    )]
+    FutureVersion {
+        /// The journal.
+        path: PathBuf,
+        /// The format byte on disk.
+        found: u8,
+        /// The newest format this build understands.
+        supported: u8,
     },
     /// A session was asked to start while an unresolved interruption stands.
     ///
@@ -407,7 +442,7 @@ pub enum Loaded {
         discarded: usize,
     },
     /// The bytes are not a journal a bx session could have written: a wrong
-    /// header or format, a first frame that is not whole, a later frame whose
+    /// header or an older format, a first frame that is not whole, a later frame whose
     /// checksum or decoding fails with a whole frame after it, bytes after its
     /// [`End`], or a record that stores a path its session could not have
     /// written. See [`load`].
@@ -506,7 +541,7 @@ impl Loaded {
 /// records.
 ///
 /// Everything else that is not whole frames is [`Loaded::Unreadable`]: a wrong
-/// magic or format; a first frame that is torn or damaged, which no crash
+/// magic or an older format; a first frame that is torn or damaged, which no crash
 /// leaves, because [`Journal::create`] renames the header and the first frame
 /// into place together; a frame whose checksum or decoding fails **with a whole
 /// frame after it**, which no crash leaves either, because only the last frame
@@ -526,7 +561,8 @@ impl Loaded {
 /// # Errors
 ///
 /// [`Error::Io`] when the file exists and cannot be read at all. Damage is a
-/// value, not an error; only a failure to look is.
+/// value, not an error; only a failure to look is. [`Error::FutureVersion`]
+/// for a journal a newer bx wrote, which is not damage and is never set aside.
 pub fn load(path: &Path) -> Result<Loaded, Error> {
     Ok(match inspect(path)? {
         Ok(loaded) => loaded,
@@ -576,9 +612,8 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
         }
     };
 
-    if bytes.len() < HEADER {
-        // Only the magic can be cut this short; the version byte is the
-        // header's last. A prefix of it is a header a crash tore.
+    if bytes.len() <= MAGIC.len() {
+        // A prefix of the magic is a header a crash tore.
         return Ok(if MAGIC.starts_with(&bytes) {
             Ok(Loaded::Unterminated(Vec::new()))
         } else {
@@ -588,15 +623,32 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
     if &bytes[..MAGIC.len()] != MAGIC.as_slice() {
         return Ok(Err("it does not start with a bx journal header"));
     }
-    if bytes[MAGIC.len()] != FORMAT {
+    let found = bytes[MAGIC.len()];
+    // Before anything else is classified: a newer format is not damage, and
+    // nothing this build could decide about its bytes is believable.
+    if found > FORMAT {
+        return Err(Error::FutureVersion {
+            path: path.to_path_buf(),
+            found,
+            supported: FORMAT,
+        });
+    }
+    if found != FORMAT {
         return Ok(Err("it is a journal format this bx cannot read"));
     }
+    // A header cut inside its nonce is still a header a crash tore.
+    let Some(nonce) = bytes
+        .get(MAGIC.len() + 1..HEADER)
+        .and_then(|nonce| <[u8; NONCE]>::try_from(nonce).ok())
+    else {
+        return Ok(Ok(Loaded::Unterminated(Vec::new())));
+    };
 
     let mut records = Vec::new();
     let mut at = HEADER;
     let mut discarded = 0;
     while at < bytes.len() {
-        match frame(&bytes, at) {
+        match frame(&bytes, at, &nonce) {
             Ok((record, next)) => {
                 records.push(record);
                 at = next;
@@ -615,7 +667,7 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
             // leave stale blocks in its unsynced bytes. A frame that fails with a
             // whole frame bx wrote after it is none of those. It is damage in the
             // middle of the log, and the frames it hides are not believed either.
-            Err(Damage::Invalid) if whole_frame_after(&bytes, at) => {
+            Err(Damage::Invalid) if whole_frame_after(&bytes, at, &nonce) => {
                 return Ok(Err(
                     "a frame after its first is damaged, and a whole frame follows it",
                 ));
@@ -758,8 +810,8 @@ enum Damage {
 }
 
 /// Decode the frame at `at`: a little-endian `u32` length, a [`CHECK`]-byte
-/// checksum, and a MessagePack body of that length.
-fn frame(bytes: &[u8], at: usize) -> Result<(Record, usize), Damage> {
+/// checksum under the session's `nonce`, and a MessagePack body of that length.
+fn frame(bytes: &[u8], at: usize, nonce: &[u8; NONCE]) -> Result<(Record, usize), Damage> {
     let prefix_end = at.checked_add(size_of::<u32>()).ok_or(Damage::Invalid)?;
     let body_start = prefix_end.checked_add(CHECK).ok_or(Damage::Invalid)?;
     let prefix: [u8; 4] = bytes
@@ -780,30 +832,34 @@ fn frame(bytes: &[u8], at: usize) -> Result<(Record, usize), Damage> {
     }
     let end = body_start.checked_add(len).ok_or(Damage::Invalid)?;
     let body = bytes.get(body_start..end).ok_or(Damage::Torn)?;
-    if checksum(prefix, body).as_slice() != sum {
+    if checksum(nonce, prefix, body).as_slice() != sum {
         return Err(Damage::Invalid);
     }
     let record = rmp_serde::from_slice::<Record>(body).map_err(|_| Damage::Invalid)?;
     Ok((record, end))
 }
 
-/// Whether a whole frame — checksum and decoding both good — starts anywhere
-/// after `at`.
+/// Whether a whole frame of this session — checksum under its `nonce` and
+/// decoding both good — starts anywhere after `at`.
 ///
 /// Every offset is tried, because the damaged frame's own length cannot be
 /// trusted to say where the next one starts. Each try is a bounds check for
 /// all but a length that fits in the file, so a zero-filled or random tail
 /// costs a few comparisons per byte; only bytes crafted to be all plausible
 /// lengths hash much, and a journal is not a file anyone else writes.
-fn whole_frame_after(bytes: &[u8], at: usize) -> bool {
-    (at + 1..bytes.len()).any(|start| frame(bytes, start).is_ok())
+///
+/// A whole frame an earlier journal left in reused blocks fails here, because
+/// its checksum was taken under that journal's nonce.
+fn whole_frame_after(bytes: &[u8], at: usize, nonce: &[u8; NONCE]) -> bool {
+    (at + 1..bytes.len()).any(|start| frame(bytes, start, nonce).is_ok())
 }
 
-/// The checksum a frame carries: the first [`CHECK`] bytes of the SHA-256 of its
-/// length prefix and its body.
-fn checksum(prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
+/// The checksum a frame carries: the first [`CHECK`] bytes of the SHA-256 of
+/// the session's nonce, the frame's length prefix, and its body.
+fn checksum(nonce: &[u8; NONCE], prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
+    hasher.update(nonce);
     hasher.update(prefix);
     hasher.update(body);
     let mut sum = [0; CHECK];
@@ -854,6 +910,8 @@ fn quarantine(path: &Path, why: &str, lock: &ExclusiveLock) -> Loaded {
 pub struct Journal {
     file: File,
     path: PathBuf,
+    /// The nonce in this journal's header, which every frame's checksum covers.
+    nonce: [u8; NONCE],
 }
 
 impl Journal {
@@ -872,10 +930,12 @@ impl Journal {
     /// framed, [`Error::Write`] when the file cannot be written, and
     /// [`Error::Io`] when it cannot be reopened for appending.
     pub fn create(path: &Path, begin: Begin) -> Result<Self, Error> {
+        let nonce = fresh_nonce();
         let mut bytes = Vec::with_capacity(HEADER);
         bytes.extend_from_slice(MAGIC);
         bytes.push(FORMAT);
-        bytes.extend_from_slice(&encode(&Record::Begin(begin))?);
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&encode(&Record::Begin(begin), &nonce)?);
         fs::write_atomically(path, &bytes, Mode::PRIVATE_FILE)?;
 
         let file = OpenOptions::new()
@@ -888,6 +948,7 @@ impl Journal {
         Ok(Self {
             file,
             path: path.to_path_buf(),
+            nonce,
         })
     }
 
@@ -910,7 +971,7 @@ impl Journal {
     pub fn append(&mut self, record: &Record) -> Result<(), Error> {
         // One buffer and one `write_all`, so a frame torn by a crash can only
         // ever be the last bytes of the file.
-        let frame = encode(record)?;
+        let frame = encode(record, &self.nonce)?;
         self.emit(&frame)
     }
 
@@ -929,9 +990,9 @@ impl Journal {
     }
 }
 
-/// One record as a frame: its length as a little-endian `u32`, its checksum,
-/// then its MessagePack encoding.
-fn encode(record: &Record) -> Result<Vec<u8>, Error> {
+/// One record as a frame: its length as a little-endian `u32`, its checksum
+/// under the session's `nonce`, then its MessagePack encoding.
+fn encode(record: &Record, nonce: &[u8; NONCE]) -> Result<Vec<u8>, Error> {
     let payload = rmp_serde::to_vec_named(record).map_err(|source| Error::Encode { source })?;
     let len = u32::try_from(payload.len())
         .ok()
@@ -940,9 +1001,49 @@ fn encode(record: &Record) -> Result<Vec<u8>, Error> {
     let prefix = len.to_le_bytes();
     let mut frame = Vec::with_capacity(size_of::<u32>() + CHECK + payload.len());
     frame.extend_from_slice(&prefix);
-    frame.extend_from_slice(&checksum(prefix, &payload));
+    frame.extend_from_slice(&checksum(nonce, prefix, &payload));
     frame.extend_from_slice(&payload);
     Ok(frame)
+}
+
+/// A nonce no other journal is expected to share.
+///
+/// It guards against damage, not an adversary, so it needs to differ between
+/// sessions, not to be secret. The kernel's random bytes are the source; the
+/// process's own hash seed, its id, a per-process counter and the clock are
+/// mixed in too, so a system without `/dev/urandom` still gets a nonce that
+/// differs from every earlier session's, and creating a journal never fails
+/// for want of one. The journal is machine state that exists only while a
+/// session is in flight, so a value that differs per run breaks no
+/// byte-identical output.
+fn fresh_nonce() -> [u8; NONCE] {
+    use sha2::Digest as _;
+    use std::hash::BuildHasher as _;
+    use std::io::Read as _;
+
+    static SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hasher = sha2::Sha256::new();
+    let mut random = [0_u8; 32];
+    if File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut random))
+        .is_ok()
+    {
+        hasher.update(random);
+    }
+    let count = SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    hasher.update(
+        std::collections::hash_map::RandomState::new()
+            .hash_one(count)
+            .to_le_bytes(),
+    );
+    hasher.update(count.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        hasher.update(now.as_nanos().to_le_bytes());
+    }
+    let mut nonce = [0; NONCE];
+    nonce.copy_from_slice(&hasher.finalize()[..NONCE]);
+    nonce
 }
 
 /// A transaction over the state directory: the lock, the ledger, the journal.
@@ -1041,8 +1142,10 @@ impl Session {
     /// # Errors
     ///
     /// [`Error::InProgress`] when a journal already stands — recover first.
-    /// [`Error::State`] when the directory cannot be made or locked, and
-    /// [`Error::Io`] when the journal cannot be written.
+    /// [`Error::FutureVersion`] when the journal that stands was written by a
+    /// newer bx: nothing is set aside. [`Error::State`] when the directory
+    /// cannot be made or locked, and [`Error::Io`] when the journal cannot be
+    /// written.
     pub fn open(
         state: &StateDir,
         kind: SessionKind,
@@ -1838,16 +1941,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_journal_from_a_future_format_is_moved_aside() {
+    fn a_journal_from_a_future_format_is_refused_and_never_moved_aside() {
+        // Review round 5, item 2. It read as `Unreadable`, and the lock holder
+        // set it aside with nothing rolled back.
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let state = StateDir::new(dir.path().to_path_buf());
+        let lock = ExclusiveLock::acquire(&state).expect("lock");
+        let path = state.journal();
+        drop(Journal::create(&path, some_begin()).expect("create"));
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[MAGIC.len()] = FORMAT + 1;
+        std::fs::write(&path, &bytes).expect("write");
+
+        for (how, loaded) in [
+            ("load", load(&path)),
+            ("load_exclusive", load_exclusive(&path, &lock)),
+        ] {
+            let err = loaded.expect_err(how);
+            let Error::FutureVersion {
+                path: named,
+                found,
+                supported,
+            } = &err
+            else {
+                panic!("{how}: {err}")
+            };
+            assert_eq!((named, *found, *supported), (&path, FORMAT + 1, FORMAT));
+            assert!(
+                err.to_string().contains("run a bx at least as new"),
+                "{err}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).expect("left in place"), bytes);
+        assert!(!StateDir::quarantine(&path).exists());
+    }
+
+    #[test]
+    fn a_journal_from_an_older_format_is_unreadable() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
         let mut bytes = MAGIC.to_vec();
-        bytes.push(FORMAT + 1);
+        bytes.push(FORMAT - 1);
+        bytes.extend_from_slice(&[0; NONCE]);
         std::fs::write(&path, &bytes).expect("write");
-        assert!(matches!(
+        assert_eq!(
             load(&path).expect("load"),
-            Loaded::Unreadable { .. }
-        ));
+            Loaded::Unreadable { moved_to: None }
+        );
     }
 
     #[test]
@@ -3535,21 +3675,30 @@ pub(crate) mod tests {
 
     /// Where each whole frame in a journal's bytes starts.
     pub(crate) fn frame_starts(bytes: &[u8]) -> Vec<usize> {
+        let nonce = nonce_of(bytes);
         let mut starts = Vec::new();
         let mut at = HEADER;
-        while let Ok((_, next)) = frame(bytes, at) {
+        while let Ok((_, next)) = frame(bytes, at, &nonce) {
             starts.push(at);
             at = next;
         }
         starts
     }
 
+    /// The nonce in a journal's header.
+    pub(crate) fn nonce_of(bytes: &[u8]) -> [u8; NONCE] {
+        bytes[MAGIC.len() + 1..HEADER]
+            .try_into()
+            .expect("a whole header")
+    }
+
     #[test]
-    fn every_frame_carries_a_checksum_of_its_length_and_body() {
+    fn every_frame_carries_a_checksum_of_its_nonce_length_and_body() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
         drop(Journal::create(&path, some_begin()).expect("create"));
         let bytes = std::fs::read(&path).expect("read");
+        let nonce = nonce_of(&bytes);
 
         let prefix: [u8; 4] = bytes[HEADER..HEADER + 4].try_into().expect("a length");
         let body = &bytes[HEADER + 4 + CHECK..];
@@ -3559,13 +3708,21 @@ pub(crate) mod tests {
         );
         assert_eq!(
             &bytes[HEADER + 4..HEADER + 4 + CHECK],
-            checksum(prefix, body)
+            checksum(&nonce, prefix, body)
         );
         let mut whole = [0; 32];
         whole.copy_from_slice(&<sha2::Sha256 as sha2::Digest>::digest(
-            [prefix.as_slice(), body].concat(),
+            [nonce.as_slice(), prefix.as_slice(), body].concat(),
         ));
-        assert_eq!(checksum(prefix, body), whole[..CHECK]);
+        assert_eq!(checksum(&nonce, prefix, body), whole[..CHECK]);
+        assert_ne!(
+            nonce,
+            nonce_of(&{
+                drop(Journal::create(&path, some_begin()).expect("create again"));
+                std::fs::read(&path).expect("read")
+            }),
+            "a second session over the same header draws a different nonce",
+        );
     }
 
     /// Write a journal exactly as given: a header, then each record as a frame.
@@ -3574,8 +3731,10 @@ pub(crate) mod tests {
     /// follows an Intent that has no `Done` - so recovery can be tested against
     /// what damage or an earlier bx could leave behind.
     pub(crate) fn raw_journal(path: &Path, records: &[Record]) {
+        let nonce = fresh_nonce();
         let mut header = MAGIC.to_vec();
         header.push(FORMAT);
+        header.extend_from_slice(&nonce);
         std::fs::write(path, &header).expect("write the header");
         let mut journal = Journal {
             file: OpenOptions::new()
@@ -3583,6 +3742,7 @@ pub(crate) mod tests {
                 .open(path)
                 .expect("reopen the journal"),
             path: path.to_path_buf(),
+            nonce,
         };
         for record in records {
             journal.append(record).expect("append");
@@ -3601,6 +3761,7 @@ pub(crate) mod tests {
                 .open(path)
                 .expect("reopen the journal"),
             path: path.to_path_buf(),
+            nonce: nonce_of(&std::fs::read(path).expect("read the journal")),
         };
         journal
             .append(&Record::End(End { written }))
@@ -3619,5 +3780,37 @@ pub(crate) mod tests {
     /// Every boundary inside [`Session::finish`], as `BX_CRASH_AT` spells it.
     pub(crate) fn finish_crash_phases() -> [&'static str; FINISH_PHASES.len()] {
         FINISH_PHASES.map(Crash::name)
+    }
+
+    #[test]
+    fn a_frame_copied_from_another_sessions_journal_does_not_validate() {
+        // Review round 5, item 3. Two sessions with the same header wrote
+        // byte-identical frames, so a frame from one validated in the other.
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let (one, two) = (dir.path().join("one.mpk"), dir.path().join("two.mpk"));
+        let done = Record::Done(Done {
+            target: Portable::try_from("~/.a".to_string()).expect("portable"),
+        });
+        let mut journal = Journal::create(&one, some_begin()).expect("create");
+        journal.append(&done).expect("append");
+        drop(journal);
+        drop(Journal::create(&two, some_begin()).expect("create"));
+
+        let from_one = std::fs::read(&one).expect("read");
+        assert_eq!(
+            load(&one).expect("load"),
+            Loaded::Unterminated(vec![Record::Begin(some_begin()), done]),
+        );
+        let copied = &from_one[frame_starts(&from_one)[1]..];
+        let mut bytes = std::fs::read(&two).expect("read");
+        bytes.extend_from_slice(copied);
+        std::fs::write(&two, &bytes).expect("write");
+        assert_eq!(
+            load(&two).expect("load"),
+            Loaded::Torn {
+                records: vec![Record::Begin(some_begin())],
+                discarded: copied.len(),
+            },
+        );
     }
 }

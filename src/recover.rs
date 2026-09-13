@@ -400,13 +400,21 @@ pub fn before_writing(state: &StateDir) -> Result<Outcome, Error> {
 /// # Errors
 ///
 /// [`Error::State`] when the lock cannot be taken and [`Error::Journal`] when
-/// the journal cannot be moved. A journal abandoned earlier is never renamed
+/// the journal cannot be moved, or with [`journal::Error::FutureVersion`] when
+/// a newer bx wrote it, which is left exactly where it is. A journal abandoned earlier is never renamed
 /// over: this one takes the next free set-aside name.
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
     let lock = ExclusiveLock::acquire(state)?;
     let path = state.journal();
     if !path.exists() {
         return Ok(None);
+    }
+    // Refused here as everywhere else it is read: abandoning a newer bx's
+    // journal from an older build discards a rollback only the newer bx can
+    // make, and the way out is to run that bx. Any other failure to read is
+    // left to the set-aside below, which reports its own.
+    if let Err(future @ journal::Error::FutureVersion { .. }) = journal::load(&path) {
+        return Err(future.into());
     }
     let aside = journal::set_aside(&path, &lock)?;
     tracing::warn!(
@@ -3214,5 +3222,108 @@ mod tests {
                 assert_eq!(crash_snapshot(&home), before);
             }
         }
+    }
+
+    #[test]
+    fn a_stale_whole_frame_from_an_earlier_journal_in_the_tail_still_rolls_back_the_prefix() {
+        // Review round 5, item 3. After a power loss the unsynced tail can hold
+        // blocks of an earlier, deleted journal. A whole frame from it validated,
+        // so the damaged last frame was read as mid-log damage: the journal was
+        // set aside as unreadable and the half-applied `.a` was never rolled back.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (a, b) = (home.child(".a"), home.child(".b"));
+        plant_file(&a, "A0\n", Mode::DEFAULT_FILE);
+        plant_file(&b, "B0\n", Mode::DEFAULT_FILE);
+
+        // An earlier session, finished and unlinked: its last frame is the stale block.
+        let mut earlier =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        earlier
+            .apply(write_to(home.path(), ".x", "X\n", Mode::DEFAULT_FILE))
+            .expect("apply");
+        let old = std::fs::read(state.journal()).expect("the earlier journal");
+        earlier.finish().expect("finish");
+        let old_done = old[*frame_starts(&old).last().expect("its Done frame")..].to_vec();
+
+        interrupted(
+            &state,
+            home.path(),
+            vec![
+                write_to(home.path(), ".a", "A1\n", Mode::DEFAULT_FILE),
+                write_to(home.path(), ".b", "B1\n", Mode::DEFAULT_FILE),
+            ],
+        );
+        let whole = std::fs::read(state.journal()).expect("the journal");
+        // `.b`'s Intent never reached the disk, so its write never began.
+        plant_file(&b, "B0\n", Mode::DEFAULT_FILE);
+        let starts = frame_starts(&whole);
+        let (intent_b, done_b) = (starts[3], starts[4]);
+        let mut bytes = whole[..done_b].to_vec();
+        for (at, byte) in (0..=u8::MAX).cycle().zip(bytes[intent_b..].iter_mut()) {
+            *byte = at.wrapping_mul(37).wrapping_add(11);
+        }
+        let place = intent_b + 16;
+        assert!(
+            place + old_done.len() <= bytes.len(),
+            "the stale frame fits"
+        );
+        bytes[place..place + old_done.len()].copy_from_slice(&old_done);
+        std::fs::write(state.journal(), &bytes).expect("the power-loss bytes");
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { undone: 1 }
+        );
+        assert_eq!(peek(&a).expect("rolled back").0, b"A0\n");
+        assert_eq!(peek(&b).expect("untouched").0, b"B0\n");
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&state.journal())).expect("kept"),
+            bytes,
+        );
+    }
+
+    #[test]
+    fn a_journal_a_newer_bx_wrote_is_refused_and_nothing_is_set_aside_or_rolled_back() {
+        // Review round 5, item 2. A newer format byte read as damage: the next
+        // session set the journal aside with nothing rolled back, discarding a
+        // newer bx's interrupted session.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let a = home.child(".a");
+        plant_file(&a, "A0\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".a", "A1\n", Mode::DEFAULT_FILE)],
+        );
+        let mut bytes = std::fs::read(state.journal()).expect("the journal");
+        bytes[7] += 1;
+        std::fs::write(state.journal(), &bytes).expect("what a newer bx leaves");
+
+        let future = |err: &journal::Error| matches!(err, journal::Error::FutureVersion { .. });
+        let refused = |err: Error| matches!(&err, Error::Journal(inner) if future(inner));
+        let loaded = crate::journal::load(&state.journal()).expect_err("load refuses");
+        assert!(future(&loaded), "{loaded}");
+        assert!(
+            loaded.to_string().contains("run a bx at least as new"),
+            "{loaded}"
+        );
+        assert!(refused(pending(&state).expect_err("pending refuses")));
+        assert!(refused(recover(&state).expect_err("recover refuses")));
+        assert!(refused(
+            before_writing(&state).expect_err("a writing command refuses")
+        ));
+        let opened = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
+            .expect_err("a session refuses");
+        assert!(future(&opened), "{opened}");
+        assert!(refused(abandon(&state).expect_err("abandon refuses")));
+
+        assert_eq!(
+            std::fs::read(state.journal()).expect("left in place"),
+            bytes
+        );
+        assert!(!StateDir::quarantine(&state.journal()).exists());
+        assert_eq!(peek(&a).expect("not rolled back").0, b"A1\n");
     }
 }

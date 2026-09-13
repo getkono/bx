@@ -2348,6 +2348,127 @@ mod tests {
         assert_eq!(peek(&home.child(".conf")), dest);
     }
 
+    /// `ledger.mpk` as a bx with a newer ledger format leaves it.
+    fn ledger_from_a_newer_bx() -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Envelope {
+            kind: &'static str,
+            version: u16,
+            payload: LedgerView,
+        }
+        rmp_serde::to_vec_named(&Envelope {
+            kind: "bx.ledger",
+            version: u16::MAX,
+            payload: LedgerView::default(),
+        })
+        .expect("encode")
+    }
+
+    /// Whether `err` is the ledger's refusal of a newer format.
+    fn is_future_version(err: &crate::state::Error) -> bool {
+        matches!(
+            err,
+            crate::state::Error::FutureVersion { found, .. } if *found == u16::MAX
+        )
+    }
+
+    #[test]
+    fn a_rollback_over_a_ledger_from_a_newer_bx_reads_only_the_journal_and_renames_nothing() {
+        // Stack integration of #7's round 4: a ledger a newer bx wrote is
+        // `Error::FutureVersion` and is never quarantined. An unterminated
+        // journal is rolled back from the journal and the restore blobs alone,
+        // so the rollback still completes; the next command that opens the
+        // ledger is what stops.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first
+            .apply(write_to(home.path(), ".conf", "one\n", Mode::DEFAULT_FILE))
+            .expect("apply");
+        first.finish().expect("finish");
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "two\n", Mode::DEFAULT_FILE)],
+        );
+        let newer = ledger_from_a_newer_bx();
+        std::fs::write(state.ledger(), &newer).expect("a newer bx's ledger");
+
+        let interruption = pending(&state).expect("a rollback's report reads no ledger");
+        let interruption = interruption.expect("interrupted");
+        assert!(!interruption.complete && !interruption.unreadable);
+        assert_eq!(interruption.unfinished.len(), 1);
+        assert!(interruption.unfinished[0].resolvable);
+
+        assert_eq!(
+            recover(&state).expect("the rollback needs no ledger"),
+            Outcome::RolledBack { undone: 1 },
+        );
+        assert_eq!(peek(&dest).expect("rolled back").0, b"one\n");
+        assert!(!state.journal().exists());
+        assert_eq!(std::fs::read(state.ledger()).expect("in place"), newer);
+        assert!(!StateDir::quarantine(&state.ledger()).exists());
+
+        // The next writing command opens the ledger and stops there.
+        let err = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
+            .expect_err("a session needs the ledger");
+        assert!(
+            matches!(&err, crate::journal::Error::State(inner) if is_future_version(inner)),
+            "got {err}"
+        );
+        let err = crate::restore::restore(&state, home.path(), &[portable])
+            .expect_err("rm needs the ledger");
+        assert!(
+            matches!(
+                &err,
+                crate::restore::Error::Journal(crate::journal::Error::State(inner))
+                    if is_future_version(inner)
+            ),
+            "got {err}"
+        );
+        assert!(!state.journal().exists(), "no session was opened");
+        assert_eq!(std::fs::read(state.ledger()).expect("in place"), newer);
+        assert!(!StateDir::quarantine(&state.ledger()).exists());
+        assert_eq!(peek(&dest).expect("untouched").0, b"one\n");
+    }
+
+    #[test]
+    fn a_terminated_journal_over_a_ledger_from_a_newer_bx_stops_and_quarantines_nothing() {
+        // Stack integration of #7's round 4: a terminated journal's bookkeeping
+        // writes the ledger, so it opens it, and a newer format stops the report,
+        // the recovery and every writing command, with nothing moved.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+        seal(&state.journal(), 1);
+        let newer = ledger_from_a_newer_bx();
+        std::fs::write(state.ledger(), &newer).expect("a newer bx's ledger");
+        let journal = std::fs::read(state.journal()).expect("the journal");
+        let dest = peek(&home.child(".conf"));
+
+        let future = |err: &Error| matches!(err, Error::State(inner) if is_future_version(inner));
+        let err = pending(&state).expect_err("the report stops");
+        assert!(future(&err), "got {err}");
+        let err = recover(&state).expect_err("the recovery stops");
+        assert!(future(&err), "got {err}");
+        let err = before_writing(&state).expect_err("and every writing command");
+        assert!(future(&err), "got {err}");
+
+        assert_eq!(std::fs::read(state.ledger()).expect("in place"), newer);
+        assert_eq!(std::fs::read(state.journal()).expect("in place"), journal);
+        assert!(!StateDir::quarantine(&state.ledger()).exists());
+        assert!(!StateDir::quarantine(&state.journal()).exists());
+        assert_eq!(peek(&home.child(".conf")), dest);
+    }
+
     #[test]
     fn a_damaged_ledger_is_only_reported_without_the_lock_and_quarantined_under_it() {
         // Stack integration of #7's round 3: a lockless read returns

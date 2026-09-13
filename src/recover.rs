@@ -289,9 +289,16 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
     let kind = loaded
         .begin()
         .map_or(SessionKind::Apply, |begin| begin.kind);
+    // A terminated journal's report depends on what the saved ledger already
+    // holds, exactly as its rebuild does. Every state file is replaced by
+    // rename, so this read needs no lock.
+    let ledger = match home {
+        Some(home) => Some(LedgerView::read(state, home)?.value),
+        None => None,
+    };
     let mut unfinished = Vec::new();
     for (intent, landed) in loaded.landed() {
-        unfinished.push(decide(state, intent, home, landed)?.1);
+        unfinished.push(decide(state, intent, home, ledger.as_ref(), landed)?.1);
     }
     Ok(Some(Interrupted {
         kind,
@@ -408,7 +415,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         if !complete && let Some(temp) = &intent.temp {
             journal::unlink(temp)?;
         }
-        let (step, report) = decide(state, intent, home, landed)?;
+        let (step, report) = decide(state, intent, home, ledger.as_deref(), landed)?;
         match step {
             Step::Blocked => {
                 conflicts.push(report);
@@ -503,11 +510,34 @@ enum Step {
 ///
 /// `home` is `Some` for a terminated journal, whose ledger entries are rebuilt
 /// with paths made portable against it, and `None` for an unterminated one,
-/// which is rolled back. `landed` is whether a `Done` follows the intent.
+/// which is rolled back. `ledger` is the ledger a rebuild would record into —
+/// the saved one, for a report — and is only read for a terminated journal.
+/// `landed` is whether a `Done` follows the intent.
+///
+/// # A rebuild over a ledger that was already saved
+///
+/// [`crate::journal::Session::finish`] saves the ledger and then unlinks the
+/// journal, so a crash or a failed unlink between the two leaves a terminated
+/// journal over a ledger that already holds its writes. Recording such an
+/// intent a second time is not a no-op: its `before` is what was on disk a
+/// moment before the write — bx's own previous output, for a target bx already
+/// managed — and the ledger, which now says bx last wrote `after`, would take
+/// those bytes for a third party's and adopt them as the prior, pushing the
+/// user's original out of reach of `rm`.
+///
+/// So a write the ledger already holds is skipped. "Already holds" is the
+/// stored entry being at the intent's `after` digest and mode while the ledger
+/// the session opened was not at that digest ([`Intent::ledger_written`]). An
+/// entry still at `after` that the session also found there is re-recorded,
+/// which is idempotent: nothing in the stored entry turns on whether it was
+/// saved. Matching `after` alone is not enough — a session that rewrites bx's
+/// last output over a user's edit and dies before the save leaves the ledger
+/// at `after` without the edit, and skipping that would lose it.
 fn decide(
     state: &StateDir,
     intent: &Intent,
     home: Option<&Path>,
+    ledger: Option<&LedgerView>,
     landed: bool,
 ) -> Result<(Step, Unfinished), Error> {
     let standing = standing(intent, &look(&intent.dest)?);
@@ -567,6 +597,21 @@ fn decide(
         // A removal, or a target the session released: nothing for bx to own.
         return Ok((Step::Forget, report(true, recorded())));
     };
+    if let Some(stored) = ledger.and_then(|ledger| ledger.get(&intent.target))
+        && stored.written == digest
+        && stored.mode == mode
+        && intent.ledger_written != Some(digest)
+    {
+        return Ok((
+            Step::Skip,
+            report(
+                true,
+                "was written, and bx's bookkeeping for it was saved before the \
+                 interruption; there is nothing left to record"
+                    .to_string(),
+            ),
+        ));
+    }
     let prior = match &intent.before {
         Prior::Absent => PriorBytes::Absent,
         Prior::Existed(reference) => match snapshot(state, reference)? {
@@ -723,7 +768,8 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        crash_phases, peek, permissions_refuse, plant_file, raw_journal, seal, target, write_to,
+        crash_phases, finish_crash_phases, peek, permissions_refuse, plant_file, raw_journal, seal,
+        target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
@@ -1647,6 +1693,7 @@ mod tests {
                     after: Written::Absent,
                     created_dirs: Vec::new(),
                     mechanism: Some(Mechanism::Own),
+                    ledger_written: None,
                 }),
                 Record::Done(Done { target: portable }),
                 Record::End(End { written: 1 }),
@@ -1731,6 +1778,7 @@ mod tests {
                     },
                     created_dirs: Vec::new(),
                     mechanism: Some(Mechanism::Own),
+                    ledger_written: None,
                 }),
                 Record::End(End { written: 0 }),
             ],
@@ -1993,6 +2041,89 @@ mod tests {
         }
         assert_eq!(SessionKind::Apply.to_string(), "apply");
         assert_eq!(SessionKind::Restore.to_string(), "restore");
+    }
+
+    #[test]
+    fn a_crash_inside_finish_is_recorded_and_rm_still_restores_the_originals() {
+        // Review round 3, item 1. Every write has landed when `finish` runs, so
+        // a crash there is bookkeeping, never a rollback. With an earlier apply
+        // behind it, a crash after the ledger save and before the unlink is the
+        // one that used to hand `rm` bx's first output instead of the user's
+        // file.
+        let guard = guarded_home();
+        for phase in finish_crash_phases() {
+            for earlier_apply in [false, true] {
+                let case = format!("{phase}, earlier apply: {earlier_apply}");
+                let home = guard.child(format!("finish-{phase}-{earlier_apply}"));
+                plant_crash_fixture(&home);
+                let before = crash_snapshot(&home);
+                let state = StateDir::resolve(&home);
+                let owned: Vec<Portable> = crash_requests(&home)
+                    .into_iter()
+                    .filter(|request| matches!(request.ownership, Ownership::Owned(_)))
+                    .map(|request| request.target)
+                    .collect();
+
+                if earlier_apply {
+                    let mut session =
+                        Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+                    for request in crash_requests(&home) {
+                        if matches!(request.ownership, Ownership::Owned(_)) {
+                            session
+                                .apply(Request {
+                                    content: Content::Bytes(b"bx one\n".to_vec()),
+                                    ..request
+                                })
+                                .expect("the earlier apply");
+                        }
+                    }
+                    session.finish().expect("finish the earlier apply");
+                }
+
+                let out = spawn_crash_child(&home, crash_requests(&home).len(), phase);
+                assert!(
+                    !out.status.success(),
+                    "{case}: the child was supposed to die; it said {}",
+                    String::from_utf8_lossy(&out.stdout),
+                );
+
+                // Every write landed.
+                for request in crash_requests(&home) {
+                    let found = peek(&request.dest);
+                    match &request.content {
+                        Content::Bytes(wanted) => {
+                            assert_eq!(found, Some((wanted.clone(), request.mode)), "{case}");
+                        }
+                        Content::Absent { .. } => assert_eq!(found, None, "{case}"),
+                    }
+                }
+
+                let interrupted = pending(&state).expect("pending").expect("a journal stands");
+                assert!(interrupted.complete, "{case}");
+                assert!(interrupted.blocked().next().is_none(), "{case}");
+                let outcome = recover(&state).expect("recover");
+                assert!(
+                    matches!(outcome, Outcome::Recorded { .. }),
+                    "{case}: {outcome:?}"
+                );
+                assert!(!state.journal().exists(), "{case}");
+                assert_eq!(recover(&state).expect("again"), Outcome::Nothing, "{case}");
+
+                let restored = crate::restore::restore(&state, &home, &owned).expect("rm");
+                assert!(
+                    restored.iter().all(|done| !done.is_conflict()),
+                    "{case}: {restored:?}"
+                );
+                for ((dest, was), (_, is)) in before.iter().zip(crash_snapshot(&home)) {
+                    if dest.ends_with(".gone.conf") {
+                        assert_eq!(is, None, "{case}: the session released and removed it");
+                    } else {
+                        assert_eq!(&is, was, "{case}: rm did not restore {}", dest.display());
+                    }
+                }
+                assert!(!home.join(".config").exists(), "{case}");
+            }
+        }
     }
 
     #[test]

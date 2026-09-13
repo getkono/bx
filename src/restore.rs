@@ -489,6 +489,82 @@ mod tests {
         rm_restores_a_file_the_user_put_over_bxs(true);
     }
 
+    /// The on-disk state of a session that died inside `finish` after the ledger
+    /// was saved and before the journal was unlinked: the saved ledger already
+    /// holds the session's writes, and a terminated journal still stands.
+    fn finished_but_left_its_journal(state: &StateDir, home: &Path, rel: &str, bytes: &str) {
+        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
+        session
+            .apply(write_to(home, rel, bytes, Mode::DEFAULT_FILE))
+            .expect("apply");
+        let journal = std::fs::read(state.journal()).expect("the journal in flight");
+        session.finish().expect("finish");
+        std::fs::write(state.journal(), journal).expect("put the journal back");
+        crate::journal::tests::seal(&state.journal(), 1);
+    }
+
+    #[test]
+    fn rm_after_a_crash_between_the_save_and_the_unlink_restores_the_users_original() {
+        // Review round 3, item 1. Rebuilding the ledger from this journal
+        // re-recorded the second write with bx's first output as its prior; the
+        // ledger took that for a third party's edit, adopted it, and `rm` then
+        // handed back "bx one" instead of the user's file.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "the user's original\n", Mode::PRIVATE_FILE);
+        let portable = managed(&state, home.path(), ".conf", "bx one\n", Mode::DEFAULT_FILE);
+        finished_but_left_its_journal(&state, home.path(), ".conf", "bx two\n");
+        let saved = entry_for(&state, home.path(), &portable).expect("managed");
+
+        assert!(matches!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::Recorded { .. },
+        ));
+        assert_eq!(
+            entry_for(&state, home.path(), &portable).expect("still managed"),
+            saved,
+            "a ledger that already holds the write is left exactly as it was",
+        );
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(restored.as_slice(), [Restored::Reverted { .. }]),
+            "{restored:?}"
+        );
+        assert_eq!(
+            peek(&dest),
+            Some((b"the user's original\n".to_vec(), Mode::PRIVATE_FILE)),
+        );
+    }
+
+    #[test]
+    fn a_rewrite_over_a_user_edit_interrupted_before_the_save_still_adopts_the_edit() {
+        // The case a rebuild that skipped every intent whose `after` the saved
+        // ledger already holds would get wrong: bx writes the same bytes it wrote
+        // last time over a file the user edited in between, and dies before the
+        // save. The saved ledger holds those bytes already, but not the edit.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "the user's original\n", Mode::DEFAULT_FILE);
+        let portable = managed(&state, home.path(), ".conf", "bx\n", Mode::DEFAULT_FILE);
+        plant_file(&dest, "the user's edit\n", Mode::PRIVATE_FILE);
+        applied_through_recovery(&state, home.path(), ".conf", "bx\n");
+
+        let entry = entry_for(&state, home.path(), &portable).expect("managed");
+        let Prior::Existed(reference) = &entry.prior else {
+            panic!("the user's edit must be the prior, got {:?}", entry.prior);
+        };
+        assert_eq!(reference.digest, ContentHash::of(b"the user's edit\n"));
+
+        restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert_eq!(
+            peek(&dest),
+            Some((b"the user's edit\n".to_vec(), Mode::PRIVATE_FILE)),
+        );
+    }
+
     #[test]
     fn restore_puts_back_the_exact_bytes_and_the_exact_mode() {
         let home = guarded_home();

@@ -282,6 +282,16 @@ pub struct Intent {
     /// How bx attached to the target, or `None` when the session is *releasing*
     /// it: the restore half of `bx rm` leaves nothing for bx to own.
     pub mechanism: Option<Mechanism>,
+    /// What the saved ledger said bx last wrote to this target when the intent
+    /// was made, or `None` when bx did not own it.
+    ///
+    /// The one fact a terminated journal cannot otherwise tell recovery: whether
+    /// the ledger save in [`Session::finish`] happened before the process died.
+    /// A save that happened leaves the target recorded at [`Intent::after`]; one
+    /// that did not leaves it at this digest. Recovery rebuilds only the second,
+    /// because re-recording the first hands the ledger bx's own earlier output
+    /// as if a third party had written it. See [`crate::recover`].
+    pub ledger_written: Option<ContentHash>,
 }
 
 impl Intent {
@@ -960,6 +970,7 @@ impl Session {
             Ownership::Released => (None, None),
         };
 
+        let ledger_written = self.ledger.get(&target).map(|entry| entry.written);
         self.journal.append(&Record::Intent(Intent {
             target: target.clone(),
             dest,
@@ -971,6 +982,7 @@ impl Session {
             },
             created_dirs,
             mechanism,
+            ledger_written,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -1025,6 +1037,7 @@ impl Session {
             after: Written::Absent,
             created_dirs: created_dirs.clone(),
             mechanism: None,
+            ledger_written: self.ledger.get(&target).map(|entry| entry.written),
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -1044,8 +1057,10 @@ impl Session {
     /// The order is the ordering rule that makes recovery idempotent. The `End`
     /// frame goes down first, so a crash before the save is a *terminated*
     /// journal that recovery finishes as bookkeeping and no destination is
-    /// touched; the journal is unlinked last, so a crash before that simply
-    /// repeats a recovery that had nothing left to do.
+    /// touched. The journal is unlinked last, so a crash — or a failed unlink —
+    /// after the save leaves a terminated journal over a ledger that already
+    /// holds every write in it; recovery recognises those entries by
+    /// [`Intent::ledger_written`] and leaves them exactly as they are.
     ///
     /// # Errors
     ///
@@ -1059,20 +1074,25 @@ impl Session {
         }
         let written = self.written;
         self.journal.append(&Record::End(End { written }))?;
+        self.crash.reached(written, Phase::AfterEnd);
         self.ledger.save()?;
+        self.crash.reached(written, Phase::AfterSave);
         unlink(self.journal.path())?;
         tracing::debug!(written, "closed a journalled session");
         Ok(written)
     }
 }
 
-/// The boundaries [`Session::apply`] crosses, named so a test can stop at one.
+/// The boundaries [`Session::apply`] and [`Session::finish`] cross, named so a
+/// test can stop at one.
 ///
-/// Six, and each is a real durability boundary rather than a convenient line:
-/// before anything exists; after a temporary file exists at its final mode but
-/// holds nothing; after its content is `fsync`ed but the destination is
-/// untouched; after the intent is durable; after the destination is replaced;
-/// after the completion is durable.
+/// Six in `apply`, and each is a real durability boundary rather than a
+/// convenient line: before anything exists; after a temporary file exists at
+/// its final mode but holds nothing; after its content is `fsync`ed but the
+/// destination is untouched; after the intent is durable; after the destination
+/// is replaced; after the completion is durable. Two in `finish`, where every
+/// write has landed: after the `End` frame is durable, and after the ledger is
+/// saved. A `finish` boundary is reached with the number of writes as its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     BeforeStage,
@@ -1081,9 +1101,11 @@ enum Phase {
     AfterIntent,
     AfterPublish,
     AfterDone,
+    AfterEnd,
+    AfterSave,
 }
 
-/// Every phase, in the order [`Session::apply`] passes them.
+/// Every phase of a write, in the order [`Session::apply`] passes them.
 #[cfg(test)]
 const PHASES: [Phase; 6] = [
     Phase::BeforeStage,
@@ -1093,6 +1115,10 @@ const PHASES: [Phase; 6] = [
     Phase::AfterPublish,
     Phase::AfterDone,
 ];
+
+/// Every phase of [`Session::finish`], in the order it passes them.
+#[cfg(test)]
+const FINISH_PHASES: [Phase; 2] = [Phase::AfterEnd, Phase::AfterSave];
 
 /// The environment variable a test child reads to choose where to stop.
 #[cfg(test)]
@@ -1146,6 +1172,7 @@ impl Crash {
         let index = index.parse().ok()?;
         let phase = PHASES
             .iter()
+            .chain(&FINISH_PHASES)
             .copied()
             .find(|candidate| Self::name(*candidate) == phase)?;
         Some((index, phase))
@@ -1161,6 +1188,8 @@ impl Crash {
             Phase::AfterIntent => "after-intent",
             Phase::AfterPublish => "after-publish",
             Phase::AfterDone => "after-done",
+            Phase::AfterEnd => "after-end",
+            Phase::AfterSave => "after-save",
         }
     }
 }
@@ -2193,6 +2222,7 @@ pub(crate) mod tests {
                     },
                     created_dirs: Vec::new(),
                     mechanism: Some(Mechanism::Own),
+                    ledger_written: None,
                 }),
             ],
         );
@@ -2278,6 +2308,12 @@ pub(crate) mod tests {
             assert_eq!(
                 Crash::parse(&format!("{index}:{phase}")),
                 Some((index, PHASES[index])),
+            );
+        }
+        for (index, phase) in finish_crash_phases().iter().enumerate() {
+            assert_eq!(
+                Crash::parse(&format!("{index}:{phase}")),
+                Some((index, FINISH_PHASES[index])),
             );
         }
         assert_eq!(Crash::parse("not a crash point"), None);
@@ -2655,5 +2691,10 @@ pub(crate) mod tests {
     /// seam having to become part of this module's surface.
     pub(crate) fn crash_phases() -> [&'static str; PHASES.len()] {
         PHASES.map(Crash::name)
+    }
+
+    /// Every boundary inside [`Session::finish`], as `BX_CRASH_AT` spells it.
+    pub(crate) fn finish_crash_phases() -> [&'static str; FINISH_PHASES.len()] {
+        FINISH_PHASES.map(Crash::name)
     }
 }

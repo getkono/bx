@@ -449,6 +449,10 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     };
     let mut conflicts = Vec::new();
     let mut resolved = 0_usize;
+    // The directories the terminated session's removals claimed. The session
+    // pruned them before its `End` frame; handing on what still stands is
+    // bookkeeping its save may not have reached.
+    let mut released = Vec::new();
 
     let mut intents = loaded.landed();
     if !complete {
@@ -498,9 +502,17 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 if let Some(ledger) = ledger.as_mut() {
                     ledger.forget(&intent.target);
                 }
+                if intent.after == Written::Absent {
+                    released.extend(&intent.created_dirs);
+                }
             }
         }
         resolved += 1;
+    }
+    if conflicts.is_empty()
+        && let (Some(ledger), Some(home)) = (ledger.as_mut(), home)
+    {
+        journal::hand_off_claims(ledger, home, released)?;
     }
 
     if !conflicts.is_empty() {
@@ -907,11 +919,14 @@ mod tests {
             ),
             {
                 let (target, dest) = target(home, ".gone.conf");
+                // Observed when the request is built, as `write_to` observes.
+                let planned = fs::observe(&dest).expect("plan's observation");
                 Request {
                     target,
                     dest,
                     content: Content::Absent {
                         created_dirs: Vec::new(),
+                        planned,
                     },
                     mode: Mode::PRIVATE_FILE,
                     ownership: Ownership::Released,
@@ -1300,6 +1315,7 @@ mod tests {
                 dest: dest.clone(),
                 content: Content::Absent {
                     created_dirs: vec![home.child(".config/deep"), home.child(".config")],
+                    planned: fs::observe(&dest).expect("plan's observation"),
                 },
                 mode: Mode::PRIVATE_FILE,
                 ownership: Ownership::Released,
@@ -3325,5 +3341,54 @@ mod tests {
         );
         assert!(!StateDir::quarantine(&state.journal()).exists());
         assert_eq!(peek(&a).expect("not rolled back").0, b"A1\n");
+    }
+
+    #[test]
+    fn a_rollback_removes_nested_created_directories_last_write_first() {
+        // Coverage review round 5, item 1. Deleting the `!` before `complete`
+        // survived: no rollback had two writes whose created directories nest.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        interrupted(
+            &state,
+            home.path(),
+            vec![
+                write_to(
+                    home.path(),
+                    ".config/deep/a.conf",
+                    "a\n",
+                    Mode::DEFAULT_FILE,
+                ),
+                write_to(
+                    home.path(),
+                    ".config/deep/nested/b.conf",
+                    "b\n",
+                    Mode::DEFAULT_FILE,
+                ),
+            ],
+        );
+        assert!(home.child(".config/deep/nested/b.conf").is_file());
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { undone: 2 }
+        );
+        assert!(
+            !home.child(".config").exists(),
+            "every directory bx created is gone"
+        );
+    }
+
+    #[test]
+    fn only_a_destination_in_a_recorded_state_is_resolvable() {
+        for (standing, resolvable) in [
+            (Standing::Prior, true),
+            (Standing::Written, true),
+            (Standing::Vanished, false),
+            (Standing::Diverged, false),
+            (Standing::Foreign, false),
+        ] {
+            assert_eq!(standing.is_resolvable(), resolvable, "{standing:?}");
+        }
     }
 }

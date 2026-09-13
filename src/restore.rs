@@ -16,7 +16,9 @@
 //! * **Absence, not emptiness.** A file bx created is unlinked, never truncated:
 //!   "there is no file" and "there is an empty file" are different states, and
 //!   only one of them is what the user had. Directories bx created are then
-//!   removed deepest-first while they are empty.
+//!   removed deepest-first while they are empty; one another managed file
+//!   still holds is handed to that file's entry, so its own `rm` removes it.
+//!   The file is unlinked only while it is still the one the plan observed.
 //! * **Never overwrite a later edit.** The destination's current digest is
 //!   compared with the digest bx recorded when it last wrote the file. If they
 //!   differ, the user has edited it since, and restoring the whole prior body
@@ -69,6 +71,10 @@ pub enum Restoration {
         dest: PathBuf,
         /// Directories bx created on the way to it, deepest first.
         created_dirs: Vec<PathBuf>,
+        /// What this plan observed at `dest`. The removal is checked against
+        /// it, so a file that changed since is refused, not unlinked. Boxed,
+        /// as in [`Restoration::Revert`].
+        planned: Box<fs::Observed>,
     },
     /// bx displaced a file; its exact bytes and mode go back.
     Revert {
@@ -188,6 +194,7 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
                     .map(|dir| dir.render(home))
                     .collect(),
                 dest,
+                planned: Box::new(observed.clone()),
             },
             Prior::Existed(reference) => Restoration::Revert {
                 dest,
@@ -264,11 +271,18 @@ fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Err
             dest,
             note,
         }),
-        Restoration::Remove { dest, created_dirs } => {
+        Restoration::Remove {
+            dest,
+            created_dirs,
+            planned,
+        } => {
             session.apply(Request {
                 target: target.clone(),
                 dest: dest.clone(),
-                content: Content::Absent { created_dirs },
+                content: Content::Absent {
+                    created_dirs,
+                    planned: *planned,
+                },
                 mode: entry.mode,
                 ownership: Ownership::Released,
             })?;
@@ -1006,7 +1020,12 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match plan_for(&created) {
-            Restoration::Remove { dest, created_dirs } => {
+            Restoration::Remove {
+                dest,
+                created_dirs,
+                planned,
+            } => {
+                assert_eq!(planned.path, home.child(".config/made.conf"));
                 assert_eq!(dest, home.child(".config/made.conf"));
                 assert_eq!(created_dirs, vec![home.child(".config")]);
             }
@@ -1035,5 +1054,273 @@ mod tests {
         );
         assert!(!home.child(".config/made.conf").exists());
         assert!(!home.child(".config").exists());
+    }
+
+    #[test]
+    fn an_edit_between_plan_restore_and_the_removal_is_kept_and_nothing_is_unlinked() {
+        // Review round 5, item 1. A removal carried no plan observation, so an
+        // edit landing after `plan_restore` was unlinked, surviving only as a
+        // blob nothing named.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let rel = ".config/app/created.conf";
+        let portable = managed(&state, home.path(), rel, "bx created\n", Mode::DEFAULT_FILE);
+        let dest = home.child(rel);
+
+        let mut session = Session::open(
+            &state,
+            SessionKind::Restore,
+            home.path(),
+            vec![portable.clone()],
+        )
+        .expect("open");
+        let entry = session.ledger().get(&portable).cloned().expect("managed");
+        let plan = plan_restore(&entry, home.path()).expect("plan");
+        plant_file(
+            &dest,
+            "the user's edit after rm's plan\n",
+            Mode::DEFAULT_FILE,
+        );
+        let Restoration::Remove {
+            dest: to,
+            created_dirs,
+            planned,
+        } = plan
+        else {
+            panic!("{plan:?}")
+        };
+        let err = session
+            .apply(Request {
+                target: portable.clone(),
+                dest: to,
+                content: Content::Absent {
+                    created_dirs,
+                    planned: *planned,
+                },
+                mode: entry.mode,
+                ownership: Ownership::Released,
+            })
+            .expect_err("the destination changed since rm's plan");
+        assert!(
+            matches!(err, journal::Error::Write(fs::Error::Changed { .. })),
+            "got {err}"
+        );
+        let finished = session.finish().expect_err("the session is poisoned");
+        assert!(
+            matches!(finished, journal::Error::Poisoned { .. }),
+            "got {finished}"
+        );
+
+        assert_eq!(
+            peek(&dest).expect("kept").0,
+            b"the user's edit after rm's plan\n"
+        );
+        assert!(home.child(".config/app").is_dir());
+        assert!(
+            crate::journal::load(&state.journal())
+                .expect("load")
+                .intents()
+                .next()
+                .is_none(),
+            "refused before its Intent: nothing was stored or announced",
+        );
+        assert_eq!(
+            recover::recover(&state).expect("recover"),
+            recover::Outcome::RolledBack { undone: 0 },
+        );
+        assert_eq!(
+            peek(&dest).expect("recovery touched nothing").0,
+            b"the user's edit after rm's plan\n"
+        );
+        assert!(entry_for(&state, home.path(), &portable).is_some());
+    }
+
+    /// How two targets sharing a directory bx created are applied and removed.
+    #[derive(Debug, Clone, Copy)]
+    enum Sharing {
+        /// One apply session, one `rm` naming both, in declared order.
+        OneRm,
+        /// One apply session, one `rm` naming both, in reverse order.
+        OneRmReversed,
+        /// Two apply sessions, then two separate `rm` calls.
+        SeparateRms,
+    }
+
+    /// Apply `~/.config/app/a.toml` and `b.toml`, remove both as `sharing` says,
+    /// and return whether `~/.config/app` and `~/.config` are still there.
+    fn remove_two_sharing_a_created_dir(sharing: Sharing, user_file: bool) -> (bool, bool) {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (a, b) = (".config/app/a.toml", ".config/app/b.toml");
+        let (ta, tb) = (target(home.path(), a).0, target(home.path(), b).0);
+        match sharing {
+            Sharing::OneRm | Sharing::OneRmReversed => {
+                let mut session =
+                    Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
+                        .expect("open");
+                session
+                    .apply(write_to(home.path(), a, "a\n", Mode::DEFAULT_FILE))
+                    .expect("apply a");
+                session
+                    .apply(write_to(home.path(), b, "b\n", Mode::DEFAULT_FILE))
+                    .expect("apply b");
+                session.finish().expect("finish");
+            }
+            Sharing::SeparateRms => {
+                managed(&state, home.path(), a, "a\n", Mode::DEFAULT_FILE);
+                managed(&state, home.path(), b, "b\n", Mode::DEFAULT_FILE);
+            }
+        }
+        if user_file {
+            std::fs::write(home.child(".config/app/theirs"), "mine\n").expect("the user's file");
+        }
+        match sharing {
+            Sharing::OneRm => {
+                restore(&state, home.path(), &[ta.clone(), tb.clone()]).expect("rm");
+            }
+            Sharing::OneRmReversed => {
+                restore(&state, home.path(), &[tb.clone(), ta.clone()]).expect("rm");
+            }
+            Sharing::SeparateRms => {
+                restore(&state, home.path(), std::slice::from_ref(&ta)).expect("rm a");
+                restore(&state, home.path(), std::slice::from_ref(&tb)).expect("rm b");
+            }
+        }
+        assert!(!home.child(a).exists() && !home.child(b).exists());
+        assert!(entry_for(&state, home.path(), &ta).is_none());
+        assert!(entry_for(&state, home.path(), &tb).is_none());
+        if user_file {
+            assert_eq!(
+                std::fs::read(home.child(".config/app/theirs")).expect("kept"),
+                b"mine\n"
+            );
+        }
+        (
+            home.child(".config/app").exists(),
+            home.child(".config").exists(),
+        )
+    }
+
+    #[test]
+    fn rm_of_two_targets_sharing_a_created_directory_leaves_nothing_bx_created() {
+        // Review round 5, item 4. Only the first write under a new directory
+        // claims it, and pruning stopped at the first non-empty directory, so
+        // removing the claiming target first left `~/.config/app` and `~/.config`.
+        for sharing in [Sharing::OneRm, Sharing::OneRmReversed, Sharing::SeparateRms] {
+            assert_eq!(
+                remove_two_sharing_a_created_dir(sharing, false),
+                (false, false),
+                "{sharing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_is_handed_on_when_the_rm_session_dies_between_its_end_and_its_save() {
+        // Review round 5, item 4. The hand-off is bookkeeping, so recovery's
+        // rebuild of a terminated journal makes it too.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (a, b) = (".config/app/a.toml", ".config/app/b.toml");
+        let ta = managed(&state, home.path(), a, "a\n", Mode::DEFAULT_FILE);
+        let tb = managed(&state, home.path(), b, "b\n", Mode::DEFAULT_FILE);
+
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), vec![ta.clone()])
+                .expect("open");
+        let entry = session.ledger().get(&ta).cloned().expect("managed");
+        let Restoration::Remove {
+            dest,
+            created_dirs,
+            planned,
+        } = plan_restore(&entry, home.path()).expect("plan")
+        else {
+            panic!("a file bx created is removed")
+        };
+        session
+            .apply(Request {
+                target: ta.clone(),
+                dest,
+                content: Content::Absent {
+                    created_dirs,
+                    planned: *planned,
+                },
+                mode: entry.mode,
+                ownership: Ownership::Released,
+            })
+            .expect("remove a");
+        drop(session);
+        crate::journal::tests::seal(&state.journal(), 1);
+
+        assert_eq!(
+            recover::recover(&state).expect("recover"),
+            recover::Outcome::Recorded { entries: 1 },
+        );
+        assert!(entry_for(&state, home.path(), &ta).is_none());
+        assert_eq!(
+            entry_for(&state, home.path(), &tb)
+                .expect("b is still managed")
+                .created_dirs
+                .iter()
+                .map(Portable::as_str)
+                .collect::<Vec<_>>(),
+            ["~/.config/app", "~/.config"],
+        );
+        restore(&state, home.path(), std::slice::from_ref(&tb)).expect("rm b");
+        assert!(!home.child(".config").exists());
+    }
+
+    #[test]
+    fn a_claimed_directory_a_live_entry_names_is_never_pruned() {
+        // Review round 5, item 4, and #8's open question: whichever entry
+        // claims a directory, one the ledger still holds as a target stays.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let rel = ".config/app/a.toml";
+        let ta = managed(&state, home.path(), rel, "a\n", Mode::DEFAULT_FILE);
+        let (app, app_dir) = target(home.path(), ".config/app");
+        {
+            let lock = crate::state::ExclusiveLock::acquire(&state).expect("lock");
+            let mut ledger = crate::state::Ledger::open(&state, &lock, home.path())
+                .expect("open the ledger")
+                .value;
+            ledger
+                .record(crate::state::NewEntry::new(
+                    app.clone(),
+                    ContentHash::of(b""),
+                    Mode::DEFAULT_DIR,
+                    crate::state::Mechanism::Own,
+                ))
+                .expect("a directory target");
+            ledger.save().expect("save");
+        }
+
+        restore(&state, home.path(), std::slice::from_ref(&ta)).expect("rm");
+        assert!(!home.child(rel).exists());
+        assert!(
+            app_dir.is_dir(),
+            "empty, claimed, and still a target the ledger holds"
+        );
+        assert_eq!(
+            entry_for(&state, home.path(), &app)
+                .expect("still managed")
+                .created_dirs
+                .iter()
+                .map(Portable::as_str)
+                .collect::<Vec<_>>(),
+            ["~/.config"],
+            "the claim on its parent is handed to it",
+        );
+    }
+
+    #[test]
+    fn a_user_file_inside_a_shared_created_directory_keeps_it() {
+        for sharing in [Sharing::OneRm, Sharing::OneRmReversed, Sharing::SeparateRms] {
+            assert_eq!(
+                remove_two_sharing_a_created_dir(sharing, true),
+                (true, true),
+                "{sharing:?}"
+            );
+        }
     }
 }

@@ -2589,7 +2589,12 @@ pub(crate) mod tests {
             Loaded::Unreadable { moved_to: None }
         );
         assert_eq!(std::fs::read(&path).expect("still there"), bytes);
-        assert!(crate::recover::pending(&state).expect("pending").is_none());
+        assert!(
+            crate::recover::pending(&state)
+                .expect("pending")
+                .expect("reported")
+                .unreadable
+        );
 
         // Under the lock: set aside with its bytes kept, and nothing rolled back.
         assert_eq!(

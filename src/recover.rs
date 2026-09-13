@@ -192,6 +192,18 @@ pub struct Interrupted {
     /// bx manages, which `plan` reports like any other — so such a session is
     /// blocked only by a prior snapshot recovery cannot read.
     pub complete: bool,
+    /// Whether the journal is one no bx session could have written — see
+    /// [`Loaded::Unreadable`] — so nothing in it is believed.
+    ///
+    /// Such a journal names no write, so `unfinished` is empty, `complete` is
+    /// `false`, `kind` is [`SessionKind::Apply`] because no header was
+    /// believed, and [`Interrupted::exit`] is
+    /// [`Exit::Pending`](crate::report::Exit::Pending). The next writing command
+    /// sets the file aside and rolls nothing back, and `plan` then reports what
+    /// the session may have written as conflicts. It is reported rather than
+    /// hidden because a read-only command is otherwise the one place a user
+    /// would never learn of it.
+    pub unreadable: bool,
     /// Every write the session announced, `Done` or not.
     pub unfinished: Vec<Unfinished>,
 }
@@ -257,10 +269,11 @@ impl Outcome {
 
 /// Whether an interrupted session stands, and what it names.
 ///
-/// Read-only, destinations and state directory alike. A journal it cannot read
-/// is reported as no session and left exactly where it is: moving it aside is
-/// the degradation `CLAUDE.md` requires of a machine-owned file, and the next
-/// writing command does it, under the lock.
+/// Read-only, destinations and state directory alike. A journal it cannot
+/// believe is reported, with [`Interrupted::unreadable`] set and no writes, and
+/// left exactly where it is: moving it aside is the degradation `CLAUDE.md`
+/// requires of a machine-owned file, and the next writing command does it,
+/// under the lock.
 ///
 /// What it reports for each write is decided by the same function [`recover`]
 /// acts on, over the same journal, so a report and a recovery that find the
@@ -290,7 +303,16 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
     let path = state.journal();
     let loaded = journal::load(&path)?;
     let complete = match loaded {
-        Loaded::Absent | Loaded::Unreadable { .. } => return Ok(None),
+        Loaded::Absent => return Ok(None),
+        Loaded::Unreadable { .. } => {
+            return Ok(Some(Interrupted {
+                kind: SessionKind::Apply,
+                journal: path,
+                complete: false,
+                unreadable: true,
+                unfinished: Vec::new(),
+            }));
+        }
         Loaded::Terminated(_) => true,
         Loaded::Unterminated(_) | Loaded::Torn { .. } => false,
     };
@@ -329,6 +351,7 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
         kind,
         journal: path,
         complete,
+        unreadable: false,
         unfinished,
     }))
 }
@@ -1746,7 +1769,12 @@ mod tests {
 
         // No header, so no home to check a single stored path against: bytes bx
         // never wrote, for a report and for recovery alike.
-        assert!(pending(&state).expect("pending").is_none());
+        assert!(
+            pending(&state)
+                .expect("pending")
+                .expect("reported")
+                .unreadable
+        );
         assert_eq!(recover(&state).expect("recover"), Outcome::Nothing);
         assert_eq!(
             std::fs::read(StateDir::quarantine(&state.journal())).expect("kept"),
@@ -1763,8 +1791,12 @@ mod tests {
         std::fs::write(state.journal(), b"not a journal").expect("write");
 
         // `pending` takes no lock, so what it is reading may be a journal a live
-        // session is in the middle of creating. It moves nothing.
-        assert!(pending(&state).expect("pending").is_none());
+        // session is in the middle of creating. It moves nothing, and it says
+        // the journal is there.
+        let report = pending(&state).expect("pending").expect("reported");
+        assert!(report.unreadable);
+        assert!(report.unfinished.is_empty());
+        assert_eq!(report.exit(), Exit::Pending);
         assert_eq!(
             std::fs::read(state.journal()).expect("still in place"),
             b"not a journal",
@@ -2191,7 +2223,13 @@ mod tests {
                 Loaded::Unreadable { moved_to: None },
                 "{case}",
             );
-            assert!(pending(&state).expect("pending").is_none(), "{case}");
+            assert!(
+                pending(&state)
+                    .expect("pending")
+                    .expect("reported")
+                    .unreadable,
+                "{case}"
+            );
             assert_eq!(
                 recover(&state).expect("recover"),
                 Outcome::Nothing,
@@ -2620,11 +2658,13 @@ mod tests {
 
             let report = pending(&state).expect("pending");
             let outcome = recover(&state).expect("recover");
+            let report = report.expect("reported");
+            assert!(report.unfinished.is_empty(), "{case}");
             if frame == 0 {
-                assert!(report.is_none(), "{case}");
+                assert!(report.unreadable, "{case}");
                 assert_eq!(outcome, Outcome::Nothing, "{case}: not believed");
             } else {
-                assert_eq!(report.expect("interrupted").unfinished.len(), 0, "{case}");
+                assert!(!report.unreadable, "{case}: a torn tail");
                 assert_eq!(outcome, Outcome::RolledBack { undone: 0 }, "{case}");
             }
             assert!(!state.journal().exists(), "{case}");
@@ -2656,7 +2696,12 @@ mod tests {
             crate::journal::load(&state.journal()).expect("load"),
             Loaded::Unreadable { moved_to: None },
         );
-        assert!(pending(&state).expect("pending").is_none());
+        assert!(
+            pending(&state)
+                .expect("pending")
+                .expect("reported")
+                .unreadable
+        );
         assert_eq!(recover(&state).expect("recover"), Outcome::Nothing);
         assert_eq!(
             std::fs::read(StateDir::quarantine(&state.journal())).expect("kept"),
@@ -2666,6 +2711,45 @@ mod tests {
             peek(&dest),
             Some((b"bx new\n".to_vec(), Mode::DEFAULT_FILE)),
         );
+    }
+
+    #[test]
+    fn an_unreadable_journal_is_reported_by_plan_and_set_aside_by_the_next_session() {
+        // Review round 4, item 2. `pending` said there was no session, and the
+        // only word of the journal was a warning below the default log level,
+        // so `plan` exited clean over a journal the next `apply` then set aside.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        std::fs::write(state.journal(), b"GARBAGE!").expect("an unreadable journal");
+
+        let report = pending(&state)
+            .expect("pending")
+            .expect("an unreadable journal is reported");
+        assert_eq!(
+            report,
+            Interrupted {
+                kind: SessionKind::Apply,
+                journal: state.journal(),
+                complete: false,
+                unreadable: true,
+                unfinished: Vec::new(),
+            },
+        );
+        assert_eq!(report.exit(), Exit::Pending);
+        assert_eq!(
+            std::fs::read(state.journal()).expect("left in place"),
+            b"GARBAGE!"
+        );
+
+        let session = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
+            .expect("a session opens over it");
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&state.journal())).expect("set aside"),
+            b"GARBAGE!",
+        );
+        assert_eq!(session.finish().expect("finish"), 0);
+        assert_eq!(pending(&state).expect("pending"), None, "and it is gone");
     }
 
     #[test]

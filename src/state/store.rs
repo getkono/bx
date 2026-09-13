@@ -104,11 +104,11 @@ pub(crate) enum Loss {
     Permanent,
 }
 
-/// What was wrong with the *contents* of a state file that had to be discarded.
+/// What was wrong with a state file that had to be discarded.
 ///
-/// Every variant is a decode failure: the bytes were read, and they are not a
-/// usable envelope. A file that could not be read is not represented here —
-/// see [`Error::Read`] and the module documentation.
+/// Every variant but [`Damage::DanglingLink`] is a decode failure: the bytes
+/// were read, and they are not a usable envelope. A file that could not be read
+/// is not represented here — see [`Error::Read`] and the module documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Damage {
     /// The bytes are not a well-formed envelope.
@@ -129,6 +129,13 @@ pub enum Damage {
         /// The newest version this build understands.
         supported: u16,
     },
+    /// The file's path is a symbolic link to something that does not exist.
+    ///
+    /// Only ever the health of a [`Loss::Recomputable`] file, where losing
+    /// what the link named costs a recomputation; for the ledger this is
+    /// [`Error::DanglingLink`]. Nothing is read through the link, and the
+    /// quarantine moves the link itself, never what it names.
+    DanglingLink,
     /// The envelope decoded, and a ledger entry names a different path from
     /// the key it is stored under.
     ///
@@ -168,6 +175,9 @@ impl std::fmt::Display for Damage {
                 f,
                 "it is version {found}, and this bx understands up to {supported}",
             ),
+            Self::DanglingLink => {
+                f.write_str("it is a symbolic link to something that does not exist")
+            }
             Self::KeyMismatch { key, path } => {
                 write!(f, "its entry for {key} names a different path, {path}")
             }
@@ -286,11 +296,17 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // `read` follows a symlink, so a link to nothing reads as no file.
             // That is not "no state" — it is usually state on storage that is
-            // not there right now — so it is refused, and nothing is renamed.
+            // not there right now. For the ledger it is refused, and nothing is
+            // renamed. A cache degrades like any other damage: under the lock
+            // the link itself is moved aside, so the next save can write a
+            // clean file where it was.
             if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-                return Err(Error::DanglingLink {
-                    path: path.to_path_buf(),
-                });
+                return match loss {
+                    Loss::Permanent => Err(Error::DanglingLink {
+                        path: path.to_path_buf(),
+                    }),
+                    Loss::Recomputable => Ok(degrade(path, Damage::DanglingLink, lock)),
+                };
             }
             return Ok(Loaded {
                 value: T::default(),

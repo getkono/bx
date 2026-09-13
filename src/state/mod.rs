@@ -212,11 +212,15 @@ pub enum Error {
         /// The newest format version this build understands.
         supported: u16,
     },
-    /// A state file's path is a symbolic link to something that does not exist.
+    /// The ledger's path is a symbolic link to something that does not exist.
     ///
     /// Not "no state": the likeliest cause is state kept on storage that is not
     /// there right now, and reading it as fresh would let the next save replace
     /// the link — and the priors behind it — with an empty ledger.
+    ///
+    /// Only the ledger is refused. A dangling link at the fingerprint cache is
+    /// [`Damage::DanglingLink`], and degrades to recomputation like any other
+    /// damage to a cache.
     #[error(
         "{} is a symbolic link to something that does not exist; bx will not read that as \
          having no state. Restore what it points at, or remove the link",

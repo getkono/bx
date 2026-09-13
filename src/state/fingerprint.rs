@@ -350,6 +350,41 @@ mod tests {
     }
 
     #[test]
+    fn a_dangling_cache_link_degrades_to_recomputation_instead_of_stopping_bx() {
+        // Review round 4: a dangling `fingerprints.mpk` link was the fatal
+        // `Error::DanglingLink`, which is right for the ledger and wrong for a
+        // file whose loss costs a recomputation.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        let far = home.child("unmounted/fingerprints.mpk");
+        std::os::unix::fs::symlink(&far, dir.fingerprints()).expect("symlink");
+
+        // A lockless reader degrades and leaves the link where it is.
+        let read = Fingerprints::read(&dir).expect("a cache link is not fatal");
+        assert_eq!(read.health, Health::Damaged(Damage::DanglingLink));
+        assert!(read.value.is_empty());
+        assert_eq!(std::fs::read_link(dir.fingerprints()).expect("link"), far);
+
+        // The lock holder moves the link itself aside, never creating its far end.
+        let opened = Fingerprints::open(&dir, &lock).expect("a cache link is not fatal");
+        assert_eq!(opened.health, Health::Reset(Damage::DanglingLink));
+        let aside = StateDir::quarantine(&dir.fingerprints());
+        assert_eq!(std::fs::read_link(&aside).expect("the link, moved"), far);
+        assert!(std::fs::symlink_metadata(dir.fingerprints()).is_err());
+        assert!(!far.exists() && !home.child("unmounted").exists());
+
+        // And the next save writes a clean cache where the link was.
+        opened.value.save(&dir, &lock).expect("save");
+        assert_eq!(
+            Fingerprints::read(&dir).expect("read").health,
+            Health::Loaded
+        );
+        assert!(Damage::DanglingLink.to_string().contains("does not exist"));
+    }
+
+    #[test]
     fn a_cache_from_a_newer_bx_degrades_to_recomputation() {
         // Review round 4 made a newer ledger a refusal. The cache is the file
         // recomputation rebuilds, so it keeps degrading.

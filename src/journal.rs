@@ -1144,7 +1144,9 @@ impl Session {
     /// # Errors
     ///
     /// [`Error::Misplaced`] when the request's destination is not where its
-    /// target renders, [`Error::Repeated`] when this session already wrote the
+    /// target renders, [`Error::State`] with
+    /// [`crate::state::Error::ForeignRecord`] when the target is spelled
+    /// absolutely under the home, [`Error::Repeated`] when this session already wrote the
     /// target, [`Error::Write`] when the destination cannot be written, is not
     /// a file bx may replace, or is no longer what the request's plan observed
     /// ([`crate::fs::Error::Changed`]), [`Error::State`] when the prior bytes
@@ -1190,6 +1192,13 @@ impl Session {
     /// write — decision 7 of the pull request that introduced the rule — though
     /// nothing has been touched: the rule does not depend on where in the
     /// sequence an error came from.
+    ///
+    /// A target spelled absolutely under the home renders to itself, so it
+    /// passes the destination check, but it is the path the ledger's home check
+    /// refuses: [`load`] would refuse the Intent naming it, the ledger would key
+    /// it under its `~` spelling, and the same file under that spelling would
+    /// pass [`Error::Repeated`]. It is refused as
+    /// [`crate::state::Error::ForeignRecord`] before anything is touched.
     fn admit(&mut self, target: &Portable, dest: &Path) -> Result<(), Error> {
         let rendered = target.render(&self.home);
         if dest != rendered {
@@ -1199,6 +1208,13 @@ impl Session {
                 rendered,
             });
         }
+        target
+            .check_against(&self.home)
+            .map_err(|source| crate::state::Error::ForeignRecord {
+                home: self.home.clone(),
+                stored: target.as_str().to_string(),
+                source: Box::new(source),
+            })?;
         if !self.touched.insert(target.clone()) {
             return Err(Error::Repeated {
                 target: target.clone(),
@@ -3289,6 +3305,61 @@ pub(crate) mod tests {
             );
         }
         session.finish().expect("finish");
+    }
+
+    #[test]
+    fn a_target_spelled_absolutely_under_the_home_is_refused_before_anything_is_touched() {
+        // Stack integration of #7's round 4: a caller holding a `Ledger` gets
+        // its home check. `new_entry` folds the destination into `~/…`, so the
+        // check inside `Ledger::check_record` cannot see a target spelled
+        // `/<home>/…`. That target renders to itself and used to be admitted:
+        // the ledger keyed it `~/.conf`, the same file under that spelling got
+        // past `Repeated`, and a crash left a journal the loader refuses.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+        let absolute = Portable::try_from(dest.to_str().expect("utf-8").to_string())
+            .expect("a well-formed absolute path");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let err = session
+            .apply(Request {
+                target: absolute,
+                content: Content::Bytes {
+                    bytes: b"new\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                dest: dest.clone(),
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect_err("the ledger's home check refuses the target");
+        assert!(
+            matches!(err, Error::State(crate::state::Error::ForeignRecord { .. })),
+            "got {err}"
+        );
+        let again = session
+            .apply(write_to(
+                home.path(),
+                ".conf",
+                "again\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect_err("the session is poisoned");
+        assert!(matches!(again, Error::Poisoned { .. }), "got {again}");
+        let finished = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
+        assert_eq!(peek(&dest).expect("untouched").0, b"old\n");
+        assert!(!holds_a_temporary_file(home.path()));
+
+        // Nothing was announced, so what the session leaves is a journal bx believes.
+        let loaded = load(&state.journal()).expect("load");
+        assert!(!matches!(loaded, Loaded::Unreadable { .. }), "{loaded:?}");
+        assert_eq!(loaded.intents().count(), 0);
     }
 
     #[test]

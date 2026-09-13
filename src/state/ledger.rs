@@ -461,6 +461,17 @@ impl Ledger {
     ///   [`LedgerEntry::superseded`] rather than being dropped, and a stored
     ///   [`Prior::Absent`] they replace had no bytes to keep.
     ///
+    ///   **Only for a file bx owns whole.** When the stored or the incoming
+    ///   [`Mechanism`] is a `Region` or an `Include`, those bytes hold bx's own
+    ///   previous region or include line as well as the user's edit, and
+    ///   adopting them would make `bx rm` write bx's stale lines back into the
+    ///   user's file. Stripping them needs the grammar the writer uses — the
+    ///   region's delimiter lines, and where an include line is placed — and no
+    ///   such writer exists yet, so `record` refuses with
+    ///   [`Error::PriorConflict`], stores nothing, and leaves the entry exactly
+    ///   as it was. `plan` reports the same target as a conflict from `written`
+    ///   alone, so an apply that shares its function never reaches this call.
+    ///
     /// The comparison is on content only. A file whose bytes still match
     /// `written` but whose mode the user changed is treated as bx's own output,
     /// because snapshotting it would record bx's generated content as the
@@ -468,6 +479,19 @@ impl Ledger {
     ///
     /// [`Ledger::forget`] followed by `record` remains the way to discard a
     /// stored prior deliberately.
+    ///
+    /// # The inference needs every published write journalled
+    ///
+    /// *Bytes that do not hash to `written` were written by a third party* is
+    /// true only if `written` is recorded for every write bx publishes. This
+    /// type alone cannot promise that: a crash after a target is published and
+    /// before [`Ledger::save`] leaves the old `written` on disk, and a retry
+    /// would read bx's own new output as a third party's and adopt it as the
+    /// prior. The write-ahead journal (entry A6, `journal`/`recover`) closes the
+    /// window — it stores the prior and an intent before publishing, and
+    /// recovery rolls the ledger forward or the target back before another
+    /// apply can open the ledger — so this rule is sound only for writes that go
+    /// through it.
     ///
     /// # Created directories accumulate
     ///
@@ -490,7 +514,8 @@ impl Ledger {
     /// # Errors
     ///
     /// [`Error::CreateDir`] or [`Error::Write`] if the snapshot cannot be
-    /// stored. The ledger is left unchanged when that happens.
+    /// stored, and [`Error::PriorConflict`] for a changed file bx shares with
+    /// the user. The ledger is left unchanged when either happens.
     pub fn record(&mut self, entry: NewEntry) -> Result<&LedgerEntry, Error> {
         let key = entry.path.clone();
         let (prior, superseded, created_dirs) = match self.view.entries.get(&key) {
@@ -500,7 +525,8 @@ impl Ledger {
                 entry.created_dirs,
             ),
             Some(existing) => {
-                let (prior, superseded) = self.carry_prior(existing, entry.prior)?;
+                let (prior, superseded) =
+                    self.carry_prior(existing, &entry.mechanism, entry.prior)?;
                 (
                     prior,
                     superseded,
@@ -530,6 +556,7 @@ impl Ledger {
     fn carry_prior(
         &self,
         existing: &LedgerEntry,
+        mechanism: &Mechanism,
         incoming: PriorBytes,
     ) -> Result<(Prior, Vec<RestoreRef>), Error> {
         let kept = || (existing.prior.clone(), existing.superseded.clone());
@@ -539,6 +566,14 @@ impl Ledger {
         let digest = ContentHash::of(&bytes);
         if digest == existing.written {
             return Ok(kept());
+        }
+        // A shared file's changed bytes still hold bx's own region or include
+        // line. Refused before anything is stored: see `record`.
+        if existing.mechanism != Mechanism::Own || *mechanism != Mechanism::Own {
+            return Err(Error::PriorConflict {
+                target: existing.path.as_str().to_string(),
+                displaced: digest,
+            });
         }
 
         // A third party wrote these bytes and this apply displaces them: they
@@ -1595,6 +1630,125 @@ mod tests {
         assert_eq!(
             reloaded.get(&target("~/.zshrc")).expect("entry").written,
             ContentHash::of(whole_with_include.as_bytes()),
+        );
+    }
+
+    #[test]
+    fn a_changed_shared_file_is_a_conflict_not_a_prior_holding_bxs_own_lines() {
+        // Review round 3. Region BX1, the user adds a line outside it, and the
+        // next apply hands `record` the whole file. Adopting it stored BX1's
+        // region as the user's original, and `bx rm` then wrote bx's stale
+        // region back into the user's file.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let original = b"user line 1\n";
+        let bx1 = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let mut edited = bx1.to_vec();
+        edited.extend_from_slice(b"user line 2\n");
+        let region = Mechanism::Region { comment: '#' };
+        let include = Mechanism::Include {
+            line: "source ~/.local/state/bx/shell/init.sh".to_string(),
+        };
+        // Either side of the re-record being shared is enough: the bytes on disk
+        // hold what the stored mechanism wrote, and the prior is read back
+        // under the incoming one.
+        let cases = [
+            (region.clone(), region.clone()),
+            (include.clone(), include),
+            (Mechanism::Own, region.clone()),
+            (region, Mechanism::Own),
+        ];
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        for (index, (first, second)) in cases.into_iter().enumerate() {
+            let name = format!("~/.rc{index}");
+            ledger
+                .record(
+                    NewEntry::new(
+                        target(&name),
+                        ContentHash::of(bx1),
+                        Mode::DEFAULT_FILE,
+                        first,
+                    )
+                    .with_prior(prior(original, 0o644)),
+                )
+                .expect("first apply");
+            ledger.save().expect("save");
+            let saved = std::fs::read(dir.ledger()).expect("read");
+            let blobs = blob_names(&dir);
+
+            let err = ledger
+                .record(
+                    NewEntry::new(
+                        target(&name),
+                        ContentHash::of(b"BX2"),
+                        Mode::DEFAULT_FILE,
+                        second,
+                    )
+                    .with_prior(prior(&edited, 0o644)),
+                )
+                .expect_err("a changed shared file is a conflict");
+            assert!(
+                matches!(
+                    &err,
+                    Error::PriorConflict { target: at, displaced }
+                        if *at == name && *displaced == ContentHash::of(&edited)
+                ),
+                "case {index}: got {err}",
+            );
+            assert!(err.to_string().contains(&name), "{err}");
+
+            // Nothing was adopted or stored, and the prior holds no bx region.
+            let stored = ledger.get(&target(&name)).expect("entry");
+            assert_eq!(stored.written, ContentHash::of(bx1));
+            assert!(stored.superseded.is_empty());
+            let Prior::Existed(reference) = &stored.prior else {
+                panic!("case {index}: the original prior must stand");
+            };
+            assert_eq!(
+                ledger.restore_bytes(&dir, reference).expect("restore"),
+                original,
+            );
+            assert!(!has_blob(&dir, &edited), "case {index}");
+            assert_eq!(blob_names(&dir), blobs, "case {index}");
+            ledger.save().expect("save");
+            assert_eq!(std::fs::read(dir.ledger()).expect("read"), saved);
+        }
+    }
+
+    #[test]
+    fn an_untouched_shared_file_still_re_records_and_keeps_its_prior() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let bx1 = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        let region = Mechanism::Region { comment: '#' };
+        ledger
+            .record(
+                NewEntry::new(
+                    target("~/.bashrc"),
+                    ContentHash::of(bx1),
+                    Mode::DEFAULT_FILE,
+                    region.clone(),
+                )
+                .with_prior(prior(b"user line 1\n", 0o644)),
+            )
+            .expect("first");
+        let stored = ledger
+            .record(
+                NewEntry::new(
+                    target("~/.bashrc"),
+                    ContentHash::of(b"BX2"),
+                    Mode::DEFAULT_FILE,
+                    region,
+                )
+                .with_prior(prior(bx1, 0o644)),
+            )
+            .expect("bx's own output is not a conflict")
+            .clone();
+        assert_eq!(stored.written, ContentHash::of(b"BX2"));
+        assert_eq!(
+            stored.prior,
+            Prior::Existed(reference(b"user line 1\n", 0o644))
         );
     }
 

@@ -187,4 +187,20 @@ pub enum Error {
         /// The snapshot that failed to match it.
         path: PathBuf,
     },
+    /// Someone other than bx changed a file bx shares with the user — through
+    /// a managed region or an include line — and a record would have adopted
+    /// the changed file, bx's own lines included, as what the user last had.
+    ///
+    /// Nothing is recorded and nothing is stored. See [`Ledger::record`].
+    #[error(
+        "{target} changed since bx last wrote it, and bx shares that file through a managed \
+         region or an include line, so it still holds bx's own lines; bx will not record it \
+         as your original. Nothing was recorded"
+    )]
+    PriorConflict {
+        /// The target, as the ledger keys it.
+        target: String,
+        /// The digest of the changed bytes that were not adopted.
+        displaced: ContentHash,
+    },
 }

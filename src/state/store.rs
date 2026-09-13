@@ -29,6 +29,16 @@
 //! the error reaches the caller and nothing is renamed, exactly as for a file
 //! that could not be read.
 //!
+//! # A newer format is damage only for a file recomputation rebuilds
+//!
+//! An envelope whose version is newer than this build's was written by a newer
+//! bx, and is most likely intact. For a cache that is still [`Damage`]: losing
+//! it costs a recomputation. For the ledger it is not — see [`Loss::Permanent`]
+//! — so it is [`Error::FutureVersion`] and nothing is renamed. The kind and
+//! version are read **before** the payload is decoded, because a newer format
+//! may have changed the payload's shape, and a payload that fails to decode
+//! for that reason says nothing about damage.
+//!
 //! # Damage is a decode failure, never an access failure
 //!
 //! The degradation applies to a file whose **bytes were read and are bad**. A
@@ -72,6 +82,28 @@ struct Envelope<T> {
     payload: T,
 }
 
+/// An envelope's kind and version, read without decoding its payload.
+#[derive(Deserialize)]
+struct Header {
+    /// As [`Envelope::kind`].
+    kind: String,
+    /// As [`Envelope::version`].
+    version: u16,
+}
+
+/// What losing a state file costs, which decides how far a file that cannot
+/// be believed is allowed to degrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Loss {
+    /// A cache: recomputation rebuilds it, so anything wrong with it degrades
+    /// to the empty default.
+    Recomputable,
+    /// The ledger: nothing rebuilds the priors it indexes, so a condition that
+    /// says the file may be intact — a newer format — is refused rather than
+    /// degraded.
+    Permanent,
+}
+
 /// What was wrong with the *contents* of a state file that had to be discarded.
 ///
 /// Every variant is a decode failure: the bytes were read, and they are not a
@@ -88,7 +120,9 @@ pub enum Damage {
         /// The kind the file claims to be.
         found: String,
     },
-    /// The envelope was written by a newer bx than this one.
+    /// The envelope was written by a newer bx than this one. Only ever the
+    /// health of a [`Loss::Recomputable`] file; for the ledger this is
+    /// [`Error::FutureVersion`].
     FutureVersion {
         /// The version on disk.
         found: u16,
@@ -215,13 +249,17 @@ impl<T> Loaded<T> {
 /// failure, not damage: the bytes were never seen, so they are neither
 /// quarantined nor discarded, and the caller must treat it as fatal rather than
 /// carry on against an empty default.
+///
+/// [`Error::FutureVersion`] for a [`Loss::Permanent`] file written by a newer
+/// bx; nothing is renamed.
 pub(crate) fn load<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
     version: u16,
+    loss: Loss,
     lock: Option<&ExclusiveLock>,
 ) -> Result<Loaded<T>, Error> {
-    load_checked(path, kind, version, lock, |_| Ok(()))
+    load_checked(path, kind, version, loss, lock, |_| Ok(()))
 }
 
 /// [`load`], with a check on the decoded value that decoding alone cannot make.
@@ -239,6 +277,7 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
     version: u16,
+    loss: Loss,
     lock: Option<&ExclusiveLock>,
     check: impl FnOnce(&T) -> Result<(), Rejected>,
 ) -> Result<Loaded<T>, Error> {
@@ -274,6 +313,17 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
             value,
             health: Health::Loaded,
         }),
+        // A newer format of a file nothing can rebuild is not believed and not
+        // discarded: it is intact as far as anyone knows.
+        Err(Rejected::Damage(Damage::FutureVersion { found, supported }))
+            if loss == Loss::Permanent =>
+        {
+            Err(Error::FutureVersion {
+                path: path.to_path_buf(),
+                found,
+                supported,
+            })
+        }
         // Quarantine happens only here: after `read` succeeded and `decode` or
         // `check` found damage, so the bytes being moved aside are known to be
         // unusable — and only under the lock, so they are still the bytes read.
@@ -288,26 +338,27 @@ fn decode<T: DeserializeOwned>(
     kind: &'static str,
     version: u16,
 ) -> Result<T, Damage> {
+    // The header first, skipping the payload: a newer bx may have changed the
+    // payload's shape, so whether this build can read the version has to be
+    // known before a payload decode failure can be called damage.
     let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(bytes));
-    let envelope: Envelope<T> =
-        serde::Deserialize::deserialize(&mut de).map_err(|_| Damage::Malformed)?;
+    let header = Header::deserialize(&mut de).map_err(|_| Damage::Malformed)?;
     // `rmp_serde::from_slice` stops at the end of the first value and ignores
     // whatever follows. A file that grew garbage at the end is damaged, not
     // half-readable, so the position is checked rather than trusted.
     if usize::try_from(de.position()).unwrap_or(usize::MAX) != bytes.len() {
         return Err(Damage::TrailingBytes);
     }
-    if envelope.kind != kind {
-        return Err(Damage::WrongKind {
-            found: envelope.kind,
-        });
+    if header.kind != kind {
+        return Err(Damage::WrongKind { found: header.kind });
     }
-    if envelope.version > version {
+    if header.version > version {
         return Err(Damage::FutureVersion {
-            found: envelope.version,
+            found: header.version,
             supported: version,
         });
     }
+    let envelope: Envelope<T> = rmp_serde::from_slice(bytes).map_err(|_| Damage::Malformed)?;
     Ok(envelope.payload)
 }
 
@@ -398,7 +449,7 @@ mod tests {
     fn locked_load<T: DeserializeOwned + Default>(path: &Path) -> Result<Loaded<T>, Error> {
         let dir = StateDir::new(path.parent().expect("a parent").to_path_buf());
         let lock = ExclusiveLock::acquire(&dir).expect("lock");
-        load(path, KIND, VERSION, Some(&lock))
+        load(path, KIND, VERSION, Loss::Recomputable, Some(&lock))
     }
 
     /// Every name in `dir` but the lock file, sorted.
@@ -534,6 +585,76 @@ mod tests {
         assert!(message.contains("up to 3"), "got {message}");
     }
 
+    /// An envelope of `version` whose payload is a shape [`Value`] is not, as
+    /// a newer format that changed the payload would write.
+    fn reshaped(version: u16) -> Vec<u8> {
+        rmp_serde::to_vec_named(&Envelope {
+            kind: KIND.to_string(),
+            version,
+            payload: vec!["a shape", "this build has never seen"],
+        })
+        .expect("encode")
+    }
+
+    #[test]
+    fn a_newer_version_is_judged_before_its_payload_is_decoded() {
+        // Review round 4: the payload was decoded before the version was
+        // looked at, so a newer format with a changed payload read as
+        // `Malformed` — damage — whatever the file's loss.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        std::fs::write(&path, reshaped(VERSION + 1)).expect("seed");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(
+            loaded.health,
+            Health::Reset(Damage::FutureVersion {
+                found: VERSION + 1,
+                supported: VERSION,
+            }),
+        );
+
+        // The same shape at a version this build reads is damage.
+        std::fs::write(&path, reshaped(VERSION)).expect("seed");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
+    }
+
+    #[test]
+    fn a_newer_version_of_a_permanent_file_is_refused_and_nothing_is_renamed() {
+        // Review round 4: after a rollback to an older bx, an intact ledger
+        // was moved aside as damage, even under the lock.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        for seed in [encoded(KIND, VERSION + 1, &sample()), reshaped(VERSION + 1)] {
+            std::fs::write(&path, &seed).expect("seed");
+            for held in [None, Some(&lock)] {
+                let err = load::<Value>(&path, KIND, VERSION, Loss::Permanent, held)
+                    .expect_err("a newer permanent file is refused");
+                assert!(
+                    matches!(
+                        &err,
+                        Error::FutureVersion { path: at, found, supported }
+                            if *at == path && *found == VERSION + 1 && *supported == VERSION
+                    ),
+                    "got {err}",
+                );
+                let message = err.to_string();
+                assert!(message.contains("newer bx"), "{message}");
+                assert!(message.contains("version 4"), "{message}");
+                assert!(message.contains("up to 3"), "{message}");
+                assert_eq!(std::fs::read(&path).expect("in place"), seed);
+                assert_eq!(names_but_the_lock(dir.path()), vec!["v.mpk"]);
+            }
+        }
+
+        // Every other damage to a permanent file still degrades under the lock.
+        std::fs::write(&path, b"garbage").expect("seed");
+        let loaded: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Permanent, Some(&lock)).expect("load");
+        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
+    }
+
     #[test]
     fn a_file_of_the_wrong_kind_is_not_accepted() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -652,7 +773,8 @@ mod tests {
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"garbage").expect("seed");
 
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION, None).expect("load");
+        let loaded: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, None).expect("load");
         assert_eq!(loaded.health, Health::Damaged(Damage::Malformed));
         assert!(!loaded.health.is_reset(), "nothing was moved aside");
         assert_eq!(loaded.health.damage(), Some(&Damage::Malformed));
@@ -670,14 +792,16 @@ mod tests {
         let path = dir.path().join("v.mpk");
         save(&path, KIND, VERSION, &Value::new()).expect("seed");
 
-        let loaded: Loaded<Value> = load_checked(&path, KIND, VERSION, None, |_| {
-            save(&path, KIND, VERSION, &sample()).expect("the writer saves");
-            Err(Damage::Malformed.into())
-        })
-        .expect("load");
+        let loaded: Loaded<Value> =
+            load_checked(&path, KIND, VERSION, Loss::Recomputable, None, |_| {
+                save(&path, KIND, VERSION, &sample()).expect("the writer saves");
+                Err(Damage::Malformed.into())
+            })
+            .expect("load");
         assert_eq!(loaded.health, Health::Damaged(Damage::Malformed));
 
-        let now: Loaded<Value> = load(&path, KIND, VERSION, None).expect("reload");
+        let now: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, None).expect("reload");
         assert_eq!(now.health, Health::Loaded);
         assert_eq!(
             now.value,
@@ -695,11 +819,18 @@ mod tests {
         let intact = std::fs::read(&path).expect("read");
         let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
 
-        let err = load_checked::<Value>(&path, KIND, VERSION, Some(&lock), |_| {
-            Err(Rejected::Refused(Error::NotADirectory {
-                path: PathBuf::from("/refused"),
-            }))
-        })
+        let err = load_checked::<Value>(
+            &path,
+            KIND,
+            VERSION,
+            Loss::Recomputable,
+            Some(&lock),
+            |_| {
+                Err(Rejected::Refused(Error::NotADirectory {
+                    path: PathBuf::from("/refused"),
+                }))
+            },
+        )
         .expect_err("a refusal is an error");
         assert!(
             matches!(&err, Error::NotADirectory { path } if path == Path::new("/refused")),

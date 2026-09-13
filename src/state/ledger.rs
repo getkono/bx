@@ -26,7 +26,7 @@ use super::Error;
 use super::dir::{StateDir, ensure_dir};
 use super::hash::ContentHash;
 use super::lock::ExclusiveLock;
-use super::store::{self, Loaded, Rejected};
+use super::store::{self, Loaded, Loss, Rejected};
 use crate::fs::{Mode, write_atomically};
 
 /// The envelope tag for `ledger.mpk`.
@@ -269,6 +269,9 @@ impl LedgerView {
     ///
     /// [`Error::Home`] if `home` is not absolute or not UTF-8. That is checked
     /// before the file is touched, so a bad home never quarantines a ledger.
+    ///
+    /// [`Error::FutureVersion`] if a newer bx wrote `ledger.mpk`. The ledger is
+    /// left exactly as it is; see [`Ledger::open`].
     pub fn read(dir: &StateDir, home: &Path) -> Result<Loaded<Self>, Error> {
         Self::load(dir, home, None)
     }
@@ -284,9 +287,14 @@ impl LedgerView {
             source,
         })?;
         let path = dir.ledger();
-        store::load_checked(&path, KIND, VERSION, lock, |view: &Self| {
-            view.check_paths(&path, home)
-        })
+        store::load_checked(
+            &path,
+            KIND,
+            VERSION,
+            Loss::Permanent,
+            lock,
+            |view: &Self| view.check_paths(&path, home),
+        )
     }
 
     /// Reject a ledger bx could not have written, or cannot use with `home`.
@@ -425,6 +433,11 @@ impl Ledger {
     /// which checks every stored path against `home` the same way. The same
     /// reasoning applies: a ledger written under another spelling of the home
     /// is refused, not reset.
+    ///
+    /// [`Error::FutureVersion`] if a newer bx wrote `ledger.mpk` — an older bx
+    /// run after a newer one. Its format is not damage: quarantining it would
+    /// let the next apply record bx's own output as every prior, and every
+    /// rollback would add another quarantine. Nothing is renamed.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
         let dir = dir.clone();
         Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self { dir, view }))
@@ -2048,6 +2061,64 @@ mod tests {
         assert!(matches!(err, Error::DanglingLink { .. }), "got {err}");
         assert_eq!(std::fs::read_link(dir.ledger()).expect("still a link"), far);
         assert!(!dir.root().join("ledger.mpk.corrupt").exists());
+    }
+
+    #[test]
+    fn a_ledger_from_a_newer_bx_is_refused_and_left_exactly_where_it_is() {
+        // Review round 4: a newer format version was damage, so after a
+        // rollback to an older bx `Ledger::open` moved an intact ledger aside,
+        // the next apply recorded bx's output as every prior, and each rollback
+        // added another `.corrupt.N`.
+        #[derive(Serialize)]
+        struct Newer<T> {
+            kind: &'static str,
+            version: u16,
+            payload: T,
+        }
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let newer = VERSION + 1;
+        // A payload this build could decode, and one a newer format reshaped.
+        let seeds = [
+            rmp_serde::to_vec_named(&Newer {
+                kind: KIND,
+                version: newer,
+                payload: LedgerView::default(),
+            })
+            .expect("encode"),
+            rmp_serde::to_vec_named(&Newer {
+                kind: KIND,
+                version: newer,
+                payload: ["entries", "reshaped"],
+            })
+            .expect("encode"),
+        ];
+        for seed in seeds {
+            std::fs::write(dir.ledger(), &seed).expect("seed");
+            let refused = |err: &Error| {
+                matches!(
+                    err,
+                    Error::FutureVersion { path, found, supported }
+                        if *path == dir.ledger() && *found == newer && *supported == VERSION
+                )
+            };
+
+            let err = LedgerView::read(&dir, home.path()).expect_err("the reader refuses");
+            assert!(refused(&err), "got {err}");
+            // Every rollback opens the ledger again; none of them moves it.
+            for _ in 0..3 {
+                let err = Ledger::open(&dir, &lock, home.path()).expect_err("open refuses");
+                assert!(refused(&err), "got {err}");
+                assert!(err.to_string().contains("newer bx"), "{err}");
+            }
+            assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seed);
+            let quarantines: Vec<_> = std::fs::read_dir(dir.root())
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("ledger.mpk."))
+                .collect();
+            assert!(quarantines.is_empty(), "{quarantines:?}");
+        }
     }
 
     #[test]

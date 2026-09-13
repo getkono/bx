@@ -19,9 +19,8 @@
 //! # Every file here is reconstructible from bad bytes — not from no bytes
 //!
 //! A machine-owned file that becomes an error the user cannot clear is a defect,
-//! so damaged *contents* are never fatal. A truncated, garbled, wrong-kind or
-//! future-versioned file is reported through `tracing::warn!` and replaced by
-//! the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
+//! so damaged *contents* are never fatal. A truncated, garbled or wrong-kind
+//! file is reported through `tracing::warn!` and replaced by the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
 //! the first free `<name>.corrupt`, `<name>.corrupt.1`, … — never over an earlier
 //! quarantine — and the next save writes a clean file. A lockless reader moves
 //! nothing ([`Health::Damaged`]): a rename by path could move aside a file a
@@ -32,6 +31,14 @@
 //! ledger checked against a home spelled differently from the one it was
 //! written under — is not damage either: [`Error::ForeignPath`] reaches the
 //! caller, and nothing is renamed.
+//!
+//! Nor is a file written by a **newer bx**, when it is one recomputation cannot
+//! rebuild. After a rollback to an older bx the ledger is almost certainly
+//! intact and merely in a format this build cannot read; resetting it would
+//! record bx's own output as every prior, and every rollback would add another
+//! quarantine. So a newer ledger is [`Error::FutureVersion`], and nothing is
+//! renamed. A newer fingerprint cache is still damage: losing it costs a
+//! recomputation.
 //!
 //! A file that **cannot be read** is a different thing and is handled the
 //! opposite way. `EACCES` left behind by a `sudo bx`, `EIO` from a failing
@@ -184,6 +191,26 @@ pub enum Error {
         /// Why it cannot be used with that home.
         #[source]
         source: Box<crate::paths::Error>,
+    },
+    /// A state file recomputation cannot rebuild — the ledger — was written by
+    /// a newer bx than this one.
+    ///
+    /// Not damage: the likeliest cause is an older bx run after a newer one,
+    /// and the file is intact in a format this build cannot read. Discarding
+    /// it would make the next apply record bx's own output as every prior, so
+    /// it is refused, and nothing is renamed or reset.
+    #[error(
+        "{} was written by a newer bx: it is format version {found}, and this bx understands up \
+         to {supported}. Nothing was changed; run a bx at least as new as the one that wrote it",
+        .path.display()
+    )]
+    FutureVersion {
+        /// The state file.
+        path: PathBuf,
+        /// The format version on disk.
+        found: u16,
+        /// The newest format version this build understands.
+        supported: u16,
     },
     /// A state file's path is a symbolic link to something that does not exist.
     ///

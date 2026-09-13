@@ -27,7 +27,7 @@ use super::Error;
 use super::dir::StateDir;
 use super::hash::ContentHash;
 use super::lock::ExclusiveLock;
-use super::store::{self, Loaded};
+use super::store::{self, Loaded, Loss};
 
 /// The envelope tag for `fingerprints.mpk`.
 const KIND: &str = "bx.fingerprints";
@@ -128,7 +128,7 @@ impl Fingerprints {
     /// caller is free to treat the failure as a cache miss, but it has to
     /// decide that itself rather than have a rename decide it.
     pub fn read(dir: &StateDir) -> Result<Loaded<Self>, Error> {
-        store::load(&dir.fingerprints(), KIND, VERSION, None)
+        store::load(&dir.fingerprints(), KIND, VERSION, Loss::Recomputable, None)
     }
 
     /// Read the cache under the exclusive lock, quarantining a damaged one.
@@ -141,7 +141,13 @@ impl Fingerprints {
     ///
     /// As [`Fingerprints::read`].
     pub fn open(dir: &StateDir, lock: &ExclusiveLock) -> Result<Loaded<Self>, Error> {
-        store::load(&dir.fingerprints(), KIND, VERSION, Some(lock))
+        store::load(
+            &dir.fingerprints(),
+            KIND,
+            VERSION,
+            Loss::Recomputable,
+            Some(lock),
+        )
     }
 
     /// The fingerprint recorded under `key`.
@@ -341,6 +347,33 @@ mod tests {
             Fingerprints::read(&dir).expect("read").health,
             Health::Loaded
         );
+    }
+
+    #[test]
+    fn a_cache_from_a_newer_bx_degrades_to_recomputation() {
+        // Review round 4 made a newer ledger a refusal. The cache is the file
+        // recomputation rebuilds, so it keeps degrading.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        store::save(
+            &dir.fingerprints(),
+            KIND,
+            VERSION + 1,
+            &Fingerprints::default(),
+        )
+        .expect("seed");
+        let newer = Damage::FutureVersion {
+            found: VERSION + 1,
+            supported: VERSION,
+        };
+
+        let read = Fingerprints::read(&dir).expect("read");
+        assert_eq!(read.health, Health::Damaged(newer.clone()));
+        let opened = Fingerprints::open(&dir, &lock).expect("open");
+        assert_eq!(opened.health, Health::Reset(newer));
+        assert!(opened.value.is_empty());
     }
 
     #[test]

@@ -1175,9 +1175,6 @@ impl Session {
         self.crash.reached(index, Phase::AfterFill);
 
         let created_dirs = filled.created_dirs().to_vec();
-        // Durable before the Intent frame that names it, and therefore before
-        // anything can displace it.
-        let before = store_prior(&self.state, filled.prior())?;
         // Assembled now, while the writer still holds the prior, and handed to
         // the ledger only once the write has landed. `None` is the restore half
         // of `bx rm`: bx is handing the target back, so there is nothing left for
@@ -1189,6 +1186,17 @@ impl Session {
             ),
             Ownership::Released => (None, None),
         };
+        // The ledger's refusal is asked before anything is stored, announced or
+        // published. `record` after the rename would refuse a changed shared
+        // file only once bx's new bytes were already over it; asked here, the
+        // refusal poisons the session with the destination untouched and no
+        // Intent for recovery to act on.
+        if let Some(entry) = &entry {
+            self.ledger.check_record(entry)?;
+        }
+        // Durable before the Intent frame that names it, and therefore before
+        // anything can displace it.
+        let before = store_prior(&self.state, filled.prior())?;
 
         let ledger_written = self.ledger.get(&target).map(|entry| entry.written);
         self.journal.append(&Record::Intent(Intent {
@@ -2896,6 +2904,98 @@ pub(crate) mod tests {
             "and no Done frame",
         );
         assert!(dest.is_dir());
+    }
+
+    /// Whether anything under `dir` is a writer's temporary file.
+    fn holds_a_temporary_file(dir: &Path) -> bool {
+        std::fs::read_dir(dir).expect("list").any(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(fs::TEMP_PREFIX)
+        })
+    }
+
+    #[test]
+    fn a_prior_conflict_poisons_the_session_before_anything_is_published() {
+        // Stack integration of #7's round 3: `Ledger::record` refuses a changed
+        // file bx shares through a region with `PriorConflict`. The session
+        // asked only after the rename, so the refusal arrived with bx's new
+        // region already written over the user's edit.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".zshrc");
+        let region = |body: &str| format!("user line\n# >>> bx >>>\n{body}\n# <<< bx <<<\n");
+        let shared = |body: &str| Request {
+            target: portable.clone(),
+            dest: dest.clone(),
+            content: Content::Bytes(region(body).into_bytes()),
+            mode: Mode::DEFAULT_FILE,
+            ownership: Ownership::Owned(Mechanism::Region { comment: '#' }),
+        };
+        plant_file(&dest, "user line\n", Mode::DEFAULT_FILE);
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first.apply(shared("BX1")).expect("apply");
+        first.finish().expect("finish");
+        let saved = std::fs::read(state.ledger()).expect("the saved ledger");
+
+        let edit = format!("{}more\n", region("BX1"));
+        plant_file(&dest, &edit, Mode::DEFAULT_FILE);
+
+        let mut second =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let err = second
+            .apply(shared("BX2"))
+            .expect_err("a changed shared file is a conflict");
+        assert!(
+            matches!(err, Error::State(crate::state::Error::PriorConflict { .. })),
+            "got {err}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read"),
+            edit.as_bytes(),
+            "the user's edit is untouched: nothing was published",
+        );
+        assert!(!holds_a_temporary_file(home.path()));
+        assert!(
+            !state
+                .restore()
+                .join(ContentHash::of(edit.as_bytes()).to_hex())
+                .exists(),
+            "the changed bytes were not stored as a prior",
+        );
+        let stored = second.ledger().get(&portable).expect("the entry");
+        assert_eq!(stored.written, ContentHash::of(region("BX1").as_bytes()));
+
+        let again = second
+            .apply(write_to(home.path(), ".other", "x\n", Mode::DEFAULT_FILE))
+            .expect_err("poisoned");
+        assert!(matches!(again, Error::Poisoned { .. }), "got {again}");
+        let finished = second
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
+
+        // The journal is kept, like any poisoned session's, and announces no
+        // write, so recovery has nothing to roll back.
+        let loaded = load(&state.journal()).expect("load");
+        assert!(matches!(loaded, Loaded::Unterminated(_)), "{loaded:?}");
+        assert!(
+            !loaded
+                .records()
+                .iter()
+                .any(|record| matches!(record, Record::Intent(_))),
+            "nothing was announced",
+        );
+        assert_eq!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::RolledBack { undone: 0 },
+        );
+        assert_eq!(std::fs::read(&dest).expect("read"), edit.as_bytes());
+        assert_eq!(std::fs::read(state.ledger()).expect("the ledger"), saved);
+        assert!(!state.journal().exists());
     }
 
     #[test]

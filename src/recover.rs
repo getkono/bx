@@ -658,6 +658,12 @@ fn decide(
                 })
                 .collect::<Result<_, _>>()?,
         );
+    // The ledger's own refusal is a verdict here, not an error: a rebuild that
+    // would adopt a changed shared file as its prior is blocked, the stored
+    // prior is kept, and the report says so before the recovery finds it.
+    if let Some(Err(conflict)) = ledger.map(|ledger| ledger.check_record(&entry)) {
+        return Ok((Step::Blocked, report(false, conflict.to_string())));
+    }
     Ok((Step::Record(entry), report(true, recorded())))
 }
 
@@ -2230,6 +2236,104 @@ mod tests {
         let outcome = recover(&state).expect("recover");
         assert_eq!(outcome, Outcome::RolledBack { undone: 1 });
         assert_eq!(peek(&dest).expect("rolled back").0, b"B0\n");
+    }
+
+    #[test]
+    fn a_rebuild_that_would_adopt_a_changed_shared_file_is_blocked_and_keeps_the_prior() {
+        // Stack integration of #7's round 3: `record` refuses a changed Region
+        // or Include file with `PriorConflict`. A rebuild must give that one
+        // verdict from `pending` and `recover` — a blocked write — and never
+        // lose or replace the stored prior.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".zshrc");
+        let region = Mechanism::Region { comment: '#' };
+        let bx1 = "user line\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let bx2 = "user line\n# >>> bx >>>\nBX2\n# <<< bx <<<\n";
+        plant_file(&dest, "user line\n", Mode::DEFAULT_FILE);
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first
+            .apply(Request {
+                target: portable.clone(),
+                dest: dest.clone(),
+                content: Content::Bytes(bx1.as_bytes().to_vec()),
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(region.clone()),
+            })
+            .expect("apply");
+        first.finish().expect("finish");
+        let saved = std::fs::read(state.ledger()).expect("the ledger");
+
+        // A journal whose one write displaced a changed copy of the shared file,
+        // and landed, and whose session died before its save.
+        let edited = format!("{bx1}more\n");
+        let displaced = ContentHash::of(edited.as_bytes());
+        fs::write_atomically(
+            &state.restore().join(displaced.to_hex()),
+            edited.as_bytes(),
+            Mode::PRIVATE_FILE,
+        )
+        .expect("the snapshot");
+        plant_file(&dest, bx2, Mode::DEFAULT_FILE);
+        raw_journal(
+            &state.journal(),
+            &[
+                Record::Begin(Begin {
+                    kind: SessionKind::Apply,
+                    home: home.path().to_path_buf(),
+                    scope: Vec::new(),
+                }),
+                Record::Intent(Intent {
+                    target: portable.clone(),
+                    dest: dest.clone(),
+                    temp: None,
+                    before: Prior::Existed(RestoreRef {
+                        digest: displaced,
+                        mode: Mode::DEFAULT_FILE,
+                        len: u64::try_from(edited.len()).expect("a length"),
+                    }),
+                    after: Written::Present {
+                        digest: ContentHash::of(bx2.as_bytes()),
+                        mode: Mode::DEFAULT_FILE,
+                    },
+                    created_dirs: Vec::new(),
+                    mechanism: Some(region),
+                    ledger_written: Some(ContentHash::of(bx1.as_bytes())),
+                }),
+                Record::Done(Done {
+                    target: portable.clone(),
+                }),
+                Record::End(End { written: 1 }),
+            ],
+        );
+        let journal = std::fs::read(state.journal()).expect("the journal");
+
+        let report = pending(&state).expect("pending").expect("interrupted");
+        assert_eq!(report.unfinished.len(), 1);
+        assert!(
+            !report.unfinished[0].resolvable,
+            "{:?}",
+            report.unfinished[0]
+        );
+        let outcome = recover(&state).expect("a conflict is a verdict, not an error");
+        assert!(
+            matches!(&outcome, Outcome::Blocked { conflicts } if conflicts.len() == 1),
+            "{outcome:?}"
+        );
+        assert_eq!(std::fs::read(state.journal()).expect("kept"), journal);
+        assert_eq!(std::fs::read(state.ledger()).expect("unchanged"), saved);
+        let entry = LedgerView::read(&state, home.path())
+            .expect("read")
+            .value
+            .get(&portable)
+            .cloned()
+            .expect("the entry");
+        let Prior::Existed(original) = &entry.prior else {
+            panic!("the user's original is still the prior");
+        };
+        assert_eq!(original.digest, ContentHash::of(b"user line\n"));
+        assert_eq!(peek(&dest).expect("untouched").0, bx2.as_bytes());
     }
 
     #[test]

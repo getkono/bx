@@ -402,6 +402,49 @@ impl Deref for Ledger {
     }
 }
 
+impl LedgerView {
+    /// The refusal [`Ledger::record`] would give `entry`, decided without
+    /// storing or changing anything.
+    ///
+    /// For a caller that must not act before it knows the record will be
+    /// accepted: a journalled session before it publishes, and a rebuild
+    /// before it reports. [`Ledger::record`] applies the same rule.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PriorConflict`] for a changed file bx shares with the user.
+    pub fn check_record(&self, entry: &NewEntry) -> Result<(), Error> {
+        self.entries.get(&entry.path).map_or(Ok(()), |existing| {
+            prior_conflict(existing, &entry.mechanism, &entry.prior)
+        })
+    }
+}
+
+/// [`Error::PriorConflict`] when re-recording `existing` with `incoming` would
+/// adopt a changed file bx shares through a region or an include line.
+///
+/// The one statement of the rule [`Ledger::record`] documents, so the check a
+/// caller makes first and the refusal `record` gives cannot disagree.
+fn prior_conflict(
+    existing: &LedgerEntry,
+    mechanism: &Mechanism,
+    incoming: &PriorBytes,
+) -> Result<(), Error> {
+    let PriorBytes::Bytes { bytes, .. } = incoming else {
+        return Ok(());
+    };
+    let digest = ContentHash::of(bytes);
+    if digest != existing.written
+        && (existing.mechanism != Mechanism::Own || *mechanism != Mechanism::Own)
+    {
+        return Err(Error::PriorConflict {
+            target: existing.path.as_str().to_string(),
+            displaced: digest,
+        });
+    }
+    Ok(())
+}
+
 impl Ledger {
     /// Open the ledger for writing.
     ///
@@ -560,6 +603,9 @@ impl Ledger {
         mechanism: &Mechanism,
         incoming: PriorBytes,
     ) -> Result<(Prior, Vec<RestoreRef>), Error> {
+        // A shared file's changed bytes still hold bx's own region or include
+        // line. Refused before anything is stored: see `record`.
+        prior_conflict(existing, mechanism, &incoming)?;
         let kept = || (existing.prior.clone(), existing.superseded.clone());
         let PriorBytes::Bytes { bytes, mode } = incoming else {
             return Ok(kept());
@@ -567,14 +613,6 @@ impl Ledger {
         let digest = ContentHash::of(&bytes);
         if digest == existing.written {
             return Ok(kept());
-        }
-        // A shared file's changed bytes still hold bx's own region or include
-        // line. Refused before anything is stored: see `record`.
-        if existing.mechanism != Mechanism::Own || *mechanism != Mechanism::Own {
-            return Err(Error::PriorConflict {
-                target: existing.path.as_str().to_string(),
-                displaced: digest,
-            });
         }
 
         // A third party wrote these bytes and this apply displaces them: they

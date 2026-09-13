@@ -76,6 +76,11 @@ pub enum Restoration {
         dest: PathBuf,
         /// Where its prior bytes live, and the mode they had.
         reference: RestoreRef,
+        /// What this plan observed at `dest`. The revert is staged against it,
+        /// so a destination that changed since is refused, not reverted over.
+        /// Boxed, because it holds the destination's bytes and the other
+        /// variants hold a path.
+        planned: Box<fs::Observed>,
     },
     /// bx created the file and it is already gone. Only the ledger entry goes.
     AlreadyGone {
@@ -172,6 +177,7 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
             Prior::Existed(reference) => Restoration::Revert {
                 dest,
                 reference: reference.clone(),
+                planned: Box::new(observed.clone()),
             },
         }),
         (Kind::File, Some(digest)) if digest == entry.written => Ok(match &entry.prior {
@@ -186,6 +192,7 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
             Prior::Existed(reference) => Restoration::Revert {
                 dest,
                 reference: reference.clone(),
+                planned: Box::new(observed.clone()),
             },
         }),
         (Kind::File, _) => Ok(Restoration::Conflict {
@@ -270,7 +277,11 @@ fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Err
                 dest,
             })
         }
-        Restoration::Revert { dest, reference } => {
+        Restoration::Revert {
+            dest,
+            reference,
+            planned,
+        } => {
             // Verified before a single byte is written: `restore_bytes` rehashes
             // the blob and refuses if it does not match the digest that named
             // it. Restoring corrupted content over the user's file would be
@@ -292,7 +303,10 @@ fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Err
             session.apply(Request {
                 target: target.clone(),
                 dest: dest.clone(),
-                content: Content::Bytes(bytes),
+                content: Content::Bytes {
+                    bytes,
+                    planned: *planned,
+                },
                 mode: reference.mode,
                 ownership: Ownership::Released,
             })?;
@@ -839,8 +853,9 @@ mod tests {
         // A restore session that dies halfway is exactly an apply session that
         // dies halfway, and the same machinery undoes it.
         let entry = entry_for(&state, home.path(), &portable).expect("managed");
-        let Restoration::Revert { reference, .. } =
-            plan_restore(&entry, home.path()).expect("plan")
+        let Restoration::Revert {
+            reference, planned, ..
+        } = plan_restore(&entry, home.path()).expect("plan")
         else {
             panic!("a displaced file is reverted")
         };
@@ -855,7 +870,10 @@ mod tests {
             .apply(crate::journal::Request {
                 target: portable.clone(),
                 dest: dest.clone(),
-                content: crate::journal::Content::Bytes(bytes),
+                content: crate::journal::Content::Bytes {
+                    bytes,
+                    planned: *planned,
+                },
                 mode: reference.mode,
                 ownership: crate::journal::Ownership::Released,
             })
@@ -977,7 +995,9 @@ mod tests {
         };
 
         match plan_for(&modified) {
-            Restoration::Revert { dest, reference } => {
+            Restoration::Revert {
+                dest, reference, ..
+            } => {
                 assert_eq!(dest, home.child(".modified"));
                 assert_eq!(reference.digest, ContentHash::of(b"theirs\n"));
                 assert_eq!(reference.mode, Mode::PRIVATE_FILE);

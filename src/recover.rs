@@ -1699,8 +1699,11 @@ mod tests {
             home.path(),
             vec![Request {
                 target: portable.clone(),
+                content: Content::Bytes {
+                    bytes: b"yours\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
                 dest,
-                content: Content::Bytes(b"yours\n".to_vec()),
                 mode: Mode::DEFAULT_FILE,
                 ownership: Ownership::Released,
             }],
@@ -2408,7 +2411,10 @@ mod tests {
             .apply(Request {
                 target: portable.clone(),
                 dest: dest.clone(),
-                content: Content::Bytes(bx1.as_bytes().to_vec()),
+                content: Content::Bytes {
+                    bytes: bx1.as_bytes().to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
                 mode: Mode::DEFAULT_FILE,
                 ownership: Ownership::Owned(region.clone()),
             })
@@ -2907,9 +2913,15 @@ mod tests {
                         Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
                     for request in crash_requests(&home) {
                         if matches!(request.ownership, Ownership::Owned(_)) {
+                            let Content::Bytes { planned, .. } = request.content else {
+                                unreachable!("an owned crash request writes bytes");
+                            };
                             session
                                 .apply(Request {
-                                    content: Content::Bytes(b"bx one\n".to_vec()),
+                                    content: Content::Bytes {
+                                        bytes: b"bx one\n".to_vec(),
+                                        planned,
+                                    },
                                     ..request
                                 })
                                 .expect("the earlier apply");
@@ -2929,7 +2941,7 @@ mod tests {
                 for request in crash_requests(&home) {
                     let found = peek(&request.dest);
                     match &request.content {
-                        Content::Bytes(wanted) => {
+                        Content::Bytes { bytes: wanted, .. } => {
                             assert_eq!(found, Some((wanted.clone(), request.mode)), "{case}");
                         }
                         Content::Absent { .. } => assert_eq!(found, None, "{case}"),
@@ -3001,7 +3013,7 @@ mod tests {
                         .find(|(path, _)| *path == dest)
                         .and_then(|(_, state)| state.clone());
                     let is_new = match &request.content {
-                        Content::Bytes(wanted) => found
+                        Content::Bytes { bytes: wanted, .. } => found
                             .as_ref()
                             .is_some_and(|(bytes, mode)| bytes == wanted && *mode == request.mode),
                         Content::Absent { .. } => found.is_none(),

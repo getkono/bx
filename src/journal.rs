@@ -12,7 +12,10 @@
 //! the sequence is fixed:
 //!
 //! 1. [`crate::fs::stage`] makes a temporary file in the destination directory,
-//!    at the final mode, with no content. The destination is untouched.
+//!    at the final mode, with no content. The destination is untouched. It is
+//!    staged against the [`crate::fs::Observed`] the request's plan compared, so
+//!    a destination that changed since plan is refused here, before anything is
+//!    stored, announced or published.
 //! 2. [`crate::fs::Staged::fill`] writes the content and `fsync`s it. The
 //!    destination is still untouched.
 //! 3. the **prior** bytes are copied into `restore/` and `fsync`ed, so the
@@ -964,6 +967,10 @@ pub struct Session {
     poisoned: bool,
     /// Every target a request has been admitted for, so none is written twice.
     touched: std::collections::HashSet<Portable>,
+    /// Every directory a write in this session created. One set for the whole
+    /// session, because [`crate::fs::ensure_dir`] reads it to tell a directory
+    /// an earlier write made from one somebody else made since plan.
+    created: fs::CreatedDirs,
     crash: Crash,
     /// Called with the destination just before a write is published, so a test
     /// can make the publish fail the way a concurrent change to the destination
@@ -994,7 +1001,16 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Content {
     /// These bytes, at [`Request::mode`].
-    Bytes(Vec<u8>),
+    Bytes {
+        /// The whole content.
+        bytes: Vec<u8>,
+        /// What plan observed at the destination when it compared these bytes
+        /// with it, from [`crate::fs::observe`]. The write is staged against
+        /// it: a destination whose kind or stamp is no longer this is refused
+        /// with [`crate::fs::Error::Changed`], which poisons the session with
+        /// nothing staged, announced or published.
+        planned: fs::Observed,
+    },
     /// No file at all.
     ///
     /// The destination is unlinked and `created_dirs` are removed, deepest
@@ -1060,6 +1076,7 @@ impl Session {
             written: 0,
             poisoned: false,
             touched: std::collections::HashSet::new(),
+            created: fs::CreatedDirs::new(),
             crash: Crash::from_env(),
             #[cfg(test)]
             before_publish: None,
@@ -1128,8 +1145,9 @@ impl Session {
     ///
     /// [`Error::Misplaced`] when the request's destination is not where its
     /// target renders, [`Error::Repeated`] when this session already wrote the
-    /// target, [`Error::Write`] when the destination cannot be written
-    /// or is not a file bx may replace, [`Error::State`] when the prior bytes
+    /// target, [`Error::Write`] when the destination cannot be written, is not
+    /// a file bx may replace, or is no longer what the request's plan observed
+    /// ([`crate::fs::Error::Changed`]), [`Error::State`] when the prior bytes
     /// cannot be stored or recorded, [`Error::Io`] when the journal cannot be
     /// appended to, and [`Error::Poisoned`] when an earlier write in this
     /// session failed.
@@ -1151,7 +1169,9 @@ impl Session {
         }
         self.crash.reached(index, Phase::BeforeStage);
         let applied = match content {
-            Content::Bytes(bytes) => self.write(index, target, dest, &bytes, mode, &ownership),
+            Content::Bytes { bytes, planned } => {
+                self.write(target, dest, &bytes, &planned, mode, &ownership)
+            }
             Content::Absent { created_dirs } => self.remove(index, target, dest, created_dirs),
         };
         if let Err(e) = applied {
@@ -1195,21 +1215,23 @@ impl Session {
     }
 
     /// The write path: stage, fill, record, journal, publish, done.
+    ///
+    /// Staged against `planned`, the observation plan compared, and with the
+    /// session's one set of created directories, so every later write in the
+    /// session knows a directory an earlier one made.
     fn write(
         &mut self,
-        index: usize,
         target: Portable,
         dest: PathBuf,
         bytes: &[u8],
+        planned: &fs::Observed,
         mode: Mode,
         ownership: &Ownership,
     ) -> Result<(), Error> {
-        // #8's `stage` now takes the observation plan compared and the set of
-        // directories the apply has created. Until the request carries plan's
-        // observation, the session observes for itself and stages with a set
-        // of its own, which is the behaviour before the merge.
-        let planned = fs::observe(&dest)?;
-        let staged = fs::stage(&dest, mode, &planned, &mut fs::CreatedDirs::new())?;
+        // `written` moves only once a write has succeeded, so it is this
+        // write's index.
+        let index = self.written;
+        let staged = fs::stage(&dest, mode, planned, &mut self.created)?;
         let temp = staged.temp_path().to_path_buf();
         self.crash.reached(index, Phase::AfterStage);
 
@@ -1672,13 +1694,20 @@ pub(crate) mod tests {
         (Portable::from_path(&dest, home).expect("portable"), dest)
     }
 
-    /// A write request for `rel` under `home`.
+    /// A write request for `rel` under `home`, carrying what is there now as
+    /// plan's observation.
     pub(crate) fn write_to(home: &Path, rel: &str, bytes: &str, mode: Mode) -> Request {
         let (target, dest) = target(home, rel);
+        // Observed when the request is built, as plan observes before anything
+        // is applied.
+        let planned = fs::observe(&dest).expect("plan's observation");
         Request {
             target,
             dest,
-            content: Content::Bytes(bytes.as_bytes().to_vec()),
+            content: Content::Bytes {
+                bytes: bytes.as_bytes().to_vec(),
+                planned,
+            },
             mode,
             ownership: Ownership::Owned(Mechanism::Own),
         }
@@ -2235,8 +2264,11 @@ pub(crate) mod tests {
         session
             .apply(Request {
                 target: portable.clone(),
+                content: Content::Bytes {
+                    bytes: b"yours\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
                 dest,
-                content: Content::Bytes(b"yours\n".to_vec()),
                 mode: Mode::DEFAULT_FILE,
                 ownership: Ownership::Released,
             })
@@ -3028,7 +3060,10 @@ pub(crate) mod tests {
         let shared = |body: &str| Request {
             target: portable.clone(),
             dest: dest.clone(),
-            content: Content::Bytes(region(body).into_bytes()),
+            content: Content::Bytes {
+                bytes: region(body).into_bytes(),
+                planned: fs::observe(&dest).expect("plan's observation"),
+            },
             mode: Mode::DEFAULT_FILE,
             ownership: Ownership::Owned(Mechanism::Region { comment: '#' }),
         };
@@ -3155,6 +3190,105 @@ pub(crate) mod tests {
             crate::recover::Outcome::Nothing
         );
         assert_eq!(std::fs::read(&dest).expect("read"), b"the user's edit\n");
+    }
+
+    #[test]
+    fn an_edit_between_plan_and_the_sessions_stage_is_kept_poisons_and_recovery_touches_nothing() {
+        // Stack integration of #8's round 4: `stage` decides on the observation
+        // plan compared, and a request carries it. An edit that lands after
+        // plan and before the session stages is refused before anything is
+        // staged, stored, announced or published.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+        // An earlier write in the same session, so recovery has one write of its
+        // own to roll back and can be seen to leave `.conf` alone.
+        let (_, other) = target(home.path(), ".other");
+        plant_file(&other, "other before\n", Mode::DEFAULT_FILE);
+
+        // Plan observes both destinations, then the user saves over one.
+        let first = write_to(home.path(), ".other", "other after\n", Mode::DEFAULT_FILE);
+        let second = write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE);
+        std::fs::write(&dest, "the user's edit after plan\n").expect("an editor saves");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(first)
+            .expect("the other destination is what plan saw");
+        let err = session
+            .apply(second)
+            .expect_err("the destination changed since plan");
+        assert!(
+            matches!(err, Error::Write(fs::Error::Changed { .. })),
+            "got {err}"
+        );
+        assert!(session.ledger().get(&portable).is_none());
+        let again = session
+            .apply(write_to(home.path(), ".third", "x\n", Mode::DEFAULT_FILE))
+            .expect_err("the session is poisoned");
+        assert!(matches!(again, Error::Poisoned { .. }), "got {again}");
+        let finished = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
+        assert_eq!(
+            std::fs::read(&dest).expect("read"),
+            b"the user's edit after plan\n"
+        );
+        assert!(!holds_a_temporary_file(home.path()));
+        assert!(!home.child(".third").exists());
+
+        // Refused before its Intent frame: the journal names only the earlier write.
+        let loaded = load(&state.journal()).expect("load");
+        let named: Vec<&Portable> = loaded.intents().map(|intent| &intent.target).collect();
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_ne!(named[0], &portable);
+
+        // Recovery rolls the earlier write back and touches nothing for `.conf`.
+        let edited = peek(&dest);
+        assert_eq!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::RolledBack { undone: 1 },
+        );
+        assert_eq!(peek(&other).expect("rolled back").0, b"other before\n");
+        assert_eq!(peek(&dest), edited, "recovery touched nothing for the edit");
+        assert!(!state.journal().exists());
+    }
+
+    #[test]
+    fn a_session_keeps_one_set_of_the_directories_its_writes_created() {
+        // Stack integration of #8's round 4: a directory target applied after a
+        // write beneath it is the `Create` plan announced only when both were
+        // given one `fs::CreatedDirs`. The session holds that set for its life.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(write_to(
+                home.path(),
+                ".config/one/a.conf",
+                "a\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("the first write");
+        session
+            .apply(write_to(
+                home.path(),
+                ".config/two/b.conf",
+                "b\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("the second write");
+        for dir in [".config", ".config/one", ".config/two"] {
+            assert!(
+                session.created.contains(&home.child(dir)),
+                "{dir} is in the session's set"
+            );
+        }
+        session.finish().expect("finish");
     }
 
     #[test]

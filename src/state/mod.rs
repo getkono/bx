@@ -124,6 +124,20 @@ pub enum Error {
         /// The lock file.
         path: PathBuf,
     },
+    /// Something other than the plain file bx creates occupies the lock path.
+    ///
+    /// A symlink, a second hard link, a FIFO or a device. The lock file's body
+    /// is truncated on every exclusive acquisition, so opening any of these
+    /// could empty a file the user wrote; bx refuses and names the path.
+    #[error(
+        "{} is not a plain file bx created (a symlink, a hard link or a special file); \
+         bx will not open it. Move it aside and run bx again",
+        .path.display()
+    )]
+    LockNotAFile {
+        /// The lock path.
+        path: PathBuf,
+    },
     /// The lock file could not be opened or locked.
     #[error("locking {}: {source}", .path.display())]
     Lock {

@@ -20,7 +20,7 @@ use std::fmt;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{FlockOperation, Mode as RawMode, OFlags};
+use rustix::fs::{FileType, FlockOperation, Mode as RawMode, OFlags};
 use rustix::io::Errno;
 
 use super::Error;
@@ -188,17 +188,48 @@ fn optional<T>(result: Result<T, Error>) -> Result<Option<T>, Error> {
 }
 
 /// Open — creating if needed — the lock file at `0600`.
+///
+/// The body of this file is truncated on every exclusive acquisition, so what
+/// is opened must be the file bx created and never a file the user wrote
+/// (Invariant 1). It is opened with `O_NOFOLLOW`, so a symlink at `lock` — to
+/// `~/.bashrc`, say, or to a path that does not exist yet — is refused rather
+/// than followed and truncated or created. The descriptor must then be a
+/// regular file with exactly one link, so a hard link to a user's file, a FIFO
+/// or a device is refused too. A lock file found readable beyond its owner is
+/// narrowed to `0600`, as the state directory itself is.
 fn open_lock_file(dir: &StateDir, path: &Path) -> Result<OwnedFd, Error> {
     ensure_dir(dir.root(), Mode::PRIVATE_DIR)?;
-    rustix::fs::open(
-        path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC,
-        Mode::PRIVATE_FILE.into(),
-    )
-    .map_err(|source| Error::Lock {
+    let failed = |source: Errno| Error::Lock {
         path: path.to_path_buf(),
         source: source.into(),
-    })
+    };
+    let not_a_file = || Error::LockNotAFile {
+        path: path.to_path_buf(),
+    };
+    let fd = match rustix::fs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::PRIVATE_FILE.into(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) => return Err(not_a_file()),
+        Err(source) => return Err(failed(source)),
+    };
+    let stat = rustix::fs::fstat(&fd).map_err(failed)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1 {
+        return Err(not_a_file());
+    }
+    let found = Mode::from_bits(stat.st_mode);
+    if found.is_shared() {
+        tracing::warn!(
+            path = %path.display(),
+            found = %found,
+            tightened_to = %Mode::PRIVATE_FILE,
+            "the bx lock file was readable beyond its owner; tightening it",
+        );
+        rustix::fs::fchmod(&fd, Mode::PRIVATE_FILE.into()).map_err(failed)?;
+    }
+    Ok(fd)
 }
 
 /// Attempt one non-blocking `flock`.
@@ -240,7 +271,11 @@ fn identify(fd: &OwnedFd) {
 fn read_holder(path: &Path) -> Holder {
     // Opened separately rather than through the refused descriptor: this runs
     // on the error path, where clarity beats saving one `open`.
-    let Ok(fd) = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, RawMode::empty()) else {
+    let Ok(fd) = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        RawMode::empty(),
+    ) else {
         return Holder::unknown();
     };
     let mut buf = [0_u8; BODY];
@@ -550,6 +585,98 @@ mod tests {
             path.exists(),
             "unlinking races: another process may hold a descriptor on the old inode",
         );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn a_symlink_at_the_lock_path_is_refused_and_never_truncates_what_it_names() {
+        // Review round 3: the lock file was opened RDWR|CREATE following
+        // symlinks and then truncated, so `<state>/lock -> ~/.bashrc` emptied
+        // the user's file.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        home.write(".bashrc", "the user wrote this\n");
+        let before = mode_of(&home.child(".bashrc"));
+        std::os::unix::fs::symlink(home.child(".bashrc"), dir.lock()).expect("symlink");
+
+        let err = ExclusiveLock::acquire(&dir).expect_err("must refuse");
+        assert!(
+            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("not a plain file"), "{err}");
+        assert!(matches!(
+            SharedLock::acquire(&dir),
+            Err(Error::LockNotAFile { .. })
+        ));
+        assert!(ExclusiveLock::try_acquire(&dir).is_err());
+        assert_eq!(
+            std::fs::read(home.child(".bashrc")).expect("read"),
+            b"the user wrote this\n",
+        );
+        assert_eq!(mode_of(&home.child(".bashrc")), before);
+    }
+
+    #[test]
+    fn a_dangling_symlink_at_the_lock_path_creates_nothing_through_it() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        std::os::unix::fs::symlink(home.child("elsewhere"), dir.lock()).expect("symlink");
+
+        let err = ExclusiveLock::acquire(&dir).expect_err("must refuse");
+        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
+        assert!(!home.child("elsewhere").exists());
+    }
+
+    #[test]
+    fn a_hard_link_or_a_fifo_at_the_lock_path_is_refused() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        home.write(".profile", "the user wrote this too\n");
+        std::fs::hard_link(home.child(".profile"), dir.lock()).expect("hard link");
+
+        let err = ExclusiveLock::acquire(&dir).expect_err("a second link is not bx's file");
+        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
+        assert_eq!(
+            std::fs::read(home.child(".profile")).expect("read"),
+            b"the user wrote this too\n",
+        );
+
+        std::fs::remove_file(dir.lock()).expect("unlink the link");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.lock(),
+            FileType::Fifo,
+            RawMode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("mkfifo");
+        let err = ExclusiveLock::acquire(&dir).expect_err("a fifo is not a lock file");
+        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_lock_file_readable_beyond_its_owner_is_narrowed_to_0600() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        std::fs::write(dir.lock(), b"").expect("seed");
+        std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o666))
+            .expect("widen");
+
+        drop(SharedLock::acquire(&dir).expect("reader"));
+        assert_eq!(mode_of(&dir.lock()), 0o600, "a reader narrows it too");
+
+        std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o640))
+            .expect("widen again");
+        let _lock = ExclusiveLock::acquire(&dir).expect("writer");
+        assert_eq!(mode_of(&dir.lock()), 0o600);
     }
 
     #[test]

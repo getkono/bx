@@ -1490,6 +1490,61 @@ mod tests {
     }
 
     #[test]
+    fn a_clashing_entry_is_held_beside_the_file_it_names_not_moved_to_the_end() {
+        // `bx.toml` puts `~/.config/default/s` first. A module names that file
+        // again, once through `profile`. With `work` the module's plain spelling
+        // replaces it in place; with `default` both module spellings are the
+        // file, and the second may not be appended after `~/.zshrc` — the
+        // file's rows stay in the file's slot, and nothing unrelated moves.
+        const BASE: &str = "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
+                            [[target]]\npath = \"~/.config/default/s\"\ncontent = \"BASE\"\n\
+                            [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        const MODULE: &str = "[[target]]\npath = \"~/.config/{{profile}}/s\"\ncontent = \"PROFILE\"\n\
+                              [[target]]\npath = \"~/.config/default/s\"\ncontent = \"DEFAULT\"\n\
+                              [[target]]\npath = \"~/.config/other\"\ncontent = \"other\"\n";
+        let layers = |answer: &str| {
+            merged_and_resolved(&[
+                ("bx.toml", LayerKind::Global, BASE),
+                ("modules/10-profile.toml", LayerKind::Global, MODULE),
+                (
+                    "local.toml",
+                    LayerKind::Local,
+                    &format!("[values]\nprofile = \"{answer}\"\n"),
+                ),
+            ])
+            .1
+        };
+
+        let work = layers("work");
+        assert_eq!(
+            keys(&work),
+            [
+                "~/.config/default/s",
+                "~/.zshrc",
+                "~/.config/work/s",
+                "~/.config/other"
+            ]
+        );
+        assert_eq!(ready(&work, 0).body, Body::Inline("DEFAULT".to_string()));
+
+        let default = layers("default");
+        assert_eq!(
+            keys(&default),
+            [
+                "~/.config/{{profile}}/s",
+                "~/.config/default/s",
+                "~/.zshrc",
+                "~/.config/other"
+            ],
+            "both rows for the file sit in the file's slot, in the order written"
+        );
+        blocked(&default, 0);
+        blocked(&default, 1);
+        ready(&default, 2);
+        ready(&default, 3);
+    }
+
+    #[test]
     fn two_ready_targets_for_one_file_are_refused_even_unmerged() {
         // `resolve` takes any `Config`, and one that did not come through the
         // merge can still carry two spellings of one file.

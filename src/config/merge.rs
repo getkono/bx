@@ -96,6 +96,8 @@ pub trait Keyed {
 }
 
 impl Keyed for Target {
+    // Unreachable from `merge`, which keys targets by the file they name
+    // (`TargetKey`); kept because `Keyed` requires it of a public list type.
     fn key(&self) -> &str {
         self.path.as_str()
     }
@@ -117,6 +119,8 @@ impl Keyed for ValueDecl {
     fn origin(&self) -> &Origin {
         &self.origin
     }
+    // Unreachable from `merge`, which keeps disabled declarations with
+    // `into_entries`; kept because `Keyed` requires it of a public list type.
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -442,9 +446,10 @@ impl Merged<Target, TargetKey> {
     /// One layer naming one file twice would leave the outcome to an order
     /// nothing in the file states. When an account answer made the two
     /// spellings meet, the statements are recorded as a [`Clash`] rather than
-    /// applied: both entries are kept, and every entry for the file is held
-    /// enabled, so resolution blocks each one in its own position instead of
-    /// hiding it. A later layer that names the file settles it — a full entry
+    /// applied: both entries are kept, the later one directly after the entries
+    /// already held for the file rather than at the end, and every entry for the
+    /// file is held enabled, so resolution blocks each one in the file's own row
+    /// instead of hiding it or moving it past unrelated targets. A later layer that names the file settles it — a full entry
     /// replaces every entry for it, and a toggle flips every one.
     ///
     /// # Errors
@@ -463,9 +468,6 @@ impl Merged<Target, TargetKey> {
     ) -> Result<(), Error> {
         // What this layer has said so far, statement by statement.
         let mut said: Vec<Said> = Vec::new();
-        // Entries beyond the first for a file a full entry here replaced. They
-        // are dropped when the layer is done, so no position moves mid-layer.
-        let mut settled: Vec<usize> = Vec::new();
 
         for target in &layer.config.targets {
             let spelling = target.path.as_str();
@@ -475,11 +477,19 @@ impl Merged<Target, TargetKey> {
                 Some(index) => {
                     let statement = (spelling, &target.origin);
                     if clash(&said, &key, statement, values, &layer.file, clashes)? {
-                        self.entries.push((key.clone(), target.clone()));
+                        // Beside the entries already held for the file, not at
+                        // the end: the file keeps its row, and no unrelated
+                        // target moves because of what the account answered.
+                        let beside = self.positions(&key).into_iter().last().unwrap_or(index) + 1;
+                        self.entries.insert(beside, (key.clone(), target.clone()));
                         self.set_enabled_for(&key, true);
                     } else {
+                        // A full entry replaces every entry for the file: it
+                        // takes the first one's place and the rest go.
                         self.entries[index] = (key.clone(), target.clone());
-                        settled.extend(self.positions(&key).into_iter().skip(1));
+                        let mut first = true;
+                        self.entries
+                            .retain(|(held, _)| held != &key || std::mem::take(&mut first));
                         clashes.retain(|clash| clash.key != key);
                     }
                 }
@@ -514,12 +524,6 @@ impl Merged<Target, TargetKey> {
                 }
                 Section::Value => {}
             }
-        }
-
-        settled.sort_unstable();
-        settled.dedup();
-        for index in settled.into_iter().rev() {
-            self.entries.remove(index);
         }
 
         Ok(())

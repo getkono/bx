@@ -13,7 +13,8 @@
 //!    turn it into a copy-then-delete with a visible half-written window.
 //! 3. the mode set with `fchmod` **before any content is written** — all of it
 //!    but a declared setuid or setgid bit, which a write would clear.
-//! 4. the content written, the set-id bits added if declared, then `fsync`ed.
+//! 4. the content written, the set-id bits added if declared and read back to
+//!    confirm the kernel kept them, then `fsync`ed.
 //! 5. the prior state recorded — [`Filled::new_entry`] assembles it and
 //!    [`crate::state::Ledger::record`] makes it durable — **before** the
 //!    rename, so a crash after the rename still has a recoverable prior state.
@@ -238,6 +239,28 @@ pub enum Error {
         #[source]
         source: crate::paths::Error,
     },
+    /// A declared setuid or setgid bit did not survive its `fchmod`.
+    ///
+    /// `fchmod(2)` reports success when the kernel silently clears `S_ISGID`
+    /// from a file whose group the caller is not in, which is the group a
+    /// setgid parent directory owned by another group gives every new file.
+    /// Publishing it would put a mode on disk that is not the declared one and
+    /// make every later `plan` announce a `Modify` no `apply` can close. The
+    /// temporary file is removed and the destination is untouched.
+    #[error(
+        "{} declares {declared}, and the kernel kept only {landed}: it drops a setgid bit \
+         from a file whose group you are not in, such as the group a setgid parent \
+         directory gives it. Nothing was replaced",
+        .path.display()
+    )]
+    SetIdNotKept {
+        /// The destination.
+        path: PathBuf,
+        /// The mode the target declares.
+        declared: Mode,
+        /// The mode the temporary file actually has.
+        landed: Mode,
+    },
 }
 
 impl Error {
@@ -252,7 +275,8 @@ impl Error {
             | Self::Read { path, .. }
             | Self::Write { path, .. }
             | Self::Changed { path, .. }
-            | Self::NotPortable { path, .. } => path,
+            | Self::NotPortable { path, .. }
+            | Self::SetIdNotKept { path, .. } => path,
         }
     }
 }
@@ -793,7 +817,10 @@ impl Staged {
     ///
     /// # Errors
     ///
-    /// [`Error::Write`] wrapping the first failing syscall.
+    /// [`Error::Write`] wrapping the first failing syscall, and
+    /// [`Error::SetIdNotKept`] when a declared setuid or setgid bit is not on
+    /// the file after the `fchmod` that adds it. The temporary file is removed
+    /// either way.
     pub fn fill(mut self, bytes: &[u8]) -> Result<Filled, Error> {
         let temp_path = self.0.temp.path().to_path_buf();
         let fail = |source| Error::Write {
@@ -807,6 +834,9 @@ impl Staged {
         // without CAP_FSETID.
         if self.0.mode.bits() & SET_ID != 0 {
             fchmod(self.0.temp.as_file(), self.0.mode, &temp_path)?;
+            // That fchmod succeeds even when the kernel drops S_ISGID, so what
+            // stuck is read back rather than assumed.
+            verify_set_id_kept(self.0.temp.as_file(), self.0.mode, &self.0.dest)?;
         }
         durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(&fail)?;
         let written = ContentHash::of(bytes);
@@ -1597,6 +1627,33 @@ fn fchmod(file: &std::fs::File, mode: Mode, path: &Path) -> Result<(), Error> {
     })
 }
 
+/// Refuse unless every setuid or setgid bit `mode` declares is on `file`.
+///
+/// Called after the `fchmod` that adds them, because that `fchmod` does not
+/// fail when a bit does not stick — see [`Error::SetIdNotKept`]. `dest` is the
+/// destination the refusal names; the temporary file is what is inspected.
+///
+/// # Errors
+///
+/// [`Error::SetIdNotKept`] when a declared set-id bit is missing, and
+/// [`Error::Read`] when `file` cannot be stat'd.
+fn verify_set_id_kept(file: &std::fs::File, mode: Mode, dest: &Path) -> Result<(), Error> {
+    let meta = file.metadata().map_err(|source| Error::Read {
+        path: dest.to_path_buf(),
+        source,
+    })?;
+    let landed = mode_of(&meta);
+    let declared = mode.bits() & SET_ID;
+    if landed.bits() & declared == declared {
+        return Ok(());
+    }
+    Err(Error::SetIdNotKept {
+        path: dest.to_path_buf(),
+        declared: mode,
+        landed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2031,6 +2088,159 @@ mod tests {
                 "{mode}: the second plan is empty",
             );
         }
+    }
+
+    #[test]
+    fn a_set_id_bit_missing_after_its_fchmod_is_a_typed_error() {
+        let home = guarded_home();
+        let path = home.child("tool");
+        seed(&path, b"x", Mode::from_bits(0o755));
+        let file = std::fs::File::open(&path).expect("open");
+
+        let err = verify_set_id_kept(&file, Mode::from_bits(0o2755), &path)
+            .expect_err("0755 on disk is not a declared 2755");
+        let Error::SetIdNotKept {
+            path: named,
+            declared,
+            landed,
+        } = &err
+        else {
+            panic!("expected SetIdNotKept, got {err:?}");
+        };
+        assert_eq!(named, &path);
+        assert_eq!(*declared, Mode::from_bits(0o2755));
+        assert_eq!(*landed, Mode::from_bits(0o755));
+        assert_eq!(err.path(), path);
+        assert!(err.to_string().contains("setgid"), "{err}");
+        assert!(err.to_string().contains("Nothing was replaced"), "{err}");
+
+        // A bit that did stick is no refusal, and neither is a mode that
+        // declares none.
+        set_mode(&path, Mode::from_bits(0o2755)).expect("our own group keeps it");
+        verify_set_id_kept(&file, Mode::from_bits(0o2755), &path).expect("kept");
+        seed(&path, b"x", Mode::from_bits(0o755));
+        verify_set_id_kept(&file, Mode::from_bits(0o755), &path).expect("none declared");
+    }
+
+    /// Set only in the unprivileged child
+    /// `a_setgid_bit_the_kernel_drops_is_refused_rather_than_published` runs
+    /// itself as, naming the setgid directory the child writes into.
+    const SET_ID_CHILD_DIR: &str = "BX_TEST_SET_ID_CHILD_DIR";
+
+    /// Printed by that child before anything else, so the parent can tell a
+    /// child that ran and failed from one that could not be started.
+    const SET_ID_CHILD_RAN: &str = "bx-set-id-child-ran";
+
+    #[test]
+    fn a_setgid_bit_the_kernel_drops_is_refused_rather_than_published() {
+        const NAME: &str =
+            "fs::atomic::tests::a_setgid_bit_the_kernel_drops_is_refused_rather_than_published";
+
+        if let Some(dir) = std::env::var_os(SET_ID_CHILD_DIR) {
+            // The child: uid 1, no supplementary groups, no capabilities, in a
+            // setgid directory owned by a group it is not in. The file it
+            // creates inherits that group, and the fchmod adding S_ISGID
+            // succeeds while the kernel clears the bit.
+            println!("{SET_ID_CHILD_RAN}");
+            let dir = PathBuf::from(dir);
+            let dest = dir.join("tool");
+            let mode = Mode::from_bits(0o2755);
+            let err = stage_now(&dest, mode)
+                .expect("stage")
+                .fill(b"#!/bin/sh\nexit 0\n")
+                .expect_err("a setgid bit the kernel dropped is not a mode bx may publish");
+            let Error::SetIdNotKept {
+                path,
+                declared,
+                landed,
+            } = &err
+            else {
+                panic!("expected SetIdNotKept, got {err:?}");
+            };
+            assert_eq!(path, &dest);
+            assert_eq!(*declared, mode);
+            assert_eq!(landed.bits() & 0o2000, 0, "the bit really was dropped");
+            assert!(!dest.exists(), "nothing was published");
+            assert_eq!(
+                names_in(&dir),
+                Vec::<OsString>::new(),
+                "no temporary file is left"
+            );
+            return;
+        }
+
+        let skip = |why: &str| eprintln!("skipped {NAME}: {why}");
+        let home = guarded_home();
+        // Another uid has to reach the directory and run this test binary,
+        // whose own directory it may not be able to read.
+        set_mode(home.path(), Mode::DEFAULT_DIR).expect("open the home to traversal");
+        let exe = home.child("bx-test");
+        std::fs::copy(std::env::current_exe().expect("the test binary"), &exe)
+            .expect("copy the test binary");
+        set_mode(&exe, Mode::from_bits(0o755)).expect("chmod the copy");
+        let dir = home.child("shared");
+        std::fs::create_dir(&dir).expect("mkdir");
+
+        // Each step in a user namespace mapping this user to root and its
+        // subordinate ids above that: give the directory group 5, make it
+        // setgid and world-writable, and run the child as uid 1.
+        let in_namespace = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new("unshare")
+                .args(["--map-auto", "--map-root-user", "--"])
+                .args(args)
+                .env(SET_ID_CHILD_DIR, &dir)
+                .output()
+        };
+        for step in [
+            [
+                std::ffi::OsStr::new("chown"),
+                "0:5".as_ref(),
+                dir.as_os_str(),
+            ],
+            ["chmod".as_ref(), "2777".as_ref(), dir.as_os_str()],
+        ] {
+            match in_namespace(&step) {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    return skip(&format!(
+                        "{step:?} in a user namespace failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                Err(e) => return skip(&format!("unshare could not run: {e}")),
+            }
+        }
+        let meta = std::fs::metadata(&dir).expect("stat");
+        if meta.mode() & 0o2000 == 0 || meta.gid() == rustix::process::getegid().as_raw() {
+            return skip("the directory is not setgid to a foreign group");
+        }
+
+        let child = in_namespace(&[
+            "setpriv".as_ref(),
+            "--reuid=1".as_ref(),
+            "--regid=1".as_ref(),
+            "--clear-groups".as_ref(),
+            "--".as_ref(),
+            exe.as_os_str(),
+            "--exact".as_ref(),
+            NAME.as_ref(),
+            "--nocapture".as_ref(),
+        ]);
+        let out = match child {
+            Ok(out) => out,
+            Err(e) => return skip(&format!("unshare could not run: {e}")),
+        };
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        if !stdout.contains(SET_ID_CHILD_RAN) {
+            return skip(&format!("the unprivileged child did not start: {stderr}"));
+        }
+        assert!(
+            out.status.success(),
+            "the unprivileged child failed:\n{stdout}\n{stderr}"
+        );
     }
 
     #[test]

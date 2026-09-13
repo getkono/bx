@@ -237,6 +237,27 @@ pub enum Error {
         /// The newest format version this build understands.
         supported: u16,
     },
+    /// A target handed to [`Ledger::record`] names a path that cannot be used
+    /// with the home the ledger was opened under.
+    ///
+    /// [`Error::ForeignPath`] is the same rule, applied when a ledger is read.
+    /// Recording such a path would leave a ledger every later open under that
+    /// home refuses, with no way back, so `record` refuses it first. Nothing is
+    /// recorded and nothing is stored.
+    #[error(
+        "bx will not record {stored}, which cannot be used with the home {}: {source}. Nothing \
+         was recorded",
+        .home.display()
+    )]
+    ForeignRecord {
+        /// The home the ledger was opened under.
+        home: PathBuf,
+        /// The path as the entry names it.
+        stored: String,
+        /// Why it cannot be used with that home.
+        #[source]
+        source: Box<crate::paths::Error>,
+    },
     /// The ledger's path is a symbolic link to something that does not exist.
     ///
     /// Not "no state": the likeliest cause is state kept on storage that is not

@@ -20,174 +20,42 @@
 //! among those files would make `bx rm` destructive. [`RootSet::owns`] is that
 //! exclusion, and it is checked before containment.
 //!
-//! The rule is therefore about the **value** a variable is given, never about
-//! the variable's name. Every value shaped like a path is judged against
-//! [`RootSet`] **whatever it is assigned to**: no list of relocating names can
-//! be complete, and a guard that judged only the names it knew approved every
-//! tool it had not heard of — `RIPGREP_CONFIG_PATH`, `GIT_CONFIG_SYSTEM`,
-//! `CARGO_TARGET_DIR`. A short, documented list of names whose value points at a
-//! program or a search list, not at a tool's files, needs no root, and is still
-//! refused a relative entry or one inside bx's own directories. [`check`] is the
-//! verdict. Declare no root — [`RootSet::strict`], which is what [`scan`] uses —
-//! and nothing may be relocated anywhere.
+//! **A fragment may set only a variable bx knows how to judge.** [`EMITTABLE`]
+//! is the table of every name bx may generate, and it says what each one holds
+//! — a [`Kind`]: a location, a program, a search list, a socket, or a setting.
+//! The value is judged for what the name holds. Every name the table does not
+//! list is refused as [`Reason::NotEmittable`], whatever its value.
 //!
-//! The guard **fails closed by shape**. It judges fragments bx generates, not
-//! arbitrary shell, so it does not model shell syntax and approve whatever it
-//! does not recognise: it reads a fragment against a small grammar — blank
-//! lines, comments, and `NAME=VALUE` or `export NAME=VALUE` with a restricted
-//! value — and refuses **every** line that is not one of those, whatever the
-//! line mentions and whether or not it relocates anything. A multi-line
-//! construct is refused at its first line, because no line the grammar accepts
-//! can leave a quote, a continuation or a heredoc open. [`scan_with`] states the
-//! grammar.
+//! The name space is closed on purpose. A value alone cannot say what it is:
+//! `EDITOR=nvim` names a program found through `PATH`, and `GIT_DIR=evil` names
+//! a directory relative to wherever the shell happens to be. And the set of
+//! variables some tool reads as a location is open-ended: every earlier guard
+//! that judged by a list of location names, or by whether a value looked like
+//! a path, approved a tool it had not heard of. The guard judges only what bx
+//! generates, so the table grows with the generators and with nothing else.
+//! [`check`] is the verdict. Declare no root — [`RootSet::strict`], which is
+//! what [`scan`] uses — and no location may be set at all.
+//!
+//! The guard **fails closed by shape** as well. It does not model shell syntax
+//! and approve whatever it does not recognise: it reads a fragment against a
+//! small grammar — blank lines, comments, and `NAME=VALUE` or
+//! `export NAME=VALUE` with a restricted value — and refuses **every** line that
+//! is not one of those, whatever the line mentions and whether or not it
+//! relocates anything. A multi-line construct is refused at its first line,
+//! because no line the grammar accepts can leave a quote, a continuation or a
+//! heredoc open. [`scan_with`] states the grammar.
 //!
 //! This module is that rule as code. Anything bx generates for a shell is run
 //! through [`scan_with`] before it is written, and the check is covered by tests
 //! rather than left to review.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::layers;
 use crate::config::values::ResolvedValues;
 use crate::paths;
-
-/// Exact variable names that say they hold a location.
-///
-/// A path given to any variable is judged whatever its name, so this list no
-/// longer decides *whether* a value is judged. It decides what a value that is
-/// no kind of path means: for one of these names a bare word is a path relative
-/// to wherever the shell happens to be, and is refused as [`Reason::NotAPath`],
-/// where for any other name it is a behaviour setting. A name missing from here
-/// costs only that.
-const DENIED_EXACT: &[&str] = &[
-    // The home itself: `~` and every XDG default are resolved against it.
-    "HOME",
-    // XDG roots — relocating any of these moves every tool at once.
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_STATE_HOME",
-    "XDG_RUNTIME_DIR",
-    // Per-tool roots.
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "GNUPGHOME",
-    "GOPATH",
-    "GOMODCACHE",
-    "GRADLE_USER_HOME",
-    "PYENV_ROOT",
-    "NVM_DIR",
-    "BUN_INSTALL",
-    "PNPM_HOME",
-    "DENO_DIR",
-    "DOTNET_CLI_HOME",
-    "NUGET_PACKAGES",
-    "GEM_HOME",
-    "COMPOSER_HOME",
-    "SSH_CONFIG",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GH_CONFIG_DIR",
-    "DOCKER_CONFIG",
-    "KUBECONFIG",
-    // zsh reads every startup file after `.zshenv` from here.
-    "ZDOTDIR",
-    // bash and zsh write the session's history here.
-    "HISTFILE",
-    // Caches and configs the prefix and suffix rules below do not reach. Each
-    // of these was observed relocating a real tool's directory while matching
-    // no rule: the guard was letting them through silently.
-    "GOCACHE",
-    "NUGET_HTTP_CACHE_PATH",
-    "HOMEBREW_CACHE",
-    "HOMEBREW_LOGS",
-    "HOMEBREW_TEMP",
-    "YARN_CACHE_FOLDER",
-    "STARSHIP_CONFIG",
-    "PYTHONUSERBASE",
-    "TMPDIR",
-    // `_CACHE_DIR` requires the underscore, so neither `CCACHE_DIR` nor
-    // `SCCACHE_DIR` (which ends in `CCACHE_DIR`) matched anything.
-    "CCACHE_DIR",
-    "SCCACHE_DIR",
-];
-
-/// Prefixes whose variables are, as a family, about where a tool's directories
-/// live. Matched against the whole name, so `MISE_DATA_DIR` is value-checked
-/// while `MISE_VERBOSE` is not.
-///
-/// A family holds far more behaviour variables than location variables, so a
-/// name matched **only** by a prefix is not, by itself, evidence that it holds a
-/// location. See [`names_a_location`].
-const DENIED_PREFIXES: &[&str] = &["UV_", "MISE_", "ASDF_", "PIP_"];
-
-/// Prefix families the tool itself reads without regard to case.
-///
-/// npm takes any environment variable matching `npm_config_*` in whatever case,
-/// and its own documentation writes them lower-case: `npm_config_cache=/x`
-/// moves npm's cache exactly as `NPM_CONFIG_CACHE=/x` does.
-const CASELESS_PREFIXES: &[&str] = &["NPM_CONFIG_"];
-
-/// Suffixes that mark a variable as naming a location.
-const DENIED_SUFFIXES: &[&str] = &[
-    "_HOME",
-    "_CONFIG_DIR",
-    "_DATA_DIR",
-    "_CACHE_DIR",
-    "_STATE_DIR",
-    "_CONFIG_FILE",
-    "_STORE_DIR",
-];
-
-/// The last word of a prefix-family name that says the variable holds a
-/// location: `UV_TOOL_DIR`, `PIP_TARGET`, `NPM_CONFIG_CACHE`,
-/// `UV_PROJECT_ENVIRONMENT`, `NPM_CONFIG_USERCONFIG`, `MISE_SHARED_INSTALL_DIRS`.
-///
-/// Each is taken from a location variable one of the families documents.
-/// It is what keeps a bare relative value — `NPM_CONFIG_CACHE=.npm`,
-/// `PIP_TARGET=build`, which move a tool's data to wherever the shell happens
-/// to be — from passing as a behaviour setting.
-const LOCATION_WORDS: &[&str] = &[
-    "DIR",
-    "DIRS",
-    "DIRECTORY",
-    "FOLDER",
-    "PATH",
-    "PATHS",
-    "FILE",
-    "FILENAME",
-    "FILENAMES",
-    "MODULE",
-    "DEST",
-    "HOME",
-    "ROOT",
-    "PREFIX",
-    "TARGET",
-    "CACHE",
-    "TMP",
-    "SRC",
-    "LOG",
-    "PROJECT",
-    "ENVIRONMENT",
-    "USERCONFIG",
-    "GLOBALCONFIG",
-];
-
-/// Names that match a rule above but carry no path at all: they configure
-/// behaviour, so a bare word given to one is not [`Reason::NotAPath`]. A path
-/// given to one is still judged, as it is for every name.
-///
-/// Only a name a *suffix* or a location word would otherwise mark is worth
-/// listing. A prefix-family behaviour variable — `UV_NO_CACHE=1`,
-/// `MISE_JOBS=8` — is recognised by its value and needs no entry here.
-const ALLOWED_EXCEPTIONS: &[&str] = &[
-    "UV_SYSTEM_PYTHON",
-    "MISE_VERBOSE",
-    "PIP_REQUIRE_VIRTUALENV",
-    // pip's `--no-cache-dir` switch, which the `_CACHE_DIR` suffix catches.
-    "PIP_NO_CACHE_DIR",
-];
 
 /// Names a shell defines and manages itself. A fragment may neither assign one
 /// nor refer to one.
@@ -395,7 +263,8 @@ const SHELL_NAMES: &[&str] = &[
     "zsh_scheduled_events",
 ];
 
-/// Names whose **assignment** a shell acts on, beyond holding the value.
+/// Names whose **assignment** a shell acts on, beyond holding the value, or
+/// whose value a shell it starts runs.
 ///
 /// None of these is defined by a pristine shell and each reads back exactly as
 /// written, so the probe behind [`SHELL_NAMES`] cannot find them. The list is
@@ -409,28 +278,39 @@ const SHELL_NAMES: &[&str] = &[
 /// * `POSIXLY_CORRECT`, `BASH_COMPAT` — bash changes how every later line
 ///   parses.
 /// * `GLOBIGNORE` — bash turns `dotglob` on when it is set.
+/// * `EXECIGNORE` — bash stops running any program whose path matches it.
 /// * `BASH_XTRACEFD` — bash closes the descriptor it held when it changes.
 /// * `PROMPT_COMMAND`, `PS0` — bash runs, or expands with command
 ///   substitution, the value at every prompt.
+/// * `RPROMPT`, `RPS1`, `RPROMPT2`, `RPS2` — zsh's right-hand prompts, which it
+///   expands at every prompt, command substitution included under
+///   `PROMPT_SUBST`, as it does `PS1`.
+/// * `BASH_ENV`, `ENV` — a non-interactive bash, and an interactive `sh`,
+///   source the file named there when they start.
 /// * `precmd_functions`, `preexec_functions`, `chpwd_functions`,
 ///   `periodic_functions`, `zshaddhistory_functions`, `zshexit_functions` — zsh
 ///   calls every function named in the value at its hook.
 ///
 /// `HISTSIZE` and `SAVEHIST` are reserved already, as [`SHELL_NAMES`].
-/// `HISTFILE` is not reserved: assigning it writes nothing, it only moves the
-/// history file, so its value is judged like any location's.
 ///
 /// `LANG` and `LC_*` change the shell's locale on assignment and are not here:
 /// the grammar admits printable ASCII only, whose meaning no locale changes,
 /// and a fragment setting a locale is ordinary.
 const ACTS_ON_ASSIGNMENT: &[&str] = &[
     "BASH_COMPAT",
+    "BASH_ENV",
     "BASH_XTRACEFD",
+    "ENV",
+    "EXECIGNORE",
     "GLOBIGNORE",
     "HISTFILESIZE",
     "POSIXLY_CORRECT",
     "PROMPT_COMMAND",
     "PS0",
+    "RPROMPT",
+    "RPROMPT2",
+    "RPS1",
+    "RPS2",
     "chpwd_functions",
     "periodic_functions",
     "precmd_functions",
@@ -444,112 +324,164 @@ fn is_reserved(name: &str) -> bool {
     SHELL_NAMES.contains(&name) || ACTS_ON_ASSIGNMENT.contains(&name)
 }
 
-/// Names whose path value points at a **program**, or at a running agent,
-/// rather than at a tool's config, data or cache. Pointing one elsewhere moves
-/// no tool's files, so it needs no declared root.
+/// What a variable in [`EMITTABLE`] holds, and therefore how its value is
+/// judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Where a tool keeps its config, data or cache, or a directory bx's own
+    /// fragment is written in terms of. Every `:`-separated entry of the value
+    /// must be an absolute path — `~` and `$HOME` expand to one — inside a
+    /// declared root and outside bx's own directories. A bare word, a relative
+    /// path and a URL are all relative to wherever the shell happens to be,
+    /// and are refused. A name that holds one path is split at `:` too, which
+    /// costs only a path with a `:` in it.
+    Location,
+    /// A program a tool runs, found by name or by path: exactly one word,
+    /// either an absolute path outside bx's own directories or a bare command
+    /// name — a letter or digit, then letters, digits, `.`, `_`, `+` and `-`.
+    /// No blank, so no argument: tools run the value through a shell, and an
+    /// argument is a second path, or a second assignment, that no check reads.
+    /// No `:`, `=`, `~` or URL either. Needs no root.
+    Program,
+    /// A list a shell or a tool searches. Every entry absolute, non-empty and
+    /// outside bx's own directories, whatever its shape, because an empty
+    /// entry or `.` *is* the current directory. A reference to the list's own
+    /// name that the fragment has not assigned — the `$PATH` in
+    /// `PATH="$HOME/.local/bin:$PATH"` — stands for the list the shell
+    /// inherited, which is the user's and is not judged, but only as a whole
+    /// entry: `$PATH/bin` is relative to nothing bx can know. Needs no root.
+    SearchList,
+    /// The socket of an agent that is already running: an absolute path
+    /// outside bx's own directories. It says where to reach a process, not
+    /// where a tool keeps anything, so it needs no root.
+    Socket,
+    /// A behaviour setting, which names no file at all.
+    Setting(Setting),
+}
+
+/// The values a [`Kind::Setting`] accepts. None of them can hold a `/`, a `~`,
+/// a `:`, a blank, a URL, or `.` or `..`, so no setting names a path; they
+/// differ only in whether a bare word is admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Setting {
+    /// `0`, `1`, `true` or `false`, and no other word.
+    Switch,
+    /// Digits, optionally followed by one of `K`, `M`, `G` or `T` — a count or
+    /// a size — and no other word.
+    Amount,
+    /// One bare word: a letter or digit, then letters, digits, `.`, `_`, `+`
+    /// and `-`. For a name whose tool reads the word as a mode or a locale.
+    Word,
+}
+
+impl Setting {
+    /// Whether this setting accepts `value`.
+    fn admits(self, value: &str) -> bool {
+        match self {
+            Self::Switch => matches!(value, "0" | "1" | "true" | "false"),
+            Self::Amount => {
+                let digits = value.strip_suffix(['K', 'M', 'G', 'T']).unwrap_or(value);
+                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+            }
+            Self::Word => is_bare_word(value),
+        }
+    }
+}
+
+/// Every variable name bx may generate, in byte order, with what it holds.
 ///
-/// It is not waved through. When the value is shaped like a path, every entry
-/// must still be absolute and outside bx's own directories: a relative program
-/// runs whatever the current directory holds, and one inside bx's state
-/// directory is one `bx rm` deletes. A value that is no kind of path —
-/// `EDITOR=nvim` — is a program found through `PATH`, as for any name.
+/// **This table is the guard's whole name space**: a name it does not list is
+/// [`Reason::NotEmittable`], whatever it is given. It must grow with the
+/// generators, one name at a time, each with the kind its tool documents —
+/// and a name whose tool reads it as a command line (`MAKEFLAGS`, `RUSTFLAGS`,
+/// `LESS`) or as either a word or a path (`CARGO_BUILD_TARGET` takes a
+/// `.json` target file) needs a kind that can judge that before it is added.
 ///
+/// * The XDG base directories, and the 23 relocating exports of the operator
+///   fragment the module's tests hold the guard to: `SCRATCH_HOME`, the root
+///   the fragment is written in terms of, and 22 toolchain caches and homes.
+///   `CACHE_DIR` and `DATA_DIR` are that fragment's two unexported helpers,
+///   and `SCCACHE_DIR` is sccache's cache, the module's motivating case.
 /// * `EDITOR`, `VISUAL`, `PAGER`, `BROWSER`, `TERMINAL` — the program a tool
-///   runs to edit, page, browse or open a terminal.
-/// * `RUSTC_WRAPPER` — the program cargo runs `rustc` through, and one of this
-///   module's two motivating cases.
-/// * `SSH_AUTH_SOCK` — the socket of an ssh agent that is already running. It
-///   says where to reach a process, not where ssh keeps anything.
+///   runs to edit, page, browse or open a terminal — and `RUSTC_WRAPPER`, the
+///   program cargo runs `rustc` through.
+/// * `PATH` and `INFOPATH`, searched for programs and documents.
+/// * `SSH_AUTH_SOCK`, the running ssh agent.
+/// * `SCCACHE_CACHE_SIZE` and `MISE_JOBS` (amounts), `UV_NO_CACHE` and
+///   `MISE_VERBOSE` (switches), `CARGO_TERM_COLOR` and `LANG` (words).
 ///
-/// `SHELL` and `MANPATH` would belong here and do not: both are
-/// [`SHELL_NAMES`], which may not be assigned at all. Every name not listed
-/// here or in [`SEARCH_LISTS`] is judged against the roots — including
-/// `LD_LIBRARY_PATH` and `PKG_CONFIG_PATH`, which change what a program loads
-/// and are left to a declared root rather than exempted.
-const PROGRAMS: &[&str] = &[
-    "BROWSER",
-    "EDITOR",
-    "PAGER",
-    "RUSTC_WRAPPER",
-    "SSH_AUTH_SOCK",
-    "TERMINAL",
-    "VISUAL",
+/// `SHELL`, `MANPATH` and `HOME` would belong here and do not: each is a
+/// [`SHELL_NAMES`] entry, which may not be assigned at all.
+const EMITTABLE: &[(&str, Kind)] = &[
+    ("ANDROID_HOME", Kind::Location),
+    ("ANDROID_USER_HOME", Kind::Location),
+    ("BROWSER", Kind::Program),
+    ("BUN_INSTALL", Kind::Location),
+    ("BUN_INSTALL_CACHE_DIR", Kind::Location),
+    ("CACHE_DIR", Kind::Location),
+    ("CARGO_HOME", Kind::Location),
+    ("CARGO_TERM_COLOR", Kind::Setting(Setting::Word)),
+    ("DATA_DIR", Kind::Location),
+    ("DOTNET_CLI_HOME", Kind::Location),
+    ("EDITOR", Kind::Program),
+    ("GOCACHE", Kind::Location),
+    ("GOMODCACHE", Kind::Location),
+    ("GOPATH", Kind::Location),
+    ("HOMEBREW_CACHE", Kind::Location),
+    ("HOMEBREW_LOGS", Kind::Location),
+    ("HOMEBREW_TEMP", Kind::Location),
+    ("INFOPATH", Kind::SearchList),
+    ("LANG", Kind::Setting(Setting::Word)),
+    ("MISE_CACHE_DIR", Kind::Location),
+    ("MISE_DATA_DIR", Kind::Location),
+    ("MISE_JOBS", Kind::Setting(Setting::Amount)),
+    ("MISE_VERBOSE", Kind::Setting(Setting::Switch)),
+    ("NPM_CONFIG_CACHE", Kind::Location),
+    ("NUGET_HTTP_CACHE_PATH", Kind::Location),
+    ("NUGET_PACKAGES", Kind::Location),
+    ("PAGER", Kind::Program),
+    ("PATH", Kind::SearchList),
+    ("PIP_CACHE_DIR", Kind::Location),
+    ("PNPM_CONFIG_STORE_DIR", Kind::Location),
+    ("RUSTC_WRAPPER", Kind::Program),
+    ("RUSTUP_HOME", Kind::Location),
+    ("SCCACHE_CACHE_SIZE", Kind::Setting(Setting::Amount)),
+    ("SCCACHE_DIR", Kind::Location),
+    ("SCRATCH_HOME", Kind::Location),
+    ("SSH_AUTH_SOCK", Kind::Socket),
+    ("TERMINAL", Kind::Program),
+    ("UV_CACHE_DIR", Kind::Location),
+    ("UV_NO_CACHE", Kind::Setting(Setting::Switch)),
+    ("VISUAL", Kind::Program),
+    ("XDG_CACHE_HOME", Kind::Location),
+    ("XDG_CONFIG_HOME", Kind::Location),
+    ("XDG_DATA_HOME", Kind::Location),
+    ("XDG_STATE_HOME", Kind::Location),
+    ("ZIG_GLOBAL_CACHE_DIR", Kind::Location),
 ];
 
-/// Colon-separated lists a shell or a tool **searches** for programs or
-/// documents, and which a fragment plausibly extends. Like [`PROGRAMS`] they
-/// need no root, and unlike them they are judged whatever their shape: every
-/// entry must be absolute and outside bx's own directories, because an empty
-/// entry or `.` *is* the current directory and a relative entry is resolved
-/// against it — `PATH=bin` runs whatever `./bin` holds.
+/// What `name` holds, if bx may generate it at all.
 ///
-/// A reference to the list's own name that the fragment has not assigned —
-/// the `$PATH` in `PATH="$HOME/.local/bin:$PATH"` — stands for the list the
-/// shell inherited. That list is the user's, not bx's, so it is not judged, but
-/// only as a whole entry: `$PATH/bin` is relative to nothing bx can know.
-const SEARCH_LISTS: &[&str] = &["INFOPATH", "PATH"];
+/// The match is exact and case-sensitive, because environment variable names
+/// are: a tool that reads `CARGO_HOME` does not read `cargo_home`, and a name
+/// the table does not spell is not in it.
+fn emittable(name: &str) -> Option<Kind> {
+    EMITTABLE
+        .iter()
+        .find(|(listed, _)| *listed == name)
+        .map(|(_, kind)| *kind)
+}
+
+/// The variable whose value, followed by `/bx`, is bx's config repo.
+const CONFIG_HOME: &str = "XDG_CONFIG_HOME";
+
+/// The variable whose value, followed by `/bx`, is bx's state directory.
+const STATE_HOME: &str = "XDG_STATE_HOME";
 
 /// What an unassigned reference to a search list's own name expands to while
 /// the list is judged. No accepted value holds a control character, so no
 /// entry a fragment writes can equal it.
 const INHERITED: &str = "\0";
-
-/// Whether `name` ends in one of [`DENIED_SUFFIXES`], with something before it.
-fn has_location_suffix(name: &str) -> bool {
-    DENIED_SUFFIXES
-        .iter()
-        .any(|s| name.ends_with(s) && name.len() > s.len())
-}
-
-/// What follows the family prefix `name` begins with, if it begins with one.
-fn family_tail(name: &str) -> Option<&str> {
-    let exact = DENIED_PREFIXES.iter().find_map(|p| name.strip_prefix(p));
-    let caseless = || {
-        CASELESS_PREFIXES.iter().find_map(|p| {
-            name.get(..p.len())
-                .filter(|head| head.eq_ignore_ascii_case(p))
-                .map(|head| &name[head.len()..])
-        })
-    };
-    exact.or_else(caseless).filter(|tail| !tail.is_empty())
-}
-
-/// Whether the variable's **name** says that it holds a location.
-///
-/// True of an exact name and of a suffix match, where the name is the evidence.
-/// For a name matched only by a family prefix it is true when the name's last
-/// word is a [`LOCATION_WORDS`] entry — unless the name is a `NO_` switch, which
-/// turns a location off rather than naming one (`UV_NO_CACHE`). Never true of
-/// an [`ALLOWED_EXCEPTIONS`] name.
-///
-/// This decides nothing about a value shaped like a path, which is judged for
-/// every name. It decides what a value that is no kind of path is: for a name
-/// that says it holds a location, a path relative to wherever the shell is
-/// ([`Reason::NotAPath`]); for any other, a behaviour setting — `MISE_JOBS=8`,
-/// `UV_PYTHON=3.12`, `CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu`. The
-/// location-word test is kept to the prefix families on purpose: across every
-/// name, `_TARGET` and `_MODULE` end ordinary settings
-/// (`DJANGO_SETTINGS_MODULE=site.settings`).
-///
-/// The match is case-sensitive, because environment variable names are and a
-/// tool that reads `CARGO_HOME` does not read `cargo_home` — except for a family
-/// its tool reads without regard to case, `npm_config_*`.
-fn names_a_location(name: &str) -> bool {
-    if ALLOWED_EXCEPTIONS.contains(&name) {
-        return false;
-    }
-    if DENIED_EXACT.contains(&name) || has_location_suffix(name) {
-        return true;
-    }
-    family_tail(name).is_some_and(|tail| {
-        let tail = tail.to_ascii_uppercase();
-        !tail.starts_with("NO_")
-            && tail
-                .rsplit('_')
-                .next()
-                .is_some_and(|last| LOCATION_WORDS.contains(&last))
-    })
-}
 
 /// The roots a configuration declares as its own.
 ///
@@ -567,6 +499,9 @@ fn names_a_location(name: &str) -> bool {
 /// rather than a root: invariant 2's first sentence — never point a tool at a
 /// bx-owned directory — is unconditional, so it holds even inside a declared
 /// root and even when the declared root is the home. See [`RootSet::owns`].
+/// And it carries bx's config repo at its default place, which bx does not own
+/// — it is the user's tree — but which bx's state directory may be put neither
+/// inside nor around.
 ///
 /// Containment is decided **lexically**, never by touching the filesystem.
 /// `canonicalize` would make the verdict depend on what exists and on what is
@@ -586,14 +521,17 @@ pub struct RootSet {
     roots: Vec<PathBuf>,
     inadmissible: Vec<PathBuf>,
     owned: Vec<PathBuf>,
+    repos: Vec<PathBuf>,
 }
 
 impl RootSet {
     /// The set that declares nothing, and therefore permits no relocation.
     ///
-    /// This is what [`scan`] uses, and it is why `scan` needs no home: with no
-    /// root declared every value shaped like a path is a violation before it is
-    /// compared with anything, so there is nothing to expand `~` against.
+    /// This is what [`scan`] uses, and it needs no home: with no root declared
+    /// every location is a violation before it is compared with anything. A
+    /// program, a search list or a socket needs no root, and without a home
+    /// the set cannot say where bx's state directory is — so it owns every
+    /// directory that could be it. See [`RootSet::owns`].
     #[must_use]
     pub fn strict() -> Self {
         Self {
@@ -601,6 +539,7 @@ impl RootSet {
             roots: Vec::new(),
             inadmissible: Vec::new(),
             owned: Vec::new(),
+            repos: Vec::new(),
         }
     }
 
@@ -630,11 +569,13 @@ impl RootSet {
             }
         }
         let owned = vec![paths::normalize(&layers::state_dir(&home, None))];
+        let repos = vec![paths::normalize(&paths::config_root_in(&home, None))];
         Self {
             home: Some(home),
             roots: admitted,
             inadmissible,
             owned,
+            repos,
         }
     }
 
@@ -677,10 +618,17 @@ impl RootSet {
     /// directory another tool believes is its own. So this is checked **before**
     /// containment and outranks it — a user may declare their home a root, and
     /// `XDG_STATE_HOME=~/.local/state/bx` is still refused.
+    ///
+    /// A set without a home — [`RootSet::strict`] — cannot show that a path is
+    /// *not* bx's state directory, whose default place is under the home. So it
+    /// owns every path that passes through `.local/state/bx`, whoever's home
+    /// that is. A set with a home knows where its state directory is, and owns
+    /// only that and what [`RootSet::owning`] adds.
     #[must_use]
     pub fn owns(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);
         self.owned.iter().any(|dir| normalised.starts_with(dir))
+            || (self.home.is_none() && passes_through_a_default_state_dir(&normalised))
     }
 
     /// Whether `path` lies inside some declared root.
@@ -726,6 +674,16 @@ impl RootSet {
     }
 }
 
+/// Whether a normalised `path` has `.local`, `state` and `bx` as three
+/// consecutive components: the default state directory under some home.
+fn passes_through_a_default_state_dir(path: &Path) -> bool {
+    let default = [".local", "state", "bx"].map(|part| Component::Normal(OsStr::new(part)));
+    path.components()
+        .collect::<Vec<_>>()
+        .windows(default.len())
+        .any(|window| window == default)
+}
+
 /// Whether a declared root may widen the guard at all.
 ///
 /// The floor under every root, whatever declared it. A root must be an absolute
@@ -769,16 +727,17 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
     false
 }
 
-/// Why a relocating assignment was rejected.
+/// Why an assignment was rejected.
 ///
 /// Each names a different user action — declare a root, fix the declared root,
 /// split the line, write the line in the grammar the guard reads, use a name
-/// the shell does not manage, move the value out of bx's own directory, move it
-/// inside a declared root, give a location variable a path, write an absolute
-/// path, define the referenced variable earlier, fix the line that assigned it,
-/// shorten it — so a caller that only knew *which* variable was rejected could
-/// not say what to do about it. The messages name no data: the caller already
-/// holds the value and the root set, and prints them itself.
+/// the shell does not manage, use a name bx may generate, move the value out of
+/// bx's own directory, move it inside a declared root, write an absolute path,
+/// give a program no arguments, give a setting a value it accepts, keep bx's
+/// state and config apart, define the referenced variable earlier, fix the line
+/// that assigned it, shorten it — so a caller that only knew *which* variable
+/// was rejected could not say what to do about it. The messages name no data:
+/// the caller already holds the value and the root set, and prints them itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Reason {
     /// Nothing was declared, so nothing may be relocated.
@@ -800,23 +759,34 @@ pub enum Reason {
     #[error("is shell the guard cannot read, so it is not approved")]
     Unreadable,
     /// It assigns, or refers to, a name the shell manages itself — `HOME`,
-    /// `RANDOM`, zsh's tied `path` — whose value would not read back as
-    /// written.
+    /// `RANDOM`, zsh's tied `path` — or acts on when it is assigned.
     #[error("assigns or refers to a name the shell manages itself")]
     ReservedName,
+    /// It assigns a name bx does not generate, whatever the value: the guard
+    /// cannot tell what a name it does not know holds.
+    #[error("assigns a variable bx does not generate, so it cannot judge the value")]
+    NotEmittable,
     /// It points at a directory bx owns, whatever the roots say.
     #[error("points inside a directory bx owns")]
     BxOwnedDirectory,
+    /// It would put bx's state directory inside its config repo, or the other
+    /// way round, or make them one directory.
+    #[error("puts bx's state directory and its config repo one inside the other")]
+    NestsBxDirectories,
     /// It resolves to a path, but not one inside any declared root.
     #[error("resolves outside every declared root")]
     OutsideDeclaredRoots,
-    /// Not a path at all, for a variable whose name says it holds one.
-    #[error("is not a path, though the variable's name says it holds a location")]
-    NotAPath,
-    /// Empty, or relative — it is shaped like a path, but not one that can be
-    /// shown to be inside a root. For a list, one of its entries is.
+    /// Empty, a bare word, a URL, or a relative path, where a path that can be
+    /// shown to be somewhere is needed. For a list, one of its entries is.
     #[error("is not an absolute path")]
     NotAbsolute,
+    /// A program given something other than exactly one absolute path or one
+    /// bare command name: an argument, a `:` list, a URL, nothing at all.
+    #[error("is not one program — an absolute path or a bare command name, with no arguments")]
+    NotAProgram,
+    /// A setting given a value it does not accept.
+    #[error("is not a value this setting accepts")]
+    NotASetting,
     /// It names a variable this fragment has not assigned by this line.
     #[error("refers to a variable this fragment has not assigned")]
     UnresolvedReference,
@@ -867,11 +837,8 @@ pub struct Violation {
 /// grammar [`scan_with`] reads a line with — so a value that is not exactly one
 /// value in that grammar, optionally followed by a comment, is refused for
 /// every variable, and a `name` that is not a variable name is refused too.
-/// Past that, the verdict is about the value, as [`scan_with`] states: a value
-/// that is no kind of path — `EDITOR=nvim`, `SCCACHE_CACHE_SIZE=100G` — is
-/// allowed unless the name says it holds a location, and a value shaped like a
-/// path is allowed exactly when every `:`-separated entry of it resolves inside
-/// a declared root, whatever the name.
+/// Past that, `name` must be one bx generates, and the value is judged for what
+/// that name holds, as [`scan_with`] states.
 ///
 /// This is the same function [`scan_with`] calls for every assignment it reads,
 /// so the two cannot disagree about one. No reference resolves here except
@@ -931,25 +898,29 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// A name the shell manages itself — `HOME`, `RANDOM`, `LINENO`, zsh's `path`
 /// and the rest of `SHELL_NAMES` — or acts on when it is assigned —
 /// `HISTFILESIZE` and the rest of [`ACTS_ON_ASSIGNMENT`] — may be neither
-/// assigned nor referred to, and is refused as [`Reason::ReservedName`]. `PATH`
-/// may.
+/// assigned nor referred to, and is refused as [`Reason::ReservedName`].
 ///
-/// **What is judged.** The value, as a shell gives it, whatever it is assigned
-/// to — exported or not, since assigning a name the environment already exports
-/// changes what every child sees:
+/// **What is judged.** Every accepted assignment, exported or not, since
+/// assigning a name the environment already exports changes what every child
+/// sees. A name [`EMITTABLE`] does not list is [`Reason::NotEmittable`]. For
+/// one it lists, the value as a shell gives it is judged for the [`Kind`] the
+/// table records:
 ///
-/// * a value **shaped like a path** — some `:`-entry of it absolute, beginning
-///   `~`, containing `/`, or `.` or `..`, and not a URL — must have every entry
-///   absolute, outside bx's own directories and inside a declared root;
-/// * a value that is **no kind of path** is allowed, unless the name says it
-///   holds a location, when it is [`Reason::NotAPath`];
-/// * a value that **does not resolve** cannot be shown not to be a path, and is
-///   judged as one;
-/// * a [`PROGRAMS`] name needs no root for a path value, and a [`SEARCH_LISTS`]
-///   name needs none for any value, but every entry of either must still be
-///   absolute and outside bx's own directories.
+/// * a **location** needs a declared root, and every `:`-entry must be
+///   absolute, outside bx's own directories and inside a root;
+///   `XDG_CONFIG_HOME` and `XDG_STATE_HOME` may not, besides, put bx's config
+///   repo and its state directory one inside the other;
+/// * a **program** is one absolute path outside bx's own directories, or one
+///   bare command name;
+/// * a **search list** has every entry absolute and outside bx's own
+///   directories, its inherited self standing in for itself;
+/// * a **socket** is an absolute path outside bx's own directories;
+/// * a **setting** holds a value of its [`Setting`] shape.
 ///
-/// **What is learned.** One forward pass. Every accepted assignment — exported
+/// A value that does not resolve cannot be shown to be any of those, and is
+/// refused for why it does not.
+///
+/// **What is learned.** Every accepted assignment — exported or not, emittable
 /// or not — is recorded, **expanded**, so a later line may refer to it: the
 /// generated `.zshenv` is written in terms of a declared root variable, and a
 /// guard that could not resolve `$SCRATCH_HOME` would either reject every
@@ -960,15 +931,15 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// known — such a line could have assigned or unset anything — so every later
 /// reference is [`Reason::UnreadableReference`].
 ///
-/// An accepted assignment to `XDG_STATE_HOME` whose value is absolute moves
-/// bx's state directory to `$XDG_STATE_HOME/bx` — [`layers::state_dir`]'s rule
-/// — for every later line, and the directory it moved from stays owned too: a
-/// tool pointed into either writes among bx's records.
-///
-/// **Lists.** A value shaped like a path is split at `:`, and every entry must
-/// be an absolute path inside a root and outside bx's own directories: a
-/// `KUBECONFIG` or a `GOPATH` is a list, and a single path with a `:` in it is
-/// judged no less strictly for being split.
+/// **Where bx's directories are.** An `XDG_STATE_HOME` the fragment assigns
+/// moves bx's state directory to `$XDG_STATE_HOME/bx` — [`layers::state_dir`]'s
+/// rule — and an `XDG_CONFIG_HOME` moves its config repo to
+/// `$XDG_CONFIG_HOME/bx`. Both are read from **every** line before any line is
+/// judged, because a shell that sources the fragment ends with the last of
+/// them, and bx then runs with that: a tool pointed at `<root>/state/bx` on the
+/// line *before* `XDG_STATE_HOME=<root>/state` writes among bx's records all
+/// the same. Every directory any assignment moves them to counts, and so do the
+/// home's defaults.
 ///
 /// **Purity.** Nothing is read from the process environment and nothing is
 /// read from disk. `$HOME` comes from `roots`, never from [`std::env`], and the
@@ -988,19 +959,34 @@ pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
 /// Find every forbidden assignment in a block of shell bx is about to write.
 ///
 /// Equivalent to [`scan_with`] against [`RootSet::strict`]: with no root
-/// declared, every value shaped like a path is a violation, except a program's
-/// or a search list's absolute one. This is the check for a
-/// caller that has no configuration to consult, and it is why it needs no home.
+/// declared, every location is a violation, and a program, a search list or a
+/// socket may not pass through a default state directory under any home. This
+/// is the check for a caller that has no configuration to consult, and it is
+/// why it needs no home.
 #[must_use]
 pub fn scan(content: &str) -> Vec<Violation> {
     scan_with(content, &RootSet::strict())
 }
 
-/// [`scan_with`]'s one pass: the violations, and what the fragment was learned
-/// to assign.
+/// [`scan_with`]'s verdict, and what the fragment was learned to assign.
+///
+/// Two walks over the content. The first learns where every `XDG_STATE_HOME`
+/// and `XDG_CONFIG_HOME` in it moves bx's directories; the second judges every
+/// line knowing all of them. Nothing else the first walk finds is kept.
 fn pass(content: &str, roots: &RootSet) -> (Vec<Violation>, Scope) {
+    let (_, first) = walk(content, roots, Scope::default());
+    let moved = Scope {
+        owned: first.owned,
+        repos: first.repos,
+        ..Scope::default()
+    };
+    walk(content, roots, moved)
+}
+
+/// One walk over `content`, judging each line against `roots` and what
+/// `scope` holds, and learning into it.
+fn walk(content: &str, roots: &RootSet, mut scope: Scope) -> (Vec<Violation>, Scope) {
     let mut found = Vec::new();
-    let mut scope = Scope::default();
     for (idx, line) in content.split('\n').enumerate() {
         let violation = |name: &str, value: &str, reason| Violation {
             line: idx + 1,
@@ -1019,7 +1005,7 @@ fn pass(content: &str, roots: &RootSet) -> (Vec<Violation>, Scope) {
                 if let Some(reason) = judged.reason {
                     found.push(violation(name, value, reason));
                 }
-                scope.learn(name, judged, roots.home());
+                scope.learn(name, judged);
             }
         }
     }
@@ -1041,8 +1027,8 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
         reason: Some(reason),
         resolved: Err(reason),
     };
-    // The shape is read for every variable, relocating or not: a line the
-    // grammar does not read may do anything, whatever its first name is.
+    // The shape is read for every variable: a line the grammar does not read
+    // may do anything, whatever its first name is.
     if !is_variable_name(name) {
         return refused(Reason::Unreadable);
     }
@@ -1054,53 +1040,121 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
         return refused(Reason::ReservedName);
     }
     let resolved = word.resolve(scope, roots.home());
-    let judged = |reason| Judged {
-        reason,
-        resolved: resolved.clone(),
+    let reason = match emittable(name) {
+        None => Some(Reason::NotEmittable),
+        Some(kind) => judge(kind, name, &word, &resolved, scope, roots),
     };
-    // Every entry of a list, judged by `refuses`, or why the value has none.
-    let each_entry =
-        |value: &Result<String, Reason>, refuses: &dyn Fn(&Path) -> Option<Reason>| match value {
-            Ok(list) => list
-                .split(':')
-                .filter(|entry| *entry != INHERITED)
-                .find_map(|entry| refuses(Path::new(entry))),
-            Err(reason) => Some(*reason),
-        };
-    let anchored = |entry: &Path| refuses_unanchored(entry, scope, roots);
+    Judged { reason, resolved }
+}
 
-    // A search list is judged entry by entry whatever its shape, with the list
-    // the shell inherited standing in for a reference to its own name.
-    if SEARCH_LISTS.contains(&name) {
-        let listed = word.expand(scope, roots.home(), Some(name));
-        return judged(each_entry(&listed, &anchored));
+/// Why `resolved` — what `word` gives `name` — may not be given to a variable
+/// of `kind`, or `None` if it may.
+fn judge(
+    kind: Kind,
+    name: &str,
+    word: &Word<'_>,
+    resolved: &Result<String, Reason>,
+    scope: &Scope,
+    roots: &RootSet,
+) -> Option<Reason> {
+    let anchored = |entry: &str| refuses_unanchored(Path::new(entry), scope, roots);
+    match kind {
+        Kind::SearchList => within(&word.expand(scope, roots.home(), Some(name)), |list| {
+            list.split(':')
+                .filter(|entry| *entry != INHERITED)
+                .find_map(anchored)
+        }),
+        // A set with no admissible root permits no location, whatever it is.
+        Kind::Location => roots.refuses_everything().or_else(|| {
+            within(resolved, |value| {
+                value
+                    .split(':')
+                    .find_map(|entry| refuses_entry(Path::new(entry), scope, roots))
+                    .or_else(|| nests(name, value, scope, roots))
+            })
+        }),
+        Kind::Program => within(resolved, |value| refuses_program(value, scope, roots)),
+        Kind::Socket => within(resolved, anchored),
+        Kind::Setting(setting) => within(resolved, |value| {
+            (!setting.admits(value)).then_some(Reason::NotASetting)
+        }),
     }
-    // A value that does not resolve cannot be shown not to be a path. An empty
-    // value, for a name that says it holds a location, is a degenerate path
-    // rather than a setting: `CARGO_HOME=` relocates the tool, to nowhere.
-    let shaped = resolved.as_ref().map_or(true, |value| {
-        path_shaped(value) || (value.is_empty() && names_a_location(name))
-    });
-    // A value that is no kind of path, for a variable whose name does not say
-    // it holds a location, is a behaviour setting: it relocates nothing, so it
-    // needs no root — `MISE_JOBS=8` is allowed with none declared.
-    if !shaped && !names_a_location(name) {
-        return judged(None);
+}
+
+/// `judge` applied to a value that resolved, or why it did not.
+fn within(
+    resolved: &Result<String, Reason>,
+    judge: impl FnOnce(&str) -> Option<Reason>,
+) -> Option<Reason> {
+    match resolved {
+        Ok(value) => judge(value),
+        Err(reason) => Some(*reason),
     }
-    if PROGRAMS.contains(&name) {
-        return judged(each_entry(&resolved, &anchored));
+}
+
+/// Why `value` is not one program bx may name, or `None` if it is.
+///
+/// A value with a `/` in it and nothing but word characters beside is a path,
+/// which must be absolute and outside bx's own directories. Anything else must
+/// be a bare command name.
+fn refuses_program(value: &str, scope: &Scope, roots: &RootSet) -> Option<Reason> {
+    if value.contains('/') && value.chars().all(|c| c == '/' || is_word_char(c)) {
+        refuses_unanchored(Path::new(value), scope, roots)
+    } else if is_bare_word(value) {
+        None
+    } else {
+        Some(Reason::NotAProgram)
     }
-    // A set with no admissible root permits no relocation, and is the only set
-    // without a home — so past this point there is always a home.
-    if let Some(reason) = roots.refuses_everything() {
-        return judged(Some(reason));
-    }
-    if !shaped {
-        return judged(Some(Reason::NotAPath));
-    }
-    judged(each_entry(&resolved, &|entry| {
-        refuses_entry(entry, scope, roots)
-    }))
+}
+
+/// A character of a bare word: an ASCII letter or digit, `.`, `_`, `+` or `-`.
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "._+-".contains(c)
+}
+
+/// Whether `value` is one bare word: a letter or digit, then word characters.
+/// So never empty, never `.` or `..`, never an option, never a path.
+fn is_bare_word(value: &str) -> bool {
+    value.starts_with(|c: char| c.is_ascii_alphanumeric()) && value.chars().all(is_word_char)
+}
+
+/// Whether `value`, given to `name`, puts bx's config repo and its state
+/// directory one inside the other — either the one the root set knows or one
+/// any line of the fragment moves.
+///
+/// The config loader refuses a state directory inside the repo
+/// (`LocalInRepo`), so such a fragment would stop bx from running; and a repo
+/// on the state directory would have git and the user writing among bx's
+/// records.
+fn nests(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Option<Reason> {
+    let (moved, mut others) = match name {
+        CONFIG_HOME => (repo_for(value), roots.owned.iter().chain(&scope.owned)),
+        STATE_HOME => (state_dir_for(value), roots.repos.iter().chain(&scope.repos)),
+        _ => return None,
+    };
+    others
+        .any(|other| moved.starts_with(other) || other.starts_with(&moved))
+        .then_some(Reason::NestsBxDirectories)
+}
+
+/// bx's state directory when `XDG_STATE_HOME` is `value`, by
+/// [`layers::state_dir`]'s own rule, normalised.
+///
+/// Worked out against an empty home. A value the rule honours is absolute and
+/// needs none. A value it does not honour leaves the directory at the home's
+/// default, which every set with a home owns already — and here yields a
+/// relative path, which no absolute path lies inside or around.
+fn state_dir_for(value: &str) -> PathBuf {
+    paths::normalize(&layers::state_dir(Path::new(""), Some(OsStr::new(value))))
+}
+
+/// bx's config repo when `XDG_CONFIG_HOME` is `value`, by
+/// [`paths::config_root_in`]'s own rule, normalised, as [`state_dir_for`].
+fn repo_for(value: &str) -> PathBuf {
+    paths::normalize(&paths::config_root_in(
+        Path::new(""),
+        Some(OsStr::new(value)),
+    ))
 }
 
 /// Why one resolved path — a value, or one entry of a list — may not be a
@@ -1124,7 +1178,7 @@ fn refuses_unanchored(path: &Path, scope: &Scope, roots: &RootSet) -> Option<Rea
     None
 }
 
-/// What one pass over a fragment has learned it assigns.
+/// What one walk over a fragment has learned it assigns.
 #[derive(Debug, Default)]
 struct Scope {
     /// What each accepted assignment expanded to, or why the guard cannot know.
@@ -1132,9 +1186,11 @@ struct Scope {
     /// Whether a refused line has passed. After one nothing is known, because
     /// the guard did not read what it assigned or unset.
     lost: bool,
-    /// bx's state directory wherever an earlier `XDG_STATE_HOME` moved it,
-    /// normalised. Only ever grows: a refused line does not give it back.
+    /// bx's state directory wherever an `XDG_STATE_HOME` moves it, normalised.
+    /// Only ever grows: a refused line does not give it back.
     owned: Vec<PathBuf>,
+    /// bx's config repo wherever an `XDG_CONFIG_HOME` moves it, normalised.
+    repos: Vec<PathBuf>,
 }
 
 impl Scope {
@@ -1168,13 +1224,13 @@ impl Scope {
         !self.lost && !self.learned.contains_key(name)
     }
 
-    /// Whether `path` lies inside a state directory the fragment moved.
+    /// Whether `path` lies inside a state directory the fragment moves.
     fn owns(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);
         self.owned.iter().any(|dir| normalised.starts_with(dir))
     }
 
-    /// Learn what an assignment the pass has just judged gave its name.
+    /// Learn what an assignment the walk has just judged gave its name.
     ///
     /// Only *after* judging it, as a shell does: the right-hand side sees the
     /// previous value of the name, not this one. A value the grammar refused
@@ -1182,19 +1238,21 @@ impl Scope {
     /// name the shell manages may change another name with it, so either
     /// forgets everything.
     ///
-    /// An `XDG_STATE_HOME` it learns moves bx's state directory, by
-    /// [`layers::state_dir`]'s rule, for every later line. Only against a
-    /// home: a set without one refuses that assignment itself, and every value
-    /// shaped like a path after it.
-    fn learn(&mut self, name: &str, judged: Judged, home: Option<&Path>) {
+    /// An `XDG_STATE_HOME` or `XDG_CONFIG_HOME` it learns moves bx's state
+    /// directory or config repo, by the XDG rule, whether or not the line was
+    /// approved: a shell moves it all the same.
+    fn learn(&mut self, name: &str, judged: Judged) {
         match judged.reason {
             Some(Reason::Unreadable | Reason::MultipleAssignments | Reason::ReservedName) => {
                 self.forget_everything();
             }
             _ => {
-                if let (Some(home), Ok(value), "XDG_STATE_HOME") = (home, &judged.resolved, name) {
-                    let dir = layers::state_dir(home, Some(std::ffi::OsStr::new(value)));
-                    self.owned.push(paths::normalize(&dir));
+                if let Ok(value) = &judged.resolved {
+                    match name {
+                        STATE_HOME => self.owned.push(state_dir_for(value)),
+                        CONFIG_HOME => self.repos.push(repo_for(value)),
+                        _ => {}
+                    }
                 }
                 self.learned
                     .insert(name.to_string(), judged.resolved.map_err(as_reference));
@@ -1224,34 +1282,6 @@ fn as_reference(reason: Reason) -> Reason {
 /// doubles a variable — `X=$X$X` — doubles what is stored, and a fragment of a
 /// few dozen such lines would otherwise hold gigabytes.
 const MAX_EXPANDED_LEN: usize = 4096;
-
-/// Whether `value` — as a shell gives it, references expanded — is shaped like
-/// a path, and so is judged as one whatever it is assigned to.
-///
-/// Shaped like a path means some `:`-separated entry of it begins with `~`,
-/// contains a `/` (an absolute path does), or is exactly `.` or `..`. The one
-/// exception is a URL: a scheme of ASCII letters, digits, `+`, `-` and `.`
-/// beginning with a letter, then `://`. A URL has slashes and is still not a
-/// path — except a `file:` URL, which names one and is judged, and fails, as
-/// one. Everything else is a number, a flag or a word, which for a variable
-/// whose name does not say it holds a location is a behaviour setting.
-fn path_shaped(value: &str) -> bool {
-    !is_url(value)
-        && value.split(':').any(|entry| {
-            entry.starts_with('~') || entry.contains('/') || matches!(entry, "." | "..")
-        })
-}
-
-/// Whether `value` is a URL other than a `file:` one.
-fn is_url(value: &str) -> bool {
-    value.split_once("://").is_some_and(|(scheme, _)| {
-        !scheme.eq_ignore_ascii_case("file")
-            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-    })
-}
 
 /// The blanks that may indent a line and separate a value from its comment.
 const BLANKS: [char; 2] = [' ', '\t'];
@@ -1312,8 +1342,7 @@ enum Part<'a> {
 /// A value, read by the value grammar.
 #[derive(Debug, PartialEq, Eq)]
 struct Word<'a> {
-    /// The value without its quotes, references not expanded: what
-    /// [`path_shaped`] looks at.
+    /// The value without its quotes, references not expanded, as written.
     text: &'a str,
     /// Whether the value begins with the unquoted `~` a shell expands.
     tilde: bool,
@@ -1846,10 +1875,11 @@ mod tests {
 
     #[test]
     fn the_declared_root_variable_itself_is_allowed() {
-        // `SCRATCH_HOME` is caught by the `_HOME` suffix and was, under the
+        // `SCRATCH_HOME` was caught by the `_HOME` suffix and, under the
         // name-based guard, denied outright — a false positive on the one
-        // variable the whole configuration is written in terms of.
-        assert!(names_a_location("SCRATCH_HOME"));
+        // variable the whole configuration is written in terms of. The emit
+        // table lists it as the location it is.
+        assert_eq!(emittable("SCRATCH_HOME"), Some(Kind::Location));
         assert_eq!(check("SCRATCH_HOME", ROOT, &rooted()), Verdict::Allowed);
     }
 
@@ -1890,45 +1920,42 @@ mod tests {
     }
 
     #[test]
-    fn a_value_that_is_no_kind_of_path_says_so_rather_than_asking_for_an_absolute_one() {
-        // Every one of these has a name that says it holds a location and a
-        // value that is no kind of path. Told that the value "is not an
-        // absolute path", a user would reach for a directory without asking
-        // whether the variable was meant to hold one.
+    fn a_location_given_a_word_is_not_absolute_and_an_unlisted_name_is_not_emittable() {
+        // Round 5 retires `NotAPath`. It existed because a name list was the
+        // only evidence that a variable held a location; the emit table now
+        // says so, and a bare word, a number or a URL given to a location is a
+        // path relative to wherever the shell is. The remedy is an absolute
+        // path, which is what the reason says.
         for (name, value) in [
             ("CARGO_HOME", "1"),
-            ("SOMETOOL_CONFIG_DIR", "yes"),
             ("NPM_CONFIG_CACHE", "npm"),
-            ("PIP_TARGET", "build"),
-            ("UV_PROJECT_ENVIRONMENT", "venv"),
+            ("PIP_CACHE_DIR", "cache"),
+            ("CARGO_HOME", "https://example.invalid/cargo"),
         ] {
-            assert!(names_a_location(name), "{name}");
             assert_eq!(
                 reason_of(&check(name, value, &rooted())),
-                Some(Reason::NotAPath),
-                "{name}"
+                Some(Reason::NotAbsolute),
+                "{name}={value}"
             );
         }
-        // A prefix-family name that does not say so is a behaviour setting,
-        // and so is pip's `--no-cache-dir` switch, which a suffix catches.
+        // Round 4 judged these by their names' families; the table lists none
+        // of them, so each is refused whatever it is given.
         for (name, value) in [
+            ("SOMETOOL_CONFIG_DIR", "yes"),
+            ("PIP_TARGET", "build"),
+            ("UV_PROJECT_ENVIRONMENT", "venv"),
             ("PIP_TIMEOUT", "60"),
             ("NPM_CONFIG_REGISTRY", "https://registry.example.invalid"),
-            ("UV_NO_CACHE", "1"),
             ("MISE_QUIET", "1"),
             ("PIP_NO_CACHE_DIR", "1"),
         ] {
-            assert_eq!(check(name, value, &rooted()), Verdict::Allowed, "{name}");
-        }
-        // And the reason a user can act on is kept for values that really are
-        // paths, where making it absolute is the right thing to do.
-        for value in ["cache/cargo", "~other/cargo", "$HOME/../x"] {
-            assert_ne!(
-                reason_of(&check("PIP_CACHE_DIR", value, &rooted())),
-                Some(Reason::NotAPath),
-                "{value}"
+            assert_eq!(
+                reason_of(&check(name, value, &rooted())),
+                Some(Reason::NotEmittable),
+                "{name}={value}"
             );
         }
+        assert_eq!(check("UV_NO_CACHE", "1", &rooted()), Verdict::Allowed);
     }
 
     #[test]
@@ -2029,10 +2056,10 @@ mod tests {
 
     #[test]
     fn a_program_needs_no_root_but_may_not_live_in_bxs_directory() {
-        // Round 4: the exclusion holds over every value shaped like a path. A
-        // program inside bx's state directory is one `bx rm` deletes, so even
-        // a name that needs no root may not point there — and it may point at
-        // an ordinary program with no root declared at all.
+        // The exclusion holds for a program too. A program inside bx's state
+        // directory is one `bx rm` deletes, so even a kind that needs no root
+        // may not point there — and it may point at an ordinary program with
+        // no root declared at all.
         assert_eq!(
             reason_of(&check(
                 "EDITOR",
@@ -2066,8 +2093,24 @@ mod tests {
             "points inside a directory bx owns"
         );
         assert_eq!(
-            Reason::NotAPath.to_string(),
-            "is not a path, though the variable's name says it holds a location"
+            Reason::NotEmittable.to_string(),
+            "assigns a variable bx does not generate, so it cannot judge the value"
+        );
+        assert_eq!(
+            Reason::NotAProgram.to_string(),
+            "is not one program — an absolute path or a bare command name, with no arguments"
+        );
+        assert_eq!(
+            Reason::NotASetting.to_string(),
+            "is not a value this setting accepts"
+        );
+        assert_eq!(
+            Reason::NestsBxDirectories.to_string(),
+            "puts bx's state directory and its config repo one inside the other"
+        );
+        assert_eq!(
+            Reason::ReservedName.to_string(),
+            "assigns or refers to a name the shell manages itself"
         );
         assert_eq!(Reason::NotAbsolute.to_string(), "is not an absolute path");
         assert_eq!(
@@ -2296,7 +2339,16 @@ mod tests {
             "C=cargo\n",
             "export CARGO_HOME=$A/$B/$C/$B/$C/$B\n",
         );
-        assert_eq!(scan_with(content, &rooted()), vec![]);
+        // The helpers are not in the emit table (round 5); the line that uses
+        // them resolves inside the root and is not refused.
+        assert_eq!(
+            reasons(content, &rooted()),
+            vec![
+                (1, Reason::NotEmittable),
+                (2, Reason::NotEmittable),
+                (3, Reason::NotEmittable)
+            ]
+        );
     }
 
     #[test]
@@ -2315,29 +2367,37 @@ mod tests {
             content.push_str(&format!("export CARGO_HOME=$X{links}/cargo\n"));
             content
         }
+        // The links are helpers the emit table does not list, so each one is
+        // `NotEmittable` (round 5). What is pinned is that the line using the
+        // chain resolves inside the root and is not refused.
         for links in [1, 7, 8, 9, 64] {
-            assert_eq!(scan_with(&chain(links), &rooted()), vec![], "{links}");
+            let helpers: Vec<(usize, Reason)> = (1..=links + 1)
+                .map(|line| (line, Reason::NotEmittable))
+                .collect();
+            assert_eq!(reasons(&chain(links), &rooted()), helpers, "{links}");
         }
     }
 
     #[test]
     fn substituted_text_is_not_expanded_again() {
-        // `Y='$X'` holds the two characters `$X`, and a shell that later
-        // expands `$Y` yields them and stops. Expanding them again would judge
-        // a path no shell produces. `X=/etc` is itself a path outside the root
-        // (round 4), and the only violation: the line that uses `$Y` is not.
-        let content = format!("X=/etc\nY='$X'\nexport CARGO_HOME={ROOT}/$Y\n");
+        // `DATA_DIR='$CACHE_DIR'` holds the characters `$CACHE_DIR`, and a
+        // shell that later expands `$DATA_DIR` yields them and stops. Expanding
+        // them again would judge a path no shell produces. Both helpers are
+        // locations, so each is judged as one; the line that uses the literal
+        // inside the root is not refused.
+        let content =
+            format!("CACHE_DIR=/etc\nDATA_DIR='$CACHE_DIR'\nexport CARGO_HOME={ROOT}/$DATA_DIR\n");
         assert_eq!(
             reasons(&content, &rooted()),
-            vec![(1, Reason::OutsideDeclaredRoots)]
+            vec![(1, Reason::OutsideDeclaredRoots), (2, Reason::NotAbsolute)]
         );
-        let content = format!("X={ROOT}\nY='$X'\nexport CARGO_HOME=$Y/cargo\n");
+        // Expanded once, `$DATA_DIR/cargo` is `$CACHE_DIR/cargo`: relative.
+        // Expanded twice it would be inside the root and approved.
+        let content =
+            format!("CACHE_DIR={ROOT}\nDATA_DIR='$CACHE_DIR'\nexport CARGO_HOME=$DATA_DIR/cargo\n");
         assert_eq!(
-            scan_with(&content, &rooted())
-                .iter()
-                .map(|violation| violation.reason)
-                .collect::<Vec<_>>(),
-            vec![Reason::NotAbsolute]
+            reasons(&content, &rooted()),
+            vec![(2, Reason::NotAbsolute), (3, Reason::NotAbsolute)]
         );
     }
 
@@ -2346,16 +2406,18 @@ mod tests {
         // `X=$X/b` sees the previous `X`, so it is one more path component
         // under the root, not a value that grows without end.
         let content = concat!(
-            "X=/var/mnt/scratch/example\n",
-            "X=$X/b\n",
-            "export CARGO_HOME=$X/cargo\n",
+            "SCRATCH_HOME=/var/mnt/scratch/example\n",
+            "SCRATCH_HOME=$SCRATCH_HOME/b\n",
+            "export CARGO_HOME=$SCRATCH_HOME/cargo\n",
         );
         assert_eq!(scan_with(content, &rooted()), vec![]);
-        // Before any `X` is assigned, the same line refers to nothing — and a
-        // value that does not resolve is judged as a path (round 4), so both
-        // lines say so.
+        // Before it is assigned, the same line refers to nothing — and a value
+        // that does not resolve is refused for that, so both lines say so.
         assert_eq!(
-            reasons("X=$X/b\nexport CARGO_HOME=$X/cargo\n", &rooted()),
+            reasons(
+                "SCRATCH_HOME=$SCRATCH_HOME/b\nexport CARGO_HOME=$SCRATCH_HOME/cargo\n",
+                &rooted()
+            ),
             vec![
                 (1, Reason::UnresolvedReference),
                 (2, Reason::UnresolvedReference)
@@ -2368,7 +2430,11 @@ mod tests {
         // A true two-node cycle. `A=$B` refers to a `B` not yet assigned, so
         // `A` is unresolvable, and `B=$A` inherits that. A value that does not
         // resolve cannot be shown not to be a path, so every line is refused.
-        let content = concat!("A=$B\n", "B=$A\n", "export CARGO_HOME=$A/cargo\n");
+        let content = concat!(
+            "CACHE_DIR=$DATA_DIR\n",
+            "DATA_DIR=$CACHE_DIR\n",
+            "export CARGO_HOME=$CACHE_DIR/cargo\n"
+        );
         assert_eq!(
             reasons(content, &rooted()),
             vec![
@@ -2478,13 +2544,16 @@ mod tests {
         // fragment plainly assigned was never assigned.
         let long = format!("{ROOT}/{}", "a".repeat(MAX_EXPANDED_LEN / 2));
         // `Y` is judged too, as every value is (round 4).
-        let content = format!("X={long}\nY=$X$X\nexport CARGO_HOME=$Y/cargo\n");
+        let content = format!(
+            "SCRATCH_HOME={long}\nCACHE_DIR=$SCRATCH_HOME$SCRATCH_HOME\nexport CARGO_HOME=$CACHE_DIR/cargo\n"
+        );
         assert_eq!(
             reasons(&content, &rooted()),
             vec![(2, Reason::ExpansionTooLong), (3, Reason::ExpansionTooLong)]
         );
         // And the same bound applies to the value being judged itself.
-        let content = format!("X={long}\nexport CARGO_HOME=$X$X\n");
+        let content =
+            format!("SCRATCH_HOME={long}\nexport CARGO_HOME=$SCRATCH_HOME$SCRATCH_HOME\n");
         assert_eq!(
             scan_with(&content, &rooted())
                 .iter()
@@ -2496,7 +2565,9 @@ mod tests {
         // The identical shape, under the bound, resolves — so the assertion
         // above pins the bound and not the shape.
         let short = format!("{ROOT}/{}", "a".repeat(16));
-        let content = format!("X={short}\nY=$X$X\nexport CARGO_HOME=$Y/cargo\n");
+        let content = format!(
+            "SCRATCH_HOME={short}\nCACHE_DIR=$SCRATCH_HOME$SCRATCH_HOME\nexport CARGO_HOME=$CACHE_DIR/cargo\n"
+        );
         assert_eq!(scan_with(&content, &rooted()), vec![]);
     }
 
@@ -2516,13 +2587,14 @@ mod tests {
         // `${X}` must expand to X's value and nothing else. Leaving the `}`
         // behind would produce a path with a `}` in a component name, which is
         // a different directory — and one that is no longer inside the root.
-        let content = format!("X={ROOT}\nexport CARGO_HOME=${{X}}/cargo\n");
+        let content = format!("SCRATCH_HOME={ROOT}\nexport CARGO_HOME=${{SCRATCH_HOME}}/cargo\n");
         assert_eq!(scan_with(&content, &rooted()), vec![]);
 
         // The brace ends the name and nothing more: text after it is appended
         // verbatim, with no separator invented. `${X}suffix` therefore names a
         // *sibling* of the root, which is outside it.
-        let content = format!("X={ROOT}\nexport CARGO_HOME=${{X}}suffix/cargo\n");
+        let content =
+            format!("SCRATCH_HOME={ROOT}\nexport CARGO_HOME=${{SCRATCH_HOME}}suffix/cargo\n");
         let found = scan_with(&content, &rooted());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].reason, Reason::OutsideDeclaredRoots);
@@ -2570,7 +2642,7 @@ mod tests {
         // exactly MAX_EXPANDED_LEN bytes is within it.
         let exact = format!("{ROOT}/{}", "a".repeat(MAX_EXPANDED_LEN - ROOT.len() - 1));
         assert_eq!(exact.len(), MAX_EXPANDED_LEN);
-        let content = format!("X={exact}\nexport CARGO_HOME=$X\n");
+        let content = format!("SCRATCH_HOME={exact}\nexport CARGO_HOME=$SCRATCH_HOME\n");
         assert_eq!(scan_with(&content, &rooted()), vec![]);
     }
 
@@ -2682,7 +2754,8 @@ mod tests {
     /// The operator's own relocating exports, with the scratch mount replaced
     /// by a neutral root so nothing user-specific enters the repository
     /// (invariant 5). Every one of these was denied or leaked by the
-    /// name-based guard; all 23 are value-checked now.
+    /// name-based guard. All 23 exports and both helpers are locations in the
+    /// emit table.
     const OPERATOR_FRAGMENT: &str = concat!(
         "export SCRATCH_HOME=\"/var/mnt/scratch/example\"\n",
         "CACHE_DIR=\"$SCRATCH_HOME/cache\"\n",
@@ -2725,7 +2798,7 @@ mod tests {
             "HOMEBREW_LOGS",
             "HOMEBREW_TEMP",
         ] {
-            assert!(names_a_location(name), "{name} should be value-checked");
+            assert_eq!(emittable(name), Some(Kind::Location), "{name}");
             assert_eq!(
                 check(name, "/var/mnt/scratch/example/x", &rooted()),
                 Verdict::Allowed,
@@ -2744,10 +2817,14 @@ mod tests {
         // The motivating case for the root set being a *set*: an sccache
         // directory may legitimately live outside the scratch root, and must
         // then be covered by a root of its own rather than waved through.
-        assert!(names_a_location("SCCACHE_DIR"));
-        // The behaviour variables that share its prefix still are not.
-        assert!(!names_a_location("SCCACHE_CACHE_SIZE"));
-        assert!(!names_a_location("SCCACHE_SERVER_UDS"));
+        assert_eq!(emittable("SCCACHE_DIR"), Some(Kind::Location));
+        // The setting that shares its prefix is an amount, and a name that
+        // shares it and is not in the table is not emittable at all.
+        assert_eq!(
+            emittable("SCCACHE_CACHE_SIZE"),
+            Some(Kind::Setting(Setting::Amount))
+        );
+        assert_eq!(emittable("SCCACHE_SERVER_UDS"), None);
 
         let roots = RootSet::new(
             Path::new(HOME),
@@ -2768,21 +2845,32 @@ mod tests {
     }
 
     #[test]
-    fn widening_the_list_did_not_capture_a_colon_separated_list() {
-        // A generic `_PATH` or `_DIR` suffix would have, and would make a bare
-        // word in any of them `NotAPath`. Their path values are judged by
-        // value since round 4 whatever this says.
-        for name in ["LD_LIBRARY_PATH", "PATH", "MANPATH", "PKG_CONFIG_PATH"] {
-            assert!(!names_a_location(name), "{name} does not name a location");
+    fn only_the_search_lists_the_table_names_are_search_lists() {
+        // `PATH` and `INFOPATH` are search lists. A list that changes what a
+        // program loads or builds against is not in the table, so it is not
+        // emittable even inside a root; `MANPATH` is the shell's own.
+        assert_eq!(emittable("PATH"), Some(Kind::SearchList));
+        assert_eq!(emittable("INFOPATH"), Some(Kind::SearchList));
+        for name in ["LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "XDG_DATA_DIRS"] {
+            assert_eq!(
+                reason_of(&check(name, "/var/mnt/scratch/example/lib", &rooted())),
+                Some(Reason::NotEmittable),
+                "{name}"
+            );
         }
+        assert_eq!(
+            reason_of(&check("MANPATH", "/usr/share/man", &rooted())),
+            Some(Reason::ReservedName)
+        );
     }
 
     #[test]
     fn the_same_fragment_is_all_violations_with_no_root_declared() {
         // A user who declares no root gets the strict guard, and the strict
-        // guard denies every path. Since round 4 that includes `CACHE_DIR` and
-        // `DATA_DIR`, which no list names: a value is judged whatever it is
-        // assigned to, so all 25 assignments are violations.
+        // guard refuses every location. Round 5 keeps the count at 25: the 23
+        // exports and the two helpers `CACHE_DIR` and `DATA_DIR` are all
+        // locations in the emit table, so every one is `NoRootsDeclared` and
+        // none is `NotEmittable`.
         let found = scan(OPERATOR_FRAGMENT);
         assert_eq!(found.len(), 25);
         assert!(found.iter().all(|v| v.reason == Reason::NoRootsDeclared));
@@ -2797,82 +2885,73 @@ mod tests {
     }
 
     #[test]
-    fn xdg_roots_are_value_checked() {
+    fn the_xdg_base_directories_and_the_operator_caches_are_locations() {
         for name in [
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
             "XDG_CACHE_HOME",
             "XDG_STATE_HOME",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "MISE_DATA_DIR",
+            "UV_CACHE_DIR",
         ] {
-            assert!(names_a_location(name), "{name} should be value-checked");
+            assert_eq!(emittable(name), Some(Kind::Location), "{name}");
         }
     }
 
     #[test]
-    fn per_tool_roots_are_value_checked() {
+    fn a_name_the_table_does_not_list_is_not_emittable_whatever_its_family() {
+        // Every rule round 4 matched a name by — an exact list, a family
+        // prefix, a location suffix, an exception — is gone. None of these is
+        // in the table, so each is refused, even given a path inside the root.
         for name in [
-            "CARGO_HOME",
-            "RUSTUP_HOME",
             "GNUPGHOME",
             "GH_CONFIG_DIR",
             "KUBECONFIG",
-        ] {
-            assert!(names_a_location(name), "{name} should be value-checked");
-        }
-    }
-
-    #[test]
-    fn tool_families_are_value_checked_by_prefix() {
-        for name in [
-            "MISE_DATA_DIR",
-            "UV_CACHE_DIR",
             "NPM_CONFIG_PREFIX",
             "ASDF_DIR",
             "PIP_TARGET",
-        ] {
-            assert!(names_a_location(name), "{name} should be value-checked");
-        }
-    }
-
-    #[test]
-    fn location_suffixes_are_value_checked_generically() {
-        // The point of the suffix rule is catching tools bx has never heard of.
-        for name in ["SOMETOOL_CONFIG_DIR", "OTHERTOOL_HOME", "THIRD_CACHE_DIR"] {
-            assert!(names_a_location(name), "{name} should be value-checked");
-        }
-    }
-
-    #[test]
-    fn a_bare_prefix_or_suffix_is_not_a_variable() {
-        // `_HOME` is the suffix itself, not a tool's variable; likewise `UV_`.
-        assert!(!names_a_location("_HOME"));
-        assert!(!names_a_location("UV_"));
-    }
-
-    #[test]
-    fn behaviour_variables_are_allowed() {
-        for name in [
-            "SCCACHE_CACHE_SIZE",
-            "RUSTC_WRAPPER",
-            "EDITOR",
-            "VISUAL",
-            "PAGER",
+            "SOMETOOL_CONFIG_DIR",
+            "OTHERTOOL_HOME",
+            "THIRD_CACHE_DIR",
+            "_HOME",
+            "UV_",
             "SCCACHE_SERVER_UDS",
+            "UV_SYSTEM_PYTHON",
+            "PIP_REQUIRE_VIRTUALENV",
         ] {
-            assert!(!names_a_location(name), "{name} should be allowed");
+            assert_eq!(emittable(name), None, "{name}");
+            assert_eq!(
+                reason_of(&check(name, "/var/mnt/scratch/example/x", &rooted())),
+                Some(Reason::NotEmittable),
+                "{name}"
+            );
         }
     }
 
     #[test]
-    fn documented_exceptions_survive_the_prefix_rule() {
-        assert!(!names_a_location("UV_SYSTEM_PYTHON"));
-        assert!(!names_a_location("MISE_VERBOSE"));
-        assert!(!names_a_location("PIP_REQUIRE_VIRTUALENV"));
+    fn programs_and_settings_have_their_kinds() {
+        for name in ["RUSTC_WRAPPER", "EDITOR", "VISUAL", "PAGER"] {
+            assert_eq!(emittable(name), Some(Kind::Program), "{name}");
+        }
+        assert_eq!(
+            emittable("SCCACHE_CACHE_SIZE"),
+            Some(Kind::Setting(Setting::Amount))
+        );
+        assert_eq!(
+            emittable("MISE_VERBOSE"),
+            Some(Kind::Setting(Setting::Switch))
+        );
     }
 
     #[test]
     fn the_check_is_case_sensitive() {
-        assert!(!names_a_location("cargo_home"));
+        assert_eq!(emittable("cargo_home"), None);
+        assert_eq!(
+            reason_of(&check("cargo_home", ROOT, &rooted())),
+            Some(Reason::NotEmittable)
+        );
     }
 
     #[test]
@@ -3142,9 +3221,12 @@ mod tests {
                 "{value}"
             );
         }
-        // A literal `~` is shaped like a path for any name (round 4).
+        // A literal `~` given to a location is a relative path.
         assert_eq!(
-            reasons("X='~'\nexport CARGO_HOME=$X/cargo\n", &home_rooted),
+            reasons(
+                "SCRATCH_HOME='~'\nexport CARGO_HOME=$SCRATCH_HOME/cargo\n",
+                &home_rooted
+            ),
             vec![(1, Reason::NotAbsolute), (2, Reason::NotAbsolute)]
         );
     }
@@ -3154,10 +3236,10 @@ mod tests {
         // Each assigns one variable. The `=` is inside the value, so the old
         // remedy — split the line — was impossible to follow.
         for line in [
-            "export MAKEFLAGS=\"-j8 V=1\"",
-            "export MAKEFLAGS='-j8 V=1'",
+            "export CARGO_HOME=\"/var/mnt/scratch/example/-j8 V=1\"",
+            "export CARGO_HOME='/var/mnt/scratch/example/-j8 V=1'",
             "export CARGO_HOME=/var/mnt/scratch/example/cargo # keep=this",
-            "export GRADLE_USER_HOME=\"/var/mnt/scratch/example/a b=c/gradle\"",
+            "export CARGO_HOME=\"/var/mnt/scratch/example/a b=c/cargo\"",
         ] {
             assert_eq!(scan_with(line, &rooted()), vec![], "{line}");
         }
@@ -3189,7 +3271,7 @@ mod tests {
                 " /var/mnt/scratch/example",
                 Some(Reason::Unreadable),
             ),
-            ("MAKEFLAGS", "\"-j8 V=1\"", None),
+            ("MAKEFLAGS", "\"-j8 V=1\"", Some(Reason::NotEmittable)),
             ("CARGO_HOME", "\"/var/mnt/scratch/example/a b\"", None),
             ("CARGO_HOME", "$(pwd)", Some(Reason::Unreadable)),
             ("CARGO_HOME", "/etc", Some(Reason::OutsideDeclaredRoots)),
@@ -3246,28 +3328,34 @@ mod tests {
 
     #[test]
     fn behaviour_variables_in_a_location_family_are_allowed() {
-        // All ten were refused as `NotAPath`, whose remedy was an edit to a
-        // private list in bx's source. None relocates anything.
+        // A setting the table lists relocates nothing, so it needs no root.
+        for (name, value) in [("UV_NO_CACHE", "1"), ("MISE_JOBS", "8")] {
+            assert_eq!(check(name, value, &rooted()), Verdict::Allowed, "{name}");
+            assert_eq!(
+                check(name, value, &RootSet::strict()),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        // Round 4 allowed the rest of the family as settings. The table does
+        // not list them, so round 5 refuses them, with or without a root.
         for (name, value) in [
             ("NPM_CONFIG_REGISTRY", "https://registry.example.invalid"),
             ("NPM_CONFIG_FUND", "false"),
             ("NPM_CONFIG_LOGLEVEL", "warn"),
             ("PIP_INDEX_URL", "https://pypi.example.invalid/simple"),
             ("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
-            ("UV_NO_CACHE", "1"),
             ("UV_PYTHON", "3.12"),
             ("MISE_ENV", "production"),
-            ("MISE_JOBS", "8"),
             ("ASDF_CONCURRENCY", "8"),
         ] {
-            assert!(!names_a_location(name), "{name}");
-            assert_eq!(check(name, value, &rooted()), Verdict::Allowed, "{name}");
-            // It relocates nothing, so it needs no root declared either.
-            assert_eq!(
-                check(name, value, &RootSet::strict()),
-                Verdict::Allowed,
-                "{name}"
-            );
+            for roots in [rooted(), RootSet::strict()] {
+                assert_eq!(
+                    reason_of(&check(name, value, &roots)),
+                    Some(Reason::NotEmittable),
+                    "{name}"
+                );
+            }
         }
     }
 
@@ -3278,18 +3366,15 @@ mod tests {
         // location is refused a bare word, which is a path relative to
         // wherever the shell happens to be.
         for name in [
-            "UV_TOOL_DIR",
-            "PIP_TARGET",
+            "UV_CACHE_DIR",
+            "PIP_CACHE_DIR",
             "NPM_CONFIG_CACHE",
-            "NPM_CONFIG_PREFIX",
-            "NPM_CONFIG_USERCONFIG",
-            "MISE_INSTALL_PATH",
-            "UV_PROJECT_ENVIRONMENT",
+            "MISE_DATA_DIR",
+            "MISE_CACHE_DIR",
         ] {
-            assert!(names_a_location(name), "{name}");
             assert_eq!(
                 reason_of(&check(name, "cache", &rooted())),
-                Some(Reason::NotAPath),
+                Some(Reason::NotAbsolute),
                 "{name}"
             );
             assert_eq!(
@@ -3303,9 +3388,21 @@ mod tests {
                 "{name}"
             );
         }
-        // A name matched by nothing is not a family name at all.
-        assert!(!names_a_location("EDITOR"));
-        assert!(!names_a_location("UV_"));
+        // The family's other locations are not in the table at all.
+        for name in [
+            "UV_TOOL_DIR",
+            "PIP_TARGET",
+            "NPM_CONFIG_PREFIX",
+            "NPM_CONFIG_USERCONFIG",
+            "MISE_INSTALL_PATH",
+            "UV_PROJECT_ENVIRONMENT",
+        ] {
+            assert_eq!(
+                reason_of(&check(name, "/var/mnt/scratch/example/x", &rooted())),
+                Some(Reason::NotEmittable),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -3569,6 +3666,550 @@ mod tests {
         assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
     }
 
+    // Round-5 reproductions, written against the round-4 API only.
+
+    /// Names the round-5 review ran a real tool against, and saw the tool
+    /// read a bare word as a path relative to the current directory: `git`
+    /// followed `GIT_DIR=evil` to `./evil`, `rg` read `./rc`, `cargo` built
+    /// into `./target2`, a child `bash` sourced `./rc`.
+    const R5_READ_AS_LOCATIONS: &[(&str, &str)] = &[
+        ("GIT_DIR", "evil"),
+        ("GIT_WORK_TREE", "work"),
+        ("GIT_CONFIG_SYSTEM", "rc"),
+        ("RIPGREP_CONFIG_PATH", "rc"),
+        ("CARGO_TARGET_DIR", "target2"),
+        ("CARGO_INSTALL_ROOT", "root"),
+        ("PYTHONPYCACHEPREFIX", "pyc"),
+        ("BASH_ENV", "rc"),
+        ("ENV", "rc"),
+        ("INPUTRC", "rc"),
+        ("LESSHISTFILE", "hist"),
+        ("GOENV", "env"),
+        ("TERMINFO", "ti"),
+        ("BAT_CONFIG_PATH", "rc"),
+        ("NODE_REPL_HISTORY", "hist"),
+    ];
+
+    #[test]
+    fn r5_1_a_bare_word_for_a_name_a_tool_reads_as_a_location() {
+        let lines: Vec<String> = R5_READ_AS_LOCATIONS
+            .iter()
+            .map(|(name, value)| format!("export {name}={value}"))
+            .collect();
+        let mut cases = Vec::new();
+        for line in &lines {
+            cases.push((line.as_str(), rooted()));
+            cases.push((line.as_str(), RootSet::strict()));
+        }
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r5_2_a_program_given_arguments() {
+        let mut cases = Vec::new();
+        for content in [
+            "export EDITOR=\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
+            "export EDITOR=\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
+            "export PAGER=\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
+        ] {
+            cases.push((content, rooted()));
+            cases.push((content, RootSet::strict()));
+        }
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r5_3_a_state_directory_moved_by_a_later_line() {
+        let cases = [(
+            "export CARGO_HOME=/var/mnt/scratch/example/state/bx\n\
+             export XDG_STATE_HOME=/var/mnt/scratch/example/state",
+            rooted(),
+        )];
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r5_4_a_url_shaped_value_is_a_relative_path() {
+        let mut cases = Vec::new();
+        for content in [
+            "export EDITOR=x://ed",
+            "export RIPGREP_CONFIG_PATH=cfg://rc",
+            "export GIT_CONFIG_SYSTEM=https://x:/etc/evil",
+        ] {
+            cases.push((content, rooted()));
+            cases.push((content, RootSet::strict()));
+        }
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r5_5_the_strict_set_owns_the_default_state_directory() {
+        let cases = [
+            "export PATH=/var/home/example/.local/state/bx/bin:/usr/bin",
+            "export VISUAL=/var/home/example/.local/state/bx/nvim",
+            "export SSH_AUTH_SOCK=/var/home/example/.local/state/bx/agent.sock",
+        ]
+        .map(|content| (content, RootSet::strict()));
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r5_6_prompts_and_execignore_act_on_assignment() {
+        let mut cases = Vec::new();
+        for content in [
+            "RPROMPT='$(touch evil)'",
+            "RPS1=x",
+            "RPROMPT2=x",
+            "RPS2=x",
+            "EXECIGNORE=x",
+        ] {
+            cases.push((content, rooted()));
+            cases.push((content, RootSet::strict()));
+        }
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r5_7_a_config_home_whose_repo_is_the_state_directory() {
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let cases = [("export XDG_CONFIG_HOME=~/.local/state", home_rooted)];
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    // Review round 5: a fragment may set only a variable bx knows how to judge.
+
+    #[test]
+    fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
+        use Reason::{
+            BxOwnedDirectory, NestsBxDirectories, NotAProgram, NotAbsolute, NotEmittable,
+            ReservedName,
+        };
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        // 1: a bare word a tool reads as a path. `BASH_ENV` and `ENV` are also
+        // names a starting shell acts on, so they are reserved first.
+        for (name, value) in R5_READ_AS_LOCATIONS {
+            let expected = if ["BASH_ENV", "ENV"].contains(name) {
+                ReservedName
+            } else {
+                NotEmittable
+            };
+            for roots in [rooted(), RootSet::strict()] {
+                assert_eq!(
+                    reason_of(&check(name, value, &roots)),
+                    Some(expected),
+                    "{name}={value}"
+                );
+            }
+        }
+        // 2: a program given arguments.
+        for value in [
+            "\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
+            "\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
+        ] {
+            for roots in [rooted(), RootSet::strict()] {
+                assert_eq!(
+                    reason_of(&check("EDITOR", value, &roots)),
+                    Some(NotAProgram),
+                    "{value}"
+                );
+            }
+        }
+        assert_eq!(
+            reason_of(&check(
+                "PAGER",
+                "\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
+                &rooted()
+            )),
+            Some(NotAProgram)
+        );
+        // 3: a state directory a later line moves.
+        assert_eq!(
+            reasons(
+                "export CARGO_HOME=/var/mnt/scratch/example/state/bx\n\
+                 export XDG_STATE_HOME=/var/mnt/scratch/example/state\n",
+                &rooted()
+            ),
+            vec![(1, BxOwnedDirectory)]
+        );
+        // 4: no URL is exempt, for any kind that holds a path.
+        for (name, value, reason) in [
+            ("EDITOR", "x://ed", NotAProgram),
+            ("RIPGREP_CONFIG_PATH", "cfg://rc", NotEmittable),
+            ("GIT_CONFIG_SYSTEM", "https://x:/etc/evil", NotEmittable),
+            ("CARGO_HOME", "cfg://rc", NotAbsolute),
+            (
+                "CARGO_HOME",
+                "https://x:/var/mnt/scratch/example",
+                NotAbsolute,
+            ),
+            ("PATH", "https://x:/usr/bin", NotAbsolute),
+            ("SSH_AUTH_SOCK", "unix://agent", NotAbsolute),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &rooted())),
+                Some(reason),
+                "{name}={value}"
+            );
+        }
+        // 5: the strict set owns the default state directory under any home.
+        for content in [
+            "export PATH=/var/home/example/.local/state/bx/bin:/usr/bin",
+            "export VISUAL=/var/home/example/.local/state/bx/nvim",
+            "export SSH_AUTH_SOCK=/var/home/example/.local/state/bx/agent.sock",
+        ] {
+            assert_eq!(
+                reasons(content, &RootSet::strict()),
+                vec![(1, BxOwnedDirectory)],
+                "{content}"
+            );
+        }
+        // 6: names a shell acts on when assigned.
+        for name in ["RPROMPT", "RPS1", "RPROMPT2", "RPS2", "EXECIGNORE"] {
+            assert_eq!(
+                reason_of(&check(name, "x", &RootSet::strict())),
+                Some(ReservedName),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            reasons("RPROMPT='$(touch evil)'", &rooted()),
+            vec![(1, ReservedName)]
+        );
+        // 7: a config repo landing on the state directory.
+        assert_eq!(
+            reasons("export XDG_CONFIG_HOME=~/.local/state", &home_rooted),
+            vec![(1, NestsBxDirectories)]
+        );
+    }
+
+    #[test]
+    fn every_name_in_the_emit_table_is_a_variable_name_with_one_kind() {
+        let names: Vec<&str> = EMITTABLE.iter().map(|(name, _)| *name).collect();
+        let mut ordered = names.clone();
+        ordered.sort_unstable();
+        ordered.dedup();
+        assert_eq!(names, ordered, "in byte order, each name once");
+        for (name, kind) in EMITTABLE {
+            assert!(is_variable_name(name), "{name}");
+            assert!(!is_reserved(name), "{name} is reserved, so never emitted");
+            assert_eq!(emittable(name), Some(*kind), "{name}");
+        }
+        for kind in [
+            Kind::Location,
+            Kind::Program,
+            Kind::SearchList,
+            Kind::Socket,
+            Kind::Setting(Setting::Switch),
+            Kind::Setting(Setting::Amount),
+            Kind::Setting(Setting::Word),
+        ] {
+            assert!(
+                EMITTABLE.iter().any(|(_, listed)| *listed == kind),
+                "{kind:?} is used"
+            );
+        }
+        // Every name the operator fragment assigns is a location in it.
+        for line in OPERATOR_FRAGMENT.lines() {
+            let assignment = line.strip_prefix("export ").unwrap_or(line);
+            let (name, _) = assignment.split_once('=').expect("an assignment");
+            assert_eq!(emittable(name), Some(Kind::Location), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_name_is_refused_even_with_an_inert_value() {
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for (name, value) in [
+            ("SOMETHING", "1"),
+            ("SOMETHING", ""),
+            ("SOMETHING", "''"),
+            ("X", "true"),
+            ("GIT_EDITOR", "vim"),
+            ("MANPAGER", "less"),
+            ("CC", "gcc"),
+            ("JAVA_HOME", "/usr/lib/jvm/java-21"),
+            ("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt"),
+            ("CARGO_BUILD_RUSTC_WRAPPER", "sccache"),
+            ("MAKEFLAGS", "\"-j8\""),
+        ] {
+            for roots in [rooted(), home_rooted.clone(), RootSet::strict()] {
+                assert_eq!(
+                    reason_of(&check(name, value, &roots)),
+                    Some(Reason::NotEmittable),
+                    "{name}={value}"
+                );
+                assert_eq!(
+                    reasons(&format!("export {name}={value}\n"), &roots),
+                    vec![(1, Reason::NotEmittable)],
+                    "{name}={value}"
+                );
+            }
+        }
+        // It is still learned, so a later line resolves it as a shell would.
+        assert_eq!(
+            reasons(
+                &format!("X={ROOT}\nexport CARGO_HOME=$X/cargo\n"),
+                &rooted()
+            ),
+            vec![(1, Reason::NotEmittable)]
+        );
+    }
+
+    #[test]
+    fn a_program_is_one_absolute_path_or_one_bare_command_name() {
+        use Reason::{BxOwnedDirectory, NotAProgram, NotAbsolute, UnresolvedReference};
+        for value in [
+            "nvim",
+            "code-insiders",
+            "nvim.appimage",
+            "g++",
+            "7z",
+            "ed_2",
+            "/usr/bin/nvim",
+            "/opt/x_y/bin/ed-2.1+b",
+            "$HOME/bin/nvim",
+            "/home/other/.local/state/bx/nvim",
+        ] {
+            assert_eq!(
+                check("EDITOR", value, &rooted()),
+                Verdict::Allowed,
+                "{value}"
+            );
+        }
+        for (value, reason) in [
+            ("", NotAProgram),
+            (".", NotAProgram),
+            ("..", NotAProgram),
+            ("-x", NotAProgram),
+            (".hidden", NotAProgram),
+            ("_x", NotAProgram),
+            ("x://ed", NotAProgram),
+            ("\"nvim --wait\"", NotAProgram),
+            ("\"/usr/bin/nvim -u /etc/evil\"", NotAProgram),
+            ("/usr/bin/a:b", NotAProgram),
+            ("a:b", NotAProgram),
+            ("\"a=b\"", NotAProgram),
+            ("user@host", NotAProgram),
+            ("a,b", NotAProgram),
+            ("'~/bin/nvim'", NotAProgram),
+            ("./nvim", NotAbsolute),
+            ("bin/nvim", NotAbsolute),
+            ("/var/home/example/.local/state/bx/nvim", BxOwnedDirectory),
+            ("$NOWHERE", UnresolvedReference),
+        ] {
+            assert_eq!(
+                reason_of(&check("EDITOR", value, &rooted())),
+                Some(reason),
+                "{value:?}"
+            );
+        }
+        // With no home, a `~` or `$HOME` program cannot be shown to be outside
+        // bx's state directory, and does not resolve.
+        for value in ["~/bin/nvim", "$HOME/bin/nvim"] {
+            assert_eq!(
+                reason_of(&check("VISUAL", value, &RootSet::strict())),
+                Some(UnresolvedReference),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_setting_accepts_only_its_own_shape() {
+        for (name, value) in [
+            ("UV_NO_CACHE", "0"),
+            ("UV_NO_CACHE", "1"),
+            ("MISE_VERBOSE", "true"),
+            ("MISE_VERBOSE", "false"),
+            ("MISE_JOBS", "8"),
+            ("MISE_JOBS", "16"),
+            ("SCCACHE_CACHE_SIZE", "100G"),
+            ("SCCACHE_CACHE_SIZE", "512M"),
+            ("SCCACHE_CACHE_SIZE", "2T"),
+            ("SCCACHE_CACHE_SIZE", "10K"),
+            ("CARGO_TERM_COLOR", "always"),
+            ("LANG", "C.UTF-8"),
+            ("LANG", "en_US.UTF-8"),
+            ("LANG", "9"),
+        ] {
+            for roots in [rooted(), RootSet::strict()] {
+                assert_eq!(
+                    check(name, value, &roots),
+                    Verdict::Allowed,
+                    "{name}={value}"
+                );
+            }
+        }
+        for (name, value) in [
+            ("UV_NO_CACHE", "yes"),
+            ("UV_NO_CACHE", ""),
+            ("UV_NO_CACHE", "2"),
+            ("MISE_VERBOSE", "/x"),
+            ("MISE_JOBS", ""),
+            ("MISE_JOBS", "G"),
+            ("MISE_JOBS", "8X"),
+            ("MISE_JOBS", "8GG"),
+            ("MISE_JOBS", "-1"),
+            ("MISE_JOBS", "1.5"),
+            ("SCCACHE_CACHE_SIZE", "G100"),
+            ("CARGO_TERM_COLOR", ""),
+            ("CARGO_TERM_COLOR", "."),
+            ("CARGO_TERM_COLOR", ".."),
+            ("CARGO_TERM_COLOR", "-always"),
+            ("CARGO_TERM_COLOR", "a/b"),
+            ("CARGO_TERM_COLOR", "~"),
+            ("CARGO_TERM_COLOR", "~/x"),
+            ("CARGO_TERM_COLOR", "a:b"),
+            ("CARGO_TERM_COLOR", "https://example.invalid"),
+            ("LANG", "\"C UTF-8\""),
+            ("LANG", "sr_RS@latin"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &rooted())),
+                Some(Reason::NotASetting),
+                "{name}={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_socket_is_an_absolute_path_outside_bxs_directories() {
+        use Reason::{BxOwnedDirectory, NotAbsolute, UnresolvedReference};
+        for roots in [
+            rooted(),
+            RootSet::new(Path::new(HOME), &[]),
+            RootSet::strict(),
+        ] {
+            for value in [
+                "/run/user/1000/gnupg/S.gpg-agent.ssh",
+                "\"/run/an agent/socket\"",
+            ] {
+                assert_eq!(
+                    check("SSH_AUTH_SOCK", value, &roots),
+                    Verdict::Allowed,
+                    "{value}"
+                );
+            }
+            for (value, reason) in [
+                ("agent.sock", NotAbsolute),
+                ("", NotAbsolute),
+                ("/var/home/example/.local/state/bx/agent", BxOwnedDirectory),
+            ] {
+                assert_eq!(
+                    reason_of(&check("SSH_AUTH_SOCK", value, &roots)),
+                    Some(reason),
+                    "{value}"
+                );
+            }
+        }
+        assert_eq!(
+            reason_of(&check("SSH_AUTH_SOCK", "~/agent", &RootSet::strict())),
+            Some(UnresolvedReference)
+        );
+    }
+
+    #[test]
+    fn without_a_home_every_default_state_directory_is_owned() {
+        let strict = RootSet::strict();
+        for path in [
+            "/var/home/example/.local/state/bx",
+            "/home/other/.local/state/bx/x",
+            "/root/.local/state/./bx",
+            "/srv/.local/state/x/../bx/y",
+        ] {
+            assert!(strict.owns(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/var/home/example/.local/state/bxtra",
+            "/var/home/example/.local/state",
+            "/var/home/example/.local/bx",
+            "/x/state/bx",
+            "/x/.local/state",
+        ] {
+            assert!(!strict.owns(Path::new(path)), "{path}");
+        }
+        // A set with a home knows where its state directory is.
+        assert!(!rooted().owns(Path::new("/home/other/.local/state/bx/x")));
+        assert_eq!(
+            check("PATH", "/home/other/.local/state/bx/bin", &rooted()),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            reason_of(&check("PATH", "/home/other/.local/state/bx/bin", &strict)),
+            Some(Reason::BxOwnedDirectory)
+        );
+    }
+
+    #[test]
+    fn every_state_directory_the_fragment_moves_counts_on_every_line() {
+        use Reason::BxOwnedDirectory;
+        // Two moves: a line before both, one between and one after, pointing
+        // into each of the two.
+        let content = concat!(
+            "export GOPATH=/var/mnt/scratch/example/b/bx/go\n",
+            "export XDG_STATE_HOME=/var/mnt/scratch/example/a\n",
+            "export CARGO_HOME=/var/mnt/scratch/example/a/bx\n",
+            "export XDG_STATE_HOME=/var/mnt/scratch/example/b\n",
+            "export RUSTUP_HOME=/var/mnt/scratch/example/a/bx/rustup\n",
+            "export GOCACHE=/var/mnt/scratch/example/c/bx\n",
+        );
+        assert_eq!(
+            reasons(content, &rooted()),
+            vec![
+                (1, BxOwnedDirectory),
+                (3, BxOwnedDirectory),
+                (5, BxOwnedDirectory)
+            ]
+        );
+    }
+
+    #[test]
+    fn bxs_config_repo_and_state_directory_may_not_nest() {
+        use Reason::{BxOwnedDirectory, NestsBxDirectories};
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for (content, expected) in [
+            // The config repo on the default state directory, and the state
+            // directory on the default config repo.
+            (
+                "export XDG_CONFIG_HOME=~/.local/state\n",
+                vec![(1, NestsBxDirectories)],
+            ),
+            (
+                "export XDG_STATE_HOME=~/.config\n",
+                vec![(1, NestsBxDirectories)],
+            ),
+            // A state directory inside a repo the fragment moves, either order.
+            (
+                "export XDG_STATE_HOME=~/c/bx/s\nexport XDG_CONFIG_HOME=~/c\n",
+                vec![(1, NestsBxDirectories), (2, NestsBxDirectories)],
+            ),
+            (
+                "export XDG_CONFIG_HOME=~/c\nexport XDG_STATE_HOME=~/c/bx/s\n",
+                vec![(1, NestsBxDirectories), (2, NestsBxDirectories)],
+            ),
+            // A repo inside a state directory the fragment moves: the config
+            // line already points inside bx's state.
+            (
+                "export XDG_STATE_HOME=~/s\nexport XDG_CONFIG_HOME=~/s/bx/c\n",
+                vec![(1, NestsBxDirectories), (2, BxOwnedDirectory)],
+            ),
+            // The defaults, and two ordinary moves, are fine.
+            (
+                "export XDG_CONFIG_HOME=~/.config\nexport XDG_STATE_HOME=~/.local/state\n",
+                vec![],
+            ),
+            (
+                "export XDG_CONFIG_HOME=~/dotfiles\nexport XDG_STATE_HOME=~/state\n",
+                vec![],
+            ),
+            // The repo is not owned: only bx's own two directories are compared.
+            ("export CARGO_HOME=~/.config/bx/cargo\n", vec![]),
+            ("export CARGO_HOME=~/.local/state\n", vec![]),
+        ] {
+            assert_eq!(reasons(content, &home_rooted), expected, "{content:?}");
+        }
+    }
+
     #[test]
     fn bash_truncates_the_history_file_when_a_fragment_assigns_histfilesize() {
         // The mechanism behind reserving `HISTFILESIZE`: bash truncates the
@@ -3602,86 +4243,71 @@ mod tests {
     // Review round 4: a value is judged whatever it is assigned to.
 
     #[test]
-    fn a_value_is_judged_by_its_shape_whatever_the_name() {
-        use Reason::{NoRootsDeclared, NotAPath, NotAbsolute, OutsideDeclaredRoots};
+    fn a_name_no_table_holds_is_refused_and_a_location_is_judged_whatever_its_shape() {
+        use Reason::{NotAbsolute, NotEmittable, OutsideDeclaredRoots};
+        // Round 4 judged these by value: allowed inside a root. Round 5 does
+        // not know what they hold, so it refuses each whatever it is given.
         for name in R4_UNLISTED_RELOCATIONS {
-            assert_eq!(
-                reason_of(&check(name, "/etc/evil", &rooted())),
-                Some(OutsideDeclaredRoots),
-                "{name}"
-            );
-            assert_eq!(
-                reason_of(&check(name, "/etc/evil", &RootSet::strict())),
-                Some(NoRootsDeclared),
-                "{name}"
-            );
-            assert_eq!(
-                check(name, "/var/mnt/scratch/example/x", &rooted()),
-                Verdict::Allowed,
-                "{name}"
-            );
+            for value in ["/etc/evil", "/var/mnt/scratch/example/x", "1"] {
+                for roots in [rooted(), RootSet::strict()] {
+                    assert_eq!(
+                        reason_of(&check(name, value, &roots)),
+                        Some(NotEmittable),
+                        "{name}={value}"
+                    );
+                }
+            }
         }
+        // A location is refused anything that is not an absolute path inside
+        // a root — a bare word, a number, and every URL included (round 5).
         for (value, reason) in [
-            (".", Some(NotAbsolute)),
-            ("..", Some(NotAbsolute)),
-            ("build/cache", Some(NotAbsolute)),
-            ("a:.", Some(NotAbsolute)),
-            ("~", Some(OutsideDeclaredRoots)),
-            ("\"~x\"", Some(NotAbsolute)),
-            ("/var/mnt/scratch/example:a", Some(NotAbsolute)),
-            ("file:///var/mnt/scratch/example", Some(NotAbsolute)),
-            ("FILE:///var/mnt/scratch/example", Some(NotAbsolute)),
-            ("1+x://y", Some(NotAbsolute)),
-            ("://y", Some(NotAbsolute)),
-            ("a_b://y", Some(NotAbsolute)),
-            // Not a path at all.
-            ("", None),
-            ("1", None),
-            ("a:b", None),
-            ("...", None),
-            (".x", None),
-            ("\"-j8 V=1\"", None),
-            ("https://example.invalid/a:b", None),
-            ("git+ssh://example.invalid/x", None),
-            ("s3.a-b://bucket/key", None),
+            (".", NotAbsolute),
+            ("..", NotAbsolute),
+            ("build/cache", NotAbsolute),
+            ("a:.", NotAbsolute),
+            ("~", OutsideDeclaredRoots),
+            ("\"~x\"", NotAbsolute),
+            ("/var/mnt/scratch/example:a", NotAbsolute),
+            ("file:///var/mnt/scratch/example", NotAbsolute),
+            ("1+x://y", NotAbsolute),
+            ("", NotAbsolute),
+            ("1", NotAbsolute),
+            ("a:b", NotAbsolute),
+            ("...", NotAbsolute),
+            (".x", NotAbsolute),
+            ("\"-j8 V=1\"", NotAbsolute),
+            ("https://example.invalid/a:b", NotAbsolute),
+            ("git+ssh://example.invalid/x", NotAbsolute),
+            ("s3.a-b://bucket/key", NotAbsolute),
         ] {
             assert_eq!(
-                reason_of(&check("SOMETHING", value, &rooted())),
-                reason,
+                reason_of(&check("CARGO_HOME", value, &rooted())),
+                Some(reason),
                 "{value:?}"
             );
         }
-        // A location name keeps its bare-word rule, and an exception keeps
-        // its setting.
-        assert_eq!(
-            reason_of(&check("HISTFILE", "history", &rooted())),
-            Some(NotAPath)
-        );
-        assert_eq!(
-            check("PIP_NO_CACHE_DIR", "1", &RootSet::strict()),
-            Verdict::Allowed
-        );
-        // The behaviour settings the round-4 brief names still pass, with no
-        // root declared.
-        for (name, value) in [
-            ("UV_NO_CACHE", "1"),
-            ("MAKEFLAGS", "\"-j8 V=1\""),
-            ("MISE_JOBS", "8"),
-            ("EDITOR", "nvim"),
-            ("CARGO_BUILD_TARGET", "x86_64-unknown-linux-gnu"),
-        ] {
+        // Of the round-4 brief's settings, the ones the table lists still pass
+        // with no root declared; the others are not emittable.
+        for (name, value) in [("UV_NO_CACHE", "1"), ("MISE_JOBS", "8"), ("EDITOR", "nvim")] {
             assert_eq!(
                 check(name, value, &RootSet::strict()),
                 Verdict::Allowed,
                 "{name}"
             );
         }
-        // `JAVA_HOME` is judged as before: an install location outside every
-        // root is refused.
-        assert_eq!(
-            reason_of(&check("JAVA_HOME", "/usr/lib/jvm/java-21", &rooted())),
-            Some(OutsideDeclaredRoots)
-        );
+        for (name, value) in [
+            ("MAKEFLAGS", "\"-j8 V=1\""),
+            ("CARGO_BUILD_TARGET", "x86_64-unknown-linux-gnu"),
+            ("HISTFILE", "history"),
+            ("PIP_NO_CACHE_DIR", "1"),
+            ("JAVA_HOME", "/usr/lib/jvm/java-21"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &RootSet::strict())),
+                Some(NotEmittable),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -3705,22 +4331,24 @@ mod tests {
             Scope::default().lookup("PROMPT_COMMAND", None),
             Err(Reason::ReservedName)
         );
-        // `HISTFILE` is a location, judged like any.
-        assert_eq!(
-            check("HISTFILE", "/var/mnt/scratch/example/history", &rooted()),
-            Verdict::Allowed
-        );
-        assert_eq!(
-            reason_of(&check("HISTFILE", "/etc/evil", &rooted())),
-            Some(Reason::OutsideDeclaredRoots)
-        );
+        // `HISTFILE` is not reserved — assigning it writes nothing — and no
+        // generator writes one, so it is not in the emit table either.
+        for value in ["/var/mnt/scratch/example/history", "/etc/evil"] {
+            assert_eq!(
+                reason_of(&check("HISTFILE", value, &rooted())),
+                Some(Reason::NotEmittable),
+                "{value}"
+            );
+        }
     }
 
     #[test]
-    fn a_state_directory_the_fragment_moves_is_owned_from_then_on() {
+    fn a_state_directory_the_fragment_moves_is_owned_on_every_line() {
         use Reason::{BxOwnedDirectory, NoRootsDeclared, NotAbsolute};
         let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
-        // Only later lines: the line that moves it is judged before it moves.
+        // Every line, the ones before the move included (round 5): a shell
+        // that sources the fragment ends with the directory moved, and bx
+        // then runs with it there.
         assert_eq!(
             reasons(
                 "export CARGO_HOME=/var/mnt/scratch/example/state/bx\n\
@@ -3730,7 +4358,11 @@ mod tests {
                  export PATH=/var/mnt/scratch/example/state/bx/bin:$PATH\n",
                 &rooted()
             ),
-            vec![(3, BxOwnedDirectory), (5, BxOwnedDirectory)]
+            vec![
+                (1, BxOwnedDirectory),
+                (3, BxOwnedDirectory),
+                (5, BxOwnedDirectory)
+            ]
         );
         // The directory it moved from stays owned.
         assert_eq!(
@@ -3802,7 +4434,7 @@ mod tests {
             ),
             ("export EDITOR=/usr/bin/nvim\n", vec![]),
             ("export EDITOR=nvim\n", vec![]),
-            ("export EDITOR=\n", vec![]),
+            ("export EDITOR=\n", vec![(1, Reason::NotAProgram)]),
             ("export RUSTC_WRAPPER=/usr/bin/sccache\n", vec![]),
             (
                 "export SSH_AUTH_SOCK=/run/user/1000/ssh-agent.socket\n",
@@ -3811,7 +4443,7 @@ mod tests {
             ("export EDITOR=./nvim\n", vec![(1, NotAbsolute)]),
             (
                 "export BROWSER=/usr/bin/firefox:chromium\n",
-                vec![(1, NotAbsolute)],
+                vec![(1, Reason::NotAProgram)],
             ),
             ("export EDITOR=$NOWHERE\n", vec![(1, UnresolvedReference)]),
             (
@@ -3885,7 +4517,7 @@ mod tests {
                 "{value:?}"
             );
         }
-        for value in ["nvim", "\"-j8 V=1\"", "$HOME/x", "/x # a comment"] {
+        for value in ["nvim", "\"nvim\"", "$HOME/x", "/x # a comment"] {
             assert_eq!(
                 check("EDITOR", value, &rooted()),
                 Verdict::Allowed,
@@ -3978,12 +4610,11 @@ mod tests {
                 "{value:?}"
             );
         }
-        // A value that begins like a path is judged as one even for a name
-        // that does not say it holds a location: `~` alone is the home, and
-        // `/a://b` starts at the filesystem root however URL-like its middle.
+        // Given to a location, `~` alone is the home, and `/a://b` starts at
+        // the filesystem root however URL-like its middle.
         for value in ["~", "/a://b"] {
             assert_eq!(
-                reason_of(&check("UV_PYTHON", value, &rooted())),
+                reason_of(&check("CARGO_HOME", value, &rooted())),
                 Some(Reason::OutsideDeclaredRoots),
                 "{value:?}"
             );
@@ -4049,12 +4680,10 @@ mod tests {
             scan_with("export PATH=\"$HOME/.local/bin:$PATH\"\n", &rooted()),
             vec![]
         );
-        // Without a home, `$HOME` is unresolved rather than reserved — and a
-        // value that does not resolve is judged as a path, which the strict
-        // set refuses.
+        // Without a home, `$HOME` is unresolved rather than reserved.
         assert_eq!(
-            reason_of(&check("GPG_TTY", "$HOME", &RootSet::strict())),
-            Some(Reason::NoRootsDeclared)
+            reason_of(&check("EDITOR", "$HOME", &RootSet::strict())),
+            Some(Reason::UnresolvedReference)
         );
         let mut scope = Scope::default();
         assert_eq!(scope.lookup("HOME", None), Err(Reason::UnresolvedReference));
@@ -4094,7 +4723,7 @@ mod tests {
                 Some(BxOwnedDirectory),
             ),
         ] {
-            for name in ["KUBECONFIG", "GOPATH", "CARGO_HOME"] {
+            for name in ["GOPATH", "GOMODCACHE", "CARGO_HOME"] {
                 assert_eq!(
                     reason_of(&check(name, value, &rooted())),
                     reason,
@@ -4105,12 +4734,12 @@ mod tests {
         // Entries arriving through references are split the same way. The
         // references are braced: zsh reads `$A:$B` as `$A` with a modifier.
         let content = concat!(
-            "A=/var/mnt/scratch/example/go\n",
-            "B=/etc/evil\n",
-            "export GOPATH=\"${A}:${B}\"\n",
-            "export GOPATH=\"$A:$B\"\n",
+            "CACHE_DIR=/var/mnt/scratch/example/go\n",
+            "DATA_DIR=/etc/evil\n",
+            "export GOPATH=\"${CACHE_DIR}:${DATA_DIR}\"\n",
+            "export GOPATH=\"$CACHE_DIR:$DATA_DIR\"\n",
         );
-        // `B=/etc/evil` is itself a path outside the root (round 4).
+        // `DATA_DIR=/etc/evil` is itself a location outside the root.
         assert_eq!(
             reasons(content, &rooted()),
             vec![
@@ -4122,48 +4751,38 @@ mod tests {
     }
 
     #[test]
-    fn npm_config_is_judged_whatever_its_case() {
+    fn npm_config_in_any_other_case_is_not_emittable() {
+        // npm reads `npm_config_*` in any case, and round 3 judged every case
+        // for that. The table spells `NPM_CONFIG_CACHE` alone, so every other
+        // spelling is refused whatever it is given — which is stricter than
+        // judging it, and needs no knowledge of which tools ignore case.
         for name in [
             "npm_config_cache",
             "Npm_Config_Prefix",
             "npm_CONFIG_userconfig",
+            "npm_config_registry",
+            "uv_cache_dir",
         ] {
-            assert!(names_a_location(name), "{name}");
-            assert_eq!(
-                reason_of(&check(name, "/etc/evil", &rooted())),
-                Some(Reason::OutsideDeclaredRoots),
-                "{name}"
-            );
-            assert_eq!(
-                reason_of(&check(name, ".npm", &rooted())),
-                Some(Reason::NotAPath),
-                "{name}"
-            );
-            assert_eq!(
-                check(name, "/var/mnt/scratch/example/npm", &rooted()),
-                Verdict::Allowed,
-                "{name}"
-            );
+            for value in ["/etc/evil", ".npm", "/var/mnt/scratch/example/npm"] {
+                assert_eq!(
+                    reason_of(&check(name, value, &rooted())),
+                    Some(Reason::NotEmittable),
+                    "{name}={value}"
+                );
+            }
         }
-        // A behaviour setting stays one in lower case.
-        assert!(!names_a_location("npm_config_registry"));
         assert_eq!(
             check(
-                "npm_config_registry",
-                "https://registry.example.invalid",
-                &RootSet::strict()
+                "NPM_CONFIG_CACHE",
+                "/var/mnt/scratch/example/npm",
+                &rooted()
             ),
             Verdict::Allowed
         );
-        assert!(!names_a_location("npm_config_"));
-        assert!(!names_a_location("npm_confi"));
-        // Only npm reads its family that way.
-        assert!(!names_a_location("uv_cache_dir"));
-        assert!(!names_a_location("mise_data_dir"));
     }
 
     #[test]
-    fn the_names_and_location_words_the_review_found_missing_are_judged() {
+    fn the_names_and_location_words_the_review_found_missing_are_refused() {
         for name in [
             "ZDOTDIR",
             "YARN_CACHE_FOLDER",
@@ -4171,33 +4790,23 @@ mod tests {
             "STARSHIP_CONFIG",
             "PYTHONUSERBASE",
             "TMPDIR",
+            "MISE_SHARED_INSTALL_DIRS",
+            "MISE_TRUSTED_CONFIG_PATHS",
+            "UV_PROJECT",
+            "MISE_DEFAULT_CONFIG_FILENAME",
         ] {
-            assert!(names_a_location(name), "{name}");
-            assert_eq!(
-                reason_of(&check(name, "/etc/evil", &rooted())),
-                Some(Reason::OutsideDeclaredRoots),
-                "{name}"
-            );
-            assert_eq!(
-                check(name, "/var/mnt/scratch/example/x", &rooted()),
-                Verdict::Allowed,
-                "{name}"
-            );
+            for value in ["/etc/evil", "/var/mnt/scratch/example/x", "evil"] {
+                assert_eq!(
+                    reason_of(&check(name, value, &rooted())),
+                    Some(Reason::NotEmittable),
+                    "{name}={value}"
+                );
+            }
         }
-        assert!(names_a_location("HOME"));
-        for (name, value) in [
-            ("MISE_SHARED_INSTALL_DIRS", "evil"),
-            ("MISE_TRUSTED_CONFIG_PATHS", "evil"),
-            ("UV_PROJECT", "evil"),
-            ("MISE_DEFAULT_CONFIG_FILENAME", "evil.toml"),
-        ] {
-            assert!(names_a_location(name), "{name}");
-            assert_eq!(
-                reason_of(&check(name, value, &rooted())),
-                Some(Reason::NotAPath),
-                "{name}"
-            );
-        }
+        assert_eq!(
+            reason_of(&check("HOME", ROOT, &rooted())),
+            Some(Reason::ReservedName)
+        );
         assert_eq!(
             reason_of(&check("UV_PROJECT", "=ls", &rooted())),
             Some(Reason::Unreadable)
@@ -4386,48 +4995,83 @@ mod tests {
     /// Whether a shell that ended holding `name=value` — and the variables
     /// `after` — has been pointed somewhere the roots do not admit.
     ///
-    /// Decided from the value alone and independently of the guard's own
-    /// classification, so it cannot share a blind spot with it: every entry
-    /// shaped like a path — containing `/`, beginning `~` or `=`, or `.` or `..` —
-    /// makes the whole value one the roots must admit, whatever the name. The
-    /// shell's own `XDG_STATE_HOME` moves bx's state directory for the check,
-    /// as it would for bx. The names the shell manages are its own business,
-    /// and the programs and search lists the guard documents as needing no
-    /// root need only be absolute and outside bx's directories.
+    /// Decided independently of the guard's emit table and ownership rules, so
+    /// it cannot share a blind spot with them. Every entry shaped like a path —
+    /// containing `/`, beginning `~` or `=`, or `.` or `..` — makes the whole
+    /// value one the roots must admit, for any name; so does any value of a
+    /// name the round-5 review saw a tool read as a location. bx's state
+    /// directory is worked out here from the test home and the shell's own
+    /// `XDG_STATE_HOME`, and an `XDG_CONFIG_HOME` whose `/bx` lands in it
+    /// escapes. The names the shell manages are its own business. The
+    /// commands, search lists and socket written out below need no root: a
+    /// command escapes with a second word or a relative or owned path, and a
+    /// list or socket with any relative or owned entry.
     fn escapes(name: &str, value: &str, roots: &RootSet, after: &HashMap<String, String>) -> bool {
-        if is_reserved(name) {
+        if SHELL_NAMES.contains(&name) {
             return false;
         }
-        let owned = match roots.home() {
-            Some(home) => roots.clone().owning(&[layers::state_dir(
-                home,
-                after.get("XDG_STATE_HOME").map(std::ffi::OsStr::new),
-            )]),
-            None => roots.clone(),
+        // bx's state directory, worked out here rather than asked of the
+        // guard: under the test home, or wherever the shell's own absolute
+        // `XDG_STATE_HOME` moved it.
+        let mut owned = vec![Path::new(HOME).join(".local/state/bx")];
+        if let Some(state) = after
+            .get("XDG_STATE_HOME")
+            .filter(|state| Path::new(state).is_absolute())
+        {
+            owned.push(Path::new(state).join("bx"));
+        }
+        // A leading `=` is zsh's `=cmd`, which expands to a program's path.
+        let pathish = |entry: &str| {
+            entry.contains('/') || entry.starts_with(['~', '=']) || entry == "." || entry == ".."
+        };
+        let unanchored = |entry: &str| {
+            let path = paths::normalize(Path::new(entry));
+            !path.is_absolute() || owned.iter().any(|dir| path.starts_with(dir))
         };
         let entries: Vec<&str> = value.split(':').collect();
-        // A leading `=` is zsh's `=cmd`, which expands to a program's path.
-        let pathish = |entry: &&str| {
-            entry.contains('/') || entry.starts_with(['~', '=']) || *entry == "." || *entry == ".."
-        };
-        let unanchored =
-            |entry: &&str| !Path::new(entry).is_absolute() || owned.owns(Path::new(entry));
-        if SEARCH_LISTS.contains(&name) {
-            entries.iter().any(unanchored)
-        } else if PROGRAMS.contains(&name) {
-            entries.iter().any(pathish) && entries.iter().any(unanchored)
-        } else {
-            entries.iter().any(pathish)
-                && entries
+        if TEST_SEARCHED_OR_REACHED.contains(&name) {
+            entries.iter().any(|entry| unanchored(entry))
+        } else if TEST_RUN_AS_COMMANDS.contains(&name) {
+            // A tool runs the value through a shell, so a second word is an
+            // argument no check looked at.
+            value.split([' ', '\t']).count() > 1
+                || (pathish(value) && unanchored(value))
+                || entries
                     .iter()
-                    .any(|entry| unanchored(entry) || !owned.contains(Path::new(entry)))
+                    .any(|entry| pathish(entry) && unanchored(entry))
+        } else {
+            let read_as_location = R5_READ_AS_LOCATIONS.iter().any(|(known, _)| *known == name);
+            let repo_lands_in_state =
+                name == "XDG_CONFIG_HOME" && unanchored(&format!("{value}/bx"));
+            repo_lands_in_state
+                || ((read_as_location || entries.iter().any(|entry| pathish(entry)))
+                    && entries
+                        .iter()
+                        .any(|entry| unanchored(entry) || !roots.contains(Path::new(entry))))
         }
     }
+
+    /// Names a tool runs as a command, written out here independently of the
+    /// guard's table: a value escapes when it has a second word, or when a
+    /// path in it is relative or inside bx's state directory.
+    const TEST_RUN_AS_COMMANDS: &[&str] = &[
+        "BROWSER",
+        "EDITOR",
+        "PAGER",
+        "RUSTC_WRAPPER",
+        "TERMINAL",
+        "VISUAL",
+    ];
+
+    /// Lists a shell or a tool searches, and a socket it connects to, written
+    /// out independently of the guard's table: every entry must be absolute
+    /// and outside bx's state directory, and no root is needed.
+    const TEST_SEARCHED_OR_REACHED: &[&str] = &["INFOPATH", "PATH", "SSH_AUTH_SOCK"];
 
     /// Run `content` in every installed shell and hold the guard to what each
     /// shell did. The guard must never approve a fragment after which any
     /// variable [`escapes`] — holds a path outside `roots` or inside bx's own
-    /// directory, whatever its name; and where the guard read every line, what it
+    /// directory, for any name; and where the guard read every line, what it
     /// learned must be exactly what the shell set. Returns, per shell, whether
     /// the shell relocated anything outside the roots.
     fn assert_the_shells_agree(
@@ -4585,7 +5229,57 @@ mod tests {
             ("export HISTFILE=/etc/evil", rooted()),
             ("export PATH=.:/usr/bin", rooted()),
             ("export EDITOR=./nvim", rooted()),
+            // Round 5: a bare word a tool reads as a path, a program given
+            // arguments, a state directory a later line moves, a URL-shaped
+            // relative path, bx's default state directory with no home, and a
+            // config repo landing on the state directory.
+            (
+                "export EDITOR=\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
+                rooted(),
+            ),
+            (
+                "export EDITOR=\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
+                RootSet::strict(),
+            ),
+            (
+                "export PAGER=\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
+                rooted(),
+            ),
+            (
+                "export CARGO_HOME=/var/mnt/scratch/example/state/bx\n\
+                 export XDG_STATE_HOME=/var/mnt/scratch/example/state",
+                rooted(),
+            ),
+            ("export EDITOR=x://ed", rooted()),
+            ("export RIPGREP_CONFIG_PATH=cfg://rc", rooted()),
+            ("export GIT_CONFIG_SYSTEM=https://x:/etc/evil", rooted()),
+            (
+                "export PATH=/var/home/example/.local/state/bx/bin:/usr/bin",
+                RootSet::strict(),
+            ),
+            (
+                "export VISUAL=/var/home/example/.local/state/bx/nvim",
+                RootSet::strict(),
+            ),
+            (
+                "export SSH_AUTH_SOCK=/var/home/example/.local/state/bx/agent.sock",
+                RootSet::strict(),
+            ),
+            ("export XDG_CONFIG_HOME=~/.local/state", home_rooted.clone()),
         ];
+        let bare_words: Vec<String> = R5_READ_AS_LOCATIONS
+            .iter()
+            .map(|(name, value)| format!("export {name}={value}"))
+            .collect();
+        let falsifiers: Vec<(&str, RootSet)> = falsifiers
+            .iter()
+            .map(|(content, roots)| (*content, roots.clone()))
+            .chain(
+                bare_words
+                    .iter()
+                    .map(|content| (content.as_str(), rooted())),
+            )
+            .collect();
         for (content, roots) in &falsifiers {
             let escaped = assert_the_shells_agree(&shells, content, roots);
             assert_ne!(scan_with(content, roots), vec![], "{content:?}");
@@ -4668,8 +5362,8 @@ mod tests {
         let shells = installed_shells();
         for base in [
             "export CARGO_HOME=/var/mnt/scratch/example/cargo",
-            "R=/var/mnt/scratch/example\nexport CARGO_HOME=\"$R/cargo\"",
-            "X=/var/mnt/scratch/example\nGOPATH=${X}/go:$X/b",
+            "SCRATCH_HOME=/var/mnt/scratch/example\nexport CARGO_HOME=\"$SCRATCH_HOME/cargo\"",
+            "SCRATCH_HOME=/var/mnt/scratch/example\nGOPATH=${SCRATCH_HOME}/go:$SCRATCH_HOME/b",
         ] {
             assert_eq!(scan_with(base, &rooted()), vec![], "{base:?}");
             for content in variants(base) {

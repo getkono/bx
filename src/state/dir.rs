@@ -7,7 +7,7 @@ use rustix::fs::{CWD, RenameFlags};
 use rustix::io::Errno;
 
 use super::Error;
-use super::lock::ExclusiveLock;
+use super::lock::{ExclusiveLock, HeldLock};
 use crate::fs::Mode;
 
 /// `$XDG_STATE_HOME/bx` — bx's machine-owned half.
@@ -111,12 +111,13 @@ impl StateDir {
 
     /// The first quarantine path for a damaged state file: `<name>.corrupt`.
     ///
-    /// A later quarantine of the same file never reuses it while it is
-    /// occupied: [`move_aside`] takes the first free of `<name>.corrupt`,
-    /// `<name>.corrupt.1`, `<name>.corrupt.2`, …. Numbered rather than
-    /// timestamped, so the name a given sequence of damage produces is
-    /// deterministic; and never over an earlier one, because the earlier one
-    /// may be the only index there is to the user's restore blobs.
+    /// A later quarantine of the same file never reuses an occupied name, nor
+    /// refills a gap: [`move_aside`] takes the number after the highest of
+    /// `<name>.corrupt`, `<name>.corrupt.1`, `<name>.corrupt.2`, … present.
+    /// Numbered rather than timestamped, so the name a given sequence of damage
+    /// produces is deterministic; in creation order, so the last is the newest;
+    /// and never over an earlier one, because the earlier one may be the only
+    /// index there is to the user's restore blobs.
     #[must_use]
     pub(crate) fn quarantine(path: &Path) -> PathBuf {
         let mut name = path.as_os_str().to_os_string();
@@ -186,33 +187,45 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
     }
 }
 
-/// Move a damaged state file to the first quarantine name nothing occupies.
+/// Move a damaged state file aside, to the quarantine number after the highest
+/// one present.
 ///
 /// Demands the exclusive lock, because a rename by path moves whatever is at
 /// the path *now*: only while no writer can save is that still the file whose
 /// bytes were judged damaged.
 ///
+/// The number is the one after the highest `<name>.corrupt[.<n>]` present —
+/// `<name>.corrupt` itself when there is none — and never a gap a deleted
+/// quarantine left. So the quarantines present are always numbered in the order
+/// they were made, and the last is the newest, whichever a human has removed.
+///
 /// The rename is `RENAME_NOREPLACE`, so an existing quarantine is never
-/// destroyed — not by an earlier bx's leftovers, and not by a race. A
-/// filesystem that does not support the flag (`EINVAL`) falls back to checking
-/// for the name first and renaming second, which the lock makes sound against
-/// every other bx.
+/// destroyed — not by an earlier bx's leftovers, and not by a race; a name
+/// taken since the listing is skipped for the next. A filesystem that does not
+/// support the flag (`EINVAL`) falls back to checking for the name first and
+/// renaming second, which the lock makes sound against every other bx.
 ///
 /// The lock must be the one of the directory holding `path` — see
 /// [`check_lock`] — or nothing is renamed.
 ///
 /// # Errors
 ///
-/// [`std::io::ErrorKind::InvalidInput`] for another directory's lock, and
-/// otherwise the first failure that is not "that name is taken".
+/// [`std::io::ErrorKind::InvalidInput`] for another directory's lock, the
+/// failure to list the directory, and otherwise the first failure that is not
+/// "that name is taken".
 pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<PathBuf> {
     check_lock(path, lock).map_err(|refused| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, refused.to_string())
     })?;
-    let mut n: u64 = 0;
+    let mut n: u64 = match numbered(path)?.last() {
+        Some(highest) => highest
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("no free quarantine name"))?,
+        None => 0,
+    };
     loop {
         let candidate = StateDir::quarantine_nth(path, n);
-        match rustix::fs::renameat_with(CWD, path, CWD, &candidate, RenameFlags::NOREPLACE) {
+        match rename_noreplace(path, &candidate) {
             Ok(()) => return Ok(candidate),
             Err(Errno::EXIST) => {}
             Err(Errno::INVAL) if std::fs::symlink_metadata(&candidate).is_err() => {
@@ -228,7 +241,58 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
     }
 }
 
-/// Every quarantine of `path` present now, in the order [`move_aside`] makes
+/// `renameat2(from, to, RENAME_NOREPLACE)`.
+///
+/// One call site, so a test can make it answer as a filesystem without the flag
+/// does — see [`noreplace_seam`] — and reach [`move_aside`]'s check-then-rename
+/// fallback, which no filesystem a test can create would exercise.
+fn rename_noreplace(from: &Path, to: &Path) -> rustix::io::Result<()> {
+    #[cfg(test)]
+    if noreplace_seam::unsupported(to) {
+        return Err(Errno::INVAL);
+    }
+    rustix::fs::renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)
+}
+
+/// A test-only, per-thread switch that makes [`rename_noreplace`] report
+/// `EINVAL`, as a filesystem that does not support `RENAME_NOREPLACE` does.
+#[cfg(test)]
+pub(crate) mod noreplace_seam {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    /// Called with each rename's destination; `true` reports `EINVAL`.
+    type Seam = Box<dyn FnMut(&Path) -> bool>;
+
+    thread_local! {
+        static SEAM: RefCell<Option<Seam>> = const { RefCell::new(None) };
+    }
+
+    /// Whether the seam installed on this thread says `RENAME_NOREPLACE` is
+    /// unsupported for `to`. With none installed, it is supported.
+    pub(super) fn unsupported(to: &Path) -> bool {
+        SEAM.with(|slot| match slot.borrow_mut().as_mut() {
+            Some(seam) => seam(to),
+            None => false,
+        })
+    }
+
+    /// Run `f` with `seam` installed on this thread, removing it afterwards
+    /// even if `f` panics.
+    pub(crate) fn with<T>(seam: impl FnMut(&Path) -> bool + 'static, f: impl FnOnce() -> T) -> T {
+        struct Remove;
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                SEAM.with(|slot| slot.borrow_mut().take());
+            }
+        }
+        SEAM.with(|slot| *slot.borrow_mut() = Some(Box::new(seam)));
+        let _remove = Remove;
+        f()
+    }
+}
+
+/// Every quarantine of `path` present now, in the order [`move_aside`] made
 /// them: `<name>.corrupt`, then `<name>.corrupt.1`, `<name>.corrupt.2`, ….
 ///
 /// Found by listing the directory, not by probing names until one is missing,
@@ -240,22 +304,33 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
 /// [`Error::Read`] if the directory exists and cannot be listed: an empty list
 /// there would be a guess.
 pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, Error> {
+    let numbers = numbered(path).map_err(|source| Error::Read {
+        path: path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+        source,
+    })?;
+    Ok(numbers
+        .into_iter()
+        .map(|n| StateDir::quarantine_nth(path, n))
+        .collect())
+}
+
+/// The number of every quarantine of `path` present now, ascending: `0` for
+/// `<name>.corrupt`, `n` for `<name>.corrupt.<n>`.
+///
+/// A missing directory holds none.
+fn numbered(path: &Path) -> std::io::Result<Vec<u64>> {
     let (Some(root), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
         return Ok(Vec::new());
-    };
-    let unlistable = |source| Error::Read {
-        path: root.to_path_buf(),
-        source,
     };
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => return Err(unlistable(source)),
+        Err(source) => return Err(source),
     };
     let prefix = format!("{name}.corrupt");
     let mut found = Vec::new();
     for entry in entries {
-        let file = entry.map_err(unlistable)?.file_name();
+        let file = entry?.file_name();
         let Some(rest) = file.to_str().and_then(|file| file.strip_prefix(&prefix)) else {
             continue;
         };
@@ -264,10 +339,10 @@ pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, Error> {
             Some(Ok(n)) if n > 0 && rest == format!(".{n}") => n,
             _ => continue,
         };
-        found.push((n, StateDir::quarantine_nth(path, n)));
+        found.push(n);
     }
-    found.sort();
-    Ok(found.into_iter().map(|(_, aside)| aside).collect())
+    found.sort_unstable();
+    Ok(found)
 }
 
 /// Refuse `lock` unless it is the lock of the state directory holding `path`.
@@ -279,14 +354,25 @@ pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, Error> {
 ///
 /// # Errors
 ///
-/// [`Error::WrongLock`], naming both lock files.
+/// [`Error::WrongLock`], naming both lock files — or the one, when it is this
+/// directory's lock file that was replaced while held.
 pub(crate) fn check_lock(path: &Path, lock: &ExclusiveLock) -> Result<(), Error> {
+    check_held(path, lock.held())
+}
+
+/// [`check_lock`], against the lock file a guard locked, for a caller that
+/// kept that rather than the guard.
+///
+/// # Errors
+///
+/// As [`check_lock`].
+pub(crate) fn check_held(path: &Path, held: &HeldLock) -> Result<(), Error> {
     let root = path.parent().unwrap_or_else(|| Path::new(""));
-    if lock.guards(root) {
+    if held.guards(root) {
         return Ok(());
     }
     Err(Error::WrongLock {
-        held: lock.path().to_path_buf(),
+        held: held.path().to_path_buf(),
         needed: StateDir::new(root.to_path_buf()).lock(),
     })
 }
@@ -295,8 +381,9 @@ pub(crate) fn check_lock(path: &Path, lock: &ExclusiveLock) -> Result<(), Error>
 /// — the question asked of a linked directory bx may not `chmod`.
 ///
 /// Search permission alone is not counted. It lets another user open a name
-/// they already know, and every file this module keeps in the state directory
-/// is `0600`, so `0711` exposes nothing and refusing it would be untrue.
+/// they already know, and every file bx writes in the state directory is
+/// `0600`, so `0711` exposes none of them and refusing it would be untrue. The
+/// one file bx does not write there, `local.toml`, is [`check_local_layer`]'s.
 ///
 /// Group permission is counted even when the group is a user-private one, as
 /// on Fedora's default `umask 002`. Whether a group has exactly one member is
@@ -304,6 +391,46 @@ pub(crate) fn check_lock(path: &Path, lock: &ExclusiveLock) -> Result<(), Error>
 /// group-readable or group-writable target is refused.
 fn open_beyond_owner(mode: Mode) -> bool {
     mode.bits() & 0o066 != 0
+}
+
+/// Refuse a linked directory of `mode` that others can search while
+/// `local.toml` in it is readable or writable beyond its owner.
+///
+/// The rule every state directory bx accepts keeps: **no other account can
+/// open `local.toml`.** A directory bx created is narrowed to `0700`, which
+/// protects the file whatever its mode. A linked directory is never narrowed,
+/// and search permission on it exposes no file bx writes — but `local.toml` is
+/// written by the user, with their own `umask`, under a name nobody has to
+/// guess. So a searchable linked directory is accepted only while that file is
+/// absent or private, and bx changes neither mode itself.
+///
+/// Checked on every [`ensure_dir`] of the directory, so a `local.toml` created
+/// or widened later is refused the next time bx runs.
+///
+/// # Errors
+///
+/// [`Error::ExposedLocalLayer`], and [`Error::Read`] if the file's mode cannot
+/// be read.
+fn check_local_layer(dir: &Path, mode: Mode) -> Result<(), Error> {
+    if mode.bits() & 0o011 == 0 {
+        return Ok(());
+    }
+    let file = crate::config::layers::local_layer_path(dir);
+    let meta = match std::fs::metadata(&file) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(Error::Read { path: file, source }),
+    };
+    let file_mode = Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
+    if open_beyond_owner(file_mode) {
+        return Err(Error::ExposedLocalLayer {
+            path: dir.to_path_buf(),
+            mode,
+            file,
+            file_mode,
+        });
+    }
+    Ok(())
 }
 
 /// Check that an existing `path` is a directory, and narrow it to `mode` if it
@@ -341,7 +468,7 @@ fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
                 mode: found,
             });
         }
-        return Ok(());
+        return check_local_layer(path, found);
     }
     if found.is_shared() {
         tracing::warn!(
@@ -591,6 +718,58 @@ mod tests {
     }
 
     #[test]
+    fn without_rename_noreplace_the_fallback_skips_a_taken_name_and_replaces_no_quarantine() {
+        // Coverage review, round 5: the check-then-rename fallback for a
+        // filesystem that rejects `RENAME_NOREPLACE` with `EINVAL` never ran,
+        // and both mutants of its occupied-name guard survived. The listing
+        // already counts every occupied name, so the guard matters only for a
+        // name taken between the listing and the rename: the seam reports
+        // `EINVAL` for every rename, and takes the first candidate it is
+        // offered, the way a racing writer would.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        let path = dir.path().join("v.mpk");
+        let earlier = StateDir::quarantine_nth(&path, 1);
+        std::fs::write(&earlier, b"an earlier quarantine").expect("seed");
+        std::fs::write(&path, b"damaged").expect("seed");
+
+        let raced = StateDir::quarantine_nth(&path, 2);
+        let taken = raced.clone();
+        let mut calls = 0;
+        let aside = noreplace_seam::with(
+            move |candidate| {
+                calls += 1;
+                assert!(calls <= 8, "the fallback never settled on a name");
+                if candidate == taken.as_path() && !taken.exists() {
+                    std::fs::write(&taken, b"taken after the listing").expect("race");
+                }
+                true
+            },
+            || move_aside(&path, &lock),
+        )
+        .expect("moved aside through the fallback");
+
+        assert_eq!(aside, StateDir::quarantine_nth(&path, 3));
+        assert_eq!(std::fs::read(&aside).expect("moved"), b"damaged");
+        assert_eq!(
+            std::fs::read(&raced).expect("kept"),
+            b"taken after the listing"
+        );
+        assert_eq!(
+            std::fs::read(&earlier).expect("kept"),
+            b"an earlier quarantine"
+        );
+        assert!(std::fs::symlink_metadata(&path).is_err(), "the file moved");
+
+        // Without the seam, the same directory takes the next number natively.
+        std::fs::write(&path, b"damaged again").expect("seed");
+        assert_eq!(
+            move_aside(&path, &lock).expect("moved aside"),
+            StateDir::quarantine_nth(&path, 4),
+        );
+    }
+
+    #[test]
     fn another_directorys_lock_moves_nothing_aside() {
         // Review round 4: `move_aside` ignored which directory its lock
         // guarded, so A's lock quarantined B's ledger while B's own bx could be
@@ -653,6 +832,93 @@ mod tests {
             assert!(message.contains("read or write"), "{message}");
             assert_eq!(mode_of(&target), Mode::from_bits(mode), "never chmodded");
             assert!(!target.join("restore").exists(), "nothing was put in it");
+        }
+    }
+
+    #[test]
+    fn a_linked_state_directory_others_can_search_is_refused_while_local_toml_is_not_private() {
+        // Review round 5: a linked `0711` directory was accepted on the ground
+        // that every file in it is `0600`, but `local.toml` is hand-written and
+        // has a name anyone knows; an unlinked `0711` directory is narrowed.
+        fn linked(
+            dir_mode: u32,
+            local: Option<u32>,
+        ) -> (crate::testing::GuardedHome, PathBuf, StateDir) {
+            let home = guarded_home();
+            let target = home.child("elsewhere");
+            std::fs::create_dir_all(&target).expect("target");
+            if let Some(file_mode) = local {
+                let file = target.join("local.toml");
+                std::fs::write(&file, "[vars]\n").expect("local.toml");
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(file_mode))
+                    .expect("chmod file");
+            }
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(dir_mode))
+                .expect("chmod dir");
+            std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+            std::os::unix::fs::symlink(&target, home.child(".local/state/bx")).expect("symlink");
+            let dir = StateDir::resolve(home.path());
+            (home, target, dir)
+        }
+
+        for (dir_mode, file_mode) in [
+            (0o711, 0o644),
+            (0o701, 0o604),
+            (0o710, 0o640),
+            (0o711, 0o622),
+        ] {
+            let (_home, target, dir) = linked(dir_mode, Some(file_mode));
+            let err = dir
+                .ensure()
+                .expect_err(&format!("{dir_mode:04o} with {file_mode:04o}"));
+            assert!(
+                matches!(
+                    &err,
+                    Error::ExposedLocalLayer { path, mode, file, file_mode: found }
+                        if path == dir.root() && *mode == Mode::from_bits(dir_mode)
+                            && *file == dir.local_toml()
+                            && *found == Mode::from_bits(file_mode)
+                ),
+                "got {err}",
+            );
+            let message = err.to_string();
+            for needle in [
+                "local.toml".to_string(),
+                format!("{dir_mode:04o}"),
+                format!("{file_mode:04o}"),
+                "chmod 600".to_string(),
+                "chmod go-x".to_string(),
+            ] {
+                assert!(message.contains(&needle), "missing {needle:?}: {message}");
+            }
+            assert_eq!(
+                mode_of(&target),
+                Mode::from_bits(dir_mode),
+                "never chmodded"
+            );
+            assert_eq!(
+                mode_of(&target.join("local.toml")),
+                Mode::from_bits(file_mode),
+                "never chmodded",
+            );
+            assert!(!target.join("restore").exists(), "nothing was put in it");
+        }
+
+        // No search permission, a private `local.toml`, or none at all.
+        for (dir_mode, local) in [
+            (0o700, Some(0o644)),
+            (0o711, Some(0o600)),
+            (0o711, Some(0o400)),
+            (0o711, None),
+        ] {
+            let (_home, target, dir) = linked(dir_mode, local);
+            dir.ensure()
+                .unwrap_or_else(|e| panic!("{dir_mode:04o} with {local:?} refused: {e}"));
+            assert_eq!(
+                mode_of(&target),
+                Mode::from_bits(dir_mode),
+                "never chmodded"
+            );
         }
     }
 

@@ -79,6 +79,8 @@ mod store;
 
 use std::path::PathBuf;
 
+use crate::fs::Mode;
+
 pub use dir::StateDir;
 pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
@@ -137,12 +139,13 @@ pub enum Error {
     },
     /// Something other than the plain file bx creates occupies the lock path.
     ///
-    /// A symlink, a second hard link, a FIFO or a device. The lock file's body
-    /// is truncated on every exclusive acquisition, so opening any of these
-    /// could empty a file the user wrote; bx refuses and names the path.
+    /// A directory, a symlink, a second hard link, a FIFO or a device. The lock
+    /// file's body is truncated on every exclusive acquisition, so opening any
+    /// of these could empty a file the user wrote; bx refuses, names the path,
+    /// and says what to do.
     #[error(
-        "{} is not a plain file bx created (a symlink, a hard link or a special file); \
-         bx will not open it. Move it aside and run bx again",
+        "{} is not a plain file bx created (a directory, a symlink, a hard link or a special \
+         file); bx will not open it. Move it aside and run bx again",
         .path.display()
     )]
     LockNotAFile {
@@ -252,21 +255,27 @@ pub enum Error {
         /// The state file.
         path: PathBuf,
     },
-    /// The state directory is a symbolic link to a directory readable beyond
-    /// its owner.
+    /// The state directory is a symbolic link to a directory that users other
+    /// than its owner can read or write.
     ///
     /// bx narrows a directory it created, but never changes the mode of one it
     /// reached through a link, which may be shared with other users; and it will
-    /// not keep prior copies of private files in a directory others can read.
+    /// not keep prior copies of private files where others can list or replace
+    /// them. Search permission alone is not refused: `0711` exposes nothing.
+    /// Group permission is, even for a user-private group, which bx cannot
+    /// confirm without reading the account database.
     #[error(
-        "{} is a symbolic link to a directory readable beyond its owner; bx will not change \
-         the mode of a directory it did not create, nor keep your files in it. Make the \
-         target 0700, or replace the link",
+        "{} is a symbolic link to a directory that users other than its owner can read or write \
+         (mode {mode}); bx will not change the mode of a directory it did not create, nor keep \
+         your files in it. Remove group and other read and write permission from it \
+         (chmod go-rw), or replace the link",
         .path.display()
     )]
     SharedLinkedDir {
         /// The linked directory.
         path: PathBuf,
+        /// The mode of the directory the link names.
+        mode: Mode,
     },
     /// A ledger entry references a restore snapshot that is not on disk.
     #[error("the restore snapshot {digest} is missing from {}", .path.display())]

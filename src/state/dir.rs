@@ -291,8 +291,26 @@ pub(crate) fn check_lock(path: &Path, lock: &ExclusiveLock) -> Result<(), Error>
     })
 }
 
+/// Whether users other than the owner can read or write a directory of `mode`
+/// — the question asked of a linked directory bx may not `chmod`.
+///
+/// Search permission alone is not counted. It lets another user open a name
+/// they already know, and every file this module keeps in the state directory
+/// is `0600`, so `0711` exposes nothing and refusing it would be untrue.
+///
+/// Group permission is counted even when the group is a user-private one, as
+/// on Fedora's default `umask 002`. Whether a group has exactly one member is
+/// a question for the account database, which bx does not consult, so a
+/// group-readable or group-writable target is refused.
+fn open_beyond_owner(mode: Mode) -> bool {
+    mode.bits() & 0o066 != 0
+}
+
 /// Check that an existing `path` is a directory, and narrow it to `mode` if it
 /// is reachable by anyone but its owner.
+///
+/// A directory reached through a symlink is never narrowed: it is refused if
+/// [`open_beyond_owner`], and otherwise left exactly as it is.
 fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
     let read_failed = |source| Error::Read {
         path: path.to_path_buf(),
@@ -312,14 +330,18 @@ fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
         });
     }
     let found = Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
-    if found.is_shared() && linked {
+    if linked {
         // Never `chmod` through a link: the directory it names is not one bx
-        // created, and may be shared with other users. Leaving it wide would
-        // put prior copies of private files where others can read them, so
-        // the only answer left is to refuse and say why.
-        return Err(Error::SharedLinkedDir {
-            path: path.to_path_buf(),
-        });
+        // created, and may be shared with other users. Leaving it open would
+        // put prior copies of private files where others can list or replace
+        // them, so the only answer left is to refuse and say why.
+        if open_beyond_owner(found) {
+            return Err(Error::SharedLinkedDir {
+                path: path.to_path_buf(),
+                mode: found,
+            });
+        }
+        return Ok(());
     }
     if found.is_shared() {
         tracing::warn!(
@@ -592,6 +614,49 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_state_directory_is_refused_for_read_or_write_beyond_its_owner_and_nothing_else() {
+        // Review round 4: the refusal counted execute bits, so a `0711` target
+        // was refused as "readable beyond its owner", which is untrue.
+        fn link_to(mode: u32) -> (crate::testing::GuardedHome, PathBuf, StateDir) {
+            let home = guarded_home();
+            let target = home.child("elsewhere");
+            std::fs::create_dir_all(&target).expect("target");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+            std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+            std::os::unix::fs::symlink(&target, home.child(".local/state/bx")).expect("symlink");
+            let dir = StateDir::resolve(home.path());
+            (home, target, dir)
+        }
+
+        // Search permission exposes no name nobody knows and no 0600 file.
+        for mode in [0o700, 0o711, 0o701, 0o710] {
+            let (_home, target, dir) = link_to(mode);
+            dir.ensure()
+                .unwrap_or_else(|e| panic!("{mode:04o} refused: {e}"));
+            assert_eq!(mode_of(&target), Mode::from_bits(mode), "never chmodded");
+            assert_eq!(mode_of(&dir.restore()), Mode::PRIVATE_DIR);
+        }
+
+        // Group or other read or write is refused — group included, whether or
+        // not the group is a user-private one. 0775 is Fedora's umask-002 default.
+        for mode in [0o775, 0o770, 0o750, 0o720, 0o705, 0o703] {
+            let (_home, target, dir) = link_to(mode);
+            let err = dir.ensure().expect_err("must refuse");
+            assert!(
+                matches!(&err, Error::SharedLinkedDir { mode: found, .. }
+                    if *found == Mode::from_bits(mode)),
+                "{mode:04o}: got {err}",
+            );
+            let message = err.to_string();
+            assert!(message.contains(&format!("{mode:04o}")), "{message}");
+            assert!(message.contains("read or write"), "{message}");
+            assert_eq!(mode_of(&target), Mode::from_bits(mode), "never chmodded");
+            assert!(!target.join("restore").exists(), "nothing was put in it");
+        }
+    }
+
+    #[test]
     fn a_symlinked_state_directory_is_accepted() {
         let home = guarded_home();
         let real = home.child("elsewhere");
@@ -619,10 +684,14 @@ mod tests {
 
         let err = dir.ensure().expect_err("must refuse");
         assert!(
-            matches!(&err, Error::SharedLinkedDir { path } if path == dir.root()),
+            matches!(
+                &err,
+                Error::SharedLinkedDir { path, mode }
+                    if path == dir.root() && *mode == Mode::from_bits(0o755)
+            ),
             "got {err}",
         );
-        assert!(err.to_string().contains("0700"), "{err}");
+        assert!(err.to_string().contains("chmod go-rw"), "{err}");
         assert_eq!(mode_of(&shared), Mode::from_bits(0o755), "left as it was");
         assert!(!shared.join("restore").exists(), "nothing was put in it");
     }

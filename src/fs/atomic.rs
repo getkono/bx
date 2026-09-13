@@ -288,7 +288,8 @@ impl Error {
 /// regular file, because there is nothing to compare or restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observed {
-    /// The destination, as it was named. Not canonicalised.
+    /// The destination, as it was named less any trailing separator or `.`
+    /// component — see [`observe`]. Not canonicalised.
     pub path: PathBuf,
     /// What is there.
     pub kind: Kind,
@@ -449,11 +450,18 @@ impl Parent {
 /// [`Kind::Symlink`] rather than as whatever it points at, and `plan` therefore
 /// never depends on resolving a path beyond the one the target declared.
 ///
+/// A trailing separator or `.` is dropped from `dest` first, so `link/` is the
+/// link rather than the directory the kernel would resolve it to, and the
+/// observation's `path` is spelled without it. [`stage`], [`ensure_dir`] and
+/// [`set_mode`] spell their paths the same way.
+///
 /// # Errors
 ///
 /// [`Error::NoParent`] when `dest` has no parent component, and [`Error::Read`]
 /// when the destination or its parent exists but cannot be read.
 pub fn observe(dest: &Path) -> Result<Observed, Error> {
+    let dest = lexical(dest);
+    let dest = dest.as_path();
     let dir = parent_of(dest)?;
     let observed_parent = observe_parent(dir)?;
 
@@ -741,6 +749,9 @@ pub fn stage(
     planned: &Observed,
     created: &mut CreatedDirs,
 ) -> Result<Staged, Error> {
+    // Spelled as `observe` spells it, so `link/` is the link.
+    let dest = lexical(dest);
+    let dest = dest.as_path();
     if planned.path != dest {
         return Err(Error::Changed {
             path: dest.to_path_buf(),
@@ -1054,6 +1065,9 @@ pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Err
 /// a link's target through the link — and [`Error::Write`] when the `chmod`
 /// fails.
 pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
+    // Without a trailing separator, or `lstat` below would follow the link too.
+    let path = lexical(path);
+    let path = path.as_path();
     // chmod(2) follows symlinks and Linux has no AT_SYMLINK_NOFOLLOW for it, so
     // the link is excluded by looking first. The remaining window is a race with
     // the invoking user against their own home directory, which is not a
@@ -1178,6 +1192,10 @@ pub fn ensure_dir(
     planned: &Observed,
     created: &mut CreatedDirs,
 ) -> Result<EnsuredDir, Error> {
+    // Spelled as `observe` spells it, so `link/` is the link and never the
+    // directory a chmod through it would change.
+    let path = lexical(path);
+    let path = path.as_path();
     let fresh = observe(path)?;
     act_on_dir(path, mode, planned, fresh, created)
 }
@@ -1369,6 +1387,19 @@ fn refuse_unwritable(observed: &Observed) -> Result<(), Error> {
             kind,
         },
     })
+}
+
+/// `path` rebuilt from its components, which drops every trailing separator
+/// and every `.` after the first component.
+///
+/// A trailing `/` or `/.` makes the kernel resolve the last component:
+/// `lstat("link/")` stats the directory a symlink points at, and
+/// `chmod("link/")` changes it. bx decides about the component a target names,
+/// however the path is spelled, so every entry point that looks at or changes a
+/// path spells it this way first. Lexical only — nothing is resolved — and `..`
+/// is kept, because removing it without resolving could name a different file.
+fn lexical(path: &Path) -> PathBuf {
+    path.components().collect()
 }
 
 /// The directory `path` will be written into.
@@ -3480,6 +3511,66 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).expect("read"), b"x");
         assert_eq!(mode_of_path(&path), Mode::DEFAULT_FILE);
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_turn_a_symlink_into_what_it_points_at() {
+        // `lstat("link/")` resolves the link, because a trailing slash demands
+        // a directory, and `chmod("link/")` changes the directory at the far
+        // end. bx decides about the component the target names, however the
+        // path is spelled.
+        let home = guarded_home();
+        std::fs::create_dir(home.child("real")).expect("mkdir");
+        set_mode(&home.child("real"), Mode::DEFAULT_DIR).expect("chmod");
+        std::os::unix::fs::symlink("real", home.child("link")).expect("symlink");
+
+        for spelled in ["link/", "link//", "link/."] {
+            let path = home.child(spelled);
+            let observed = observe(&path).expect("observe");
+            assert_eq!(observed.kind, Kind::Symlink, "{spelled}");
+            assert_eq!(observed.path, home.child("link"), "{spelled}");
+            assert_eq!(
+                compare_dir(&observed, Mode::PRIVATE_DIR).action,
+                Action::Conflict,
+                "{spelled}",
+            );
+            assert_eq!(
+                ensure_dir(&path, Mode::PRIVATE_DIR, &observed, &mut CreatedDirs::new())
+                    .expect("a verdict")
+                    .action,
+                Action::Conflict,
+                "{spelled}",
+            );
+            let err = set_mode(&path, Mode::PRIVATE_DIR).expect_err("a link is not chmod'd");
+            assert!(matches!(err, Error::Symlink(_)), "{spelled}: {err:?}");
+            let err = write_atomically(&path, b"x", Mode::DEFAULT_FILE)
+                .expect_err("a link is not written over");
+            assert!(matches!(err, Error::Symlink(_)), "{spelled}: {err:?}");
+
+            assert_eq!(
+                mode_of_path(&home.child("real")),
+                Mode::DEFAULT_DIR,
+                "{spelled}: the link's target keeps its mode",
+            );
+            assert_eq!(
+                names_in(&home.child("real")),
+                Vec::<OsString>::new(),
+                "{spelled}: nothing was written through the link",
+            );
+        }
+
+        // A link to a file, with a slash the kernel would refuse as ENOTDIR,
+        // is still the link bx refuses to replace rather than a read error.
+        seed(&home.child("file"), b"theirs\n", Mode::DEFAULT_FILE);
+        std::os::unix::fs::symlink("file", home.child("flink")).expect("symlink");
+        let err = write_atomically(&home.child("flink/"), b"x", Mode::DEFAULT_FILE)
+            .expect_err("a link is not written over");
+        assert!(matches!(err, Error::Symlink(_)), "{err:?}");
+        assert_eq!(err.path(), home.child("flink"));
+        assert_eq!(
+            std::fs::read(home.child("file")).expect("read"),
+            b"theirs\n"
+        );
     }
 
     #[test]

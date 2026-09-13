@@ -573,6 +573,8 @@ impl Ledger {
     ///   [`Error::PriorConflict`], stores nothing, and leaves the entry exactly
     ///   as it was. `plan` reports the same target as a conflict from `written`
     ///   alone, so an apply that shares its function never reaches this call.
+    ///   The way out that loses no byte is [`Ledger::adopt_current_as_prior`],
+    ///   run only because the user chose it.
     ///
     /// The comparison is on content only. A file whose bytes still match
     /// `written` but whose mode the user changed is treated as bx's own output,
@@ -682,14 +684,7 @@ impl Ledger {
         // A third party wrote these bytes and this apply displaces them: they
         // reach `restore/` before anything else is decided.
         let adopted = self.store_restore(digest, &bytes, mode)?;
-        let mut superseded = existing.superseded.clone();
-        if let Prior::Existed(previous) = &existing.prior
-            && !superseded.contains(previous)
-        {
-            superseded.push(previous.clone());
-        }
-        // A snapshot the user has put back is the prior again, not history.
-        superseded.retain(|reference| *reference != adopted);
+        let superseded = supersede(existing, &adopted);
         tracing::info!(
             path = %existing.path,
             digest = %adopted.digest,
@@ -709,6 +704,59 @@ impl Ledger {
     /// deletion. Reclaiming unreferenced blobs is not implemented.
     pub fn forget(&mut self, path: &crate::paths::Portable) -> Option<LedgerEntry> {
         self.view.entries.remove(path)
+    }
+
+    /// Accept a target as it is now as the version `bx rm` restores — the way
+    /// out of [`Error::PriorConflict`] that loses no byte.
+    ///
+    /// `bytes` and `mode` are the target as it is on disk now. When the bytes
+    /// hash to the entry's `written`, nothing has changed and nothing is done.
+    /// Otherwise they are stored in `restore/`, durably, and become the prior;
+    /// the prior they replace moves to [`LedgerEntry::superseded`], exactly as
+    /// a re-record of an `Own` target moves it, so no snapshot is dropped.
+    /// `written` becomes their digest: the next `plan` sees the file as bx
+    /// last accepted it, and the next apply's re-record keeps this prior
+    /// instead of conflicting again.
+    ///
+    /// For a `Region` or `Include` target this is on purpose what `record`
+    /// refuses to do by itself. The accepted bytes hold bx's own lines, and
+    /// `bx rm` will write them back, so it must run only because the user chose
+    /// it. Restoring the user's edit without bx's lines needs the region
+    /// writer's delimiter grammar, which does not exist yet.
+    ///
+    /// Returns `Ok(None)`, changing nothing, when bx records no entry for
+    /// `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CreateDir`] or [`Error::Write`] if the bytes cannot be stored.
+    /// The entry is left unchanged.
+    pub fn adopt_current_as_prior(
+        &mut self,
+        path: &crate::paths::Portable,
+        bytes: &[u8],
+        mode: Mode,
+    ) -> Result<Option<&LedgerEntry>, Error> {
+        let Some(existing) = self.view.entries.get(path) else {
+            return Ok(None);
+        };
+        let digest = ContentHash::of(bytes);
+        if digest == existing.written {
+            return Ok(self.view.entries.get(path));
+        }
+        let adopted = self.store_restore(digest, bytes, mode)?;
+        let superseded = supersede(existing, &adopted);
+        if let Some(entry) = self.view.entries.get_mut(path) {
+            tracing::info!(
+                path = %entry.path,
+                digest = %adopted.digest,
+                "accepting the file as it is now as the version bx rm restores",
+            );
+            entry.prior = Prior::Existed(adopted);
+            entry.superseded = superseded;
+            entry.written = digest;
+        }
+        Ok(self.view.entries.get(path))
     }
 
     /// Turn caller-supplied prior bytes into a durable [`Prior`].
@@ -778,6 +826,22 @@ impl Ledger {
         write_atomically(&path, bytes, Mode::PRIVATE_FILE)?;
         Ok(())
     }
+}
+
+/// `existing`'s superseded list once `adopted` becomes its prior.
+///
+/// The prior it replaces is appended unless it is already there, so every blob
+/// stored for a live target stays indexed; and a snapshot the user has put back
+/// is the prior again, not history.
+fn supersede(existing: &LedgerEntry, adopted: &RestoreRef) -> Vec<RestoreRef> {
+    let mut superseded = existing.superseded.clone();
+    if let Prior::Existed(previous) = &existing.prior
+        && !superseded.contains(previous)
+    {
+        superseded.push(previous.clone());
+    }
+    superseded.retain(|reference| reference != adopted);
+    superseded
 }
 
 /// The directories an earlier record created, plus any a later one did.
@@ -1893,6 +1957,87 @@ mod tests {
             .check_record(&at(b"BX2", bx1))
             .expect("bx's own output");
         ledger.record(at(b"BX2", bx1)).expect("record");
+    }
+
+    #[test]
+    fn accepting_a_changed_shared_file_converges_and_keeps_the_first_original() {
+        // Review round 4: `PriorConflict` fires on any edit outside bx's
+        // region, its message named no remedy, and re-recording converged
+        // nowhere.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let region = Mechanism::Region { comment: '#' };
+        let original: &[u8] = b"user line 1\n";
+        let bx1: &[u8] = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let edited: &[u8] = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\nuser line 2\n";
+        let bx2: &[u8] = b"user line 1\n# >>> bx >>>\nBX2\n# <<< bx <<<\nuser line 2\n";
+        let apply = |written: &[u8], before: &[u8]| {
+            NewEntry::new(
+                target("~/.bashrc"),
+                ContentHash::of(written),
+                Mode::DEFAULT_FILE,
+                region.clone(),
+            )
+            .with_prior(prior(before, 0o644))
+        };
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger.record(apply(bx1, original)).expect("first apply");
+
+        // The edit: a conflict, every time, whose message names both ways out.
+        for _ in 0..2 {
+            let message = ledger
+                .record(apply(bx2, edited))
+                .expect_err("a conflict")
+                .to_string();
+            assert!(message.contains("put the file back"), "{message}");
+            assert!(
+                message.contains("accept the file as it is now"),
+                "{message}"
+            );
+        }
+
+        // The user accepts the file as it is now.
+        let accepted = ledger
+            .adopt_current_as_prior(&target("~/.bashrc"), edited, Mode::from_bits(0o640))
+            .expect("adopt")
+            .expect("an entry")
+            .clone();
+        assert_eq!(accepted.written, ContentHash::of(edited));
+        assert_eq!(accepted.prior, Prior::Existed(reference(edited, 0o640)));
+        assert_eq!(
+            accepted.superseded,
+            vec![reference(original, 0o644)],
+            "the first original is kept, not dropped",
+        );
+        assert_eq!(accepted.mechanism, region);
+        assert!(has_blob(&dir, edited) && has_blob(&dir, original));
+
+        // Accepting the same file again changes nothing.
+        ledger
+            .adopt_current_as_prior(&target("~/.bashrc"), edited, Mode::from_bits(0o640))
+            .expect("adopt again");
+        assert_eq!(ledger.get(&target("~/.bashrc")), Some(&accepted));
+
+        // The next apply converges: no conflict, and the accepted prior stands.
+        let stored = ledger
+            .record(apply(bx2, edited))
+            .expect("the next apply records")
+            .clone();
+        assert_eq!(stored.written, ContentHash::of(bx2));
+        assert_eq!(stored.prior, accepted.prior);
+        assert_eq!(stored.superseded, accepted.superseded);
+        ledger.save().expect("save");
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
+        assert_eq!(reloaded.get(&target("~/.bashrc")), Some(&stored));
+
+        // A target bx does not record is not invented.
+        assert!(
+            ledger
+                .adopt_current_as_prior(&target("~/.zshrc"), edited, Mode::DEFAULT_FILE)
+                .expect("adopt")
+                .is_none()
+        );
+        assert!(ledger.get(&target("~/.zshrc")).is_none());
     }
 
     #[test]

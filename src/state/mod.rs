@@ -319,10 +319,20 @@ pub enum Error {
     /// the changed file, bx's own lines included, as what the user last had.
     ///
     /// Nothing is recorded and nothing is stored. See [`Ledger::record`].
+    ///
+    /// Any edit outside bx's lines raises this, and re-recording converges
+    /// nowhere, so the message names the two ways out. Putting the file back
+    /// needs nothing from bx. Accepting the file as it is now is
+    /// [`Ledger::adopt_current_as_prior`], which the command that reports the
+    /// conflict must offer: it keeps the earlier original in
+    /// [`LedgerEntry::superseded`], and afterwards `bx rm` restores the file as
+    /// it is now, bx's lines in it included.
     #[error(
         "{target} changed since bx last wrote it, and bx shares that file through a managed \
          region or an include line, so it still holds bx's own lines; bx will not record it \
-         as your original. Nothing was recorded"
+         as your original. Nothing was recorded. To go on, either put the file back as bx last \
+         wrote it, or accept the file as it is now as the version `bx rm` restores (bx's lines \
+         in it included; the original bx first recorded is kept in the ledger's history)"
     )]
     PriorConflict {
         /// The target, as the ledger keys it.

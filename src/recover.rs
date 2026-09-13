@@ -2450,6 +2450,107 @@ mod tests {
     }
 
     #[test]
+    fn two_successive_torn_journals_are_both_rolled_back_and_kept_and_bx_writes_afterwards() {
+        // #9's round-3 review: the set-aside name was checked before the
+        // rollback, so a second torn journal blocked recover, rm, abandon and
+        // every session while the machine stayed half-applied. Recovery rolls
+        // back first and sets the journal aside last, under the next free name.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut kept = Vec::new();
+        for round in 0..2 {
+            let (dest, mut bytes) = interrupted_modify(&state, home.path());
+            // A different cut each round, so the two kept files differ.
+            bytes.truncate(bytes.len() - 1 - round);
+            std::fs::write(state.journal(), &bytes).expect("tear the last frame");
+            assert_eq!(
+                recover(&state).expect("recover"),
+                Outcome::RolledBack { undone: 1 },
+                "round {round}",
+            );
+            assert_eq!(
+                peek(&dest).expect("rolled back").0,
+                b"the user's original\n",
+                "round {round}",
+            );
+            assert!(!state.journal().exists(), "round {round}");
+            kept.push(bytes);
+        }
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&state.journal())).expect("the first"),
+            kept[0],
+        );
+        assert_eq!(
+            std::fs::read(StateDir::quarantine_nth(&state.journal(), 1)).expect("the second"),
+            kept[1],
+        );
+
+        let mut session = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
+            .expect("bx writes again");
+        session
+            .apply(write_to(
+                home.path(),
+                ".conf",
+                "bx new\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        assert_eq!(session.finish().expect("finish"), 1);
+        assert_eq!(peek(&home.child(".conf")).expect("written").0, b"bx new\n");
+    }
+
+    #[test]
+    fn a_set_aside_that_fails_after_the_rollback_leaves_the_journal_in_place() {
+        // The rollback comes first. If the torn journal then cannot be moved
+        // aside, it stays where it is, and the next run repeats a rollback that
+        // has nothing left to do before trying again.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (dest, mut bytes) = interrupted_modify(&state, home.path());
+        bytes.truncate(bytes.len() - 1);
+        std::fs::write(state.journal(), &bytes).expect("tear the last frame");
+
+        // The rollback writes in the home; only the set-aside renames in the
+        // state directory. Narrower than 0700, so nothing tightens it back.
+        fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
+        if !permissions_refuse(state.root()) {
+            fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+            return;
+        }
+        let first = recover(&state);
+        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+
+        let err = first.expect_err("the journal cannot be moved aside");
+        assert!(
+            matches!(err, Error::Journal(journal::Error::Io { .. })),
+            "got {err}"
+        );
+        assert_eq!(
+            peek(&dest).expect("rolled back").0,
+            b"the user's original\n",
+            "the rollback ran before the set-aside was tried",
+        );
+        assert_eq!(
+            std::fs::read(state.journal()).expect("left in place"),
+            bytes
+        );
+        assert!(!StateDir::quarantine(&state.journal()).exists());
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { undone: 1 }
+        );
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&state.journal())).expect("set aside"),
+            bytes,
+        );
+        assert_eq!(
+            peek(&dest).expect("still rolled back").0,
+            b"the user's original\n"
+        );
+    }
+
+    #[test]
     fn abandoning_twice_keeps_both_set_aside_journals() {
         // Review round 3, item 5. The set-aside name was fixed, and the second
         // abandon renamed its journal over the first. Round 3 refused the

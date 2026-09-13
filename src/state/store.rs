@@ -245,6 +245,14 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `read` follows a symlink, so a link to nothing reads as no file.
+            // That is not "no state" — it is usually state on storage that is
+            // not there right now — so it is refused, and nothing is renamed.
+            if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Err(Error::DanglingLink {
+                    path: path.to_path_buf(),
+                });
+            }
             return Ok(Loaded {
                 value: T::default(),
                 health: Health::Fresh,

@@ -185,6 +185,36 @@ pub enum Error {
         #[source]
         source: Box<crate::paths::Error>,
     },
+    /// A state file's path is a symbolic link to something that does not exist.
+    ///
+    /// Not "no state": the likeliest cause is state kept on storage that is not
+    /// there right now, and reading it as fresh would let the next save replace
+    /// the link — and the priors behind it — with an empty ledger.
+    #[error(
+        "{} is a symbolic link to something that does not exist; bx will not read that as \
+         having no state. Restore what it points at, or remove the link",
+        .path.display()
+    )]
+    DanglingLink {
+        /// The state file.
+        path: PathBuf,
+    },
+    /// The state directory is a symbolic link to a directory readable beyond
+    /// its owner.
+    ///
+    /// bx narrows a directory it created, but never changes the mode of one it
+    /// reached through a link, which may be shared with other users; and it will
+    /// not keep prior copies of private files in a directory others can read.
+    #[error(
+        "{} is a symbolic link to a directory readable beyond its owner; bx will not change \
+         the mode of a directory it did not create, nor keep your files in it. Make the \
+         target 0700, or replace the link",
+        .path.display()
+    )]
+    SharedLinkedDir {
+        /// The linked directory.
+        path: PathBuf,
+    },
     /// A ledger entry references a restore snapshot that is not on disk.
     #[error("the restore snapshot {digest} is missing from {}", .path.display())]
     RestoreMissing {

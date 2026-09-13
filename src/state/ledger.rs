@@ -19,6 +19,7 @@ use std::collections::btree_map::Iter;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{FileType, Mode as RawMode, OFlags};
 use serde::{Deserialize, Serialize};
 
 use super::Error;
@@ -659,6 +660,10 @@ impl Ledger {
     /// A `stat` rather than a re-hash: it keeps the common repeat path O(1),
     /// and the two ways a blob is plausibly lost — a truncated write and an
     /// empty file left by an interrupted one — both change the length.
+    ///
+    /// The `stat` is of the name itself, never of what it links to: see
+    /// [`blob_len`]. A symlink or a second hard link of the right length is not
+    /// a blob bx wrote, so it is rewritten too.
     fn store_blob(&self, digest: ContentHash, bytes: &[u8]) -> Result<(), Error> {
         let restore = self.dir.restore();
         ensure_dir(&restore, Mode::PRIVATE_DIR)?;
@@ -692,13 +697,28 @@ fn merge_created_dirs(
     merged
 }
 
-/// The length of the file at `path`, or `None` if it is not a readable file.
+/// The length of the blob at `path`, or `None` unless it is bx's own file.
 ///
 /// `None` means *rewrite it*: a blob that cannot be stat'ed is not a blob whose
 /// content has been established.
+///
+/// The name is opened `O_PATH | O_NOFOLLOW` and the descriptor is checked, so
+/// what is measured is the entry in `restore/` and never what a symlink there
+/// names: a decoy link to a same-length file elsewhere used to satisfy the
+/// check with none of the user's bytes behind it. It must be a regular file
+/// with exactly one link. `O_PATH` reads nothing and cannot block on a FIFO.
+/// The rewrite goes through [`write_atomically`], whose rename replaces the
+/// entry, so a link is replaced and never written through.
 fn blob_len(path: &Path) -> Option<u64> {
-    let metadata = std::fs::metadata(path).ok()?;
-    metadata.is_file().then_some(metadata.len())
+    let fd = rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        RawMode::empty(),
+    )
+    .ok()?;
+    let stat = rustix::fs::fstat(&fd).ok()?;
+    let own = FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_nlink == 1;
+    own.then(|| u64::try_from(stat.st_size).ok()).flatten()
 }
 
 /// Where a snapshot with this digest lives.
@@ -1466,6 +1486,44 @@ mod tests {
     }
 
     #[test]
+    fn a_decoy_link_at_a_blob_name_is_replaced_rather_than_trusted() {
+        // Review round 3: `blob_len` followed a symlink, so a link at
+        // `restore/<digest>` to any file of the same length made `record`
+        // return Ok with none of the user's bytes on disk — found only at rm,
+        // as RestoreCorrupt. A second hard link was trusted the same way.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        home.write("decoy", "ZZZZZ");
+        home.write("other", "YYYYY");
+        std::os::unix::fs::symlink(home.child("decoy"), dir.restore().join(hex(b"prior")))
+            .expect("symlink");
+        std::fs::hard_link(home.child("other"), dir.restore().join(hex(b"third")))
+            .expect("hard link");
+
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        for (name, body) in [("~/.a", &b"prior"[..]), ("~/.b", b"third")] {
+            let stored = ledger
+                .record(entry(name, b"bx").with_prior(prior(body, 0o644)))
+                .expect("record")
+                .clone();
+            let Prior::Existed(reference) = &stored.prior else {
+                panic!("expected a snapshot");
+            };
+            assert_eq!(
+                ledger.restore_bytes(&dir, reference).expect("restore"),
+                body
+            );
+            let blob = dir.restore().join(hex(body));
+            let meta = std::fs::symlink_metadata(&blob).expect("stat");
+            assert!(meta.file_type().is_file(), "the decoy was replaced");
+            assert_eq!(meta.nlink(), 1);
+        }
+        // Neither decoy was written through.
+        assert_eq!(std::fs::read(home.child("decoy")).expect("read"), b"ZZZZZ");
+        assert_eq!(std::fs::read(home.child("other")).expect("read"), b"YYYYY");
+    }
+
+    #[test]
     fn a_tampered_restore_blob_is_refused_rather_than_returned() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
@@ -1969,6 +2027,27 @@ mod tests {
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
         assert!(dir.root().join("ledger.mpk.corrupt").exists());
+    }
+
+    #[test]
+    fn a_dangling_ledger_symlink_stops_bx_instead_of_reading_as_fresh() {
+        // Review round 3: a `ledger.mpk` link to storage that is not mounted
+        // read as `Health::Fresh`, and the next save replaced the link.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let far = home.child("unmounted/ledger.mpk");
+        std::os::unix::fs::symlink(&far, dir.ledger()).expect("symlink");
+
+        let err = LedgerView::read(&dir, home.path()).expect_err("must refuse");
+        assert!(
+            matches!(&err, Error::DanglingLink { path } if *path == dir.ledger()),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        let err = Ledger::open(&dir, &lock, home.path()).expect_err("must refuse");
+        assert!(matches!(err, Error::DanglingLink { .. }), "got {err}");
+        assert_eq!(std::fs::read_link(dir.ledger()).expect("still a link"), far);
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
     }
 
     #[test]

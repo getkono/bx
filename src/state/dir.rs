@@ -224,19 +224,33 @@ pub(crate) fn move_aside(path: &Path, _lock: &ExclusiveLock) -> std::io::Result<
 /// Check that an existing `path` is a directory, and narrow it to `mode` if it
 /// is reachable by anyone but its owner.
 fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
+    let read_failed = |source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    let linked = std::fs::symlink_metadata(path)
+        .map_err(read_failed)?
+        .file_type()
+        .is_symlink();
     // `metadata` follows symlinks on purpose: a state directory the user has
     // symlinked onto other storage is theirs to arrange, and refusing it would
     // be bx dictating a layout.
-    let meta = std::fs::metadata(path).map_err(|source| Error::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let meta = std::fs::metadata(path).map_err(read_failed)?;
     if !meta.is_dir() {
         return Err(Error::NotADirectory {
             path: path.to_path_buf(),
         });
     }
     let found = Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
+    if found.is_shared() && linked {
+        // Never `chmod` through a link: the directory it names is not one bx
+        // created, and may be shared with other users. Leaving it wide would
+        // put prior copies of private files where others can read them, so
+        // the only answer left is to refuse and say why.
+        return Err(Error::SharedLinkedDir {
+            path: path.to_path_buf(),
+        });
+    }
     if found.is_shared() {
         tracing::warn!(
             path = %path.display(),
@@ -489,10 +503,34 @@ mod tests {
         let home = guarded_home();
         let real = home.child("elsewhere");
         std::fs::create_dir_all(&real).expect("real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("private");
         std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
         std::os::unix::fs::symlink(&real, home.child(".local/state/bx")).expect("symlink");
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("ensure");
         assert!(real.join("restore").is_dir());
+        assert_eq!(mode_of(&real.join("restore")), Mode::PRIVATE_DIR);
+    }
+
+    #[test]
+    fn a_symlinked_state_directory_onto_a_shared_directory_is_refused_not_chmodded() {
+        // Review round 3: `tighten` followed the link and narrowed the
+        // directory it named — one bx did not create, and may share with others.
+        let home = guarded_home();
+        let shared = home.child("shared");
+        std::fs::create_dir_all(&shared).expect("shared");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).expect("wide");
+        std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+        std::os::unix::fs::symlink(&shared, home.child(".local/state/bx")).expect("symlink");
+        let dir = StateDir::resolve(home.path());
+
+        let err = dir.ensure().expect_err("must refuse");
+        assert!(
+            matches!(&err, Error::SharedLinkedDir { path } if path == dir.root()),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("0700"), "{err}");
+        assert_eq!(mode_of(&shared), Mode::from_bits(0o755), "left as it was");
+        assert!(!shared.join("restore").exists(), "nothing was put in it");
     }
 }

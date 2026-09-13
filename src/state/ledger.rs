@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use super::Error;
 use super::dir::{StateDir, ensure_dir};
 use super::hash::ContentHash;
-use super::lock::ExclusiveLock;
+use super::lock::{ExclusiveLock, HeldLock};
 use super::store::{self, Loaded, Loss, Rejected};
 use crate::fs::{Mode, write_atomically};
 
@@ -136,6 +136,42 @@ pub struct LedgerEntry {
     /// wrote becomes an unindexed orphan in `restore/`.
     #[serde(default)]
     pub superseded: Vec<RestoreRef>,
+    /// Whether a [`Prior::Absent`] has been superseded: before bx first wrote
+    /// the target there was no file, and that is no longer the prior.
+    ///
+    /// Kept beside [`LedgerEntry::superseded`] rather than in it, so that list
+    /// stays the list of snapshots callers already read. No order is lost:
+    /// `Absent` is only ever the prior of an entry's first record — a re-record
+    /// never lets an incoming `Absent` replace a stored prior — so once it is
+    /// superseded it is the oldest point in the history, before every snapshot
+    /// in `superseded`.
+    ///
+    /// Written only when `true`. A ledger in which this never happened saves
+    /// byte-identically to one written before the field existed, and a build
+    /// that predates the field ignores it rather than refusing the ledger —
+    /// losing only this fact, at its next save.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded_absent: bool,
+}
+
+/// What an entry keeps of the priors it no longer restores: the two history
+/// fields of [`LedgerEntry`], moved together.
+#[derive(Debug, Default)]
+struct History {
+    /// As [`LedgerEntry::superseded`].
+    superseded: Vec<RestoreRef>,
+    /// As [`LedgerEntry::superseded_absent`].
+    absent: bool,
+}
+
+impl History {
+    /// `entry`'s history as it stands.
+    fn of(entry: &LedgerEntry) -> Self {
+        Self {
+            superseded: entry.superseded.clone(),
+            absent: entry.superseded_absent,
+        }
+    }
 }
 
 /// The bytes a target held before bx wrote it, as handed to [`Ledger::record`].
@@ -394,6 +430,12 @@ impl LedgerView {
 /// held now*: a caller could drop the guard and keep the `Ledger`. Expressing
 /// the stronger property would mean a lifetime parameter on every signature that
 /// names a ledger, which is the threading this design exists to avoid.
+///
+/// What is checked again, before every write — [`Ledger::record`],
+/// [`Ledger::adopt_current_as_prior`] and [`Ledger::save`] — is that the lock
+/// file this was opened under is still the file at the lock path. An outside
+/// `mv` or `rm` of a held lock file lets a second bx lock a new one, and a
+/// ledger that went on writing would be writing beside it.
 #[derive(Debug)]
 pub struct Ledger {
     /// Where it lives, so `record` and `save` need no further arguments.
@@ -401,6 +443,9 @@ pub struct Ledger {
     /// The home it was opened under, so `record` refuses exactly the paths the
     /// next `open` under that home would refuse.
     home: PathBuf,
+    /// The lock file it was opened under, so a write can refuse once that file
+    /// has been replaced.
+    lock: HeldLock,
     /// The entries themselves.
     view: LedgerView,
 }
@@ -462,8 +507,8 @@ impl Ledger {
     /// The lock is not stored; requiring it here is what makes a `Ledger` proof
     /// that one was taken.
     ///
-    /// A damaged `ledger.mpk` is moved aside to the first free quarantine name
-    /// and this returns an empty ledger, with [`super::Health::Reset`] saying
+    /// A damaged `ledger.mpk` is moved aside to the next quarantine name and
+    /// this returns an empty ledger, with [`super::Health::Reset`] saying
     /// so. The lock is what makes that rename safe: no writer can have saved
     /// since the bytes were read.
     ///
@@ -493,6 +538,7 @@ impl Ledger {
         Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self {
             dir,
             home: home.to_path_buf(),
+            lock: lock.held().clone(),
             view,
         }))
     }
@@ -561,7 +607,9 @@ impl Ledger {
     ///   bytes. They are stored in `restore/`, durably, and become the prior. A
     ///   stored [`Prior::Existed`] they replace moves to
     ///   [`LedgerEntry::superseded`] rather than being dropped, and a stored
-    ///   [`Prior::Absent`] they replace had no bytes to keep.
+    ///   [`Prior::Absent`] they replace sets
+    ///   [`LedgerEntry::superseded_absent`]: it had no bytes to keep, but that
+    ///   there was no file before bx is still part of the history.
     ///
     ///   **Only for a file bx owns whole.** When the stored or the incoming
     ///   [`Mechanism`] is a `Region` or an `Include`, those bytes hold bx's own
@@ -625,21 +673,24 @@ impl Ledger {
     /// cannot be used with the home the ledger was opened under. That is
     /// checked before anything is stored: once saved, such a path would make
     /// every later open under the same home refuse the ledger, with no way back.
+    ///
+    /// [`Error::WrongLock`] if the lock file this ledger was opened under has
+    /// been replaced or removed since; nothing is stored.
     pub fn record(&mut self, entry: NewEntry) -> Result<&LedgerEntry, Error> {
+        self.check_lock()?;
         self.check_new_paths(&entry)?;
         let key = entry.path.clone();
-        let (prior, superseded, created_dirs) = match self.view.entries.get(&key) {
+        let (prior, history, created_dirs) = match self.view.entries.get(&key) {
             None => (
                 self.store_prior(entry.prior)?,
-                Vec::new(),
+                History::default(),
                 entry.created_dirs,
             ),
             Some(existing) => {
-                let (prior, superseded) =
-                    self.carry_prior(existing, &entry.mechanism, entry.prior)?;
+                let (prior, history) = self.carry_prior(existing, &entry.mechanism, entry.prior)?;
                 (
                     prior,
-                    superseded,
+                    history,
                     merge_created_dirs(&existing.created_dirs, entry.created_dirs),
                 )
             }
@@ -653,13 +704,14 @@ impl Ledger {
                 mechanism: entry.mechanism,
                 prior,
                 created_dirs,
-                superseded,
+                superseded: history.superseded,
+                superseded_absent: history.absent,
             },
         );
         Ok(&self.view.entries[&key])
     }
 
-    /// Decide the prior and the superseded list for a re-record of `existing`.
+    /// Decide the prior and the history for a re-record of `existing`.
     ///
     /// The rule is documented on [`Ledger::record`]. Any bytes that are to be
     /// adopted are durable in `restore/` before this returns.
@@ -668,11 +720,11 @@ impl Ledger {
         existing: &LedgerEntry,
         mechanism: &Mechanism,
         incoming: PriorBytes,
-    ) -> Result<(Prior, Vec<RestoreRef>), Error> {
+    ) -> Result<(Prior, History), Error> {
         // A shared file's changed bytes still hold bx's own region or include
         // line. Refused before anything is stored: see `record`.
         prior_conflict(existing, mechanism, &incoming)?;
-        let kept = || (existing.prior.clone(), existing.superseded.clone());
+        let kept = || (existing.prior.clone(), History::of(existing));
         let PriorBytes::Bytes { bytes, mode } = incoming else {
             return Ok(kept());
         };
@@ -684,13 +736,13 @@ impl Ledger {
         // A third party wrote these bytes and this apply displaces them: they
         // reach `restore/` before anything else is decided.
         let adopted = self.store_restore(digest, &bytes, mode)?;
-        let superseded = supersede(existing, &adopted);
+        let history = supersede(existing, &adopted);
         tracing::info!(
             path = %existing.path,
             digest = %adopted.digest,
             "the file changed since bx last wrote it; keeping the displaced bytes as its prior",
         );
-        Ok((Prior::Existed(adopted), superseded))
+        Ok((Prior::Existed(adopted), history))
     }
 
     /// Drop a target from the ledger, returning the entry that was there.
@@ -712,17 +764,25 @@ impl Ledger {
     /// `bytes` and `mode` are the target as it is on disk now. When the bytes
     /// hash to the entry's `written`, nothing has changed and nothing is done.
     /// Otherwise they are stored in `restore/`, durably, and become the prior;
-    /// the prior they replace moves to [`LedgerEntry::superseded`], exactly as
-    /// a re-record of an `Own` target moves it, so no snapshot is dropped.
-    /// `written` becomes their digest: the next `plan` sees the file as bx
-    /// last accepted it, and the next apply's re-record keeps this prior
-    /// instead of conflicting again.
+    /// the prior they replace joins the history exactly as a re-record of an
+    /// `Own` target moves it — a snapshot to [`LedgerEntry::superseded`], a
+    /// [`Prior::Absent`] to [`LedgerEntry::superseded_absent`] — so nothing
+    /// that was there before bx is lost from the ledger, not even that there
+    /// was nothing. `written` becomes their digest: the next `plan` sees the
+    /// file as bx last accepted it, and the next apply's re-record keeps this
+    /// prior instead of conflicting again.
     ///
     /// For a `Region` or `Include` target this is on purpose what `record`
-    /// refuses to do by itself. The accepted bytes hold bx's own lines, and
-    /// `bx rm` will write them back, so it must run only because the user chose
-    /// it. Restoring the user's edit without bx's lines needs the region
-    /// writer's delimiter grammar, which does not exist yet.
+    /// refuses to do by itself, and what it leaves behind has to be said
+    /// plainly. The accepted bytes hold bx's own region or include line as it
+    /// is now, and `bx rm` restores exactly those bytes: bx's lines go back
+    /// into the file stale, bx no longer manages or removes them there, and
+    /// the user removes them by hand. That holds for a file bx created too —
+    /// `bx rm` then leaves the file, bx's line in it, rather than removing it.
+    /// So it must run only because the user chose it, and
+    /// [`Error::PriorConflict`]'s message says the same. Restoring the user's
+    /// edit without bx's lines needs the region writer's delimiter grammar,
+    /// which does not exist yet.
     ///
     /// Returns `Ok(None)`, changing nothing, when bx records no entry for
     /// `path`.
@@ -731,12 +791,16 @@ impl Ledger {
     ///
     /// [`Error::CreateDir`] or [`Error::Write`] if the bytes cannot be stored.
     /// The entry is left unchanged.
+    ///
+    /// [`Error::WrongLock`] if the lock file this ledger was opened under has
+    /// been replaced or removed since; nothing is stored.
     pub fn adopt_current_as_prior(
         &mut self,
         path: &crate::paths::Portable,
         bytes: &[u8],
         mode: Mode,
     ) -> Result<Option<&LedgerEntry>, Error> {
+        self.check_lock()?;
         let Some(existing) = self.view.entries.get(path) else {
             return Ok(None);
         };
@@ -745,7 +809,7 @@ impl Ledger {
             return Ok(self.view.entries.get(path));
         }
         let adopted = self.store_restore(digest, bytes, mode)?;
-        let superseded = supersede(existing, &adopted);
+        let history = supersede(existing, &adopted);
         if let Some(entry) = self.view.entries.get_mut(path) {
             tracing::info!(
                 path = %entry.path,
@@ -753,7 +817,8 @@ impl Ledger {
                 "accepting the file as it is now as the version bx rm restores",
             );
             entry.prior = Prior::Existed(adopted);
-            entry.superseded = superseded;
+            entry.superseded = history.superseded;
+            entry.superseded_absent = history.absent;
             entry.written = digest;
         }
         Ok(self.view.entries.get(path))
@@ -792,8 +857,23 @@ impl Ledger {
     ///
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
     /// leaves the previous ledger exactly as it was.
+    ///
+    /// [`Error::WrongLock`] if the lock file this ledger was opened under has
+    /// been replaced or removed since; nothing is written.
     pub fn save(&self) -> Result<(), Error> {
+        self.check_lock()?;
         store::save(&self.dir.ledger(), KIND, VERSION, &self.view)
+    }
+
+    /// Refuse to write through this ledger once the lock file it was opened
+    /// under is no longer the one at the lock path.
+    ///
+    /// An outside `mv` or `rm` of a held lock file lets a second bx lock a new
+    /// file there, and from then on this ledger's writes are unguarded. This
+    /// cannot tell that the guard is still alive — see [`Ledger`] — only that
+    /// the file it locked is still the lock file.
+    fn check_lock(&self) -> Result<(), Error> {
+        super::dir::check_held(&self.dir.ledger(), &self.lock)
     }
 
     /// Write `bytes` to `restore/<digest>`, durably, unless the bytes are
@@ -831,20 +911,25 @@ impl Ledger {
     }
 }
 
-/// `existing`'s superseded list once `adopted` becomes its prior.
+/// `existing`'s history once `adopted` becomes its prior.
 ///
-/// The prior it replaces is appended unless it is already there, so every blob
-/// stored for a live target stays indexed; and a snapshot the user has put back
-/// is the prior again, not history.
-fn supersede(existing: &LedgerEntry, adopted: &RestoreRef) -> Vec<RestoreRef> {
-    let mut superseded = existing.superseded.clone();
-    if let Prior::Existed(previous) = &existing.prior
-        && !superseded.contains(previous)
-    {
-        superseded.push(previous.clone());
+/// A snapshot it replaces is appended to the superseded list unless it is
+/// already there, so every blob stored for a live target stays indexed; a
+/// [`Prior::Absent`] it replaces sets [`LedgerEntry::superseded_absent`], so
+/// that there was no file before bx is not lost either; and a snapshot the user
+/// has put back is the prior again, not history.
+fn supersede(existing: &LedgerEntry, adopted: &RestoreRef) -> History {
+    let mut history = History::of(existing);
+    match &existing.prior {
+        Prior::Existed(previous) => {
+            if !history.superseded.contains(previous) {
+                history.superseded.push(previous.clone());
+            }
+        }
+        Prior::Absent => history.absent = true,
     }
-    superseded.retain(|reference| reference != adopted);
-    superseded
+    history.superseded.retain(|reference| reference != adopted);
+    history
 }
 
 /// The directories an earlier record created, plus any a later one did.
@@ -1419,6 +1504,12 @@ mod tests {
             reachable.dedup();
             assert_eq!(reachable, blobs, "{cell}: every blob is indexed");
             assert_eq!(entry.written, ContentHash::of(BX_V2), "{cell}: written");
+            // Review round 5: a replaced `Absent` is history, not nothing.
+            assert_eq!(
+                entry.superseded_absent,
+                matches!((stored, incoming), (Stored::Absent, Incoming::UserChanged)),
+                "{cell}: superseded_absent",
+            );
         }
     }
 
@@ -2078,6 +2169,326 @@ mod tests {
     }
 
     #[test]
+    fn accepting_a_file_bx_created_keeps_that_there_was_no_file_before_bx() {
+        // Review round 5: `supersede` kept only `RestoreRef`s, so accepting a
+        // file whose stored prior was `Absent` dropped that fact. bx creates
+        // `~/.zshrc` holding only its include line, the user adds an alias,
+        // and after accepting the entry read exactly like a file the user had
+        // all along — while the conflict message said the original was kept.
+        let include = Mechanism::Include {
+            line: "source ~/.local/state/bx/shell/init.zsh".to_string(),
+        };
+        let created: &[u8] = b"source ~/.local/state/bx/shell/init.zsh\n";
+        let edited: &[u8] = b"source ~/.local/state/bx/shell/init.zsh\nalias ll='ls -l'\n";
+        let zshrc = target("~/.zshrc");
+        let record = |written: &[u8]| {
+            NewEntry::new(
+                zshrc.clone(),
+                ContentHash::of(written),
+                Mode::DEFAULT_FILE,
+                include.clone(),
+            )
+        };
+
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger.record(record(created)).expect("bx creates the file");
+        let err = ledger
+            .record(record(created).with_prior(prior(edited, 0o644)))
+            .expect_err("the alias is a conflict");
+        assert!(matches!(err, Error::PriorConflict { .. }), "got {err}");
+        let accepted = ledger
+            .adopt_current_as_prior(&zshrc, edited, Mode::DEFAULT_FILE)
+            .expect("adopt")
+            .expect("an entry")
+            .clone();
+
+        // The same bytes on a file the user had before bx ever wrote it.
+        let other = guarded_home();
+        let (other_dir, other_lock) = locked(&other);
+        let mut all_along = Ledger::open(&other_dir, &other_lock, other.path())
+            .expect("open")
+            .value;
+        let had = all_along
+            .record(record(edited).with_prior(prior(edited, 0o644)))
+            .expect("record")
+            .clone();
+        assert_eq!(accepted.prior, had.prior, "both restore the accepted bytes");
+        assert_ne!(
+            accepted, had,
+            "a file bx created must not read, once accepted, as one the user had all along",
+        );
+        assert!(accepted.superseded_absent, "that there was no file is kept");
+        assert!(
+            accepted.superseded.is_empty(),
+            "and no snapshot is invented"
+        );
+        assert!(!had.superseded_absent);
+
+        // The next apply converges and keeps it, and so does a save.
+        let stored = ledger
+            .record(record(edited).with_prior(prior(edited, 0o644)))
+            .expect("the next apply records")
+            .clone();
+        assert!(stored.superseded_absent);
+        assert_eq!(stored.prior, accepted.prior);
+        ledger.save().expect("save");
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
+        assert_eq!(reloaded.get(&zshrc), Some(&stored));
+    }
+
+    #[test]
+    fn a_ledger_that_never_superseded_an_absent_prior_saves_as_it_did_before_the_field() {
+        // Review round 5 added `superseded_absent`. It is written only when
+        // true, so every other ledger keeps its bytes (Invariant 3), and a
+        // build that predates the field reads one where it is set.
+        #[derive(Serialize, Deserialize)]
+        struct Before {
+            path: Portable,
+            written: ContentHash,
+            mode: Mode,
+            mechanism: Mechanism,
+            prior: Prior,
+            created_dirs: Vec<Portable>,
+            superseded: Vec<RestoreRef>,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct BeforeView {
+            entries: BTreeMap<Portable, Before>,
+        }
+        #[derive(Deserialize)]
+        struct BeforeEnvelope {
+            payload: BeforeView,
+        }
+        let before = |ledger: &Ledger| BeforeView {
+            entries: ledger
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        key.clone(),
+                        Before {
+                            path: entry.path.clone(),
+                            written: entry.written,
+                            mode: entry.mode,
+                            mechanism: entry.mechanism.clone(),
+                            prior: entry.prior.clone(),
+                            created_dirs: entry.created_dirs.clone(),
+                            superseded: entry.superseded.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .record(entry("~/.ssh/config", b"v1").with_prior(prior(b"theirs", 0o640)))
+            .expect("record");
+        ledger
+            .record(entry("~/.ssh/config", b"v2").with_prior(prior(b"edited", 0o644)))
+            .expect("a user edit is superseded");
+        ledger
+            .record(entry("~/new", b"x"))
+            .expect("an absent prior");
+        ledger.save().expect("save");
+        let now = std::fs::read(dir.ledger()).expect("read");
+
+        let old_shape = dir.root().join("before.mpk");
+        store::save(&old_shape, KIND, VERSION, &before(&ledger)).expect("save the old shape");
+        assert_eq!(std::fs::read(&old_shape).expect("read"), now);
+        let reopened = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        reopened.save().expect("save again");
+        assert_eq!(std::fs::read(dir.ledger()).expect("read"), now);
+
+        // Once set, the flag is written, and the old shape still decodes.
+        ledger
+            .record(entry("~/new", b"y").with_prior(prior(b"the user's own", 0o644)))
+            .expect("the absent prior is superseded");
+        ledger.save().expect("save");
+        let flagged = std::fs::read(dir.ledger()).expect("read");
+        assert_ne!(flagged, now);
+        let old: BeforeEnvelope =
+            rmp_serde::from_slice(&flagged).expect("an older build decodes it");
+        assert_eq!(old.payload.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_prior_conflict_says_plainly_what_accepting_leaves_behind() {
+        // Review round 5: accepting a region or include file makes `bx rm`
+        // write bx's stale lines back, unmanaged, and the message did not say
+        // so.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let region = Mechanism::Region { comment: '#' };
+        let bx1: &[u8] = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let edited: &[u8] = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\nuser line 2\n";
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        let apply = |before: &[u8]| {
+            NewEntry::new(
+                target("~/.bashrc"),
+                ContentHash::of(bx1),
+                Mode::DEFAULT_FILE,
+                region.clone(),
+            )
+            .with_prior(prior(before, 0o644))
+        };
+        ledger.record(apply(b"user line 1\n")).expect("first apply");
+        let message = ledger
+            .record(apply(edited))
+            .expect_err("a conflict")
+            .to_string();
+        for needle in [
+            "put the file back",
+            "accept the file as it is now",
+            "write them back stale",
+            "no longer manages them",
+            "remove them by hand",
+            "or that there was none",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_flipped_version_bit_names_a_way_out_and_says_the_version_looks_damaged() {
+        // Review round 5: one flipped bit in the envelope's version byte made
+        // an intact ledger `FutureVersion` forever, and the only remedy named
+        // — run a newer bx — does not exist.
+        #[derive(Serialize)]
+        struct Newer<T> {
+            kind: &'static str,
+            version: u16,
+            payload: T,
+        }
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .record(entry("~/.gitconfig", b"bx").with_prior(prior(b"mine", 0o644)))
+            .expect("record");
+        ledger.save().expect("save");
+        let mut bytes = std::fs::read(dir.ledger()).expect("read");
+        let field = b"\xa7version\x01";
+        let at = bytes
+            .windows(field.len())
+            .position(|window| window == field)
+            .expect("the version field")
+            + field.len()
+            - 1;
+        bytes[at] ^= 0b10;
+        std::fs::write(dir.ledger(), &bytes).expect("flip one bit");
+        let aside = format!("{}.corrupt", dir.ledger().display());
+
+        let errors = [
+            LedgerView::read(&dir, home.path()).expect_err("the reader refuses"),
+            Ledger::open(&dir, &lock, home.path()).expect_err("open refuses"),
+        ];
+        for err in errors {
+            assert!(
+                matches!(&err, Error::FutureVersion { found: 3, .. }),
+                "got {err}"
+            );
+            let message = err.to_string();
+            for needle in [
+                "version number itself may be damaged",
+                "move it aside",
+                aside.as_str(),
+                "empty ledger",
+                "can no longer restore",
+            ] {
+                assert!(message.contains(needle), "missing {needle:?}: {message}");
+            }
+        }
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), bytes);
+        assert!(!StateDir::quarantine(&dir.ledger()).exists());
+
+        // A newer bx's reshaped payload is not called damaged, and the way out
+        // is still named.
+        let reshaped = rmp_serde::to_vec_named(&Newer {
+            kind: KIND,
+            version: VERSION + 1,
+            payload: ["entries", "reshaped"],
+        })
+        .expect("encode");
+        std::fs::write(dir.ledger(), reshaped).expect("seed");
+        let message = Ledger::open(&dir, &lock, home.path())
+            .expect_err("open refuses")
+            .to_string();
+        assert!(!message.contains("may be damaged"), "{message}");
+        assert!(message.contains("move it aside"), "{message}");
+    }
+
+    #[test]
+    fn a_ledger_link_that_loops_or_runs_through_a_file_is_still_refused() {
+        // Review round 5 made those degrade for the cache. The ledger is the
+        // file nothing rebuilds, so it refuses, as for a link to nothing.
+        for looped in [true, false] {
+            let home = guarded_home();
+            let (dir, lock) = locked(&home);
+            let far = if looped {
+                dir.ledger()
+            } else {
+                home.write("a-file", "not a directory");
+                home.child("a-file/ledger.mpk")
+            };
+            std::os::unix::fs::symlink(&far, dir.ledger()).expect("symlink");
+            let dangling =
+                |err: &Error| matches!(err, Error::DanglingLink { path } if *path == dir.ledger());
+
+            let err = LedgerView::read(&dir, home.path()).expect_err("must refuse");
+            assert!(dangling(&err), "looped {looped}: got {err}");
+            let err = Ledger::open(&dir, &lock, home.path()).expect_err("must refuse");
+            assert!(dangling(&err), "looped {looped}: got {err}");
+            assert_eq!(std::fs::read_link(dir.ledger()).expect("still a link"), far);
+            assert!(!StateDir::quarantine(&dir.ledger()).exists());
+        }
+    }
+
+    #[test]
+    fn a_lock_file_replaced_while_held_stops_every_write_through_the_ledger() {
+        // Review round 5: an outside `mv` of the lock file while it was held
+        // let a second bx lock a new file, and `record` and `save` never looked
+        // again. The refusal also named the same path twice.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger.record(entry("~/a", b"x")).expect("record");
+        ledger.save().expect("save");
+        let saved = std::fs::read(dir.ledger()).expect("read");
+
+        std::fs::rename(dir.lock(), home.child("moved-lock")).expect("an outside mv");
+        let _second = ExclusiveLock::acquire(&dir).expect("a second writer locks a new file");
+        let replaced = |err: &Error| {
+            let message = err.to_string();
+            let lock_path = dir.lock().display().to_string();
+            matches!(err, Error::WrongLock { held, needed } if *held == dir.lock() && *needed == dir.lock())
+                && message.contains("was replaced or removed while")
+                && message.matches(&lock_path).count() == 1
+        };
+
+        let err = ledger
+            .record(entry("~/b", b"y").with_prior(prior(b"mine", 0o644)))
+            .expect_err("record refuses");
+        assert!(replaced(&err), "got {err}");
+        assert!(ledger.get(&target("~/b")).is_none());
+        assert!(!has_blob(&dir, b"mine"), "nothing was stored");
+        let err = ledger
+            .adopt_current_as_prior(&target("~/a"), b"changed", Mode::DEFAULT_FILE)
+            .expect_err("accepting refuses");
+        assert!(replaced(&err), "got {err}");
+        let err = ledger.save().expect_err("save refuses");
+        assert!(replaced(&err), "got {err}");
+        assert_eq!(std::fs::read(dir.ledger()).expect("read"), saved);
+        let err = Fingerprints::default()
+            .save(&dir, &lock)
+            .expect_err("the cache refuses too");
+        assert!(replaced(&err), "got {err}");
+    }
+
+    #[test]
     fn a_changed_shared_file_is_a_conflict_not_a_prior_holding_bxs_own_lines() {
         // Review round 3. Region BX1, the user adds a line outside it, and the
         // next apply hands `record` the whole file. Adopting it stored BX1's
@@ -2228,9 +2639,12 @@ mod tests {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        assert_eq!(ledger.len(), 0);
+        assert!(ledger.is_empty());
         for name in ["~/z", "~/a", "~/m"] {
             ledger.record(entry(name, b"x")).expect("record");
         }
+        assert_eq!(ledger.len(), 3);
         let order: Vec<_> = ledger.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(order, vec!["~/a", "~/m", "~/z"]);
     }
@@ -2471,7 +2885,7 @@ mod tests {
             let refused = |err: &Error| {
                 matches!(
                     err,
-                    Error::FutureVersion { path, found, supported }
+                    Error::FutureVersion { path, found, supported, .. }
                         if *path == dir.ledger() && *found == newer && *supported == VERSION
                 )
             };
@@ -2617,6 +3031,7 @@ mod tests {
                 prior: Prior::Absent,
                 created_dirs,
                 superseded: Vec::new(),
+                superseded_absent: false,
             },
         );
         store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
@@ -2751,6 +3166,7 @@ mod tests {
                 prior: Prior::Absent,
                 created_dirs: Vec::new(),
                 superseded: Vec::new(),
+                superseded_absent: false,
             },
         );
         store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");

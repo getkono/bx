@@ -21,8 +21,9 @@
 //! A machine-owned file that becomes an error the user cannot clear is a defect,
 //! so damaged *contents* are never fatal. A truncated, garbled or wrong-kind
 //! file is reported through `tracing::warn!` and replaced by the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
-//! the first free `<name>.corrupt`, `<name>.corrupt.1`, … — never over an earlier
-//! quarantine — and the next save writes a clean file. A lockless reader moves
+//! the quarantine number after the highest present — `<name>.corrupt`, then
+//! `<name>.corrupt.1`, … — never over an earlier quarantine and never into a
+//! gap one left, and the next save writes a clean file. A lockless reader moves
 //! nothing ([`Health::Damaged`]): a rename by path could move aside a file a
 //! writer saved after the read. The damaged bytes are kept, never deleted, so a
 //! human or `bx doctor` can still look at them. See [`Damage`] and [`Health`].
@@ -77,7 +78,7 @@ mod ledger;
 mod lock;
 mod store;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::fs::Mode;
 
@@ -166,15 +167,17 @@ pub enum Error {
     /// The exclusive lock presented is not the lock of the state directory the
     /// operation would change.
     ///
-    /// The caller's defect. A rename or a save under another directory's lock
-    /// is as unguarded as one under no lock at all, so nothing is read,
-    /// renamed or written.
-    #[error(
-        "the lock held, {}, is not the lock of the state directory being changed, {}; nothing \
-         was read, renamed or written. Take the lock of that state directory",
-        .held.display(),
-        .needed.display()
-    )]
+    /// Usually the caller's defect: a rename or a save under another
+    /// directory's lock is as unguarded as one under no lock at all, so nothing
+    /// is read, renamed or written.
+    ///
+    /// When `held` and `needed` are the same path, it is not: the lock file was
+    /// replaced or removed while it was held — an outside `mv` or `rm` — so a
+    /// second bx may have locked a new file at that path. The message then says
+    /// so, and names the path once. [`Ledger::record`],
+    /// [`Ledger::adopt_current_as_prior`] and [`Ledger::save`] check for this
+    /// before they write.
+    #[error("{}", wrong_lock(.held, .needed))]
     WrongLock {
         /// The lock file the presented guard holds.
         held: PathBuf,
@@ -219,18 +222,20 @@ pub enum Error {
         #[source]
         source: Box<crate::paths::Error>,
     },
-    /// A state file recomputation cannot rebuild — the ledger — was written by
-    /// a newer bx than this one.
+    /// A state file recomputation cannot rebuild — the ledger — says it was
+    /// written by a newer bx than this one.
     ///
     /// Not damage: the likeliest cause is an older bx run after a newer one,
     /// and the file is intact in a format this build cannot read. Discarding
     /// it would make the next apply record bx's own output as every prior, so
     /// it is refused, and nothing is renamed or reset.
-    #[error(
-        "{} was written by a newer bx: it is format version {found}, and this bx understands up \
-         to {supported}. Nothing was changed; run a bx at least as new as the one that wrote it",
-        .path.display()
-    )]
+    ///
+    /// It can also be one flipped bit in the version number of an intact
+    /// file, which no newer bx will ever read. So the message always names the
+    /// way out a human can take — move the file aside, and what that costs —
+    /// and says the version number may be damaged when the rest of the file
+    /// reads as this build's format ([`Error::FutureVersion::payload_readable`]).
+    #[error("{}", future_version(.path, *.found, *.supported, *.payload_readable))]
     FutureVersion {
         /// The state file.
         path: PathBuf,
@@ -238,6 +243,13 @@ pub enum Error {
         found: u16,
         /// The newest format version this build understands.
         supported: u16,
+        /// Whether everything but the version also decodes as the newest
+        /// format this build understands.
+        ///
+        /// A newer bx that changed nothing this build decodes is possible, so
+        /// this is not proof of damage — but a newer format that reshaped the
+        /// payload would not decode, and a flipped bit in the version would.
+        payload_readable: bool,
     },
     /// A target handed to [`Ledger::record`] names a path that cannot be used
     /// with the home the ledger was opened under.
@@ -260,18 +272,21 @@ pub enum Error {
         #[source]
         source: Box<crate::paths::Error>,
     },
-    /// The ledger's path is a symbolic link to something that does not exist.
+    /// The ledger's path is a symbolic link that leads nowhere: to something
+    /// that does not exist, round a loop of links (`ELOOP`), or through a file
+    /// (`ENOTDIR`).
     ///
     /// Not "no state": the likeliest cause is state kept on storage that is not
     /// there right now, and reading it as fresh would let the next save replace
     /// the link — and the priors behind it — with an empty ledger.
     ///
-    /// Only the ledger is refused. A dangling link at the fingerprint cache is
+    /// Only the ledger is refused. The same link at the fingerprint cache is
     /// [`Damage::DanglingLink`], and degrades to recomputation like any other
     /// damage to a cache.
     #[error(
-        "{} is a symbolic link to something that does not exist; bx will not read that as \
-         having no state. Restore what it points at, or remove the link",
+        "{} is a symbolic link to something that does not exist, or that cannot be followed \
+         (the links loop, or the path runs through a file); bx will not read that as having no \
+         state. Restore what it points at, or remove the link",
         .path.display()
     )]
     DanglingLink {
@@ -284,7 +299,8 @@ pub enum Error {
     /// bx narrows a directory it created, but never changes the mode of one it
     /// reached through a link, which may be shared with other users; and it will
     /// not keep prior copies of private files where others can list or replace
-    /// them. Search permission alone is not refused: `0711` exposes nothing.
+    /// them. Search permission alone is not refused here: `0711` exposes no file
+    /// bx writes — see [`Error::ExposedLocalLayer`] for the one it does not.
     /// Group permission is, even for a user-private group, which bx cannot
     /// confirm without reading the account database.
     #[error(
@@ -299,6 +315,38 @@ pub enum Error {
         path: PathBuf,
         /// The mode of the directory the link names.
         mode: Mode,
+    },
+    /// The state directory is a symbolic link to a directory users other than
+    /// its owner can search, and `local.toml` in it is readable or writable by
+    /// them.
+    ///
+    /// Search permission exposes only a name someone already knows, and every
+    /// file bx writes in the state directory is `0600`. `local.toml` is the
+    /// exception: the user writes it, with whatever `umask` they have, under a
+    /// name nobody has to guess. A directory bx created is narrowed to `0700`,
+    /// which protects the file whatever its mode; a linked one is never
+    /// narrowed, so while it is searchable bx requires the file to be private,
+    /// and changes neither mode itself.
+    #[error(
+        "{} is a symbolic link to a directory users other than its owner can search (mode \
+         {mode}), and {} in it can be read or written by them (mode {file_mode}): anyone who \
+         knows its name can open it. bx will not change the mode of a directory it did not \
+         create, nor of a file you wrote. Make the file private (chmod 600 {}), or remove search \
+         permission from the directory (chmod go-x {})",
+        .path.display(),
+        .file.display(),
+        .file.display(),
+        .path.display()
+    )]
+    ExposedLocalLayer {
+        /// The linked directory.
+        path: PathBuf,
+        /// The mode of the directory the link names.
+        mode: Mode,
+        /// `local.toml` inside it.
+        file: PathBuf,
+        /// That file's mode.
+        file_mode: Mode,
     },
     /// A ledger entry references a restore snapshot that is not on disk.
     #[error("the restore snapshot {digest} is missing from {}", .path.display())]
@@ -323,18 +371,23 @@ pub enum Error {
     /// Nothing is recorded and nothing is stored. See [`Ledger::record`].
     ///
     /// Any edit outside bx's lines raises this, and re-recording converges
-    /// nowhere, so the message names the two ways out. Putting the file back
-    /// needs nothing from bx. Accepting the file as it is now is
-    /// [`Ledger::adopt_current_as_prior`], which the command that reports the
-    /// conflict must offer: it keeps the earlier original in
-    /// [`LedgerEntry::superseded`], and afterwards `bx rm` restores the file as
-    /// it is now, bx's lines in it included.
+    /// nowhere, so the message names the two ways out, and what the second
+    /// leaves behind. Putting the file back needs nothing from bx. Accepting the
+    /// file as it is now is [`Ledger::adopt_current_as_prior`], which the
+    /// command that reports the conflict must offer. Afterwards `bx rm`
+    /// restores the file exactly as it was accepted — bx's region or include
+    /// line in it as it was then, stale and no longer managed, for the user to
+    /// remove by hand — and what was there before bx stays in the ledger's
+    /// history: the original in [`LedgerEntry::superseded`], or, for a file bx
+    /// created, [`LedgerEntry::superseded_absent`].
     #[error(
         "{target} changed since bx last wrote it, and bx shares that file through a managed \
          region or an include line, so it still holds bx's own lines; bx will not record it \
          as your original. Nothing was recorded. To go on, either put the file back as bx last \
-         wrote it, or accept the file as it is now as the version `bx rm` restores (bx's lines \
-         in it included; the original bx first recorded is kept in the ledger's history)"
+         wrote it, or accept the file as it is now as the version `bx rm` restores. Accepting \
+         keeps bx's lines as they are in it now: `bx rm` will write them back stale, bx no \
+         longer manages them there, and you remove them by hand. What was there before bx, the \
+         original file or that there was none, stays in the ledger's history"
     )]
     PriorConflict {
         /// The target, as the ledger keys it.
@@ -342,4 +395,46 @@ pub enum Error {
         /// The digest of the changed bytes that were not adopted.
         displaced: ContentHash,
     },
+}
+
+/// [`Error::WrongLock`]'s message: a lock file replaced while held when both
+/// paths are the same, and another directory's lock otherwise.
+fn wrong_lock(held: &Path, needed: &Path) -> String {
+    if held == needed {
+        format!(
+            "the lock file {} was replaced or removed while bx held it, so another bx may be \
+             changing this state directory; nothing was read, renamed or written. Let any other \
+             bx finish, then run bx again",
+            held.display()
+        )
+    } else {
+        format!(
+            "the lock held, {}, is not the lock of the state directory being changed, {}; nothing \
+             was read, renamed or written. Take the lock of that state directory",
+            held.display(),
+            needed.display()
+        )
+    }
+}
+
+/// [`Error::FutureVersion`]'s message, which always names the way out a human
+/// can take and what it costs.
+fn future_version(path: &Path, found: u16, supported: u16, payload_readable: bool) -> String {
+    let path = path.display();
+    let damaged = if payload_readable {
+        format!(
+            " Its contents also read as format {supported}, so the version number itself may be \
+             damaged rather than newer."
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{path} says it was written by a newer bx: it is format version {found}, and this bx \
+         understands up to {supported}. Nothing was changed.{damaged} Run a bx at least as new as \
+         the one that wrote it. If no newer bx has run on this account, move it aside yourself, \
+         to {path}.corrupt (or {path}.corrupt.<n> if that is taken): bx then starts an empty \
+         ledger, and `bx rm` can no longer restore any file bx changed before; the copies in \
+         restore/ are kept"
+    )
 }

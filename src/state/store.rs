@@ -4,7 +4,7 @@
 //! corrupt one degrades to recomputation rather than to an error the user cannot
 //! clear. That requirement is met here, once, for every file in the state
 //! directory: [`load`] returns the stored value, or — for damaged *contents* —
-//! the empty default, having moved the damaged bytes aside to the first free
+//! the empty default, having moved the damaged bytes aside to the next
 //! `<name>.corrupt`, `<name>.corrupt.1`, … and warned about it.
 //!
 //! # Only the holder of the exclusive lock moves a file
@@ -17,9 +17,11 @@
 //! lockless reader reports [`Health::Damaged`] and touches nothing. The next
 //! holder of the lock does the quarantine.
 //!
-//! A quarantine never renames over an earlier one. The first free name is taken,
-//! with `RENAME_NOREPLACE`, so a second damaged ledger cannot destroy the first —
-//! which may be the only index there is to the user's restore blobs.
+//! A quarantine never renames over an earlier one. It takes the number after
+//! the highest quarantine present, with `RENAME_NOREPLACE`, so a second damaged
+//! ledger cannot destroy the first — which may be the only index there is to the
+//! user's restore blobs — and a gap left by a deleted one is never refilled, so
+//! the numbers present are always in the order the quarantines were made.
 //!
 //! # A refusal is not damage
 //!
@@ -129,7 +131,8 @@ pub enum Damage {
         /// The newest version this build understands.
         supported: u16,
     },
-    /// The file's path is a symbolic link to something that does not exist.
+    /// The file's path is a symbolic link that leads nowhere: to something
+    /// that does not exist, round a loop of links, or through a file.
     ///
     /// Only ever the health of a [`Loss::Recomputable`] file, where losing
     /// what the link named costs a recomputation; for the ledger this is
@@ -175,9 +178,10 @@ impl std::fmt::Display for Damage {
                 f,
                 "it is version {found}, and this bx understands up to {supported}",
             ),
-            Self::DanglingLink => {
-                f.write_str("it is a symbolic link to something that does not exist")
-            }
+            Self::DanglingLink => f.write_str(
+                "it is a symbolic link to something that does not exist, or that cannot be \
+                 followed",
+            ),
             Self::KeyMismatch { key, path } => {
                 write!(f, "its entry for {key} names a different path, {path}")
             }
@@ -235,7 +239,8 @@ pub struct Loaded<T> {
     pub health: Health,
     /// Every quarantine of this file in the state directory now, in the order
     /// they were made — `<name>.corrupt`, `<name>.corrupt.1`, … — including
-    /// one this load made.
+    /// one this load made. A new quarantine always takes the number after the
+    /// highest present and never refills a gap, so the last is the newest.
     ///
     /// Independent of [`Loaded::health`]. A run that quarantined the file and
     /// stopped before its save leaves the next load [`Health::Fresh`], and this
@@ -259,7 +264,7 @@ impl<T> Loaded<T> {
 /// Read a state file, degrading to `T::default()` for damaged contents.
 ///
 /// A missing file is [`Health::Fresh`]. Damaged contents yield the default and
-/// a `tracing::warn!`. With `lock`, the file is also moved to the first free
+/// a `tracing::warn!`. With `lock`, the file is also moved to the next
 /// quarantine name and the health is [`Health::Reset`]; the next [`save`] writes
 /// a clean file over the original name, so the condition clears itself. Without
 /// it, nothing is renamed and the health is [`Health::Damaged`].
@@ -328,14 +333,17 @@ fn judge<T: DeserializeOwned + Default>(
     }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // `read` follows a symlink, so a link to nothing reads as no file.
-            // That is not "no state" — it is usually state on storage that is
-            // not there right now. For the ledger it is refused, and nothing is
-            // renamed. A cache degrades like any other damage: under the lock
-            // the link itself is moved aside, so the next save can write a
-            // clean file where it was.
-            if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        Err(source) => {
+            // `read` follows a symlink, so a link to nothing reads as no file,
+            // a link that loops as `ELOOP`, and a link whose path runs through
+            // a file as `ENOTDIR`. None of those is "no state" — it is usually
+            // state on storage that is not there right now. For the ledger it
+            // is refused, and nothing is renamed. A cache degrades like any
+            // other damage: under the lock the link itself is moved aside, so
+            // the next save can write a clean file where it was.
+            if leads_nowhere(&source)
+                && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+            {
                 return match loss {
                     Loss::Permanent => Err(Error::DanglingLink {
                         path: path.to_path_buf(),
@@ -343,13 +351,13 @@ fn judge<T: DeserializeOwned + Default>(
                     Loss::Recomputable => Ok(degrade(path, Damage::DanglingLink, lock)),
                 };
             }
-            return Ok(Loaded {
-                value: T::default(),
-                health: Health::Fresh,
-                quarantined: Vec::new(),
-            });
-        }
-        Err(source) => {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                return Ok(Loaded {
+                    value: T::default(),
+                    health: Health::Fresh,
+                    quarantined: Vec::new(),
+                });
+            }
             return Err(Error::Read {
                 path: path.to_path_buf(),
                 source,
@@ -371,10 +379,15 @@ fn judge<T: DeserializeOwned + Default>(
         Err(Rejected::Damage(Damage::FutureVersion { found, supported }))
             if loss == Loss::Permanent =>
         {
+            // One flipped bit in the version number also makes an intact file
+            // "newer". Whether the rest of it reads as this build's format is
+            // what the message can honestly say about that.
+            let payload_readable = rmp_serde::from_slice::<Envelope<T>>(&bytes).is_ok();
             Err(Error::FutureVersion {
                 path: path.to_path_buf(),
                 found,
                 supported,
+                payload_readable,
             })
         }
         // Quarantine happens only here: after `read` succeeded and `decode` or
@@ -383,6 +396,21 @@ fn judge<T: DeserializeOwned + Default>(
         Err(Rejected::Damage(damage)) => Ok(degrade(path, damage, lock)),
         Err(Rejected::Refused(error)) => Err(error),
     }
+}
+
+/// Whether a failed `read` is one that following a symbolic link to nowhere
+/// gives: `ENOENT` for a link to nothing, `ELOOP` for links that loop, and
+/// `ENOTDIR` for a link whose path runs through a file.
+///
+/// Only meaningful once the path itself is known to be a link: without one,
+/// `ENOENT` is simply no file, and `ENOTDIR` a state directory that is not a
+/// directory.
+fn leads_nowhere(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error().is_some_and(|code| {
+            code == rustix::io::Errno::LOOP.raw_os_error()
+                || code == rustix::io::Errno::NOTDIR.raw_os_error()
+        })
 }
 
 /// Decode one envelope, rejecting anything that is not exactly one.
@@ -681,7 +709,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
-        for seed in [encoded(KIND, VERSION + 1, &sample()), reshaped(VERSION + 1)] {
+        // Review round 5: whether the rest of the file reads as this format is
+        // reported, so the message can say the version itself may be damaged.
+        for (seed, readable) in [
+            (encoded(KIND, VERSION + 1, &sample()), true),
+            (reshaped(VERSION + 1), false),
+        ] {
             std::fs::write(&path, &seed).expect("seed");
             for held in [None, Some(&lock)] {
                 let err = load::<Value>(&path, KIND, VERSION, Loss::Permanent, held)
@@ -689,12 +722,14 @@ mod tests {
                 assert!(
                     matches!(
                         &err,
-                        Error::FutureVersion { path: at, found, supported }
+                        Error::FutureVersion { path: at, found, supported, payload_readable }
                             if *at == path && *found == VERSION + 1 && *supported == VERSION
+                                && *payload_readable == readable
                     ),
                     "got {err}",
                 );
                 let message = err.to_string();
+                assert_eq!(message.contains("may be damaged"), readable, "{message}");
                 assert!(message.contains("newer bx"), "{message}");
                 assert!(message.contains("version 4"), "{message}");
                 assert!(message.contains("up to 3"), "{message}");
@@ -828,6 +863,47 @@ mod tests {
     }
 
     #[test]
+    fn a_new_quarantine_takes_the_number_after_the_highest_and_never_refills_a_gap() {
+        // Review round 5: `move_aside` took the lowest free number, so once a
+        // human deleted `.corrupt` the next quarantine refilled it, and
+        // `Loaded::quarantined` listed the newest first.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        for body in [&b"first"[..], b"second", b"third"] {
+            std::fs::write(&path, body).expect("seed");
+            let _: Loaded<Value> = locked_load(&path).expect("load");
+        }
+        std::fs::remove_file(StateDir::quarantine(&path)).expect("a human removes the first");
+
+        std::fs::write(&path, b"fourth").expect("seed");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert!(loaded.health.is_reset());
+        let newest = StateDir::quarantine_nth(&path, 3);
+        assert_eq!(
+            loaded.quarantined,
+            vec![
+                StateDir::quarantine_nth(&path, 1),
+                StateDir::quarantine_nth(&path, 2),
+                newest.clone(),
+            ],
+            "creation order, newest last",
+        );
+        assert_eq!(std::fs::read(&newest).expect("the newest"), b"fourth");
+        assert!(
+            !StateDir::quarantine(&path).exists(),
+            "the gap is not refilled"
+        );
+
+        // Once every quarantine is gone, numbering starts again at the first.
+        for n in 1..=3 {
+            std::fs::remove_file(StateDir::quarantine_nth(&path, n)).expect("remove");
+        }
+        std::fs::write(&path, b"fifth").expect("seed");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(loaded.quarantined, vec![StateDir::quarantine(&path)]);
+    }
+
+    #[test]
     fn a_quarantine_left_by_an_earlier_run_is_reported_on_every_load() {
         // Review round 4: a quarantine followed by a crash before the save left
         // the next reader and writer looking at `Health::Fresh`, with the
@@ -872,6 +948,7 @@ mod tests {
         std::fs::write(&third, b"after a gap").expect("seed");
         for decoy in [
             "v.mpk.corrupt.01",
+            "v.mpk.corrupt.0",
             "v.mpk.corrupt.+3",
             "v.mpk.corrupt.x",
             "v.mpk.corrupt.",

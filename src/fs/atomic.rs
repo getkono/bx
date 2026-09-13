@@ -125,7 +125,7 @@
 //! call site remembered to sync", and it is not one a change to this file can
 //! break.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -239,20 +239,21 @@ pub enum Error {
         #[source]
         source: crate::paths::Error,
     },
-    /// A declared setuid or setgid bit did not survive its `fchmod`.
+    /// A declared setuid, setgid or sticky bit did not survive its `fchmod`.
     ///
     /// `fchmod(2)` reports success when the kernel silently clears `S_ISGID`
     /// from a file whose group the caller is not in, which is the group a
-    /// setgid parent directory owned by another group gives every new file.
-    /// Publishing it would put a mode on disk that is not the declared one and
-    /// make every later `plan` announce a `Modify` no `apply` can close. The
-    /// temporary file is removed and the destination is untouched.
-    #[error(
-        "{} declares {declared}, and the kernel kept only {landed}: it drops a setgid bit \
-         from a file whose group you are not in, such as the group a setgid parent \
-         directory gives it. Nothing was replaced",
-        .path.display()
-    )]
+    /// setgid parent directory owned by another group gives every new file. A
+    /// filesystem that stores no set-id or sticky bits — vfat or exfat mounted
+    /// with `quiet`, and some FUSE and network filesystems — can drop any of
+    /// the three the same way. Publishing it would put a mode on disk that is
+    /// not the declared one and make every later `plan` announce a `Modify` no
+    /// `apply` can close. The temporary file is removed and the destination is
+    /// untouched.
+    ///
+    /// The message names the bits that were lost, and blames group membership
+    /// only when the setgid bit is among them.
+    #[error("{}", special_bits_not_kept(.path, *.declared, *.landed))]
     SetIdNotKept {
         /// The destination.
         path: PathBuf,
@@ -261,6 +262,98 @@ pub enum Error {
         /// The mode the temporary file actually has.
         landed: Mode,
     },
+    /// The path has a `..` component.
+    ///
+    /// The kernel resolves `..` *after* following the component before it, so
+    /// `lnk/../f` with `lnk -> elsewhere/sub` names `elsewhere/f`, while the
+    /// path read lexically — the reading a ledger key is made from — names `f`.
+    /// Writing through it would record one file and change another, and `rm`
+    /// would then restore the wrong one. bx neither resolves `..` (decision 2
+    /// writes through links, so resolving is not lexical) nor drops it (which
+    /// could name a different file), so it refuses the path.
+    #[error(
+        "{} has a `..` component, which the kernel resolves through any symlink before it; \
+         bx will not write to a path it cannot name exactly. Spell the path without `..`",
+        .0.display()
+    )]
+    ParentComponent(PathBuf),
+    /// A file would be published beneath a directory this apply declares,
+    /// while that directory still exists wider than its declared mode.
+    ///
+    /// The directory target's `Modify` has not been applied yet. Publishing
+    /// first would leave the file reachable through a directory the
+    /// configuration declares narrower — for as long as the apply takes to
+    /// reach the directory target, and for good if it stops before then. A
+    /// declared directory this apply *creates* is created at its declared mode,
+    /// so this arises only for one that already exists. Nothing is created or
+    /// written.
+    #[error(
+        "{} is beneath {}, which is {found}, wider than the {declared} its directory target \
+         declares; apply that directory target first. Nothing was written",
+        .path.display(),
+        .dir.display()
+    )]
+    DirectoryTargetPending {
+        /// The destination.
+        path: PathBuf,
+        /// The declared directory that is still wider than declared.
+        dir: PathBuf,
+        /// Its mode now.
+        found: Mode,
+        /// The mode its directory target declares.
+        declared: Mode,
+    },
+    /// A directory target's directory was created earlier in this apply at a
+    /// mode other than the one the target declares.
+    ///
+    /// A write beneath it ran before the directory was declared with
+    /// [`CreatedDirs::declare`], so it was made at [`Mode::DEFAULT_DIR`] and a
+    /// file may already have been published in it at that mode. Adopting it
+    /// would hide that, and would leave the write's ledger entry and the
+    /// directory target's both claiming the directory. Nothing is chmod'd; the
+    /// next `plan` announces the `Modify` that narrows it.
+    #[error(
+        "{} was created at {created} earlier in this apply, not at the {declared} its directory \
+         target declares: declare every directory target before applying any target. \
+         Nothing was changed",
+        .path.display()
+    )]
+    UndeclaredDirectory {
+        /// The directory.
+        path: PathBuf,
+        /// The mode this apply created it at.
+        created: Mode,
+        /// The mode its directory target declares.
+        declared: Mode,
+    },
+}
+
+/// The message of [`Error::SetIdNotKept`]: which special bits were lost, and
+/// the causes that can lose them.
+fn special_bits_not_kept(path: &Path, declared: Mode, landed: Mode) -> String {
+    let lost = declared.bits() & SPECIAL & !landed.bits();
+    let names: Vec<&str> = [(0o4000, "setuid"), (0o2000, "setgid"), (0o1000, "sticky")]
+        .into_iter()
+        .filter(|(bit, _)| lost & bit != 0)
+        .map(|(_, name)| name)
+        .collect();
+    let (named, noun) = match names.as_slice() {
+        [one] => ((*one).to_string(), "bit"),
+        [init @ .., last] => (format!("{} and {last}", init.join(", ")), "bits"),
+        [] => ("special".to_string(), "bits"),
+    };
+    let group = if lost & 0o2000 != 0 {
+        "The kernel drops a setgid bit from a file whose group you are not in, such as the \
+         group a setgid parent directory gives it, and a"
+    } else {
+        "A"
+    };
+    format!(
+        "{} declares {declared}, and only {landed} is on the file: the {named} {noun} did not \
+         stick. {group} filesystem that stores no set-id or sticky bits, such as vfat or exfat \
+         mounted with `quiet`, drops them. Nothing was replaced",
+        path.display()
+    )
 }
 
 impl Error {
@@ -276,7 +369,10 @@ impl Error {
             | Self::Write { path, .. }
             | Self::Changed { path, .. }
             | Self::NotPortable { path, .. }
-            | Self::SetIdNotKept { path, .. } => path,
+            | Self::SetIdNotKept { path, .. }
+            | Self::ParentComponent(path)
+            | Self::DirectoryTargetPending { path, .. }
+            | Self::UndeclaredDirectory { path, .. } => path,
         }
     }
 }
@@ -457,10 +553,11 @@ impl Parent {
 ///
 /// # Errors
 ///
+/// [`Error::ParentComponent`] when `dest` has a `..` component,
 /// [`Error::NoParent`] when `dest` has no parent component, and [`Error::Read`]
 /// when the destination or its parent exists but cannot be read.
 pub fn observe(dest: &Path) -> Result<Observed, Error> {
-    let dest = lexical(dest);
+    let dest = lexical(dest)?;
     let dest = dest.as_path();
     let dir = parent_of(dest)?;
     let observed_parent = observe_parent(dir)?;
@@ -686,8 +783,9 @@ struct Pending {
     dest: PathBuf,
     mode: Mode,
     prior: Observed,
-    /// Parent directories this write invented, deepest first, so a reversal can
-    /// remove them in order and leave nothing behind.
+    /// Parent directories this write invented and claims — all but one a
+    /// directory target in this apply declares — deepest first, so a reversal
+    /// can remove them in order and leave nothing behind.
     created_dirs: Vec<PathBuf>,
 }
 
@@ -703,13 +801,19 @@ impl Pending {
 /// A declared setuid or setgid bit is the exception: it is left off until
 /// [`Staged::fill`] has written the content, because the write would clear it.
 ///
-/// Missing parent directories are created at [`Mode::DEFAULT_DIR`] — a target
-/// deep under `~/.config` must not need a directory declaration for every
-/// component. An *existing* directory is never chmod'd: it is the user's. When
-/// that leaves a parent wider than the declared mode, [`compare`] reports it,
-/// and the remedy is to declare the directory as a target of its own — or, for
-/// a parent that is a symlink, to `chmod` the directory it resolves to, which
-/// the report names.
+/// Missing parent directories are created at the mode a directory target in
+/// this apply declares for them ([`CreatedDirs::declare`]), and at
+/// [`Mode::DEFAULT_DIR`] when none does — a target deep under `~/.config` must
+/// not need a directory declaration for every component. A declared directory
+/// is therefore never created wider than declared with a file inside it,
+/// whichever target is applied first. An *existing* directory is never
+/// chmod'd: it is the user's, or its directory target's to change. When that
+/// leaves a parent wider than the declared mode, [`compare`] reports it, and
+/// the remedy is to declare the directory as a target of its own — or, for a
+/// parent that is a symlink, to `chmod` the directory it resolves to, which the
+/// report names. Beneath a directory that *is* declared and still exists wider
+/// than declared, `stage` refuses with [`Error::DirectoryTargetPending`]
+/// until that directory target's `Modify` has been applied.
 ///
 /// A directory created here and then abandoned — because the temporary file
 /// could not be made, or because the write was never committed — is left in
@@ -717,9 +821,12 @@ impl Pending {
 /// attempt reuses it, and removing it would race any other write that had
 /// already begun using it.
 ///
-/// Every directory created here is added to `created`, the directories this
-/// apply has made so far. [`ensure_dir`] reads it, so a declared directory that
-/// this write created first is still the create `plan` announced for it.
+/// Every directory created here is added to `created`, this apply's
+/// [`CreatedDirs`]. [`ensure_dir`] reads it, so a declared directory that this
+/// write created first is still the create `plan` announced for it. The write
+/// claims, in [`Filled::created_dirs`], every directory it created except a
+/// declared one: that one is its directory target's alone, so each directory
+/// has exactly one claimant whichever target is applied first.
 ///
 /// # What `planned` is for
 ///
@@ -740,7 +847,10 @@ impl Pending {
 /// observed, or `planned` observed a different path. [`Error::UnusableParent`],
 /// [`Error::Symlink`] or [`Error::NotAFile`] when `planned` or the second
 /// observation found a parent that does not resolve, a symlink, or a directory
-/// or device node. [`Error::NoParent`] when `dest` has no parent component, and
+/// or device node. [`Error::DirectoryTargetPending`] when a directory `dest` is
+/// beneath is declared and still wider than declared.
+/// [`Error::ParentComponent`] when `dest` has a `..`
+/// component, [`Error::NoParent`] when it has no parent component, and
 /// [`Error::Write`] when the parent cannot be created or the temporary file
 /// cannot be made.
 pub fn stage(
@@ -750,7 +860,7 @@ pub fn stage(
     created: &mut CreatedDirs,
 ) -> Result<Staged, Error> {
     // Spelled as `observe` spells it, so `link/` is the link.
-    let dest = lexical(dest);
+    let dest = lexical(dest)?;
     let dest = dest.as_path();
     if planned.path != dest {
         return Err(Error::Changed {
@@ -769,8 +879,10 @@ pub fn stage(
     refuse_unwritable(&prior)?;
 
     let dir = parent_of(dest)?;
-    let created_dirs = create_missing_dirs(dir, Mode::DEFAULT_DIR)?;
-    created.record(&created_dirs);
+    // Before creating anything, so a refusal leaves nothing behind.
+    refuse_wider_than_declared(dest, dir, created)?;
+    let made = create_missing_dirs(dir, None, created)?;
+    let created_dirs = created.record(made, None);
 
     let temp = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
@@ -829,9 +941,9 @@ impl Staged {
     /// # Errors
     ///
     /// [`Error::Write`] wrapping the first failing syscall, and
-    /// [`Error::SetIdNotKept`] when a declared setuid or setgid bit is not on
-    /// the file after the `fchmod` that adds it. The temporary file is removed
-    /// either way.
+    /// [`Error::SetIdNotKept`] when a declared setuid, setgid or sticky bit is
+    /// not on the file once the content is written. The temporary file is
+    /// removed either way.
     pub fn fill(mut self, bytes: &[u8]) -> Result<Filled, Error> {
         let temp_path = self.0.temp.path().to_path_buf();
         let fail = |source| Error::Write {
@@ -845,8 +957,11 @@ impl Staged {
         // without CAP_FSETID.
         if self.0.mode.bits() & SET_ID != 0 {
             fchmod(self.0.temp.as_file(), self.0.mode, &temp_path)?;
-            // That fchmod succeeds even when the kernel drops S_ISGID, so what
-            // stuck is read back rather than assumed.
+        }
+        // An fchmod succeeds even when the kernel drops S_ISGID, or the
+        // filesystem stores no special bits at all, so what stuck is read back
+        // rather than assumed — the sticky bit `stage` set included.
+        if self.0.mode.bits() & SPECIAL != 0 {
             verify_set_id_kept(self.0.temp.as_file(), self.0.mode, &self.0.dest)?;
         }
         durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(&fail)?;
@@ -911,10 +1026,14 @@ impl Filled {
         self.written
     }
 
-    /// The parent directories this write invented, deepest first.
+    /// The parent directories this write invented and claims, deepest first.
     ///
-    /// Empty when every component already existed. A reversal removes these in
-    /// order, so a target that created `~/.config/a/b` leaves nothing behind.
+    /// Empty when every component already existed. A directory that a
+    /// directory target in this apply declares is left out even when this
+    /// write made it: that target's [`EnsuredDir::created_dirs`] claims it, so
+    /// reversing this write can never remove a directory that is still
+    /// declared. A reversal removes these in order, so a target that created
+    /// `~/.config/a/b` leaves nothing behind.
     #[must_use]
     pub fn created_dirs(&self) -> &[PathBuf] {
         &self.pending.created_dirs
@@ -1062,11 +1181,11 @@ pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Err
 /// # Errors
 ///
 /// [`Error::Symlink`] when `path` is a symlink — bx does not change the mode of
-/// a link's target through the link — and [`Error::Write`] when the `chmod`
-/// fails.
+/// a link's target through the link — [`Error::ParentComponent`] when it has a
+/// `..` component, and [`Error::Write`] when the `chmod` fails.
 pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
     // Without a trailing separator, or `lstat` below would follow the link too.
-    let path = lexical(path);
+    let path = lexical(path)?;
     let path = path.as_path();
     // chmod(2) follows symlinks and Linux has no AT_SYMLINK_NOFOLLOW for it, so
     // the link is excluded by looking first. The remaining window is a race with
@@ -1155,8 +1274,9 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// one that created the directory.
 ///
 /// On agreement it performs **exactly** that action: nothing for `Unchanged`;
-/// `mkdir` for `Create`, with `path` at `mode` and missing ancestors at
-/// [`Mode::DEFAULT_DIR`]; [`set_mode`] for `Modify`; and nothing at all for
+/// `mkdir` for `Create`, with `path` at `mode` and missing ancestors at the
+/// mode declared for them or [`Mode::DEFAULT_DIR`]; [`set_mode`] for `Modify`;
+/// and nothing at all for
 /// `Conflict`, which is reported rather than raised because it is a verdict
 /// `plan` already printed. `plan` must use [`observe`] + [`compare_dir`], not
 /// this.
@@ -1165,15 +1285,19 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// it acted on — so the mode a `Modify` overwrote is `prior.mode` — and the
 /// directories it created, deepest first.
 ///
-/// `created` is the directories this apply has made so far; [`stage`] and this
-/// function both add to it. A path `plan` saw absent that is now a directory in
-/// that set is still the `Create` `plan` announced — a write beneath it was
-/// applied first and made it at [`Mode::DEFAULT_DIR`] — so it is set to `mode`
-/// rather than refused, and the returned `created_dirs` names it. The order in
-/// which a caller applies a directory target and the targets beneath it
-/// therefore does not matter, provided every write in one apply shares one
-/// set. A directory outside the set that appeared after `plan` is still
-/// refused.
+/// `created` is this apply's [`CreatedDirs`]; [`stage`] and this function both
+/// add to it, and this function declares `path` at `mode` in it. A path `plan`
+/// saw absent that is now a directory an earlier call in this apply made —
+/// the same device and inode — is still the `Create` `plan` announced, so it is
+/// set to `mode` rather than refused, and the returned `created_dirs` names it.
+/// That call made it at `mode` when the directory was declared before it ran.
+/// One made at any other mode was made before its declaration, possibly with a
+/// file already published in it at [`Mode::DEFAULT_DIR`], and is refused with
+/// [`Error::UndeclaredDirectory`]. With every directory target declared before
+/// any target is applied, the order in which a caller applies a directory
+/// target and the targets beneath it does not matter. A directory outside the
+/// set, or a different directory now at a path in it, that appeared after
+/// `plan` is still refused.
 ///
 /// Two windows remain. A `chmod` landing between the second observation and
 /// the [`set_mode`] is overwritten, as for any mode change (decision 6). And
@@ -1184,8 +1308,11 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// # Errors
 ///
 /// [`Error::Changed`] when the path is no longer what `plan` saw;
-/// [`Error::Read`] when the path or its parent cannot be stat'd; and
-/// [`Error::Write`] when a directory cannot be created or chmod'd.
+/// [`Error::UndeclaredDirectory`] when an earlier call in this apply made the
+/// directory at another mode; [`Error::ParentComponent`] when it has a `..`
+/// component; [`Error::Read`]
+/// when the path or its parent cannot be stat'd; and [`Error::Write`] when a
+/// directory cannot be created or chmod'd.
 pub fn ensure_dir(
     path: &Path,
     mode: Mode,
@@ -1194,7 +1321,7 @@ pub fn ensure_dir(
 ) -> Result<EnsuredDir, Error> {
     // Spelled as `observe` spells it, so `link/` is the link and never the
     // directory a chmod through it would change.
-    let path = lexical(path);
+    let path = lexical(path)?;
     let path = path.as_path();
     let fresh = observe(path)?;
     act_on_dir(path, mode, planned, fresh, created)
@@ -1210,38 +1337,102 @@ pub struct EnsuredDir {
     /// an earlier write in this apply created, it is `plan`'s observation:
     /// nothing was there before this apply.
     pub prior: Observed,
-    /// The directories this call created, deepest first — the path itself
-    /// and any ancestor it had to invent — which is the order a reversal
-    /// removes them in. Empty unless `action` is `Create`.
+    /// The directories this target claims, deepest first — the path itself
+    /// and any ancestor this call had to invent, less an ancestor another
+    /// directory target in this apply declares, which that target claims —
+    /// in the order a reversal removes them. For a directory an earlier call in
+    /// this apply made, just the path. Empty unless `action` is `Create`.
     pub created_dirs: Vec<PathBuf>,
 }
 
-/// The directories one `apply` has created so far.
+/// The directories one `apply` has created so far, and the modes its
+/// directory targets declare.
 ///
-/// [`stage`] and [`ensure_dir`] add every directory they make. [`ensure_dir`]
-/// consults it, so a declared directory that a write beneath it created
-/// earlier in the same apply is the `Create` `plan` announced rather than a
-/// change to refuse. Start one per apply and pass the same one to every write
-/// in it: a fresh set per call brings the refusal back.
+/// Start one per apply, [`declare`](Self::declare) every directory target in
+/// it before applying any target, and pass the same one to every [`stage`] and
+/// [`ensure_dir`] in the apply. That is what makes the order of targets not
+/// matter:
+///
+/// * [`stage`] creates a missing declared directory at its declared mode, not
+///   [`Mode::DEFAULT_DIR`], so no file is published into a directory wider
+///   than its target declares. Beneath a declared directory that already
+///   exists wider than declared it refuses with
+///   [`Error::DirectoryTargetPending`].
+/// * Every directory has exactly one claimant. A declared directory is claimed
+///   by its own directory target's [`EnsuredDir::created_dirs`] alone:
+///   [`Filled::created_dirs`] and a deeper target's `created_dirs` leave it
+///   out, whichever call made it. Any other directory is claimed by the call
+///   that made it.
+/// * [`ensure_dir`] adopts a declared directory an earlier call in this apply
+///   made as the `Create` `plan` announced — only when it is the same
+///   directory, by device and inode, and was made at the declared mode. One
+///   made before its declaration is refused with
+///   [`Error::UndeclaredDirectory`].
+///
+/// A fresh set per call brings back the refusal of a directory an earlier
+/// write in the same apply made.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CreatedDirs(BTreeSet<PathBuf>);
+pub struct CreatedDirs {
+    /// Every directory this apply created, and how.
+    made: BTreeMap<PathBuf, Made>,
+    /// The mode each directory target in this apply declares.
+    declared: BTreeMap<PathBuf, Mode>,
+}
+
+/// One directory an apply created: the mode it was created at, and which
+/// directory it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Made {
+    mode: Mode,
+    dev: u64,
+    ino: u64,
+}
 
 impl CreatedDirs {
-    /// No directories created yet.
+    /// No directories created or declared yet.
     #[must_use]
     pub const fn new() -> Self {
-        Self(BTreeSet::new())
+        Self {
+            made: BTreeMap::new(),
+            declared: BTreeMap::new(),
+        }
     }
 
     /// Whether this apply created `path`.
     #[must_use]
     pub fn contains(&self, path: &Path) -> bool {
-        self.0.contains(path)
+        self.made.contains_key(path)
     }
 
-    /// Note directories a write just created.
-    fn record(&mut self, dirs: &[PathBuf]) {
-        self.0.extend(dirs.iter().cloned());
+    /// Declare that a directory target in this apply wants `path` at `mode`.
+    ///
+    /// Call it for every directory target before applying any target in the
+    /// apply. [`ensure_dir`] declares its own path too, so a caller that always
+    /// applies a directory target before anything beneath it needs no separate
+    /// call — but one that does not, and skips this, gets
+    /// [`Error::UndeclaredDirectory`] from the directory target.
+    pub fn declare(&mut self, path: &Path, mode: Mode) {
+        self.declared.insert(path.components().collect(), mode);
+    }
+
+    /// The mode a directory target in this apply declares for `path`, if any.
+    #[must_use]
+    pub fn declared(&self, path: &Path) -> Option<Mode> {
+        self.declared.get(path).copied()
+    }
+
+    /// Note the directories a call just created, deepest first, and return the
+    /// ones that call claims: all of them but a declared directory, unless it
+    /// is `own`, the path of the directory target making the call.
+    fn record(&mut self, made: Vec<(PathBuf, Made)>, own: Option<&Path>) -> Vec<PathBuf> {
+        let mut claimed = Vec::with_capacity(made.len());
+        for (path, how) in made {
+            if own == Some(path.as_path()) || !self.declared.contains_key(&path) {
+                claimed.push(path.clone());
+            }
+            self.made.insert(path, how);
+        }
+        claimed
     }
 }
 
@@ -1254,12 +1445,27 @@ fn act_on_dir(
     fresh: Observed,
     created: &mut CreatedDirs,
 ) -> Result<EnsuredDir, Error> {
+    created.declare(path, mode);
     let announced = compare_dir(planned, mode);
-    // A directory an earlier write in this apply created is still the create
-    // plan announced: plan saw nothing, and nothing but bx has made one since.
-    // It exists at the mode that write gave it, so what remains of the create
-    // is the declared mode.
-    if announced.action == Action::Create && fresh.kind == Kind::Dir && created.contains(path) {
+    // A directory an earlier call in this apply created is still the create
+    // plan announced: plan saw nothing, and bx made it since. Only that very
+    // directory counts — another one somebody put at the same path is not
+    // bx's — and only one made at the declared mode: a write that ran before
+    // the declaration made it at 0755 and may already have published into it.
+    if announced.action == Action::Create
+        && fresh.kind == Kind::Dir
+        && let (Some(made), Some(stamp)) = (created.made.get(path).copied(), fresh.stamp)
+        && (made.dev, made.ino) == (stamp.dev, stamp.ino)
+    {
+        if made.mode != mode {
+            return Err(Error::UndeclaredDirectory {
+                path: path.to_path_buf(),
+                created: made.mode,
+                declared: mode,
+            });
+        }
+        // Normally a no-op; it also narrows the directory again if it was
+        // chmod'd after bx made it, as a create at `mode` would have left it.
         set_mode(path, mode)?;
         tracing::debug!(
             path = %path.display(),
@@ -1285,12 +1491,12 @@ fn act_on_dir(
     let mut created_dirs = Vec::new();
     match outcome.action {
         Action::Create => {
-            created_dirs = create_missing_dirs(path, mode)?;
+            let made = create_missing_dirs(path, Some(mode), created)?;
             // The path itself is the deepest entry when this call made it. When
             // it is not there, something took the path between the observation
             // and the `mkdir` — somebody else's directory, or not a directory at
             // all — and neither is the create `plan` announced.
-            if created_dirs.first().map(PathBuf::as_path) != Some(path) {
+            if made.first().map(|(dir, _)| dir.as_path()) != Some(path) {
                 let now = optional_metadata(path)?
                     .map_or(Kind::Absent, |meta| Kind::from(meta.file_type()));
                 return Err(Error::Changed {
@@ -1300,7 +1506,7 @@ fn act_on_dir(
                     ),
                 });
             }
-            created.record(&created_dirs);
+            created_dirs = created.record(made, Some(path));
             tracing::debug!(path = %path.display(), %mode, "created a directory");
         }
         Action::Modify => set_mode(path, mode)?,
@@ -1389,17 +1595,64 @@ fn refuse_unwritable(observed: &Observed) -> Result<(), Error> {
     })
 }
 
+/// Refuse to put `dest` beneath a directory this apply declares while that
+/// directory exists wider than its declared mode — see
+/// [`Error::DirectoryTargetPending`].
+///
+/// Only a declared directory that exists is checked: a missing one is about
+/// to be created at its declared mode. Something there that is not a directory
+/// is left to the verdicts `plan` already printed for it.
+///
+/// # Errors
+///
+/// [`Error::DirectoryTargetPending`], and [`Error::Read`] when a declared
+/// directory above `dest` cannot be stat'd.
+fn refuse_wider_than_declared(dest: &Path, dir: &Path, created: &CreatedDirs) -> Result<(), Error> {
+    for (declared_dir, &declared) in &created.declared {
+        if !dir.starts_with(declared_dir) {
+            continue;
+        }
+        let Some(meta) = optional_metadata(declared_dir)? else {
+            continue;
+        };
+        let found = mode_of(&meta);
+        if meta.is_dir() && found.is_wider_than(declared) {
+            return Err(Error::DirectoryTargetPending {
+                path: dest.to_path_buf(),
+                dir: declared_dir.clone(),
+                found,
+                declared,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// `path` rebuilt from its components, which drops every trailing separator
-/// and every `.` after the first component.
+/// and every `.` after the first component, or a refusal when it has a `..`.
 ///
 /// A trailing `/` or `/.` makes the kernel resolve the last component:
 /// `lstat("link/")` stats the directory a symlink points at, and
 /// `chmod("link/")` changes it. bx decides about the component a target names,
 /// however the path is spelled, so every entry point that looks at or changes a
-/// path spells it this way first. Lexical only — nothing is resolved — and `..`
-/// is kept, because removing it without resolving could name a different file.
-fn lexical(path: &Path) -> PathBuf {
-    path.components().collect()
+/// path spells it this way first. Lexical only — nothing is resolved.
+///
+/// A `..` anywhere is refused rather than kept or removed: kept, the kernel
+/// resolves it through any symlink before it, and removed, it can name a
+/// different file. Either way the path bx records would not be the file it
+/// changed — see [`Error::ParentComponent`].
+///
+/// # Errors
+///
+/// [`Error::ParentComponent`] when `path` has a `..` component.
+fn lexical(path: &Path) -> Result<PathBuf, Error> {
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(Error::ParentComponent(path.to_path_buf()));
+    }
+    Ok(path.components().collect())
 }
 
 /// The directory `path` will be written into.
@@ -1557,12 +1810,18 @@ fn parent_state(dir: &Path) -> Result<ParentState, Error> {
     Ok(ParentState::Absent(Mode::DEFAULT_DIR))
 }
 
-/// Create every missing component of `dir`: the ancestors bx had to invent at
-/// [`Mode::DEFAULT_DIR`], and `dir` itself at `leaf_mode`.
+/// Create every missing component of `dir`: `dir` itself at `leaf_mode` when
+/// one is given, and every other component — `dir` too, when none is — at the
+/// mode a directory target in this apply declares for it, or at
+/// [`Mode::DEFAULT_DIR`] when none does.
 ///
-/// Returns what it created, **deepest first**, which is the order a reversal
-/// removes them in.
-fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<Vec<PathBuf>, Error> {
+/// Returns what it created and how, **deepest first**, which is the order a
+/// reversal removes them in.
+fn create_missing_dirs(
+    dir: &Path,
+    leaf_mode: Option<Mode>,
+    created: &CreatedDirs,
+) -> Result<Vec<(PathBuf, Made)>, Error> {
     // `ancestors` yields deepest first, so the collected prefix is already in
     // removal order; reversing it gives shallowest-first creation order.
     let missing: Vec<PathBuf> = dir
@@ -1583,20 +1842,19 @@ fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<Vec<PathBuf>, Erro
     // removed it would be deleting a directory another tool made — Invariant 1,
     // with no way to notice afterwards, because the wrong list is durable on
     // disk by the time `bx rm` reads it.
-    let mut created = Vec::with_capacity(missing.len());
+    let mut made_here = Vec::with_capacity(missing.len());
     for path in missing.iter().rev() {
-        let mode = if path == dir {
-            leaf_mode
-        } else {
-            Mode::DEFAULT_DIR
+        let mode = match leaf_mode {
+            Some(mode) if path == dir => mode,
+            _ => created.declared(path).unwrap_or(Mode::DEFAULT_DIR),
         };
-        if create_dir_at(path, mode)? {
-            created.push(path.clone());
+        if let Some(made) = create_dir_at(path, mode)? {
+            made_here.push((path.clone(), made));
         }
     }
     // The walk above is shallowest first; a reversal wants deepest first.
-    created.reverse();
-    Ok(created)
+    made_here.reverse();
+    Ok(made_here)
 }
 
 /// `mkdir` one directory at exactly `mode`.
@@ -1614,13 +1872,18 @@ fn create_missing_dirs(dir: &Path, leaf_mode: Mode) -> Result<Vec<PathBuf>, Erro
 /// contents — the directory is empty — it is the **descriptor**: a process that
 /// opens it inside that window holds a handle whose access checks have already
 /// passed, and the later `chmod` does not revoke it.
-fn create_dir_at(path: &Path, mode: Mode) -> Result<bool, Error> {
+///
+/// Returns the mode and the device and inode of the directory it made, or
+/// `None` when something was already at `path`.
+fn create_dir_at(path: &Path, mode: Mode) -> Result<Option<Made>, Error> {
+    use std::os::unix::fs::MetadataExt as _;
+
     match rustix::fs::mkdir(path, mode.into()) {
         Ok(()) => {}
         // Somebody else created it between the stat and the mkdir. It is not
         // bx's directory then, so its mode is not bx's to set — and it is not
         // bx's to record as one it invented, because a reversal removes those.
-        Err(Errno::EXIST) => return Ok(false),
+        Err(Errno::EXIST) => return Ok(None),
         Err(source) => {
             return Err(Error::Write {
                 path: path.to_path_buf(),
@@ -1630,7 +1893,17 @@ fn create_dir_at(path: &Path, mode: Mode) -> Result<bool, Error> {
     }
     // `mkdir`'s mode argument is masked by the umask; `chmod` is not.
     set_mode(path, mode)?;
-    Ok(true)
+    // Which directory this is, so a later call can tell it from another one
+    // put at the same path after it.
+    let meta = std::fs::symlink_metadata(path).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(Some(Made {
+        mode,
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }))
 }
 
 /// The setuid and setgid bits.
@@ -1643,6 +1916,12 @@ fn create_dir_at(path: &Path, mode: Mode) -> Result<bool, Error> {
 /// keeps both promises: never wider than the declared mode while empty, and
 /// exactly the declared mode by the time anything can see the content.
 const SET_ID: u32 = 0o6000;
+
+/// The setuid, setgid and sticky bits: the ones a filesystem may not store.
+///
+/// [`Staged::fill`] reads them back after the content whenever a mode declares
+/// any of them — see [`Error::SetIdNotKept`].
+const SPECIAL: u32 = 0o7000;
 
 /// `mode` without its setuid and setgid bits — see [`SET_ID`].
 const fn without_set_id(mode: Mode) -> Mode {
@@ -1658,15 +1937,16 @@ fn fchmod(file: &std::fs::File, mode: Mode, path: &Path) -> Result<(), Error> {
     })
 }
 
-/// Refuse unless every setuid or setgid bit `mode` declares is on `file`.
+/// Refuse unless every setuid, setgid or sticky bit `mode` declares is on
+/// `file`.
 ///
-/// Called after the `fchmod` that adds them, because that `fchmod` does not
-/// fail when a bit does not stick — see [`Error::SetIdNotKept`]. `dest` is the
+/// Called after the content, because the `fchmod` that adds a set-id bit does
+/// not fail when it does not stick — see [`Error::SetIdNotKept`]. `dest` is the
 /// destination the refusal names; the temporary file is what is inspected.
 ///
 /// # Errors
 ///
-/// [`Error::SetIdNotKept`] when a declared set-id bit is missing, and
+/// [`Error::SetIdNotKept`] when a declared special bit is missing, and
 /// [`Error::Read`] when `file` cannot be stat'd.
 fn verify_set_id_kept(file: &std::fs::File, mode: Mode, dest: &Path) -> Result<(), Error> {
     let meta = file.metadata().map_err(|source| Error::Read {
@@ -1674,7 +1954,7 @@ fn verify_set_id_kept(file: &std::fs::File, mode: Mode, dest: &Path) -> Result<(
         source,
     })?;
     let landed = mode_of(&meta);
-    let declared = mode.bits() & SET_ID;
+    let declared = mode.bits() & SPECIAL;
     if landed.bits() & declared == declared {
         return Ok(());
     }
@@ -1861,10 +2141,45 @@ mod tests {
 
         let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
         assert_eq!(outcome.action, Action::Unchanged, "the file itself is fine");
-        let note = outcome.parent_note.expect("the parent must be reported");
-        assert!(note.contains(".ssh"), "{note}");
-        assert!(note.contains("is 0755"), "{note}");
-        assert!(note.contains("wider than the 0600"), "{note}");
+        // Exactly, so a plain directory is never reported with the symlink
+        // wording, whose remedy ("chmod ... itself") names a different action
+        // and shares every substring checked above it.
+        assert_eq!(
+            outcome.parent_note,
+            Some(format!(
+                "{} is 0755, wider than the 0600 this file declares",
+                home.child(".ssh").display()
+            )),
+        );
+    }
+
+    #[test]
+    fn a_destination_that_cannot_be_stat_ed_is_an_error_not_an_absent_file() {
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so there is nothing to assert.
+            return;
+        }
+        let home = guarded_home();
+        let dir = home.child("unsearchable");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let dest = dir.join("f");
+        seed(&dest, b"theirs\n", Mode::DEFAULT_FILE);
+        // Readable but not searchable: the directory itself stats fine, and
+        // `lstat` on the file inside it fails with EACCES rather than ENOENT.
+        set_mode(&dir, Mode::from_bits(0o600)).expect("chmod");
+
+        let result = observe(&dest);
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for cleanup");
+
+        // Reported as absent, plan would announce a Create over a file bx
+        // cannot read.
+        let err = result.expect_err("a file bx cannot look at is not an absent one");
+        let Error::Read { path, source } = &err else {
+            panic!("expected a read error, got {err:?}");
+        };
+        assert_eq!(path, &dest);
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&dest).expect("read"), b"theirs\n");
     }
 
     #[test]
@@ -2095,7 +2410,7 @@ mod tests {
         // lands: the second plan reads `Modify`, and the ledger records a mode
         // that is not on disk. Under root the bits survive either way, so this
         // cannot fail there — which is not a reason to skip it.
-        for bits in [0o4755, 0o2755, 0o6755] {
+        for bits in [0o4755, 0o2755, 0o6755, 0o1755] {
             let home = guarded_home();
             let dest = home.child("tool");
             let mode = Mode::from_bits(bits);
@@ -2128,6 +2443,50 @@ mod tests {
         seed(&path, b"x", Mode::from_bits(0o755));
         let file = std::fs::File::open(&path).expect("open");
 
+        // A lost setuid bit names setuid, and does not blame group membership,
+        // which only ever costs a file its setgid bit.
+        let lost_setuid = verify_set_id_kept(&file, Mode::from_bits(0o4755), &path)
+            .expect_err("0755 on disk is not a declared 4755")
+            .to_string();
+        assert!(
+            lost_setuid.contains("the setuid bit did not stick"),
+            "{lost_setuid}"
+        );
+        assert!(!lost_setuid.contains("setgid"), "{lost_setuid}");
+        assert!(!lost_setuid.contains("group"), "{lost_setuid}");
+        assert!(
+            lost_setuid.contains("filesystem that stores no set-id or sticky bits"),
+            "{lost_setuid}"
+        );
+        // Every bit that did not stick is named, and only those.
+        let lost_both = verify_set_id_kept(&file, Mode::from_bits(0o7755), &path)
+            .expect_err("0755 on disk is not a declared 7755")
+            .to_string();
+        assert!(
+            lost_both.contains("the setuid, setgid and sticky bits did not stick"),
+            "{lost_both}"
+        );
+        set_mode(&path, Mode::from_bits(0o1755)).expect("sticky sticks here");
+        let lost_sticky = verify_set_id_kept(&file, Mode::from_bits(0o5755), &path)
+            .expect_err("1755 on disk is not a declared 5755")
+            .to_string();
+        assert!(
+            lost_sticky.contains("the setuid bit did not stick"),
+            "{lost_sticky}"
+        );
+        assert!(
+            verify_set_id_kept(&file, Mode::from_bits(0o1755), &path).is_ok(),
+            "a sticky bit that stuck is no refusal",
+        );
+        seed(&path, b"x", Mode::from_bits(0o755));
+        let lost_sticky = verify_set_id_kept(&file, Mode::from_bits(0o1755), &path)
+            .expect_err("0755 on disk is not a declared 1755")
+            .to_string();
+        assert!(
+            lost_sticky.contains("the sticky bit did not stick"),
+            "{lost_sticky}"
+        );
+
         let err = verify_set_id_kept(&file, Mode::from_bits(0o2755), &path)
             .expect_err("0755 on disk is not a declared 2755");
         let Error::SetIdNotKept {
@@ -2142,8 +2501,17 @@ mod tests {
         assert_eq!(*declared, Mode::from_bits(0o2755));
         assert_eq!(*landed, Mode::from_bits(0o755));
         assert_eq!(err.path(), path);
-        assert!(err.to_string().contains("setgid"), "{err}");
-        assert!(err.to_string().contains("Nothing was replaced"), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("the setgid bit did not stick"),
+            "{message}"
+        );
+        assert!(message.contains("whose group you are not in"), "{message}");
+        assert!(
+            message.contains("filesystem that stores no set-id or sticky bits"),
+            "{message}"
+        );
+        assert!(message.contains("Nothing was replaced"), "{message}");
 
         // A bit that did stick is no refusal, and neither is a mode that
         // declares none.
@@ -3286,10 +3654,10 @@ mod tests {
 
     #[test]
     fn a_directory_target_applied_after_a_file_beneath_it_is_the_create_plan_announced() {
-        // ~/.ssh at 0700 and ~/.ssh/config at 0600, both absent, applied file
-        // first. The file's write makes ~/.ssh at 0755, and the directory
-        // target that follows must end at 0700 rather than stop the apply
-        // with the file already written.
+        // ~/.ssh at 0700 and ~/.ssh/config at 0600, both absent and both
+        // declared, applied file first. The file's write makes ~/.ssh at its
+        // declared 0700, and the directory target that follows must adopt it
+        // as its create rather than stop the apply with the file written.
         let home = guarded_home();
         let dir = home.child(".ssh");
         let file = home.child(".ssh/config");
@@ -3305,14 +3673,19 @@ mod tests {
         );
 
         let mut created = CreatedDirs::new();
+        created.declare(&dir, Mode::PRIVATE_DIR);
         let filled = stage(&file, Mode::PRIVATE_FILE, &planned_file, &mut created)
             .expect("stage")
             .fill(b"Host *\n")
             .expect("fill");
+        assert!(
+            filled.created_dirs().is_empty(),
+            "the file's write made the declared directory, and leaves it to its target",
+        );
         assert_eq!(
-            filled.created_dirs(),
-            std::slice::from_ref(&dir),
-            "the file's write made the directory, and its entry says so",
+            mode_of_path(&dir),
+            Mode::PRIVATE_DIR,
+            "made at its declared mode"
         );
         filled.publish().expect("publish");
         assert!(created.contains(&dir));
@@ -3326,7 +3699,7 @@ mod tests {
         )
         .expect_err("a directory from nowhere is still refused");
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
-        assert_eq!(mode_of_path(&dir), Mode::DEFAULT_DIR);
+        assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
 
         let ensured = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned_dir, &mut created)
             .expect("the create plan announced");
@@ -3368,6 +3741,8 @@ mod tests {
             let planned_b = observe(&b).expect("plan observes a/b");
 
             let mut created = CreatedDirs::new();
+            created.declare(&a, mode_a);
+            created.declare(&b, Mode::PRIVATE_DIR);
             let (ensured_a, ensured_b) = if deeper_first {
                 let b_done = ensure_dir(&b, Mode::PRIVATE_DIR, &planned_b, &mut created);
                 let a_done = ensure_dir(&a, mode_a, &planned_a, &mut created);
@@ -3385,12 +3760,13 @@ mod tests {
             assert_eq!(mode_of_path(&a), mode_a, "{order}");
             assert_eq!(mode_of_path(&b), Mode::PRIVATE_DIR, "{order}");
             assert_eq!(ensured_a.created_dirs, std::slice::from_ref(&a), "{order}");
-            let expected_b = if deeper_first {
-                vec![b.clone(), a.clone()]
-            } else {
-                vec![b.clone()]
-            };
-            assert_eq!(ensured_b.created_dirs, expected_b, "{order}");
+            // `a` is declared, so its own target owns it in either order: a
+            // deeper target that had to create it does not claim it too.
+            assert_eq!(
+                ensured_b.created_dirs,
+                std::slice::from_ref(&b),
+                "{order}: a/b claims only itself",
+            );
             assert_eq!(
                 dir_outcome_for(&home, "a", mode_a).action,
                 Action::Unchanged,
@@ -3402,6 +3778,382 @@ mod tests {
                 "{order}: the second plan is empty",
             );
         }
+    }
+
+    /// Run `during`, watching `dir` from another thread, and return every mode
+    /// `dir` had at an instant anything was inside it.
+    fn modes_while_occupied<T>(dir: &Path, during: impl FnOnce() -> T) -> (T, Vec<Mode>) {
+        /// Stops the watcher when dropped, so an assertion failing inside
+        /// `during` unwinds to a report instead of leaving the scope waiting
+        /// on a thread that never stops.
+        struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let seen = Mutex::new(Vec::new());
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let occupied =
+                        std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+                    if occupied && let Ok(meta) = std::fs::symlink_metadata(dir) {
+                        let mode = mode_of(&meta);
+                        let mut seen = seen
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if !seen.contains(&mode) {
+                            seen.push(mode);
+                        }
+                    }
+                }
+            });
+            let _stop = Stop(&done);
+            during()
+        });
+        let seen = seen
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (result, seen)
+    }
+
+    #[test]
+    fn a_file_never_sits_in_a_directory_wider_than_its_directory_target_declares_in_either_order() {
+        // ~/.ssh declared 0700 and ~/.ssh/notes declared 0644, both absent.
+        // Applied file first, the write used to create ~/.ssh at 0755 and
+        // publish a file any local user could read, until the directory target
+        // narrowed it — and for good if the apply stopped in between.
+        for file_first in [true, false] {
+            let order = if file_first {
+                "file first"
+            } else {
+                "directory first"
+            };
+            let home = guarded_home();
+            let (dir, file) = (home.child(".ssh"), home.child(".ssh/notes"));
+            let planned_dir = observe(&dir).expect("plan observes the directory");
+            let planned_file = observe(&file).expect("plan observes the file");
+            let mut created = CreatedDirs::new();
+            created.declare(&dir, Mode::PRIVATE_DIR);
+
+            let write_file = |created: &mut CreatedDirs| {
+                let staged = stage(&file, Mode::DEFAULT_FILE, &planned_file, created)
+                    .unwrap_or_else(|e| panic!("{order}: stage: {e:?}"));
+                assert_eq!(
+                    mode_of_path(&dir),
+                    Mode::PRIVATE_DIR,
+                    "{order}: the directory the temporary file sits in",
+                );
+                staged
+                    .commit(b"notes\n")
+                    .unwrap_or_else(|e| panic!("{order}: commit: {e:?}"));
+                assert_eq!(
+                    mode_of_path(&dir),
+                    Mode::PRIVATE_DIR,
+                    "{order}: the directory the file was published into",
+                );
+            };
+            let apply_dir_target = |created: &mut CreatedDirs| {
+                ensure_dir(&dir, Mode::PRIVATE_DIR, &planned_dir, created)
+                    .unwrap_or_else(|e| panic!("{order}: ensure_dir: {e:?}"))
+            };
+            let (ensured, modes) = modes_while_occupied(&dir, || {
+                if file_first {
+                    write_file(&mut created);
+                    apply_dir_target(&mut created)
+                } else {
+                    let ensured = apply_dir_target(&mut created);
+                    write_file(&mut created);
+                    ensured
+                }
+            });
+
+            for mode in &modes {
+                assert_eq!(
+                    mode.bits() & !Mode::PRIVATE_DIR.bits(),
+                    0,
+                    "{order}: ~/.ssh was {mode} while something was in it; every mode seen: \
+                     {modes:?}",
+                );
+            }
+            assert_eq!(ensured.action, Action::Create, "{order}");
+            assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR, "{order}");
+            assert_eq!(mode_of_path(&file), Mode::DEFAULT_FILE, "{order}");
+            assert_eq!(std::fs::read(&file).expect("read"), b"notes\n", "{order}");
+            assert_eq!(
+                dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).action,
+                Action::Unchanged,
+                "{order}: the second plan is empty for the directory",
+            );
+            assert_eq!(
+                outcome_for(&home, ".ssh/notes", b"notes\n", Mode::DEFAULT_FILE).action,
+                Action::Unchanged,
+                "{order}: and for the file",
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_beneath_a_declared_directory_still_wider_than_declared_is_refused() {
+        let home = guarded_home();
+        let (dir, file) = (home.child(".ssh"), home.child(".ssh/notes"));
+        std::fs::create_dir(&dir).expect("mkdir");
+        set_mode(&dir, Mode::DEFAULT_DIR).expect("the user's own wide ~/.ssh");
+        let planned_dir = observe(&dir).expect("plan observes the directory");
+        assert_eq!(
+            compare_dir(&planned_dir, Mode::PRIVATE_DIR).action,
+            Action::Modify
+        );
+        let planned_file = observe(&file).expect("plan observes the file");
+        let deeper = home.child(".ssh/sub/notes");
+        let planned_deeper = observe(&deeper).expect("plan observes the deeper file");
+        let mut created = CreatedDirs::new();
+        created.declare(&dir, Mode::PRIVATE_DIR);
+
+        let err = stage(&file, Mode::DEFAULT_FILE, &planned_file, &mut created)
+            .expect_err("a file is not published into a declared directory still at 0755");
+        let Error::DirectoryTargetPending {
+            path,
+            dir: named,
+            found,
+            declared,
+        } = &err
+        else {
+            panic!("expected DirectoryTargetPending, got {err:?}");
+        };
+        assert_eq!(path, &file);
+        assert_eq!(named, &dir);
+        assert_eq!(*found, Mode::DEFAULT_DIR);
+        assert_eq!(*declared, Mode::PRIVATE_DIR);
+        assert_eq!(err.path(), file);
+        assert!(
+            err.to_string()
+                .contains("apply that directory target first"),
+            "{err}"
+        );
+        // A declared directory further up governs a file deeper down as well,
+        // and nothing beneath it is created either.
+        let err = stage(&deeper, Mode::DEFAULT_FILE, &planned_deeper, &mut created)
+            .expect_err("nor into a directory beneath it");
+        assert!(
+            matches!(&err, Error::DirectoryTargetPending { dir: named, .. } if *named == dir),
+            "{err:?}"
+        );
+        assert_eq!(
+            names_in(&dir),
+            Vec::<OsString>::new(),
+            "nothing was written"
+        );
+
+        // Narrowed first, the same writes go through.
+        ensure_dir(&dir, Mode::PRIVATE_DIR, &planned_dir, &mut created).expect("the modify");
+        stage(&file, Mode::DEFAULT_FILE, &planned_file, &mut created)
+            .expect("stage")
+            .commit(b"notes\n")
+            .expect("commit");
+        stage(&deeper, Mode::DEFAULT_FILE, &planned_deeper, &mut created)
+            .expect("stage the deeper file")
+            .commit(b"notes\n")
+            .expect("commit");
+        assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
+
+        // A declared directory that is already no wider than declared refuses
+        // nothing.
+        let open = home.child("open");
+        std::fs::create_dir(&open).expect("mkdir");
+        set_mode(&open, Mode::PRIVATE_DIR).expect("chmod");
+        let mut created = CreatedDirs::new();
+        created.declare(&open, Mode::DEFAULT_DIR);
+        let inside = home.child("open/f");
+        let planned_inside = observe(&inside).expect("plan observes");
+        stage(&inside, Mode::DEFAULT_FILE, &planned_inside, &mut created)
+            .expect("a narrower directory than declared is no exposure")
+            .commit(b"x")
+            .expect("commit");
+    }
+
+    #[test]
+    fn a_directory_a_write_created_before_its_declaration_is_refused_rather_than_adopted() {
+        // A caller that never declared ~/.ssh: the write beneath it made it at
+        // 0755 and published into it. Adopting it would hide that, and both
+        // the write's entry and the directory target's would claim it.
+        let home = guarded_home();
+        let (dir, file) = (home.child(".ssh"), home.child(".ssh/config"));
+        let planned_dir = observe(&dir).expect("plan observes the directory");
+        let planned_file = observe(&file).expect("plan observes the file");
+        let mut created = CreatedDirs::new();
+
+        let filled = stage(&file, Mode::PRIVATE_FILE, &planned_file, &mut created)
+            .expect("stage")
+            .fill(b"Host *\n")
+            .expect("fill");
+        assert_eq!(
+            filled.created_dirs(),
+            std::slice::from_ref(&dir),
+            "undeclared, the directory is the write's to claim",
+        );
+        filled.publish().expect("publish");
+        assert_eq!(mode_of_path(&dir), Mode::DEFAULT_DIR);
+
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned_dir, &mut created)
+            .expect_err("a directory made before its declaration is not adopted");
+        let Error::UndeclaredDirectory {
+            path,
+            created: at,
+            declared,
+        } = &err
+        else {
+            panic!("expected UndeclaredDirectory, got {err:?}");
+        };
+        assert_eq!(path, &dir);
+        assert_eq!(*at, Mode::DEFAULT_DIR);
+        assert_eq!(*declared, Mode::PRIVATE_DIR);
+        assert_eq!(err.path(), dir);
+        assert!(
+            err.to_string()
+                .contains("declare every directory target before applying any target"),
+            "{err}"
+        );
+        assert_eq!(mode_of_path(&dir), Mode::DEFAULT_DIR, "nothing was chmod'd");
+        assert_eq!(
+            dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR)
+                .note
+                .as_deref(),
+            Some("mode 0755 -> 0700"),
+            "the next plan announces the modify that narrows it",
+        );
+    }
+
+    #[test]
+    fn a_declared_directory_is_owned_by_its_directory_target_alone_in_either_order() {
+        // With #9's `prune_dirs`, removing a file whose entry also claimed a
+        // still-declared ~/.ssh removed the directory — and only when the file
+        // had been applied first. Every directory has exactly one claimant: a
+        // declared one its directory target, any other the call that made it.
+        for file_first in [true, false] {
+            let order = if file_first {
+                "file first"
+            } else {
+                "directory first"
+            };
+            let home = guarded_home();
+            let (deep, dir, file) = (
+                home.child("deep"),
+                home.child("deep/.ssh"),
+                home.child("deep/.ssh/config"),
+            );
+            let planned_dir = observe(&dir).expect("plan observes the directory");
+            let planned_file = observe(&file).expect("plan observes the file");
+            let mut created = CreatedDirs::new();
+            created.declare(&dir, Mode::PRIVATE_DIR);
+
+            let write_file = |created: &mut CreatedDirs| {
+                let filled = stage(&file, Mode::PRIVATE_FILE, &planned_file, created)
+                    .unwrap_or_else(|e| panic!("{order}: stage: {e:?}"))
+                    .fill(b"Host *\n")
+                    .unwrap_or_else(|e| panic!("{order}: fill: {e:?}"));
+                let claim = filled.created_dirs().to_vec();
+                let entry = filled
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry");
+                assert_eq!(
+                    entry.created_dirs.len(),
+                    claim.len(),
+                    "{order}: the ledger entry claims what the write reports",
+                );
+                filled
+                    .publish()
+                    .unwrap_or_else(|e| panic!("{order}: publish: {e:?}"));
+                claim
+            };
+            let apply_dir_target = |created: &mut CreatedDirs| {
+                ensure_dir(&dir, Mode::PRIVATE_DIR, &planned_dir, created)
+                    .unwrap_or_else(|e| panic!("{order}: ensure_dir: {e:?}"))
+                    .created_dirs
+            };
+            let (file_claim, dir_claim) = if file_first {
+                let file_claim = write_file(&mut created);
+                (file_claim, apply_dir_target(&mut created))
+            } else {
+                let dir_claim = apply_dir_target(&mut created);
+                (write_file(&mut created), dir_claim)
+            };
+
+            for directory in [&dir, &deep] {
+                let claimants = [&file_claim, &dir_claim]
+                    .iter()
+                    .filter(|claim| claim.contains(directory))
+                    .count();
+                assert_eq!(
+                    claimants,
+                    1,
+                    "{order}: {} is claimed by the file {file_claim:?} and the directory \
+                     target {dir_claim:?}",
+                    directory.display(),
+                );
+            }
+            assert_eq!(
+                dir_claim.first(),
+                Some(&dir),
+                "{order}: the declared directory is its target's",
+            );
+            let (expected_file, expected_dir) = if file_first {
+                (vec![deep.clone()], vec![dir.clone()])
+            } else {
+                (Vec::new(), vec![dir.clone(), deep.clone()])
+            };
+            assert_eq!(file_claim, expected_file, "{order}: the file's claim");
+            assert_eq!(dir_claim, expected_dir, "{order}: the directory's claim");
+
+            // `rm` of the file, pruned the way a reversal prunes: unlink, then
+            // remove its claimed directories deepest first while they are empty.
+            std::fs::remove_file(&file).expect("unlink");
+            for claimed in &file_claim {
+                if std::fs::remove_dir(claimed).is_err() {
+                    break;
+                }
+            }
+            assert!(
+                dir.is_dir(),
+                "{order}: removing the file leaves the directory that is still declared",
+            );
+            assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR, "{order}");
+        }
+    }
+
+    #[test]
+    fn a_directory_recreated_at_a_path_this_apply_created_is_not_adopted() {
+        let home = guarded_home();
+        let (dir, file) = (home.child(".ssh"), home.child(".ssh/config"));
+        let planned_dir = observe(&dir).expect("plan observes the directory");
+        let planned_file = observe(&file).expect("plan observes the file");
+        let mut created = CreatedDirs::new();
+        created.declare(&dir, Mode::PRIVATE_DIR);
+        stage(&file, Mode::PRIVATE_FILE, &planned_file, &mut created)
+            .expect("stage")
+            .commit(b"Host *\n")
+            .expect("commit");
+        assert!(created.contains(&dir));
+
+        // Another tool moves bx's directory aside and makes its own at the same
+        // path. The moved one stays allocated under its new name, so the new
+        // directory cannot reuse its inode number.
+        std::fs::rename(&dir, home.child(".ssh.moved")).expect("move aside");
+        std::fs::create_dir(&dir).expect("their own directory");
+        set_mode(&dir, Mode::from_bits(0o770)).expect("at their own mode");
+
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned_dir, &mut created)
+            .expect_err("a directory from somebody else at the same path is not bx's create");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(
+            mode_of_path(&dir),
+            Mode::from_bits(0o770),
+            "their directory keeps its mode",
+        );
+        assert_eq!(names_in(&dir), Vec::<OsString>::new());
     }
 
     #[test]
@@ -3600,6 +4352,91 @@ mod tests {
                 .expect("stat")
                 .file_type()
                 .is_symlink(),
+        );
+    }
+
+    /// Assert that `result` is the refusal of a `..` component in `path`.
+    fn assert_parent_component_refused<T: std::fmt::Debug>(
+        what: &str,
+        result: Result<T, Error>,
+        path: &Path,
+    ) {
+        match result {
+            Err(Error::ParentComponent(named)) => assert_eq!(named, path, "{what}"),
+            other => panic!("{what}: expected ParentComponent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parent_component_is_refused_rather_than_resolved_through_a_link() {
+        // `lnk/../f` with `lnk -> elsewhere/sub`: the kernel resolves `..`
+        // after following the link, so it names `elsewhere/f`, while any
+        // lexical reading of the path — the one a ledger key is made from —
+        // names `f`. A write through it would record one file and change
+        // another, and `rm` would restore the wrong one.
+        let home = guarded_home();
+        std::fs::create_dir_all(home.child("elsewhere/sub")).expect("mkdir");
+        std::os::unix::fs::symlink("elsewhere/sub", home.child("lnk")).expect("symlink");
+        seed(&home.child("elsewhere/f"), b"theirs\n", Mode::DEFAULT_FILE);
+
+        let dotted = home.child("lnk/../f");
+        assert_parent_component_refused("observe", observe(&dotted), &dotted);
+        assert_parent_component_refused(
+            "write_atomically",
+            write_atomically(&dotted, b"ours\n", Mode::PRIVATE_FILE),
+            &dotted,
+        );
+        let planned = observe(&home.child("f")).expect("plan observes the lexical name");
+        assert_parent_component_refused(
+            "stage",
+            stage(
+                &dotted,
+                Mode::PRIVATE_FILE,
+                &planned,
+                &mut CreatedDirs::new(),
+            ),
+            &dotted,
+        );
+        assert_parent_component_refused("set_mode", set_mode(&dotted, Mode::PRIVATE_FILE), &dotted);
+        let dotted_dir = home.child("lnk/../d");
+        let planned_dir = observe(&home.child("d")).expect("plan observes the lexical name");
+        assert_parent_component_refused(
+            "ensure_dir",
+            ensure_dir(
+                &dotted_dir,
+                Mode::PRIVATE_DIR,
+                &planned_dir,
+                &mut CreatedDirs::new(),
+            ),
+            &dotted_dir,
+        );
+        // A final `..`, and a relative path that starts with one, likewise.
+        let trailing = home.child("lnk/..");
+        assert_parent_component_refused("a final ..", observe(&trailing), &trailing);
+        assert_parent_component_refused(
+            "a relative ..",
+            observe(Path::new("../f")),
+            Path::new("../f"),
+        );
+
+        // Nothing was written or changed at either name.
+        assert_eq!(
+            std::fs::read(home.child("elsewhere/f")).expect("read"),
+            b"theirs\n"
+        );
+        assert_eq!(mode_of_path(&home.child("elsewhere/f")), Mode::DEFAULT_FILE);
+        assert!(std::fs::symlink_metadata(home.child("f")).is_err());
+        assert!(std::fs::symlink_metadata(home.child("d")).is_err());
+        assert!(std::fs::symlink_metadata(home.child("elsewhere/d")).is_err());
+        assert_eq!(
+            names_in(&home.child("elsewhere")),
+            [OsString::from("f"), OsString::from("sub")],
+            "no temporary file is left",
+        );
+        assert_eq!(
+            Error::ParentComponent(dotted.clone()).path(),
+            dotted,
+            "the refusal names the path as given",
         );
     }
 
@@ -3877,7 +4714,9 @@ mod tests {
         // made it. It is that tool's directory, and `bx rm` removing it would
         // be deleting something bx did not create.
         assert!(
-            !create_dir_at(&path, Mode::PRIVATE_DIR).expect("create_dir_at"),
+            create_dir_at(&path, Mode::PRIVATE_DIR)
+                .expect("create_dir_at")
+                .is_none(),
             "an existing directory was not created by this call",
         );
         assert_eq!(
@@ -3887,7 +4726,9 @@ mod tests {
         );
 
         assert!(
-            create_dir_at(&home.child("ours"), Mode::PRIVATE_DIR).expect("create_dir_at"),
+            create_dir_at(&home.child("ours"), Mode::PRIVATE_DIR)
+                .expect("create_dir_at")
+                .is_some(),
             "a directory bx made is reported as bx's",
         );
         assert_eq!(mode_of_path(&home.child("ours")), Mode::PRIVATE_DIR);

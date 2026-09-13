@@ -144,6 +144,22 @@ impl ExclusiveLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Whether this guard is the lock of the state directory at `root`.
+    ///
+    /// Decided by identity — the device and inode of the locked descriptor
+    /// against those of `root`'s lock file — never by spelling. A directory
+    /// reached through a symlink is still recognised, and a lock file replaced
+    /// since it was locked, or one that is not there, is not.
+    pub(crate) fn guards(&self, root: &Path) -> bool {
+        let Ok(held) = rustix::fs::fstat(&self.fd) else {
+            return false;
+        };
+        let Ok(there) = rustix::fs::lstat(StateDir::new(root.to_path_buf()).lock()) else {
+            return false;
+        };
+        held.st_dev == there.st_dev && held.st_ino == there.st_ino
+    }
 }
 
 impl SharedLock {
@@ -379,6 +395,25 @@ mod tests {
         );
         assert_eq!(mode, Mode::PRIVATE_FILE);
         assert_eq!(lock.path(), dir.lock());
+    }
+
+    #[test]
+    fn a_lock_guards_its_own_directory_by_identity_and_no_other() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        assert!(lock.guards(dir.root()));
+
+        // The same directory spelled through a link is the same directory.
+        let alias = home.child("alias");
+        std::os::unix::fs::symlink(dir.root(), &alias).expect("alias");
+        assert!(lock.guards(&alias));
+
+        // Another directory, with or without a lock file of its own, is not.
+        let other = StateDir::new(home.child("other"));
+        assert!(!lock.guards(other.root()));
+        drop(ExclusiveLock::acquire(&other).expect("the other lock file"));
+        assert!(!lock.guards(other.root()));
     }
 
     #[test]

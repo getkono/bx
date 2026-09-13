@@ -154,6 +154,24 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// The exclusive lock presented is not the lock of the state directory the
+    /// operation would change.
+    ///
+    /// The caller's defect. A rename or a save under another directory's lock
+    /// is as unguarded as one under no lock at all, so nothing is read,
+    /// renamed or written.
+    #[error(
+        "the lock held, {}, is not the lock of the state directory being changed, {}; nothing \
+         was read, renamed or written. Take the lock of that state directory",
+        .held.display(),
+        .needed.display()
+    )]
+    WrongLock {
+        /// The lock file the presented guard holds.
+        held: PathBuf,
+        /// The lock file of the directory the operation needed.
+        needed: PathBuf,
+    },
     /// The home a stored document's paths are to be checked against is not a
     /// home this crate can answer for.
     ///

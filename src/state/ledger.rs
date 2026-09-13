@@ -438,6 +438,10 @@ impl Ledger {
     /// run after a newer one. Its format is not damage: quarantining it would
     /// let the next apply record bx's own output as every prior, and every
     /// rollback would add another quarantine. Nothing is renamed.
+    ///
+    /// [`Error::WrongLock`] if `lock` is not `dir`'s own lock. It is checked
+    /// before the ledger is read, so another directory's lock never
+    /// quarantines this one.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
         let dir = dir.clone();
         Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self { dir, view }))
@@ -2145,6 +2149,42 @@ mod tests {
             std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
             b"not messagepack",
         );
+    }
+
+    #[test]
+    fn a_lock_on_another_state_directory_opens_nothing_and_quarantines_nothing() {
+        // Review round 4: `Ledger::open` and `Fingerprints::open` accepted any
+        // `ExclusiveLock`, so A's lock quarantined B's damaged ledger while B's
+        // own bx, holding B's lock, could be saving it.
+        let a = guarded_home();
+        let b = guarded_home();
+        let (dir_a, lock_a) = locked(&a);
+        let dir_b = StateDir::resolve(b.path());
+        dir_b.ensure().expect("ensure");
+        std::fs::write(dir_b.ledger(), b"not messagepack").expect("seed");
+        std::fs::write(dir_b.fingerprints(), b"not messagepack").expect("seed");
+        let wrong = |err: &Error| {
+            matches!(
+                err,
+                Error::WrongLock { held, needed }
+                    if *held == dir_a.lock() && *needed == dir_b.lock()
+            )
+        };
+
+        let err = Ledger::open(&dir_b, &lock_a, b.path()).expect_err("A's lock is not B's");
+        assert!(wrong(&err), "got {err}");
+        assert!(err.to_string().contains("Take the lock"), "{err}");
+        let err = Fingerprints::open(&dir_b, &lock_a).expect_err("A's lock is not B's");
+        assert!(wrong(&err), "got {err}");
+        let err = Fingerprints::default()
+            .save(&dir_b, &lock_a)
+            .expect_err("A's lock is not B's");
+        assert!(wrong(&err), "got {err}");
+
+        for file in [dir_b.ledger(), dir_b.fingerprints()] {
+            assert_eq!(std::fs::read(&file).expect("in place"), b"not messagepack");
+            assert!(!StateDir::quarantine(&file).exists());
+        }
     }
 
     #[test]

@@ -198,10 +198,17 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
 /// for the name first and renaming second, which the lock makes sound against
 /// every other bx.
 ///
+/// The lock must be the one of the directory holding `path` — see
+/// [`check_lock`] — or nothing is renamed.
+///
 /// # Errors
 ///
-/// The first failure that is not "that name is taken".
-pub(crate) fn move_aside(path: &Path, _lock: &ExclusiveLock) -> std::io::Result<PathBuf> {
+/// [`std::io::ErrorKind::InvalidInput`] for another directory's lock, and
+/// otherwise the first failure that is not "that name is taken".
+pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<PathBuf> {
+    check_lock(path, lock).map_err(|refused| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, refused.to_string())
+    })?;
     let mut n: u64 = 0;
     loop {
         let candidate = StateDir::quarantine_nth(path, n);
@@ -219,6 +226,27 @@ pub(crate) fn move_aside(path: &Path, _lock: &ExclusiveLock) -> std::io::Result<
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("no free quarantine name"))?;
     }
+}
+
+/// Refuse `lock` unless it is the lock of the state directory holding `path`.
+///
+/// Every operation that demands an [`ExclusiveLock`] demands it for one
+/// directory. A quarantine or a save under another directory's lock is as
+/// unguarded as one under none: another bx holding *this* directory's lock can
+/// be saving the very file being moved.
+///
+/// # Errors
+///
+/// [`Error::WrongLock`], naming both lock files.
+pub(crate) fn check_lock(path: &Path, lock: &ExclusiveLock) -> Result<(), Error> {
+    let root = path.parent().unwrap_or_else(|| Path::new(""));
+    if lock.guards(root) {
+        return Ok(());
+    }
+    Err(Error::WrongLock {
+        held: lock.path().to_path_buf(),
+        needed: StateDir::new(root.to_path_buf()).lock(),
+    })
 }
 
 /// Check that an existing `path` is a directory, and narrow it to `mode` if it
@@ -496,6 +524,29 @@ mod tests {
             StateDir::quarantine_nth(Path::new("/s/bx/ledger.mpk"), 12),
             PathBuf::from("/s/bx/ledger.mpk.corrupt.12"),
         );
+    }
+
+    #[test]
+    fn another_directorys_lock_moves_nothing_aside() {
+        // Review round 4: `move_aside` ignored which directory its lock
+        // guarded, so A's lock quarantined B's ledger while B's own bx could be
+        // saving it.
+        let a = guarded_home();
+        let b = guarded_home();
+        let lock_a = ExclusiveLock::acquire(&StateDir::resolve(a.path())).expect("A's lock");
+        let dir_b = StateDir::resolve(b.path());
+        dir_b.ensure().expect("ensure");
+        std::fs::write(dir_b.ledger(), b"damaged").expect("seed");
+
+        let err = move_aside(&dir_b.ledger(), &lock_a).expect_err("must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not the lock"), "{err}");
+        assert_eq!(std::fs::read(dir_b.ledger()).expect("in place"), b"damaged");
+        assert!(!StateDir::quarantine(&dir_b.ledger()).exists());
+
+        let lock_b = ExclusiveLock::acquire(&dir_b).expect("B's lock");
+        let aside = move_aside(&dir_b.ledger(), &lock_b).expect("B's own lock moves it");
+        assert_eq!(aside, StateDir::quarantine(&dir_b.ledger()));
     }
 
     #[test]

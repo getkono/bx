@@ -62,7 +62,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Error;
-use super::dir::{ensure_dir, move_aside};
+use super::dir::{check_lock, ensure_dir, move_aside};
 use super::lock::ExclusiveLock;
 use crate::fs::{Mode, write_atomically};
 
@@ -262,6 +262,9 @@ impl<T> Loaded<T> {
 ///
 /// [`Error::FutureVersion`] for a [`Loss::Permanent`] file written by a newer
 /// bx; nothing is renamed.
+///
+/// [`Error::WrongLock`] if `lock` is not the lock of the directory holding
+/// `path`; nothing is read.
 pub(crate) fn load<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
@@ -291,6 +294,11 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
     lock: Option<&ExclusiveLock>,
     check: impl FnOnce(&T) -> Result<(), Rejected>,
 ) -> Result<Loaded<T>, Error> {
+    // A lock presented for another directory guards nothing here, and is
+    // refused before anything is read.
+    if let Some(lock) = lock {
+        check_lock(path, lock)?;
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

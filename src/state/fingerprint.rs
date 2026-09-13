@@ -139,7 +139,8 @@ impl Fingerprints {
     ///
     /// # Errors
     ///
-    /// As [`Fingerprints::read`].
+    /// As [`Fingerprints::read`], and [`Error::WrongLock`] if `lock` is not
+    /// `dir`'s own lock, before anything is read.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock) -> Result<Loaded<Self>, Error> {
         store::load(
             &dir.fingerprints(),
@@ -204,8 +205,13 @@ impl Fingerprints {
     ///
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
     /// leaves the previous cache exactly as it was.
-    pub fn save(&self, dir: &StateDir, _lock: &ExclusiveLock) -> Result<(), Error> {
-        store::save(&dir.fingerprints(), KIND, VERSION, self)
+    ///
+    /// [`Error::WrongLock`] if `lock` is not `dir`'s own lock; nothing is
+    /// written.
+    pub fn save(&self, dir: &StateDir, lock: &ExclusiveLock) -> Result<(), Error> {
+        let path = dir.fingerprints();
+        super::dir::check_lock(&path, lock)?;
+        store::save(&path, KIND, VERSION, self)
     }
 }
 

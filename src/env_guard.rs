@@ -26,14 +26,21 @@
 //! against. Declare no root — [`RootSet::strict`], which is what [`scan`] uses —
 //! and nothing may be relocated anywhere.
 //!
-//! The guard **fails closed**. Shell it cannot read is never approved: a line
-//! that could assign a variable and is not one of the few forms [`scan_with`]
-//! reads is refused as [`Reason::Unreadable`], whatever the variable.
+//! The guard **fails closed by shape**. It judges fragments bx generates, not
+//! arbitrary shell, so it does not model shell syntax and approve whatever it
+//! does not recognise: it reads a fragment against a small grammar — blank
+//! lines, comments, and `NAME=VALUE` or `export NAME=VALUE` with a restricted
+//! value — and refuses **every** line that is not one of those, whatever the
+//! line mentions and whether or not it relocates anything. A multi-line
+//! construct is refused at its first line, because no line the grammar accepts
+//! can leave a quote, a continuation or a heredoc open. [`scan_with`] states the
+//! grammar.
 //!
 //! This module is that rule as code. Anything bx generates for a shell is run
 //! through [`scan_with`] before it is written, and the check is covered by tests
 //! rather than left to review.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::layers;
@@ -43,6 +50,8 @@ use crate::paths;
 /// Exact variable names whose assigned value must be checked against the
 /// declared roots.
 const DENIED_EXACT: &[&str] = &[
+    // The home itself: `~` and every XDG default are resolved against it.
+    "HOME",
     // XDG roots — relocating any of these moves every tool at once.
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
@@ -71,16 +80,23 @@ const DENIED_EXACT: &[&str] = &[
     "GH_CONFIG_DIR",
     "DOCKER_CONFIG",
     "KUBECONFIG",
-    // Caches the prefix and suffix rules below do not reach. Each of these was
-    // observed relocating a real toolchain cache while matching no rule: the
-    // guard was letting them through silently.
+    // zsh reads every startup file after `.zshenv` from here.
+    "ZDOTDIR",
+    // Caches and configs the prefix and suffix rules below do not reach. Each
+    // of these was observed relocating a real tool's directory while matching
+    // no rule: the guard was letting them through silently.
     "GOCACHE",
     "NUGET_HTTP_CACHE_PATH",
     "HOMEBREW_CACHE",
     "HOMEBREW_LOGS",
     "HOMEBREW_TEMP",
-    // `_CACHE_DIR` requires the underscore, and `SCCACHE_DIR` ends in
-    // `CCACHE_DIR`, so it matched nothing either.
+    "YARN_CACHE_FOLDER",
+    "STARSHIP_CONFIG",
+    "PYTHONUSERBASE",
+    "TMPDIR",
+    // `_CACHE_DIR` requires the underscore, so neither `CCACHE_DIR` nor
+    // `SCCACHE_DIR` (which ends in `CCACHE_DIR`) matched anything.
+    "CCACHE_DIR",
     "SCCACHE_DIR",
 ];
 
@@ -91,7 +107,14 @@ const DENIED_EXACT: &[&str] = &[
 /// A family holds far more behaviour variables than location variables, so a
 /// name matched **only** by a prefix is not, by itself, evidence that it holds a
 /// location. See [`names_a_location`].
-const DENIED_PREFIXES: &[&str] = &["NPM_CONFIG_", "UV_", "MISE_", "ASDF_", "PIP_"];
+const DENIED_PREFIXES: &[&str] = &["UV_", "MISE_", "ASDF_", "PIP_"];
+
+/// Prefix families the tool itself reads without regard to case.
+///
+/// npm takes any environment variable matching `npm_config_*` in whatever case,
+/// and its own documentation writes them lower-case: `npm_config_cache=/x`
+/// moves npm's cache exactly as `NPM_CONFIG_CACHE=/x` does.
+const CASELESS_PREFIXES: &[&str] = &["NPM_CONFIG_"];
 
 /// Suffixes that mark a variable as naming a location.
 const DENIED_SUFFIXES: &[&str] = &[
@@ -106,16 +129,19 @@ const DENIED_SUFFIXES: &[&str] = &[
 
 /// The last word of a prefix-family name that says the variable holds a
 /// location: `UV_TOOL_DIR`, `PIP_TARGET`, `NPM_CONFIG_CACHE`,
-/// `UV_PROJECT_ENVIRONMENT`, `NPM_CONFIG_USERCONFIG`.
+/// `UV_PROJECT_ENVIRONMENT`, `NPM_CONFIG_USERCONFIG`, `MISE_SHARED_INSTALL_DIRS`.
 ///
-/// Each is taken from a location variable one of the five families documents.
+/// Each is taken from a location variable one of the families documents.
 /// It is what keeps a bare relative value — `NPM_CONFIG_CACHE=.npm`,
 /// `PIP_TARGET=build`, which move a tool's data to wherever the shell happens
 /// to be — from passing as a behaviour setting.
 const LOCATION_WORDS: &[&str] = &[
     "DIR",
+    "DIRS",
     "PATH",
+    "PATHS",
     "FILE",
+    "FILENAME",
     "HOME",
     "ROOT",
     "PREFIX",
@@ -124,6 +150,7 @@ const LOCATION_WORDS: &[&str] = &[
     "TMP",
     "SRC",
     "LOG",
+    "PROJECT",
     "ENVIRONMENT",
     "USERCONFIG",
     "GLOBALCONFIG",
@@ -143,22 +170,224 @@ const ALLOWED_EXCEPTIONS: &[&str] = &[
     "PIP_NO_CACHE_DIR",
 ];
 
+/// Names a shell defines and manages itself. A fragment may neither assign one
+/// nor refer to one.
+///
+/// A value assigned to one of these does not read back as it was written:
+/// `RANDOM`, `SECONDS` and `LINENO` are computed, `HISTSIZE` is an integer the
+/// shell evaluates arithmetically, `UID` and `USERNAME` change who the process
+/// is, and zsh's lower-case `path`, `fpath` and `manpath` are tied to the
+/// upper-case lists, so assigning one rewrites another. A guard that learned
+/// `RANDOM=<root>` and resolved `$RANDOM/cargo` inside the root would approve a
+/// relative path.
+///
+/// The list is every parameter a pristine `bash --norc --noprofile` (5.3) and
+/// `zsh -f` (5.9, with every bundled module loaded) define, plus the three
+/// documented names — `FUNCNAME`, `ERRNO`, `ZLE_RPROMPT_INDENT` — whose assigned
+/// value did not read back in one of them although neither defines it at
+/// startup. A test re-derives the first part from whichever shells the machine
+/// running it has.
+///
+/// `PATH` is deliberately absent. It reads back exactly as assigned in both
+/// shells — zsh's tied `path` is what is reserved — and it is the one
+/// shell-defined name a generated fragment plausibly extends. `HOME` is
+/// present: `~` expands against it, so a fragment that assigned it would change
+/// what every later `~` means.
+const SHELL_NAMES: &[&str] = &[
+    "ARGC",
+    "BASH",
+    "BASHOPTS",
+    "BASHPID",
+    "BASH_ALIASES",
+    "BASH_ARGC",
+    "BASH_ARGV",
+    "BASH_ARGV0",
+    "BASH_CMDS",
+    "BASH_COMMAND",
+    "BASH_EXECUTION_STRING",
+    "BASH_LINENO",
+    "BASH_LOADABLES_PATH",
+    "BASH_MONOSECONDS",
+    "BASH_SOURCE",
+    "BASH_SUBSHELL",
+    "BASH_VERSINFO",
+    "BASH_VERSION",
+    "CDPATH",
+    "COLUMNS",
+    "COMP_WORDBREAKS",
+    "CPUTYPE",
+    "DIRSTACK",
+    "EGID",
+    "EPOCHREALTIME",
+    "EPOCHSECONDS",
+    "ERRNO",
+    "EUID",
+    "FIGNORE",
+    "FPATH",
+    "FUNCNAME",
+    "FUNCNEST",
+    "GID",
+    "GROUPS",
+    "HISTCHARS",
+    "HISTCMD",
+    "HISTSIZE",
+    "HOME",
+    "HOST",
+    "HOSTNAME",
+    "HOSTTYPE",
+    "IFS",
+    "KEYBOARD_HACK",
+    "KEYTIMEOUT",
+    "LINENO",
+    "LINES",
+    "LISTMAX",
+    "LOGCHECK",
+    "LOGNAME",
+    "MACHTYPE",
+    "MAILCHECK",
+    "MAILPATH",
+    "MANPATH",
+    "MODULE_PATH",
+    "NULLCMD",
+    "OLDPWD",
+    "OPTARG",
+    "OPTERR",
+    "OPTIND",
+    "OSTYPE",
+    "PPID",
+    "PROMPT",
+    "PROMPT2",
+    "PROMPT3",
+    "PROMPT4",
+    "PS1",
+    "PS2",
+    "PS3",
+    "PS4",
+    "PSVAR",
+    "PWD",
+    "RANDOM",
+    "READNULLCMD",
+    "SAVEHIST",
+    "SECONDS",
+    "SHELL",
+    "SHELLOPTS",
+    "SHLVL",
+    "SPROMPT",
+    "SRANDOM",
+    "TERM",
+    "TIMEFMT",
+    "TMPPREFIX",
+    "TRY_BLOCK_ERROR",
+    "TRY_BLOCK_INTERRUPT",
+    "TTY",
+    "TTYIDLE",
+    "UID",
+    "USERNAME",
+    "VENDOR",
+    "WATCH",
+    "WATCHFMT",
+    "WORDCHARS",
+    "ZCURSES_COLORS",
+    "ZCURSES_COLOR_PAIRS",
+    "ZFTP_PREFS",
+    "ZFTP_SESSION",
+    "ZFTP_TMOUT",
+    "ZFTP_VERBOSE",
+    "ZLE_RPROMPT_INDENT",
+    "ZSH_ARGZERO",
+    "ZSH_EVAL_CONTEXT",
+    "ZSH_EXECUTION_STRING",
+    "ZSH_NAME",
+    "ZSH_PATCHLEVEL",
+    "ZSH_SUBSHELL",
+    "ZSH_VERSION",
+    "_",
+    "aliases",
+    "argv",
+    "builtins",
+    "cdpath",
+    "commands",
+    "dirstack",
+    "dis_aliases",
+    "dis_builtins",
+    "dis_functions",
+    "dis_functions_source",
+    "dis_galiases",
+    "dis_patchars",
+    "dis_reswords",
+    "dis_saliases",
+    "epochtime",
+    "errnos",
+    "exarr",
+    "exint",
+    "exstr",
+    "fignore",
+    "fpath",
+    "funcfiletrace",
+    "funcsourcetrace",
+    "funcstack",
+    "functions",
+    "functions_source",
+    "functrace",
+    "galiases",
+    "histchars",
+    "history",
+    "historywords",
+    "jobdirs",
+    "jobstates",
+    "jobtexts",
+    "keymaps",
+    "langinfo",
+    "mailpath",
+    "manpath",
+    "mapfile",
+    "module_path",
+    "modules",
+    "nameddirs",
+    "options",
+    "parameters",
+    "patchars",
+    "path",
+    "pipestatus",
+    "prompt",
+    "psvar",
+    "reswords",
+    "saliases",
+    "signals",
+    "status",
+    "sysparams",
+    "termcap",
+    "terminfo",
+    "userdirs",
+    "usergroups",
+    "watch",
+    "widgets",
+    "zcurses_attrs",
+    "zcurses_colors",
+    "zcurses_keycodes",
+    "zcurses_windows",
+    "zle_bracketed_paste",
+    "zsh_eval_context",
+    "zsh_scheduled_events",
+];
+
 /// Whether assigning `name` requires its **value** to be checked against the
 /// declared roots.
 ///
 /// This used to be the verdict itself: a matching name was a denial. It is now
 /// only the question. A matching name is one that names a location, so *where*
 /// that location is decides whether bx may write it, and [`check`] is what
-/// decides. The three lists above are therefore no longer a deny-list.
+/// decides. The lists above are therefore no longer a deny-list.
 ///
 /// Because a wider list now means more checking rather than more denial, the
 /// list can afford to be wide — but it is still widened only by evidence. A
 /// generic `_DIR` or `_PATH` suffix is deliberately absent: `_PATH` would
-/// capture colon-separated lists such as `LD_LIBRARY_PATH`, which are not
-/// single paths and would be rejected for not being absolute.
+/// capture `LD_LIBRARY_PATH`, `MANPATH` and every other list of directories
+/// that tools *search* rather than write to.
 ///
-/// The check is case-sensitive: environment variable names are, and a tool that
-/// reads `CARGO_HOME` does not read `cargo_home`.
+/// The check is case-sensitive, because environment variable names are and a
+/// tool that reads `CARGO_HOME` does not read `cargo_home` — except for a family
+/// its tool reads without regard to case, `npm_config_*`.
 #[must_use]
 pub fn is_relocating(name: &str) -> bool {
     if ALLOWED_EXCEPTIONS.contains(&name) {
@@ -176,10 +405,15 @@ fn has_location_suffix(name: &str) -> bool {
 
 /// What follows the family prefix `name` begins with, if it begins with one.
 fn family_tail(name: &str) -> Option<&str> {
-    DENIED_PREFIXES
-        .iter()
-        .find_map(|p| name.strip_prefix(p))
-        .filter(|tail| !tail.is_empty())
+    let exact = DENIED_PREFIXES.iter().find_map(|p| name.strip_prefix(p));
+    let caseless = || {
+        CASELESS_PREFIXES.iter().find_map(|p| {
+            name.get(..p.len())
+                .filter(|head| head.eq_ignore_ascii_case(p))
+                .map(|head| &name[head.len()..])
+        })
+    };
+    exact.or_else(caseless).filter(|tail| !tail.is_empty())
 }
 
 /// Whether the variable's **name** says that it holds a location.
@@ -196,6 +430,7 @@ fn names_a_location(name: &str) -> bool {
         return true;
     }
     family_tail(name).is_some_and(|tail| {
+        let tail = tail.to_ascii_uppercase();
         !tail.starts_with("NO_")
             && tail
                 .rsplit('_')
@@ -425,13 +660,13 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// Why a relocating assignment was rejected.
 ///
 /// Each names a different user action — declare a root, fix the declared root,
-/// split the line, write the line in a form the guard reads, move the value out
-/// of bx's own directory, move it inside a declared root, give a location
-/// variable a path, write an absolute path, define the referenced variable
-/// earlier, fix the line that assigned it, shorten it — so a caller that only
-/// knew *which* variable was rejected could not say what to do about it. The
-/// messages name no data: the caller already holds the value and the root set,
-/// and prints them itself.
+/// split the line, write the line in the grammar the guard reads, use a name
+/// the shell does not manage, move the value out of bx's own directory, move it
+/// inside a declared root, give a location variable a path, write an absolute
+/// path, define the referenced variable earlier, fix the line that assigned it,
+/// shorten it — so a caller that only knew *which* variable was rejected could
+/// not say what to do about it. The messages name no data: the caller already
+/// holds the value and the root set, and prints them itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Reason {
     /// Nothing was declared, so nothing may be relocated.
@@ -446,12 +681,17 @@ pub enum Reason {
     /// The line assigns more than one variable.
     #[error("puts more than one assignment on one line")]
     MultipleAssignments,
-    /// Shell the guard does not read, so it cannot approve it: a command
-    /// substitution, an escape, an operator, a parameter expansion other than
-    /// `$NAME` and `${NAME}`, a keyword option it does not know, or a statement
-    /// that is not one of the forms [`scan_with`] reads.
+    /// A line, or a value, that is not in the grammar [`scan_with`] reads —
+    /// any keyword but `export`, any quoting or escaping but one plain quoted
+    /// string, a substitution other than `$NAME` and `${NAME}`, a special
+    /// parameter, an operator, an unclosed quote, a control character.
     #[error("is shell the guard cannot read, so it is not approved")]
     Unreadable,
+    /// It assigns, or refers to, a name the shell manages itself — `HOME`,
+    /// `RANDOM`, zsh's tied `path` — whose value would not read back as
+    /// written.
+    #[error("assigns or refers to a name the shell manages itself")]
+    ReservedName,
     /// It points at a directory bx owns, whatever the roots say.
     #[error("points inside a directory bx owns")]
     BxOwnedDirectory,
@@ -461,14 +701,15 @@ pub enum Reason {
     /// Not a path at all, for a variable whose name says it holds one.
     #[error("is not a path, though the variable's name says it holds a location")]
     NotAPath,
-    /// Empty, relative, or `~user` — it is shaped like a path, but not one
-    /// that can be shown to be inside a root.
+    /// Empty, or relative — it is shaped like a path, but not one that can be
+    /// shown to be inside a root. For a list, one of its entries is.
     #[error("is not an absolute path")]
     NotAbsolute,
     /// It names a variable this fragment has not assigned by this line.
     #[error("refers to a variable this fragment has not assigned")]
     UnresolvedReference,
-    /// It names a variable whose assignment the guard could not read.
+    /// It names a variable whose assignment the guard could not read, or comes
+    /// after a line the guard refused, after which nothing assigned is known.
     #[error("refers to a variable whose assignment the guard could not read")]
     UnreadableReference,
     /// Its expansion grows past [`MAX_EXPANDED_LEN`].
@@ -498,11 +739,11 @@ pub struct Violation {
     /// Empty for a line refused as [`Reason::Unreadable`] before any one
     /// variable could be picked out of it.
     pub name: String,
-    /// The value as written, before quote stripping and expansion, so a
-    /// diagnostic can quote the line back exactly as the user will see it.
+    /// Everything written after `NAME=`, trailing comment included, so a
+    /// diagnostic can quote it back exactly as the user will see it.
     ///
     /// For a line refused before any one variable could be picked out of it,
-    /// the line itself.
+    /// the line itself, without its indentation.
     pub value: String,
     /// Why the assignment was rejected.
     pub reason: Reason,
@@ -510,22 +751,23 @@ pub struct Violation {
 
 /// Whether bx may assign `value` to `name`, given the roots `roots` declares.
 ///
-/// `value` is the value **as a shell would read it** after `name=`: quotes are
-/// its quotes, and a blank outside them ends it. So the value is first read as
-/// one shell word, for every variable — a second word after it is a second
-/// assignment or a command, and is refused however harmless the first. Past
-/// that, a variable that does not relocate anything is allowed without its
-/// value being looked at, so `EDITOR=nvim` and `SCCACHE_CACHE_SIZE=100G` can
-/// never trip a path rule. A relocating variable is allowed exactly when its
-/// value resolves to a path inside a declared root.
+/// `value` is everything written after `NAME=`, and is read by the same value
+/// grammar [`scan_with`] reads a line with — so a value that is not exactly one
+/// value in that grammar, optionally followed by a comment, is refused for
+/// every variable, and a `name` that is not a variable name is refused too.
+/// Past that, a variable that does not relocate anything is allowed without
+/// its value being judged against a root, so `EDITOR=nvim` and
+/// `SCCACHE_CACHE_SIZE=100G` can never trip a path rule. A relocating variable
+/// is allowed exactly when every `:`-separated entry of its value resolves to a
+/// path inside a declared root.
 ///
 /// This is the same function [`scan_with`] calls for every assignment it reads,
-/// so the two cannot disagree about one. No `$VAR` reference resolves here
-/// except `$HOME`: `check` judges one assignment in isolation and has no
+/// so the two cannot disagree about one. No reference resolves here except
+/// `$HOME` and `~`: `check` judges one assignment in isolation and has no
 /// fragment to learn from.
 #[must_use]
 pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
-    match evaluate(name, value, &Assignments::new(), roots).reason {
+    match evaluate(name, value, &Scope::default(), roots).reason {
         None => Verdict::Allowed,
         Some(reason) => Verdict::Violation(Violation {
             line: 0,
@@ -537,113 +779,76 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 }
 
 /// Find every forbidden assignment in a block of shell bx is about to write,
-/// judged against the roots `roots` declares.
+/// judged against the roots `roots` declares. A fragment is approved exactly
+/// when this returns nothing.
 ///
-/// One forward pass. Every assignment the pass reads — exported or not — is
-/// recorded, **expanded**, so a later line may refer to it: the generated
-/// `.zshenv` is written in terms of a declared root variable, and a guard that
-/// could not resolve `$SCRATCH_HOME` would either reject every fragment bx
-/// generates or check nothing at all. A reference to a variable assigned
-/// *later* in the file is unresolved, because a shell would not have it either;
-/// order-dependence here is correctness.
+/// **The grammar.** The content is split at `\n`, and every line must be one
+/// of:
 ///
-/// Nothing is read from the process environment and nothing is read from disk.
-/// `$HOME` comes from `roots`, never from [`std::env`], and the roots are held
-/// in declaration order, so this is a pure function of `(content, roots)` and
-/// two calls on the same arguments return the same violations. That is what
-/// lets `plan` call it without becoming machine-dependent (invariant 3).
+/// * **blank** — spaces and tabs only;
+/// * **a comment** — optional blanks, `#`, then anything without a control
+///   character;
+/// * **an assignment** — optional blanks, optionally `export` and blanks, then
+///   `NAME=VALUE`, optionally followed by blanks and a `#` comment. `NAME` is
+///   `[A-Za-z_][A-Za-z0-9_]*`. `VALUE` is exactly one of:
+///   * nothing;
+///   * `'…'`, one single-quoted string of printable ASCII, taken literally;
+///   * `"…"`, one double-quoted string of printable ASCII other than `\`,
+///     `` ` `` and `!`, in which `$` may only begin a reference;
+///   * a bare word of `A-Z a-z 0-9 _ . / , : @ % + -` and references, which
+///     may begin with `~` alone or `~/`.
 ///
-/// **What is read.** Each line is split into shell words — quotes, `$(…)`,
-/// `${…}` and a `NAME=(…)` array are kept whole, and an unquoted `#` beginning
-/// a word starts a comment. A line is then one of:
+///   A reference is `${NAME}`, or `$NAME` followed by `/` or by the end of the
+///   value's text. zsh reads on past an unbraced name — `$NAME:h` is a
+///   modifier and `$NAME[1]` a subscript — so nothing else may follow one.
 ///
-/// * `NAME=value` or `NAME+=value`;
-/// * a keyword — `export`, `declare`, `typeset`, `readonly`, `local`,
-///   `integer`, `float` — with options drawn from `-x`, `-g`, `-r` and `--`,
-///   followed by one `NAME` or `NAME=value`;
-/// * `setenv NAME value`.
+/// **Everything else is refused**, as [`Reason::Unreadable`] or
+/// [`Reason::MultipleAssignments`], whatever it mentions and whether or not it
+/// relocates anything. That includes every keyword but `export` (`declare`,
+/// `typeset`, `local`, `readonly`, `unset`, `set`, `alias`, `eval`, `source`,
+/// `.`, `for`, `read`, `printf`), `export` itself quoted or escaped, `export`
+/// with no value, a backslash, a quote that does not close on its line, mixed
+/// quoting, command, arithmetic and brace substitution, a `${NAME…}` operator,
+/// a special parameter (`$@ $* $# $? $! $$ $- $0`…), a glob, `;`, `&&`, `|`, a
+/// redirection or heredoc, `+=`, an array or subscript, a `=` or `~` anywhere
+/// but where listed (so zsh's `=cmd` and a `~` after `:` never occur), and any
+/// control character. Because no accepted line can leave a quote, a
+/// continuation or a heredoc open, every accepted line begins where a shell
+/// begins a statement, and a multi-line construct is refused at its first line.
 ///
-/// **What is refused.** A line that mentions one of those keywords anywhere, or
-/// has an assignment where a command would start, and is *not* one of the
-/// forms above — several operands, another option, an operator such as `&&`
-/// or `;`, a keyword after a command such as `builtin export`, a quote that
-/// does not close — is [`Reason::Unreadable`] or
-/// [`Reason::MultipleAssignments`], whatever its names. The guard does not
-/// parse such a line, and it does not approve it either. A refused line teaches
-/// the pass nothing: every name it mentions becomes one a later reference
-/// cannot resolve.
+/// A name the shell manages itself — `HOME`, `RANDOM`, `LINENO`, zsh's `path`
+/// and the rest of `SHELL_NAMES` — may be neither assigned nor referred to, and
+/// is refused as [`Reason::ReservedName`]. `PATH` may.
 ///
-/// **What is out of scope.** A line with no keyword and no assignment in
-/// command position is a command, and assigns nothing the guard judges:
-/// `source`, `eval`, `alias`, `read`, `for`. Content bx merely *copies* from
-/// another tool (a cached `mise activate` block, say) is that tool's business
-/// and is not scanned. A statement continued onto the next line is judged line
-/// by line, which refuses rather than misreads it.
+/// **What is learned.** One forward pass. Every accepted assignment — exported
+/// or not — is recorded, **expanded**, so a later line may refer to it: the
+/// generated `.zshenv` is written in terms of a declared root variable, and a
+/// guard that could not resolve `$SCRATCH_HOME` would either reject every
+/// fragment bx generates or check nothing at all. A reference to a variable
+/// assigned *later* is unresolved, because a shell would not have it either.
+/// `~` and `$HOME` resolve against the root set's home, which a fragment cannot
+/// change because it cannot assign `HOME`. After a refused line nothing is
+/// known — such a line could have assigned or unset anything — so every later
+/// reference is [`Reason::UnreadableReference`].
+///
+/// **Lists.** A relocating value is split at `:`, and every entry must be an
+/// absolute path inside a root and outside bx's own directories: a
+/// `KUBECONFIG` or a `GOPATH` is a list, and a single path with a `:` in it is
+/// judged no less strictly for being split.
+///
+/// **Purity.** Nothing is read from the process environment and nothing is
+/// read from disk. `$HOME` comes from `roots`, never from [`std::env`], and the
+/// roots are held in declaration order, so this is a pure function of
+/// `(content, roots)`. That is what lets `plan` call it without becoming
+/// machine-dependent (invariant 3).
+///
+/// **What is out of scope.** The shell the fragment is sourced into: an alias,
+/// a function or an option the user's own startup files set before bx's
+/// fragment runs is the user's configuration, not bx's output. The grammar is
+/// checked against bash and zsh.
 #[must_use]
 pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
-    let mut found = Vec::new();
-    let mut seen = Assignments::new();
-    for (idx, raw) in content.lines().enumerate() {
-        let line = raw.trim();
-        let violation = |name: &str, value: &str, reason| Violation {
-            line: idx + 1,
-            name: name.to_string(),
-            value: value.to_string(),
-            reason,
-        };
-        match statement(line) {
-            Statement::Nothing => {}
-            Statement::Refused {
-                name,
-                value,
-                reason,
-            } => {
-                found.push(violation(name, value, reason));
-                forget_names_in(line, &mut seen);
-            }
-            Statement::Assign {
-                name,
-                value,
-                append,
-            } => {
-                // `NAME+=value` is `NAME=${NAME}value`: its result starts with
-                // whatever the name held before, which is exactly what a
-                // reference resolves.
-                let written = match value {
-                    Some(value) if append => Some(format!("${{{name}}}{value}")),
-                    Some(value) => Some(value.to_string()),
-                    // A valueless `export NAME` still has to be judged — an
-                    // inherited value is no more a declared root than an empty
-                    // one — and `""` is what it is judged as.
-                    None => None,
-                };
-                let judged = evaluate(name, written.as_deref().unwrap_or(""), &seen, roots);
-                if let Some(reason) = judged.reason {
-                    found.push(violation(name, value.unwrap_or(""), reason));
-                }
-                // Learn the assignment only *after* judging it, as a shell does:
-                // the right-hand side sees the previous value of the name, not
-                // this one. A line that assigned no value teaches nothing:
-                // `export X` marks an inherited value for export and does not
-                // set one. `$HOME` is the one name that may come from outside
-                // the fragment.
-                if written.is_some() {
-                    match judged.resolved {
-                        Ok(resolved) => {
-                            seen.insert(name.to_string(), Ok(resolved));
-                        }
-                        Err(reason) => {
-                            if matches!(reason, Reason::MultipleAssignments | Reason::Unreadable) {
-                                forget_names_in(line, &mut seen);
-                            }
-                            seen.insert(name.to_string(), Err(as_reference(reason)));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    found
+    pass(content, roots).0
 }
 
 /// Find every forbidden assignment in a block of shell bx is about to write.
@@ -656,6 +861,36 @@ pub fn scan(content: &str) -> Vec<Violation> {
     scan_with(content, &RootSet::strict())
 }
 
+/// [`scan_with`]'s one pass: the violations, and what the fragment was learned
+/// to assign.
+fn pass(content: &str, roots: &RootSet) -> (Vec<Violation>, Scope) {
+    let mut found = Vec::new();
+    let mut scope = Scope::default();
+    for (idx, line) in content.split('\n').enumerate() {
+        let violation = |name: &str, value: &str, reason| Violation {
+            line: idx + 1,
+            name: name.to_string(),
+            value: value.to_string(),
+            reason,
+        };
+        match statement(line) {
+            Statement::Nothing => {}
+            Statement::Refused => {
+                found.push(violation("", line.trim_matches(BLANKS), Reason::Unreadable));
+                scope.forget_everything();
+            }
+            Statement::Assign { name, value } => {
+                let judged = evaluate(name, value, &scope, roots);
+                if let Some(reason) = judged.reason {
+                    found.push(violation(name, value, reason));
+                }
+                scope.learn(name, judged);
+            }
+        }
+    }
+    (found, scope)
+}
+
 /// What [`evaluate`] found: the verdict, and what the value expands to.
 struct Judged {
     /// Why the assignment may not be written, or `None` if it may.
@@ -666,20 +901,24 @@ struct Judged {
 }
 
 /// The verdict on `name = value`, for [`check`] and [`scan_with`] alike.
-fn evaluate(name: &str, value: &str, seen: &Assignments, roots: &RootSet) -> Judged {
-    // The shape of the value is read for every variable: a second word is a
-    // second assignment or a command, and a head the name lists do not know
-    // must not carry it past the guard.
-    let word = match value_word(value) {
-        Ok(word) => word,
-        Err(reason) => {
-            return Judged {
-                reason: Some(reason),
-                resolved: Err(reason),
-            };
-        }
+fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
+    let refused = |reason| Judged {
+        reason: Some(reason),
+        resolved: Err(reason),
     };
-    let resolved = resolve(&word, seen, roots.home());
+    // The shape is read for every variable, relocating or not: a line the
+    // grammar does not read may do anything, whatever its first name is.
+    if !is_variable_name(name) {
+        return refused(Reason::Unreadable);
+    }
+    let word = match read_value(value) {
+        Ok(word) => word,
+        Err(reason) => return refused(reason),
+    };
+    if SHELL_NAMES.contains(&name) {
+        return refused(Reason::ReservedName);
+    }
+    let resolved = word.resolve(scope, roots.home());
     let judged = |reason| Judged {
         reason,
         resolved: resolved.clone(),
@@ -688,9 +927,9 @@ fn evaluate(name: &str, value: &str, seen: &Assignments, roots: &RootSet) -> Jud
     if !is_relocating(name) {
         return judged(None);
     }
-    // An empty value is a degenerate path, not a non-path: `export CARGO_HOME`
-    // with nothing after it does relocate the tool, to nowhere.
-    let not_a_path = !word.text.is_empty() && !path_shaped(&word.text);
+    // An empty value is a degenerate path, not a non-path: `CARGO_HOME=` does
+    // relocate the tool, to nowhere.
+    let not_a_path = !word.text.is_empty() && !path_shaped(word.text);
     // A value that is no kind of path, for a variable whose name does not say
     // it holds a location, is a behaviour setting: it relocates nothing, so it
     // needs no root — `MISE_JOBS=8` is allowed with none declared.
@@ -702,34 +941,96 @@ fn evaluate(name: &str, value: &str, seen: &Assignments, roots: &RootSet) -> Jud
     if let Some(reason) = roots.refuses_everything() {
         return judged(Some(reason));
     }
-    if word.opaque {
-        return judged(Some(Reason::Unreadable));
-    }
     if not_a_path {
         return judged(Some(Reason::NotAPath));
     }
-    let path = match &resolved {
-        Ok(resolved) => PathBuf::from(resolved),
-        Err(reason) => return judged(Some(*reason)),
+    let reason = match &resolved {
+        Ok(resolved) => resolved
+            .split(':')
+            .find_map(|entry| refuses_entry(Path::new(entry), roots)),
+        Err(reason) => Some(*reason),
     };
+    judged(reason)
+}
+
+/// Why one resolved path — a value, or one entry of a list — may not be a
+/// relocation target, or `None` if it may.
+fn refuses_entry(path: &Path, roots: &RootSet) -> Option<Reason> {
     if !path.is_absolute() {
-        return judged(Some(Reason::NotAbsolute));
+        return Some(Reason::NotAbsolute);
     }
     // Before the root test, and therefore ahead of any declaration: a root the
     // user declared widens where tools may live, never who owns bx's own state.
-    if roots.owns(&path) {
-        return judged(Some(Reason::BxOwnedDirectory));
+    if roots.owns(path) {
+        return Some(Reason::BxOwnedDirectory);
     }
-    if roots.contains(&path) {
-        judged(None)
+    if roots.contains(path) {
+        None
     } else {
-        judged(Some(Reason::OutsideDeclaredRoots))
+        Some(Reason::OutsideDeclaredRoots)
     }
 }
 
-/// Variable values learned during one pass over a fragment: what each name
-/// expands to, or why the guard cannot know.
-type Assignments = std::collections::HashMap<String, Result<String, Reason>>;
+/// What one pass over a fragment has learned it assigns.
+#[derive(Debug, Default)]
+struct Scope {
+    /// What each accepted assignment expanded to, or why the guard cannot know.
+    learned: HashMap<String, Result<String, Reason>>,
+    /// Whether a refused line has passed. After one nothing is known, because
+    /// the guard did not read what it assigned or unset.
+    lost: bool,
+}
+
+impl Scope {
+    /// What a reference to `name` expands to.
+    ///
+    /// A name the fragment assigned wins, as it would in a shell. `HOME` comes
+    /// from the root set, and is the only value not learned from the fragment —
+    /// which is why a fragment may not assign it.
+    fn lookup(&self, name: &str, home: Option<&Path>) -> Result<String, Reason> {
+        if let Some(known) = self.learned.get(name) {
+            return known.clone();
+        }
+        if self.lost {
+            return Err(Reason::UnreadableReference);
+        }
+        if name == "HOME" {
+            return home
+                .map(|home| home.to_string_lossy().into_owned())
+                .ok_or(Reason::UnresolvedReference);
+        }
+        Err(if SHELL_NAMES.contains(&name) {
+            Reason::ReservedName
+        } else {
+            Reason::UnresolvedReference
+        })
+    }
+
+    /// Learn what an assignment the pass has just judged gave its name.
+    ///
+    /// Only *after* judging it, as a shell does: the right-hand side sees the
+    /// previous value of the name, not this one. A value the grammar refused
+    /// is not a value any shell gives the name, and a line that assigns a
+    /// name the shell manages may change another name with it, so either
+    /// forgets everything.
+    fn learn(&mut self, name: &str, judged: Judged) {
+        match judged.reason {
+            Some(Reason::Unreadable | Reason::MultipleAssignments | Reason::ReservedName) => {
+                self.forget_everything();
+            }
+            _ => {
+                self.learned
+                    .insert(name.to_string(), judged.resolved.map_err(as_reference));
+            }
+        }
+    }
+
+    /// After a line the guard did not read, know nothing.
+    fn forget_everything(&mut self) {
+        self.learned.clear();
+        self.lost = true;
+    }
+}
 
 /// The reason a *reference* to a name reports, given why the name's own value
 /// could not be known.
@@ -740,123 +1041,12 @@ fn as_reference(reason: Reason) -> Reason {
     }
 }
 
-/// Mark every name `line` might assign as one a later reference cannot resolve.
-///
-/// For a line the guard refused to read. It does not know what such a line
-/// assigns, so it forgets rather than guesses: any word that is a variable name,
-/// or begins with one followed by `=` or `+=`, is forgotten.
-fn forget_names_in(line: &str, seen: &mut Assignments) {
-    let separators = |c: char| c.is_whitespace() || ";&|(){}!`\"'".contains(c);
-    for chunk in line.split(separators) {
-        let ident = chunk
-            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .map_or(chunk, |end| &chunk[..end]);
-        let rest = &chunk[ident.len()..];
-        if is_variable_name(ident)
-            && (rest.is_empty() || rest.starts_with('=') || rest.starts_with("+="))
-        {
-            seen.insert(ident.to_string(), Err(Reason::UnreadableReference));
-        }
-    }
-}
-
 /// How long an expansion may grow before it is refused.
 ///
 /// The expander's bound on work. Values are learned expanded, so a line that
 /// doubles a variable — `X=$X$X` — doubles what is stored, and a fragment of a
 /// few dozen such lines would otherwise hold gigabytes.
 const MAX_EXPANDED_LEN: usize = 4096;
-
-/// How deeply `$(`, `${` and quotes may nest inside one word before the line is
-/// refused. The word reader's bound on recursion.
-const MAX_NESTING: usize = 32;
-
-/// Expand `$NAME` and `${NAME}` in `raw` from `seen`, plus `$HOME` from `home`.
-///
-/// The grammar is closed and is the whole of it: `$NAME` and `${NAME}` where
-/// `NAME` is a shell-legal variable name. A `$` followed by anything that
-/// cannot begin a name is literal text. A `${` that does not close on a name —
-/// `${}`, `${X:-y}`, `${X` — is not text to any shell, and is refused as
-/// [`Reason::Unreadable`]. There is no backslash escape, no word splitting and
-/// no second pass: values are learned already expanded, so substituted text is
-/// never expanded again, as a shell never expands it again.
-fn expand(raw: &str, seen: &Assignments, home: Option<&Path>) -> Result<String, Reason> {
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-
-    // This pass's own bound, and the reason it is a `for` rather than a
-    // `while`: every iteration consumes at least the `$` it found, so `rest`
-    // strictly shrinks and there can be no more iterations than the value has
-    // bytes. Without it, a refactor that stopped consuming the `$` would spin
-    // here forever and hang `bx plan`, rather than return a wrong answer a test
-    // can see.
-    for _ in 0..raw.len() {
-        let Some(at) = rest.find('$') else { break };
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 1..];
-
-        let (name, tail) = match after.strip_prefix('{') {
-            Some(braced) => match braced.find('}') {
-                Some(end) if is_variable_name(&braced[..end]) => {
-                    (&braced[..end], &braced[end + 1..])
-                }
-                _ => return Err(Reason::Unreadable),
-            },
-            None => {
-                let end = after
-                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .unwrap_or(after.len());
-                (&after[..end], &after[end..])
-            }
-        };
-
-        if !is_variable_name(name) {
-            out.push('$');
-            rest = after;
-            continue;
-        }
-
-        // A name the fragment assigned wins over `$HOME`, as it would in a
-        // shell; `home` is the fallback, and is the only value not learned from
-        // the fragment itself.
-        match seen.get(name) {
-            Some(Ok(learned)) => out.push_str(learned),
-            Some(Err(reason)) => return Err(*reason),
-            None => match home {
-                Some(home) if name == "HOME" => out.push_str(&home.to_string_lossy()),
-                _ => return Err(Reason::UnresolvedReference),
-            },
-        }
-        if out.len() > MAX_EXPANDED_LEN {
-            return Err(Reason::ExpansionTooLong);
-        }
-        rest = tail;
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
-/// What a value expands to, as a shell would give it to the name.
-fn resolve(word: &Word, seen: &Assignments, home: Option<&Path>) -> Result<String, Reason> {
-    if word.opaque {
-        return Err(Reason::Unreadable);
-    }
-    let expanded = if word.expands {
-        expand(&word.text, seen, home)?
-    } else {
-        word.text.clone()
-    };
-    // A shell expands `~` only where it is written, unquoted, at the start of
-    // the value. `"~/x"`, and a `~` that arrived through a reference, are the
-    // literal character — and a relative path.
-    match home {
-        Some(home) if word.tilde => Ok(paths::render(&expanded, home)
-            .to_string_lossy()
-            .into_owned()),
-        None if word.tilde => Err(Reason::UnresolvedReference),
-        _ => Ok(expanded),
-    }
-}
 
 /// Whether `value` is shaped like a path at all.
 ///
@@ -871,411 +1061,226 @@ fn path_shaped(value: &str) -> bool {
         || (value.contains('/') && !value.contains("://"))
 }
 
-/// One shell word's value, with its quoting removed.
-#[derive(Debug, Clone, Default)]
-struct Word {
-    /// The text with quotes removed; references not yet expanded.
-    text: String,
-    /// Whether `$` references in `text` expand: false for single quotes.
-    expands: bool,
-    /// Whether the word begins with an unquoted `~`, which a shell expands.
-    tilde: bool,
-    /// Whether it holds something this guard does not evaluate: a command
-    /// substitution, a backslash escape, a brace expansion, an array, or
-    /// single quotes mixed with other text.
-    opaque: bool,
-}
+/// The blanks that may indent a line and separate a value from its comment.
+const BLANKS: [char; 2] = [' ', '\t'];
 
-/// Read the value written after `NAME=` as exactly one shell word.
-///
-/// An empty value is the empty word. A value that starts with a blank is an
-/// empty assignment followed by a command, and a value of more than one word is
-/// a second assignment or a command: neither is a value.
-fn value_word(value: &str) -> Result<Word, Reason> {
-    let bytes = value.as_bytes();
-    // The value's own word begins at its first byte, so a `#` there is text,
-    // not a comment, and a `(` there opens an array. A blank there ends it at
-    // once: the value is empty and whatever follows is not part of it.
-    let end = match bytes.first() {
-        None => return Ok(Word::default()),
-        Some(b'(') => closing(bytes, 1, b')', 0),
-        Some(_) => word_end(bytes, 0),
-    }
-    .ok_or(Reason::Unreadable)?;
-    let rest = tokens(&value[end..]).ok_or(Reason::Unreadable)?;
-    if rest.compound {
-        return Err(Reason::Unreadable);
-    }
-    if !rest.words.is_empty() {
-        return Err(
-            if rest.words.iter().any(|w| assigned_name(w.raw).is_some()) {
-                Reason::MultipleAssignments
-            } else {
-                Reason::Unreadable
-            },
-        );
-    }
-    Ok(dequote(&value[..end]))
-}
-
-/// Remove a word's quoting.
-///
-/// Called only on a word [`tokens`] has already read, so every quote closes.
-fn dequote(raw: &str) -> Word {
-    let opaque = Word {
-        opaque: true,
-        ..Word::default()
-    };
-    let mut text = String::with_capacity(raw.len());
-    let (mut single, mut other) = (false, false);
-    let mut rest = raw;
-    while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix('\'') {
-            let end = after.find('\'').unwrap_or(after.len());
-            text.push_str(&after[..end]);
-            single = true;
-            rest = after.get(end + 1..).unwrap_or("");
-        } else if let Some(after) = rest.strip_prefix('"') {
-            let end = after.find('"').unwrap_or(after.len());
-            let inner = &after[..end];
-            if inner.contains(['\\', '`']) || inner.contains("$(") {
-                return opaque;
-            }
-            text.push_str(inner);
-            other = true;
-            rest = after.get(end + 1..).unwrap_or("");
-        } else {
-            let end = rest.find(['\'', '"']).unwrap_or(rest.len());
-            let bare = &rest[..end];
-            // `(` covers `$(…)`, `$((…))` and an array; a `{` that does not
-            // open `${` is brace expansion, which bash applies to an `export`
-            // argument and turns one word into several.
-            let brace_expansion = bare
-                .match_indices('{')
-                .any(|(at, _)| !bare[..at].ends_with('$'));
-            if bare.contains(['\\', '`', '(']) || brace_expansion {
-                return opaque;
-            }
-            text.push_str(bare);
-            other = true;
-            rest = &rest[end..];
-        }
-    }
-    if single && other {
-        // `'$A'/x` expands one part and not the other; a single flag cannot say
-        // which, so the word is not evaluated.
-        return opaque;
-    }
-    Word {
-        text,
-        expands: !single,
-        tilde: raw.starts_with('~'),
-        opaque: false,
-    }
-}
-
-/// Keywords that assign a variable. A line mentioning one anywhere is judged
-/// or refused, never ignored.
-const KEYWORDS: &[&str] = &[
-    "export", "declare", "typeset", "readonly", "local", "integer", "float", "setenv",
-];
-
-/// Reserved words after which the next word still begins a command.
-const RESERVED: &[&str] = &[
-    "!", "{", "if", "then", "elif", "else", "do", "while", "until", "time",
-];
-
-/// What one line of a fragment is, to the guard.
+/// What one line of a fragment is, to the grammar.
 #[derive(Debug, PartialEq, Eq)]
 enum Statement<'a> {
-    /// A command, a comment, or nothing: it assigns nothing the guard judges.
+    /// A blank line or a comment.
     Nothing,
-    /// One assignment: `value` as written, or `None` for `export NAME`.
-    Assign {
-        name: &'a str,
-        value: Option<&'a str>,
-        append: bool,
-    },
-    /// A line refused as a whole.
-    Refused {
-        name: &'a str,
-        value: &'a str,
-        reason: Reason,
-    },
+    /// `NAME=VALUE` or `export NAME=VALUE`: `value` is everything after the
+    /// `=`, still to be read by the value grammar.
+    Assign { name: &'a str, value: &'a str },
+    /// Not a statement the grammar reads.
+    Refused,
 }
 
-/// Read one trimmed line as a [`Statement`].
+/// Read one line of a fragment against the statement grammar.
 fn statement(line: &str) -> Statement<'_> {
-    let Some(tokens) = tokens(line) else {
-        // A quote that never closes, or nesting past the bound. Refused if it
-        // could be an assignment at all.
-        let mentions = line
-            .split(|c: char| c.is_whitespace() || ";&|(){}!".contains(c))
-            .any(|chunk| KEYWORDS.contains(&chunk) || assigned_name(chunk).is_some());
-        return if mentions {
-            Statement::Refused {
-                name: "",
-                value: line,
-                reason: Reason::Unreadable,
-            }
+    let text = line.trim_matches(BLANKS);
+    if text.is_empty() {
+        return Statement::Nothing;
+    }
+    if text.starts_with('#') {
+        return if text.chars().any(is_unprintable) {
+            Statement::Refused
         } else {
             Statement::Nothing
         };
+    }
+    let assignment = match text.strip_prefix("export") {
+        Some(operand) if operand.starts_with(BLANKS) => operand.trim_start_matches(BLANKS),
+        _ => text,
     };
-    let triggered = tokens.words.iter().any(|word| {
-        KEYWORDS.contains(&word.raw) || (word.command && assigned_name(word.raw).is_some())
-    });
-    if !triggered {
-        return Statement::Nothing;
-    }
-    let content = line[..tokens.end].trim_end();
-    let unreadable = Statement::Refused {
-        name: "",
-        value: content,
-        reason: Reason::Unreadable,
-    };
-    if tokens.compound {
-        return unreadable;
-    }
-    let words = &tokens.words;
-    // `triggered` guarantees a word.
-    let first = words[0].raw;
-    let after = |word: &RawWord| content[word.start + word.raw.len()..].trim();
-
-    if first == "setenv" {
-        return match words.get(1) {
-            None => Statement::Nothing,
-            Some(name) if is_variable_name(name.raw) => {
-                let value = after(name);
-                Statement::Assign {
-                    name: name.raw,
-                    value: Some(value),
-                    append: false,
-                }
-            }
-            Some(_) => unreadable,
-        };
-    }
-
-    let mut at = 0;
-    if KEYWORDS.contains(&first) {
-        at = 1;
-        while let Some(word) = words.get(at) {
-            if word.raw == "--" {
-                at += 1;
-                break;
-            }
-            if !word.raw.starts_with(['-', '+']) {
-                break;
-            }
-            // `-x`, `-g` and `-r` change where a value is visible, never what it
-            // is. Every other option — `-n` nameref, `-u` upper-casing, `-a`
-            // array, `+x` — changes what the name means or holds.
-            match word.raw.strip_prefix('-') {
-                Some(flags) if !flags.is_empty() && flags.chars().all(|c| "xgr".contains(c)) => {
-                    at += 1;
-                }
-                _ => return unreadable,
-            }
-        }
-        if at == words.len() {
-            // `export` or `declare -x` alone lists; it assigns nothing.
-            return Statement::Nothing;
-        }
-    }
-
-    let operand = &words[at];
-    if let Some((name, append)) = assigned_name(operand.raw) {
-        let skip = name.len() + if append { 2 } else { 1 };
-        return Statement::Assign {
-            name,
-            value: Some(&content[operand.start + skip..]),
-            append,
-        };
-    }
-    if at > 0 && is_variable_name(operand.raw) {
-        let extra = &words[at + 1..];
-        return match extra.first() {
-            None => Statement::Assign {
-                name: operand.raw,
-                value: None,
-                append: false,
-            },
-            Some(next) => Statement::Refused {
-                name: operand.raw,
-                value: &content[next.start..],
-                reason: if extra
-                    .iter()
-                    .any(|w| is_variable_name(w.raw) || assigned_name(w.raw).is_some())
-                {
-                    Reason::MultipleAssignments
-                } else {
-                    Reason::Unreadable
-                },
-            },
-        };
-    }
-    unreadable
-}
-
-/// The name a word assigns, and whether it appends: `NAME=…` or `NAME+=…`.
-fn assigned_name(word: &str) -> Option<(&str, bool)> {
-    let (head, _) = word.split_once('=')?;
-    match head.strip_suffix('+') {
-        Some(name) if is_variable_name(name) => Some((name, true)),
-        _ if is_variable_name(head) => Some((head, false)),
-        _ => None,
+    match assignment.split_once('=') {
+        Some((name, value)) if is_variable_name(name) => Statement::Assign { name, value },
+        _ => Statement::Refused,
     }
 }
 
-/// One word of a line, as written.
-#[derive(Debug)]
-struct RawWord<'a> {
-    raw: &'a str,
-    /// Byte offset of the word in the text it was read from.
-    start: usize,
-    /// Whether the word is where a command begins.
-    command: bool,
+/// A character no line of a fragment may hold: a control character other
+/// than a tab.
+fn is_unprintable(c: char) -> bool {
+    c.is_control() && c != '\t'
 }
 
-/// A line read into words.
-#[derive(Debug)]
-struct Tokens<'a> {
-    words: Vec<RawWord<'a>>,
-    /// Whether an unquoted operator — `;`, `&`, `|`, `<`, `>`, `(`, `)` — made
-    /// the line more than one simple statement.
-    compound: bool,
-    /// Where the line's content ends: its length, or where a comment starts.
-    end: usize,
+/// A character of printable ASCII, space included.
+fn is_printable(c: char) -> bool {
+    (' '..='~').contains(&c)
 }
 
-/// Split `text` into shell words, or `None` if a quote or a nested
-/// construct does not close.
-///
-/// This finds where words begin and end and nothing more. The special
-/// characters are all ASCII, so byte offsets are always character boundaries.
-fn tokens(text: &str) -> Option<Tokens<'_>> {
-    let bytes = text.as_bytes();
-    let mut words = Vec::new();
-    let mut compound = false;
-    let mut command = true;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b' ' | b'\t' => i += 1,
-            b'#' => {
-                return Some(Tokens {
-                    words,
-                    compound,
-                    end: i,
-                });
-            }
-            b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' => {
-                compound = true;
-                command = true;
-                i += 1;
-            }
-            _ => {
-                let start = i;
-                i = word_end(bytes, i)?;
-                let raw = &text[start..i];
-                words.push(RawWord {
-                    raw,
-                    start,
-                    command,
-                });
-                command = command && RESERVED.contains(&raw);
-            }
-        }
-    }
-    Some(Tokens {
-        words,
-        compound,
-        end: bytes.len(),
-    })
+/// One piece of a value: text as written, or a reference to expand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part<'a> {
+    Text(&'a str),
+    Reference(&'a str),
 }
 
-/// Where the word starting at `i` ends.
-fn word_end(bytes: &[u8], mut i: usize) -> Option<usize> {
-    let start = i;
-    while let Some(&byte) = bytes.get(i) {
-        i = match byte {
-            b' ' | b'\t' | b';' | b'&' | b'|' | b'<' | b'>' | b')' => break,
-            // `NAME=(…)` keeps its parentheses; anywhere else `(` is an
-            // operator and ends the word.
-            b'(' if std::str::from_utf8(&bytes[start..i])
-                .ok()
-                .and_then(|head| head.strip_suffix('='))
-                .is_some_and(is_variable_name) =>
-            {
-                closing(bytes, i + 1, b')', 0)?
-            }
-            b'(' => break,
-            _ => past_quoting(bytes, i, 0)?,
-        };
-    }
-    Some(i)
+/// A value, read by the value grammar.
+#[derive(Debug, PartialEq, Eq)]
+struct Word<'a> {
+    /// The value without its quotes, references not expanded: what
+    /// [`path_shaped`] looks at.
+    text: &'a str,
+    /// Whether the value begins with the unquoted `~` a shell expands.
+    tilde: bool,
+    /// The text, split into literal text and references, in order.
+    parts: Vec<Part<'a>>,
 }
 
-/// Step past the byte at `i`, or past the whole quoted or nested construct it
-/// opens.
-fn past_quoting(bytes: &[u8], i: usize, depth: usize) -> Option<usize> {
-    if depth > MAX_NESTING {
-        return None;
-    }
-    match (bytes[i], bytes.get(i + 1)) {
-        (b'\'', _) => Some(i + 1 + bytes[i + 1..].iter().position(|&b| b == b'\'')? + 1),
-        (b'"', _) => double_quoted(bytes, i + 1, depth + 1),
-        (b'`', _) => {
-            let mut j = i + 1;
-            loop {
-                match bytes.get(j)? {
-                    b'`' => return Some(j + 1),
-                    b'\\' => j += 2,
-                    _ => j += 1,
-                }
-            }
-        }
-        (b'\\', Some(_)) => Some(i + 2),
-        (b'\\', None) => None,
-        (b'$', Some(b'(')) => closing(bytes, i + 2, b')', depth + 1),
-        (b'$', Some(b'{')) => closing(bytes, i + 2, b'}', depth + 1),
-        _ => Some(i + 1),
-    }
-}
-
-/// Where a double-quoted string whose content starts at `i` ends.
-fn double_quoted(bytes: &[u8], mut i: usize, depth: usize) -> Option<usize> {
-    loop {
-        i = match bytes.get(i)? {
-            b'"' => return Some(i + 1),
-            b'\\' => i + 2,
-            b'`' | b'$' => past_quoting(bytes, i, depth)?,
-            _ => i + 1,
-        };
-    }
-}
-
-/// Where a `(…)` or `{…}` whose content starts at `i` ends, counting nested
-/// pairs and stepping over quotes.
-fn closing(bytes: &[u8], mut i: usize, close: u8, depth: usize) -> Option<usize> {
-    let open = if close == b')' { b'(' } else { b'{' };
-    let mut pairs = 1usize;
-    loop {
-        let byte = *bytes.get(i)?;
-        if byte == close {
-            pairs -= 1;
-            if pairs == 0 {
-                return Some(i + 1);
-            }
-            i += 1;
-        } else if byte == open {
-            pairs += 1;
-            i += 1;
+impl Word<'_> {
+    /// What a shell gives the name this value is assigned to.
+    fn resolve(&self, scope: &Scope, home: Option<&Path>) -> Result<String, Reason> {
+        let mut out = if self.tilde {
+            scope.lookup("HOME", home)?
         } else {
-            i = past_quoting(bytes, i, depth)?;
+            String::new()
+        };
+        for part in &self.parts {
+            match part {
+                Part::Text(text) => out.push_str(text),
+                Part::Reference(name) => out.push_str(&scope.lookup(name, home)?),
+            }
+            if out.len() > MAX_EXPANDED_LEN {
+                return Err(Reason::ExpansionTooLong);
+            }
         }
+        Ok(out)
     }
+}
+
+/// Read everything written after `NAME=` as one value, optionally followed by
+/// blanks and a comment.
+fn read_value(value: &str) -> Result<Word<'_>, Reason> {
+    if value.chars().any(is_unprintable) {
+        return Err(Reason::Unreadable);
+    }
+    let (word, rest) = if let Some(inner) = value.strip_prefix('\'') {
+        single_quoted(inner)?
+    } else if let Some(inner) = value.strip_prefix('"') {
+        double_quoted(inner)?
+    } else {
+        bare(value)?
+    };
+    after_value(rest)?;
+    Ok(word)
+}
+
+/// A single-quoted value whose content starts `inner`, and what follows it.
+fn single_quoted(inner: &str) -> Result<(Word<'_>, &str), Reason> {
+    let end = inner.find('\'').ok_or(Reason::Unreadable)?;
+    let text = &inner[..end];
+    if !text.chars().all(is_printable) {
+        return Err(Reason::Unreadable);
+    }
+    let word = Word {
+        text,
+        tilde: false,
+        parts: vec![Part::Text(text)],
+    };
+    Ok((word, &inner[end + 1..]))
+}
+
+/// A double-quoted value whose content starts `inner`, and what follows it.
+fn double_quoted(inner: &str) -> Result<(Word<'_>, &str), Reason> {
+    let end = inner.find('"').ok_or(Reason::Unreadable)?;
+    let text = &inner[..end];
+    let parts = parts(text, |c| is_printable(c) && !"\\`!".contains(c))?;
+    let word = Word {
+        text,
+        tilde: false,
+        parts,
+    };
+    Ok((word, &inner[end + 1..]))
+}
+
+/// An unquoted value, and what follows it.
+fn bare(value: &str) -> Result<(Word<'_>, &str), Reason> {
+    let (text, rest) = value.split_at(value.find(BLANKS).unwrap_or(value.len()));
+    // A shell expands `~` at the start of a value, and zsh and bash expand it
+    // after a `:` as well, so `~` is read only here and only as the home.
+    let (tilde, body) = match text.strip_prefix('~') {
+        None => (false, text),
+        Some(body) if body.is_empty() || body.starts_with('/') => (true, body),
+        Some(_) => return Err(Reason::Unreadable),
+    };
+    let parts = parts(body, |c| {
+        c.is_ascii_alphanumeric() || "_./,:@%+-".contains(c)
+    })?;
+    let word = Word { text, tilde, parts };
+    Ok((word, rest))
+}
+
+/// Split a value's text into literal text and references, refusing a
+/// character `allowed` does not admit.
+///
+/// Every `$` begins a reference, so the text is split at each one: what
+/// precedes the first is literal, and every later piece starts with a name.
+fn parts(text: &str, allowed: impl Fn(char) -> bool) -> Result<Vec<Part<'_>>, Reason> {
+    let mut pieces = text.split('$');
+    let mut parts = vec![literal(pieces.next().unwrap_or_default(), &allowed)?];
+    for piece in pieces {
+        let (name, tail) = reference(piece)?;
+        parts.push(Part::Reference(name));
+        parts.push(literal(tail, &allowed)?);
+    }
+    Ok(parts)
+}
+
+/// Literal text of a value, if every character of it is `allowed`.
+fn literal<'a>(text: &'a str, allowed: &impl Fn(char) -> bool) -> Result<Part<'a>, Reason> {
+    if text.chars().all(allowed) {
+        Ok(Part::Text(text))
+    } else {
+        Err(Reason::Unreadable)
+    }
+}
+
+/// The name a reference whose text follows its `$` refers to, and the text
+/// after it.
+fn reference(piece: &str) -> Result<(&str, &str), Reason> {
+    let (name, tail) = match piece.strip_prefix('{') {
+        Some(braced) => braced.split_once('}').ok_or(Reason::Unreadable)?,
+        None => {
+            let end = piece
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(piece.len());
+            let (name, tail) = piece.split_at(end);
+            // zsh reads on past an unbraced name: `$X:h` takes a modifier and
+            // `$X[1]` a subscript. Only a `/`, or the end, is a safe place to
+            // stop.
+            if !(tail.is_empty() || tail.starts_with('/')) {
+                return Err(Reason::Unreadable);
+            }
+            (name, tail)
+        }
+    };
+    if is_variable_name(name) {
+        Ok((name, tail))
+    } else {
+        Err(Reason::Unreadable)
+    }
+}
+
+/// What may follow a value on its line: nothing, or blanks and a comment.
+fn after_value(rest: &str) -> Result<(), Reason> {
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let after = rest.trim_start_matches(BLANKS);
+    // Text straight after the value, with no blank between, is more of the
+    // same shell word in a form the grammar does not read.
+    if after.len() == rest.len() {
+        return Err(Reason::Unreadable);
+    }
+    if after.is_empty() || after.starts_with('#') {
+        return Ok(());
+    }
+    Err(match after.split_once('=') {
+        Some((head, _)) if is_variable_name(head) => Reason::MultipleAssignments,
+        _ => Reason::Unreadable,
+    })
 }
 
 /// Whether `name` is a shell-legal variable name.
@@ -1285,6 +1290,7 @@ fn is_variable_name(name: &str) -> bool {
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1731,14 +1737,17 @@ mod tests {
     }
 
     #[test]
-    fn another_users_home_is_not_expanded_and_is_not_absolute() {
-        // `~other` is deliberately left alone by `paths::render` — bx does not
-        // resolve another account's home — so it cannot be shown to be inside
-        // any root, and is rejected rather than silently accepted.
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", "~other/cargo", &rooted())),
-            Some(Reason::NotAbsolute)
-        );
+    fn another_users_home_is_refused() {
+        // A shell expands `~other` to that account's home, which bx does not
+        // resolve, so it cannot be shown to be inside any root. `~` is read
+        // only alone or before `/`.
+        for value in ["~other/cargo", "~+/cargo", "~-"] {
+            assert_eq!(
+                reason_of(&check("CARGO_HOME", value, &rooted())),
+                Some(Reason::Unreadable),
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -1891,10 +1900,10 @@ mod tests {
             ("export EDITOR=nvim\n", vec![]),
             ("export SCCACHE_CACHE_SIZE=100G\n", vec![]),
             ("# export CARGO_HOME=/x\n", vec![]),
-            ("source ~/.cargo/env\n", vec![]),
+            ("# source ~/.cargo/env\n", vec![]),
             ("export CARGO_HOME=$HOME/x\n", vec![(1, "CARGO_HOME")]),
             (
-                "setenv GOPATH /x\nsource ~/.cargo/env\n",
+                "export GOPATH=/x\n# source ~/.cargo/env\n",
                 vec![(1, "GOPATH")],
             ),
             // Widened: the name-based guard let this one through unchecked.
@@ -1951,40 +1960,33 @@ mod tests {
     }
 
     #[test]
-    fn a_valueless_export_teaches_the_scan_nothing() {
-        // `export X` marks an inherited value for export; it does not set `X`
-        // to the empty string. Learned as empty, `$X/...` resolved to a path
-        // inside the root and the fragment scanned clean — while on a machine
-        // where `X` is `/tmp` the shell writes a `CARGO_HOME` outside every
-        // root. An absent name is unresolved, which is the safe direction.
+    fn a_valueless_export_is_refused_and_teaches_the_scan_nothing() {
+        // `export X` marks an inherited value for export; it does not set `X`.
+        // Round 2 judged it and learned nothing. Round 3 does not read it at
+        // all — bx has no reason to export a value it did not write — so it is
+        // refused, and a later reference is as unknown as after any refused
+        // line.
         let content = concat!(
             "export X\n",
             "export CARGO_HOME=$X/var/mnt/scratch/example/cargo\n",
         );
-        let found = scan_with(content, &rooted());
         assert_eq!(
-            found
-                .iter()
-                .map(|violation| (violation.line, violation.reason))
-                .collect::<Vec<_>>(),
-            vec![(2, Reason::UnresolvedReference)]
+            reasons(content, &rooted()),
+            vec![(1, Reason::Unreadable), (2, Reason::UnreadableReference)]
         );
-
-        // The valueless form is still judged when the name itself relocates.
         assert_eq!(
-            scan_with("export CARGO_HOME\n", &rooted())
-                .iter()
-                .map(|violation| (violation.line, violation.reason))
-                .collect::<Vec<_>>(),
-            vec![(1, Reason::NotAbsolute)]
+            reasons("export CARGO_HOME\n", &rooted()),
+            vec![(1, Reason::Unreadable)]
         );
-
-        // `setenv NAME value` does assign, and is still learned.
+        // `setenv` is csh, and neither bash nor zsh has it.
         let content = concat!(
             "setenv SCRATCH_HOME /var/mnt/scratch/example\n",
             "export CARGO_HOME=$SCRATCH_HOME/cargo\n",
         );
-        assert_eq!(scan_with(content, &rooted()), vec![]);
+        assert_eq!(
+            reasons(content, &rooted()),
+            vec![(1, Reason::Unreadable), (2, Reason::UnreadableReference)]
+        );
     }
 
     #[test]
@@ -2186,66 +2188,68 @@ mod tests {
         ] {
             assert_eq!(scan_with(content, &rooted()), vec![], "{content}");
         }
-        // Text, not a comment: inside a word, and at the start of a value.
-        assert_eq!(
-            check("CARGO_HOME", "/var/mnt/scratch/example/a#b", &rooted()),
-            Verdict::Allowed
-        );
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", "#/etc", &rooted())),
-            Some(Reason::NotAbsolute)
-        );
-    }
-
-    #[test]
-    fn the_line_reader_holds_its_bounds() {
-        // Lines that assign nothing stay nothing, including ones the reader
-        // cannot split, as long as they mention no assignment.
-        for line in [
-            "export",
-            "declare -x",
-            "setenv",
-            "echo \"it's",
-            "echo `date`",
-            "echo \"$(date \"+%F\")\" ${HOME}",
-        ] {
-            assert_eq!(statement(line), Statement::Nothing, "{line}");
-        }
-        // `setenv` assigns what follows its name, and nothing to a non-name.
-        assert_eq!(
-            statement("setenv GOPATH /x"),
-            Statement::Assign {
-                name: "GOPATH",
-                value: Some("/x"),
-                append: false,
-            }
-        );
-        assert_eq!(
-            statement("setenv 2bad /x"),
-            Statement::Refused {
-                name: "",
-                value: "setenv 2bad /x",
-                reason: Reason::Unreadable,
-            }
-        );
-        // Every construct that must close, and does not, is unreadable.
-        for value in ["`pwd", "\"`pwd\\`\"", "/x\\", "$(pwd", "\"$(pwd)", "(a b"] {
+        // A `#` that does not follow a blank is not a comment to a shell, and
+        // not a character the bare-word grammar admits: refused. Quoted, it is
+        // text.
+        for value in ["/var/mnt/scratch/example/a#b", "#/etc", "\"/x\"#c"] {
             assert_eq!(
                 reason_of(&check("CARGO_HOME", value, &rooted())),
                 Some(Reason::Unreadable),
                 "{value}"
             );
         }
-        // Nesting is bounded: past it, a line is refused rather than recursed
-        // into without end.
-        let deep = format!(
-            "export GPG_TTY={}{}",
-            "$(".repeat(MAX_NESTING + 2),
-            ")".repeat(MAX_NESTING + 2)
+        assert_eq!(
+            check("CARGO_HOME", "\"/var/mnt/scratch/example/a#b\"", &rooted()),
+            Verdict::Allowed
         );
-        assert_eq!(reasons(&deep, &rooted()), vec![(1, Reason::Unreadable)]);
-        let shallow = format!("export GPG_TTY={}{}", "$(".repeat(4), ")".repeat(4));
-        assert_eq!(scan_with(&shallow, &rooted()), vec![]);
+    }
+
+    #[test]
+    fn the_statement_grammar_reads_only_its_own_statements() {
+        for line in [
+            "",
+            "   ",
+            "\t",
+            "#",
+            "# export CARGO_HOME=/x",
+            "  \t# note — with prose",
+        ] {
+            assert_eq!(statement(line), Statement::Nothing, "{line:?}");
+        }
+        for (line, name, value) in [
+            ("CARGO_HOME=/x", "CARGO_HOME", "/x"),
+            ("export CARGO_HOME=/x", "CARGO_HOME", "/x"),
+            ("  export\t CARGO_HOME=/x # c ", "CARGO_HOME", "/x # c"),
+            ("export=/x", "export", "/x"),
+            ("exportX=", "exportX", ""),
+            ("X=a=b", "X", "a=b"),
+        ] {
+            assert_eq!(
+                statement(line),
+                Statement::Assign { name, value },
+                "{line:?}"
+            );
+        }
+        for line in [
+            "export",
+            "export CARGO_HOME",
+            "export  ",
+            "export\u{b}CARGO_HOME=/x",
+            "\\export CARGO_HOME=/x",
+            "\"export\" CARGO_HOME=/x",
+            "e''xport CARGO_HOME=/x",
+            "declare -x CARGO_HOME=/x",
+            "export -- CARGO_HOME=/x",
+            "CARGO_HOME+=/x",
+            "CARGO_HOME[1]=/x",
+            "2bad=x",
+            "=x",
+            "# comment\r",
+            "# bell \u{7}",
+            "\u{c}",
+        ] {
+            assert_eq!(statement(line), Statement::Refused, "{line:?}");
+        }
     }
 
     #[test]
@@ -2324,32 +2328,20 @@ mod tests {
                 "{value}"
             );
         }
-        // Matched quotes around part of a value are removed, as a shell
-        // removes them, so a quoted `..` still climbs.
-        assert_eq!(
-            reason_of(&check(
-                "CARGO_HOME",
-                "/var/mnt/scratch/example/\"..\"/'..'/etc",
-                &rooted()
-            )),
-            Some(Reason::Unreadable),
-        );
-        assert_eq!(
-            reason_of(&check(
-                "CARGO_HOME",
-                "/var/mnt/scratch/example/\"..\"/\"..\"/etc",
-                &rooted()
-            )),
-            Some(Reason::OutsideDeclaredRoots),
-        );
-        assert_eq!(
-            check(
-                "CARGO_HOME",
-                "\"/var/mnt/scratch/example\"/cargo",
-                &rooted()
-            ),
-            Verdict::Allowed
-        );
+        // Quotes around part of a value are mixed quoting, which the grammar
+        // does not read, even where a shell would make one path of it. A value
+        // is one quoted string or one bare word.
+        for value in [
+            "/var/mnt/scratch/example/\"..\"/'..'/etc",
+            "/var/mnt/scratch/example/\"..\"/\"..\"/etc",
+            "\"/var/mnt/scratch/example\"/cargo",
+        ] {
+            assert_eq!(
+                reason_of(&check("CARGO_HOME", value, &rooted())),
+                Some(Reason::Unreadable),
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -2363,35 +2355,30 @@ mod tests {
     }
 
     #[test]
-    fn a_dollar_that_begins_no_reference_is_literal_text() {
+    fn a_dollar_that_begins_no_reference_is_refused() {
         // The expansion grammar is closed: `$NAME` and `${NAME}`, nothing else.
-        // A `$` that cannot begin a name is text, and text that is not an
-        // absolute path is rejected for being one, not for being unresolvable.
-        for value in ["$", "$1/x"] {
-            assert_eq!(
-                reason_of(&check("CARGO_HOME", value, &rooted())),
-                Some(Reason::NotAbsolute),
-                "{value}"
-            );
-        }
-        // And a literal `$` inside an otherwise-contained path is kept. `$1b`
-        // is not a reference — a name may not begin with a digit — so it stays
-        // as written rather than resolving or failing to.
-        assert_eq!(
-            check("CARGO_HOME", "/var/mnt/scratch/example/a$1b", &rooted()),
-            Verdict::Allowed
-        );
-        // A `${` that does not close on a name is not text to any shell: an
-        // unclosed one is a syntax error, `${}` a bad substitution, and
-        // `${A:+..}` an operator the guard does not evaluate — with `A` set it
-        // is `..`, which climbs out of the root. None of them may be approved
-        // even when the path around it is squarely inside a root.
+        // A `$` that begins neither is a special parameter or an operator that
+        // a shell expands — `$@` and `$1` to nothing, which let
+        // `<root>/$@/$@/../..` climb out of the root while round 2 read the
+        // `$@` as literal components — so it is refused wherever it sits.
         for value in [
+            "$",
+            "$1/x",
+            "/var/mnt/scratch/example/a$1b",
+            "/var/mnt/scratch/example/$@/$@/../../etc",
+            "/var/mnt/scratch/example/$*",
+            "/var/mnt/scratch/example/$#",
+            "/var/mnt/scratch/example/$?",
+            "/var/mnt/scratch/example/$!",
+            "/var/mnt/scratch/example/$$",
+            "/var/mnt/scratch/example/$-",
+            "/var/mnt/scratch/example/$0",
             "${/x",
             "/var/mnt/scratch/example/${FOO",
             "${FOO",
             "${}/x",
             "/var/mnt/scratch/example/${}",
+            "/var/mnt/scratch/example/${1}",
             "/var/mnt/scratch/example/${HOME:+..}",
             "/var/mnt/scratch/example/${HOME#/}",
         ] {
@@ -2690,10 +2677,23 @@ mod tests {
     }
 
     #[test]
-    fn scan_recognises_every_assignment_form() {
+    fn scan_judges_its_two_assignment_forms_and_refuses_every_other() {
         for line in [
             "export CARGO_HOME=/x",
             "CARGO_HOME=/x",
+            "  export CARGO_HOME=/x",
+            "\texport\tCARGO_HOME=/x # note",
+        ] {
+            assert_eq!(
+                scan(line)
+                    .iter()
+                    .map(|violation| (violation.name.as_str(), violation.reason))
+                    .collect::<Vec<_>>(),
+                vec![("CARGO_HOME", Reason::NoRootsDeclared)],
+                "should have judged: {line}"
+            );
+        }
+        for line in [
             "typeset -x CARGO_HOME=/x",
             "declare -x CARGO_HOME=/x",
             "setenv CARGO_HOME /x",
@@ -2705,12 +2705,14 @@ mod tests {
             "export CARGO_HOME+=/x",
         ] {
             assert_eq!(
-                scan(line)
-                    .iter()
-                    .map(|violation| (violation.name.as_str(), violation.reason))
-                    .collect::<Vec<_>>(),
-                vec![("CARGO_HOME", Reason::NoRootsDeclared)],
-                "should have judged: {line}"
+                scan(line),
+                vec![Violation {
+                    line: 1,
+                    name: String::new(),
+                    value: line.into(),
+                    reason: Reason::Unreadable,
+                }],
+                "should have refused: {line}"
             );
         }
     }
@@ -2721,8 +2723,22 @@ mod tests {
     }
 
     #[test]
-    fn scan_ignores_lines_that_assign_nothing() {
-        assert!(scan("source ~/.cargo/env\n\n[[ -r $f ]] && source $f\n2bad=x\n=x").is_empty());
+    fn scan_refuses_a_line_that_is_not_a_statement_it_reads() {
+        // Round 2 let a command through as assigning nothing. Round 3 does not
+        // decide what a command assigns: a line that is not blank, a comment or
+        // an assignment in the grammar is refused.
+        assert_eq!(
+            reasons(
+                "source ~/.cargo/env\n\n[[ -r $f ]] && source $f\n2bad=x\n=x",
+                &RootSet::strict()
+            ),
+            vec![
+                (1, Reason::Unreadable),
+                (3, Reason::Unreadable),
+                (4, Reason::Unreadable),
+                (5, Reason::Unreadable),
+            ]
+        );
     }
 
     // Review round 2: the guard fails closed on shell it cannot read, reads
@@ -2737,10 +2753,11 @@ mod tests {
     }
 
     #[test]
-    fn a_keyword_line_is_judged_whatever_options_precede_the_assignment() {
-        // Each of these sets `CARGO_HOME=/etc/evil` in bash and zsh, and each
-        // was approved: the text before the first `=` was not one bare name,
-        // so the line was read as assigning nothing.
+    fn a_keyword_other_than_export_is_refused_whatever_it_assigns() {
+        // Each of these sets `CARGO_HOME=/etc/evil` in bash or zsh. Round 2
+        // read the keyword and judged the operand; round 3 reads no keyword but
+        // `export`, so each is refused before its operand is looked at — and
+        // so would be the next spelling of a keyword round 2 did not know.
         for line in [
             "declare -gx CARGO_HOME=/etc/evil",
             "typeset -gx CARGO_HOME=/etc/evil",
@@ -2753,15 +2770,15 @@ mod tests {
                 scan(line),
                 vec![Violation {
                     line: 1,
-                    name: "CARGO_HOME".into(),
-                    value: "/etc/evil".into(),
-                    reason: Reason::NoRootsDeclared,
+                    name: String::new(),
+                    value: line.into(),
+                    reason: Reason::Unreadable,
                 }],
                 "{line}"
             );
             assert_eq!(
                 reasons(line, &rooted()),
-                vec![(1, Reason::OutsideDeclaredRoots)],
+                vec![(1, Reason::Unreadable)],
                 "{line}"
             );
         }
@@ -2769,12 +2786,10 @@ mod tests {
 
     #[test]
     fn a_line_the_guard_cannot_read_is_never_approved() {
-        // Several operands: refused as a second assignment, and not learned.
+        // A second assignment after a value: refused as one, and not learned.
         for line in [
-            "export FOO CARGO_HOME=/etc/evil",
-            "export A B CARGO_HOME=/etc/evil",
             "export FOO=1 CARGO_HOME=/etc/evil",
-            "export PATH CARGO_HOME=/var/mnt/scratch/example/cargo",
+            "FOO=1 CARGO_HOME=/etc/evil",
         ] {
             assert_eq!(
                 reasons(line, &RootSet::strict()),
@@ -2785,6 +2800,9 @@ mod tests {
         // Anything else that mentions a keyword, or assigns where a command
         // starts, and is not a form the guard reads.
         for line in [
+            "export FOO CARGO_HOME=/etc/evil",
+            "export A B CARGO_HOME=/etc/evil",
+            "export PATH CARGO_HOME=/var/mnt/scratch/example/cargo",
             "true && export CARGO_HOME=/etc/evil",
             "[ -d /x ] && CARGO_HOME=/etc/evil",
             "builtin export CARGO_HOME=/etc/evil",
@@ -2804,13 +2822,13 @@ mod tests {
             );
         }
         // A line refused before a variable can be picked out of it quotes
-        // itself back, comment excluded.
+        // itself back whole, without its indentation.
         assert_eq!(
-            scan("true && export CARGO_HOME=/etc/evil # note"),
+            scan("  true && export CARGO_HOME=/etc/evil # note"),
             vec![Violation {
                 line: 1,
                 name: String::new(),
-                value: "true && export CARGO_HOME=/etc/evil".into(),
+                value: "true && export CARGO_HOME=/etc/evil # note".into(),
                 reason: Reason::Unreadable,
             }]
         );
@@ -2825,37 +2843,47 @@ mod tests {
             reasons(&format!("export XDG_STATE_HOME={state}"), &wide),
             vec![(1, Reason::BxOwnedDirectory)]
         );
+        for line in [
+            format!("declare -gx XDG_STATE_HOME={state}"),
+            format!("export FOO XDG_STATE_HOME={state}"),
+        ] {
+            assert_eq!(
+                reasons(&line, &wide),
+                vec![(1, Reason::Unreadable)],
+                "{line}"
+            );
+        }
         assert_eq!(
-            reasons(&format!("declare -gx XDG_STATE_HOME={state}"), &wide),
-            vec![(1, Reason::BxOwnedDirectory)]
-        );
-        assert_eq!(
-            reasons(&format!("export FOO XDG_STATE_HOME={state}"), &wide),
+            reasons(&format!("export FOO=1 XDG_STATE_HOME={state}"), &wide),
             vec![(1, Reason::MultipleAssignments)]
         );
     }
 
     #[test]
-    fn a_value_the_guard_does_not_evaluate_is_refused_for_a_relocating_name_only() {
+    fn a_value_or_a_line_the_guard_does_not_read_is_refused_whatever_the_name() {
         // A command substitution, an escape, a brace expansion, an array and
-        // mixed quoting are shell the guard does not run. For a variable that
-        // relocates nothing that costs nothing; for one that does, it is a
-        // value that cannot be shown to be inside a root.
-        for value in [
-            "$(pwd)/cargo",
-            "\"$(pwd)/cargo\"",
-            "`pwd`/cargo",
-            "/var/mnt/scratch/example/\\../cargo",
-            "/var/mnt/scratch/example/{..,x}",
-            "(/var/mnt/scratch/example)",
-            "'/var/mnt/scratch/example'/$X",
-        ] {
-            assert_eq!(
-                reason_of(&check("CARGO_HOME", value, &rooted())),
-                Some(Reason::Unreadable),
-                "{value}"
-            );
+        // mixed quoting are shell the guard does not run. Round 2 refused them
+        // for a relocating variable only; round 3 refuses them for every one,
+        // because a line the grammar does not read may do anything whatever
+        // its first name is.
+        for name in ["CARGO_HOME", "EDITOR"] {
+            for value in [
+                "$(pwd)/cargo",
+                "\"$(pwd)/cargo\"",
+                "`pwd`/cargo",
+                "/var/mnt/scratch/example/\\../cargo",
+                "/var/mnt/scratch/example/{..,x}",
+                "(/var/mnt/scratch/example)",
+                "'/var/mnt/scratch/example'/$X",
+            ] {
+                assert_eq!(
+                    reason_of(&check(name, value, &rooted())),
+                    Some(Reason::Unreadable),
+                    "{name}={value}"
+                );
+            }
         }
+        // Ordinary rc content that round 2 let through as assigning nothing.
         for line in [
             "export GPG_TTY=$(tty)",
             "export GIT_TOP=\"$(git rev-parse --show-toplevel)\"",
@@ -2865,13 +2893,17 @@ mod tests {
             "eval \"$(mise activate zsh)\"",
             "make V=1",
         ] {
-            assert_eq!(scan_with(line, &rooted()), vec![], "{line}");
+            assert_eq!(
+                reasons(line, &rooted()),
+                vec![(1, Reason::Unreadable)],
+                "{line}"
+            );
         }
-        // And what it could not evaluate, it does not learn.
+        // And what it could not read, it does not learn.
         let content = "X=$(pwd)\nexport CARGO_HOME=$X/cargo\n";
         assert_eq!(
             reasons(content, &rooted()),
-            vec![(2, Reason::UnreadableReference)]
+            vec![(1, Reason::Unreadable), (2, Reason::UnreadableReference)]
         );
     }
 
@@ -3064,5 +3096,899 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].line, 1);
         assert_eq!(found[1].line, 3);
+    }
+
+    // Round-3 reproductions, written against the round-2 API only.
+
+    /// Every case the guard approves; a reproduction fails listing all of them.
+    fn r3_approved_cases(cases: &[(&str, RootSet)]) -> Vec<String> {
+        cases
+            .iter()
+            .filter(|(content, roots)| scan_with(content, roots).is_empty())
+            .map(|(content, _)| content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn r3_1_quoted_escaped_and_aliased_keywords() {
+        let mut cases = Vec::new();
+        for content in [
+            "\\export CARGO_HOME=/etc/evil",
+            "\"export\" CARGO_HOME=/etc/evil",
+            "e''xport CARGO_HOME=/etc/evil",
+            "alias ex=export\nex CARGO_HOME=/etc/evil",
+        ] {
+            cases.push((content, rooted()));
+            cases.push((content, RootSet::strict()));
+        }
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r3_2_multi_line_constructs() {
+        let cases = [
+            ": '\n'; export CARGO_HOME=/etc/evil #'",
+            "ex\\\nport CARGO_HOME=/etc/evil",
+            "export CARGO_HOME=/var/mnt/scratch/example/cargo\nCARGO_\\\nHOME=/etc/evil",
+        ]
+        .map(|content| (content, rooted()));
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r3_3_assigning_commands_and_stale_values() {
+        let cases = [
+            "for CARGO_HOME in /etc/evil; do :; done",
+            "read -r CARGO_HOME <<< /etc/evil",
+            "printf -v CARGO_HOME /etc/evil",
+            "CARGO_HOME[1,-1]=/etc/evil",
+            ": ${CARGO_HOME::=/etc/evil}",
+            "set -a\n: ${CARGO_HOME:=/etc/evil}",
+            "R=/var/mnt/scratch/example\nunset R\nexport CARGO_HOME=$R/etc/evil",
+        ]
+        .map(|content| (content, rooted()));
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r3_4_special_parameters_and_a_fragment_assigned_home() {
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let cases = [
+            (
+                "CARGO_HOME=/var/mnt/scratch/example/$@/$@/$@/$@/../../../../etc/evil",
+                rooted(),
+            ),
+            ("XDG_STATE_HOME=~/.local/state/b$@x", home_rooted.clone()),
+            ("HOME=/etc/evil\nCARGO_HOME=~/cargo", home_rooted),
+        ];
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r3_5_eval_and_source_with_a_literal_payload() {
+        let cases = [
+            "eval \"export CARGO_HOME=/etc/evil\"",
+            "source /dev/stdin <<< 'export CARGO_HOME=/etc/evil'",
+        ]
+        .map(|content| (content, rooted()));
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r3_6_missing_relocating_names() {
+        let approved: Vec<&str> = [
+            "HOME",
+            "npm_config_cache",
+            "ZDOTDIR",
+            "YARN_CACHE_FOLDER",
+            "CCACHE_DIR",
+            "STARSHIP_CONFIG",
+            "PYTHONUSERBASE",
+            "TMPDIR",
+        ]
+        .into_iter()
+        .filter(|name| check(name, "/etc/evil", &rooted()) == Verdict::Allowed)
+        .collect();
+        assert_eq!(approved, Vec::<&str>::new());
+    }
+
+    #[test]
+    fn r3_7_colon_lists() {
+        let cases = [
+            "KUBECONFIG=/var/mnt/scratch/example/k:/etc/evil/config",
+            "GOPATH=/var/mnt/scratch/example/go:/etc/evil",
+        ]
+        .map(|content| (content, rooted()));
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r3_8_location_words_and_zsh_equals_expansion() {
+        let cases = [
+            "MISE_SHARED_INSTALL_DIRS=evil",
+            "MISE_TRUSTED_CONFIG_PATHS=evil",
+            "UV_PROJECT=evil",
+            "MISE_DEFAULT_CONFIG_FILENAME=evil.toml",
+            "UV_PROJECT==ls",
+        ]
+        .map(|content| (content, rooted()));
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    // Review round 3: the guard fails closed by shape.
+
+    #[test]
+    fn the_value_grammar_reads_its_three_forms_and_nothing_else() {
+        // Judged for a variable that relocates nothing, so the verdict is the
+        // grammar's alone — and `check` and `scan_with` must give the same one.
+        let accepted = [
+            "",
+            "''",
+            "\"\"",
+            "nvim",
+            "/a_b.c,d:e@f%g+h-i",
+            "'$X `x` \\ \"q\" ! ~ = # {a,b} *'",
+            "\"a b=c{d}[e]*f?g#h~i'j %^&;|<>()\"",
+            "\"-j8 V=1\"",
+            "~",
+            "~/x",
+            "$HOME",
+            "${HOME}",
+            "$HOME/x",
+            "${HOME}x",
+            "${HOME}:h",
+            "$HOME$HOME",
+            "\"$HOME\"",
+            "\"${HOME}[1]\"",
+            "\"$HOME/a:$HOME\"",
+            "/x # a comment",
+            "/x\t# a comment",
+            "\"/x\" # a comment",
+        ];
+        for value in accepted {
+            assert_eq!(
+                check("EDITOR", value, &rooted()),
+                Verdict::Allowed,
+                "{value:?}"
+            );
+            assert_eq!(
+                scan_with(&format!("export EDITOR={value}"), &rooted()),
+                vec![],
+                "{value:?}"
+            );
+        }
+        let unreadable = [
+            // zsh modifiers and subscripts after an unbraced name.
+            "$HOME:h",
+            "\"$HOME:h\"",
+            "$HOME[1]",
+            "\"$HOME[1]\"",
+            "$HOME.y",
+            "$HOME-y",
+            // zsh `=cmd`, and `~` or `=` after a `:`.
+            "=ls",
+            "a:=ls",
+            "/a:~/b",
+            "~other",
+            "a~",
+            // Escapes, and quoting that is not one plain string.
+            "\\/x",
+            "\"a\\\"b\"",
+            "'a'b",
+            "'a''b'",
+            "\"a\"'b'",
+            "a\"b\"",
+            "'a",
+            "\"a",
+            "a'",
+            "$'x'",
+            "$\"x\"",
+            // Substitutions and expansions.
+            "`x`",
+            "\"`x`\"",
+            "$(x)",
+            "\"$(x)\"",
+            "$((1))",
+            "${X:-y}",
+            "${#X}",
+            "${X",
+            "{a,b}",
+            // Globs, operators, history.
+            "*",
+            "?",
+            "[a]",
+            "a;b",
+            "a&b",
+            "a|b",
+            "a>b",
+            "a<b",
+            "(a)",
+            "!x",
+            "\"!x\"",
+            "^x",
+            "#x",
+            "x#y",
+            // A second word that is not an assignment.
+            "/x cmd",
+            "/x \\",
+            // Characters outside printable ASCII, and control characters.
+            "é",
+            "\"é\"",
+            "'é'",
+            "\"a\tb\"",
+            "'a\tb'",
+            "/x\u{7}",
+            "/x # \u{7}",
+            "/x\r",
+        ];
+        for value in unreadable {
+            assert_eq!(
+                reason_of(&check("EDITOR", value, &rooted())),
+                Some(Reason::Unreadable),
+                "{value:?}"
+            );
+            assert_eq!(
+                reasons(&format!("export EDITOR={value}"), &rooted()),
+                vec![(1, Reason::Unreadable)],
+                "{value:?}"
+            );
+        }
+        for value in ["/x A=1", "/x\tA=1", "'/x' A=1"] {
+            assert_eq!(
+                reason_of(&check("EDITOR", value, &rooted())),
+                Some(Reason::MultipleAssignments),
+                "{value:?}"
+            );
+        }
+        // A name `check` is handed that no shell could assign.
+        for name in ["", "2bad", "A-B", "A B", "É"] {
+            assert_eq!(
+                reason_of(&check(name, "/x", &rooted())),
+                Some(Reason::Unreadable),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_the_shell_manages_may_be_neither_assigned_nor_referred_to() {
+        for name in [
+            "HOME", "RANDOM", "SECONDS", "LINENO", "path", "fpath", "USERNAME", "UID", "_",
+            "FUNCNAME", "ERRNO",
+        ] {
+            assert_eq!(
+                reason_of(&check(name, ROOT, &rooted())),
+                Some(Reason::ReservedName),
+                "{name}"
+            );
+            assert_eq!(
+                reasons(&format!("export {name}={ROOT}\n"), &RootSet::strict()),
+                vec![(1, Reason::ReservedName)],
+                "{name}"
+            );
+        }
+        // `RANDOM` reads back as a number, whatever it was given.
+        assert_eq!(
+            reasons(
+                &format!("RANDOM={ROOT}\nexport CARGO_HOME=$RANDOM/cargo\n"),
+                &rooted()
+            ),
+            vec![(1, Reason::ReservedName), (2, Reason::UnreadableReference)]
+        );
+        assert_eq!(
+            reasons(
+                "export CARGO_HOME=/var/mnt/scratch/example/$LINENO\n",
+                &rooted()
+            ),
+            vec![(1, Reason::ReservedName)]
+        );
+        // The review's case: a fragment that moves `HOME` no longer moves `~`.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        assert_eq!(
+            reasons("HOME=/etc/evil\nCARGO_HOME=~/cargo\n", &home_rooted),
+            vec![(1, Reason::ReservedName), (2, Reason::UnreadableReference)]
+        );
+        // `PATH` reads back as written, so it may be assigned and extended.
+        assert!(!SHELL_NAMES.contains(&"PATH"));
+        assert_eq!(
+            scan_with("export PATH=\"$HOME/.local/bin:$PATH\"\n", &rooted()),
+            vec![]
+        );
+        // Without a home, `$HOME` is unresolved rather than reserved.
+        assert_eq!(
+            reason_of(&check("GPG_TTY", "$HOME", &RootSet::strict())),
+            None
+        );
+        let mut scope = Scope::default();
+        assert_eq!(scope.lookup("HOME", None), Err(Reason::UnresolvedReference));
+        assert_eq!(scope.lookup("RANDOM", None), Err(Reason::ReservedName));
+        assert_eq!(
+            scope.lookup("SCRATCH", None),
+            Err(Reason::UnresolvedReference)
+        );
+        scope.forget_everything();
+        assert_eq!(
+            scope.lookup("HOME", Some(Path::new(HOME))),
+            Err(Reason::UnreadableReference)
+        );
+    }
+
+    #[test]
+    fn every_entry_of_a_list_is_judged() {
+        use Reason::{BxOwnedDirectory, NotAbsolute, OutsideDeclaredRoots};
+        for (value, reason) in [
+            (
+                "/var/mnt/scratch/example/k:/var/mnt/scratch/example/l",
+                None,
+            ),
+            (
+                "/var/mnt/scratch/example/k:/etc/evil/config",
+                Some(OutsideDeclaredRoots),
+            ),
+            (
+                "/etc/evil:/var/mnt/scratch/example/k",
+                Some(OutsideDeclaredRoots),
+            ),
+            ("/var/mnt/scratch/example/k:", Some(NotAbsolute)),
+            (":/var/mnt/scratch/example/k", Some(NotAbsolute)),
+            ("/var/mnt/scratch/example/k:relative", Some(NotAbsolute)),
+            (
+                "/var/mnt/scratch/example/k:/var/home/example/.local/state/bx",
+                Some(BxOwnedDirectory),
+            ),
+        ] {
+            for name in ["KUBECONFIG", "GOPATH", "CARGO_HOME"] {
+                assert_eq!(
+                    reason_of(&check(name, value, &rooted())),
+                    reason,
+                    "{name}={value}"
+                );
+            }
+        }
+        // Entries arriving through references are split the same way. The
+        // references are braced: zsh reads `$A:$B` as `$A` with a modifier.
+        let content = concat!(
+            "A=/var/mnt/scratch/example/go\n",
+            "B=/etc/evil\n",
+            "export GOPATH=\"${A}:${B}\"\n",
+            "export GOPATH=\"$A:$B\"\n",
+        );
+        assert_eq!(
+            reasons(content, &rooted()),
+            vec![(3, OutsideDeclaredRoots), (4, Reason::Unreadable)]
+        );
+    }
+
+    #[test]
+    fn npm_config_is_judged_whatever_its_case() {
+        for name in [
+            "npm_config_cache",
+            "Npm_Config_Prefix",
+            "npm_CONFIG_userconfig",
+        ] {
+            assert!(is_relocating(name), "{name}");
+            assert!(names_a_location(name), "{name}");
+            assert_eq!(
+                reason_of(&check(name, "/etc/evil", &rooted())),
+                Some(Reason::OutsideDeclaredRoots),
+                "{name}"
+            );
+            assert_eq!(
+                reason_of(&check(name, ".npm", &rooted())),
+                Some(Reason::NotAPath),
+                "{name}"
+            );
+            assert_eq!(
+                check(name, "/var/mnt/scratch/example/npm", &rooted()),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        // A behaviour setting stays one in lower case.
+        assert!(!names_a_location("npm_config_registry"));
+        assert_eq!(
+            check(
+                "npm_config_registry",
+                "https://registry.example.invalid",
+                &RootSet::strict()
+            ),
+            Verdict::Allowed
+        );
+        assert!(!is_relocating("npm_config_"));
+        assert!(!is_relocating("npm_confi"));
+        // Only npm reads its family that way.
+        assert!(!is_relocating("uv_cache_dir"));
+        assert!(!is_relocating("mise_data_dir"));
+    }
+
+    #[test]
+    fn the_names_and_location_words_the_review_found_missing_are_judged() {
+        for name in [
+            "ZDOTDIR",
+            "YARN_CACHE_FOLDER",
+            "CCACHE_DIR",
+            "STARSHIP_CONFIG",
+            "PYTHONUSERBASE",
+            "TMPDIR",
+        ] {
+            assert!(is_relocating(name), "{name}");
+            assert_eq!(
+                reason_of(&check(name, "/etc/evil", &rooted())),
+                Some(Reason::OutsideDeclaredRoots),
+                "{name}"
+            );
+            assert_eq!(
+                check(name, "/var/mnt/scratch/example/x", &rooted()),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        assert!(is_relocating("HOME"));
+        for (name, value) in [
+            ("MISE_SHARED_INSTALL_DIRS", "evil"),
+            ("MISE_TRUSTED_CONFIG_PATHS", "evil"),
+            ("UV_PROJECT", "evil"),
+            ("MISE_DEFAULT_CONFIG_FILENAME", "evil.toml"),
+        ] {
+            assert!(names_a_location(name), "{name}");
+            assert_eq!(
+                reason_of(&check(name, value, &rooted())),
+                Some(Reason::NotAPath),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            reason_of(&check("UV_PROJECT", "=ls", &rooted())),
+            Some(Reason::Unreadable)
+        );
+    }
+
+    /// Shell that sets a variable in bash or zsh — `{N}` the name, `{V}` the
+    /// value. The review's forms, and the neighbours of each.
+    const ASSIGNING_FORMS: &[&str] = &[
+        // A keyword quoted, escaped or aliased.
+        "\\export {N}={V}",
+        "\"export\" {N}={V}",
+        "'export' {N}={V}",
+        "e''xport {N}={V}",
+        "ex\"\"port {N}={V}",
+        "alias ex=export\nex {N}={V}",
+        // Constructs that span lines.
+        ": '\n'; export {N}={V} #'",
+        "ex\\\nport {N}={V}",
+        "{N}=\\\n{V}",
+        "export {N}=/var/mnt/scratch/example/cargo\n{N}_\\\n={V}",
+        ": <<'EOF'\nEOF\nexport {N}={V}",
+        "X=\"\nexport {N}={V}\n\"",
+        // Commands that assign.
+        "for {N} in {V}; do :; done",
+        "select {N} in {V}; do break; done",
+        "read -r {N} <<< {V}",
+        "printf -v {N} {V}",
+        "getopts : {N}",
+        "{N}[1,-1]={V}",
+        "{N}[1]={V}",
+        ": ${{N}::={V}}",
+        ": ${{N}:={V}}",
+        ": ${{N}={V}}",
+        "set -a\n: ${{N}:={V}}",
+        "unset {N}\nexport {N}={V}",
+        "export {N}\n{N}={V}",
+        // Declaration builtins.
+        "declare -x {N}={V}",
+        "declare -gx {N}={V}",
+        "typeset -x {N}={V}",
+        "readonly {N}={V}",
+        "local {N}={V}",
+        "integer {N}={V}",
+        "export -- {N}={V}",
+        "export -x {N}={V}",
+        "{N}+={V}",
+        "export {N}+={V}",
+        "{N}=({V})",
+        // Evaluation with a literal payload.
+        "eval \"export {N}={V}\"",
+        "eval export {N}={V}",
+        "source /dev/stdin <<< 'export {N}={V}'",
+        ". /dev/stdin <<< 'export {N}={V}'",
+        // Operators and prefixes.
+        "true && export {N}={V}",
+        "export {N}={V}; :",
+        "builtin export {N}={V}",
+        "command export {N}={V}",
+        "export A=1 {N}={V}",
+        "{N}={V} true",
+        // Values a shell expands.
+        "export {N}=$(printf %s {V})",
+        "export {N}=`printf %s {V}`",
+        "export {N}=\"$(printf %s {V})\"",
+        "export {N}=${{N}:-{V}}",
+        "export {N}=\"${{N}:={V}}\"",
+        "export {N}={V}/$@/$@/../..",
+        "export {N}=$'{V}'",
+        "export {N}=\"{V}",
+    ];
+
+    #[test]
+    fn no_form_known_to_assign_is_approved_whatever_its_name_or_value() {
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for form in ASSIGNING_FORMS {
+            for name in ["CARGO_HOME", "EDITOR", "npm_config_cache", "X"] {
+                for value in ["/var/mnt/scratch/example/cargo", "/etc/evil", "nvim"] {
+                    let content = form.replace("{N}", name).replace("{V}", value);
+                    for roots in [rooted(), home_rooted.clone(), RootSet::strict()] {
+                        assert_ne!(scan_with(&content, &roots), vec![], "{content:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A shell the guard is held to, and how to make it report every variable
+    /// it holds when it exits. The report runs from an exit trap, so it still
+    /// reports after a fragment that stops the shell with an error. zsh also
+    /// reports arrays, joined with `:`, because `NAME[1,-1]=value` on an unset
+    /// name makes one — and so every element is judged as a list entry.
+    struct Shell {
+        program: &'static str,
+        flags: &'static [&'static str],
+        report: &'static str,
+    }
+
+    const SHELLS: &[Shell] = &[
+        Shell {
+            program: "bash",
+            flags: &["--norc", "--noprofile"],
+            report: "__bx_report() { local __bx_n; for __bx_n in $(compgen -v); do \
+                     printf '%s=%s\\0' \"$__bx_n\" \"${!__bx_n}\"; done; }; trap __bx_report EXIT",
+        },
+        Shell {
+            program: "zsh",
+            flags: &["-f"],
+            report: "__bx_report() { local __bx_n; for __bx_n in ${(k)parameters}; do \
+                     [[ ${parameters[$__bx_n]} == (scalar|array)* ]] && \
+                     printf '%s=%s\\0' \"$__bx_n\" \"${(j.:.)${(P)__bx_n}}\"; done; }; \
+                     trap __bx_report EXIT",
+        },
+    ];
+
+    /// The installed shell `program` resolves to, or `None` with a message.
+    fn installed(program: &str) -> Option<PathBuf> {
+        match crate::detect::locate_in_env(program) {
+            crate::detect::Presence::Present { path } => Some(path),
+            _ => {
+                eprintln!("skipping the {program} check: {program} is not installed");
+                None
+            }
+        }
+    }
+
+    /// Run `script` in `shell` with an empty environment and the test home,
+    /// and return what it printed. Nothing in this process's environment is
+    /// touched: the child's is built per command.
+    ///
+    /// Some of the fragments these tests run are deliberately broken shell,
+    /// and a stray `>` in one is a redirection. So the child runs in a fresh
+    /// temporary directory, where a relative redirection lands, and with a
+    /// `PATH` that finds no program, so a word that becomes a command runs
+    /// nothing.
+    fn run_script(shell: &Path, flags: &[&str], script: &str) -> Vec<u8> {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        std::process::Command::new(shell)
+            .args(flags)
+            .arg("-c")
+            .arg(script)
+            .current_dir(scratch.path())
+            .env_clear()
+            .env("HOME", HOME)
+            .env("PATH", "/nonexistent")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("an installed shell runs")
+            .stdout
+    }
+
+    /// Every scalar variable `shell` holds after running `content`.
+    fn variables_after(shell: &Shell, path: &Path, content: &str) -> HashMap<String, String> {
+        let script = format!("{}\n{content}", shell.report);
+        run_script(path, shell.flags, &script)
+            .split(|&byte| byte == 0)
+            .filter_map(|entry| {
+                let entry = String::from_utf8_lossy(entry);
+                let (name, value) = entry.split_once('=')?;
+                (!name.starts_with("__bx_")).then(|| (name.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    /// Each installed shell, with the variables it holds running nothing.
+    ///
+    /// None at all if the neutral root exists on this machine: a broken
+    /// fragment could then redirect into it, and a test may not write outside
+    /// a temporary directory.
+    fn installed_shells() -> Vec<(&'static Shell, PathBuf, HashMap<String, String>)> {
+        if Path::new(ROOT).exists() {
+            eprintln!("skipping the shell checks: {ROOT} exists on this machine");
+            return Vec::new();
+        }
+        SHELLS
+            .iter()
+            .filter_map(|shell| {
+                let path = installed(shell.program)?;
+                let baseline = variables_after(shell, &path, "");
+                Some((shell, path, baseline))
+            })
+            .collect()
+    }
+
+    /// Run `content` in every installed shell and hold the guard to what each
+    /// shell did. The guard must never approve a fragment after which a
+    /// relocating variable holds a value with an entry outside `roots` or
+    /// inside bx's own directory; and where the guard read every line, what it
+    /// learned must be exactly what the shell set. Returns, per shell, whether
+    /// the shell relocated anything outside the roots.
+    fn assert_the_shells_agree(
+        shells: &[(&'static Shell, PathBuf, HashMap<String, String>)],
+        content: &str,
+        roots: &RootSet,
+    ) -> Vec<bool> {
+        let (found, scope) = pass(content, roots);
+        let mut escaped_in = Vec::new();
+        for (shell, path, baseline) in shells {
+            let after = variables_after(shell, path, content);
+            let changed: Vec<(&String, &String)> = after
+                .iter()
+                .filter(|(name, value)| baseline.get(*name) != Some(*value))
+                .collect();
+            let escaped: Vec<_> = changed
+                .iter()
+                .filter(|(name, value)| {
+                    is_relocating(name)
+                        && value
+                            .split(':')
+                            .any(|entry| refuses_entry(Path::new(entry), roots).is_some())
+                })
+                .collect();
+            assert!(
+                escaped.is_empty() || !found.is_empty(),
+                "{}: the guard approved {content:?}, after which {escaped:?}",
+                shell.program
+            );
+            escaped_in.push(!escaped.is_empty());
+            if scope.lost {
+                continue;
+            }
+            for (name, value) in &changed {
+                if SHELL_NAMES.contains(&name.as_str()) {
+                    continue;
+                }
+                match scope.learned.get(*name) {
+                    Some(Ok(learned)) => assert_eq!(
+                        learned, *value,
+                        "{}: {content:?} gives {name} a different value",
+                        shell.program
+                    ),
+                    Some(Err(_)) => {}
+                    None => panic!(
+                        "{}: {content:?} sets {name}={value:?}, which the guard did not learn",
+                        shell.program
+                    ),
+                }
+            }
+            for (name, learned) in &scope.learned {
+                if let Ok(learned) = learned {
+                    assert_eq!(
+                        after.get(name),
+                        Some(learned),
+                        "{}: {content:?} does not give {name} what the guard learned",
+                        shell.program
+                    );
+                }
+            }
+        }
+        escaped_in
+    }
+
+    /// Fragments the grammar reads line for line, some approved and some
+    /// judged a violation, whose learned values the shells must reproduce.
+    const READABLE_FRAGMENTS: &[&str] = &[
+        OPERATOR_FRAGMENT,
+        "X=/var/mnt/scratch/example\nexport CARGO_HOME=${X}:h\nexport RUSTUP_HOME=\"${X}[1]\"\n",
+        "export MAKEFLAGS=\"-j8 V=1\"\nexport GRADLE_USER_HOME=\"/var/mnt/scratch/example/a b=c/gradle\"\n",
+        "X=/etc\nY='$X'\nexport CARGO_HOME=/var/mnt/scratch/example/$Y\n",
+        "export CARGO_HOME=~/x\nexport RUSTUP_HOME=~\nexport GOPATH=\"~/x\"\nexport GOCACHE='~'\n",
+        "export KUBECONFIG=/var/mnt/scratch/example/k:/etc/evil/config\n",
+        "export EDITOR=nvim # a comment\n  \texport  PAGER=less\t# another\n\n# only a comment\n",
+        "X=a,b@c%d+e-f.g:h\nY=\nZ=''\nW=\"\"\nexport V=$X$X\n",
+        "X=/var/mnt/scratch/example\nX=$X/b\nexport CARGO_HOME=$X/cargo\n",
+        "export PATH=\"$HOME/.local/bin:/usr/bin\"\n",
+        "export XDG_STATE_HOME=~/.local/state/bx\n",
+        "export npm_config_cache=/etc/evil\nexport TMPDIR=/tmp\n",
+        "X=\"it's\"\nY='say \"hi\"'\nZ='a\\b'\nW='$(echo pwned)'\nV=\"{a,b} *\"\n",
+        "X=${HOME}x\nY=\"$HOME\"\nZ=$HOME$HOME\nexport export=1\nexportX=2\n",
+    ];
+
+    #[test]
+    fn the_shells_read_every_readable_fragment_as_the_guard_does() {
+        let shells = installed_shells();
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for content in READABLE_FRAGMENTS {
+            for roots in [rooted(), home_rooted.clone()] {
+                assert!(!pass(content, &roots).1.lost, "{content:?}");
+                assert_the_shells_agree(&shells, content, &roots);
+            }
+        }
+    }
+
+    #[test]
+    fn every_review_falsifier_relocates_in_a_real_shell_and_is_refused() {
+        let shells = installed_shells();
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for form in ASSIGNING_FORMS {
+            let content = form
+                .replace("{N}", "CARGO_HOME")
+                .replace("{V}", "/etc/evil");
+            assert_ne!(scan_with(&content, &rooted()), vec![], "{content:?}");
+            assert_the_shells_agree(&shells, &content, &rooted());
+        }
+        // The review's own list, each run for real: every one but the alias
+        // (neither shell expands an alias defined in the same `-c` string)
+        // relocates outside the roots in at least one installed shell.
+        let falsifiers = [
+            ("\\export CARGO_HOME=/etc/evil", rooted()),
+            ("\"export\" CARGO_HOME=/etc/evil", rooted()),
+            ("e''xport CARGO_HOME=/etc/evil", rooted()),
+            (": '\n'; export CARGO_HOME=/etc/evil #'", rooted()),
+            ("ex\\\nport CARGO_HOME=/etc/evil", rooted()),
+            (
+                "export CARGO_HOME=/var/mnt/scratch/example/cargo\nCARGO_\\\nHOME=/etc/evil",
+                rooted(),
+            ),
+            ("for CARGO_HOME in /etc/evil; do :; done", rooted()),
+            ("read -r CARGO_HOME <<< /etc/evil", rooted()),
+            ("printf -v CARGO_HOME /etc/evil", rooted()),
+            ("CARGO_HOME[1,-1]=/etc/evil", rooted()),
+            (": ${CARGO_HOME::=/etc/evil}", rooted()),
+            ("set -a\n: ${CARGO_HOME:=/etc/evil}", rooted()),
+            (
+                "R=/var/mnt/scratch/example\nunset R\nexport CARGO_HOME=$R/etc/evil",
+                rooted(),
+            ),
+            (
+                "CARGO_HOME=/var/mnt/scratch/example/$@/$@/$@/$@/../../../../etc/evil",
+                rooted(),
+            ),
+            ("HOME=/etc/evil\nCARGO_HOME=~/cargo", home_rooted.clone()),
+            ("eval \"export CARGO_HOME=/etc/evil\"", rooted()),
+            (
+                "source /dev/stdin <<< 'export CARGO_HOME=/etc/evil'",
+                rooted(),
+            ),
+            ("UV_PROJECT==ls", rooted()),
+            (
+                "KUBECONFIG=/var/mnt/scratch/example/k:/etc/evil/config",
+                rooted(),
+            ),
+            ("GOPATH=/var/mnt/scratch/example/go:/etc/evil", rooted()),
+            ("npm_config_cache=/etc/evil", rooted()),
+            ("ZDOTDIR=/etc/evil", rooted()),
+        ];
+        for (content, roots) in &falsifiers {
+            assert_ne!(scan_with(content, roots), vec![], "{content:?}");
+            let escaped = assert_the_shells_agree(&shells, content, roots);
+            if shells.len() == SHELLS.len() {
+                assert!(
+                    escaped.contains(&true),
+                    "{content:?} relocated nothing in any shell"
+                );
+            }
+        }
+    }
+
+    /// Every variant of `base` with one of the characters or sequences a shell
+    /// treats specially inserted at each of a few positions on its last line.
+    fn variants(base: &str) -> Vec<String> {
+        const INSERTS: &[&str] = &[
+            "\\",
+            "'",
+            "\"",
+            "`",
+            "$",
+            "$@",
+            "$1",
+            "${",
+            "}",
+            "(",
+            ")",
+            "{",
+            "[1]",
+            ":h",
+            "<",
+            ">",
+            "|",
+            "&",
+            ";",
+            "*",
+            "?",
+            "!",
+            "#",
+            " #",
+            "~",
+            ":~/",
+            "=",
+            "==",
+            ":=",
+            "^",
+            " ",
+            "\t",
+            "\n",
+            "\\\n",
+            "\r",
+            "..",
+            "/../../../..",
+            "$(printf /etc)",
+        ];
+        let last = base.rfind('\n').map_or(0, |at| at + 1);
+        let equals = last + base[last..].find('=').expect("an assignment");
+        let mut positions = vec![
+            last,
+            equals,
+            equals + 1,
+            equals + 2,
+            base.len() - 3,
+            base.len(),
+        ];
+        if base[last..].starts_with("export ") {
+            positions.extend([last + 6, last + 7]);
+        }
+        let mut out = Vec::new();
+        for at in positions {
+            for insert in INSERTS {
+                out.push(format!("{}{insert}{}", &base[..at], &base[at..]));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_single_special_character_makes_the_guard_approve_what_a_shell_reads_otherwise() {
+        let shells = installed_shells();
+        for base in [
+            "export CARGO_HOME=/var/mnt/scratch/example/cargo",
+            "R=/var/mnt/scratch/example\nexport CARGO_HOME=\"$R/cargo\"",
+            "X=/var/mnt/scratch/example\nGOPATH=${X}/go:$X/b",
+        ] {
+            assert_eq!(scan_with(base, &rooted()), vec![], "{base:?}");
+            for content in variants(base) {
+                assert_the_shells_agree(&shells, &content, &rooted());
+            }
+        }
+    }
+
+    #[test]
+    fn the_shells_define_no_name_a_fragment_may_assign_except_path() {
+        for (program, flags, list) in [
+            ("bash", &["--norc", "--noprofile"][..], "compgen -v"),
+            (
+                "zsh",
+                &["-f"][..],
+                "for __bx_m in $module_path[1]/zsh/**/*.so(N); do \
+                 __bx_n=${__bx_m#$module_path[1]/}; zmodload ${__bx_n%.so} >/dev/null 2>&1; \
+                 done; print -l ${(k)parameters}",
+            ),
+        ] {
+            let Some(path) = installed(program) else {
+                continue;
+            };
+            let listed = run_script(&path, flags, list);
+            let unreserved: Vec<String> = String::from_utf8_lossy(&listed)
+                .lines()
+                .filter(|name| is_variable_name(name) && !name.starts_with("__bx_"))
+                .filter(|name| *name != "PATH" && !SHELL_NAMES.contains(name))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(unreserved, Vec::<String>::new(), "{program}");
+        }
     }
 }

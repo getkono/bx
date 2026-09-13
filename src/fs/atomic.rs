@@ -124,6 +124,7 @@
 //! call site remembered to sync", and it is not one a change to this file can
 //! break.
 
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -684,6 +685,10 @@ impl Pending {
 /// attempt reuses it, and removing it would race any other write that had
 /// already begun using it.
 ///
+/// Every directory created here is added to `created`, the directories this
+/// apply has made so far. [`ensure_dir`] reads it, so a declared directory that
+/// this write created first is still the create `plan` announced for it.
+///
 /// # What `planned` is for
 ///
 /// `planned` is the observation `plan` compared for this destination — the
@@ -706,7 +711,12 @@ impl Pending {
 /// or device node. [`Error::NoParent`] when `dest` has no parent component, and
 /// [`Error::Write`] when the parent cannot be created or the temporary file
 /// cannot be made.
-pub fn stage(dest: &Path, mode: Mode, planned: &Observed) -> Result<Staged, Error> {
+pub fn stage(
+    dest: &Path,
+    mode: Mode,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+) -> Result<Staged, Error> {
     if planned.path != dest {
         return Err(Error::Changed {
             path: dest.to_path_buf(),
@@ -725,6 +735,7 @@ pub fn stage(dest: &Path, mode: Mode, planned: &Observed) -> Result<Staged, Erro
 
     let dir = parent_of(dest)?;
     let created_dirs = create_missing_dirs(dir, Mode::DEFAULT_DIR)?;
+    created.record(&created_dirs);
 
     let temp = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
@@ -995,7 +1006,7 @@ impl Filled {
 /// Whatever [`observe`], [`stage`] or [`Staged::commit`] returns.
 pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Error> {
     let planned = observe(path)?;
-    stage(path, mode, &planned)?.commit(bytes)
+    stage(path, mode, &planned, &mut CreatedDirs::new())?.commit(bytes)
 }
 
 /// Set the mode of an existing file or directory, in place.
@@ -1110,6 +1121,16 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// it acted on — so the mode a `Modify` overwrote is `prior.mode` — and the
 /// directories it created, deepest first.
 ///
+/// `created` is the directories this apply has made so far; [`stage`] and this
+/// function both add to it. A path `plan` saw absent that is now a directory in
+/// that set is still the `Create` `plan` announced — a write beneath it was
+/// applied first and made it at [`Mode::DEFAULT_DIR`] — so it is set to `mode`
+/// rather than refused, and the returned `created_dirs` names it. The order in
+/// which a caller applies a directory target and the targets beneath it
+/// therefore does not matter, provided every write in one apply shares one
+/// set. A directory outside the set that appeared after `plan` is still
+/// refused.
+///
 /// Two windows remain. A `chmod` landing between the second observation and
 /// the [`set_mode`] is overwritten, as for any mode change (decision 6). And
 /// when a `Create` is refused because the path was taken after the second
@@ -1121,9 +1142,14 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// [`Error::Changed`] when the path is no longer what `plan` saw;
 /// [`Error::Read`] when the path or its parent cannot be stat'd; and
 /// [`Error::Write`] when a directory cannot be created or chmod'd.
-pub fn ensure_dir(path: &Path, mode: Mode, planned: &Observed) -> Result<EnsuredDir, Error> {
+pub fn ensure_dir(
+    path: &Path,
+    mode: Mode,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+) -> Result<EnsuredDir, Error> {
     let fresh = observe(path)?;
-    act_on_dir(path, mode, planned, fresh)
+    act_on_dir(path, mode, planned, fresh, created)
 }
 
 /// What [`ensure_dir`] did, and what a ledger needs to reverse it.
@@ -1132,12 +1158,43 @@ pub struct EnsuredDir {
     /// The action performed — the one `plan` announced.
     pub action: Action,
     /// What was at the path immediately before, which is what `plan` saw. For
-    /// a `Modify` its `mode` is the mode that was overwritten.
+    /// a `Modify` its `mode` is the mode that was overwritten. For a directory
+    /// an earlier write in this apply created, it is `plan`'s observation:
+    /// nothing was there before this apply.
     pub prior: Observed,
     /// The directories this call created, deepest first — the path itself
     /// and any ancestor it had to invent — which is the order a reversal
     /// removes them in. Empty unless `action` is `Create`.
     pub created_dirs: Vec<PathBuf>,
+}
+
+/// The directories one `apply` has created so far.
+///
+/// [`stage`] and [`ensure_dir`] add every directory they make. [`ensure_dir`]
+/// consults it, so a declared directory that a write beneath it created
+/// earlier in the same apply is the `Create` `plan` announced rather than a
+/// change to refuse. Start one per apply and pass the same one to every write
+/// in it: a fresh set per call brings the refusal back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreatedDirs(BTreeSet<PathBuf>);
+
+impl CreatedDirs {
+    /// No directories created yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(BTreeSet::new())
+    }
+
+    /// Whether this apply created `path`.
+    #[must_use]
+    pub fn contains(&self, path: &Path) -> bool {
+        self.0.contains(path)
+    }
+
+    /// Note directories a write just created.
+    fn record(&mut self, dirs: &[PathBuf]) {
+        self.0.extend(dirs.iter().cloned());
+    }
 }
 
 /// The half of [`ensure_dir`] after its own observation, separate so a test can
@@ -1147,8 +1204,26 @@ fn act_on_dir(
     mode: Mode,
     planned: &Observed,
     fresh: Observed,
+    created: &mut CreatedDirs,
 ) -> Result<EnsuredDir, Error> {
     let announced = compare_dir(planned, mode);
+    // A directory an earlier write in this apply created is still the create
+    // plan announced: plan saw nothing, and nothing but bx has made one since.
+    // It exists at the mode that write gave it, so what remains of the create
+    // is the declared mode.
+    if announced.action == Action::Create && fresh.kind == Kind::Dir && created.contains(path) {
+        set_mode(path, mode)?;
+        tracing::debug!(
+            path = %path.display(),
+            %mode,
+            "set a directory this apply created to its declared mode"
+        );
+        return Ok(EnsuredDir {
+            action: Action::Create,
+            prior: planned.clone(),
+            created_dirs: vec![path.to_path_buf()],
+        });
+    }
     let outcome = compare_dir(&fresh, mode);
     // Equal outcomes are equal verdicts: the action, the mode found for a
     // `Modify`, and the cause of a `Conflict` are all part of one.
@@ -1177,6 +1252,7 @@ fn act_on_dir(
                     ),
                 });
             }
+            created.record(&created_dirs);
             tracing::debug!(path = %path.display(), %mode, "created a directory");
         }
         Action::Modify => set_mode(path, mode)?,
@@ -1581,7 +1657,7 @@ mod tests {
     /// between.
     fn stage_now(dest: &Path, mode: Mode) -> Result<Staged, Error> {
         let planned = observe(dest)?;
-        stage(dest, mode, &planned)
+        stage(dest, mode, &planned, &mut CreatedDirs::new())
     }
 
     /// The outcome for a destination under a guarded home.
@@ -2345,7 +2421,7 @@ mod tests {
             change(&dest);
             let now = std::fs::read(&dest).ok();
 
-            let err = stage(&dest, Mode::DEFAULT_FILE, &planned)
+            let err = stage(&dest, Mode::DEFAULT_FILE, &planned, &mut CreatedDirs::new())
                 .expect_err("a destination that changed after plan is not staged over");
             assert!(matches!(err, Error::Changed { .. }), "{how}: {err:?}");
             assert_eq!(err.path(), dest, "{how}");
@@ -2368,15 +2444,21 @@ mod tests {
         let dest = home.child(".conf");
         let planned = observe(&dest).expect("plan observes");
         std::fs::write(&dest, b"another tool's\n").expect("another tool creates it");
-        let err = stage(&dest, Mode::DEFAULT_FILE, &planned).expect_err("plan announced a create");
+        let err = stage(&dest, Mode::DEFAULT_FILE, &planned, &mut CreatedDirs::new())
+            .expect_err("plan announced a create");
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(std::fs::read(&dest).expect("read"), b"another tool's\n");
         assert_eq!(names_in(home.path()), vec![OsString::from(".conf")]);
 
         // And plan's observation of one path does not license a write to
         // another.
-        let err = stage(&home.child("other"), Mode::DEFAULT_FILE, &planned)
-            .expect_err("plan observed a different path");
+        let err = stage(
+            &home.child("other"),
+            Mode::DEFAULT_FILE,
+            &planned,
+            &mut CreatedDirs::new(),
+        )
+        .expect_err("plan observed a different path");
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(names_in(home.path()), vec![OsString::from(".conf")]);
     }
@@ -2727,7 +2809,7 @@ mod tests {
     /// nothing changing in between.
     fn apply_dir(path: &Path, mode: Mode) -> Result<EnsuredDir, Error> {
         let planned = observe(path).expect("plan observes");
-        ensure_dir(path, mode, &planned)
+        ensure_dir(path, mode, &planned, &mut CreatedDirs::new())
     }
 
     #[test]
@@ -2744,7 +2826,7 @@ mod tests {
 
         set_mode(&dir, Mode::DEFAULT_DIR).expect("somebody widens it after plan");
 
-        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned)
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned, &mut CreatedDirs::new())
             .expect_err("plan announced nothing, so apply may do nothing");
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(err.path(), dir);
@@ -2768,7 +2850,7 @@ mod tests {
         std::fs::create_dir(&dir).expect("another tool makes it");
         set_mode(&dir, Mode::from_bits(0o777)).expect("at its own mode");
 
-        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned)
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned, &mut CreatedDirs::new())
             .expect_err("plan announced a create, not a chmod of somebody else's directory");
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(mode_of_path(&dir), Mode::from_bits(0o777));
@@ -2788,8 +2870,14 @@ mod tests {
         // ...and then a file lands before the mkdir does.
         seed(&dir, b"a file\n", Mode::DEFAULT_FILE);
 
-        let err = act_on_dir(&dir, Mode::PRIVATE_DIR, &planned, fresh)
-            .expect_err("a file where a directory was to be created is not a create");
+        let err = act_on_dir(
+            &dir,
+            Mode::PRIVATE_DIR,
+            &planned,
+            fresh,
+            &mut CreatedDirs::new(),
+        )
+        .expect_err("a file where a directory was to be created is not a create");
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(std::fs::read(&dir).expect("read"), b"a file\n");
         assert_eq!(mode_of_path(&dir), Mode::DEFAULT_FILE);
@@ -2948,6 +3036,126 @@ mod tests {
             let outcome = dir_outcome_for(&home, rel, Mode::PRIVATE_DIR);
             assert_eq!(outcome.action, Action::Conflict, "{rel}");
             assert_eq!(outcome.note.as_deref(), Some(expected), "{rel}");
+        }
+    }
+
+    #[test]
+    fn a_directory_target_applied_after_a_file_beneath_it_is_the_create_plan_announced() {
+        // ~/.ssh at 0700 and ~/.ssh/config at 0600, both absent, applied file
+        // first. The file's write makes ~/.ssh at 0755, and the directory
+        // target that follows must end at 0700 rather than stop the apply
+        // with the file already written.
+        let home = guarded_home();
+        let dir = home.child(".ssh");
+        let file = home.child(".ssh/config");
+        let planned_dir = observe(&dir).expect("plan observes the directory");
+        let planned_file = observe(&file).expect("plan observes the file");
+        assert_eq!(
+            compare_dir(&planned_dir, Mode::PRIVATE_DIR).action,
+            Action::Create
+        );
+        assert_eq!(
+            compare(&planned_file, &desired(b"Host *\n", Mode::PRIVATE_FILE)).action,
+            Action::Create,
+        );
+
+        let mut created = CreatedDirs::new();
+        let filled = stage(&file, Mode::PRIVATE_FILE, &planned_file, &mut created)
+            .expect("stage")
+            .fill(b"Host *\n")
+            .expect("fill");
+        assert_eq!(
+            filled.created_dirs(),
+            std::slice::from_ref(&dir),
+            "the file's write made the directory, and its entry says so",
+        );
+        filled.publish().expect("publish");
+        assert!(created.contains(&dir));
+
+        // Outside this apply's set, the same directory is one plan never saw.
+        let err = ensure_dir(
+            &dir,
+            Mode::PRIVATE_DIR,
+            &planned_dir,
+            &mut CreatedDirs::new(),
+        )
+        .expect_err("a directory from nowhere is still refused");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(mode_of_path(&dir), Mode::DEFAULT_DIR);
+
+        let ensured = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned_dir, &mut created)
+            .expect("the create plan announced");
+        assert_eq!(ensured.action, Action::Create);
+        assert_eq!(
+            ensured.prior.kind,
+            Kind::Absent,
+            "nothing was there before this apply"
+        );
+        assert_eq!(
+            ensured.created_dirs,
+            std::slice::from_ref(&dir),
+            "the declared directory's entry names it as bx's",
+        );
+
+        assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
+        assert_eq!(mode_of_path(&file), Mode::PRIVATE_FILE);
+        assert_eq!(std::fs::read(&file).expect("read"), b"Host *\n");
+        assert_eq!(
+            dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).action,
+            Action::Unchanged,
+            "the second plan is empty for the directory",
+        );
+        assert_eq!(
+            outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE).action,
+            Action::Unchanged,
+            "and for the file",
+        );
+    }
+
+    #[test]
+    fn nested_directory_targets_end_at_their_declared_modes_in_either_order() {
+        let mode_a = Mode::from_bits(0o750);
+        for deeper_first in [false, true] {
+            let order = if deeper_first { "a/b first" } else { "a first" };
+            let home = guarded_home();
+            let (a, b) = (home.child("a"), home.child("a/b"));
+            let planned_a = observe(&a).expect("plan observes a");
+            let planned_b = observe(&b).expect("plan observes a/b");
+
+            let mut created = CreatedDirs::new();
+            let (ensured_a, ensured_b) = if deeper_first {
+                let b_done = ensure_dir(&b, Mode::PRIVATE_DIR, &planned_b, &mut created);
+                let a_done = ensure_dir(&a, mode_a, &planned_a, &mut created);
+                (a_done, b_done)
+            } else {
+                let a_done = ensure_dir(&a, mode_a, &planned_a, &mut created);
+                let b_done = ensure_dir(&b, Mode::PRIVATE_DIR, &planned_b, &mut created);
+                (a_done, b_done)
+            };
+            let ensured_a = ensured_a.unwrap_or_else(|e| panic!("{order}: a: {e:?}"));
+            let ensured_b = ensured_b.unwrap_or_else(|e| panic!("{order}: a/b: {e:?}"));
+
+            assert_eq!(ensured_a.action, Action::Create, "{order}");
+            assert_eq!(ensured_b.action, Action::Create, "{order}");
+            assert_eq!(mode_of_path(&a), mode_a, "{order}");
+            assert_eq!(mode_of_path(&b), Mode::PRIVATE_DIR, "{order}");
+            assert_eq!(ensured_a.created_dirs, std::slice::from_ref(&a), "{order}");
+            let expected_b = if deeper_first {
+                vec![b.clone(), a.clone()]
+            } else {
+                vec![b.clone()]
+            };
+            assert_eq!(ensured_b.created_dirs, expected_b, "{order}");
+            assert_eq!(
+                dir_outcome_for(&home, "a", mode_a).action,
+                Action::Unchanged,
+                "{order}: the second plan is empty",
+            );
+            assert_eq!(
+                dir_outcome_for(&home, "a/b", Mode::PRIVATE_DIR).action,
+                Action::Unchanged,
+                "{order}: the second plan is empty",
+            );
         }
     }
 

@@ -2669,6 +2669,76 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_filled_tail_after_whole_frames_is_rolled_back_then_kept() {
+        // Review round 4, item 1. A power loss that zero-fills the unsynced last
+        // frame left bytes that fail its checksum. Round 3 read that as damage:
+        // the journal was set aside with nothing rolled back, so `.a` kept bx's
+        // bytes, the ledger had no entry for it, and `rm` called it unmanaged.
+        let guard = guarded_home();
+        for (case, zeroed_done_of_a) in [("the Intent of .b", false), ("the Done of .a", true)] {
+            let home = guard.child(case.replace(' ', "-"));
+            let state = StateDir::resolve(&home);
+            let a = home.join(".a");
+            let b = home.join(".b");
+            plant_file(&a, "A0\n", Mode::DEFAULT_FILE);
+            plant_file(&b, "B0\n", Mode::DEFAULT_FILE);
+            let mut session =
+                Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+            session
+                .apply(write_to(&home, ".a", "A1\n", Mode::DEFAULT_FILE))
+                .expect("apply .a");
+            let after_a = std::fs::read(state.journal()).expect("the journal");
+            session
+                .apply(write_to(&home, ".b", "B1\n", Mode::DEFAULT_FILE))
+                .expect("apply .b");
+            let after_b = std::fs::read(state.journal()).expect("the journal");
+            drop(session);
+            // The frame that zero-filled was never synced, so the write it
+            // announced, or the one after it, had not begun: `.b` is as it was.
+            plant_file(&b, "B0\n", Mode::DEFAULT_FILE);
+            let (bytes, kept) = if zeroed_done_of_a {
+                let mut bytes = after_a;
+                let done = frame_starts(&bytes)[2];
+                bytes[done..].fill(0);
+                (bytes, 2)
+            } else {
+                let starts = frame_starts(&after_b);
+                let mut bytes = after_b[..starts[4]].to_vec();
+                bytes[starts[3]..].fill(0);
+                (bytes, 3)
+            };
+            std::fs::write(state.journal(), &bytes).expect("zero-fill the tail");
+
+            let loaded = crate::journal::load(&state.journal()).expect("load");
+            assert!(
+                matches!(&loaded, Loaded::Torn { records, .. } if records.len() == kept),
+                "{case}: {loaded:?}",
+            );
+            let report = pending(&state)
+                .expect("pending")
+                .expect("an interrupted session");
+            assert_eq!(report.unfinished.len(), 1, "{case}");
+            assert_eq!(
+                recover(&state).expect("recover"),
+                Outcome::RolledBack { undone: 1 },
+                "{case}",
+            );
+            assert_eq!(peek(&a).expect("rolled back").0, b"A0\n", "{case}");
+            assert_eq!(peek(&b).expect("untouched").0, b"B0\n", "{case}");
+            assert!(!state.journal().exists(), "{case}");
+            assert_eq!(
+                std::fs::read(StateDir::quarantine(&state.journal())).expect("kept aside"),
+                bytes,
+                "{case}",
+            );
+
+            let (portable, _) = target(&home, ".a");
+            crate::restore::restore(&state, &home, &[portable]).expect("rm");
+            assert_eq!(peek(&a).expect("still the original").0, b"A0\n", "{case}");
+        }
+    }
+
+    #[test]
     fn a_torn_journal_whose_first_set_aside_name_is_taken_is_recovered_and_kept_beside_it() {
         // Round 3 refused this recovery until the user moved the earlier file.
         // With #7's numbered names nothing is in the way: the rollback runs and

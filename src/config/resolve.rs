@@ -132,8 +132,9 @@ pub struct Resolved {
 /// [`Error::BadValue`] for a defect in the committed repo: a malformed
 /// placeholder, a reference to a value no layer declares, a `default` that
 /// references a later value, a `default` that is not of its kind with no
-/// account answer involved, or a target field that substitution makes invalid
-/// with no account answer in it; and for two ready targets that name one file.
+/// account answer involved, a target field that substitution makes invalid
+/// with no account answer in it, or a `file` that references a `path` value,
+/// answered or not; and for two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -190,6 +191,10 @@ fn resolve_target(
     values: &ResolvedValues,
     conflicts: &[Conflict],
 ) -> Result<Resolution<Target>, Error> {
+    if let Body::File(file) = &target.body {
+        refuse_path_value_in_file(target, &file.to_string_lossy(), values)?;
+    }
+
     let mut unset: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
     let mut invalid: Vec<String> = Vec::new();
@@ -287,6 +292,44 @@ fn resolve_target(
             let hint = values.answers_hint(&problem, &names);
             block(BlockReason::InvalidValue { names }, hint)
         }
+    }
+}
+
+/// Refuse a `file` that references a `path` value.
+///
+/// A `path` value is absolute by construction, and `file` names a file relative
+/// to the config repo root. Opening `file`, the substituted text can never be
+/// repo-relative whatever the answer; further in, it names repo content by an
+/// account's absolute location. No answer fixes either, so it is the layer's
+/// defect and a load error naming the target, whether or not the value has an
+/// answer yet — not a blocked target whose hint advises changing one.
+///
+/// A malformed placeholder is left to the probe, which reports it with the
+/// rest of the target's defects.
+fn refuse_path_value_in_file(
+    target: &Target,
+    file: &str,
+    values: &ResolvedValues,
+) -> Result<(), Error> {
+    let path_value = super::values::placeholders(file)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|name| {
+            values
+                .decl(name)
+                .is_some_and(|decl| decl.kind == super::values::ValueKind::Path)
+        });
+    match path_value {
+        None => Ok(()),
+        Some(name) => Err(Error::BadValue {
+            origin: target.origin.clone(),
+            message: format!(
+                "target `{}`: `file` references `{name}`, a `path` value; a `path` value \
+                 is always absolute and `file` is relative to the config repo root, so no \
+                 answer could make it name a file in the repo; reference a `string` value",
+                target.path
+            ),
+        }),
     }
 }
 
@@ -610,6 +653,50 @@ mod tests {
             ready(&ordinary, 0).body,
             Body::File(PathBuf::from("cfg/work/gitconfig")),
             "the case this spelling exists for still resolves"
+        );
+    }
+
+    #[test]
+    fn a_file_body_may_not_reference_a_path_value() {
+        // A `path` value is absolute by construction and `file` is relative to
+        // the repo root. Opening `file`, it can never name a repo file whatever
+        // the answer; inside it, it names repo content by an account's absolute
+        // location. Either way no answer fixes it, so it is refused at load,
+        // naming the target's line, before anything is answered.
+        const LAYER: &str = "[[value]]\n\
+                             name = \"cfg_dir\"\n\
+                             kind = \"path\"\n\
+                             [[target]]\n\
+                             path = \"~/.gitconfig\"\n\
+                             file = \"FILE\"\n\
+                             [[target]]\n\
+                             path = \"~/.zshrc\"\n\
+                             content = \"setopt\"\n";
+
+        for file in ["{{cfg_dir}}/gitconfig", "cfg/{{cfg_dir}}/gitconfig"] {
+            for local in [None, Some("[values]\ncfg_dir = \"/var/mnt/cfg\"\n")] {
+                let message = resolved(&LAYER.replace("FILE", file), local)
+                    .expect_err("a `path` value in `file` is the layer's defect");
+                for part in [
+                    "bx.toml:4",
+                    "`cfg_dir`",
+                    "a `path` value",
+                    "relative to the config repo",
+                ] {
+                    assert!(message.contains(part), "{file} {local:?} {part}: {message}");
+                }
+            }
+        }
+
+        // The same spelling with a `string` value is the case `file` substitution
+        // exists for.
+        let string = LAYER
+            .replace("kind = \"path\"", "kind = \"string\"")
+            .replace("FILE", "cfg/{{cfg_dir}}/gitconfig");
+        let ordinary = resolved(&string, Some("[values]\ncfg_dir = \"work\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig"))
         );
     }
 
@@ -1186,6 +1273,275 @@ mod tests {
             assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
         }
         ready(&resolved, 1);
+    }
+
+    /// Merge and resolve an arbitrary layer set against the fixtures' home.
+    fn merged_and_resolved(layers: &[(&str, LayerKind, &str)]) -> (Config, Resolved) {
+        let layers: Vec<Layer> = layers
+            .iter()
+            .map(|(file, kind, text)| layer(file, *kind, text).unwrap())
+            .collect();
+        let merged = merge(&layers, &home()).expect("an account's answer does not fail the merge");
+        let resolved = resolve(&merged, &home()).expect("nor the resolution");
+        (merged, resolved)
+    }
+
+    /// Two independent pairs, `s` and `t`, each two files as written and one
+    /// file when `profile` is answered `default`.
+    const TWO_PAIRS: &str = "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/{{profile}}/s\"\ncontent = \"PS\"\n\
+                             [[target]]\npath = \"~/.config/default/s\"\ncontent = \"DS\"\n\
+                             [[target]]\npath = \"~/.config/{{profile}}/t\"\ncontent = \"PT\"\n\
+                             [[target]]\npath = \"~/.config/default/t\"\ncontent = \"DT\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+    #[test]
+    fn two_clashing_pairs_in_one_layer_each_keep_their_own_conflict() {
+        // Recording the second pair's clash may only replace what was recorded
+        // for that same file in that same layer. Dropping the first pair's clash
+        // would leave two ready targets for `~/.config/default/s`.
+        let (merged, resolved) = merged_and_resolved(&[
+            ("bx.toml", LayerKind::Global, TWO_PAIRS),
+            (
+                "local.toml",
+                LayerKind::Local,
+                "[values]\nprofile = \"default\"\n",
+            ),
+        ]);
+
+        assert_eq!(
+            merged
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.file.as_str())
+                .collect::<Vec<_>>(),
+            ["~/.config/default/s", "~/.config/default/t"]
+        );
+        assert_eq!(
+            keys(&resolved),
+            [
+                "~/.config/{{profile}}/s",
+                "~/.config/default/s",
+                "~/.config/{{profile}}/t",
+                "~/.config/default/t",
+                "~/.zshrc",
+            ]
+        );
+        for (index, own, other) in [
+            (0, ["bx.toml:4", "bx.toml:7"], ["bx.toml:10", "bx.toml:13"]),
+            (1, ["bx.toml:4", "bx.toml:7"], ["bx.toml:10", "bx.toml:13"]),
+            (2, ["bx.toml:10", "bx.toml:13"], ["bx.toml:4", "bx.toml:7"]),
+            (3, ["bx.toml:10", "bx.toml:13"], ["bx.toml:4", "bx.toml:7"]),
+        ] {
+            let entry = blocked(&resolved, index);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["profile".to_string()]
+                }
+            );
+            for line in own {
+                assert!(entry.hint.contains(line), "{index} {line}: {}", entry.hint);
+            }
+            for line in other {
+                assert!(!entry.hint.contains(line), "{index} {line}: {}", entry.hint);
+            }
+        }
+        assert_eq!(ready(&resolved, 4).path.as_str(), "~/.zshrc");
+    }
+
+    #[test]
+    fn one_file_clashing_in_two_layers_is_recorded_for_each_and_settled_only_by_name() {
+        // `bx.toml` names `s` twice through `profile`, and a module toggles it
+        // twice the same way. Recording the module's clash may not drop
+        // `bx.toml`'s, which is a different layer's statement about the file.
+        // A later full entry for `s` settles both, and leaves `t` alone.
+        const MODULE: &str = "[[target]]\npath = \"~/.config/{{profile}}/s\"\nenabled = true\n\
+                              [[target]]\npath = \"~/.config/default/s\"\nenabled = true\n";
+
+        let (merged, resolved) = merged_and_resolved(&[
+            ("bx.toml", LayerKind::Global, TWO_PAIRS),
+            ("modules/10-profile.toml", LayerKind::Global, MODULE),
+            (
+                "local.toml",
+                LayerKind::Local,
+                "[values]\nprofile = \"default\"\n",
+            ),
+        ]);
+
+        assert_eq!(
+            merged
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.file.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "~/.config/default/s",
+                "~/.config/default/t",
+                "~/.config/default/s"
+            ],
+            "one conflict per layer that named the file twice"
+        );
+        for index in [0, 1] {
+            let entry = blocked(&resolved, index);
+            for line in [
+                "`~/.config/{{profile}}/s` at bx.toml:4",
+                "`~/.config/default/s` at bx.toml:7",
+                "`~/.config/{{profile}}/s` at modules/10-profile.toml:1",
+                "`~/.config/default/s` at modules/10-profile.toml:4",
+            ] {
+                assert!(entry.hint.contains(line), "{index} {line}: {}", entry.hint);
+            }
+        }
+
+        let (merged, resolved) = merged_and_resolved(&[
+            ("bx.toml", LayerKind::Global, TWO_PAIRS),
+            ("modules/10-profile.toml", LayerKind::Global, MODULE),
+            (
+                "local.toml",
+                LayerKind::Local,
+                "[values]\nprofile = \"default\"\n\
+                 [[target]]\npath = \"~/.config/default/s\"\ncontent = \"LOCAL\"\n",
+            ),
+        ]);
+
+        assert_eq!(
+            merged
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.file.as_str())
+                .collect::<Vec<_>>(),
+            ["~/.config/default/t"],
+            "the full entry settles every layer's clash for `s`, and only `s`"
+        );
+        assert_eq!(
+            keys(&resolved),
+            [
+                "~/.config/default/s",
+                "~/.config/{{profile}}/t",
+                "~/.config/default/t",
+                "~/.zshrc",
+            ]
+        );
+        assert_eq!(ready(&resolved, 0).body, Body::Inline("LOCAL".to_string()));
+        blocked(&resolved, 1);
+        blocked(&resolved, 2);
+        ready(&resolved, 3);
+    }
+
+    #[test]
+    fn a_clashing_pair_reasserted_a_third_time_is_one_conflict_naming_all_three() {
+        // The third statement replaces the clash the first two recorded; it
+        // does not add a second one beside it, which would repeat every line in
+        // the hint.
+        let (merged, resolved) = merged_and_resolved(&[
+            (
+                "bx.toml",
+                LayerKind::Global,
+                "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
+                 [[value]]\nname = \"other\"\nkind = \"string\"\n\
+                 [[target]]\npath = \"~/.config/{{profile}}/s\"\ncontent = \"P\"\n\
+                 [[target]]\npath = \"~/.config/default/s\"\ncontent = \"D\"\n\
+                 [[target]]\npath = \"~/.config/{{other}}/s\"\ncontent = \"O\"\n\
+                 [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+            ),
+            (
+                "local.toml",
+                LayerKind::Local,
+                "[values]\nprofile = \"default\"\nother = \"default\"\n",
+            ),
+        ]);
+
+        assert_eq!(merged.conflicts.len(), 1, "{:#?}", merged.conflicts);
+        assert_eq!(merged.conflicts[0].names, ["profile", "other"]);
+        assert_eq!(
+            keys(&resolved),
+            [
+                "~/.config/{{profile}}/s",
+                "~/.config/default/s",
+                "~/.config/{{other}}/s",
+                "~/.zshrc",
+            ]
+        );
+        for index in [0, 1, 2] {
+            let entry = blocked(&resolved, index);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["profile".to_string(), "other".to_string()]
+                }
+            );
+            for line in [
+                "bx.toml:7",
+                "bx.toml:10",
+                "bx.toml:13",
+                "`profile` at local.toml:2",
+                "`other` at local.toml:3",
+            ] {
+                assert_eq!(
+                    entry.hint.matches(line).count(),
+                    1,
+                    "{index} {line}: {}",
+                    entry.hint
+                );
+            }
+        }
+        ready(&resolved, 3);
+    }
+
+    #[test]
+    fn a_clashing_entry_is_held_beside_the_file_it_names_not_moved_to_the_end() {
+        // `bx.toml` puts `~/.config/default/s` first. A module names that file
+        // again, once through `profile`. With `work` the module's plain spelling
+        // replaces it in place; with `default` both module spellings are the
+        // file, and the second may not be appended after `~/.zshrc` — the
+        // file's rows stay in the file's slot, and nothing unrelated moves.
+        const BASE: &str = "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
+                            [[target]]\npath = \"~/.config/default/s\"\ncontent = \"BASE\"\n\
+                            [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        const MODULE: &str = "[[target]]\npath = \"~/.config/{{profile}}/s\"\ncontent = \"PROFILE\"\n\
+                              [[target]]\npath = \"~/.config/default/s\"\ncontent = \"DEFAULT\"\n\
+                              [[target]]\npath = \"~/.config/other\"\ncontent = \"other\"\n";
+        let layers = |answer: &str| {
+            merged_and_resolved(&[
+                ("bx.toml", LayerKind::Global, BASE),
+                ("modules/10-profile.toml", LayerKind::Global, MODULE),
+                (
+                    "local.toml",
+                    LayerKind::Local,
+                    &format!("[values]\nprofile = \"{answer}\"\n"),
+                ),
+            ])
+            .1
+        };
+
+        let work = layers("work");
+        assert_eq!(
+            keys(&work),
+            [
+                "~/.config/default/s",
+                "~/.zshrc",
+                "~/.config/work/s",
+                "~/.config/other"
+            ]
+        );
+        assert_eq!(ready(&work, 0).body, Body::Inline("DEFAULT".to_string()));
+
+        let default = layers("default");
+        assert_eq!(
+            keys(&default),
+            [
+                "~/.config/{{profile}}/s",
+                "~/.config/default/s",
+                "~/.zshrc",
+                "~/.config/other"
+            ],
+            "both rows for the file sit in the file's slot, in the order written"
+        );
+        blocked(&default, 0);
+        blocked(&default, 1);
+        ready(&default, 2);
+        ready(&default, 3);
     }
 
     #[test]

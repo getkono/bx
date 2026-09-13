@@ -19,13 +19,14 @@ use std::collections::btree_map::Iter;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{FileType, Mode as RawMode, OFlags};
 use serde::{Deserialize, Serialize};
 
 use super::Error;
 use super::dir::{StateDir, ensure_dir};
 use super::hash::ContentHash;
 use super::lock::ExclusiveLock;
-use super::store::{self, Loaded};
+use super::store::{self, Loaded, Rejected};
 use crate::fs::{Mode, write_atomically};
 
 /// The envelope tag for `ledger.mpk`.
@@ -230,8 +231,11 @@ pub struct LedgerView {
 impl LedgerView {
     /// Read the ledger without taking a lock.
     ///
-    /// A damaged `ledger.mpk` is quarantined and this returns an empty ledger,
-    /// with [`super::Health::Reset`] saying so.
+    /// A damaged `ledger.mpk` yields an empty ledger with
+    /// [`super::Health::Damaged`] saying so, and is **left where it is**: a
+    /// reader holding no lock cannot know that the path still names the bytes
+    /// it read, so it renames nothing. [`Ledger::open`], under the lock, is what
+    /// quarantines.
     ///
     /// # Every stored path is checked against `home`
     ///
@@ -242,8 +246,16 @@ impl LedgerView {
     /// meets last. So every stored path — each key, each entry's `path`, and
     /// each of its `created_dirs` — goes through
     /// [`crate::paths::Portable::check_against`], and a ledger holding one that
-    /// fails is damaged ([`super::Damage::ForeignPath`]) and quarantined like
-    /// any other, never believed.
+    /// fails is **refused**, never believed and never discarded.
+    ///
+    /// Refused rather than degraded because the likeliest cause is not a
+    /// damaged ledger but the same account with its home spelled another way —
+    /// a `/home` → `/var/home` alias, or `HOME=/` — and resetting a good ledger
+    /// for that would make the next apply record bx's own output as every prior.
+    ///
+    /// An entry stored under a key that is not its own `path` is different: bx
+    /// never writes one, whatever the home, so that is
+    /// [`super::Damage::KeyMismatch`].
     ///
     /// # Errors
     ///
@@ -252,31 +264,56 @@ impl LedgerView {
     /// intact behind the failure, so it is neither quarantined nor replaced,
     /// and the caller must stop rather than proceed against an empty ledger.
     ///
+    /// [`Error::ForeignPath`] if a stored path cannot be used with `home`. The
+    /// ledger is left exactly as it is.
+    ///
     /// [`Error::Home`] if `home` is not absolute or not UTF-8. That is checked
     /// before the file is touched, so a bad home never quarantines a ledger.
     pub fn read(dir: &StateDir, home: &Path) -> Result<Loaded<Self>, Error> {
+        Self::load(dir, home, None)
+    }
+
+    /// Read the ledger, quarantining damage only when `lock` is held.
+    fn load(
+        dir: &StateDir,
+        home: &Path,
+        lock: Option<&ExclusiveLock>,
+    ) -> Result<Loaded<Self>, Error> {
         crate::paths::Portable::parse_in("~", home).map_err(|source| Error::Home {
             home: home.to_path_buf(),
             source,
         })?;
-        store::load_checked(&dir.ledger(), KIND, VERSION, |view: &Self| {
-            view.check_paths(home)
+        let path = dir.ledger();
+        store::load_checked(&path, KIND, VERSION, lock, |view: &Self| {
+            view.check_paths(&path, home)
         })
     }
 
-    /// Refuse a ledger holding a path this account could not have written.
+    /// Reject a ledger bx could not have written, or cannot use with `home`.
     ///
-    /// `home` has already been accepted, so the only failure left is
-    /// [`crate::paths::Error::AbsoluteUnderHome`].
-    fn check_paths(&self, home: &Path) -> Result<(), super::Damage> {
+    /// Damage is looked for across every entry before any path is checked
+    /// against the home, so a damaged ledger is never reported as a home
+    /// problem. `home` has already been accepted, so the only home failure left
+    /// is [`crate::paths::Error::AbsoluteUnderHome`].
+    fn check_paths(&self, file: &Path, home: &Path) -> Result<(), Rejected> {
         for (key, entry) in &self.entries {
-            for stored in [key, &entry.path].into_iter().chain(&entry.created_dirs) {
-                stored
-                    .check_against(home)
-                    .map_err(|reason| super::Damage::ForeignPath {
+            if *key != entry.path {
+                return Err(Rejected::Damage(super::Damage::KeyMismatch {
+                    key: key.as_str().to_string(),
+                    path: entry.path.as_str().to_string(),
+                }));
+            }
+        }
+        for (key, entry) in &self.entries {
+            for stored in std::iter::once(key).chain(&entry.created_dirs) {
+                stored.check_against(home).map_err(|source| {
+                    Rejected::Refused(Error::ForeignPath {
+                        path: file.to_path_buf(),
+                        home: home.to_path_buf(),
                         stored: stored.as_str().to_string(),
-                        reason: reason.to_string(),
-                    })?;
+                        source: Box::new(source),
+                    })
+                })?;
             }
         }
         Ok(())
@@ -371,8 +408,10 @@ impl Ledger {
     /// The lock is not stored; requiring it here is what makes a `Ledger` proof
     /// that one was taken.
     ///
-    /// A damaged `ledger.mpk` is quarantined and this returns an empty ledger,
-    /// with [`super::Health::Reset`] saying so.
+    /// A damaged `ledger.mpk` is moved aside to the first free quarantine name
+    /// and this returns an empty ledger, with [`super::Health::Reset`] saying
+    /// so. The lock is what makes that rename safe: no writer can have saved
+    /// since the bytes were read.
     ///
     /// # Errors
     ///
@@ -382,11 +421,13 @@ impl Ledger {
     /// target's prior and discard the user's, so the failure is returned rather
     /// than degraded.
     ///
-    /// [`Error::Home`], as [`LedgerView::read`], which checks every stored path
-    /// against `home` the same way.
-    pub fn open(dir: &StateDir, _lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
+    /// [`Error::ForeignPath`] and [`Error::Home`], as [`LedgerView::read`],
+    /// which checks every stored path against `home` the same way. The same
+    /// reasoning applies: a ledger written under another spelling of the home
+    /// is refused, not reset.
+    pub fn open(dir: &StateDir, lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
         let dir = dir.clone();
-        Ok(LedgerView::read(&dir, home)?.map(|view| Self { dir, view }))
+        Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self { dir, view }))
     }
 
     /// The state directory this ledger was opened from.
@@ -421,6 +462,17 @@ impl Ledger {
     ///   [`LedgerEntry::superseded`] rather than being dropped, and a stored
     ///   [`Prior::Absent`] they replace had no bytes to keep.
     ///
+    ///   **Only for a file bx owns whole.** When the stored or the incoming
+    ///   [`Mechanism`] is a `Region` or an `Include`, those bytes hold bx's own
+    ///   previous region or include line as well as the user's edit, and
+    ///   adopting them would make `bx rm` write bx's stale lines back into the
+    ///   user's file. Stripping them needs the grammar the writer uses — the
+    ///   region's delimiter lines, and where an include line is placed — and no
+    ///   such writer exists yet, so `record` refuses with
+    ///   [`Error::PriorConflict`], stores nothing, and leaves the entry exactly
+    ///   as it was. `plan` reports the same target as a conflict from `written`
+    ///   alone, so an apply that shares its function never reaches this call.
+    ///
     /// The comparison is on content only. A file whose bytes still match
     /// `written` but whose mode the user changed is treated as bx's own output,
     /// because snapshotting it would record bx's generated content as the
@@ -428,6 +480,19 @@ impl Ledger {
     ///
     /// [`Ledger::forget`] followed by `record` remains the way to discard a
     /// stored prior deliberately.
+    ///
+    /// # The inference needs every published write journalled
+    ///
+    /// *Bytes that do not hash to `written` were written by a third party* is
+    /// true only if `written` is recorded for every write bx publishes. This
+    /// type alone cannot promise that: a crash after a target is published and
+    /// before [`Ledger::save`] leaves the old `written` on disk, and a retry
+    /// would read bx's own new output as a third party's and adopt it as the
+    /// prior. The write-ahead journal (entry A6, `journal`/`recover`) closes the
+    /// window — it stores the prior and an intent before publishing, and
+    /// recovery rolls the ledger forward or the target back before another
+    /// apply can open the ledger — so this rule is sound only for writes that go
+    /// through it.
     ///
     /// # Created directories accumulate
     ///
@@ -450,7 +515,8 @@ impl Ledger {
     /// # Errors
     ///
     /// [`Error::CreateDir`] or [`Error::Write`] if the snapshot cannot be
-    /// stored. The ledger is left unchanged when that happens.
+    /// stored, and [`Error::PriorConflict`] for a changed file bx shares with
+    /// the user. The ledger is left unchanged when either happens.
     pub fn record(&mut self, entry: NewEntry) -> Result<&LedgerEntry, Error> {
         let key = entry.path.clone();
         let (prior, superseded, created_dirs) = match self.view.entries.get(&key) {
@@ -460,7 +526,8 @@ impl Ledger {
                 entry.created_dirs,
             ),
             Some(existing) => {
-                let (prior, superseded) = self.carry_prior(existing, entry.prior)?;
+                let (prior, superseded) =
+                    self.carry_prior(existing, &entry.mechanism, entry.prior)?;
                 (
                     prior,
                     superseded,
@@ -490,6 +557,7 @@ impl Ledger {
     fn carry_prior(
         &self,
         existing: &LedgerEntry,
+        mechanism: &Mechanism,
         incoming: PriorBytes,
     ) -> Result<(Prior, Vec<RestoreRef>), Error> {
         let kept = || (existing.prior.clone(), existing.superseded.clone());
@@ -499,6 +567,14 @@ impl Ledger {
         let digest = ContentHash::of(&bytes);
         if digest == existing.written {
             return Ok(kept());
+        }
+        // A shared file's changed bytes still hold bx's own region or include
+        // line. Refused before anything is stored: see `record`.
+        if existing.mechanism != Mechanism::Own || *mechanism != Mechanism::Own {
+            return Err(Error::PriorConflict {
+                target: existing.path.as_str().to_string(),
+                displaced: digest,
+            });
         }
 
         // A third party wrote these bytes and this apply displaces them: they
@@ -584,6 +660,10 @@ impl Ledger {
     /// A `stat` rather than a re-hash: it keeps the common repeat path O(1),
     /// and the two ways a blob is plausibly lost — a truncated write and an
     /// empty file left by an interrupted one — both change the length.
+    ///
+    /// The `stat` is of the name itself, never of what it links to: see
+    /// [`blob_len`]. A symlink or a second hard link of the right length is not
+    /// a blob bx wrote, so it is rewritten too.
     fn store_blob(&self, digest: ContentHash, bytes: &[u8]) -> Result<(), Error> {
         let restore = self.dir.restore();
         ensure_dir(&restore, Mode::PRIVATE_DIR)?;
@@ -617,13 +697,28 @@ fn merge_created_dirs(
     merged
 }
 
-/// The length of the file at `path`, or `None` if it is not a readable file.
+/// The length of the blob at `path`, or `None` unless it is bx's own file.
 ///
 /// `None` means *rewrite it*: a blob that cannot be stat'ed is not a blob whose
 /// content has been established.
+///
+/// The name is opened `O_PATH | O_NOFOLLOW` and the descriptor is checked, so
+/// what is measured is the entry in `restore/` and never what a symlink there
+/// names: a decoy link to a same-length file elsewhere used to satisfy the
+/// check with none of the user's bytes behind it. It must be a regular file
+/// with exactly one link. `O_PATH` reads nothing and cannot block on a FIFO.
+/// The rewrite goes through [`write_atomically`], whose rename replaces the
+/// entry, so a link is replaced and never written through.
 fn blob_len(path: &Path) -> Option<u64> {
-    let metadata = std::fs::metadata(path).ok()?;
-    metadata.is_file().then_some(metadata.len())
+    let fd = rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        RawMode::empty(),
+    )
+    .ok()?;
+    let stat = rustix::fs::fstat(&fd).ok()?;
+    let own = FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_nlink == 1;
+    own.then(|| u64::try_from(stat.st_size).ok()).flatten()
 }
 
 /// Where a snapshot with this digest lives.
@@ -1391,6 +1486,44 @@ mod tests {
     }
 
     #[test]
+    fn a_decoy_link_at_a_blob_name_is_replaced_rather_than_trusted() {
+        // Review round 3: `blob_len` followed a symlink, so a link at
+        // `restore/<digest>` to any file of the same length made `record`
+        // return Ok with none of the user's bytes on disk — found only at rm,
+        // as RestoreCorrupt. A second hard link was trusted the same way.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        home.write("decoy", "ZZZZZ");
+        home.write("other", "YYYYY");
+        std::os::unix::fs::symlink(home.child("decoy"), dir.restore().join(hex(b"prior")))
+            .expect("symlink");
+        std::fs::hard_link(home.child("other"), dir.restore().join(hex(b"third")))
+            .expect("hard link");
+
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        for (name, body) in [("~/.a", &b"prior"[..]), ("~/.b", b"third")] {
+            let stored = ledger
+                .record(entry(name, b"bx").with_prior(prior(body, 0o644)))
+                .expect("record")
+                .clone();
+            let Prior::Existed(reference) = &stored.prior else {
+                panic!("expected a snapshot");
+            };
+            assert_eq!(
+                ledger.restore_bytes(&dir, reference).expect("restore"),
+                body
+            );
+            let blob = dir.restore().join(hex(body));
+            let meta = std::fs::symlink_metadata(&blob).expect("stat");
+            assert!(meta.file_type().is_file(), "the decoy was replaced");
+            assert_eq!(meta.nlink(), 1);
+        }
+        // Neither decoy was written through.
+        assert_eq!(std::fs::read(home.child("decoy")).expect("read"), b"ZZZZZ");
+        assert_eq!(std::fs::read(home.child("other")).expect("read"), b"YYYYY");
+    }
+
+    #[test]
     fn a_tampered_restore_blob_is_refused_rather_than_returned() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
@@ -1555,6 +1688,125 @@ mod tests {
         assert_eq!(
             reloaded.get(&target("~/.zshrc")).expect("entry").written,
             ContentHash::of(whole_with_include.as_bytes()),
+        );
+    }
+
+    #[test]
+    fn a_changed_shared_file_is_a_conflict_not_a_prior_holding_bxs_own_lines() {
+        // Review round 3. Region BX1, the user adds a line outside it, and the
+        // next apply hands `record` the whole file. Adopting it stored BX1's
+        // region as the user's original, and `bx rm` then wrote bx's stale
+        // region back into the user's file.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let original = b"user line 1\n";
+        let bx1 = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let mut edited = bx1.to_vec();
+        edited.extend_from_slice(b"user line 2\n");
+        let region = Mechanism::Region { comment: '#' };
+        let include = Mechanism::Include {
+            line: "source ~/.local/state/bx/shell/init.sh".to_string(),
+        };
+        // Either side of the re-record being shared is enough: the bytes on disk
+        // hold what the stored mechanism wrote, and the prior is read back
+        // under the incoming one.
+        let cases = [
+            (region.clone(), region.clone()),
+            (include.clone(), include),
+            (Mechanism::Own, region.clone()),
+            (region, Mechanism::Own),
+        ];
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        for (index, (first, second)) in cases.into_iter().enumerate() {
+            let name = format!("~/.rc{index}");
+            ledger
+                .record(
+                    NewEntry::new(
+                        target(&name),
+                        ContentHash::of(bx1),
+                        Mode::DEFAULT_FILE,
+                        first,
+                    )
+                    .with_prior(prior(original, 0o644)),
+                )
+                .expect("first apply");
+            ledger.save().expect("save");
+            let saved = std::fs::read(dir.ledger()).expect("read");
+            let blobs = blob_names(&dir);
+
+            let err = ledger
+                .record(
+                    NewEntry::new(
+                        target(&name),
+                        ContentHash::of(b"BX2"),
+                        Mode::DEFAULT_FILE,
+                        second,
+                    )
+                    .with_prior(prior(&edited, 0o644)),
+                )
+                .expect_err("a changed shared file is a conflict");
+            assert!(
+                matches!(
+                    &err,
+                    Error::PriorConflict { target: at, displaced }
+                        if *at == name && *displaced == ContentHash::of(&edited)
+                ),
+                "case {index}: got {err}",
+            );
+            assert!(err.to_string().contains(&name), "{err}");
+
+            // Nothing was adopted or stored, and the prior holds no bx region.
+            let stored = ledger.get(&target(&name)).expect("entry");
+            assert_eq!(stored.written, ContentHash::of(bx1));
+            assert!(stored.superseded.is_empty());
+            let Prior::Existed(reference) = &stored.prior else {
+                panic!("case {index}: the original prior must stand");
+            };
+            assert_eq!(
+                ledger.restore_bytes(&dir, reference).expect("restore"),
+                original,
+            );
+            assert!(!has_blob(&dir, &edited), "case {index}");
+            assert_eq!(blob_names(&dir), blobs, "case {index}");
+            ledger.save().expect("save");
+            assert_eq!(std::fs::read(dir.ledger()).expect("read"), saved);
+        }
+    }
+
+    #[test]
+    fn an_untouched_shared_file_still_re_records_and_keeps_its_prior() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let bx1 = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        let region = Mechanism::Region { comment: '#' };
+        ledger
+            .record(
+                NewEntry::new(
+                    target("~/.bashrc"),
+                    ContentHash::of(bx1),
+                    Mode::DEFAULT_FILE,
+                    region.clone(),
+                )
+                .with_prior(prior(b"user line 1\n", 0o644)),
+            )
+            .expect("first");
+        let stored = ledger
+            .record(
+                NewEntry::new(
+                    target("~/.bashrc"),
+                    ContentHash::of(b"BX2"),
+                    Mode::DEFAULT_FILE,
+                    region,
+                )
+                .with_prior(prior(bx1, 0o644)),
+            )
+            .expect("bx's own output is not a conflict")
+            .clone();
+        assert_eq!(stored.written, ContentHash::of(b"BX2"));
+        assert_eq!(
+            stored.prior,
+            Prior::Existed(reference(b"user line 1\n", 0o644))
         );
     }
 
@@ -1777,6 +2029,72 @@ mod tests {
         assert!(dir.root().join("ledger.mpk.corrupt").exists());
     }
 
+    #[test]
+    fn a_dangling_ledger_symlink_stops_bx_instead_of_reading_as_fresh() {
+        // Review round 3: a `ledger.mpk` link to storage that is not mounted
+        // read as `Health::Fresh`, and the next save replaced the link.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let far = home.child("unmounted/ledger.mpk");
+        std::os::unix::fs::symlink(&far, dir.ledger()).expect("symlink");
+
+        let err = LedgerView::read(&dir, home.path()).expect_err("must refuse");
+        assert!(
+            matches!(&err, Error::DanglingLink { path } if *path == dir.ledger()),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        let err = Ledger::open(&dir, &lock, home.path()).expect_err("must refuse");
+        assert!(matches!(err, Error::DanglingLink { .. }), "got {err}");
+        assert_eq!(std::fs::read_link(dir.ledger()).expect("still a link"), far);
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
+    }
+
+    #[test]
+    fn a_lockless_view_of_a_damaged_ledger_leaves_it_for_the_lock_holder() {
+        // Review round 3: `LedgerView::read` renamed by path with no lock, so a
+        // writer's save between the read and the rename lost its ledger.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(view.health, Health::Damaged(Damage::Malformed));
+        assert!(view.value.is_empty());
+        assert_eq!(
+            std::fs::read(dir.ledger()).expect("left in place"),
+            b"not messagepack",
+        );
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
+
+        let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert_eq!(opened.health, Health::Reset(Damage::Malformed));
+        assert!(!dir.ledger().exists());
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
+            b"not messagepack",
+        );
+    }
+
+    #[test]
+    fn a_second_damaged_ledger_never_replaces_the_first_quarantine() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        std::fs::write(dir.ledger(), b"first damaged ledger").expect("seed");
+        Ledger::open(&dir, &lock, home.path()).expect("first open");
+        std::fs::write(dir.ledger(), b"second damaged ledger").expect("seed again");
+        Ledger::open(&dir, &lock, home.path()).expect("second open");
+
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("first kept"),
+            b"first damaged ledger",
+        );
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt.1")).expect("second kept"),
+            b"second damaged ledger",
+        );
+    }
+
     /// `home/<rel>` as the absolute `Portable` a hand-edited or foreign ledger
     /// would hold: well-formed, so it decodes, and under this home.
     fn absolute_under(home: &GuardedHome, rel: &str) -> Portable {
@@ -1804,83 +2122,127 @@ mod tests {
     }
 
     #[test]
-    fn a_ledger_keyed_by_an_absolute_path_under_the_home_is_not_trusted() {
+    fn a_ledger_keyed_by_an_absolute_path_under_the_home_is_refused_not_reset() {
         // Decision R3-1 of #4: `/…/home/.gitconfig` decodes, because a decoder
         // has no home, and on this account it is a second key for
-        // `~/.gitconfig`. The loader is where the home is, so the loader refuses.
+        // `~/.gitconfig`. The loader is where the home is, so the loader
+        // refuses — and, since review round 3, renames nothing.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let key = absolute_under(&home, ".gitconfig");
         assert!(key.as_str().starts_with('/'), "{key}");
         let seeded = seed_ledger(&dir, key.clone(), Vec::new());
 
-        let view = LedgerView::read(&dir, home.path()).expect("read");
-        let Health::Reset(Damage::ForeignPath { stored, reason }) = &view.health else {
-            panic!("a foreign key must not load, got {:?}", view.health);
+        let err = LedgerView::read(&dir, home.path()).expect_err("must refuse");
+        let Error::ForeignPath {
+            path,
+            home: checked,
+            stored,
+            source,
+        } = &err
+        else {
+            panic!("a foreign key must be refused, got {err}");
         };
+        assert_eq!(path, &dir.ledger());
+        assert_eq!(checked, home.path());
         assert_eq!(stored, key.as_str());
-        assert!(reason.contains("~/.gitconfig"), "{reason}");
-        assert!(
-            view.value.is_empty(),
-            "nothing from that ledger is believed"
-        );
-        assert!(
-            view.health
-                .damage()
-                .expect("damage")
-                .to_string()
-                .contains(key.as_str()),
-            "the warning names the path",
-        );
-        // Quarantined like any other damage: the bytes are kept, not deleted.
-        let quarantine = dir.root().join("ledger.mpk.corrupt");
-        assert_eq!(std::fs::read(&quarantine).expect("quarantined"), seeded);
+        assert!(source.to_string().contains("~/.gitconfig"), "{source}");
+        assert!(err.to_string().contains(key.as_str()), "names the path");
+        assert!(err.to_string().contains("Nothing was changed"), "{err}");
 
-        // Opening for writing goes through the same check.
-        seed_ledger(&dir, key, Vec::new());
-        let ledger = Ledger::open(&dir, &lock, home.path()).expect("open");
-        assert!(
-            matches!(ledger.health, Health::Reset(Damage::ForeignPath { .. })),
-            "{:?}",
-            ledger.health,
-        );
-        assert!(ledger.value.is_empty());
+        // Opening for writing goes through the same check, and refuses too.
+        let err = Ledger::open(&dir, &lock, home.path()).expect_err("must refuse");
+        assert!(matches!(err, Error::ForeignPath { .. }), "got {err}");
+
+        // Neither call touched the ledger.
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
     }
 
     #[test]
-    fn a_created_directory_spelled_absolutely_under_the_home_is_not_trusted() {
+    fn a_home_spelled_through_an_alias_stops_bx_and_leaves_the_ledger_in_place() {
+        // Review round 3's falsifier. An apply under one spelling of the home —
+        // `/var/home/me`, reached through a `/home/me` alias — records a target
+        // named by the other spelling as an absolute path. The next run, under
+        // the other spelling, folds that path into its home. That used to
+        // quarantine a good ledger, after which the next apply recorded bx's own
+        // output as every prior.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let alias = home.child("alias");
+        std::os::unix::fs::symlink(home.path(), &alias).expect("alias");
+
+        let mut ledger = Ledger::open(&dir, &lock, &alias).expect("open").value;
+        let key = Portable::from_path(&home.child(".foo"), &alias).expect("portable");
+        assert!(key.as_str().starts_with('/'), "{key}");
+        ledger
+            .record(
+                NewEntry::new(
+                    key,
+                    ContentHash::of(b"bx"),
+                    Mode::DEFAULT_FILE,
+                    Mechanism::Own,
+                )
+                .with_prior(prior(b"the user wrote this", 0o644)),
+            )
+            .expect("record");
+        ledger.save().expect("save");
+        let seeded = std::fs::read(dir.ledger()).expect("read");
+
+        let err = Ledger::open(&dir, &lock, home.path()).expect_err("must refuse");
+        assert!(matches!(err, Error::ForeignPath { .. }), "got {err}");
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
+
+        // The ledger is intact: under the spelling it was written with, it loads.
+        let reopened = Ledger::open(&dir, &lock, &alias).expect("reopen");
+        assert_eq!(reopened.health, Health::Loaded);
+        assert_eq!(reopened.value.len(), 1);
+    }
+
+    #[test]
+    fn a_root_home_refuses_rather_than_resetting() {
+        // `HOME=/` folds every absolute path into the home.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let outside = Portable::try_from("/etc/bx-example.conf".to_string()).expect("absolute");
+        let seeded = seed_ledger(&dir, outside, Vec::new());
+
+        let err = Ledger::open(&dir, &lock, Path::new("/")).expect_err("must refuse");
+        assert!(matches!(err, Error::ForeignPath { .. }), "got {err}");
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
+    }
+
+    #[test]
+    fn a_created_directory_spelled_absolutely_under_the_home_is_refused() {
         // Every stored Portable, not only the keys: `bx rm` removes these.
         let home = guarded_home();
         let (dir, _lock) = locked(&home);
-        seed_ledger(
+        let seeded = seed_ledger(
             &dir,
             target("~/.config/tool/x.conf"),
             vec![target("~/.config/tool"), absolute_under(&home, ".config")],
         );
 
-        let view = LedgerView::read(&dir, home.path()).expect("read");
+        let err = LedgerView::read(&dir, home.path()).expect_err("must refuse");
         assert!(
             matches!(
-                &view.health,
-                Health::Reset(Damage::ForeignPath { stored, .. })
+                &err,
+                Error::ForeignPath { stored, .. }
                     if *stored == absolute_under(&home, ".config").as_str()
             ),
-            "{:?}",
-            view.health,
+            "got {err}",
         );
-        assert!(view.value.is_empty());
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
     }
 
-    #[test]
-    fn an_entry_whose_path_disagrees_with_a_home_relative_key_is_not_trusted() {
-        // The key and the entry's own `path` are both stored, and both checked.
-        let home = guarded_home();
-        let (dir, _lock) = locked(&home);
+    /// A one-entry ledger whose entry names `path` but is stored under `key`.
+    fn seed_mismatched(dir: &StateDir, key: Portable, path: Portable) -> Vec<u8> {
         let mut entries = BTreeMap::new();
         entries.insert(
-            target("~/.gitconfig"),
+            key,
             LedgerEntry {
-                path: absolute_under(&home, ".gitconfig"),
+                path,
                 written: ContentHash::of(b"x"),
                 mode: Mode::DEFAULT_FILE,
                 mechanism: Mechanism::Own,
@@ -1890,10 +2252,50 @@ mod tests {
             },
         );
         store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
+        std::fs::read(dir.ledger()).expect("read the seed")
+    }
+
+    #[test]
+    fn an_entry_stored_under_a_key_that_is_not_its_path_is_damage() {
+        // Review round 3: `check_paths` never compared the two, so an entry for
+        // `~/.bbbb` filed under `~/.aaaa` loaded, and `get(~/.aaaa)` answered
+        // with another target's record.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let seeded = seed_mismatched(&dir, target("~/.aaaa"), target("~/.bbbb"));
+        let damage = Damage::KeyMismatch {
+            key: "~/.aaaa".to_string(),
+            path: "~/.bbbb".to_string(),
+        };
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(view.health, Health::Damaged(damage.clone()));
+        assert!(view.value.is_empty());
+        assert!(damage.to_string().contains("~/.bbbb"), "{damage}");
+
+        let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert_eq!(opened.health, Health::Reset(damage));
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
+            seeded,
+        );
+    }
+
+    #[test]
+    fn a_mismatched_entry_is_damage_before_it_is_a_home_problem() {
+        // A key under the home and an entry path spelled absolutely under it:
+        // both wrong, and the mismatch is what bx never writes.
+        let home = guarded_home();
+        let (dir, _lock) = locked(&home);
+        seed_mismatched(
+            &dir,
+            target("~/.gitconfig"),
+            absolute_under(&home, ".gitconfig"),
+        );
 
         let view = LedgerView::read(&dir, home.path()).expect("read");
         assert!(
-            matches!(view.health, Health::Reset(Damage::ForeignPath { .. })),
+            matches!(view.health, Health::Damaged(Damage::KeyMismatch { .. })),
             "{:?}",
             view.health,
         );

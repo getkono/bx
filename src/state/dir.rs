@@ -3,9 +3,11 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{CWD, RenameFlags};
 use rustix::io::Errno;
 
 use super::Error;
+use super::lock::ExclusiveLock;
 use crate::fs::Mode;
 
 /// `$XDG_STATE_HOME/bx` — bx's machine-owned half.
@@ -107,15 +109,29 @@ impl StateDir {
         self.root.join("lock")
     }
 
-    /// The quarantine path for a damaged state file: `<name>.corrupt`.
+    /// The first quarantine path for a damaged state file: `<name>.corrupt`.
     ///
-    /// A fixed name, deliberately. A timestamped or numbered quarantine would
-    /// be nondeterministic and would grow without bound; this one holds the
-    /// most recent damage and nothing more.
+    /// A later quarantine of the same file never reuses it while it is
+    /// occupied: [`move_aside`] takes the first free of `<name>.corrupt`,
+    /// `<name>.corrupt.1`, `<name>.corrupt.2`, …. Numbered rather than
+    /// timestamped, so the name a given sequence of damage produces is
+    /// deterministic; and never over an earlier one, because the earlier one
+    /// may be the only index there is to the user's restore blobs.
     #[must_use]
     pub(crate) fn quarantine(path: &Path) -> PathBuf {
         let mut name = path.as_os_str().to_os_string();
         name.push(".corrupt");
+        PathBuf::from(name)
+    }
+
+    /// The `n`th quarantine path: [`StateDir::quarantine`] for `0`, then
+    /// `<name>.corrupt.<n>`.
+    #[must_use]
+    pub(crate) fn quarantine_nth(path: &Path, n: u64) -> PathBuf {
+        let mut name = Self::quarantine(path).into_os_string();
+        if n > 0 {
+            name.push(format!(".{n}"));
+        }
         PathBuf::from(name)
     }
 
@@ -170,22 +186,71 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
     }
 }
 
+/// Move a damaged state file to the first quarantine name nothing occupies.
+///
+/// Demands the exclusive lock, because a rename by path moves whatever is at
+/// the path *now*: only while no writer can save is that still the file whose
+/// bytes were judged damaged.
+///
+/// The rename is `RENAME_NOREPLACE`, so an existing quarantine is never
+/// destroyed — not by an earlier bx's leftovers, and not by a race. A
+/// filesystem that does not support the flag (`EINVAL`) falls back to checking
+/// for the name first and renaming second, which the lock makes sound against
+/// every other bx.
+///
+/// # Errors
+///
+/// The first failure that is not "that name is taken".
+pub(crate) fn move_aside(path: &Path, _lock: &ExclusiveLock) -> std::io::Result<PathBuf> {
+    let mut n: u64 = 0;
+    loop {
+        let candidate = StateDir::quarantine_nth(path, n);
+        match rustix::fs::renameat_with(CWD, path, CWD, &candidate, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(candidate),
+            Err(Errno::EXIST) => {}
+            Err(Errno::INVAL) if std::fs::symlink_metadata(&candidate).is_err() => {
+                std::fs::rename(path, &candidate)?;
+                return Ok(candidate);
+            }
+            Err(Errno::INVAL) => {}
+            Err(source) => return Err(source.into()),
+        }
+        n = n
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("no free quarantine name"))?;
+    }
+}
+
 /// Check that an existing `path` is a directory, and narrow it to `mode` if it
 /// is reachable by anyone but its owner.
 fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
+    let read_failed = |source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    let linked = std::fs::symlink_metadata(path)
+        .map_err(read_failed)?
+        .file_type()
+        .is_symlink();
     // `metadata` follows symlinks on purpose: a state directory the user has
     // symlinked onto other storage is theirs to arrange, and refusing it would
     // be bx dictating a layout.
-    let meta = std::fs::metadata(path).map_err(|source| Error::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let meta = std::fs::metadata(path).map_err(read_failed)?;
     if !meta.is_dir() {
         return Err(Error::NotADirectory {
             path: path.to_path_buf(),
         });
     }
     let found = Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
+    if found.is_shared() && linked {
+        // Never `chmod` through a link: the directory it names is not one bx
+        // created, and may be shared with other users. Leaving it wide would
+        // put prior copies of private files where others can read them, so
+        // the only answer left is to refuse and say why.
+        return Err(Error::SharedLinkedDir {
+            path: path.to_path_buf(),
+        });
+    }
     if found.is_shared() {
         tracing::warn!(
             path = %path.display(),
@@ -423,6 +488,14 @@ mod tests {
             StateDir::quarantine(Path::new("/s/bx/ledger.mpk")),
             PathBuf::from("/s/bx/ledger.mpk.corrupt"),
         );
+        assert_eq!(
+            StateDir::quarantine_nth(Path::new("/s/bx/ledger.mpk"), 0),
+            PathBuf::from("/s/bx/ledger.mpk.corrupt"),
+        );
+        assert_eq!(
+            StateDir::quarantine_nth(Path::new("/s/bx/ledger.mpk"), 12),
+            PathBuf::from("/s/bx/ledger.mpk.corrupt.12"),
+        );
     }
 
     #[test]
@@ -430,10 +503,34 @@ mod tests {
         let home = guarded_home();
         let real = home.child("elsewhere");
         std::fs::create_dir_all(&real).expect("real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("private");
         std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
         std::os::unix::fs::symlink(&real, home.child(".local/state/bx")).expect("symlink");
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("ensure");
         assert!(real.join("restore").is_dir());
+        assert_eq!(mode_of(&real.join("restore")), Mode::PRIVATE_DIR);
+    }
+
+    #[test]
+    fn a_symlinked_state_directory_onto_a_shared_directory_is_refused_not_chmodded() {
+        // Review round 3: `tighten` followed the link and narrowed the
+        // directory it named — one bx did not create, and may share with others.
+        let home = guarded_home();
+        let shared = home.child("shared");
+        std::fs::create_dir_all(&shared).expect("shared");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).expect("wide");
+        std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+        std::os::unix::fs::symlink(&shared, home.child(".local/state/bx")).expect("symlink");
+        let dir = StateDir::resolve(home.path());
+
+        let err = dir.ensure().expect_err("must refuse");
+        assert!(
+            matches!(&err, Error::SharedLinkedDir { path } if path == dir.root()),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("0700"), "{err}");
+        assert_eq!(mode_of(&shared), Mode::from_bits(0o755), "left as it was");
+        assert!(!shared.join("restore").exists(), "nothing was put in it");
     }
 }

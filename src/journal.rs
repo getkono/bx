@@ -1454,20 +1454,13 @@ fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
         len,
     };
     let path = state.restore().join(reference.blob_name());
-    // The same test the ledger's own blob store makes: a content-addressed name
-    // holding the right number of bytes already holds these bytes.
-    if blob_len(&path) != Some(len) {
+    // The ledger's own blob store's test, the same function: a content-addressed
+    // name holding the right number of bytes, as a one-link regular file, already
+    // holds these bytes.
+    if crate::state::blob_len(&path) != Some(len) {
         fs::write_atomically(&path, &bytes, Mode::PRIVATE_FILE)?;
     }
     Ok(Prior::Existed(reference))
-}
-
-/// The length of an existing restore blob, or `None` if there is no file there.
-fn blob_len(path: &Path) -> Option<u64> {
-    std::fs::symlink_metadata(path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .map(|meta| meta.len())
 }
 
 /// Remove `path` if it is there, and `fsync` the directory it was in.
@@ -3057,6 +3050,64 @@ pub(crate) mod tests {
             crate::recover::Outcome::Nothing
         );
         assert_eq!(std::fs::read(&dest).expect("read"), b"the user's edit\n");
+    }
+
+    #[test]
+    fn a_hard_linked_decoy_at_a_blob_name_is_replaced_before_an_intent_names_it() {
+        // Stack integration of #7's round 3: a same-length file at
+        // `restore/<digest>` that is a second hard link is not a blob bx wrote,
+        // and the ledger's store stopped trusting one. The journal's own copy of
+        // the length check still did, so an Intent named a blob holding the
+        // decoy's bytes and the rollback could not put the original back. A
+        // removal records nothing in the ledger, so only that copy runs here.
+        use std::os::unix::fs::MetadataExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let (portable, dest) = target(home.path(), ".conf");
+        plant_file(&dest, "the original\n", Mode::DEFAULT_FILE);
+        let decoy = home.child("decoy");
+        std::fs::write(&decoy, "ZZZZZZZZZZZZ\n").expect("a decoy of the same length");
+        let blob = state
+            .restore()
+            .join(ContentHash::of(b"the original\n").to_hex());
+        std::fs::hard_link(&decoy, &blob).expect("a second link at the blob name");
+
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+        session
+            .apply(Request {
+                target: portable,
+                dest: dest.clone(),
+                content: Content::Absent {
+                    created_dirs: Vec::new(),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Released,
+            })
+            .expect("remove");
+        drop(session);
+        assert!(peek(&dest).is_none());
+
+        let meta = std::fs::symlink_metadata(&blob).expect("stat");
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.nlink(), 1, "the decoy link was replaced, not trusted");
+        assert_eq!(std::fs::read(&blob).expect("read"), b"the original\n");
+        assert_eq!(
+            std::fs::read(&decoy).expect("read"),
+            b"ZZZZZZZZZZZZ\n",
+            "and not written through",
+        );
+
+        assert_eq!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::RolledBack { undone: 1 },
+        );
+        assert_eq!(
+            peek(&dest),
+            Some((b"the original\n".to_vec(), Mode::DEFAULT_FILE))
+        );
     }
 
     #[test]

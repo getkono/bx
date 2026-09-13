@@ -73,6 +73,7 @@ pub(crate) use dir::move_aside;
 pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use ledger::RestoreRef;
+pub(crate) use ledger::blob_len;
 pub use ledger::{Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes};
 pub use lock::{ExclusiveLock, Holder, SharedLock};
 pub use store::{Damage, Health, Loaded};

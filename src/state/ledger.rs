@@ -751,7 +751,11 @@ fn merge_created_dirs(
 /// The rewrite goes through [`write_atomically`]: its rename replaces a second
 /// hard link, and it refuses a symlink outright, so a link is never written
 /// through.
-fn blob_len(path: &Path) -> Option<u64> {
+///
+/// Crate-visible because the journal's own snapshot store asks the same
+/// question before an Intent names a blob, and one rule means a decoy the
+/// ledger refuses to trust is not trusted there either.
+pub(crate) fn blob_len(path: &Path) -> Option<u64> {
     let fd = rustix::fs::open(
         path,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,

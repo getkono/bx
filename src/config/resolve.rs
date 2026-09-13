@@ -41,6 +41,7 @@
 
 use std::path::Path;
 
+use super::merge::Conflict;
 use super::target::{Attach, Body, Format, KeyPath, Target};
 use super::values::{ResolvedValues, Unresolved};
 use super::{Config, Error, Origin};
@@ -139,7 +140,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let targets = merged
         .targets
         .iter()
-        .map(|target| resolve_target(target, &values))
+        .map(|target| resolve_target(target, &values, &merged.conflicts))
         .collect::<Result<Vec<_>, Error>>()?;
 
     refuse_shared_files(&targets)?;
@@ -181,7 +182,14 @@ fn refuse_shared_files(targets: &[Resolution<Target>]) -> Result<(), Error> {
 }
 
 /// Substitute one target, or explain why it cannot be.
-fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution<Target>, Error> {
+///
+/// `conflicts` are the files a layer named twice because of this account's
+/// answers; a target that resolves to one of them is blocked rather than ready.
+fn resolve_target(
+    target: &Target,
+    values: &ResolvedValues,
+    conflicts: &[Conflict],
+) -> Result<Resolution<Target>, Error> {
     let mut unset: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
     let mut invalid: Vec<String> = Vec::new();
@@ -237,7 +245,30 @@ fn resolve_target(target: &Target, values: &ResolvedValues) -> Result<Resolution
     }
 
     match substituted(target, values) {
-        Ok(target) => Ok(Resolution::Ready(target)),
+        // One file a layer named twice because of this account's answers. Each
+        // entry for it is held back in its own position, naming the lines.
+        Ok(ready) => {
+            let clashes: Vec<&Conflict> = conflicts
+                .iter()
+                .filter(|conflict| conflict.file == ready.path.as_str())
+                .collect();
+            if clashes.is_empty() {
+                return Ok(Resolution::Ready(ready));
+            }
+            let names = in_declaration_order(
+                values,
+                clashes
+                    .iter()
+                    .flat_map(|conflict| conflict.names.iter().cloned())
+                    .collect(),
+            );
+            let hint = clashes
+                .iter()
+                .map(|conflict| conflict.hint.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            block(BlockReason::InvalidValue { names }, hint)
+        }
         Err(Broken::Defect(error)) => Err(error),
         // A field substitution made invalid. With an account answer in it, the
         // answer is the account's to change, so it costs this target and names
@@ -1027,6 +1058,134 @@ mod tests {
         .expect("the opt-out reaches the target");
 
         assert_eq!(keys(&resolved), ["~/.zshrc"]);
+    }
+
+    /// Two committed targets whose paths are two files as written, and one file
+    /// when `profile` is answered `default`.
+    const PROFILE: &str = "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
+                           [[target]]\npath = \"~/.config/{{profile}}/s\"\ncontent = \"PROFILE\"\n\
+                           [[target]]\npath = \"~/.config/default/s\"\ncontent = \"DEFAULT\"\n\
+                           [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+    #[test]
+    fn an_answer_that_makes_one_layer_name_one_file_twice_blocks_both_and_nothing_else() {
+        // The panel's falsifier. `profile = "default"` made two committed
+        // targets one file, and the whole load failed naming `bx.toml`, which
+        // the account cannot edit, taking `~/.zshrc` with it.
+        let unanswered = resolved(PROFILE, None).expect("unanswered");
+        blocked(&unanswered, 0);
+        ready(&unanswered, 1);
+        assert_eq!(ready(&unanswered, 2).path.as_str(), "~/.zshrc");
+
+        let work = resolved(PROFILE, Some("[values]\nprofile = \"work\"\n")).expect("work");
+        assert_eq!(
+            keys(&work),
+            ["~/.config/work/s", "~/.config/default/s", "~/.zshrc"]
+        );
+        ready(&work, 0);
+        ready(&work, 1);
+        ready(&work, 2);
+
+        let default = resolved(
+            PROFILE,
+            Some("# this account's answers\n[values]\nprofile = \"default\"\n"),
+        )
+        .expect("an account's answer does not fail the load");
+        assert_eq!(
+            keys(&default),
+            ["~/.config/{{profile}}/s", "~/.config/default/s", "~/.zshrc"],
+            "both targets for the file are held back, each in its own position"
+        );
+        for index in [0, 1] {
+            let entry = blocked(&default, index);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["profile".to_string()]
+                }
+            );
+            for part in [
+                "`~/.config/{{profile}}/s` at bx.toml:4",
+                "`~/.config/default/s` at bx.toml:7",
+                "the answer to `profile` at local.toml:3",
+            ] {
+                assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
+            }
+        }
+        assert_eq!(ready(&default, 2).path.as_str(), "~/.zshrc");
+    }
+
+    #[test]
+    fn a_later_layer_that_names_the_file_settles_what_an_answer_made_one_layer_name_twice() {
+        // The account has the last word: a full entry for the file replaces
+        // both, and a toggle switches both off.
+        let replaced = resolved(
+            PROFILE,
+            Some(
+                "[values]\nprofile = \"default\"\n\
+                 [[target]]\npath = \"~/.config/default/s\"\ncontent = \"LOCAL\"\n",
+            ),
+        )
+        .expect("a later full entry settles it");
+        assert_eq!(keys(&replaced), ["~/.config/default/s", "~/.zshrc"]);
+        assert_eq!(ready(&replaced, 0).body, Body::Inline("LOCAL".to_string()));
+
+        let off = resolved(
+            PROFILE,
+            Some(
+                "[values]\nprofile = \"default\"\n\
+                 [[target]]\npath = \"~/.config/default/s\"\nenabled = false\n",
+            ),
+        )
+        .expect("a later toggle switches every entry for the file off");
+        assert_eq!(keys(&off), ["~/.zshrc"]);
+    }
+
+    #[test]
+    fn an_answer_that_makes_a_layer_toggle_its_own_entry_blocks_that_file() {
+        // A module that adds a per-profile file and switches the default one
+        // off. With `profile = "default"` it both sets and switches off one file,
+        // and which wins would be an order nothing in the file states. It is
+        // reported, not hidden: the entry stays in the plan, blocked.
+        let merged = merge(
+            &[
+                layer(
+                    "bx.toml",
+                    LayerKind::Global,
+                    "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
+                     [[target]]\npath = \"~/.config/default/s\"\ncontent = \"DEFAULT\"\n\
+                     [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+                )
+                .unwrap(),
+                layer(
+                    "modules/10-profile.toml",
+                    LayerKind::Global,
+                    "[[target]]\npath = \"~/.config/{{profile}}/s\"\ncontent = \"PROFILE\"\n\
+                     [[target]]\npath = \"~/.config/default/s\"\nenabled = false\n",
+                )
+                .unwrap(),
+                layer(
+                    "local.toml",
+                    LayerKind::Local,
+                    "[values]\nprofile = \"default\"\n",
+                )
+                .unwrap(),
+            ],
+            &home(),
+        )
+        .expect("an account's answer does not fail the merge");
+        let resolved = resolve(&merged, &home()).unwrap();
+
+        assert_eq!(keys(&resolved), ["~/.config/{{profile}}/s", "~/.zshrc"]);
+        let entry = blocked(&resolved, 0);
+        for part in [
+            "modules/10-profile.toml:1",
+            "modules/10-profile.toml:4",
+            "the answer to `profile` at local.toml:2",
+        ] {
+            assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
+        }
+        ready(&resolved, 1);
     }
 
     #[test]

@@ -70,6 +70,12 @@ pub struct Config {
     ///
     /// Always empty after [`merge::merge`], which consumes them.
     pub toggles: Vec<merge::Toggle>,
+    /// Files one layer names more than once only because of this account's
+    /// answers.
+    ///
+    /// Empty from the parser. [`merge::merge`] fills it instead of failing the
+    /// load, and [`resolve::resolve`] blocks every target for such a file.
+    pub(crate) conflicts: Vec<merge::Conflict>,
 }
 
 /// One layer file and what it says.

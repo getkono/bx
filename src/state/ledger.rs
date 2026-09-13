@@ -663,7 +663,10 @@ impl Ledger {
     ///
     /// The `stat` is of the name itself, never of what it links to: see
     /// [`blob_len`]. A symlink or a second hard link of the right length is not
-    /// a blob bx wrote, so it is rewritten too.
+    /// a blob bx wrote, so it is never trusted. A second hard link is rewritten.
+    /// A symlink is refused: [`write_atomically`] never replaces a link, so
+    /// this returns [`Error::Write`] carrying [`crate::fs::Error::Symlink`] and
+    /// leaves the link and what it names alone.
     fn store_blob(&self, digest: ContentHash, bytes: &[u8]) -> Result<(), Error> {
         let restore = self.dir.restore();
         ensure_dir(&restore, Mode::PRIVATE_DIR)?;
@@ -707,8 +710,9 @@ fn merge_created_dirs(
 /// names: a decoy link to a same-length file elsewhere used to satisfy the
 /// check with none of the user's bytes behind it. It must be a regular file
 /// with exactly one link. `O_PATH` reads nothing and cannot block on a FIFO.
-/// The rewrite goes through [`write_atomically`], whose rename replaces the
-/// entry, so a link is replaced and never written through.
+/// The rewrite goes through [`write_atomically`]: its rename replaces a second
+/// hard link, and it refuses a symlink outright, so a link is never written
+/// through.
 fn blob_len(path: &Path) -> Option<u64> {
     let fd = rustix::fs::open(
         path,
@@ -1486,38 +1490,67 @@ mod tests {
     }
 
     #[test]
-    fn a_decoy_link_at_a_blob_name_is_replaced_rather_than_trusted() {
+    fn a_decoy_link_at_a_blob_name_is_refused_and_a_decoy_hard_link_replaced_never_trusted() {
         // Review round 3: `blob_len` followed a symlink, so a link at
         // `restore/<digest>` to any file of the same length made `record`
         // return Ok with none of the user's bytes on disk — found only at rm,
         // as RestoreCorrupt. A second hard link was trusted the same way.
+        //
+        // Stack integration with #8: the writer refuses to replace a symlink
+        // anywhere (`fs::Error::Symlink`), state files included. So a symlink
+        // decoy is refused, not replaced: `record` fails, stores nothing, and
+        // neither the link nor what it names is touched. A hard link is a
+        // regular file to the writer, and is still replaced.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         home.write("decoy", "ZZZZZ");
         home.write("other", "YYYYY");
-        std::os::unix::fs::symlink(home.child("decoy"), dir.restore().join(hex(b"prior")))
-            .expect("symlink");
+        let link = dir.restore().join(hex(b"prior"));
+        std::os::unix::fs::symlink(home.child("decoy"), &link).expect("symlink");
         std::fs::hard_link(home.child("other"), dir.restore().join(hex(b"third")))
             .expect("hard link");
 
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
-        for (name, body) in [("~/.a", &b"prior"[..]), ("~/.b", b"third")] {
-            let stored = ledger
-                .record(entry(name, b"bx").with_prior(prior(body, 0o644)))
-                .expect("record")
-                .clone();
-            let Prior::Existed(reference) = &stored.prior else {
-                panic!("expected a snapshot");
-            };
-            assert_eq!(
-                ledger.restore_bytes(&dir, reference).expect("restore"),
-                body
-            );
-            let blob = dir.restore().join(hex(body));
-            let meta = std::fs::symlink_metadata(&blob).expect("stat");
-            assert!(meta.file_type().is_file(), "the decoy was replaced");
-            assert_eq!(meta.nlink(), 1);
-        }
+
+        let err = ledger
+            .record(entry("~/.a", b"bx").with_prior(prior(b"prior", 0o644)))
+            .expect_err("a symlink at the blob name is never trusted");
+        assert!(
+            matches!(&err, Error::Write(crate::fs::Error::Symlink(path)) if *path == link),
+            "{err:?}",
+        );
+        assert!(
+            ledger.get(&target("~/.a")).is_none(),
+            "nothing was recorded"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the link is left where it is",
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("readlink"),
+            home.child("decoy")
+        );
+
+        let stored = ledger
+            .record(entry("~/.b", b"bx").with_prior(prior(b"third", 0o644)))
+            .expect("record")
+            .clone();
+        let Prior::Existed(reference) = &stored.prior else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(
+            ledger.restore_bytes(&dir, reference).expect("restore"),
+            b"third"
+        );
+        let blob = dir.restore().join(hex(b"third"));
+        let meta = std::fs::symlink_metadata(&blob).expect("stat");
+        assert!(meta.file_type().is_file(), "the hard link was replaced");
+        assert_eq!(meta.nlink(), 1);
+
         // Neither decoy was written through.
         assert_eq!(std::fs::read(home.child("decoy")).expect("read"), b"ZZZZZ");
         assert_eq!(std::fs::read(home.child("other")).expect("read"), b"YYYYY");

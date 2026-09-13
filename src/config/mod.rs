@@ -20,7 +20,10 @@
 //! binary through one install channel, so a repo and a binary are versioned
 //! together, and a silent no-op is the failure mode this tool exists to end.
 
+pub mod layers;
+pub mod merge;
 pub mod origin;
+pub mod resolve;
 pub mod target;
 pub mod values;
 
@@ -57,6 +60,22 @@ pub struct Config {
     pub values: Vec<ValueDecl>,
     /// `[values]`, in document order. Parsed, never resolved.
     pub value_assignments: Vec<ValueAssignment>,
+    /// List entries that restate only their natural key and `enabled`.
+    ///
+    /// A **toggle**: it flips the flag on an entry an earlier layer introduced
+    /// and leaves every other field alone, so opting out of a target costs three
+    /// lines in `local.toml` rather than a copy of the whole target — body
+    /// included — that the account wants gone. One list serves every keyed
+    /// section, each toggle carrying the section it came from.
+    ///
+    /// Always empty after [`merge::merge`], which consumes them.
+    pub toggles: Vec<merge::Toggle>,
+    /// Files one layer names more than once only because of this account's
+    /// answers.
+    ///
+    /// Empty from the parser. [`merge::merge`] fills it instead of failing the
+    /// load, and [`resolve::resolve`] blocks every target for such a file.
+    pub(crate) conflicts: Vec<merge::Conflict>,
 }
 
 /// One layer file and what it says.
@@ -64,8 +83,26 @@ pub struct Config {
 pub struct Layer {
     /// The file it was read from.
     pub file: PathBuf,
+    /// Whether the file is committed material or this account's own.
+    pub kind: LayerKind,
     /// What that file says, on its own.
     pub config: Config,
+}
+
+/// Which of the two roots a layer came from.
+///
+/// The distinction is not decoration: only [`LayerKind::Local`] may carry a
+/// `[values]` table. A committed layer that answered a value would be putting
+/// account content into a git working tree meant to be published, and Invariant
+/// 5 has no exception clause. The mechanism for a global answer already exists
+/// and is `default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LayerKind {
+    /// From the config repo: committed, publishable, account-independent.
+    #[default]
+    Global,
+    /// This account's `local.toml`, from the state directory.
+    Local,
 }
 
 /// The global layer files in a config repo, in merge order.
@@ -219,6 +256,9 @@ pub fn load_layer(path: &Path, home: &Path) -> Result<Layer, Error> {
 
     Ok(Layer {
         file: path.to_path_buf(),
+        // The repo loader only ever reads committed material. `layers::load_layer_set`
+        // is what marks the one layer that came from the state directory.
+        kind: LayerKind::Global,
         config: parse_str(&text, path, home)?,
     })
 }
@@ -250,16 +290,25 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
         match name {
             "target" => {
                 for table in entries(root, name, item, file, text)? {
-                    config
-                        .targets
-                        .push(target::parse_target(table, file, text, home)?);
+                    // A table whose only keys are `path` and `enabled` is a
+                    // toggle, not a target with no body: it flips a flag on an
+                    // entry an earlier layer introduced.
+                    match merge::toggle_of(table, merge::Section::Target, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config
+                            .targets
+                            .push(target::parse_target(table, file, text, home)?),
+                    }
                 }
             }
             "value" => {
                 for table in entries(root, name, item, file, text)? {
-                    config
-                        .values
-                        .push(values::parse_value_decl(table, file, text)?);
+                    match merge::toggle_of(table, merge::Section::Value, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config
+                            .values
+                            .push(values::parse_value_decl(table, file, text)?),
+                    }
                 }
             }
             "values" => {
@@ -280,12 +329,16 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
         }
     }
 
+    // Toggles are checked alongside the entries they flip, so one layer cannot
+    // both restate an entry and toggle it — which would leave the outcome
+    // depending on the order the two were applied in.
     check_unique(
         "target",
         config
             .targets
             .iter()
             .map(|t| (t.path.as_str(), &t.origin))
+            .chain(toggles_in(&config, merge::Section::Target))
             .collect(),
     )?;
     check_unique(
@@ -294,10 +347,21 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .values
             .iter()
             .map(|v| (v.name.as_str(), &v.origin))
+            .chain(toggles_in(&config, merge::Section::Value))
             .collect(),
     )?;
 
     Ok(config)
+}
+
+/// The toggles in `config` that belong to one section, as `check_unique` wants
+/// them.
+fn toggles_in(config: &Config, section: merge::Section) -> impl Iterator<Item = (&str, &Origin)> {
+    config
+        .toggles
+        .iter()
+        .filter(move |toggle| toggle.section == section)
+        .map(|toggle| (toggle.key.as_str(), &toggle.origin))
 }
 
 /// The elements of an array-of-tables section.
@@ -449,6 +513,26 @@ pub enum Error {
         key: String,
         /// Where it was first declared.
         first: Origin,
+    },
+
+    /// This account's layer would be read from inside the config repo.
+    ///
+    /// The state directory lies inside the repo — `XDG_STATE_HOME` set to
+    /// `XDG_CONFIG_HOME`, for one — so `local.toml` would be account content
+    /// in a publishable git tree. Refused rather than skipped, because an
+    /// account whose layer is silently dropped gets every other account's
+    /// configuration with nothing saying why.
+    #[error(
+        "{}: this account's local layer is inside the config repo {}, a git working \
+         tree meant to be published; set XDG_STATE_HOME to a directory outside it",
+        .local.display(),
+        .repo.display()
+    )]
+    LocalInRepo {
+        /// Where the local layer would be read from.
+        local: PathBuf,
+        /// The config repo it lies inside.
+        repo: PathBuf,
     },
 }
 
@@ -1198,6 +1282,38 @@ mod tests {
     }
 
     #[test]
+    fn one_layer_may_not_both_restate_an_entry_and_toggle_it() {
+        // The silent no-op the toggle mechanism exists to prevent, at its
+        // sharpest: which of the two wins would depend on the order the merge
+        // happens to apply them in, and nothing in the file says what that order
+        // is. The uniqueness check sees toggles alongside the entries they flip
+        // for exactly this.
+        let text = "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n\n\
+                    [[target]]\npath = \"~/.gitconfig\"\nenabled = false\n";
+        let message = message(text);
+
+        assert!(
+            message.contains("duplicate target `~/.gitconfig`"),
+            "{message}"
+        );
+        assert!(message.contains("first declared at bx.toml:1"), "{message}");
+        assert!(message.contains("bx.toml:5"), "{message}");
+    }
+
+    #[test]
+    fn a_toggle_before_the_entry_it_flips_is_the_same_ambiguity() {
+        // Order within the file makes no difference: it is the pair that is
+        // ambiguous, not the direction.
+        let text = "[[target]]\npath = \"~/.gitconfig\"\nenabled = false\n\n\
+                    [[target]]\npath = \"~/.gitconfig\"\ncontent = \"x\"\n";
+        assert!(message(text).contains("duplicate target `~/.gitconfig`"));
+
+        let text = "[[value]]\nname = \"agent_slice\"\nkind = \"string\"\n\n\
+                    [[value]]\nname = \"agent_slice\"\nenabled = false\n";
+        assert!(message(text).contains("duplicate value `agent_slice`"));
+    }
+
+    #[test]
     fn the_same_path_in_two_layers_is_not_a_duplicate() {
         // It is a replacement, and A3 performs it.
         let a = parse("[[target]]\npath = \"~/a\"\nfile = \"a\"\n").unwrap();
@@ -1307,6 +1423,15 @@ mod tests {
 
         assert_eq!(rendered[0], "no bx config repo at /repo");
         assert_eq!(rendered[1], "/repo/bx.toml: broken");
+        assert_eq!(
+            Error::LocalInRepo {
+                local: PathBuf::from("/repo/local.toml"),
+                repo: PathBuf::from("/repo"),
+            }
+            .to_string(),
+            "/repo/local.toml: this account's local layer is inside the config repo /repo, a \
+             git working tree meant to be published; set XDG_STATE_HOME to a directory outside it"
+        );
         for message in &rendered[2..] {
             assert!(
                 message.starts_with("bx.toml:7: "),

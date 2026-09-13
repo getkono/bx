@@ -42,7 +42,7 @@ use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
 
 /// The section header, as messages spell it.
-const SECTION: &str = "[[target]]";
+pub(crate) const SECTION: &str = "[[target]]";
 
 /// Every key a `[[target]]` entry may carry.
 const KEYS: [&str; 15] = [
@@ -576,14 +576,26 @@ fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> 
 ///
 /// The stored form is normalised, so `files/./a` and `files/a` are one body.
 fn repo_relative(ctx: &Ctx, table: &Table, key: &str, raw: &str) -> Result<PathBuf, Error> {
+    confine_to_repo(key, raw).map_err(|message| ctx.bad(table, key, message))
+}
+
+/// The rule itself, without the provenance to report it against.
+///
+/// Separate from [`repo_relative`] because it has **two** callers and may not
+/// have two implementations. A `file` may carry a `{{name}}`, so what the parser
+/// validates is the path as written and what reaches `repo.join` is the path as
+/// *substituted*: `cfg/{{account}}/gitconfig` with an answer of `../../../etc`
+/// is a repo escape that the parse-time check never sees. [`super::resolve`]
+/// re-applies this to the substituted value.
+///
+/// The message is returned rather than an [`Error`], because the two callers
+/// have different provenance to attach: a table and a key, or a target and its
+/// origin.
+pub(crate) fn confine_to_repo(key: &str, raw: &str) -> Result<PathBuf, String> {
     if raw.starts_with('/') || raw.starts_with('~') {
-        return Err(ctx.bad(
-            table,
-            key,
-            format!(
-                "`{key}` names a file inside the config repo, so it is relative to the \
-                 repo root; got {raw:?}"
-            ),
+        return Err(format!(
+            "`{key}` names a file inside the config repo, so it is relative to the \
+             repo root; got {raw:?}"
         ));
     }
 
@@ -593,10 +605,8 @@ fn repo_relative(ctx: &Ctx, table: &Table, key: &str, raw: &str) -> Result<PathB
             "" | "." => {}
             ".." => {
                 if parts.pop().is_none() {
-                    return Err(ctx.bad(
-                        table,
-                        key,
-                        format!("`{key}` may not climb out of the config repo; got {raw:?}"),
+                    return Err(format!(
+                        "`{key}` may not climb out of the config repo; got {raw:?}"
                     ));
                 }
             }
@@ -605,10 +615,8 @@ fn repo_relative(ctx: &Ctx, table: &Table, key: &str, raw: &str) -> Result<PathB
     }
 
     if parts.is_empty() {
-        return Err(ctx.bad(
-            table,
-            key,
-            format!("`{key}` must name a file in the config repo; got {raw:?}"),
+        return Err(format!(
+            "`{key}` must name a file in the config repo; got {raw:?}"
         ));
     }
 

@@ -23,7 +23,7 @@
 //! adds a second resolver.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -167,17 +167,28 @@ pub enum Error {
     NotUtf8(PathBuf),
 }
 
-/// Normalise a rooted path lexically, without touching the filesystem.
+/// Normalise a **rooted** path lexically, without touching the filesystem.
 ///
-/// Collapses `//` and `.`, and resolves `..` textually. Lexical and not
-/// `canonicalize`, because a portable path names a destination that need not
-/// exist yet, and because resolving symlinks would make the result depend on the
-/// machine — which is the one thing a *portable* path may not do.
+/// The one entry point that knows what a root means. It delegates the `.`, `//`
+/// and `..` folding to [`normalize`] — there is one implementation of that rule
+/// in this crate, because two that disagreed would let a value land outside the
+/// root that was meant to admit it — and adds the only thing a root contributes:
+/// what a `..` with nothing left to cancel does.
 ///
-/// An absolute path clamps at `/`, as the kernel does: `/a/../..` is `/`. A
-/// `~`-rooted path does not clamp, because `~/..` is a real location outside the
-/// home and silently reading it as the home would be the surprise.
-fn normalise(raw: &str) -> Result<String, Error> {
+/// An absolute path **clamps** at `/`, as the kernel does: `/a/../..` is `/`. A
+/// `~`-rooted one is **refused** with [`Error::EscapesRoot`], because `~/..` is
+/// a real location outside the home and silently reading it as the home would be
+/// the surprise.
+///
+/// Lexical and never `canonicalize`: a portable path names a destination that
+/// need not exist yet, and resolving symlinks would make the result depend on
+/// the machine, which is the one thing a *portable* path may not do.
+///
+/// # Errors
+///
+/// [`Error::NotPortable`] if `raw` is neither `~`- nor `/`-rooted;
+/// [`Error::EscapesRoot`] if it is `~`-rooted and climbs out of that root.
+pub fn normalize_rooted(raw: &str) -> Result<String, Error> {
     let Some((root, rest)) = split_root(raw) else {
         return Err(if raw.starts_with('~') {
             Error::UnknownRoot(raw.to_string())
@@ -186,17 +197,24 @@ fn normalise(raw: &str) -> Result<String, Error> {
         });
     };
 
-    let mut parts: Vec<&str> = Vec::new();
-    for part in rest.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                if parts.pop().is_none() && !root.is_empty() {
-                    return Err(Error::EscapesRoot(raw.to_string()));
-                }
-            }
-            named => parts.push(named),
+    // `rest` is relative to the root, so `normalize` keeps a leading `..` that
+    // has nothing to cancel — which is exactly the climb the root then rules on.
+    // Its leading slashes are separators and are stripped first: `~//..` has the
+    // rest `/..`, which `normalize` would read as absolute and clamp at `/`,
+    // turning a climb out of the home into the home itself.
+    let folded = normalize(Path::new(rest.trim_start_matches('/')));
+    let folded = folded.to_string_lossy();
+    let mut parts: Vec<&str> = folded
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+
+    if root.is_empty() {
+        while parts.first() == Some(&"..") {
+            parts.remove(0);
         }
+    } else if parts.first() == Some(&"..") {
+        return Err(Error::EscapesRoot(raw.to_string()));
     }
 
     Ok(match (root, parts.is_empty()) {
@@ -379,7 +397,7 @@ impl TryFrom<String> for Portable {
     /// [`Error::NotNormalised`] for one that is well-rooted but not its own
     /// normal form.
     fn try_from(raw: String) -> Result<Self, Error> {
-        let normalised = normalise(&raw)?;
+        let normalised = normalize_rooted(&raw)?;
         if normalised == raw {
             Ok(Self(normalised))
         } else {
@@ -432,7 +450,7 @@ impl Portable {
         if !path.is_absolute() {
             return Err(Error::NotPortable(raw.to_string()));
         }
-        let normalised = normalise(raw)?;
+        let normalised = normalize_rooted(raw)?;
         Ok(Self(fold_under_home(&normalised, &home)))
     }
 
@@ -492,7 +510,7 @@ impl Portable {
     /// spelling is the one the refusal message recommends.
     pub fn parse_in(raw: &str, home: &Path) -> Result<Self, Error> {
         let home = home_str(home)?;
-        let normalised = normalise(raw)?;
+        let normalised = normalize_rooted(raw)?;
         let folded = fold_under_home(&normalised, &home);
         if folded == normalised {
             Ok(Self(normalised))
@@ -567,7 +585,7 @@ impl Portable {
 /// [`Error::HomeNotAbsolute`] when `home` is not an absolute path. An absolute
 /// path always normalises — it clamps at `/` — so that is the only failure.
 ///
-/// [`normalise`] succeeds for a `~`-rooted string as well as a `/`-rooted one,
+/// [`normalize_rooted`] succeeds for a `~`-rooted string as well as a `/`-rooted one,
 /// so normalising alone rejected only a home that was neither. A `~`-rooted
 /// home was accepted: `parse_in("~/x", Path::new("~/nested"))` returned `Ok`,
 /// and rendering the result against that home produced a **relative** path.
@@ -576,7 +594,8 @@ fn home_str(home: &Path) -> Result<String, Error> {
     let raw = home
         .to_str()
         .ok_or_else(|| Error::NotUtf8(home.to_path_buf()))?;
-    let normalised = normalise(raw).map_err(|_| Error::HomeNotAbsolute(home.to_path_buf()))?;
+    let normalised =
+        normalize_rooted(raw).map_err(|_| Error::HomeNotAbsolute(home.to_path_buf()))?;
     if normalised.starts_with('/') {
         Ok(normalised)
     } else {
@@ -597,6 +616,56 @@ impl std::fmt::Display for Portable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Normalise a path **lexically**: no `.`, no `..`, no repeated or trailing
+/// separator — and without touching the filesystem.
+///
+/// The filesystem is deliberately not consulted. `plan` must describe the same
+/// change whether or not the paths it names exist yet, so `canonicalize` — which
+/// fails on a missing path and resolves symlinks against whatever happens to be
+/// mounted — is not available here. The architecture fixes that rule for the
+/// `env_guard` root comparison, and a declared `path` value is normalised with
+/// this same function so that a root and a value can be compared at all.
+///
+/// `..` never walks above the root: `/..` is `/`, because on Linux the root's
+/// parent is the root. In a *relative* path a leading `..` is preserved, since
+/// there is no earlier component for it to cancel and dropping it would change
+/// which directory the path names.
+///
+/// An empty result normalises to `.`, the shortest path naming the same place.
+///
+/// This is the crate's **only** implementation of the lexical rule.
+/// [`normalize_rooted`] is the same rule with a root's policy on top, and
+/// [`Portable`] is built through that, so a declared `path` value, a portable
+/// path and `env_guard`'s root comparison cannot disagree about what a `..`
+/// means. Two normalisers that disagreed would let a value land outside the root
+/// that was meant to admit it.
+#[must_use]
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            // `Components` already elides an interior `.`; a *leading* one in a
+            // relative path survives, and is what this arm removes.
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `/..` is `/`. Anything else — an empty stack, or one whose
+                // last entry is itself a `..` — has nothing to cancel, so the
+                // `..` is kept.
+                Some(Component::RootDir) => {}
+                _ => out.push(component),
+            },
+            other => out.push(other),
+        }
+    }
+    if out.is_empty() {
+        return PathBuf::from(".");
+    }
+    out.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -1064,6 +1133,58 @@ mod tests {
     }
 
     #[test]
+    fn both_normalisers_fold_by_one_rule() {
+        // The collision this branch had to resolve: a rooted path and a bare
+        // path must agree about what `.`, `//` and `..` mean, or a value can be
+        // normalised into one shape for the env_guard root set and another for
+        // the target it is written into.
+        for rest in [
+            "a/./b",
+            "a//b",
+            "a/b/../c",
+            "a/../b",
+            "a/b/",
+            ".",
+            "",
+            "a/../../b",
+            // A rest that opens with a slash: `~//..` is `~` then `/..`, and it
+            // climbs out of the root however many slashes separate the two.
+            "/..",
+            "/../x",
+            "//..",
+            "/x",
+            "//x",
+        ] {
+            // The rest is relative to its root, so its leading slashes are the
+            // separator's and not an absolute path's.
+            let folded = normalize(Path::new(rest.trim_start_matches('/')));
+            let folded = folded.to_string_lossy();
+
+            let absolute = normalize_rooted(&format!("/{rest}")).expect("absolute always folds");
+            let tilde = normalize_rooted(&format!("~/{rest}"));
+
+            if folded.starts_with("..") {
+                // The root's own policy, and the only thing that differs: an
+                // absolute path clamps the climb away, as the kernel does, and a
+                // `~`-rooted one is refused outright.
+                let clamped = folded.trim_start_matches("..").trim_start_matches('/');
+                assert_eq!(absolute, format!("/{clamped}"), "{rest}");
+                assert_eq!(
+                    tilde,
+                    Err(Error::EscapesRoot(format!("~/{rest}"))),
+                    "{rest}"
+                );
+            } else if folded == "." {
+                assert_eq!(absolute, "/", "/{rest}");
+                assert_eq!(tilde.unwrap(), "~", "{rest}");
+            } else {
+                assert_eq!(absolute, format!("/{folded}"), "{rest}");
+                assert_eq!(tilde.unwrap(), format!("~/{folded}"), "{rest}");
+            }
+        }
+    }
+
+    #[test]
     fn a_portable_that_climbs_out_of_home_is_rejected() {
         // under_home() is a claim about location, so this may not parse.
         for escaping in [
@@ -1071,6 +1192,12 @@ mod tests {
             "~/../../etc/passwd",
             "~/.ssh/../../etc",
             "~/a/../..",
+            // A doubled separator after `~` is still a climb out of the home,
+            // not an absolute `/..` clamped at the filesystem root.
+            "~//..",
+            "~//../x",
+            "~///../x",
+            "~//../.bashrc",
         ] {
             assert_eq!(
                 Portable::parse_in(escaping, &home()),
@@ -1078,6 +1205,11 @@ mod tests {
                 "{escaping}"
             );
         }
+        assert_eq!(
+            Portable::parse_in("~//x", &home()).unwrap().as_str(),
+            "~/x",
+            "a doubled separator that does not climb still folds"
+        );
         assert_eq!(
             Error::EscapesRoot("~/..".to_string()).to_string(),
             "a portable path may not climb out of the home it is rooted in: ~/.."
@@ -1344,6 +1476,61 @@ mod tests {
                 built
             );
         }
+    }
+
+    // --- lexical normalisation --------------------------------------------
+
+    #[test]
+    fn normalize_removes_dot_and_dotdot() {
+        assert_eq!(
+            normalize(Path::new("/var/mnt/scratch/./one/../example/cache")),
+            Path::new("/var/mnt/scratch/example/cache")
+        );
+        assert_eq!(normalize(Path::new("./a/b")), Path::new("a/b"));
+    }
+
+    #[test]
+    fn normalize_collapses_repeated_and_trailing_slashes() {
+        assert_eq!(
+            normalize(Path::new("/var//mnt///scratch/")),
+            Path::new("/var/mnt/scratch")
+        );
+    }
+
+    #[test]
+    fn normalize_does_not_walk_above_the_root() {
+        // The root's parent is the root, so a `..` chain cannot escape it and
+        // cannot be used to smuggle a path out of a declared root.
+        assert_eq!(normalize(Path::new("/../../..")), Path::new("/"));
+        assert_eq!(normalize(Path::new("/a/../../b")), Path::new("/b"));
+    }
+
+    #[test]
+    fn normalize_keeps_a_leading_dotdot_in_a_relative_path() {
+        // Nothing precedes it, so dropping it would name a different directory.
+        assert_eq!(normalize(Path::new("../../a")), Path::new("../../a"));
+        assert_eq!(normalize(Path::new("a/../../b")), Path::new("../b"));
+    }
+
+    #[test]
+    fn normalize_reduces_an_empty_result_to_dot() {
+        assert_eq!(normalize(Path::new("")), Path::new("."));
+        assert_eq!(normalize(Path::new(".")), Path::new("."));
+        assert_eq!(normalize(Path::new("a/..")), Path::new("."));
+    }
+
+    #[test]
+    fn normalize_never_touches_the_filesystem() {
+        // Normalising a path that does not exist succeeds and leaves it alone,
+        // which `canonicalize` could not do.
+        let absent = Path::new("/var/mnt/scratch/example/does/not/exist");
+        assert_eq!(normalize(absent), absent);
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        let once = normalize(Path::new("/a/./b/../c//d/"));
+        assert_eq!(normalize(&once), once);
     }
 
     /// The recorded limit: a home reached through a symlinked alias is not seen.

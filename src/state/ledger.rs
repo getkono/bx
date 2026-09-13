@@ -25,7 +25,7 @@ use super::Error;
 use super::dir::{StateDir, ensure_dir};
 use super::hash::ContentHash;
 use super::lock::ExclusiveLock;
-use super::store::{self, Loaded};
+use super::store::{self, Loaded, Rejected};
 use crate::fs::{Mode, write_atomically};
 
 /// The envelope tag for `ledger.mpk`.
@@ -230,8 +230,11 @@ pub struct LedgerView {
 impl LedgerView {
     /// Read the ledger without taking a lock.
     ///
-    /// A damaged `ledger.mpk` is quarantined and this returns an empty ledger,
-    /// with [`super::Health::Reset`] saying so.
+    /// A damaged `ledger.mpk` yields an empty ledger with
+    /// [`super::Health::Damaged`] saying so, and is **left where it is**: a
+    /// reader holding no lock cannot know that the path still names the bytes
+    /// it read, so it renames nothing. [`Ledger::open`], under the lock, is what
+    /// quarantines.
     ///
     /// # Every stored path is checked against `home`
     ///
@@ -242,8 +245,16 @@ impl LedgerView {
     /// meets last. So every stored path — each key, each entry's `path`, and
     /// each of its `created_dirs` — goes through
     /// [`crate::paths::Portable::check_against`], and a ledger holding one that
-    /// fails is damaged ([`super::Damage::ForeignPath`]) and quarantined like
-    /// any other, never believed.
+    /// fails is **refused**, never believed and never discarded.
+    ///
+    /// Refused rather than degraded because the likeliest cause is not a
+    /// damaged ledger but the same account with its home spelled another way —
+    /// a `/home` → `/var/home` alias, or `HOME=/` — and resetting a good ledger
+    /// for that would make the next apply record bx's own output as every prior.
+    ///
+    /// An entry stored under a key that is not its own `path` is different: bx
+    /// never writes one, whatever the home, so that is
+    /// [`super::Damage::KeyMismatch`].
     ///
     /// # Errors
     ///
@@ -252,31 +263,56 @@ impl LedgerView {
     /// intact behind the failure, so it is neither quarantined nor replaced,
     /// and the caller must stop rather than proceed against an empty ledger.
     ///
+    /// [`Error::ForeignPath`] if a stored path cannot be used with `home`. The
+    /// ledger is left exactly as it is.
+    ///
     /// [`Error::Home`] if `home` is not absolute or not UTF-8. That is checked
     /// before the file is touched, so a bad home never quarantines a ledger.
     pub fn read(dir: &StateDir, home: &Path) -> Result<Loaded<Self>, Error> {
+        Self::load(dir, home, None)
+    }
+
+    /// Read the ledger, quarantining damage only when `lock` is held.
+    fn load(
+        dir: &StateDir,
+        home: &Path,
+        lock: Option<&ExclusiveLock>,
+    ) -> Result<Loaded<Self>, Error> {
         crate::paths::Portable::parse_in("~", home).map_err(|source| Error::Home {
             home: home.to_path_buf(),
             source,
         })?;
-        store::load_checked(&dir.ledger(), KIND, VERSION, |view: &Self| {
-            view.check_paths(home)
+        let path = dir.ledger();
+        store::load_checked(&path, KIND, VERSION, lock, |view: &Self| {
+            view.check_paths(&path, home)
         })
     }
 
-    /// Refuse a ledger holding a path this account could not have written.
+    /// Reject a ledger bx could not have written, or cannot use with `home`.
     ///
-    /// `home` has already been accepted, so the only failure left is
-    /// [`crate::paths::Error::AbsoluteUnderHome`].
-    fn check_paths(&self, home: &Path) -> Result<(), super::Damage> {
+    /// Damage is looked for across every entry before any path is checked
+    /// against the home, so a damaged ledger is never reported as a home
+    /// problem. `home` has already been accepted, so the only home failure left
+    /// is [`crate::paths::Error::AbsoluteUnderHome`].
+    fn check_paths(&self, file: &Path, home: &Path) -> Result<(), Rejected> {
         for (key, entry) in &self.entries {
-            for stored in [key, &entry.path].into_iter().chain(&entry.created_dirs) {
-                stored
-                    .check_against(home)
-                    .map_err(|reason| super::Damage::ForeignPath {
+            if *key != entry.path {
+                return Err(Rejected::Damage(super::Damage::KeyMismatch {
+                    key: key.as_str().to_string(),
+                    path: entry.path.as_str().to_string(),
+                }));
+            }
+        }
+        for (key, entry) in &self.entries {
+            for stored in std::iter::once(key).chain(&entry.created_dirs) {
+                stored.check_against(home).map_err(|source| {
+                    Rejected::Refused(Error::ForeignPath {
+                        path: file.to_path_buf(),
+                        home: home.to_path_buf(),
                         stored: stored.as_str().to_string(),
-                        reason: reason.to_string(),
-                    })?;
+                        source: Box::new(source),
+                    })
+                })?;
             }
         }
         Ok(())
@@ -371,8 +407,10 @@ impl Ledger {
     /// The lock is not stored; requiring it here is what makes a `Ledger` proof
     /// that one was taken.
     ///
-    /// A damaged `ledger.mpk` is quarantined and this returns an empty ledger,
-    /// with [`super::Health::Reset`] saying so.
+    /// A damaged `ledger.mpk` is moved aside to the first free quarantine name
+    /// and this returns an empty ledger, with [`super::Health::Reset`] saying
+    /// so. The lock is what makes that rename safe: no writer can have saved
+    /// since the bytes were read.
     ///
     /// # Errors
     ///
@@ -382,11 +420,13 @@ impl Ledger {
     /// target's prior and discard the user's, so the failure is returned rather
     /// than degraded.
     ///
-    /// [`Error::Home`], as [`LedgerView::read`], which checks every stored path
-    /// against `home` the same way.
-    pub fn open(dir: &StateDir, _lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
+    /// [`Error::ForeignPath`] and [`Error::Home`], as [`LedgerView::read`],
+    /// which checks every stored path against `home` the same way. The same
+    /// reasoning applies: a ledger written under another spelling of the home
+    /// is refused, not reset.
+    pub fn open(dir: &StateDir, lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
         let dir = dir.clone();
-        Ok(LedgerView::read(&dir, home)?.map(|view| Self { dir, view }))
+        Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self { dir, view }))
     }
 
     /// The state directory this ledger was opened from.
@@ -1777,6 +1817,51 @@ mod tests {
         assert!(dir.root().join("ledger.mpk.corrupt").exists());
     }
 
+    #[test]
+    fn a_lockless_view_of_a_damaged_ledger_leaves_it_for_the_lock_holder() {
+        // Review round 3: `LedgerView::read` renamed by path with no lock, so a
+        // writer's save between the read and the rename lost its ledger.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(view.health, Health::Damaged(Damage::Malformed));
+        assert!(view.value.is_empty());
+        assert_eq!(
+            std::fs::read(dir.ledger()).expect("left in place"),
+            b"not messagepack",
+        );
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
+
+        let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert_eq!(opened.health, Health::Reset(Damage::Malformed));
+        assert!(!dir.ledger().exists());
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
+            b"not messagepack",
+        );
+    }
+
+    #[test]
+    fn a_second_damaged_ledger_never_replaces_the_first_quarantine() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        std::fs::write(dir.ledger(), b"first damaged ledger").expect("seed");
+        Ledger::open(&dir, &lock, home.path()).expect("first open");
+        std::fs::write(dir.ledger(), b"second damaged ledger").expect("seed again");
+        Ledger::open(&dir, &lock, home.path()).expect("second open");
+
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("first kept"),
+            b"first damaged ledger",
+        );
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt.1")).expect("second kept"),
+            b"second damaged ledger",
+        );
+    }
+
     /// `home/<rel>` as the absolute `Portable` a hand-edited or foreign ledger
     /// would hold: well-formed, so it decodes, and under this home.
     fn absolute_under(home: &GuardedHome, rel: &str) -> Portable {
@@ -1804,83 +1889,127 @@ mod tests {
     }
 
     #[test]
-    fn a_ledger_keyed_by_an_absolute_path_under_the_home_is_not_trusted() {
+    fn a_ledger_keyed_by_an_absolute_path_under_the_home_is_refused_not_reset() {
         // Decision R3-1 of #4: `/…/home/.gitconfig` decodes, because a decoder
         // has no home, and on this account it is a second key for
-        // `~/.gitconfig`. The loader is where the home is, so the loader refuses.
+        // `~/.gitconfig`. The loader is where the home is, so the loader
+        // refuses — and, since review round 3, renames nothing.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let key = absolute_under(&home, ".gitconfig");
         assert!(key.as_str().starts_with('/'), "{key}");
         let seeded = seed_ledger(&dir, key.clone(), Vec::new());
 
-        let view = LedgerView::read(&dir, home.path()).expect("read");
-        let Health::Reset(Damage::ForeignPath { stored, reason }) = &view.health else {
-            panic!("a foreign key must not load, got {:?}", view.health);
+        let err = LedgerView::read(&dir, home.path()).expect_err("must refuse");
+        let Error::ForeignPath {
+            path,
+            home: checked,
+            stored,
+            source,
+        } = &err
+        else {
+            panic!("a foreign key must be refused, got {err}");
         };
+        assert_eq!(path, &dir.ledger());
+        assert_eq!(checked, home.path());
         assert_eq!(stored, key.as_str());
-        assert!(reason.contains("~/.gitconfig"), "{reason}");
-        assert!(
-            view.value.is_empty(),
-            "nothing from that ledger is believed"
-        );
-        assert!(
-            view.health
-                .damage()
-                .expect("damage")
-                .to_string()
-                .contains(key.as_str()),
-            "the warning names the path",
-        );
-        // Quarantined like any other damage: the bytes are kept, not deleted.
-        let quarantine = dir.root().join("ledger.mpk.corrupt");
-        assert_eq!(std::fs::read(&quarantine).expect("quarantined"), seeded);
+        assert!(source.to_string().contains("~/.gitconfig"), "{source}");
+        assert!(err.to_string().contains(key.as_str()), "names the path");
+        assert!(err.to_string().contains("Nothing was changed"), "{err}");
 
-        // Opening for writing goes through the same check.
-        seed_ledger(&dir, key, Vec::new());
-        let ledger = Ledger::open(&dir, &lock, home.path()).expect("open");
-        assert!(
-            matches!(ledger.health, Health::Reset(Damage::ForeignPath { .. })),
-            "{:?}",
-            ledger.health,
-        );
-        assert!(ledger.value.is_empty());
+        // Opening for writing goes through the same check, and refuses too.
+        let err = Ledger::open(&dir, &lock, home.path()).expect_err("must refuse");
+        assert!(matches!(err, Error::ForeignPath { .. }), "got {err}");
+
+        // Neither call touched the ledger.
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
     }
 
     #[test]
-    fn a_created_directory_spelled_absolutely_under_the_home_is_not_trusted() {
+    fn a_home_spelled_through_an_alias_stops_bx_and_leaves_the_ledger_in_place() {
+        // Review round 3's falsifier. An apply under one spelling of the home —
+        // `/var/home/me`, reached through a `/home/me` alias — records a target
+        // named by the other spelling as an absolute path. The next run, under
+        // the other spelling, folds that path into its home. That used to
+        // quarantine a good ledger, after which the next apply recorded bx's own
+        // output as every prior.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let alias = home.child("alias");
+        std::os::unix::fs::symlink(home.path(), &alias).expect("alias");
+
+        let mut ledger = Ledger::open(&dir, &lock, &alias).expect("open").value;
+        let key = Portable::from_path(&home.child(".foo"), &alias).expect("portable");
+        assert!(key.as_str().starts_with('/'), "{key}");
+        ledger
+            .record(
+                NewEntry::new(
+                    key,
+                    ContentHash::of(b"bx"),
+                    Mode::DEFAULT_FILE,
+                    Mechanism::Own,
+                )
+                .with_prior(prior(b"the user wrote this", 0o644)),
+            )
+            .expect("record");
+        ledger.save().expect("save");
+        let seeded = std::fs::read(dir.ledger()).expect("read");
+
+        let err = Ledger::open(&dir, &lock, home.path()).expect_err("must refuse");
+        assert!(matches!(err, Error::ForeignPath { .. }), "got {err}");
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
+
+        // The ledger is intact: under the spelling it was written with, it loads.
+        let reopened = Ledger::open(&dir, &lock, &alias).expect("reopen");
+        assert_eq!(reopened.health, Health::Loaded);
+        assert_eq!(reopened.value.len(), 1);
+    }
+
+    #[test]
+    fn a_root_home_refuses_rather_than_resetting() {
+        // `HOME=/` folds every absolute path into the home.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let outside = Portable::try_from("/etc/bx-example.conf".to_string()).expect("absolute");
+        let seeded = seed_ledger(&dir, outside, Vec::new());
+
+        let err = Ledger::open(&dir, &lock, Path::new("/")).expect_err("must refuse");
+        assert!(matches!(err, Error::ForeignPath { .. }), "got {err}");
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
+    }
+
+    #[test]
+    fn a_created_directory_spelled_absolutely_under_the_home_is_refused() {
         // Every stored Portable, not only the keys: `bx rm` removes these.
         let home = guarded_home();
         let (dir, _lock) = locked(&home);
-        seed_ledger(
+        let seeded = seed_ledger(
             &dir,
             target("~/.config/tool/x.conf"),
             vec![target("~/.config/tool"), absolute_under(&home, ".config")],
         );
 
-        let view = LedgerView::read(&dir, home.path()).expect("read");
+        let err = LedgerView::read(&dir, home.path()).expect_err("must refuse");
         assert!(
             matches!(
-                &view.health,
-                Health::Reset(Damage::ForeignPath { stored, .. })
+                &err,
+                Error::ForeignPath { stored, .. }
                     if *stored == absolute_under(&home, ".config").as_str()
             ),
-            "{:?}",
-            view.health,
+            "got {err}",
         );
-        assert!(view.value.is_empty());
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
     }
 
-    #[test]
-    fn an_entry_whose_path_disagrees_with_a_home_relative_key_is_not_trusted() {
-        // The key and the entry's own `path` are both stored, and both checked.
-        let home = guarded_home();
-        let (dir, _lock) = locked(&home);
+    /// A one-entry ledger whose entry names `path` but is stored under `key`.
+    fn seed_mismatched(dir: &StateDir, key: Portable, path: Portable) -> Vec<u8> {
         let mut entries = BTreeMap::new();
         entries.insert(
-            target("~/.gitconfig"),
+            key,
             LedgerEntry {
-                path: absolute_under(&home, ".gitconfig"),
+                path,
                 written: ContentHash::of(b"x"),
                 mode: Mode::DEFAULT_FILE,
                 mechanism: Mechanism::Own,
@@ -1890,10 +2019,50 @@ mod tests {
             },
         );
         store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
+        std::fs::read(dir.ledger()).expect("read the seed")
+    }
+
+    #[test]
+    fn an_entry_stored_under_a_key_that_is_not_its_path_is_damage() {
+        // Review round 3: `check_paths` never compared the two, so an entry for
+        // `~/.bbbb` filed under `~/.aaaa` loaded, and `get(~/.aaaa)` answered
+        // with another target's record.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let seeded = seed_mismatched(&dir, target("~/.aaaa"), target("~/.bbbb"));
+        let damage = Damage::KeyMismatch {
+            key: "~/.aaaa".to_string(),
+            path: "~/.bbbb".to_string(),
+        };
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(view.health, Health::Damaged(damage.clone()));
+        assert!(view.value.is_empty());
+        assert!(damage.to_string().contains("~/.bbbb"), "{damage}");
+
+        let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert_eq!(opened.health, Health::Reset(damage));
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
+            seeded,
+        );
+    }
+
+    #[test]
+    fn a_mismatched_entry_is_damage_before_it_is_a_home_problem() {
+        // A key under the home and an entry path spelled absolutely under it:
+        // both wrong, and the mismatch is what bx never writes.
+        let home = guarded_home();
+        let (dir, _lock) = locked(&home);
+        seed_mismatched(
+            &dir,
+            target("~/.gitconfig"),
+            absolute_under(&home, ".gitconfig"),
+        );
 
         let view = LedgerView::read(&dir, home.path()).expect("read");
         assert!(
-            matches!(view.health, Health::Reset(Damage::ForeignPath { .. })),
+            matches!(view.health, Health::Damaged(Damage::KeyMismatch { .. })),
             "{:?}",
             view.health,
         );

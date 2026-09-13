@@ -20,10 +20,18 @@
 //!
 //! A machine-owned file that becomes an error the user cannot clear is a defect,
 //! so damaged *contents* are never fatal. A truncated, garbled, wrong-kind or
-//! future-versioned file is moved aside to a fixed `<name>.corrupt`, reported
-//! through `tracing::warn!`, and replaced by the empty default; the next save
-//! writes a clean file. The damaged bytes are kept, never deleted, so a human or
-//! `bx doctor` can still look at them. See [`Damage`] and [`Health`].
+//! future-versioned file is reported through `tracing::warn!` and replaced by
+//! the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
+//! the first free `<name>.corrupt`, `<name>.corrupt.1`, … — never over an earlier
+//! quarantine — and the next save writes a clean file. A lockless reader moves
+//! nothing ([`Health::Damaged`]): a rename by path could move aside a file a
+//! writer saved after the read. The damaged bytes are kept, never deleted, so a
+//! human or `bx doctor` can still look at them. See [`Damage`] and [`Health`].
+//!
+//! A stored value refused for a reason that says nothing about its bytes — a
+//! ledger checked against a home spelled differently from the one it was
+//! written under — is not damage either: [`Error::ForeignPath`] reaches the
+//! caller, and nothing is renamed.
 //!
 //! A file that **cannot be read** is a different thing and is handled the
 //! opposite way. `EACCES` left behind by a `sudo bx`, `EIO` from a failing
@@ -138,6 +146,30 @@ pub enum Error {
         /// Why it was refused.
         #[source]
         source: crate::paths::Error,
+    },
+    /// A stored path cannot be used with the home it was checked against.
+    ///
+    /// Almost always the same account with its home spelled another way — a
+    /// `/home` → `/var/home` alias, or `HOME=/` — rather than a damaged file,
+    /// so it is refused rather than degraded. Nothing is renamed or reset: the
+    /// ledger is left exactly where it is, and bx stops, because proceeding
+    /// against an empty ledger would record bx's own output as every prior.
+    #[error(
+        "{} stores the path {stored}, which cannot be used with the home {}: {source}. \
+         Nothing was changed; run bx with the home spelled as it was when bx wrote it",
+        .path.display(),
+        .home.display()
+    )]
+    ForeignPath {
+        /// The state file holding the path.
+        path: PathBuf,
+        /// The home it was checked against.
+        home: PathBuf,
+        /// The path as it is stored.
+        stored: String,
+        /// Why it cannot be used with that home.
+        #[source]
+        source: Box<crate::paths::Error>,
     },
     /// A ledger entry references a restore snapshot that is not on disk.
     #[error("the restore snapshot {digest} is missing from {}", .path.display())]

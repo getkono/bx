@@ -3,9 +3,11 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{CWD, RenameFlags};
 use rustix::io::Errno;
 
 use super::Error;
+use super::lock::ExclusiveLock;
 use crate::fs::Mode;
 
 /// `$XDG_STATE_HOME/bx` — bx's machine-owned half.
@@ -107,15 +109,29 @@ impl StateDir {
         self.root.join("lock")
     }
 
-    /// The quarantine path for a damaged state file: `<name>.corrupt`.
+    /// The first quarantine path for a damaged state file: `<name>.corrupt`.
     ///
-    /// A fixed name, deliberately. A timestamped or numbered quarantine would
-    /// be nondeterministic and would grow without bound; this one holds the
-    /// most recent damage and nothing more.
+    /// A later quarantine of the same file never reuses it while it is
+    /// occupied: [`move_aside`] takes the first free of `<name>.corrupt`,
+    /// `<name>.corrupt.1`, `<name>.corrupt.2`, …. Numbered rather than
+    /// timestamped, so the name a given sequence of damage produces is
+    /// deterministic; and never over an earlier one, because the earlier one
+    /// may be the only index there is to the user's restore blobs.
     #[must_use]
     pub(crate) fn quarantine(path: &Path) -> PathBuf {
         let mut name = path.as_os_str().to_os_string();
         name.push(".corrupt");
+        PathBuf::from(name)
+    }
+
+    /// The `n`th quarantine path: [`StateDir::quarantine`] for `0`, then
+    /// `<name>.corrupt.<n>`.
+    #[must_use]
+    pub(crate) fn quarantine_nth(path: &Path, n: u64) -> PathBuf {
+        let mut name = Self::quarantine(path).into_os_string();
+        if n > 0 {
+            name.push(format!(".{n}"));
+        }
         PathBuf::from(name)
     }
 
@@ -167,6 +183,41 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
         Ok(()) => rustix::fs::chmod(path, mode.into()).map_err(create_failed),
         Err(Errno::EXIST) => tighten(path, mode),
         Err(source) => Err(create_failed(source)),
+    }
+}
+
+/// Move a damaged state file to the first quarantine name nothing occupies.
+///
+/// Demands the exclusive lock, because a rename by path moves whatever is at
+/// the path *now*: only while no writer can save is that still the file whose
+/// bytes were judged damaged.
+///
+/// The rename is `RENAME_NOREPLACE`, so an existing quarantine is never
+/// destroyed — not by an earlier bx's leftovers, and not by a race. A
+/// filesystem that does not support the flag (`EINVAL`) falls back to checking
+/// for the name first and renaming second, which the lock makes sound against
+/// every other bx.
+///
+/// # Errors
+///
+/// The first failure that is not "that name is taken".
+pub(crate) fn move_aside(path: &Path, _lock: &ExclusiveLock) -> std::io::Result<PathBuf> {
+    let mut n: u64 = 0;
+    loop {
+        let candidate = StateDir::quarantine_nth(path, n);
+        match rustix::fs::renameat_with(CWD, path, CWD, &candidate, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(candidate),
+            Err(Errno::EXIST) => {}
+            Err(Errno::INVAL) if std::fs::symlink_metadata(&candidate).is_err() => {
+                std::fs::rename(path, &candidate)?;
+                return Ok(candidate);
+            }
+            Err(Errno::INVAL) => {}
+            Err(source) => return Err(source.into()),
+        }
+        n = n
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("no free quarantine name"))?;
     }
 }
 
@@ -422,6 +473,14 @@ mod tests {
         assert_eq!(
             StateDir::quarantine(Path::new("/s/bx/ledger.mpk")),
             PathBuf::from("/s/bx/ledger.mpk.corrupt"),
+        );
+        assert_eq!(
+            StateDir::quarantine_nth(Path::new("/s/bx/ledger.mpk"), 0),
+            PathBuf::from("/s/bx/ledger.mpk.corrupt"),
+        );
+        assert_eq!(
+            StateDir::quarantine_nth(Path::new("/s/bx/ledger.mpk"), 12),
+            PathBuf::from("/s/bx/ledger.mpk.corrupt.12"),
         );
     }
 

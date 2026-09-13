@@ -4,8 +4,30 @@
 //! corrupt one degrades to recomputation rather than to an error the user cannot
 //! clear. That requirement is met here, once, for every file in the state
 //! directory: [`load`] returns the stored value, or — for damaged *contents* —
-//! the empty default, having first moved the damaged bytes aside to
-//! `<name>.corrupt` and warned about it.
+//! the empty default, having moved the damaged bytes aside to the first free
+//! `<name>.corrupt`, `<name>.corrupt.1`, … and warned about it.
+//!
+//! # Only the holder of the exclusive lock moves a file
+//!
+//! A quarantine is a rename **by path**, and a path names whatever is there when
+//! the rename runs, not what was there when the bytes were read. A lockless
+//! reader that read a damaged file, and then renamed the path, would move aside
+//! the fresh file a writer saved in between. So [`load`] renames only when it is
+//! handed an [`ExclusiveLock`] — no writer can save while that is held — and a
+//! lockless reader reports [`Health::Damaged`] and touches nothing. The next
+//! holder of the lock does the quarantine.
+//!
+//! A quarantine never renames over an earlier one. The first free name is taken,
+//! with `RENAME_NOREPLACE`, so a second damaged ledger cannot destroy the first —
+//! which may be the only index there is to the user's restore blobs.
+//!
+//! # A refusal is not damage
+//!
+//! A decoded value can also be *refused* by the file's loader for a reason that
+//! says nothing about its bytes — a ledger checked against a home spelled
+//! differently from the one it was written under. That is [`Rejected::Refused`]:
+//! the error reaches the caller and nothing is renamed, exactly as for a file
+//! that could not be read.
 //!
 //! # Damage is a decode failure, never an access failure
 //!
@@ -30,7 +52,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Error;
-use super::dir::{StateDir, ensure_dir};
+use super::dir::{ensure_dir, move_aside};
+use super::lock::ExclusiveLock;
 use crate::fs::{Mode, write_atomically};
 
 /// What every state file is wrapped in.
@@ -72,21 +95,33 @@ pub enum Damage {
         /// The newest version this build understands.
         supported: u16,
     },
-    /// The envelope decoded, and a path it stores is one no constructor would
-    /// have built for this account.
+    /// The envelope decoded, and a ledger entry names a different path from
+    /// the key it is stored under.
     ///
-    /// Decoding a [`crate::paths::Portable`] applies every rule that needs no
-    /// home. The one that does — an absolute spelling of a file under the home,
-    /// which is a second key for its `~/…` spelling — cannot run inside a
-    /// decoder, so the file's loader applies
-    /// [`crate::paths::Portable::check_against`] and a failure lands here, as
-    /// damage: the stored value is not believed.
-    ForeignPath {
-        /// The path as it is stored.
-        stored: String,
-        /// Why it cannot be used on this account.
-        reason: String,
+    /// `record` stores every entry under its own path, so a mismatch is not
+    /// something bx wrote: it is damage, whatever home the ledger is read with.
+    KeyMismatch {
+        /// The key the entry is stored under.
+        key: String,
+        /// The path the entry itself names.
+        path: String,
     },
+}
+
+/// Why a file's loader did not accept a value that decoded.
+#[derive(Debug)]
+pub(crate) enum Rejected {
+    /// The contents are damaged. Quarantined under the lock, reported without.
+    Damage(Damage),
+    /// The contents may be intact, and the context they were checked against is
+    /// what is wrong. Returned to the caller; nothing is renamed.
+    Refused(Error),
+}
+
+impl From<Damage> for Rejected {
+    fn from(damage: Damage) -> Self {
+        Self::Damage(damage)
+    }
 }
 
 impl std::fmt::Display for Damage {
@@ -99,10 +134,9 @@ impl std::fmt::Display for Damage {
                 f,
                 "it is version {found}, and this bx understands up to {supported}",
             ),
-            Self::ForeignPath { stored, reason } => write!(
-                f,
-                "it stores the path {stored}, which this account cannot use: {reason}",
-            ),
+            Self::KeyMismatch { key, path } => {
+                write!(f, "its entry for {key} names a different path, {path}")
+            }
         }
     }
 }
@@ -117,20 +151,25 @@ pub enum Health {
     /// The file was damaged, has been quarantined, and the value is the empty
     /// default.
     Reset(Damage),
+    /// The file is damaged, and was **left where it is**, because the reader
+    /// holds no exclusive lock. The value is the empty default. The next holder
+    /// of the lock quarantines it.
+    Damaged(Damage),
 }
 
 impl Health {
-    /// Whether the caller is looking at recovered-from-nothing state.
+    /// Whether the caller is looking at recovered-from-nothing state that has
+    /// been moved aside.
     #[must_use]
     pub fn is_reset(&self) -> bool {
         matches!(self, Self::Reset(_))
     }
 
-    /// The damage, if this is a reset.
+    /// The damage, whether or not the file has been moved aside yet.
     #[must_use]
     pub fn damage(&self) -> Option<&Damage> {
         match self {
-            Self::Reset(damage) => Some(damage),
+            Self::Reset(damage) | Self::Damaged(damage) => Some(damage),
             _ => None,
         }
     }
@@ -164,10 +203,11 @@ impl<T> Loaded<T> {
 
 /// Read a state file, degrading to `T::default()` for damaged contents.
 ///
-/// A missing file is [`Health::Fresh`]. Damaged contents move the file to
-/// `<name>.corrupt`, emit a `tracing::warn!`, and yield the default; the next
-/// [`save`] writes a clean file over the original name, so the condition clears
-/// itself.
+/// A missing file is [`Health::Fresh`]. Damaged contents yield the default and
+/// a `tracing::warn!`. With `lock`, the file is also moved to the first free
+/// quarantine name and the health is [`Health::Reset`]; the next [`save`] writes
+/// a clean file over the original name, so the condition clears itself. Without
+/// it, nothing is renamed and the health is [`Health::Damaged`].
 ///
 /// # Errors
 ///
@@ -179,25 +219,28 @@ pub(crate) fn load<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
     version: u16,
+    lock: Option<&ExclusiveLock>,
 ) -> Result<Loaded<T>, Error> {
-    load_checked(path, kind, version, |_| Ok(()))
+    load_checked(path, kind, version, lock, |_| Ok(()))
 }
 
 /// [`load`], with a check on the decoded value that decoding alone cannot make.
 ///
-/// `check` runs only on a value that decoded whole. A value it refuses is
-/// damage like any other decode failure: the file is quarantined and the empty
-/// default returned, so a stored value that fails a rule needing context the
-/// decoder did not have — the account's home — is never believed.
+/// `check` runs only on a value that decoded whole. [`Rejected::Damage`] is
+/// handled like any other decode failure. [`Rejected::Refused`] is returned as
+/// the error and renames nothing: a value refused against context the decoder
+/// did not have — the account's home — is never believed, and never discarded
+/// either.
 ///
 /// # Errors
 ///
-/// As [`load`].
+/// As [`load`], and whatever `check` refuses with.
 pub(crate) fn load_checked<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
     version: u16,
-    check: impl FnOnce(&T) -> Result<(), Damage>,
+    lock: Option<&ExclusiveLock>,
+    check: impl FnOnce(&T) -> Result<(), Rejected>,
 ) -> Result<Loaded<T>, Error> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -215,14 +258,19 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
         }
     };
 
-    match decode::<T>(&bytes, kind, version).and_then(|value| check(&value).map(|()| value)) {
+    let checked = decode::<T>(&bytes, kind, version)
+        .map_err(Rejected::Damage)
+        .and_then(|value| check(&value).map(|()| value));
+    match checked {
         Ok(value) => Ok(Loaded {
             value,
             health: Health::Loaded,
         }),
         // Quarantine happens only here: after `read` succeeded and `decode` or
-        // `check` failed, so the bytes being moved aside are known to be unusable.
-        Err(damage) => Ok(reset(path, &damage)),
+        // `check` found damage, so the bytes being moved aside are known to be
+        // unusable — and only under the lock, so they are still the bytes read.
+        Err(Rejected::Damage(damage)) => Ok(degrade(path, damage, lock)),
+        Err(Rejected::Refused(error)) => Err(error),
     }
 }
 
@@ -255,11 +303,23 @@ fn decode<T: DeserializeOwned>(
     Ok(envelope.payload)
 }
 
-/// Move a damaged file aside and return the empty default.
-fn reset<T: Default>(path: &Path, damage: &Damage) -> Loaded<T> {
-    let quarantine = StateDir::quarantine(path);
-    match std::fs::rename(path, &quarantine) {
-        Ok(()) => tracing::warn!(
+/// Return the empty default for a damaged file, moving it aside only under the
+/// lock.
+fn degrade<T: Default>(path: &Path, damage: Damage, lock: Option<&ExclusiveLock>) -> Loaded<T> {
+    let Some(lock) = lock else {
+        tracing::warn!(
+            path = %path.display(),
+            "{} is damaged: {damage}. It was left in place; the next bx that holds \
+             the state directory lock moves it aside.",
+            path.display(),
+        );
+        return Loaded {
+            value: T::default(),
+            health: Health::Damaged(damage),
+        };
+    };
+    match move_aside(path, lock) {
+        Ok(quarantine) => tracing::warn!(
             path = %path.display(),
             moved_to = %quarantine.display(),
             "discarding {}: {damage}. The bytes were kept, not deleted.",
@@ -274,7 +334,7 @@ fn reset<T: Default>(path: &Path, damage: &Damage) -> Loaded<T> {
     }
     Loaded {
         value: T::default(),
-        health: Health::Reset(damage.clone()),
+        health: Health::Reset(damage),
     }
 }
 
@@ -316,12 +376,33 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+
+    use crate::state::StateDir;
 
     const KIND: &str = "bx.test";
     const OTHER: &str = "bx.other";
     const VERSION: u16 = 3;
 
     type Value = BTreeMap<String, u32>;
+
+    /// [`load`] under the exclusive lock of `path`'s directory, as a writer does.
+    fn locked_load<T: DeserializeOwned + Default>(path: &Path) -> Result<Loaded<T>, Error> {
+        let dir = StateDir::new(path.parent().expect("a parent").to_path_buf());
+        let lock = ExclusiveLock::acquire(&dir).expect("lock");
+        load(path, KIND, VERSION, Some(&lock))
+    }
+
+    /// Every name in `dir` but the lock file, sorted.
+    fn names_but_the_lock(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "lock")
+            .collect();
+        names.sort();
+        names
+    }
 
     fn sample() -> Value {
         let mut map = Value::new();
@@ -342,8 +423,7 @@ mod tests {
     #[test]
     fn a_missing_file_loads_as_fresh_and_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let loaded: Loaded<Value> =
-            load(&dir.path().join("nope.mpk"), KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&dir.path().join("nope.mpk")).expect("load");
         assert_eq!(loaded.health, Health::Fresh);
         assert!(loaded.value.is_empty());
         assert!(!loaded.health.is_reset());
@@ -355,7 +435,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         save(&path, KIND, VERSION, &sample()).expect("save");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Loaded);
         assert_eq!(loaded.value, sample());
     }
@@ -389,7 +469,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, encoded(KIND, VERSION - 1, &sample())).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Loaded);
         assert_eq!(loaded.value, sample());
     }
@@ -400,7 +480,7 @@ mod tests {
         let path = dir.path().join("v.mpk");
         let bytes = encoded(KIND, VERSION, &sample());
         std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
     }
@@ -410,7 +490,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"this is certainly not MessagePack").expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
     }
@@ -422,7 +502,7 @@ mod tests {
         let mut bytes = encoded(KIND, VERSION, &sample());
         bytes.extend_from_slice(b"\x00\x00leftovers");
         std::fs::write(&path, &bytes).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Reset(Damage::TrailingBytes));
         assert!(loaded.value.is_empty());
     }
@@ -432,7 +512,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, encoded(KIND, VERSION + 5, &sample())).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(
             loaded.health,
             Health::Reset(Damage::FutureVersion {
@@ -451,7 +531,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, encoded(OTHER, VERSION, &sample())).expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(
             loaded.health,
             Health::Reset(Damage::WrongKind {
@@ -467,7 +547,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"garbage").expect("seed");
-        let _: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let _: Loaded<Value> = locked_load(&path).expect("load");
         assert!(!path.exists(), "the damaged file must be moved aside");
         let quarantine = StateDir::quarantine(&path);
         assert_eq!(std::fs::read(&quarantine).expect("read"), b"garbage");
@@ -484,7 +564,7 @@ mod tests {
         let path = dir.path().join("v.mpk");
         std::os::unix::fs::symlink(&elsewhere, &path).expect("symlink");
 
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
 
         // `rename` acts on the link itself, never on what it names.
@@ -529,28 +609,96 @@ mod tests {
                 .file_type()
                 .is_symlink(),
         );
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.value, sample());
     }
 
     #[test]
-    fn a_second_quarantine_reuses_the_same_fixed_name() {
+    fn successive_quarantines_keep_every_earlier_one() {
+        // Review round 3: a fixed `<name>.corrupt` was renamed over, so a
+        // second damaged ledger destroyed the first — which may be the only
+        // index there is to the user's restore blobs.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
-        std::fs::write(&path, b"first").expect("seed");
-        let _: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
-        std::fs::write(&path, b"second").expect("seed again");
-        let _: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        for body in [&b"first"[..], b"second", b"third"] {
+            std::fs::write(&path, body).expect("seed");
+            let loaded: Loaded<Value> = locked_load(&path).expect("load");
+            assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
+        }
 
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read_dir")
-            .map(|e| e.expect("entry").file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("v.mpk.corrupt")]);
         assert_eq!(
-            std::fs::read(StateDir::quarantine(&path)).expect("read"),
-            b"second",
+            names_but_the_lock(dir.path()),
+            vec!["v.mpk.corrupt", "v.mpk.corrupt.1", "v.mpk.corrupt.2"],
         );
+        for (n, body) in [(0, &b"first"[..]), (1, b"second"), (2, b"third")] {
+            assert_eq!(
+                std::fs::read(StateDir::quarantine_nth(&path, n)).expect("kept"),
+                body,
+            );
+        }
+    }
+
+    #[test]
+    fn a_lockless_reader_reports_damage_and_moves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        std::fs::write(&path, b"garbage").expect("seed");
+
+        let loaded: Loaded<Value> = load(&path, KIND, VERSION, None).expect("load");
+        assert_eq!(loaded.health, Health::Damaged(Damage::Malformed));
+        assert!(!loaded.health.is_reset(), "nothing was moved aside");
+        assert_eq!(loaded.health.damage(), Some(&Damage::Malformed));
+        assert!(loaded.value.is_empty());
+        assert_eq!(std::fs::read(&path).expect("in place"), b"garbage");
+        assert_eq!(names_but_the_lock(dir.path()), vec!["v.mpk"]);
+    }
+
+    #[test]
+    fn a_writer_saving_inside_a_lockless_readers_window_keeps_its_file() {
+        // Review round 3's falsifier: the reader has read and judged the bytes,
+        // a writer saves a fresh file, and the reader then acts on the path.
+        // A rename by path there moved the writer's fresh file aside.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        save(&path, KIND, VERSION, &Value::new()).expect("seed");
+
+        let loaded: Loaded<Value> = load_checked(&path, KIND, VERSION, None, |_| {
+            save(&path, KIND, VERSION, &sample()).expect("the writer saves");
+            Err(Damage::Malformed.into())
+        })
+        .expect("load");
+        assert_eq!(loaded.health, Health::Damaged(Damage::Malformed));
+
+        let now: Loaded<Value> = load(&path, KIND, VERSION, None).expect("reload");
+        assert_eq!(now.health, Health::Loaded);
+        assert_eq!(
+            now.value,
+            sample(),
+            "the writer's file is where it saved it"
+        );
+        assert_eq!(names_but_the_lock(dir.path()), vec!["v.mpk"]);
+    }
+
+    #[test]
+    fn a_refused_value_is_the_error_and_nothing_is_renamed_even_under_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        save(&path, KIND, VERSION, &sample()).expect("seed");
+        let intact = std::fs::read(&path).expect("read");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+
+        let err = load_checked::<Value>(&path, KIND, VERSION, Some(&lock), |_| {
+            Err(Rejected::Refused(Error::NotADirectory {
+                path: PathBuf::from("/refused"),
+            }))
+        })
+        .expect_err("a refusal is an error");
+        assert!(
+            matches!(&err, Error::NotADirectory { path } if path == Path::new("/refused")),
+            "got {err}",
+        );
+        assert_eq!(std::fs::read(&path).expect("in place"), intact);
+        assert_eq!(names_but_the_lock(dir.path()), vec!["v.mpk"]);
     }
 
     #[test]
@@ -558,11 +706,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"garbage").expect("seed");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert!(loaded.health.is_reset());
 
         save(&path, KIND, VERSION, &sample()).expect("save");
-        let again: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let again: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(again.health, Health::Loaded);
         assert_eq!(again.value, sample());
     }
@@ -574,7 +722,7 @@ mod tests {
         // is neither NotFound nor a statement about any bytes.
         let path = dir.path().join("v.mpk");
         std::fs::create_dir(&path).expect("seed");
-        let err = load::<Value>(&path, KIND, VERSION).expect_err("must fail");
+        let err = locked_load::<Value>(&path).expect_err("must fail");
         assert!(
             matches!(&err, Error::Read { path: at, .. } if *at == path),
             "got {err}",
@@ -598,7 +746,7 @@ mod tests {
         // be renamed and nothing may be reset.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let err = load::<Value>(&path, KIND, VERSION).expect_err("must fail");
+        let err = locked_load::<Value>(&path).expect_err("must fail");
         assert!(matches!(err, Error::Read { .. }), "got {err}");
         assert!(path.exists(), "the file must not be moved aside");
         assert!(
@@ -607,7 +755,7 @@ mod tests {
         );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("restore");
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Loaded);
         assert_eq!(loaded.value, sample());
         assert_eq!(std::fs::read(&path).expect("read"), intact);
@@ -616,19 +764,38 @@ mod tests {
     #[test]
     fn a_file_that_cannot_be_moved_aside_still_degrades() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("sub").join("v.mpk");
-        std::fs::create_dir(path.parent().expect("parent")).expect("mkdir");
+        // A name at the 255-byte limit: every quarantine name is longer, so
+        // each rename fails with ENAMETOOLONG rather than finding a free name.
+        let path = dir.path().join("v".repeat(255));
         std::fs::write(&path, b"garbage").expect("seed");
-        // Quarantining renames within the directory; occupying the target with
-        // a non-empty directory makes the rename fail.
-        let quarantine = StateDir::quarantine(&path);
-        std::fs::create_dir(&quarantine).expect("occupy");
-        std::fs::write(quarantine.join("keep"), b"x").expect("occupy");
 
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION).expect("load");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert!(loaded.health.is_reset());
         assert!(loaded.value.is_empty());
-        assert!(path.exists(), "the damaged bytes survive a failed rename");
+        assert_eq!(
+            std::fs::read(&path).expect("in place"),
+            b"garbage",
+            "the damaged bytes survive a failed rename",
+        );
+    }
+
+    #[test]
+    fn an_occupied_quarantine_name_is_skipped_not_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        std::fs::write(&path, b"garbage").expect("seed");
+        // Whatever holds the first name — a directory here — is left alone.
+        let first = StateDir::quarantine(&path);
+        std::fs::create_dir(&first).expect("occupy");
+        std::fs::write(first.join("keep"), b"x").expect("occupy");
+
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert!(loaded.health.is_reset());
+        assert_eq!(std::fs::read(first.join("keep")).expect("kept"), b"x");
+        assert_eq!(
+            std::fs::read(StateDir::quarantine_nth(&path, 1)).expect("moved"),
+            b"garbage",
+        );
     }
 
     #[test]

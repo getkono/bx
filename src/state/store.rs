@@ -29,6 +29,16 @@
 //! the error reaches the caller and nothing is renamed, exactly as for a file
 //! that could not be read.
 //!
+//! # A newer format is damage only for a file recomputation rebuilds
+//!
+//! An envelope whose version is newer than this build's was written by a newer
+//! bx, and is most likely intact. For a cache that is still [`Damage`]: losing
+//! it costs a recomputation. For the ledger it is not — see [`Loss::Permanent`]
+//! — so it is [`Error::FutureVersion`] and nothing is renamed. The kind and
+//! version are read **before** the payload is decoded, because a newer format
+//! may have changed the payload's shape, and a payload that fails to decode
+//! for that reason says nothing about damage.
+//!
 //! # Damage is a decode failure, never an access failure
 //!
 //! The degradation applies to a file whose **bytes were read and are bad**. A
@@ -46,13 +56,13 @@
 //! restore bx's own generated content over the user's files. Losing a cache is
 //! a delay; losing the ledger is permanent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Error;
-use super::dir::{ensure_dir, move_aside};
+use super::dir::{check_lock, ensure_dir, move_aside, quarantines};
 use super::lock::ExclusiveLock;
 use crate::fs::{Mode, write_atomically};
 
@@ -72,11 +82,33 @@ struct Envelope<T> {
     payload: T,
 }
 
-/// What was wrong with the *contents* of a state file that had to be discarded.
+/// An envelope's kind and version, read without decoding its payload.
+#[derive(Deserialize)]
+struct Header {
+    /// As [`Envelope::kind`].
+    kind: String,
+    /// As [`Envelope::version`].
+    version: u16,
+}
+
+/// What losing a state file costs, which decides how far a file that cannot
+/// be believed is allowed to degrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Loss {
+    /// A cache: recomputation rebuilds it, so anything wrong with it degrades
+    /// to the empty default.
+    Recomputable,
+    /// The ledger: nothing rebuilds the priors it indexes, so a condition that
+    /// says the file may be intact — a newer format — is refused rather than
+    /// degraded.
+    Permanent,
+}
+
+/// What was wrong with a state file that had to be discarded.
 ///
-/// Every variant is a decode failure: the bytes were read, and they are not a
-/// usable envelope. A file that could not be read is not represented here —
-/// see [`Error::Read`] and the module documentation.
+/// Every variant but [`Damage::DanglingLink`] is a decode failure: the bytes
+/// were read, and they are not a usable envelope. A file that could not be read
+/// is not represented here — see [`Error::Read`] and the module documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Damage {
     /// The bytes are not a well-formed envelope.
@@ -88,13 +120,22 @@ pub enum Damage {
         /// The kind the file claims to be.
         found: String,
     },
-    /// The envelope was written by a newer bx than this one.
+    /// The envelope was written by a newer bx than this one. Only ever the
+    /// health of a [`Loss::Recomputable`] file; for the ledger this is
+    /// [`Error::FutureVersion`].
     FutureVersion {
         /// The version on disk.
         found: u16,
         /// The newest version this build understands.
         supported: u16,
     },
+    /// The file's path is a symbolic link to something that does not exist.
+    ///
+    /// Only ever the health of a [`Loss::Recomputable`] file, where losing
+    /// what the link named costs a recomputation; for the ledger this is
+    /// [`Error::DanglingLink`]. Nothing is read through the link, and the
+    /// quarantine moves the link itself, never what it names.
+    DanglingLink,
     /// The envelope decoded, and a ledger entry names a different path from
     /// the key it is stored under.
     ///
@@ -134,6 +175,9 @@ impl std::fmt::Display for Damage {
                 f,
                 "it is version {found}, and this bx understands up to {supported}",
             ),
+            Self::DanglingLink => {
+                f.write_str("it is a symbolic link to something that does not exist")
+            }
             Self::KeyMismatch { key, path } => {
                 write!(f, "its entry for {key} names a different path, {path}")
             }
@@ -189,6 +233,16 @@ pub struct Loaded<T> {
     pub value: T,
     /// Where it came from.
     pub health: Health,
+    /// Every quarantine of this file in the state directory now, in the order
+    /// they were made — `<name>.corrupt`, `<name>.corrupt.1`, … — including
+    /// one this load made.
+    ///
+    /// Independent of [`Loaded::health`]. A run that quarantined the file and
+    /// stopped before its save leaves the next load [`Health::Fresh`], and this
+    /// is what still shows that damaged bytes were set aside. They may be the
+    /// only index there is to the user's restore blobs, so `plan` and `doctor`
+    /// should name every one until a human moves it; bx never deletes them.
+    pub quarantined: Vec<PathBuf>,
 }
 
 impl<T> Loaded<T> {
@@ -197,6 +251,7 @@ impl<T> Loaded<T> {
         Loaded {
             value: f(self.value),
             health: self.health,
+            quarantined: self.quarantined,
         }
     }
 }
@@ -215,13 +270,20 @@ impl<T> Loaded<T> {
 /// failure, not damage: the bytes were never seen, so they are neither
 /// quarantined nor discarded, and the caller must treat it as fatal rather than
 /// carry on against an empty default.
+///
+/// [`Error::FutureVersion`] for a [`Loss::Permanent`] file written by a newer
+/// bx; nothing is renamed.
+///
+/// [`Error::WrongLock`] if `lock` is not the lock of the directory holding
+/// `path`; nothing is read.
 pub(crate) fn load<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
     version: u16,
+    loss: Loss,
     lock: Option<&ExclusiveLock>,
 ) -> Result<Loaded<T>, Error> {
-    load_checked(path, kind, version, lock, |_| Ok(()))
+    load_checked(path, kind, version, loss, lock, |_| Ok(()))
 }
 
 /// [`load`], with a check on the decoded value that decoding alone cannot make.
@@ -239,23 +301,52 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
     version: u16,
+    loss: Loss,
     lock: Option<&ExclusiveLock>,
     check: impl FnOnce(&T) -> Result<(), Rejected>,
 ) -> Result<Loaded<T>, Error> {
+    let mut loaded = judge(path, kind, version, loss, lock, check)?;
+    // Listed after any quarantine this load made, and whatever the health: an
+    // earlier run's quarantine must not hide behind `Fresh`.
+    loaded.quarantined = quarantines(path)?;
+    Ok(loaded)
+}
+
+/// [`load_checked`], less the listing of quarantines.
+fn judge<T: DeserializeOwned + Default>(
+    path: &Path,
+    kind: &'static str,
+    version: u16,
+    loss: Loss,
+    lock: Option<&ExclusiveLock>,
+    check: impl FnOnce(&T) -> Result<(), Rejected>,
+) -> Result<Loaded<T>, Error> {
+    // A lock presented for another directory guards nothing here, and is
+    // refused before anything is read.
+    if let Some(lock) = lock {
+        check_lock(path, lock)?;
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // `read` follows a symlink, so a link to nothing reads as no file.
             // That is not "no state" — it is usually state on storage that is
-            // not there right now — so it is refused, and nothing is renamed.
+            // not there right now. For the ledger it is refused, and nothing is
+            // renamed. A cache degrades like any other damage: under the lock
+            // the link itself is moved aside, so the next save can write a
+            // clean file where it was.
             if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-                return Err(Error::DanglingLink {
-                    path: path.to_path_buf(),
-                });
+                return match loss {
+                    Loss::Permanent => Err(Error::DanglingLink {
+                        path: path.to_path_buf(),
+                    }),
+                    Loss::Recomputable => Ok(degrade(path, Damage::DanglingLink, lock)),
+                };
             }
             return Ok(Loaded {
                 value: T::default(),
                 health: Health::Fresh,
+                quarantined: Vec::new(),
             });
         }
         Err(source) => {
@@ -273,7 +364,19 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
         Ok(value) => Ok(Loaded {
             value,
             health: Health::Loaded,
+            quarantined: Vec::new(),
         }),
+        // A newer format of a file nothing can rebuild is not believed and not
+        // discarded: it is intact as far as anyone knows.
+        Err(Rejected::Damage(Damage::FutureVersion { found, supported }))
+            if loss == Loss::Permanent =>
+        {
+            Err(Error::FutureVersion {
+                path: path.to_path_buf(),
+                found,
+                supported,
+            })
+        }
         // Quarantine happens only here: after `read` succeeded and `decode` or
         // `check` found damage, so the bytes being moved aside are known to be
         // unusable — and only under the lock, so they are still the bytes read.
@@ -288,26 +391,27 @@ fn decode<T: DeserializeOwned>(
     kind: &'static str,
     version: u16,
 ) -> Result<T, Damage> {
+    // The header first, skipping the payload: a newer bx may have changed the
+    // payload's shape, so whether this build can read the version has to be
+    // known before a payload decode failure can be called damage.
     let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(bytes));
-    let envelope: Envelope<T> =
-        serde::Deserialize::deserialize(&mut de).map_err(|_| Damage::Malformed)?;
+    let header = Header::deserialize(&mut de).map_err(|_| Damage::Malformed)?;
     // `rmp_serde::from_slice` stops at the end of the first value and ignores
     // whatever follows. A file that grew garbage at the end is damaged, not
     // half-readable, so the position is checked rather than trusted.
     if usize::try_from(de.position()).unwrap_or(usize::MAX) != bytes.len() {
         return Err(Damage::TrailingBytes);
     }
-    if envelope.kind != kind {
-        return Err(Damage::WrongKind {
-            found: envelope.kind,
-        });
+    if header.kind != kind {
+        return Err(Damage::WrongKind { found: header.kind });
     }
-    if envelope.version > version {
+    if header.version > version {
         return Err(Damage::FutureVersion {
-            found: envelope.version,
+            found: header.version,
             supported: version,
         });
     }
+    let envelope: Envelope<T> = rmp_serde::from_slice(bytes).map_err(|_| Damage::Malformed)?;
     Ok(envelope.payload)
 }
 
@@ -324,6 +428,7 @@ fn degrade<T: Default>(path: &Path, damage: Damage, lock: Option<&ExclusiveLock>
         return Loaded {
             value: T::default(),
             health: Health::Damaged(damage),
+            quarantined: Vec::new(),
         };
     };
     match move_aside(path, lock) {
@@ -343,6 +448,7 @@ fn degrade<T: Default>(path: &Path, damage: Damage, lock: Option<&ExclusiveLock>
     Loaded {
         value: T::default(),
         health: Health::Reset(damage),
+        quarantined: Vec::new(),
     }
 }
 
@@ -398,7 +504,7 @@ mod tests {
     fn locked_load<T: DeserializeOwned + Default>(path: &Path) -> Result<Loaded<T>, Error> {
         let dir = StateDir::new(path.parent().expect("a parent").to_path_buf());
         let lock = ExclusiveLock::acquire(&dir).expect("lock");
-        load(path, KIND, VERSION, Some(&lock))
+        load(path, KIND, VERSION, Loss::Recomputable, Some(&lock))
     }
 
     /// Every name in `dir` but the lock file, sorted.
@@ -534,6 +640,76 @@ mod tests {
         assert!(message.contains("up to 3"), "got {message}");
     }
 
+    /// An envelope of `version` whose payload is a shape [`Value`] is not, as
+    /// a newer format that changed the payload would write.
+    fn reshaped(version: u16) -> Vec<u8> {
+        rmp_serde::to_vec_named(&Envelope {
+            kind: KIND.to_string(),
+            version,
+            payload: vec!["a shape", "this build has never seen"],
+        })
+        .expect("encode")
+    }
+
+    #[test]
+    fn a_newer_version_is_judged_before_its_payload_is_decoded() {
+        // Review round 4: the payload was decoded before the version was
+        // looked at, so a newer format with a changed payload read as
+        // `Malformed` — damage — whatever the file's loss.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        std::fs::write(&path, reshaped(VERSION + 1)).expect("seed");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(
+            loaded.health,
+            Health::Reset(Damage::FutureVersion {
+                found: VERSION + 1,
+                supported: VERSION,
+            }),
+        );
+
+        // The same shape at a version this build reads is damage.
+        std::fs::write(&path, reshaped(VERSION)).expect("seed");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
+    }
+
+    #[test]
+    fn a_newer_version_of_a_permanent_file_is_refused_and_nothing_is_renamed() {
+        // Review round 4: after a rollback to an older bx, an intact ledger
+        // was moved aside as damage, even under the lock.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        for seed in [encoded(KIND, VERSION + 1, &sample()), reshaped(VERSION + 1)] {
+            std::fs::write(&path, &seed).expect("seed");
+            for held in [None, Some(&lock)] {
+                let err = load::<Value>(&path, KIND, VERSION, Loss::Permanent, held)
+                    .expect_err("a newer permanent file is refused");
+                assert!(
+                    matches!(
+                        &err,
+                        Error::FutureVersion { path: at, found, supported }
+                            if *at == path && *found == VERSION + 1 && *supported == VERSION
+                    ),
+                    "got {err}",
+                );
+                let message = err.to_string();
+                assert!(message.contains("newer bx"), "{message}");
+                assert!(message.contains("version 4"), "{message}");
+                assert!(message.contains("up to 3"), "{message}");
+                assert_eq!(std::fs::read(&path).expect("in place"), seed);
+                assert_eq!(names_but_the_lock(dir.path()), vec!["v.mpk"]);
+            }
+        }
+
+        // Every other damage to a permanent file still degrades under the lock.
+        std::fs::write(&path, b"garbage").expect("seed");
+        let loaded: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Permanent, Some(&lock)).expect("load");
+        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
+    }
+
     #[test]
     fn a_file_of_the_wrong_kind_is_not_accepted() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -652,12 +828,94 @@ mod tests {
     }
 
     #[test]
+    fn a_quarantine_left_by_an_earlier_run_is_reported_on_every_load() {
+        // Review round 4: a quarantine followed by a crash before the save left
+        // the next reader and writer looking at `Health::Fresh`, with the
+        // `.corrupt` file orphaned and reported nowhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let first = StateDir::quarantine(&path);
+
+        let absent: Loaded<Value> = load(
+            &dir.path().join("absent/v.mpk"),
+            KIND,
+            VERSION,
+            Loss::Recomputable,
+            None,
+        )
+        .expect("a missing directory lists nothing");
+        assert!(absent.quarantined.is_empty());
+
+        std::fs::write(&path, b"garbage").expect("seed");
+        let reset: Loaded<Value> = locked_load(&path).expect("load");
+        assert!(reset.health.is_reset());
+        assert_eq!(
+            reset.quarantined,
+            vec![first.clone()],
+            "the quarantining load"
+        );
+
+        // The crash: no save. The next reader and writer both see Fresh, and
+        // both are told what was set aside.
+        let lockless: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, None).expect("load");
+        assert_eq!(lockless.health, Health::Fresh);
+        assert_eq!(lockless.quarantined, vec![first.clone()]);
+        let writer: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(writer.health, Health::Fresh);
+        assert_eq!(writer.quarantined, vec![first.clone()]);
+
+        // A clean save does not hide it either. A gap hides nothing after it,
+        // and names that are not this file's quarantines are not listed.
+        save(&path, KIND, VERSION, &sample()).expect("save");
+        let third = StateDir::quarantine_nth(&path, 2);
+        std::fs::write(&third, b"after a gap").expect("seed");
+        for decoy in [
+            "v.mpk.corrupt.01",
+            "v.mpk.corrupt.+3",
+            "v.mpk.corrupt.x",
+            "v.mpk.corrupt.",
+            "v.mpk.corrupted",
+            "w.mpk.corrupt",
+        ] {
+            std::fs::write(dir.path().join(decoy), b"not a quarantine").expect("decoy");
+        }
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(loaded.health, Health::Loaded);
+        assert_eq!(loaded.quarantined, vec![first, third]);
+    }
+
+    #[test]
+    fn a_state_directory_that_cannot_be_listed_is_an_error_not_an_empty_list() {
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("state");
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("v.mpk");
+        save(&path, KIND, VERSION, &sample()).expect("seed");
+        // Searchable, so the file itself reads; not readable, so it cannot be
+        // listed. Reporting no quarantines there would be a guess.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+        let result = load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        let err = result.expect_err("an unlistable directory is not an empty one");
+        assert!(
+            matches!(&err, Error::Read { path: at, .. } if *at == root),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn a_lockless_reader_reports_damage_and_moves_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
         std::fs::write(&path, b"garbage").expect("seed");
 
-        let loaded: Loaded<Value> = load(&path, KIND, VERSION, None).expect("load");
+        let loaded: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, None).expect("load");
         assert_eq!(loaded.health, Health::Damaged(Damage::Malformed));
         assert!(!loaded.health.is_reset(), "nothing was moved aside");
         assert_eq!(loaded.health.damage(), Some(&Damage::Malformed));
@@ -675,14 +933,16 @@ mod tests {
         let path = dir.path().join("v.mpk");
         save(&path, KIND, VERSION, &Value::new()).expect("seed");
 
-        let loaded: Loaded<Value> = load_checked(&path, KIND, VERSION, None, |_| {
-            save(&path, KIND, VERSION, &sample()).expect("the writer saves");
-            Err(Damage::Malformed.into())
-        })
-        .expect("load");
+        let loaded: Loaded<Value> =
+            load_checked(&path, KIND, VERSION, Loss::Recomputable, None, |_| {
+                save(&path, KIND, VERSION, &sample()).expect("the writer saves");
+                Err(Damage::Malformed.into())
+            })
+            .expect("load");
         assert_eq!(loaded.health, Health::Damaged(Damage::Malformed));
 
-        let now: Loaded<Value> = load(&path, KIND, VERSION, None).expect("reload");
+        let now: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, None).expect("reload");
         assert_eq!(now.health, Health::Loaded);
         assert_eq!(
             now.value,
@@ -700,11 +960,18 @@ mod tests {
         let intact = std::fs::read(&path).expect("read");
         let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
 
-        let err = load_checked::<Value>(&path, KIND, VERSION, Some(&lock), |_| {
-            Err(Rejected::Refused(Error::NotADirectory {
-                path: PathBuf::from("/refused"),
-            }))
-        })
+        let err = load_checked::<Value>(
+            &path,
+            KIND,
+            VERSION,
+            Loss::Recomputable,
+            Some(&lock),
+            |_| {
+                Err(Rejected::Refused(Error::NotADirectory {
+                    path: PathBuf::from("/refused"),
+                }))
+            },
+        )
         .expect_err("a refusal is an error");
         assert!(
             matches!(&err, Error::NotADirectory { path } if path == Path::new("/refused")),
@@ -857,10 +1124,12 @@ mod tests {
         let loaded = Loaded {
             value: 1_u32,
             health: Health::Reset(Damage::Malformed),
+            quarantined: vec![PathBuf::from("/s/v.mpk.corrupt")],
         };
         let mapped = loaded.map(|v| v + 1);
         assert_eq!(mapped.value, 2);
         assert_eq!(mapped.health, Health::Reset(Damage::Malformed));
+        assert_eq!(mapped.quarantined, vec![PathBuf::from("/s/v.mpk.corrupt")]);
         assert_eq!(mapped.value, 2);
     }
 }

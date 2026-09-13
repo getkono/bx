@@ -27,7 +27,7 @@ use super::Error;
 use super::dir::StateDir;
 use super::hash::ContentHash;
 use super::lock::ExclusiveLock;
-use super::store::{self, Loaded};
+use super::store::{self, Loaded, Loss};
 
 /// The envelope tag for `fingerprints.mpk`.
 const KIND: &str = "bx.fingerprints";
@@ -128,7 +128,7 @@ impl Fingerprints {
     /// caller is free to treat the failure as a cache miss, but it has to
     /// decide that itself rather than have a rename decide it.
     pub fn read(dir: &StateDir) -> Result<Loaded<Self>, Error> {
-        store::load(&dir.fingerprints(), KIND, VERSION, None)
+        store::load(&dir.fingerprints(), KIND, VERSION, Loss::Recomputable, None)
     }
 
     /// Read the cache under the exclusive lock, quarantining a damaged one.
@@ -139,9 +139,16 @@ impl Fingerprints {
     ///
     /// # Errors
     ///
-    /// As [`Fingerprints::read`].
+    /// As [`Fingerprints::read`], and [`Error::WrongLock`] if `lock` is not
+    /// `dir`'s own lock, before anything is read.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock) -> Result<Loaded<Self>, Error> {
-        store::load(&dir.fingerprints(), KIND, VERSION, Some(lock))
+        store::load(
+            &dir.fingerprints(),
+            KIND,
+            VERSION,
+            Loss::Recomputable,
+            Some(lock),
+        )
     }
 
     /// The fingerprint recorded under `key`.
@@ -198,8 +205,13 @@ impl Fingerprints {
     ///
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
     /// leaves the previous cache exactly as it was.
-    pub fn save(&self, dir: &StateDir, _lock: &ExclusiveLock) -> Result<(), Error> {
-        store::save(&dir.fingerprints(), KIND, VERSION, self)
+    ///
+    /// [`Error::WrongLock`] if `lock` is not `dir`'s own lock; nothing is
+    /// written.
+    pub fn save(&self, dir: &StateDir, lock: &ExclusiveLock) -> Result<(), Error> {
+        let path = dir.fingerprints();
+        super::dir::check_lock(&path, lock)?;
+        store::save(&path, KIND, VERSION, self)
     }
 }
 
@@ -341,6 +353,68 @@ mod tests {
             Fingerprints::read(&dir).expect("read").health,
             Health::Loaded
         );
+    }
+
+    #[test]
+    fn a_dangling_cache_link_degrades_to_recomputation_instead_of_stopping_bx() {
+        // Review round 4: a dangling `fingerprints.mpk` link was the fatal
+        // `Error::DanglingLink`, which is right for the ledger and wrong for a
+        // file whose loss costs a recomputation.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        let far = home.child("unmounted/fingerprints.mpk");
+        std::os::unix::fs::symlink(&far, dir.fingerprints()).expect("symlink");
+
+        // A lockless reader degrades and leaves the link where it is.
+        let read = Fingerprints::read(&dir).expect("a cache link is not fatal");
+        assert_eq!(read.health, Health::Damaged(Damage::DanglingLink));
+        assert!(read.value.is_empty());
+        assert_eq!(std::fs::read_link(dir.fingerprints()).expect("link"), far);
+
+        // The lock holder moves the link itself aside, never creating its far end.
+        let opened = Fingerprints::open(&dir, &lock).expect("a cache link is not fatal");
+        assert_eq!(opened.health, Health::Reset(Damage::DanglingLink));
+        let aside = StateDir::quarantine(&dir.fingerprints());
+        assert_eq!(std::fs::read_link(&aside).expect("the link, moved"), far);
+        assert!(std::fs::symlink_metadata(dir.fingerprints()).is_err());
+        assert!(!far.exists() && !home.child("unmounted").exists());
+
+        // And the next save writes a clean cache where the link was.
+        opened.value.save(&dir, &lock).expect("save");
+        assert_eq!(
+            Fingerprints::read(&dir).expect("read").health,
+            Health::Loaded
+        );
+        assert!(Damage::DanglingLink.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn a_cache_from_a_newer_bx_degrades_to_recomputation() {
+        // Review round 4 made a newer ledger a refusal. The cache is the file
+        // recomputation rebuilds, so it keeps degrading.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        store::save(
+            &dir.fingerprints(),
+            KIND,
+            VERSION + 1,
+            &Fingerprints::default(),
+        )
+        .expect("seed");
+        let newer = Damage::FutureVersion {
+            found: VERSION + 1,
+            supported: VERSION,
+        };
+
+        let read = Fingerprints::read(&dir).expect("read");
+        assert_eq!(read.health, Health::Damaged(newer.clone()));
+        let opened = Fingerprints::open(&dir, &lock).expect("open");
+        assert_eq!(opened.health, Health::Reset(newer));
+        assert!(opened.value.is_empty());
     }
 
     #[test]

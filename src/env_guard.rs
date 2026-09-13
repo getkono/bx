@@ -21,9 +21,14 @@
 //! exclusion, and it is checked before containment.
 //!
 //! The rule is therefore about the **value** a variable is given, never about
-//! the variable's name. [`is_relocating`] only decides whether a value has to be
-//! looked at; [`check`] is the verdict, and [`RootSet`] is what it is judged
-//! against. Declare no root — [`RootSet::strict`], which is what [`scan`] uses —
+//! the variable's name. Every value shaped like a path is judged against
+//! [`RootSet`] **whatever it is assigned to**: no list of relocating names can
+//! be complete, and a guard that judged only the names it knew approved every
+//! tool it had not heard of — `RIPGREP_CONFIG_PATH`, `GIT_CONFIG_SYSTEM`,
+//! `CARGO_TARGET_DIR`. A short, documented list of names whose value points at a
+//! program or a search list, not at a tool's files, needs no root, and is still
+//! refused a relative entry or one inside bx's own directories. [`check`] is the
+//! verdict. Declare no root — [`RootSet::strict`], which is what [`scan`] uses —
 //! and nothing may be relocated anywhere.
 //!
 //! The guard **fails closed by shape**. It judges fragments bx generates, not
@@ -47,8 +52,14 @@ use crate::config::layers;
 use crate::config::values::ResolvedValues;
 use crate::paths;
 
-/// Exact variable names whose assigned value must be checked against the
-/// declared roots.
+/// Exact variable names that say they hold a location.
+///
+/// A path given to any variable is judged whatever its name, so this list no
+/// longer decides *whether* a value is judged. It decides what a value that is
+/// no kind of path means: for one of these names a bare word is a path relative
+/// to wherever the shell happens to be, and is refused as [`Reason::NotAPath`],
+/// where for any other name it is a behaviour setting. A name missing from here
+/// costs only that.
 const DENIED_EXACT: &[&str] = &[
     // The home itself: `~` and every XDG default are resolved against it.
     "HOME",
@@ -82,6 +93,8 @@ const DENIED_EXACT: &[&str] = &[
     "KUBECONFIG",
     // zsh reads every startup file after `.zshenv` from here.
     "ZDOTDIR",
+    // bash and zsh write the session's history here.
+    "HISTFILE",
     // Caches and configs the prefix and suffix rules below do not reach. Each
     // of these was observed relocating a real tool's directory while matching
     // no rule: the guard was letting them through silently.
@@ -138,10 +151,15 @@ const DENIED_SUFFIXES: &[&str] = &[
 const LOCATION_WORDS: &[&str] = &[
     "DIR",
     "DIRS",
+    "DIRECTORY",
+    "FOLDER",
     "PATH",
     "PATHS",
     "FILE",
     "FILENAME",
+    "FILENAMES",
+    "MODULE",
+    "DEST",
     "HOME",
     "ROOT",
     "PREFIX",
@@ -157,7 +175,8 @@ const LOCATION_WORDS: &[&str] = &[
 ];
 
 /// Names that match a rule above but carry no path at all: they configure
-/// behaviour, so their value must not be checked against a root.
+/// behaviour, so a bare word given to one is not [`Reason::NotAPath`]. A path
+/// given to one is still judged, as it is for every name.
 ///
 /// Only a name a *suffix* or a location word would otherwise mark is worth
 /// listing. A prefix-family behaviour variable — `UV_NO_CACHE=1`,
@@ -187,6 +206,11 @@ const ALLOWED_EXCEPTIONS: &[&str] = &[
 /// value did not read back in one of them although neither defines it at
 /// startup. A test re-derives the first part from whichever shells the machine
 /// running it has.
+///
+/// That probe finds names a shell *defines*. It cannot find a name the shell
+/// *acts on* when it is assigned and that reads back exactly as written —
+/// `HISTFILESIZE=0` is one — so those are curated by hand in
+/// [`ACTS_ON_ASSIGNMENT`], and refused the same way.
 ///
 /// `PATH` is deliberately absent. It reads back exactly as assigned in both
 /// shells — zsh's tied `path` is what is reserved — and it is the one
@@ -371,30 +395,104 @@ const SHELL_NAMES: &[&str] = &[
     "zsh_scheduled_events",
 ];
 
-/// Whether assigning `name` requires its **value** to be checked against the
-/// declared roots.
+/// Names whose **assignment** a shell acts on, beyond holding the value.
 ///
-/// This used to be the verdict itself: a matching name was a denial. It is now
-/// only the question. A matching name is one that names a location, so *where*
-/// that location is decides whether bx may write it, and [`check`] is what
-/// decides. The lists above are therefore no longer a deny-list.
+/// None of these is defined by a pristine shell and each reads back exactly as
+/// written, so the probe behind [`SHELL_NAMES`] cannot find them. The list is
+/// curated from bash(1) and zshparam(1), and is only as complete as that
+/// reading — which is why a fragment is refused rather than judged when it
+/// assigns one:
 ///
-/// Because a wider list now means more checking rather than more denial, the
-/// list can afford to be wide — but it is still widened only by evidence. A
-/// generic `_DIR` or `_PATH` suffix is deliberately absent: `_PATH` would
-/// capture `LD_LIBRARY_PATH`, `MANPATH` and every other list of directories
-/// that tools *search* rather than write to.
+/// * `HISTFILESIZE` — bash truncates the history file to that many lines the
+///   moment it is assigned, non-interactive shells included, so
+///   `HISTFILESIZE=0` deletes the user's history (invariant 1).
+/// * `POSIXLY_CORRECT`, `BASH_COMPAT` — bash changes how every later line
+///   parses.
+/// * `GLOBIGNORE` — bash turns `dotglob` on when it is set.
+/// * `BASH_XTRACEFD` — bash closes the descriptor it held when it changes.
+/// * `PROMPT_COMMAND`, `PS0` — bash runs, or expands with command
+///   substitution, the value at every prompt.
+/// * `precmd_functions`, `preexec_functions`, `chpwd_functions`,
+///   `periodic_functions`, `zshaddhistory_functions`, `zshexit_functions` — zsh
+///   calls every function named in the value at its hook.
 ///
-/// The check is case-sensitive, because environment variable names are and a
-/// tool that reads `CARGO_HOME` does not read `cargo_home` — except for a family
-/// its tool reads without regard to case, `npm_config_*`.
-#[must_use]
-pub fn is_relocating(name: &str) -> bool {
-    if ALLOWED_EXCEPTIONS.contains(&name) {
-        return false;
-    }
-    DENIED_EXACT.contains(&name) || has_location_suffix(name) || family_tail(name).is_some()
+/// `HISTSIZE` and `SAVEHIST` are reserved already, as [`SHELL_NAMES`].
+/// `HISTFILE` is not reserved: assigning it writes nothing, it only moves the
+/// history file, so its value is judged like any location's.
+///
+/// `LANG` and `LC_*` change the shell's locale on assignment and are not here:
+/// the grammar admits printable ASCII only, whose meaning no locale changes,
+/// and a fragment setting a locale is ordinary.
+const ACTS_ON_ASSIGNMENT: &[&str] = &[
+    "BASH_COMPAT",
+    "BASH_XTRACEFD",
+    "GLOBIGNORE",
+    "HISTFILESIZE",
+    "POSIXLY_CORRECT",
+    "PROMPT_COMMAND",
+    "PS0",
+    "chpwd_functions",
+    "periodic_functions",
+    "precmd_functions",
+    "preexec_functions",
+    "zshaddhistory_functions",
+    "zshexit_functions",
+];
+
+/// Whether a fragment may neither assign nor refer to `name`.
+fn is_reserved(name: &str) -> bool {
+    SHELL_NAMES.contains(&name) || ACTS_ON_ASSIGNMENT.contains(&name)
 }
+
+/// Names whose path value points at a **program**, or at a running agent,
+/// rather than at a tool's config, data or cache. Pointing one elsewhere moves
+/// no tool's files, so it needs no declared root.
+///
+/// It is not waved through. When the value is shaped like a path, every entry
+/// must still be absolute and outside bx's own directories: a relative program
+/// runs whatever the current directory holds, and one inside bx's state
+/// directory is one `bx rm` deletes. A value that is no kind of path —
+/// `EDITOR=nvim` — is a program found through `PATH`, as for any name.
+///
+/// * `EDITOR`, `VISUAL`, `PAGER`, `BROWSER`, `TERMINAL` — the program a tool
+///   runs to edit, page, browse or open a terminal.
+/// * `RUSTC_WRAPPER` — the program cargo runs `rustc` through, and one of this
+///   module's two motivating cases.
+/// * `SSH_AUTH_SOCK` — the socket of an ssh agent that is already running. It
+///   says where to reach a process, not where ssh keeps anything.
+///
+/// `SHELL` and `MANPATH` would belong here and do not: both are
+/// [`SHELL_NAMES`], which may not be assigned at all. Every name not listed
+/// here or in [`SEARCH_LISTS`] is judged against the roots — including
+/// `LD_LIBRARY_PATH` and `PKG_CONFIG_PATH`, which change what a program loads
+/// and are left to a declared root rather than exempted.
+const PROGRAMS: &[&str] = &[
+    "BROWSER",
+    "EDITOR",
+    "PAGER",
+    "RUSTC_WRAPPER",
+    "SSH_AUTH_SOCK",
+    "TERMINAL",
+    "VISUAL",
+];
+
+/// Colon-separated lists a shell or a tool **searches** for programs or
+/// documents, and which a fragment plausibly extends. Like [`PROGRAMS`] they
+/// need no root, and unlike them they are judged whatever their shape: every
+/// entry must be absolute and outside bx's own directories, because an empty
+/// entry or `.` *is* the current directory and a relative entry is resolved
+/// against it — `PATH=bin` runs whatever `./bin` holds.
+///
+/// A reference to the list's own name that the fragment has not assigned —
+/// the `$PATH` in `PATH="$HOME/.local/bin:$PATH"` — stands for the list the
+/// shell inherited. That list is the user's, not bx's, so it is not judged, but
+/// only as a whole entry: `$PATH/bin` is relative to nothing bx can know.
+const SEARCH_LISTS: &[&str] = &["INFOPATH", "PATH"];
+
+/// What an unassigned reference to a search list's own name expands to while
+/// the list is judged. No accepted value holds a control character, so no
+/// entry a fragment writes can equal it.
+const INHERITED: &str = "\0";
 
 /// Whether `name` ends in one of [`DENIED_SUFFIXES`], with something before it.
 fn has_location_suffix(name: &str) -> bool {
@@ -421,11 +519,25 @@ fn family_tail(name: &str) -> Option<&str> {
 /// True of an exact name and of a suffix match, where the name is the evidence.
 /// For a name matched only by a family prefix it is true when the name's last
 /// word is a [`LOCATION_WORDS`] entry — unless the name is a `NO_` switch, which
-/// turns a location off rather than naming one (`UV_NO_CACHE`).
+/// turns a location off rather than naming one (`UV_NO_CACHE`). Never true of
+/// an [`ALLOWED_EXCEPTIONS`] name.
 ///
-/// A relocating variable whose name does *not* say so, given a value that is no
-/// kind of path, is a behaviour setting: `MISE_JOBS=8`, `UV_PYTHON=3.12`.
+/// This decides nothing about a value shaped like a path, which is judged for
+/// every name. It decides what a value that is no kind of path is: for a name
+/// that says it holds a location, a path relative to wherever the shell is
+/// ([`Reason::NotAPath`]); for any other, a behaviour setting — `MISE_JOBS=8`,
+/// `UV_PYTHON=3.12`, `CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu`. The
+/// location-word test is kept to the prefix families on purpose: across every
+/// name, `_TARGET` and `_MODULE` end ordinary settings
+/// (`DJANGO_SETTINGS_MODULE=site.settings`).
+///
+/// The match is case-sensitive, because environment variable names are and a
+/// tool that reads `CARGO_HOME` does not read `cargo_home` — except for a family
+/// its tool reads without regard to case, `npm_config_*`.
 fn names_a_location(name: &str) -> bool {
+    if ALLOWED_EXCEPTIONS.contains(&name) {
+        return false;
+    }
     if DENIED_EXACT.contains(&name) || has_location_suffix(name) {
         return true;
     }
@@ -480,8 +592,8 @@ impl RootSet {
     /// The set that declares nothing, and therefore permits no relocation.
     ///
     /// This is what [`scan`] uses, and it is why `scan` needs no home: with no
-    /// root declared every relocating variable is a violation before its value
-    /// is ever looked at, so there is nothing to expand `~` against.
+    /// root declared every value shaped like a path is a violation before it is
+    /// compared with anything, so there is nothing to expand `~` against.
     #[must_use]
     pub fn strict() -> Self {
         Self {
@@ -755,11 +867,11 @@ pub struct Violation {
 /// grammar [`scan_with`] reads a line with — so a value that is not exactly one
 /// value in that grammar, optionally followed by a comment, is refused for
 /// every variable, and a `name` that is not a variable name is refused too.
-/// Past that, a variable that does not relocate anything is allowed without
-/// its value being judged against a root, so `EDITOR=nvim` and
-/// `SCCACHE_CACHE_SIZE=100G` can never trip a path rule. A relocating variable
-/// is allowed exactly when every `:`-separated entry of its value resolves to a
-/// path inside a declared root.
+/// Past that, the verdict is about the value, as [`scan_with`] states: a value
+/// that is no kind of path — `EDITOR=nvim`, `SCCACHE_CACHE_SIZE=100G` — is
+/// allowed unless the name says it holds a location, and a value shaped like a
+/// path is allowed exactly when every `:`-separated entry of it resolves inside
+/// a declared root, whatever the name.
 ///
 /// This is the same function [`scan_with`] calls for every assignment it reads,
 /// so the two cannot disagree about one. No reference resolves here except
@@ -817,8 +929,25 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// begins a statement, and a multi-line construct is refused at its first line.
 ///
 /// A name the shell manages itself — `HOME`, `RANDOM`, `LINENO`, zsh's `path`
-/// and the rest of `SHELL_NAMES` — may be neither assigned nor referred to, and
-/// is refused as [`Reason::ReservedName`]. `PATH` may.
+/// and the rest of `SHELL_NAMES` — or acts on when it is assigned —
+/// `HISTFILESIZE` and the rest of [`ACTS_ON_ASSIGNMENT`] — may be neither
+/// assigned nor referred to, and is refused as [`Reason::ReservedName`]. `PATH`
+/// may.
+///
+/// **What is judged.** The value, as a shell gives it, whatever it is assigned
+/// to — exported or not, since assigning a name the environment already exports
+/// changes what every child sees:
+///
+/// * a value **shaped like a path** — some `:`-entry of it absolute, beginning
+///   `~`, containing `/`, or `.` or `..`, and not a URL — must have every entry
+///   absolute, outside bx's own directories and inside a declared root;
+/// * a value that is **no kind of path** is allowed, unless the name says it
+///   holds a location, when it is [`Reason::NotAPath`];
+/// * a value that **does not resolve** cannot be shown not to be a path, and is
+///   judged as one;
+/// * a [`PROGRAMS`] name needs no root for a path value, and a [`SEARCH_LISTS`]
+///   name needs none for any value, but every entry of either must still be
+///   absolute and outside bx's own directories.
 ///
 /// **What is learned.** One forward pass. Every accepted assignment — exported
 /// or not — is recorded, **expanded**, so a later line may refer to it: the
@@ -831,8 +960,13 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// known — such a line could have assigned or unset anything — so every later
 /// reference is [`Reason::UnreadableReference`].
 ///
-/// **Lists.** A relocating value is split at `:`, and every entry must be an
-/// absolute path inside a root and outside bx's own directories: a
+/// An accepted assignment to `XDG_STATE_HOME` whose value is absolute moves
+/// bx's state directory to `$XDG_STATE_HOME/bx` — [`layers::state_dir`]'s rule
+/// — for every later line, and the directory it moved from stays owned too: a
+/// tool pointed into either writes among bx's records.
+///
+/// **Lists.** A value shaped like a path is split at `:`, and every entry must
+/// be an absolute path inside a root and outside bx's own directories: a
 /// `KUBECONFIG` or a `GOPATH` is a list, and a single path with a `:` in it is
 /// judged no less strictly for being split.
 ///
@@ -854,7 +988,8 @@ pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
 /// Find every forbidden assignment in a block of shell bx is about to write.
 ///
 /// Equivalent to [`scan_with`] against [`RootSet::strict`]: with no root
-/// declared, every relocating variable is a violation. This is the check for a
+/// declared, every value shaped like a path is a violation, except a program's
+/// or a search list's absolute one. This is the check for a
 /// caller that has no configuration to consult, and it is why it needs no home.
 #[must_use]
 pub fn scan(content: &str) -> Vec<Violation> {
@@ -884,7 +1019,7 @@ fn pass(content: &str, roots: &RootSet) -> (Vec<Violation>, Scope) {
                 if let Some(reason) = judged.reason {
                     found.push(violation(name, value, reason));
                 }
-                scope.learn(name, judged);
+                scope.learn(name, judged, roots.home());
             }
         }
     }
@@ -915,7 +1050,7 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
         Ok(word) => word,
         Err(reason) => return refused(reason),
     };
-    if SHELL_NAMES.contains(&name) {
+    if is_reserved(name) {
         return refused(Reason::ReservedName);
     }
     let resolved = word.resolve(scope, roots.home());
@@ -923,52 +1058,70 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
         reason,
         resolved: resolved.clone(),
     };
+    // Every entry of a list, judged by `refuses`, or why the value has none.
+    let each_entry =
+        |value: &Result<String, Reason>, refuses: &dyn Fn(&Path) -> Option<Reason>| match value {
+            Ok(list) => list
+                .split(':')
+                .filter(|entry| *entry != INHERITED)
+                .find_map(|entry| refuses(Path::new(entry))),
+            Err(reason) => Some(*reason),
+        };
+    let anchored = |entry: &Path| refuses_unanchored(entry, scope, roots);
 
-    if !is_relocating(name) {
-        return judged(None);
+    // A search list is judged entry by entry whatever its shape, with the list
+    // the shell inherited standing in for a reference to its own name.
+    if SEARCH_LISTS.contains(&name) {
+        let listed = word.expand(scope, roots.home(), Some(name));
+        return judged(each_entry(&listed, &anchored));
     }
-    // An empty value is a degenerate path, not a non-path: `CARGO_HOME=` does
-    // relocate the tool, to nowhere.
-    let not_a_path = !word.text.is_empty() && !path_shaped(word.text);
+    // A value that does not resolve cannot be shown not to be a path. An empty
+    // value, for a name that says it holds a location, is a degenerate path
+    // rather than a setting: `CARGO_HOME=` relocates the tool, to nowhere.
+    let shaped = resolved.as_ref().map_or(true, |value| {
+        path_shaped(value) || (value.is_empty() && names_a_location(name))
+    });
     // A value that is no kind of path, for a variable whose name does not say
     // it holds a location, is a behaviour setting: it relocates nothing, so it
     // needs no root — `MISE_JOBS=8` is allowed with none declared.
-    if not_a_path && !names_a_location(name) {
+    if !shaped && !names_a_location(name) {
         return judged(None);
+    }
+    if PROGRAMS.contains(&name) {
+        return judged(each_entry(&resolved, &anchored));
     }
     // A set with no admissible root permits no relocation, and is the only set
     // without a home — so past this point there is always a home.
     if let Some(reason) = roots.refuses_everything() {
         return judged(Some(reason));
     }
-    if not_a_path {
+    if !shaped {
         return judged(Some(Reason::NotAPath));
     }
-    let reason = match &resolved {
-        Ok(resolved) => resolved
-            .split(':')
-            .find_map(|entry| refuses_entry(Path::new(entry), roots)),
-        Err(reason) => Some(*reason),
-    };
-    judged(reason)
+    judged(each_entry(&resolved, &|entry| {
+        refuses_entry(entry, scope, roots)
+    }))
 }
 
 /// Why one resolved path — a value, or one entry of a list — may not be a
 /// relocation target, or `None` if it may.
-fn refuses_entry(path: &Path, roots: &RootSet) -> Option<Reason> {
+fn refuses_entry(path: &Path, scope: &Scope, roots: &RootSet) -> Option<Reason> {
+    refuses_unanchored(path, scope, roots)
+        .or_else(|| (!roots.contains(path)).then_some(Reason::OutsideDeclaredRoots))
+}
+
+/// Why one resolved path may not be named at all — relative, or inside a
+/// directory bx owns — whether or not it must also lie inside a root.
+fn refuses_unanchored(path: &Path, scope: &Scope, roots: &RootSet) -> Option<Reason> {
     if !path.is_absolute() {
         return Some(Reason::NotAbsolute);
     }
     // Before the root test, and therefore ahead of any declaration: a root the
     // user declared widens where tools may live, never who owns bx's own state.
-    if roots.owns(path) {
+    if roots.owns(path) || scope.owns(path) {
         return Some(Reason::BxOwnedDirectory);
     }
-    if roots.contains(path) {
-        None
-    } else {
-        Some(Reason::OutsideDeclaredRoots)
-    }
+    None
 }
 
 /// What one pass over a fragment has learned it assigns.
@@ -979,6 +1132,9 @@ struct Scope {
     /// Whether a refused line has passed. After one nothing is known, because
     /// the guard did not read what it assigned or unset.
     lost: bool,
+    /// bx's state directory wherever an earlier `XDG_STATE_HOME` moved it,
+    /// normalised. Only ever grows: a refused line does not give it back.
+    owned: Vec<PathBuf>,
 }
 
 impl Scope {
@@ -999,11 +1155,23 @@ impl Scope {
                 .map(|home| home.to_string_lossy().into_owned())
                 .ok_or(Reason::UnresolvedReference);
         }
-        Err(if SHELL_NAMES.contains(&name) {
+        Err(if is_reserved(name) {
             Reason::ReservedName
         } else {
             Reason::UnresolvedReference
         })
+    }
+
+    /// Whether a reference to `name` is to the value the shell inherited:
+    /// nothing in the fragment has assigned it, and no refused line could have.
+    fn inherits(&self, name: &str) -> bool {
+        !self.lost && !self.learned.contains_key(name)
+    }
+
+    /// Whether `path` lies inside a state directory the fragment moved.
+    fn owns(&self, path: &Path) -> bool {
+        let normalised = paths::normalize(path);
+        self.owned.iter().any(|dir| normalised.starts_with(dir))
     }
 
     /// Learn what an assignment the pass has just judged gave its name.
@@ -1013,12 +1181,21 @@ impl Scope {
     /// is not a value any shell gives the name, and a line that assigns a
     /// name the shell manages may change another name with it, so either
     /// forgets everything.
-    fn learn(&mut self, name: &str, judged: Judged) {
+    ///
+    /// An `XDG_STATE_HOME` it learns moves bx's state directory, by
+    /// [`layers::state_dir`]'s rule, for every later line. Only against a
+    /// home: a set without one refuses that assignment itself, and every value
+    /// shaped like a path after it.
+    fn learn(&mut self, name: &str, judged: Judged, home: Option<&Path>) {
         match judged.reason {
             Some(Reason::Unreadable | Reason::MultipleAssignments | Reason::ReservedName) => {
                 self.forget_everything();
             }
             _ => {
+                if let (Some(home), Ok(value), "XDG_STATE_HOME") = (home, &judged.resolved, name) {
+                    let dir = layers::state_dir(home, Some(std::ffi::OsStr::new(value)));
+                    self.owned.push(paths::normalize(&dir));
+                }
                 self.learned
                     .insert(name.to_string(), judged.resolved.map_err(as_reference));
             }
@@ -1048,17 +1225,32 @@ fn as_reference(reason: Reason) -> Reason {
 /// few dozen such lines would otherwise hold gigabytes.
 const MAX_EXPANDED_LEN: usize = 4096;
 
-/// Whether `value` is shaped like a path at all.
+/// Whether `value` — as a shell gives it, references expanded — is shaped like
+/// a path, and so is judged as one whatever it is assigned to.
 ///
-/// Shaped like a path means: absolute, `~`-relative, containing a `$` that may
-/// name one, or containing a `/` without a `://` — a URL has slashes and is
-/// still not a path. Everything else is a number, a flag or a word, which for a
-/// variable whose name does not say it holds a location is a behaviour setting.
+/// Shaped like a path means some `:`-separated entry of it begins with `~`,
+/// contains a `/` (an absolute path does), or is exactly `.` or `..`. The one
+/// exception is a URL: a scheme of ASCII letters, digits, `+`, `-` and `.`
+/// beginning with a letter, then `://`. A URL has slashes and is still not a
+/// path — except a `file:` URL, which names one and is judged, and fails, as
+/// one. Everything else is a number, a flag or a word, which for a variable
+/// whose name does not say it holds a location is a behaviour setting.
 fn path_shaped(value: &str) -> bool {
-    value.starts_with('/')
-        || value.starts_with('~')
-        || value.contains('$')
-        || (value.contains('/') && !value.contains("://"))
+    !is_url(value)
+        && value.split(':').any(|entry| {
+            entry.starts_with('~') || entry.contains('/') || matches!(entry, "." | "..")
+        })
+}
+
+/// Whether `value` is a URL other than a `file:` one.
+fn is_url(value: &str) -> bool {
+    value.split_once("://").is_some_and(|(scheme, _)| {
+        !scheme.eq_ignore_ascii_case("file")
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    })
 }
 
 /// The blanks that may indent a line and separate a value from its comment.
@@ -1132,6 +1324,17 @@ struct Word<'a> {
 impl Word<'_> {
     /// What a shell gives the name this value is assigned to.
     fn resolve(&self, scope: &Scope, home: Option<&Path>) -> Result<String, Reason> {
+        self.expand(scope, home, None)
+    }
+
+    /// [`Word::resolve`], except that a reference to `inherited` which the
+    /// fragment has not assigned expands to [`INHERITED`].
+    fn expand(
+        &self,
+        scope: &Scope,
+        home: Option<&Path>,
+        inherited: Option<&str>,
+    ) -> Result<String, Reason> {
         let mut out = if self.tilde {
             scope.lookup("HOME", home)?
         } else {
@@ -1140,6 +1343,9 @@ impl Word<'_> {
         for part in &self.parts {
             match part {
                 Part::Text(text) => out.push_str(text),
+                Part::Reference(name) if inherited == Some(*name) && scope.inherits(name) => {
+                    out.push_str(INHERITED);
+                }
                 Part::Reference(name) => out.push_str(&scope.lookup(name, home)?),
             }
             if out.len() > MAX_EXPANDED_LEN {
@@ -1643,7 +1849,7 @@ mod tests {
         // `SCRATCH_HOME` is caught by the `_HOME` suffix and was, under the
         // name-based guard, denied outright — a false positive on the one
         // variable the whole configuration is written in terms of.
-        assert!(is_relocating("SCRATCH_HOME"));
+        assert!(names_a_location("SCRATCH_HOME"));
         assert_eq!(check("SCRATCH_HOME", ROOT, &rooted()), Verdict::Allowed);
     }
 
@@ -1696,7 +1902,7 @@ mod tests {
             ("PIP_TARGET", "build"),
             ("UV_PROJECT_ENVIRONMENT", "venv"),
         ] {
-            assert!(is_relocating(name), "{name}");
+            assert!(names_a_location(name), "{name}");
             assert_eq!(
                 reason_of(&check(name, value, &rooted())),
                 Some(Reason::NotAPath),
@@ -1822,18 +2028,26 @@ mod tests {
     }
 
     #[test]
-    fn a_variable_that_does_not_relocate_may_still_name_bxs_directory() {
-        // The exclusion is part of the relocation verdict, not a second rule
-        // over every value: a tool told where bx's own state is has not been
-        // moved there.
+    fn a_program_needs_no_root_but_may_not_live_in_bxs_directory() {
+        // Round 4: the exclusion holds over every value shaped like a path. A
+        // program inside bx's state directory is one `bx rm` deletes, so even
+        // a name that needs no root may not point there — and it may point at
+        // an ordinary program with no root declared at all.
         assert_eq!(
-            check(
+            reason_of(&check(
                 "EDITOR",
                 "/var/home/example/.local/state/bx/editor",
                 &rooted()
-            ),
-            Verdict::Allowed
+            )),
+            Some(Reason::BxOwnedDirectory)
         );
+        for roots in [
+            rooted(),
+            RootSet::new(Path::new(HOME), &[]),
+            RootSet::strict(),
+        ] {
+            assert_eq!(check("EDITOR", "/usr/bin/nvim", &roots), Verdict::Allowed);
+        }
     }
 
     #[test]
@@ -2110,9 +2324,13 @@ mod tests {
     fn substituted_text_is_not_expanded_again() {
         // `Y='$X'` holds the two characters `$X`, and a shell that later
         // expands `$Y` yields them and stops. Expanding them again would judge
-        // a path no shell produces.
+        // a path no shell produces. `X=/etc` is itself a path outside the root
+        // (round 4), and the only violation: the line that uses `$Y` is not.
         let content = format!("X=/etc\nY='$X'\nexport CARGO_HOME={ROOT}/$Y\n");
-        assert_eq!(scan_with(&content, &rooted()), vec![]);
+        assert_eq!(
+            reasons(&content, &rooted()),
+            vec![(1, Reason::OutsideDeclaredRoots)]
+        );
         let content = format!("X={ROOT}\nY='$X'\nexport CARGO_HOME=$Y/cargo\n");
         assert_eq!(
             scan_with(&content, &rooted())
@@ -2133,31 +2351,31 @@ mod tests {
             "export CARGO_HOME=$X/cargo\n",
         );
         assert_eq!(scan_with(content, &rooted()), vec![]);
-        // Before any `X` is assigned, the same line refers to nothing.
-        let found = scan_with("X=$X/b\nexport CARGO_HOME=$X/cargo\n", &rooted());
+        // Before any `X` is assigned, the same line refers to nothing — and a
+        // value that does not resolve is judged as a path (round 4), so both
+        // lines say so.
         assert_eq!(
-            found
-                .iter()
-                .map(|violation| violation.reason)
-                .collect::<Vec<_>>(),
-            vec![Reason::UnresolvedReference]
+            reasons("X=$X/b\nexport CARGO_HOME=$X/cargo\n", &rooted()),
+            vec![
+                (1, Reason::UnresolvedReference),
+                (2, Reason::UnresolvedReference)
+            ]
         );
     }
 
     #[test]
     fn two_values_that_refer_to_each_other_do_not_resolve() {
         // A true two-node cycle. `A=$B` refers to a `B` not yet assigned, so
-        // `A` is unresolvable, and `B=$A` inherits that. Neither `A` nor `B`
-        // relocates anything, so the cycle reaches the guard through the value
-        // that does.
+        // `A` is unresolvable, and `B=$A` inherits that. A value that does not
+        // resolve cannot be shown not to be a path, so every line is refused.
         let content = concat!("A=$B\n", "B=$A\n", "export CARGO_HOME=$A/cargo\n");
-        let found = scan_with(content, &rooted());
         assert_eq!(
-            found
-                .iter()
-                .map(|violation| (violation.line, violation.reason))
-                .collect::<Vec<_>>(),
-            vec![(3, Reason::UnresolvedReference)]
+            reasons(content, &rooted()),
+            vec![
+                (1, Reason::UnresolvedReference),
+                (2, Reason::UnresolvedReference),
+                (3, Reason::UnresolvedReference)
+            ]
         );
     }
 
@@ -2259,10 +2477,12 @@ mod tests {
         // without end. The reason says so, rather than that a variable the
         // fragment plainly assigned was never assigned.
         let long = format!("{ROOT}/{}", "a".repeat(MAX_EXPANDED_LEN / 2));
+        // `Y` is judged too, as every value is (round 4).
         let content = format!("X={long}\nY=$X$X\nexport CARGO_HOME=$Y/cargo\n");
-        let found = scan_with(&content, &rooted());
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].reason, Reason::ExpansionTooLong);
+        assert_eq!(
+            reasons(&content, &rooted()),
+            vec![(2, Reason::ExpansionTooLong), (3, Reason::ExpansionTooLong)]
+        );
         // And the same bound applies to the value being judged itself.
         let content = format!("X={long}\nexport CARGO_HOME=$X$X\n");
         assert_eq!(
@@ -2505,7 +2725,7 @@ mod tests {
             "HOMEBREW_LOGS",
             "HOMEBREW_TEMP",
         ] {
-            assert!(is_relocating(name), "{name} should be value-checked");
+            assert!(names_a_location(name), "{name} should be value-checked");
             assert_eq!(
                 check(name, "/var/mnt/scratch/example/x", &rooted()),
                 Verdict::Allowed,
@@ -2524,10 +2744,10 @@ mod tests {
         // The motivating case for the root set being a *set*: an sccache
         // directory may legitimately live outside the scratch root, and must
         // then be covered by a root of its own rather than waved through.
-        assert!(is_relocating("SCCACHE_DIR"));
+        assert!(names_a_location("SCCACHE_DIR"));
         // The behaviour variables that share its prefix still are not.
-        assert!(!is_relocating("SCCACHE_CACHE_SIZE"));
-        assert!(!is_relocating("SCCACHE_SERVER_UDS"));
+        assert!(!names_a_location("SCCACHE_CACHE_SIZE"));
+        assert!(!names_a_location("SCCACHE_SERVER_UDS"));
 
         let roots = RootSet::new(
             Path::new(HOME),
@@ -2549,27 +2769,26 @@ mod tests {
 
     #[test]
     fn widening_the_list_did_not_capture_a_colon_separated_list() {
-        // A generic `_PATH` or `_DIR` suffix would have. Those lists are not
-        // single paths and would be rejected for not being absolute, which is
-        // why the list is widened by observed evidence and nothing else.
+        // A generic `_PATH` or `_DIR` suffix would have, and would make a bare
+        // word in any of them `NotAPath`. Their path values are judged by
+        // value since round 4 whatever this says.
         for name in ["LD_LIBRARY_PATH", "PATH", "MANPATH", "PKG_CONFIG_PATH"] {
-            assert!(!is_relocating(name), "{name} should not be value-checked");
+            assert!(!names_a_location(name), "{name} does not name a location");
         }
     }
 
     #[test]
     fn the_same_fragment_is_all_violations_with_no_root_declared() {
         // A user who declares no root gets the strict guard, and the strict
-        // guard denies every relocation. `CACHE_DIR` and `DATA_DIR` are not
-        // relocating names, so 25 assignments yield 23 violations — and 23 is
-        // the whole relocating set, six of which reach this count only because
-        // the name list was widened.
+        // guard denies every path. Since round 4 that includes `CACHE_DIR` and
+        // `DATA_DIR`, which no list names: a value is judged whatever it is
+        // assigned to, so all 25 assignments are violations.
         let found = scan(OPERATOR_FRAGMENT);
-        assert_eq!(found.len(), 23);
+        assert_eq!(found.len(), 25);
         assert!(found.iter().all(|v| v.reason == Reason::NoRootsDeclared));
         assert!(found.windows(2).all(|w| w[0].line < w[1].line));
-        assert!(!found.iter().any(|v| v.name == "CACHE_DIR"));
-        assert!(!found.iter().any(|v| v.name == "DATA_DIR"));
+        assert!(found.iter().any(|v| v.name == "CACHE_DIR"));
+        assert!(found.iter().any(|v| v.name == "DATA_DIR"));
     }
 
     #[test]
@@ -2585,7 +2804,7 @@ mod tests {
             "XDG_CACHE_HOME",
             "XDG_STATE_HOME",
         ] {
-            assert!(is_relocating(name), "{name} should be value-checked");
+            assert!(names_a_location(name), "{name} should be value-checked");
         }
     }
 
@@ -2598,7 +2817,7 @@ mod tests {
             "GH_CONFIG_DIR",
             "KUBECONFIG",
         ] {
-            assert!(is_relocating(name), "{name} should be value-checked");
+            assert!(names_a_location(name), "{name} should be value-checked");
         }
     }
 
@@ -2611,7 +2830,7 @@ mod tests {
             "ASDF_DIR",
             "PIP_TARGET",
         ] {
-            assert!(is_relocating(name), "{name} should be value-checked");
+            assert!(names_a_location(name), "{name} should be value-checked");
         }
     }
 
@@ -2619,15 +2838,15 @@ mod tests {
     fn location_suffixes_are_value_checked_generically() {
         // The point of the suffix rule is catching tools bx has never heard of.
         for name in ["SOMETOOL_CONFIG_DIR", "OTHERTOOL_HOME", "THIRD_CACHE_DIR"] {
-            assert!(is_relocating(name), "{name} should be value-checked");
+            assert!(names_a_location(name), "{name} should be value-checked");
         }
     }
 
     #[test]
     fn a_bare_prefix_or_suffix_is_not_a_variable() {
         // `_HOME` is the suffix itself, not a tool's variable; likewise `UV_`.
-        assert!(!is_relocating("_HOME"));
-        assert!(!is_relocating("UV_"));
+        assert!(!names_a_location("_HOME"));
+        assert!(!names_a_location("UV_"));
     }
 
     #[test]
@@ -2640,20 +2859,20 @@ mod tests {
             "PAGER",
             "SCCACHE_SERVER_UDS",
         ] {
-            assert!(!is_relocating(name), "{name} should be allowed");
+            assert!(!names_a_location(name), "{name} should be allowed");
         }
     }
 
     #[test]
     fn documented_exceptions_survive_the_prefix_rule() {
-        assert!(!is_relocating("UV_SYSTEM_PYTHON"));
-        assert!(!is_relocating("MISE_VERBOSE"));
-        assert!(!is_relocating("PIP_REQUIRE_VIRTUALENV"));
+        assert!(!names_a_location("UV_SYSTEM_PYTHON"));
+        assert!(!names_a_location("MISE_VERBOSE"));
+        assert!(!names_a_location("PIP_REQUIRE_VIRTUALENV"));
     }
 
     #[test]
     fn the_check_is_case_sensitive() {
-        assert!(!is_relocating("cargo_home"));
+        assert!(!names_a_location("cargo_home"));
     }
 
     #[test]
@@ -2923,9 +3142,10 @@ mod tests {
                 "{value}"
             );
         }
+        // A literal `~` is shaped like a path for any name (round 4).
         assert_eq!(
             reasons("X='~'\nexport CARGO_HOME=$X/cargo\n", &home_rooted),
-            vec![(2, Reason::NotAbsolute)]
+            vec![(1, Reason::NotAbsolute), (2, Reason::NotAbsolute)]
         );
     }
 
@@ -3040,7 +3260,6 @@ mod tests {
             ("MISE_JOBS", "8"),
             ("ASDF_CONCURRENCY", "8"),
         ] {
-            assert!(is_relocating(name), "{name}");
             assert!(!names_a_location(name), "{name}");
             assert_eq!(check(name, value, &rooted()), Verdict::Allowed, "{name}");
             // It relocates nothing, so it needs no root declared either.
@@ -3215,6 +3434,405 @@ mod tests {
         assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
     }
 
+    // Round-4 reproductions, written against the round-3 API only.
+
+    #[test]
+    fn r4_1_a_state_directory_the_fragment_moves_is_owned_by_later_lines() {
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let cases = [
+            (
+                "export XDG_STATE_HOME=/var/mnt/scratch/example/state\n\
+                 export CARGO_HOME=/var/mnt/scratch/example/state/bx",
+                rooted(),
+            ),
+            (
+                "export XDG_STATE_HOME=~/state\nexport CARGO_HOME=~/state/bx/cargo",
+                home_rooted,
+            ),
+        ];
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r4_2_a_name_whose_assignment_the_shell_acts_on() {
+        let mut cases = Vec::new();
+        for content in [
+            "export HISTFILESIZE=0",
+            "export HISTFILE=/etc/evil",
+            "export HISTFILE=history",
+            "POSIXLY_CORRECT=1",
+            "BASH_COMPAT=50",
+            "GLOBIGNORE=x",
+            "BASH_XTRACEFD=1",
+            "PROMPT_COMMAND=x",
+            "PS0=x",
+            "precmd_functions=x",
+        ] {
+            cases.push((content, rooted()));
+            cases.push((content, RootSet::strict()));
+        }
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    /// Names the round-3 lists did not hold, each of which moves a tool's
+    /// config, data or cache — `rg` and `git` were shown to obey two of them.
+    const R4_UNLISTED_RELOCATIONS: &[&str] = &[
+        "CARGO_TARGET_DIR",
+        "CARGO_INSTALL_ROOT",
+        "LESSHISTFILE",
+        "NODE_REPL_HISTORY",
+        "PYTHONPYCACHEPREFIX",
+        "GOENV",
+        "GOBIN",
+        "GOTMPDIR",
+        "RIPGREP_CONFIG_PATH",
+        "BAT_CONFIG_PATH",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "INPUTRC",
+        "TERMINFO",
+        "CCACHE_CONFIGPATH",
+        "XDG_CONFIG_DIRS",
+        "XDG_DATA_DIRS",
+        "YARN_GLOBAL_FOLDER",
+        "BUNDLE_USER_CONFIG",
+        "BUNDLE_PATH",
+        "POETRY_VIRTUALENVS_PATH",
+        "CONDA_PKGS_DIRS",
+        "PIPX_HOME",
+        "PIPX_BIN_DIR",
+        "pnpm_config_store_dir",
+        "RBENV_ROOT",
+        "NODENV_ROOT",
+        "FNM_DIR",
+        "SDKMAN_DIR",
+        "STARSHIP_CACHE",
+        "NUGET_PLUGINS_CACHE_PATH",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "CYPRESS_CACHE_FOLDER",
+        "ELECTRON_CACHE",
+        "LD_LIBRARY_PATH",
+    ];
+
+    #[test]
+    fn r4_3_a_path_given_to_a_name_no_list_holds() {
+        let mut cases = Vec::new();
+        let unlisted: Vec<String> = R4_UNLISTED_RELOCATIONS
+            .iter()
+            .map(|name| format!("export {name}=/etc/evil"))
+            .collect();
+        for content in &unlisted {
+            cases.push((content.as_str(), rooted()));
+            cases.push((content.as_str(), RootSet::strict()));
+        }
+        for content in [
+            "export SOMETHING=.",
+            "export SOMETHING=..",
+            "export SOMETHING=build/cache",
+            "export SOMETHING=~/elsewhere",
+            "export SOMETHING=a:/etc/evil",
+            "X=/etc/evil",
+        ] {
+            cases.push((content, rooted()));
+        }
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r4_4_location_words_the_review_found_missing() {
+        let cases = [
+            "MISE_CONFIG_DIRECTORY=evil",
+            "MISE_OVERRIDE_CONFIG_FILENAMES=evil",
+            "UV_TOOL_FOLDER=evil",
+            "ASDF_PLUGIN_MODULE=evil",
+            "PIP_INSTALL_DEST=evil",
+        ]
+        .map(|content| (content, rooted()));
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn r4_5_a_search_list_or_a_program_that_is_not_an_absolute_path() {
+        let mut cases = Vec::new();
+        for content in [
+            "export PATH=.:/usr/bin",
+            "export PATH=/usr/bin:",
+            "export PATH=bin",
+            "export PATH=",
+            "export PATH=/var/home/example/.local/state/bx/bin:/usr/bin",
+            "export EDITOR=./nvim",
+            "export EDITOR=/var/home/example/.local/state/bx/nvim",
+        ] {
+            cases.push((content, rooted()));
+            cases.push((content, RootSet::new(Path::new(HOME), &[])));
+        }
+        assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
+    }
+
+    #[test]
+    fn bash_truncates_the_history_file_when_a_fragment_assigns_histfilesize() {
+        // The mechanism behind reserving `HISTFILESIZE`: bash truncates the
+        // history file the moment the name is assigned, in a non-interactive
+        // shell too, so a fragment that set it would destroy bytes the user
+        // wrote (invariant 1). Run against a history file in a temporary
+        // directory, never a real one.
+        let Some(bash) = installed("bash") else {
+            return;
+        };
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let history = scratch.path().join("history");
+        std::fs::write(&history, "echo one\necho two\n").expect("a history file");
+        std::process::Command::new(bash)
+            .args(["--norc", "--noprofile", "-c", "HISTFILESIZE=0"])
+            .current_dir(scratch.path())
+            .env_clear()
+            .env("HOME", HOME)
+            .env("PATH", "/nonexistent")
+            .env("HISTFILE", &history)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("an installed shell runs");
+        assert_eq!(std::fs::read(&history).expect("the history file"), b"");
+        assert_eq!(
+            reasons("export HISTFILESIZE=0\n", &rooted()),
+            vec![(1, Reason::ReservedName)]
+        );
+    }
+
+    // Review round 4: a value is judged whatever it is assigned to.
+
+    #[test]
+    fn a_value_is_judged_by_its_shape_whatever_the_name() {
+        use Reason::{NoRootsDeclared, NotAPath, NotAbsolute, OutsideDeclaredRoots};
+        for name in R4_UNLISTED_RELOCATIONS {
+            assert_eq!(
+                reason_of(&check(name, "/etc/evil", &rooted())),
+                Some(OutsideDeclaredRoots),
+                "{name}"
+            );
+            assert_eq!(
+                reason_of(&check(name, "/etc/evil", &RootSet::strict())),
+                Some(NoRootsDeclared),
+                "{name}"
+            );
+            assert_eq!(
+                check(name, "/var/mnt/scratch/example/x", &rooted()),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        for (value, reason) in [
+            (".", Some(NotAbsolute)),
+            ("..", Some(NotAbsolute)),
+            ("build/cache", Some(NotAbsolute)),
+            ("a:.", Some(NotAbsolute)),
+            ("~", Some(OutsideDeclaredRoots)),
+            ("\"~x\"", Some(NotAbsolute)),
+            ("/var/mnt/scratch/example:a", Some(NotAbsolute)),
+            ("file:///var/mnt/scratch/example", Some(NotAbsolute)),
+            ("FILE:///var/mnt/scratch/example", Some(NotAbsolute)),
+            ("1+x://y", Some(NotAbsolute)),
+            ("://y", Some(NotAbsolute)),
+            ("a_b://y", Some(NotAbsolute)),
+            // Not a path at all.
+            ("", None),
+            ("1", None),
+            ("a:b", None),
+            ("...", None),
+            (".x", None),
+            ("\"-j8 V=1\"", None),
+            ("https://example.invalid/a:b", None),
+            ("git+ssh://example.invalid/x", None),
+            ("s3.a-b://bucket/key", None),
+        ] {
+            assert_eq!(
+                reason_of(&check("SOMETHING", value, &rooted())),
+                reason,
+                "{value:?}"
+            );
+        }
+        // A location name keeps its bare-word rule, and an exception keeps
+        // its setting.
+        assert_eq!(
+            reason_of(&check("HISTFILE", "history", &rooted())),
+            Some(NotAPath)
+        );
+        assert_eq!(
+            check("PIP_NO_CACHE_DIR", "1", &RootSet::strict()),
+            Verdict::Allowed
+        );
+        // The behaviour settings the round-4 brief names still pass, with no
+        // root declared.
+        for (name, value) in [
+            ("UV_NO_CACHE", "1"),
+            ("MAKEFLAGS", "\"-j8 V=1\""),
+            ("MISE_JOBS", "8"),
+            ("EDITOR", "nvim"),
+            ("CARGO_BUILD_TARGET", "x86_64-unknown-linux-gnu"),
+        ] {
+            assert_eq!(
+                check(name, value, &RootSet::strict()),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        // `JAVA_HOME` is judged as before: an install location outside every
+        // root is refused.
+        assert_eq!(
+            reason_of(&check("JAVA_HOME", "/usr/lib/jvm/java-21", &rooted())),
+            Some(OutsideDeclaredRoots)
+        );
+    }
+
+    #[test]
+    fn a_name_whose_assignment_the_shell_acts_on_is_reserved() {
+        for name in ACTS_ON_ASSIGNMENT {
+            assert_eq!(
+                reason_of(&check(name, "0", &rooted())),
+                Some(Reason::ReservedName),
+                "{name}"
+            );
+        }
+        // Refused as assignments, and as references, and it forgets.
+        assert_eq!(
+            reasons(
+                "HISTFILESIZE=0\nexport CARGO_HOME=/var/mnt/scratch/example/$HISTFILESIZE\n",
+                &rooted()
+            ),
+            vec![(1, Reason::ReservedName), (2, Reason::UnreadableReference)]
+        );
+        assert_eq!(
+            Scope::default().lookup("PROMPT_COMMAND", None),
+            Err(Reason::ReservedName)
+        );
+        // `HISTFILE` is a location, judged like any.
+        assert_eq!(
+            check("HISTFILE", "/var/mnt/scratch/example/history", &rooted()),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            reason_of(&check("HISTFILE", "/etc/evil", &rooted())),
+            Some(Reason::OutsideDeclaredRoots)
+        );
+    }
+
+    #[test]
+    fn a_state_directory_the_fragment_moves_is_owned_from_then_on() {
+        use Reason::{BxOwnedDirectory, NoRootsDeclared, NotAbsolute};
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        // Only later lines: the line that moves it is judged before it moves.
+        assert_eq!(
+            reasons(
+                "export CARGO_HOME=/var/mnt/scratch/example/state/bx\n\
+                 export XDG_STATE_HOME=/var/mnt/scratch/example/state\n\
+                 export RUSTUP_HOME=/var/mnt/scratch/example/state/bx/rustup\n\
+                 export GOPATH=/var/mnt/scratch/example/state/bxtra\n\
+                 export PATH=/var/mnt/scratch/example/state/bx/bin:$PATH\n",
+                &rooted()
+            ),
+            vec![(3, BxOwnedDirectory), (5, BxOwnedDirectory)]
+        );
+        // The directory it moved from stays owned.
+        assert_eq!(
+            reasons(
+                "export XDG_STATE_HOME=~/state\nexport CARGO_HOME=~/.local/state/bx\n",
+                &home_rooted
+            ),
+            vec![(2, BxOwnedDirectory)]
+        );
+        // A value the XDG rule does not honour moves nothing: a quoted `~` is
+        // relative, so bx's state directory stays where the home puts it.
+        assert_eq!(
+            reasons(
+                "export XDG_STATE_HOME=\"~/state\"\nexport CARGO_HOME=~/state/bx\n",
+                &home_rooted
+            ),
+            vec![(1, NotAbsolute)]
+        );
+        // With no home the moving line is refused already, and so is every
+        // path after it.
+        assert_eq!(
+            reasons(
+                "export XDG_STATE_HOME=/s\nexport CARGO_HOME=/s/bx\n",
+                &RootSet::strict()
+            ),
+            vec![(1, NoRootsDeclared), (2, NoRootsDeclared)]
+        );
+        // `check` judges one line, and learns nothing from it.
+        assert_eq!(
+            check("CARGO_HOME", "/var/mnt/scratch/example/state/bx", &rooted()),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn a_search_list_or_a_program_needs_no_root_but_every_entry_is_anchored() {
+        use Reason::{BxOwnedDirectory, NotAbsolute, UnreadableReference, UnresolvedReference};
+        let no_root = RootSet::new(Path::new(HOME), &[]);
+        for (content, expected) in [
+            ("export PATH=\"$HOME/.local/bin:$PATH\"\n", vec![]),
+            ("export PATH=$PATH\n", vec![]),
+            ("export PATH=/usr/bin:/opt/x/bin\n", vec![]),
+            ("export INFOPATH=/usr/share/info:$INFOPATH\n", vec![]),
+            ("export PATH=.:/usr/bin\n", vec![(1, NotAbsolute)]),
+            ("export PATH=/usr/bin:\n", vec![(1, NotAbsolute)]),
+            ("export PATH=bin\n", vec![(1, NotAbsolute)]),
+            ("export PATH=\n", vec![(1, NotAbsolute)]),
+            ("export PATH=$PATH/bin\n", vec![(1, NotAbsolute)]),
+            ("export PATH=${PATH}x\n", vec![(1, NotAbsolute)]),
+            ("export INFOPATH=info\n", vec![(1, NotAbsolute)]),
+            (
+                "export PATH=/var/home/example/.local/state/bx/bin:$PATH\n",
+                vec![(1, BxOwnedDirectory)],
+            ),
+            // Only its own name stands for what was inherited.
+            (
+                "export PATH=/usr/bin:$INFOPATH\n",
+                vec![(1, UnresolvedReference)],
+            ),
+            // Once the fragment assigns it, `$PATH` is what it assigned.
+            (
+                "PATH=bin\nexport PATH=/usr/bin:$PATH\n",
+                vec![(1, NotAbsolute), (2, NotAbsolute)],
+            ),
+            // After a refused line nothing is inherited either.
+            (
+                "true\nexport PATH=/usr/bin:$PATH\n",
+                vec![(1, Reason::Unreadable), (2, UnreadableReference)],
+            ),
+            ("export EDITOR=/usr/bin/nvim\n", vec![]),
+            ("export EDITOR=nvim\n", vec![]),
+            ("export EDITOR=\n", vec![]),
+            ("export RUSTC_WRAPPER=/usr/bin/sccache\n", vec![]),
+            (
+                "export SSH_AUTH_SOCK=/run/user/1000/ssh-agent.socket\n",
+                vec![],
+            ),
+            ("export EDITOR=./nvim\n", vec![(1, NotAbsolute)]),
+            (
+                "export BROWSER=/usr/bin/firefox:chromium\n",
+                vec![(1, NotAbsolute)],
+            ),
+            ("export EDITOR=$NOWHERE\n", vec![(1, UnresolvedReference)]),
+            (
+                "export PAGER=/var/home/example/.local/state/bx/less\n",
+                vec![(1, BxOwnedDirectory)],
+            ),
+        ] {
+            assert_eq!(reasons(content, &no_root), expected, "{content:?}");
+            assert_eq!(reasons(content, &rooted()), expected, "{content:?}");
+        }
+        // A list or a program is not a relocation, so it does not inherit
+        // `$PATH` for another name.
+        assert_eq!(
+            reasons(
+                "export GOPATH=/var/mnt/scratch/example:$GOPATH\n",
+                &rooted()
+            ),
+            vec![(1, UnresolvedReference)]
+        );
+    }
+
     // Review round 3: the guard fails closed by shape.
 
     #[test]
@@ -3245,15 +3863,32 @@ mod tests {
             "/x\t# a comment",
             "\"/x\" # a comment",
         ];
+        // Since round 4 every value is judged, so a form the grammar reads may
+        // still be refused for where it points. What is pinned here is that no
+        // accepted form is refused *as a form*, and that `check` and
+        // `scan_with` agree on it.
         for value in accepted {
+            let verdict = reason_of(&check("EDITOR", value, &rooted()));
+            assert!(
+                !matches!(
+                    verdict,
+                    Some(Reason::Unreadable | Reason::MultipleAssignments)
+                ),
+                "{value:?}: {verdict:?}"
+            );
+            assert_eq!(
+                reasons(&format!("export EDITOR={value}"), &rooted()),
+                verdict
+                    .map(|reason| (1, reason))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{value:?}"
+            );
+        }
+        for value in ["nvim", "\"-j8 V=1\"", "$HOME/x", "/x # a comment"] {
             assert_eq!(
                 check("EDITOR", value, &rooted()),
                 Verdict::Allowed,
-                "{value:?}"
-            );
-            assert_eq!(
-                scan_with(&format!("export EDITOR={value}"), &rooted()),
-                vec![],
                 "{value:?}"
             );
         }
@@ -3414,10 +4049,12 @@ mod tests {
             scan_with("export PATH=\"$HOME/.local/bin:$PATH\"\n", &rooted()),
             vec![]
         );
-        // Without a home, `$HOME` is unresolved rather than reserved.
+        // Without a home, `$HOME` is unresolved rather than reserved — and a
+        // value that does not resolve is judged as a path, which the strict
+        // set refuses.
         assert_eq!(
             reason_of(&check("GPG_TTY", "$HOME", &RootSet::strict())),
-            None
+            Some(Reason::NoRootsDeclared)
         );
         let mut scope = Scope::default();
         assert_eq!(scope.lookup("HOME", None), Err(Reason::UnresolvedReference));
@@ -3473,9 +4110,14 @@ mod tests {
             "export GOPATH=\"${A}:${B}\"\n",
             "export GOPATH=\"$A:$B\"\n",
         );
+        // `B=/etc/evil` is itself a path outside the root (round 4).
         assert_eq!(
             reasons(content, &rooted()),
-            vec![(3, OutsideDeclaredRoots), (4, Reason::Unreadable)]
+            vec![
+                (2, OutsideDeclaredRoots),
+                (3, OutsideDeclaredRoots),
+                (4, Reason::Unreadable)
+            ]
         );
     }
 
@@ -3486,7 +4128,6 @@ mod tests {
             "Npm_Config_Prefix",
             "npm_CONFIG_userconfig",
         ] {
-            assert!(is_relocating(name), "{name}");
             assert!(names_a_location(name), "{name}");
             assert_eq!(
                 reason_of(&check(name, "/etc/evil", &rooted())),
@@ -3514,11 +4155,11 @@ mod tests {
             ),
             Verdict::Allowed
         );
-        assert!(!is_relocating("npm_config_"));
-        assert!(!is_relocating("npm_confi"));
+        assert!(!names_a_location("npm_config_"));
+        assert!(!names_a_location("npm_confi"));
         // Only npm reads its family that way.
-        assert!(!is_relocating("uv_cache_dir"));
-        assert!(!is_relocating("mise_data_dir"));
+        assert!(!names_a_location("uv_cache_dir"));
+        assert!(!names_a_location("mise_data_dir"));
     }
 
     #[test]
@@ -3531,7 +4172,7 @@ mod tests {
             "PYTHONUSERBASE",
             "TMPDIR",
         ] {
-            assert!(is_relocating(name), "{name}");
+            assert!(names_a_location(name), "{name}");
             assert_eq!(
                 reason_of(&check(name, "/etc/evil", &rooted())),
                 Some(Reason::OutsideDeclaredRoots),
@@ -3543,7 +4184,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert!(is_relocating("HOME"));
+        assert!(names_a_location("HOME"));
         for (name, value) in [
             ("MISE_SHARED_INSTALL_DIRS", "evil"),
             ("MISE_TRUSTED_CONFIG_PATHS", "evil"),
@@ -3742,10 +4383,51 @@ mod tests {
             .collect()
     }
 
+    /// Whether a shell that ended holding `name=value` — and the variables
+    /// `after` — has been pointed somewhere the roots do not admit.
+    ///
+    /// Decided from the value alone and independently of the guard's own
+    /// classification, so it cannot share a blind spot with it: every entry
+    /// shaped like a path — containing `/`, beginning `~` or `=`, or `.` or `..` —
+    /// makes the whole value one the roots must admit, whatever the name. The
+    /// shell's own `XDG_STATE_HOME` moves bx's state directory for the check,
+    /// as it would for bx. The names the shell manages are its own business,
+    /// and the programs and search lists the guard documents as needing no
+    /// root need only be absolute and outside bx's directories.
+    fn escapes(name: &str, value: &str, roots: &RootSet, after: &HashMap<String, String>) -> bool {
+        if is_reserved(name) {
+            return false;
+        }
+        let owned = match roots.home() {
+            Some(home) => roots.clone().owning(&[layers::state_dir(
+                home,
+                after.get("XDG_STATE_HOME").map(std::ffi::OsStr::new),
+            )]),
+            None => roots.clone(),
+        };
+        let entries: Vec<&str> = value.split(':').collect();
+        // A leading `=` is zsh's `=cmd`, which expands to a program's path.
+        let pathish = |entry: &&str| {
+            entry.contains('/') || entry.starts_with(['~', '=']) || *entry == "." || *entry == ".."
+        };
+        let unanchored =
+            |entry: &&str| !Path::new(entry).is_absolute() || owned.owns(Path::new(entry));
+        if SEARCH_LISTS.contains(&name) {
+            entries.iter().any(unanchored)
+        } else if PROGRAMS.contains(&name) {
+            entries.iter().any(pathish) && entries.iter().any(unanchored)
+        } else {
+            entries.iter().any(pathish)
+                && entries
+                    .iter()
+                    .any(|entry| unanchored(entry) || !owned.contains(Path::new(entry)))
+        }
+    }
+
     /// Run `content` in every installed shell and hold the guard to what each
-    /// shell did. The guard must never approve a fragment after which a
-    /// relocating variable holds a value with an entry outside `roots` or
-    /// inside bx's own directory; and where the guard read every line, what it
+    /// shell did. The guard must never approve a fragment after which any
+    /// variable [`escapes`] — holds a path outside `roots` or inside bx's own
+    /// directory, whatever its name; and where the guard read every line, what it
     /// learned must be exactly what the shell set. Returns, per shell, whether
     /// the shell relocated anything outside the roots.
     fn assert_the_shells_agree(
@@ -3763,12 +4445,7 @@ mod tests {
                 .collect();
             let escaped: Vec<_> = changed
                 .iter()
-                .filter(|(name, value)| {
-                    is_relocating(name)
-                        && value
-                            .split(':')
-                            .any(|entry| refuses_entry(Path::new(entry), roots).is_some())
-                })
+                .filter(|(name, value)| escapes(name, value, roots, &after))
                 .collect();
             assert!(
                 escaped.is_empty() || !found.is_empty(),
@@ -3780,7 +4457,7 @@ mod tests {
                 continue;
             }
             for (name, value) in &changed {
-                if SHELL_NAMES.contains(&name.as_str()) {
+                if is_reserved(name) {
                     continue;
                 }
                 match scope.learned.get(*name) {
@@ -3893,10 +4570,25 @@ mod tests {
             ("GOPATH=/var/mnt/scratch/example/go:/etc/evil", rooted()),
             ("npm_config_cache=/etc/evil", rooted()),
             ("ZDOTDIR=/etc/evil", rooted()),
+            // Round 4: names no list held, a state directory the fragment
+            // moved, a history file, and a search list with a relative entry.
+            ("export RIPGREP_CONFIG_PATH=/etc/evil", rooted()),
+            ("export GIT_CONFIG_SYSTEM=/etc/evil", rooted()),
+            ("export CARGO_TARGET_DIR=/etc/evil", rooted()),
+            ("export XDG_CONFIG_DIRS=/etc/evil", rooted()),
+            ("SOMETHING=build/cache", rooted()),
+            (
+                "export XDG_STATE_HOME=/var/mnt/scratch/example/state\n\
+                 export CARGO_HOME=/var/mnt/scratch/example/state/bx",
+                rooted(),
+            ),
+            ("export HISTFILE=/etc/evil", rooted()),
+            ("export PATH=.:/usr/bin", rooted()),
+            ("export EDITOR=./nvim", rooted()),
         ];
         for (content, roots) in &falsifiers {
-            assert_ne!(scan_with(content, roots), vec![], "{content:?}");
             let escaped = assert_the_shells_agree(&shells, content, roots);
+            assert_ne!(scan_with(content, roots), vec![], "{content:?}");
             if shells.len() == SHELLS.len() {
                 assert!(
                     escaped.contains(&true),

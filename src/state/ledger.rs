@@ -26,7 +26,7 @@ use super::Error;
 use super::dir::{StateDir, ensure_dir};
 use super::hash::ContentHash;
 use super::lock::ExclusiveLock;
-use super::store::{self, Loaded, Rejected};
+use super::store::{self, Loaded, Loss, Rejected};
 use crate::fs::{Mode, write_atomically};
 
 /// The envelope tag for `ledger.mpk`.
@@ -269,6 +269,9 @@ impl LedgerView {
     ///
     /// [`Error::Home`] if `home` is not absolute or not UTF-8. That is checked
     /// before the file is touched, so a bad home never quarantines a ledger.
+    ///
+    /// [`Error::FutureVersion`] if a newer bx wrote `ledger.mpk`. The ledger is
+    /// left exactly as it is; see [`Ledger::open`].
     pub fn read(dir: &StateDir, home: &Path) -> Result<Loaded<Self>, Error> {
         Self::load(dir, home, None)
     }
@@ -284,9 +287,14 @@ impl LedgerView {
             source,
         })?;
         let path = dir.ledger();
-        store::load_checked(&path, KIND, VERSION, lock, |view: &Self| {
-            view.check_paths(&path, home)
-        })
+        store::load_checked(
+            &path,
+            KIND,
+            VERSION,
+            Loss::Permanent,
+            lock,
+            |view: &Self| view.check_paths(&path, home),
+        )
     }
 
     /// Reject a ledger bx could not have written, or cannot use with `home`.
@@ -390,6 +398,9 @@ impl LedgerView {
 pub struct Ledger {
     /// Where it lives, so `record` and `save` need no further arguments.
     dir: StateDir,
+    /// The home it was opened under, so `record` refuses exactly the paths the
+    /// next `open` under that home would refuse.
+    home: PathBuf,
     /// The entries themselves.
     view: LedgerView,
 }
@@ -400,6 +411,49 @@ impl Deref for Ledger {
     fn deref(&self) -> &Self::Target {
         &self.view
     }
+}
+
+impl LedgerView {
+    /// The refusal [`Ledger::record`] would give `entry`, decided without
+    /// storing or changing anything.
+    ///
+    /// For a caller that must not act before it knows the record will be
+    /// accepted: a journalled session before it publishes, and a rebuild
+    /// before it reports. [`Ledger::record`] applies the same rule.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PriorConflict`] for a changed file bx shares with the user.
+    pub fn check_record(&self, entry: &NewEntry) -> Result<(), Error> {
+        self.entries.get(&entry.path).map_or(Ok(()), |existing| {
+            prior_conflict(existing, &entry.mechanism, &entry.prior)
+        })
+    }
+}
+
+/// [`Error::PriorConflict`] when re-recording `existing` with `incoming` would
+/// adopt a changed file bx shares through a region or an include line.
+///
+/// The one statement of the rule [`Ledger::record`] documents, so the check a
+/// caller makes first and the refusal `record` gives cannot disagree.
+fn prior_conflict(
+    existing: &LedgerEntry,
+    mechanism: &Mechanism,
+    incoming: &PriorBytes,
+) -> Result<(), Error> {
+    let PriorBytes::Bytes { bytes, .. } = incoming else {
+        return Ok(());
+    };
+    let digest = ContentHash::of(bytes);
+    if digest != existing.written
+        && (existing.mechanism != Mechanism::Own || *mechanism != Mechanism::Own)
+    {
+        return Err(Error::PriorConflict {
+            target: existing.path.as_str().to_string(),
+            displaced: digest,
+        });
+    }
+    Ok(())
 }
 
 impl Ledger {
@@ -425,15 +479,62 @@ impl Ledger {
     /// which checks every stored path against `home` the same way. The same
     /// reasoning applies: a ledger written under another spelling of the home
     /// is refused, not reset.
+    ///
+    /// [`Error::FutureVersion`] if a newer bx wrote `ledger.mpk` — an older bx
+    /// run after a newer one. Its format is not damage: quarantining it would
+    /// let the next apply record bx's own output as every prior, and every
+    /// rollback would add another quarantine. Nothing is renamed.
+    ///
+    /// [`Error::WrongLock`] if `lock` is not `dir`'s own lock. It is checked
+    /// before the ledger is read, so another directory's lock never
+    /// quarantines this one.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
         let dir = dir.clone();
-        Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self { dir, view }))
+        Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self {
+            dir,
+            home: home.to_path_buf(),
+            view,
+        }))
     }
 
     /// The state directory this ledger was opened from.
     #[must_use]
     pub fn dir(&self) -> &StateDir {
         &self.dir
+    }
+
+    /// The refusal [`Ledger::record`] would give `entry`, decided without
+    /// storing or changing anything.
+    ///
+    /// Everything [`LedgerView::check_record`] checks, and also that every
+    /// path `entry` names can be used with the home this ledger was opened
+    /// under — the check [`Ledger::open`] makes of every stored path. Method
+    /// resolution picks this over the view's for any caller holding a
+    /// `Ledger`, so a journalled session and a rebuild refuse what `record`
+    /// refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ForeignRecord`] for a path the next open under this home would
+    /// refuse, and [`Error::PriorConflict`] for a changed file bx shares with
+    /// the user.
+    pub fn check_record(&self, entry: &NewEntry) -> Result<(), Error> {
+        self.check_new_paths(entry)?;
+        self.view.check_record(entry)
+    }
+
+    /// Refuse an entry naming a path that [`LedgerView::read`] would refuse
+    /// under this ledger's home once it had been saved.
+    fn check_new_paths(&self, entry: &NewEntry) -> Result<(), Error> {
+        for path in std::iter::once(&entry.path).chain(&entry.created_dirs) {
+            path.check_against(&self.home)
+                .map_err(|source| Error::ForeignRecord {
+                    home: self.home.clone(),
+                    stored: path.as_str().to_string(),
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
     }
 
     /// Record a target, replacing any entry for the same path — **except its
@@ -472,6 +573,8 @@ impl Ledger {
     ///   [`Error::PriorConflict`], stores nothing, and leaves the entry exactly
     ///   as it was. `plan` reports the same target as a conflict from `written`
     ///   alone, so an apply that shares its function never reaches this call.
+    ///   The way out that loses no byte is [`Ledger::adopt_current_as_prior`],
+    ///   run only because the user chose it.
     ///
     /// The comparison is on content only. A file whose bytes still match
     /// `written` but whose mode the user changed is treated as bx's own output,
@@ -517,7 +620,13 @@ impl Ledger {
     /// [`Error::CreateDir`] or [`Error::Write`] if the snapshot cannot be
     /// stored, and [`Error::PriorConflict`] for a changed file bx shares with
     /// the user. The ledger is left unchanged when either happens.
+    ///
+    /// [`Error::ForeignRecord`] if `entry.path` or one of its `created_dirs`
+    /// cannot be used with the home the ledger was opened under. That is
+    /// checked before anything is stored: once saved, such a path would make
+    /// every later open under the same home refuse the ledger, with no way back.
     pub fn record(&mut self, entry: NewEntry) -> Result<&LedgerEntry, Error> {
+        self.check_new_paths(&entry)?;
         let key = entry.path.clone();
         let (prior, superseded, created_dirs) = match self.view.entries.get(&key) {
             None => (
@@ -560,6 +669,9 @@ impl Ledger {
         mechanism: &Mechanism,
         incoming: PriorBytes,
     ) -> Result<(Prior, Vec<RestoreRef>), Error> {
+        // A shared file's changed bytes still hold bx's own region or include
+        // line. Refused before anything is stored: see `record`.
+        prior_conflict(existing, mechanism, &incoming)?;
         let kept = || (existing.prior.clone(), existing.superseded.clone());
         let PriorBytes::Bytes { bytes, mode } = incoming else {
             return Ok(kept());
@@ -568,26 +680,11 @@ impl Ledger {
         if digest == existing.written {
             return Ok(kept());
         }
-        // A shared file's changed bytes still hold bx's own region or include
-        // line. Refused before anything is stored: see `record`.
-        if existing.mechanism != Mechanism::Own || *mechanism != Mechanism::Own {
-            return Err(Error::PriorConflict {
-                target: existing.path.as_str().to_string(),
-                displaced: digest,
-            });
-        }
 
         // A third party wrote these bytes and this apply displaces them: they
         // reach `restore/` before anything else is decided.
         let adopted = self.store_restore(digest, &bytes, mode)?;
-        let mut superseded = existing.superseded.clone();
-        if let Prior::Existed(previous) = &existing.prior
-            && !superseded.contains(previous)
-        {
-            superseded.push(previous.clone());
-        }
-        // A snapshot the user has put back is the prior again, not history.
-        superseded.retain(|reference| *reference != adopted);
+        let superseded = supersede(existing, &adopted);
         tracing::info!(
             path = %existing.path,
             digest = %adopted.digest,
@@ -607,6 +704,59 @@ impl Ledger {
     /// deletion. Reclaiming unreferenced blobs is not implemented.
     pub fn forget(&mut self, path: &crate::paths::Portable) -> Option<LedgerEntry> {
         self.view.entries.remove(path)
+    }
+
+    /// Accept a target as it is now as the version `bx rm` restores — the way
+    /// out of [`Error::PriorConflict`] that loses no byte.
+    ///
+    /// `bytes` and `mode` are the target as it is on disk now. When the bytes
+    /// hash to the entry's `written`, nothing has changed and nothing is done.
+    /// Otherwise they are stored in `restore/`, durably, and become the prior;
+    /// the prior they replace moves to [`LedgerEntry::superseded`], exactly as
+    /// a re-record of an `Own` target moves it, so no snapshot is dropped.
+    /// `written` becomes their digest: the next `plan` sees the file as bx
+    /// last accepted it, and the next apply's re-record keeps this prior
+    /// instead of conflicting again.
+    ///
+    /// For a `Region` or `Include` target this is on purpose what `record`
+    /// refuses to do by itself. The accepted bytes hold bx's own lines, and
+    /// `bx rm` will write them back, so it must run only because the user chose
+    /// it. Restoring the user's edit without bx's lines needs the region
+    /// writer's delimiter grammar, which does not exist yet.
+    ///
+    /// Returns `Ok(None)`, changing nothing, when bx records no entry for
+    /// `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CreateDir`] or [`Error::Write`] if the bytes cannot be stored.
+    /// The entry is left unchanged.
+    pub fn adopt_current_as_prior(
+        &mut self,
+        path: &crate::paths::Portable,
+        bytes: &[u8],
+        mode: Mode,
+    ) -> Result<Option<&LedgerEntry>, Error> {
+        let Some(existing) = self.view.entries.get(path) else {
+            return Ok(None);
+        };
+        let digest = ContentHash::of(bytes);
+        if digest == existing.written {
+            return Ok(self.view.entries.get(path));
+        }
+        let adopted = self.store_restore(digest, bytes, mode)?;
+        let superseded = supersede(existing, &adopted);
+        if let Some(entry) = self.view.entries.get_mut(path) {
+            tracing::info!(
+                path = %entry.path,
+                digest = %adopted.digest,
+                "accepting the file as it is now as the version bx rm restores",
+            );
+            entry.prior = Prior::Existed(adopted);
+            entry.superseded = superseded;
+            entry.written = digest;
+        }
+        Ok(self.view.entries.get(path))
     }
 
     /// Turn caller-supplied prior bytes into a durable [`Prior`].
@@ -679,6 +829,22 @@ impl Ledger {
         write_atomically(&path, bytes, Mode::PRIVATE_FILE)?;
         Ok(())
     }
+}
+
+/// `existing`'s superseded list once `adopted` becomes its prior.
+///
+/// The prior it replaces is appended unless it is already there, so every blob
+/// stored for a live target stays indexed; and a snapshot the user has put back
+/// is the prior again, not history.
+fn supersede(existing: &LedgerEntry, adopted: &RestoreRef) -> Vec<RestoreRef> {
+    let mut superseded = existing.superseded.clone();
+    if let Prior::Existed(previous) = &existing.prior
+        && !superseded.contains(previous)
+    {
+        superseded.push(previous.clone());
+    }
+    superseded.retain(|reference| reference != adopted);
+    superseded
 }
 
 /// The directories an earlier record created, plus any a later one did.
@@ -1725,6 +1891,189 @@ mod tests {
     }
 
     #[test]
+    fn record_refuses_a_path_the_next_open_under_the_same_home_would_refuse() {
+        // Review round 4's falsifier: `record` accepted `/<home>/.gitconfig`
+        // built through `Portable::try_from`, `save` wrote it, and every later
+        // `open` under that home refused the ledger, with no way back.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .record(entry("~/.bashrc", b"bx").with_prior(prior(b"mine", 0o644)))
+            .expect("an ordinary record");
+        ledger.save().expect("save");
+        let saved = std::fs::read(dir.ledger()).expect("read");
+        let blobs = blob_names(&dir);
+
+        let foreign_key = absolute_under(&home, ".gitconfig");
+        let foreign_dir = absolute_under(&home, ".config/tool");
+        let cases = [
+            (
+                NewEntry::new(
+                    foreign_key.clone(),
+                    ContentHash::of(b"bx"),
+                    Mode::DEFAULT_FILE,
+                    Mechanism::Own,
+                )
+                .with_prior(prior(b"the user's gitconfig", 0o644)),
+                foreign_key,
+            ),
+            (
+                entry("~/.config/tool/x.conf", b"bx")
+                    .with_prior(prior(b"the user's tool config", 0o644))
+                    .with_created_dirs(vec![foreign_dir.clone()]),
+                foreign_dir,
+            ),
+        ];
+        for (new, refused) in cases {
+            let checked = ledger.check_record(&new).expect_err("check refuses");
+            let recorded = ledger.record(new).expect_err("record refuses");
+            for err in [checked, recorded] {
+                assert!(
+                    matches!(
+                        &err,
+                        Error::ForeignRecord { home: at, stored, .. }
+                            if at == home.path() && *stored == refused.as_str()
+                    ),
+                    "got {err}",
+                );
+                assert!(err.to_string().contains("Nothing was recorded"), "{err}");
+            }
+        }
+
+        // Nothing entered the ledger, nothing reached `restore/`, and the
+        // ledger still opens under the home it was opened with.
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(blob_names(&dir), blobs);
+        ledger.save().expect("save");
+        assert_eq!(std::fs::read(dir.ledger()).expect("read"), saved);
+        let reopened = Ledger::open(&dir, &lock, home.path()).expect("still opens");
+        assert_eq!(reopened.health, Health::Loaded);
+    }
+
+    #[test]
+    fn check_record_refuses_exactly_what_record_refuses_and_stores_nothing() {
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let region = Mechanism::Region { comment: '#' };
+        let bx1: &[u8] = b"user\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let at = |written: &[u8], before: &[u8]| {
+            NewEntry::new(
+                target("~/.bashrc"),
+                ContentHash::of(written),
+                Mode::DEFAULT_FILE,
+                region.clone(),
+            )
+            .with_prior(prior(before, 0o644))
+        };
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .check_record(&at(bx1, b"user\n"))
+            .expect("a new target");
+        ledger.record(at(bx1, b"user\n")).expect("record");
+        let blobs = blob_names(&dir);
+
+        let edited = at(b"BX2", b"user\n# >>> bx >>>\nBX1\n# <<< bx <<<\nedit\n");
+        let err = (*ledger)
+            .check_record(&edited)
+            .expect_err("the view refuses");
+        assert!(matches!(err, Error::PriorConflict { .. }), "got {err}");
+        let err = ledger
+            .check_record(&edited)
+            .expect_err("the ledger refuses");
+        assert!(matches!(err, Error::PriorConflict { .. }), "got {err}");
+        let err = ledger.record(edited).expect_err("record refuses");
+        assert!(matches!(err, Error::PriorConflict { .. }), "got {err}");
+        assert_eq!(blob_names(&dir), blobs, "nothing was stored");
+
+        ledger
+            .check_record(&at(b"BX2", bx1))
+            .expect("bx's own output");
+        ledger.record(at(b"BX2", bx1)).expect("record");
+    }
+
+    #[test]
+    fn accepting_a_changed_shared_file_converges_and_keeps_the_first_original() {
+        // Review round 4: `PriorConflict` fires on any edit outside bx's
+        // region, its message named no remedy, and re-recording converged
+        // nowhere.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let region = Mechanism::Region { comment: '#' };
+        let original: &[u8] = b"user line 1\n";
+        let bx1: &[u8] = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+        let edited: &[u8] = b"user line 1\n# >>> bx >>>\nBX1\n# <<< bx <<<\nuser line 2\n";
+        let bx2: &[u8] = b"user line 1\n# >>> bx >>>\nBX2\n# <<< bx <<<\nuser line 2\n";
+        let apply = |written: &[u8], before: &[u8]| {
+            NewEntry::new(
+                target("~/.bashrc"),
+                ContentHash::of(written),
+                Mode::DEFAULT_FILE,
+                region.clone(),
+            )
+            .with_prior(prior(before, 0o644))
+        };
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger.record(apply(bx1, original)).expect("first apply");
+
+        // The edit: a conflict, every time, whose message names both ways out.
+        for _ in 0..2 {
+            let message = ledger
+                .record(apply(bx2, edited))
+                .expect_err("a conflict")
+                .to_string();
+            assert!(message.contains("put the file back"), "{message}");
+            assert!(
+                message.contains("accept the file as it is now"),
+                "{message}"
+            );
+        }
+
+        // The user accepts the file as it is now.
+        let accepted = ledger
+            .adopt_current_as_prior(&target("~/.bashrc"), edited, Mode::from_bits(0o640))
+            .expect("adopt")
+            .expect("an entry")
+            .clone();
+        assert_eq!(accepted.written, ContentHash::of(edited));
+        assert_eq!(accepted.prior, Prior::Existed(reference(edited, 0o640)));
+        assert_eq!(
+            accepted.superseded,
+            vec![reference(original, 0o644)],
+            "the first original is kept, not dropped",
+        );
+        assert_eq!(accepted.mechanism, region);
+        assert!(has_blob(&dir, edited) && has_blob(&dir, original));
+
+        // Accepting the same file again changes nothing.
+        ledger
+            .adopt_current_as_prior(&target("~/.bashrc"), edited, Mode::from_bits(0o640))
+            .expect("adopt again");
+        assert_eq!(ledger.get(&target("~/.bashrc")), Some(&accepted));
+
+        // The next apply converges: no conflict, and the accepted prior stands.
+        let stored = ledger
+            .record(apply(bx2, edited))
+            .expect("the next apply records")
+            .clone();
+        assert_eq!(stored.written, ContentHash::of(bx2));
+        assert_eq!(stored.prior, accepted.prior);
+        assert_eq!(stored.superseded, accepted.superseded);
+        ledger.save().expect("save");
+        let reloaded = LedgerView::read(&dir, home.path()).expect("read").value;
+        assert_eq!(reloaded.get(&target("~/.bashrc")), Some(&stored));
+
+        // A target bx does not record is not invented.
+        assert!(
+            ledger
+                .adopt_current_as_prior(&target("~/.zshrc"), edited, Mode::DEFAULT_FILE)
+                .expect("adopt")
+                .is_none()
+        );
+        assert!(ledger.get(&target("~/.zshrc")).is_none());
+    }
+
+    #[test]
     fn a_changed_shared_file_is_a_conflict_not_a_prior_holding_bxs_own_lines() {
         // Review round 3. Region BX1, the user adds a line outside it, and the
         // next apply hands `record` the whole file. Adopting it stored BX1's
@@ -2084,6 +2433,64 @@ mod tests {
     }
 
     #[test]
+    fn a_ledger_from_a_newer_bx_is_refused_and_left_exactly_where_it_is() {
+        // Review round 4: a newer format version was damage, so after a
+        // rollback to an older bx `Ledger::open` moved an intact ledger aside,
+        // the next apply recorded bx's output as every prior, and each rollback
+        // added another `.corrupt.N`.
+        #[derive(Serialize)]
+        struct Newer<T> {
+            kind: &'static str,
+            version: u16,
+            payload: T,
+        }
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let newer = VERSION + 1;
+        // A payload this build could decode, and one a newer format reshaped.
+        let seeds = [
+            rmp_serde::to_vec_named(&Newer {
+                kind: KIND,
+                version: newer,
+                payload: LedgerView::default(),
+            })
+            .expect("encode"),
+            rmp_serde::to_vec_named(&Newer {
+                kind: KIND,
+                version: newer,
+                payload: ["entries", "reshaped"],
+            })
+            .expect("encode"),
+        ];
+        for seed in seeds {
+            std::fs::write(dir.ledger(), &seed).expect("seed");
+            let refused = |err: &Error| {
+                matches!(
+                    err,
+                    Error::FutureVersion { path, found, supported }
+                        if *path == dir.ledger() && *found == newer && *supported == VERSION
+                )
+            };
+
+            let err = LedgerView::read(&dir, home.path()).expect_err("the reader refuses");
+            assert!(refused(&err), "got {err}");
+            // Every rollback opens the ledger again; none of them moves it.
+            for _ in 0..3 {
+                let err = Ledger::open(&dir, &lock, home.path()).expect_err("open refuses");
+                assert!(refused(&err), "got {err}");
+                assert!(err.to_string().contains("newer bx"), "{err}");
+            }
+            assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seed);
+            let quarantines: Vec<_> = std::fs::read_dir(dir.root())
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("ledger.mpk."))
+                .collect();
+            assert!(quarantines.is_empty(), "{quarantines:?}");
+        }
+    }
+
+    #[test]
     fn a_lockless_view_of_a_damaged_ledger_leaves_it_for_the_lock_holder() {
         // Review round 3: `LedgerView::read` renamed by path with no lock, so a
         // writer's save between the read and the rename lost its ledger.
@@ -2107,6 +2514,64 @@ mod tests {
             std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
             b"not messagepack",
         );
+    }
+
+    #[test]
+    fn a_lock_on_another_state_directory_opens_nothing_and_quarantines_nothing() {
+        // Review round 4: `Ledger::open` and `Fingerprints::open` accepted any
+        // `ExclusiveLock`, so A's lock quarantined B's damaged ledger while B's
+        // own bx, holding B's lock, could be saving it.
+        let a = guarded_home();
+        let b = guarded_home();
+        let (dir_a, lock_a) = locked(&a);
+        let dir_b = StateDir::resolve(b.path());
+        dir_b.ensure().expect("ensure");
+        std::fs::write(dir_b.ledger(), b"not messagepack").expect("seed");
+        std::fs::write(dir_b.fingerprints(), b"not messagepack").expect("seed");
+        let wrong = |err: &Error| {
+            matches!(
+                err,
+                Error::WrongLock { held, needed }
+                    if *held == dir_a.lock() && *needed == dir_b.lock()
+            )
+        };
+
+        let err = Ledger::open(&dir_b, &lock_a, b.path()).expect_err("A's lock is not B's");
+        assert!(wrong(&err), "got {err}");
+        assert!(err.to_string().contains("Take the lock"), "{err}");
+        let err = Fingerprints::open(&dir_b, &lock_a).expect_err("A's lock is not B's");
+        assert!(wrong(&err), "got {err}");
+        let err = Fingerprints::default()
+            .save(&dir_b, &lock_a)
+            .expect_err("A's lock is not B's");
+        assert!(wrong(&err), "got {err}");
+
+        for file in [dir_b.ledger(), dir_b.fingerprints()] {
+            assert_eq!(std::fs::read(&file).expect("in place"), b"not messagepack");
+            assert!(!StateDir::quarantine(&file).exists());
+        }
+    }
+
+    #[test]
+    fn a_quarantine_orphaned_by_a_crash_before_the_save_stays_visible() {
+        // Review round 4's falsifier: `Ledger::open` quarantined a damaged
+        // ledger, bx stopped before `save`, and the next reader and writer saw
+        // `Health::Fresh` with the `.corrupt` file reported nowhere.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
+        let first = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert!(first.health.is_reset());
+        let aside = vec![StateDir::quarantine(&dir.ledger())];
+        assert_eq!(first.quarantined, aside);
+        drop(first);
+
+        let view = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(view.health, Health::Fresh);
+        assert_eq!(view.quarantined, aside);
+        let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert_eq!(opened.health, Health::Fresh);
+        assert_eq!(opened.quarantined, aside);
     }
 
     #[test]

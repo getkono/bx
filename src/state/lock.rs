@@ -144,6 +144,22 @@ impl ExclusiveLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Whether this guard is the lock of the state directory at `root`.
+    ///
+    /// Decided by identity — the device and inode of the locked descriptor
+    /// against those of `root`'s lock file — never by spelling. A directory
+    /// reached through a symlink is still recognised, and a lock file replaced
+    /// since it was locked, or one that is not there, is not.
+    pub(crate) fn guards(&self, root: &Path) -> bool {
+        let Ok(held) = rustix::fs::fstat(&self.fd) else {
+            return false;
+        };
+        let Ok(there) = rustix::fs::lstat(StateDir::new(root.to_path_buf()).lock()) else {
+            return false;
+        };
+        held.st_dev == there.st_dev && held.st_ino == there.st_ino
+    }
 }
 
 impl SharedLock {
@@ -212,7 +228,9 @@ fn open_lock_file(dir: &StateDir, path: &Path) -> Result<OwnedFd, Error> {
         Mode::PRIVATE_FILE.into(),
     ) {
         Ok(fd) => fd,
-        Err(Errno::LOOP) => return Err(not_a_file()),
+        // `ELOOP`: a symlink, refused by `O_NOFOLLOW`. `EISDIR`: a directory,
+        // which `O_RDWR` cannot open. Either is something to move aside.
+        Err(Errno::LOOP | Errno::ISDIR) => return Err(not_a_file()),
         Err(source) => return Err(failed(source)),
     };
     let stat = rustix::fs::fstat(&fd).map_err(failed)?;
@@ -379,6 +397,25 @@ mod tests {
         );
         assert_eq!(mode, Mode::PRIVATE_FILE);
         assert_eq!(lock.path(), dir.lock());
+    }
+
+    #[test]
+    fn a_lock_guards_its_own_directory_by_identity_and_no_other() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        assert!(lock.guards(dir.root()));
+
+        // The same directory spelled through a link is the same directory.
+        let alias = home.child("alias");
+        std::os::unix::fs::symlink(dir.root(), &alias).expect("alias");
+        assert!(lock.guards(&alias));
+
+        // Another directory, with or without a lock file of its own, is not.
+        let other = StateDir::new(home.child("other"));
+        assert!(!lock.guards(other.root()));
+        drop(ExclusiveLock::acquire(&other).expect("the other lock file"));
+        assert!(!lock.guards(other.root()));
     }
 
     #[test]
@@ -680,12 +717,43 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_file_that_cannot_be_opened_is_reported() {
+    fn a_directory_at_the_lock_path_is_refused_with_a_remedy() {
+        // Review round 4: a directory there was a bare `Error::Lock` carrying
+        // EISDIR, which says what failed and not what to do.
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("ensure");
-        // A directory where the lock file goes: `open` with O_RDWR fails.
         std::fs::create_dir(dir.lock()).expect("occupy");
+        std::fs::write(dir.lock().join("keep"), b"x").expect("occupy");
+
+        for err in [
+            ExclusiveLock::acquire(&dir).expect_err("must fail"),
+            SharedLock::acquire(&dir).expect_err("must fail"),
+        ] {
+            assert!(
+                matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
+                "got {err}",
+            );
+            let message = err.to_string();
+            assert!(message.contains("a directory"), "{message}");
+            assert!(message.contains("Move it aside"), "{message}");
+        }
+        assert!(ExclusiveLock::try_acquire(&dir).is_err());
+        assert_eq!(std::fs::read(dir.lock().join("keep")).expect("kept"), b"x");
+    }
+
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_reported() {
+        if rustix::process::geteuid().is_root() {
+            // `0000` denies nothing to root, so the condition cannot be staged.
+            return;
+        }
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        std::fs::write(dir.lock(), b"").expect("seed");
+        std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
         let err = ExclusiveLock::acquire(&dir).expect_err("must fail");
         assert!(matches!(err, Error::Lock { .. }), "got {err}");
         assert!(ExclusiveLock::try_acquire(&dir).is_err());

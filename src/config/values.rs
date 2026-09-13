@@ -592,46 +592,52 @@ pub enum PlaceholderError {
 /// all four. An unmatched closing pair is ordinary content — there is no escape
 /// for it and none is needed, because a closing pair is only special once a
 /// placeholder is open.
+///
+/// Every step names the byte the next one starts at, and that byte is asserted
+/// to be past this one. A cursor that stopped advancing would loop forever — and
+/// in the escape branch grow `pieces` without bound while it did — so a defect
+/// in the arithmetic is a panic naming the byte, never a hang.
 fn scan(text: &str) -> Result<Vec<Piece<'_>>, PlaceholderError> {
     let mut pieces = Vec::new();
     let mut literal_from = 0;
     let mut at = 0;
 
     while at < text.len() {
-        if !text[at..].starts_with("{{") {
+        let next = if !text[at..].starts_with("{{") {
             // Advance one *character*, so a multi-byte character can never be
             // split and indexed into the middle of.
-            at += text[at..].chars().next().map_or(1, char::len_utf8);
-            continue;
-        }
-
-        if text[at..].starts_with("{{{{") {
+            at + text[at..].chars().next().map_or(1, char::len_utf8)
+        } else if text[at..].starts_with("{{{{") {
             // Flush the run *including* the first brace pair, which is exactly
             // the literal the escape stands for. Nothing is synthesised.
             pieces.push(Piece::Literal(&text[literal_from..at + 2]));
-            at += 4;
-            literal_from = at;
-            continue;
-        }
+            literal_from = at + 4;
+            literal_from
+        } else {
+            let open = at + 2;
+            let Some(close) = text[open..].find("}}").map(|rel| open + rel) else {
+                return Err(PlaceholderError::Unterminated { at });
+            };
+            let name = &text[open..close];
+            if !is_value_name(name) {
+                return Err(PlaceholderError::IllegalName {
+                    name: name.to_string(),
+                    at,
+                });
+            }
 
-        let open = at + 2;
-        let Some(close) = text[open..].find("}}").map(|rel| open + rel) else {
-            return Err(PlaceholderError::Unterminated { at });
+            if literal_from < at {
+                pieces.push(Piece::Literal(&text[literal_from..at]));
+            }
+            pieces.push(Piece::Name(name));
+            literal_from = close + 2;
+            literal_from
         };
-        let name = &text[open..close];
-        if !is_value_name(name) {
-            return Err(PlaceholderError::IllegalName {
-                name: name.to_string(),
-                at,
-            });
-        }
-
-        if literal_from < at {
-            pieces.push(Piece::Literal(&text[literal_from..at]));
-        }
-        pieces.push(Piece::Name(name));
-        at = close + 2;
-        literal_from = at;
+        assert!(
+            next > at,
+            "the placeholder scan did not advance past byte {at}"
+        );
+        at = next;
     }
 
     if literal_from < text.len() {
@@ -1915,6 +1921,41 @@ mod tests {
     }
 
     #[test]
+    fn a_key_blob_may_carry_every_base64_symbol() {
+        // Base64 spells key material with `+` and `/` as well as letters and
+        // digits, and a real key's blob holds both almost every time. Every
+        // other fixture here is alphanumeric, so a check that refused either
+        // symbol would pass them all and reject nearly every real key.
+        //
+        // Synthetic: the algorithm headers are the real encodings of the
+        // algorithm names, and what follows them is made-up material, not
+        // anyone's key.
+        let ed25519 =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB+synthetic/key+material/for+tests/only0";
+        let rsa = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC+synthetic/rsa+material/for+tests/only0== a comment";
+
+        for key in [ed25519, rsa] {
+            assert_eq!(
+                check(ValueKind::SshKey, key).as_deref(),
+                Ok(key),
+                "an ssh-key value"
+            );
+            assert_eq!(
+                check(ValueKind::AgeRecipient, key).as_deref(),
+                Ok(key),
+                "an ssh key is an age recipient too"
+            );
+        }
+
+        // Each symbol on its own, so neither can hide behind the other.
+        for blob in ["AAAA+AAAA", "AAAA/AAAA"] {
+            let key = format!("ssh-ed25519 {blob}");
+            assert!(check(ValueKind::SshKey, &key).is_ok(), "{key}");
+            assert!(check(ValueKind::AgeRecipient, &key).is_ok(), "{key}");
+        }
+    }
+
+    #[test]
     fn a_string_value_accepts_anything() {
         for text in ["", "192", "agents.slice", "a b\tc\n"] {
             assert_eq!(check(ValueKind::String, text).unwrap(), text);
@@ -2813,6 +2854,39 @@ mod tests {
             .to_string();
 
         assert!(message.contains("is declared later"), "{message}");
+    }
+
+    #[test]
+    fn a_prompt_refuses_an_answer_that_references_its_own_value() {
+        // A self reference is the shortest cycle, and the loader refuses it as
+        // a forward reference because a value is not resolvable from its own
+        // position. The prompt has to refuse it the same way, whether or not the
+        // value already has an answer to read back.
+        let unanswered = a_prompt(ValueKind::String);
+        let answered = resolve(
+            vec![
+                a_decl("scratch_root", ValueKind::Path),
+                a_decl("v", ValueKind::String),
+            ],
+            &[answer("scratch_root", SCRATCH), answer("v", "earlier")],
+        )
+        .unwrap();
+
+        for values in [&unanswered, &answered] {
+            assert_eq!(
+                values.check_answer("v", "{{v}}"),
+                Err(AnswerError::Reference(Unresolved::Forward("v".to_string())))
+            );
+            assert_eq!(
+                values.check_answer("v", "again {{v}}/x"),
+                Err(AnswerError::Reference(Unresolved::Forward("v".to_string())))
+            );
+        }
+
+        let loaded = through_the_loader(ValueKind::String, "{{v}}")
+            .expect_err("the loader refuses a self reference");
+        assert!(loaded.contains("is declared later"), "{loaded}");
+        assert!(loaded.contains("local.toml:2"), "{loaded}");
     }
 
     #[test]

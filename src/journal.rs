@@ -2999,6 +2999,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_edit_between_fill_and_publish_is_kept_and_recovery_rolls_nothing_back_over_it() {
+        // Stack integration of #8's round 3: `publish` re-checks the destination
+        // and returns `fs::Error::Changed` before the rename. Inside a session
+        // that poisons like any publish error, keeps the edit, and leaves
+        // recovery nothing to put back over it.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session.before_publish = Some(|dest: &Path| {
+            std::fs::write(dest, "the user's edit\n").expect("an editor saves in place");
+        });
+        let err = session
+            .apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
+            .expect_err("the destination changed");
+        assert!(
+            matches!(err, Error::Write(fs::Error::Changed { .. })),
+            "got {err}"
+        );
+        assert!(session.ledger().get(&portable).is_none());
+        let finished = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"the user's edit\n");
+        assert!(!holds_a_temporary_file(home.path()));
+
+        // The Intent was durable before the publish was refused, so recovery
+        // finds a destination holding neither recorded state. It is reported
+        // and left alone, exactly as an edit after a crash is.
+        let interruption = crate::recover::pending(&state)
+            .expect("pending")
+            .expect("interrupted");
+        assert_eq!(interruption.unfinished.len(), 1);
+        assert_eq!(
+            interruption.unfinished[0].standing,
+            crate::recover::Standing::Diverged
+        );
+        assert!(!interruption.unfinished[0].resolvable);
+        let outcome = crate::recover::recover(&state).expect("recover");
+        assert!(
+            matches!(&outcome, crate::recover::Outcome::Blocked { conflicts } if conflicts.len() == 1),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read"),
+            b"the user's edit\n",
+            "recovery rolled nothing back over the edit",
+        );
+        assert!(crate::recover::abandon(&state).expect("abandon").is_some());
+        assert_eq!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::Nothing
+        );
+        assert_eq!(std::fs::read(&dest).expect("read"), b"the user's edit\n");
+    }
+
+    #[test]
     fn a_failed_removal_keeps_the_ledger_entry_and_poisons_the_session() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());

@@ -239,20 +239,21 @@ pub enum Error {
         #[source]
         source: crate::paths::Error,
     },
-    /// A declared setuid or setgid bit did not survive its `fchmod`.
+    /// A declared setuid, setgid or sticky bit did not survive its `fchmod`.
     ///
     /// `fchmod(2)` reports success when the kernel silently clears `S_ISGID`
     /// from a file whose group the caller is not in, which is the group a
-    /// setgid parent directory owned by another group gives every new file.
-    /// Publishing it would put a mode on disk that is not the declared one and
-    /// make every later `plan` announce a `Modify` no `apply` can close. The
-    /// temporary file is removed and the destination is untouched.
-    #[error(
-        "{} declares {declared}, and the kernel kept only {landed}: it drops a setgid bit \
-         from a file whose group you are not in, such as the group a setgid parent \
-         directory gives it. Nothing was replaced",
-        .path.display()
-    )]
+    /// setgid parent directory owned by another group gives every new file. A
+    /// filesystem that stores no set-id or sticky bits — vfat or exfat mounted
+    /// with `quiet`, and some FUSE and network filesystems — can drop any of
+    /// the three the same way. Publishing it would put a mode on disk that is
+    /// not the declared one and make every later `plan` announce a `Modify` no
+    /// `apply` can close. The temporary file is removed and the destination is
+    /// untouched.
+    ///
+    /// The message names the bits that were lost, and blames group membership
+    /// only when the setgid bit is among them.
+    #[error("{}", special_bits_not_kept(.path, *.declared, *.landed))]
     SetIdNotKept {
         /// The destination.
         path: PathBuf,
@@ -261,6 +262,49 @@ pub enum Error {
         /// The mode the temporary file actually has.
         landed: Mode,
     },
+    /// The path has a `..` component.
+    ///
+    /// The kernel resolves `..` *after* following the component before it, so
+    /// `lnk/../f` with `lnk -> elsewhere/sub` names `elsewhere/f`, while the
+    /// path read lexically — the reading a ledger key is made from — names `f`.
+    /// Writing through it would record one file and change another, and `rm`
+    /// would then restore the wrong one. bx neither resolves `..` (decision 2
+    /// writes through links, so resolving is not lexical) nor drops it (which
+    /// could name a different file), so it refuses the path.
+    #[error(
+        "{} has a `..` component, which the kernel resolves through any symlink before it; \
+         bx will not write to a path it cannot name exactly. Spell the path without `..`",
+        .0.display()
+    )]
+    ParentComponent(PathBuf),
+}
+
+/// The message of [`Error::SetIdNotKept`]: which special bits were lost, and
+/// the causes that can lose them.
+fn special_bits_not_kept(path: &Path, declared: Mode, landed: Mode) -> String {
+    let lost = declared.bits() & SPECIAL & !landed.bits();
+    let names: Vec<&str> = [(0o4000, "setuid"), (0o2000, "setgid"), (0o1000, "sticky")]
+        .into_iter()
+        .filter(|(bit, _)| lost & bit != 0)
+        .map(|(_, name)| name)
+        .collect();
+    let (named, noun) = match names.as_slice() {
+        [one] => ((*one).to_string(), "bit"),
+        [init @ .., last] => (format!("{} and {last}", init.join(", ")), "bits"),
+        [] => ("special".to_string(), "bits"),
+    };
+    let group = if lost & 0o2000 != 0 {
+        "The kernel drops a setgid bit from a file whose group you are not in, such as the \
+         group a setgid parent directory gives it, and a"
+    } else {
+        "A"
+    };
+    format!(
+        "{} declares {declared}, and only {landed} is on the file: the {named} {noun} did not \
+         stick. {group} filesystem that stores no set-id or sticky bits, such as vfat or exfat \
+         mounted with `quiet`, drops them. Nothing was replaced",
+        path.display()
+    )
 }
 
 impl Error {
@@ -276,7 +320,8 @@ impl Error {
             | Self::Write { path, .. }
             | Self::Changed { path, .. }
             | Self::NotPortable { path, .. }
-            | Self::SetIdNotKept { path, .. } => path,
+            | Self::SetIdNotKept { path, .. }
+            | Self::ParentComponent(path) => path,
         }
     }
 }
@@ -457,10 +502,11 @@ impl Parent {
 ///
 /// # Errors
 ///
+/// [`Error::ParentComponent`] when `dest` has a `..` component,
 /// [`Error::NoParent`] when `dest` has no parent component, and [`Error::Read`]
 /// when the destination or its parent exists but cannot be read.
 pub fn observe(dest: &Path) -> Result<Observed, Error> {
-    let dest = lexical(dest);
+    let dest = lexical(dest)?;
     let dest = dest.as_path();
     let dir = parent_of(dest)?;
     let observed_parent = observe_parent(dir)?;
@@ -740,7 +786,8 @@ impl Pending {
 /// observed, or `planned` observed a different path. [`Error::UnusableParent`],
 /// [`Error::Symlink`] or [`Error::NotAFile`] when `planned` or the second
 /// observation found a parent that does not resolve, a symlink, or a directory
-/// or device node. [`Error::NoParent`] when `dest` has no parent component, and
+/// or device node. [`Error::ParentComponent`] when `dest` has a `..`
+/// component, [`Error::NoParent`] when it has no parent component, and
 /// [`Error::Write`] when the parent cannot be created or the temporary file
 /// cannot be made.
 pub fn stage(
@@ -750,7 +797,7 @@ pub fn stage(
     created: &mut CreatedDirs,
 ) -> Result<Staged, Error> {
     // Spelled as `observe` spells it, so `link/` is the link.
-    let dest = lexical(dest);
+    let dest = lexical(dest)?;
     let dest = dest.as_path();
     if planned.path != dest {
         return Err(Error::Changed {
@@ -829,9 +876,9 @@ impl Staged {
     /// # Errors
     ///
     /// [`Error::Write`] wrapping the first failing syscall, and
-    /// [`Error::SetIdNotKept`] when a declared setuid or setgid bit is not on
-    /// the file after the `fchmod` that adds it. The temporary file is removed
-    /// either way.
+    /// [`Error::SetIdNotKept`] when a declared setuid, setgid or sticky bit is
+    /// not on the file once the content is written. The temporary file is
+    /// removed either way.
     pub fn fill(mut self, bytes: &[u8]) -> Result<Filled, Error> {
         let temp_path = self.0.temp.path().to_path_buf();
         let fail = |source| Error::Write {
@@ -845,8 +892,11 @@ impl Staged {
         // without CAP_FSETID.
         if self.0.mode.bits() & SET_ID != 0 {
             fchmod(self.0.temp.as_file(), self.0.mode, &temp_path)?;
-            // That fchmod succeeds even when the kernel drops S_ISGID, so what
-            // stuck is read back rather than assumed.
+        }
+        // An fchmod succeeds even when the kernel drops S_ISGID, or the
+        // filesystem stores no special bits at all, so what stuck is read back
+        // rather than assumed — the sticky bit `stage` set included.
+        if self.0.mode.bits() & SPECIAL != 0 {
             verify_set_id_kept(self.0.temp.as_file(), self.0.mode, &self.0.dest)?;
         }
         durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(&fail)?;
@@ -1062,11 +1112,11 @@ pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Err
 /// # Errors
 ///
 /// [`Error::Symlink`] when `path` is a symlink — bx does not change the mode of
-/// a link's target through the link — and [`Error::Write`] when the `chmod`
-/// fails.
+/// a link's target through the link — [`Error::ParentComponent`] when it has a
+/// `..` component, and [`Error::Write`] when the `chmod` fails.
 pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
     // Without a trailing separator, or `lstat` below would follow the link too.
-    let path = lexical(path);
+    let path = lexical(path)?;
     let path = path.as_path();
     // chmod(2) follows symlinks and Linux has no AT_SYMLINK_NOFOLLOW for it, so
     // the link is excluded by looking first. The remaining window is a race with
@@ -1184,8 +1234,9 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// # Errors
 ///
 /// [`Error::Changed`] when the path is no longer what `plan` saw;
-/// [`Error::Read`] when the path or its parent cannot be stat'd; and
-/// [`Error::Write`] when a directory cannot be created or chmod'd.
+/// [`Error::ParentComponent`] when it has a `..` component; [`Error::Read`]
+/// when the path or its parent cannot be stat'd; and [`Error::Write`] when a
+/// directory cannot be created or chmod'd.
 pub fn ensure_dir(
     path: &Path,
     mode: Mode,
@@ -1194,7 +1245,7 @@ pub fn ensure_dir(
 ) -> Result<EnsuredDir, Error> {
     // Spelled as `observe` spells it, so `link/` is the link and never the
     // directory a chmod through it would change.
-    let path = lexical(path);
+    let path = lexical(path)?;
     let path = path.as_path();
     let fresh = observe(path)?;
     act_on_dir(path, mode, planned, fresh, created)
@@ -1390,16 +1441,30 @@ fn refuse_unwritable(observed: &Observed) -> Result<(), Error> {
 }
 
 /// `path` rebuilt from its components, which drops every trailing separator
-/// and every `.` after the first component.
+/// and every `.` after the first component, or a refusal when it has a `..`.
 ///
 /// A trailing `/` or `/.` makes the kernel resolve the last component:
 /// `lstat("link/")` stats the directory a symlink points at, and
 /// `chmod("link/")` changes it. bx decides about the component a target names,
 /// however the path is spelled, so every entry point that looks at or changes a
-/// path spells it this way first. Lexical only — nothing is resolved — and `..`
-/// is kept, because removing it without resolving could name a different file.
-fn lexical(path: &Path) -> PathBuf {
-    path.components().collect()
+/// path spells it this way first. Lexical only — nothing is resolved.
+///
+/// A `..` anywhere is refused rather than kept or removed: kept, the kernel
+/// resolves it through any symlink before it, and removed, it can name a
+/// different file. Either way the path bx records would not be the file it
+/// changed — see [`Error::ParentComponent`].
+///
+/// # Errors
+///
+/// [`Error::ParentComponent`] when `path` has a `..` component.
+fn lexical(path: &Path) -> Result<PathBuf, Error> {
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(Error::ParentComponent(path.to_path_buf()));
+    }
+    Ok(path.components().collect())
 }
 
 /// The directory `path` will be written into.
@@ -1644,6 +1709,12 @@ fn create_dir_at(path: &Path, mode: Mode) -> Result<bool, Error> {
 /// exactly the declared mode by the time anything can see the content.
 const SET_ID: u32 = 0o6000;
 
+/// The setuid, setgid and sticky bits: the ones a filesystem may not store.
+///
+/// [`Staged::fill`] reads them back after the content whenever a mode declares
+/// any of them — see [`Error::SetIdNotKept`].
+const SPECIAL: u32 = 0o7000;
+
 /// `mode` without its setuid and setgid bits — see [`SET_ID`].
 const fn without_set_id(mode: Mode) -> Mode {
     Mode::from_bits(mode.bits() & !SET_ID)
@@ -1658,15 +1729,16 @@ fn fchmod(file: &std::fs::File, mode: Mode, path: &Path) -> Result<(), Error> {
     })
 }
 
-/// Refuse unless every setuid or setgid bit `mode` declares is on `file`.
+/// Refuse unless every setuid, setgid or sticky bit `mode` declares is on
+/// `file`.
 ///
-/// Called after the `fchmod` that adds them, because that `fchmod` does not
-/// fail when a bit does not stick — see [`Error::SetIdNotKept`]. `dest` is the
+/// Called after the content, because the `fchmod` that adds a set-id bit does
+/// not fail when it does not stick — see [`Error::SetIdNotKept`]. `dest` is the
 /// destination the refusal names; the temporary file is what is inspected.
 ///
 /// # Errors
 ///
-/// [`Error::SetIdNotKept`] when a declared set-id bit is missing, and
+/// [`Error::SetIdNotKept`] when a declared special bit is missing, and
 /// [`Error::Read`] when `file` cannot be stat'd.
 fn verify_set_id_kept(file: &std::fs::File, mode: Mode, dest: &Path) -> Result<(), Error> {
     let meta = file.metadata().map_err(|source| Error::Read {
@@ -1674,7 +1746,7 @@ fn verify_set_id_kept(file: &std::fs::File, mode: Mode, dest: &Path) -> Result<(
         source,
     })?;
     let landed = mode_of(&meta);
-    let declared = mode.bits() & SET_ID;
+    let declared = mode.bits() & SPECIAL;
     if landed.bits() & declared == declared {
         return Ok(());
     }
@@ -2095,7 +2167,7 @@ mod tests {
         // lands: the second plan reads `Modify`, and the ledger records a mode
         // that is not on disk. Under root the bits survive either way, so this
         // cannot fail there — which is not a reason to skip it.
-        for bits in [0o4755, 0o2755, 0o6755] {
+        for bits in [0o4755, 0o2755, 0o6755, 0o1755] {
             let home = guarded_home();
             let dest = home.child("tool");
             let mode = Mode::from_bits(bits);
@@ -2128,6 +2200,50 @@ mod tests {
         seed(&path, b"x", Mode::from_bits(0o755));
         let file = std::fs::File::open(&path).expect("open");
 
+        // A lost setuid bit names setuid, and does not blame group membership,
+        // which only ever costs a file its setgid bit.
+        let lost_setuid = verify_set_id_kept(&file, Mode::from_bits(0o4755), &path)
+            .expect_err("0755 on disk is not a declared 4755")
+            .to_string();
+        assert!(
+            lost_setuid.contains("the setuid bit did not stick"),
+            "{lost_setuid}"
+        );
+        assert!(!lost_setuid.contains("setgid"), "{lost_setuid}");
+        assert!(!lost_setuid.contains("group"), "{lost_setuid}");
+        assert!(
+            lost_setuid.contains("filesystem that stores no set-id or sticky bits"),
+            "{lost_setuid}"
+        );
+        // Every bit that did not stick is named, and only those.
+        let lost_both = verify_set_id_kept(&file, Mode::from_bits(0o7755), &path)
+            .expect_err("0755 on disk is not a declared 7755")
+            .to_string();
+        assert!(
+            lost_both.contains("the setuid, setgid and sticky bits did not stick"),
+            "{lost_both}"
+        );
+        set_mode(&path, Mode::from_bits(0o1755)).expect("sticky sticks here");
+        let lost_sticky = verify_set_id_kept(&file, Mode::from_bits(0o5755), &path)
+            .expect_err("1755 on disk is not a declared 5755")
+            .to_string();
+        assert!(
+            lost_sticky.contains("the setuid bit did not stick"),
+            "{lost_sticky}"
+        );
+        assert!(
+            verify_set_id_kept(&file, Mode::from_bits(0o1755), &path).is_ok(),
+            "a sticky bit that stuck is no refusal",
+        );
+        seed(&path, b"x", Mode::from_bits(0o755));
+        let lost_sticky = verify_set_id_kept(&file, Mode::from_bits(0o1755), &path)
+            .expect_err("0755 on disk is not a declared 1755")
+            .to_string();
+        assert!(
+            lost_sticky.contains("the sticky bit did not stick"),
+            "{lost_sticky}"
+        );
+
         let err = verify_set_id_kept(&file, Mode::from_bits(0o2755), &path)
             .expect_err("0755 on disk is not a declared 2755");
         let Error::SetIdNotKept {
@@ -2142,8 +2258,17 @@ mod tests {
         assert_eq!(*declared, Mode::from_bits(0o2755));
         assert_eq!(*landed, Mode::from_bits(0o755));
         assert_eq!(err.path(), path);
-        assert!(err.to_string().contains("setgid"), "{err}");
-        assert!(err.to_string().contains("Nothing was replaced"), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("the setgid bit did not stick"),
+            "{message}"
+        );
+        assert!(message.contains("whose group you are not in"), "{message}");
+        assert!(
+            message.contains("filesystem that stores no set-id or sticky bits"),
+            "{message}"
+        );
+        assert!(message.contains("Nothing was replaced"), "{message}");
 
         // A bit that did stick is no refusal, and neither is a mode that
         // declares none.
@@ -3600,6 +3725,91 @@ mod tests {
                 .expect("stat")
                 .file_type()
                 .is_symlink(),
+        );
+    }
+
+    /// Assert that `result` is the refusal of a `..` component in `path`.
+    fn assert_parent_component_refused<T: std::fmt::Debug>(
+        what: &str,
+        result: Result<T, Error>,
+        path: &Path,
+    ) {
+        match result {
+            Err(Error::ParentComponent(named)) => assert_eq!(named, path, "{what}"),
+            other => panic!("{what}: expected ParentComponent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parent_component_is_refused_rather_than_resolved_through_a_link() {
+        // `lnk/../f` with `lnk -> elsewhere/sub`: the kernel resolves `..`
+        // after following the link, so it names `elsewhere/f`, while any
+        // lexical reading of the path — the one a ledger key is made from —
+        // names `f`. A write through it would record one file and change
+        // another, and `rm` would restore the wrong one.
+        let home = guarded_home();
+        std::fs::create_dir_all(home.child("elsewhere/sub")).expect("mkdir");
+        std::os::unix::fs::symlink("elsewhere/sub", home.child("lnk")).expect("symlink");
+        seed(&home.child("elsewhere/f"), b"theirs\n", Mode::DEFAULT_FILE);
+
+        let dotted = home.child("lnk/../f");
+        assert_parent_component_refused("observe", observe(&dotted), &dotted);
+        assert_parent_component_refused(
+            "write_atomically",
+            write_atomically(&dotted, b"ours\n", Mode::PRIVATE_FILE),
+            &dotted,
+        );
+        let planned = observe(&home.child("f")).expect("plan observes the lexical name");
+        assert_parent_component_refused(
+            "stage",
+            stage(
+                &dotted,
+                Mode::PRIVATE_FILE,
+                &planned,
+                &mut CreatedDirs::new(),
+            ),
+            &dotted,
+        );
+        assert_parent_component_refused("set_mode", set_mode(&dotted, Mode::PRIVATE_FILE), &dotted);
+        let dotted_dir = home.child("lnk/../d");
+        let planned_dir = observe(&home.child("d")).expect("plan observes the lexical name");
+        assert_parent_component_refused(
+            "ensure_dir",
+            ensure_dir(
+                &dotted_dir,
+                Mode::PRIVATE_DIR,
+                &planned_dir,
+                &mut CreatedDirs::new(),
+            ),
+            &dotted_dir,
+        );
+        // A final `..`, and a relative path that starts with one, likewise.
+        let trailing = home.child("lnk/..");
+        assert_parent_component_refused("a final ..", observe(&trailing), &trailing);
+        assert_parent_component_refused(
+            "a relative ..",
+            observe(Path::new("../f")),
+            Path::new("../f"),
+        );
+
+        // Nothing was written or changed at either name.
+        assert_eq!(
+            std::fs::read(home.child("elsewhere/f")).expect("read"),
+            b"theirs\n"
+        );
+        assert_eq!(mode_of_path(&home.child("elsewhere/f")), Mode::DEFAULT_FILE);
+        assert!(std::fs::symlink_metadata(home.child("f")).is_err());
+        assert!(std::fs::symlink_metadata(home.child("d")).is_err());
+        assert!(std::fs::symlink_metadata(home.child("elsewhere/d")).is_err());
+        assert_eq!(
+            names_in(&home.child("elsewhere")),
+            [OsString::from("f"), OsString::from("sub")],
+            "no temporary file is left",
+        );
+        assert_eq!(
+            Error::ParentComponent(dotted.clone()).path(),
+            dotted,
+            "the refusal names the path as given",
         );
     }
 

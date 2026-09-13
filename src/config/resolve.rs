@@ -1188,6 +1188,220 @@ mod tests {
         ready(&resolved, 1);
     }
 
+    /// Merge and resolve an arbitrary layer set against the fixtures' home.
+    fn merged_and_resolved(layers: &[(&str, LayerKind, &str)]) -> (Config, Resolved) {
+        let layers: Vec<Layer> = layers
+            .iter()
+            .map(|(file, kind, text)| layer(file, *kind, text).unwrap())
+            .collect();
+        let merged = merge(&layers, &home()).expect("an account's answer does not fail the merge");
+        let resolved = resolve(&merged, &home()).expect("nor the resolution");
+        (merged, resolved)
+    }
+
+    /// Two independent pairs, `s` and `t`, each two files as written and one
+    /// file when `profile` is answered `default`.
+    const TWO_PAIRS: &str = "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/{{profile}}/s\"\ncontent = \"PS\"\n\
+                             [[target]]\npath = \"~/.config/default/s\"\ncontent = \"DS\"\n\
+                             [[target]]\npath = \"~/.config/{{profile}}/t\"\ncontent = \"PT\"\n\
+                             [[target]]\npath = \"~/.config/default/t\"\ncontent = \"DT\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+    #[test]
+    fn two_clashing_pairs_in_one_layer_each_keep_their_own_conflict() {
+        // Recording the second pair's clash may only replace what was recorded
+        // for that same file in that same layer. Dropping the first pair's clash
+        // would leave two ready targets for `~/.config/default/s`.
+        let (merged, resolved) = merged_and_resolved(&[
+            ("bx.toml", LayerKind::Global, TWO_PAIRS),
+            (
+                "local.toml",
+                LayerKind::Local,
+                "[values]\nprofile = \"default\"\n",
+            ),
+        ]);
+
+        assert_eq!(
+            merged
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.file.as_str())
+                .collect::<Vec<_>>(),
+            ["~/.config/default/s", "~/.config/default/t"]
+        );
+        assert_eq!(
+            keys(&resolved),
+            [
+                "~/.config/{{profile}}/s",
+                "~/.config/default/s",
+                "~/.config/{{profile}}/t",
+                "~/.config/default/t",
+                "~/.zshrc",
+            ]
+        );
+        for (index, own, other) in [
+            (0, ["bx.toml:4", "bx.toml:7"], ["bx.toml:10", "bx.toml:13"]),
+            (1, ["bx.toml:4", "bx.toml:7"], ["bx.toml:10", "bx.toml:13"]),
+            (2, ["bx.toml:10", "bx.toml:13"], ["bx.toml:4", "bx.toml:7"]),
+            (3, ["bx.toml:10", "bx.toml:13"], ["bx.toml:4", "bx.toml:7"]),
+        ] {
+            let entry = blocked(&resolved, index);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["profile".to_string()]
+                }
+            );
+            for line in own {
+                assert!(entry.hint.contains(line), "{index} {line}: {}", entry.hint);
+            }
+            for line in other {
+                assert!(!entry.hint.contains(line), "{index} {line}: {}", entry.hint);
+            }
+        }
+        assert_eq!(ready(&resolved, 4).path.as_str(), "~/.zshrc");
+    }
+
+    #[test]
+    fn one_file_clashing_in_two_layers_is_recorded_for_each_and_settled_only_by_name() {
+        // `bx.toml` names `s` twice through `profile`, and a module toggles it
+        // twice the same way. Recording the module's clash may not drop
+        // `bx.toml`'s, which is a different layer's statement about the file.
+        // A later full entry for `s` settles both, and leaves `t` alone.
+        const MODULE: &str = "[[target]]\npath = \"~/.config/{{profile}}/s\"\nenabled = true\n\
+                              [[target]]\npath = \"~/.config/default/s\"\nenabled = true\n";
+
+        let (merged, resolved) = merged_and_resolved(&[
+            ("bx.toml", LayerKind::Global, TWO_PAIRS),
+            ("modules/10-profile.toml", LayerKind::Global, MODULE),
+            (
+                "local.toml",
+                LayerKind::Local,
+                "[values]\nprofile = \"default\"\n",
+            ),
+        ]);
+
+        assert_eq!(
+            merged
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.file.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "~/.config/default/s",
+                "~/.config/default/t",
+                "~/.config/default/s"
+            ],
+            "one conflict per layer that named the file twice"
+        );
+        for index in [0, 1] {
+            let entry = blocked(&resolved, index);
+            for line in [
+                "`~/.config/{{profile}}/s` at bx.toml:4",
+                "`~/.config/default/s` at bx.toml:7",
+                "`~/.config/{{profile}}/s` at modules/10-profile.toml:1",
+                "`~/.config/default/s` at modules/10-profile.toml:4",
+            ] {
+                assert!(entry.hint.contains(line), "{index} {line}: {}", entry.hint);
+            }
+        }
+
+        let (merged, resolved) = merged_and_resolved(&[
+            ("bx.toml", LayerKind::Global, TWO_PAIRS),
+            ("modules/10-profile.toml", LayerKind::Global, MODULE),
+            (
+                "local.toml",
+                LayerKind::Local,
+                "[values]\nprofile = \"default\"\n\
+                 [[target]]\npath = \"~/.config/default/s\"\ncontent = \"LOCAL\"\n",
+            ),
+        ]);
+
+        assert_eq!(
+            merged
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.file.as_str())
+                .collect::<Vec<_>>(),
+            ["~/.config/default/t"],
+            "the full entry settles every layer's clash for `s`, and only `s`"
+        );
+        assert_eq!(
+            keys(&resolved),
+            [
+                "~/.config/default/s",
+                "~/.config/{{profile}}/t",
+                "~/.config/default/t",
+                "~/.zshrc",
+            ]
+        );
+        assert_eq!(ready(&resolved, 0).body, Body::Inline("LOCAL".to_string()));
+        blocked(&resolved, 1);
+        blocked(&resolved, 2);
+        ready(&resolved, 3);
+    }
+
+    #[test]
+    fn a_clashing_pair_reasserted_a_third_time_is_one_conflict_naming_all_three() {
+        // The third statement replaces the clash the first two recorded; it
+        // does not add a second one beside it, which would repeat every line in
+        // the hint.
+        let (merged, resolved) = merged_and_resolved(&[
+            (
+                "bx.toml",
+                LayerKind::Global,
+                "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
+                 [[value]]\nname = \"other\"\nkind = \"string\"\n\
+                 [[target]]\npath = \"~/.config/{{profile}}/s\"\ncontent = \"P\"\n\
+                 [[target]]\npath = \"~/.config/default/s\"\ncontent = \"D\"\n\
+                 [[target]]\npath = \"~/.config/{{other}}/s\"\ncontent = \"O\"\n\
+                 [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n",
+            ),
+            (
+                "local.toml",
+                LayerKind::Local,
+                "[values]\nprofile = \"default\"\nother = \"default\"\n",
+            ),
+        ]);
+
+        assert_eq!(merged.conflicts.len(), 1, "{:#?}", merged.conflicts);
+        assert_eq!(merged.conflicts[0].names, ["profile", "other"]);
+        assert_eq!(
+            keys(&resolved),
+            [
+                "~/.config/{{profile}}/s",
+                "~/.config/default/s",
+                "~/.config/{{other}}/s",
+                "~/.zshrc",
+            ]
+        );
+        for index in [0, 1, 2] {
+            let entry = blocked(&resolved, index);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["profile".to_string(), "other".to_string()]
+                }
+            );
+            for line in [
+                "bx.toml:7",
+                "bx.toml:10",
+                "bx.toml:13",
+                "`profile` at local.toml:2",
+                "`other` at local.toml:3",
+            ] {
+                assert_eq!(
+                    entry.hint.matches(line).count(),
+                    1,
+                    "{index} {line}: {}",
+                    entry.hint
+                );
+            }
+        }
+        ready(&resolved, 3);
+    }
+
     #[test]
     fn two_ready_targets_for_one_file_are_refused_even_unmerged() {
         // `resolve` takes any `Config`, and one that did not come through the

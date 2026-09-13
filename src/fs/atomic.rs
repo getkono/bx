@@ -1053,30 +1053,117 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// Make `path` the directory at `mode` that [`compare_dir`] announced — the
 /// `apply` half of a declared directory target.
 ///
-/// It observes, runs [`compare_dir`], and performs **exactly** the action that
-/// comparison returns, which it also returns: nothing for `Unchanged`; `mkdir`
-/// for `Create`, with `path` at `mode` and missing ancestors at
+/// `planned` is the observation `plan` compared — the [`Observed`] it handed to
+/// [`compare_dir`]. `ensure_dir` observes the path again and refuses with
+/// [`Error::Changed`] unless [`compare_dir`] reaches the same verdict from both:
+/// the same action, the same mode found for a `Modify`, the same cause for a
+/// `Conflict`. A directory chmod'd after `plan` printed `Unchanged`, a directory
+/// that appeared after `plan` printed `Create`, and a file that took the path
+/// are refused rather than acted on, so `apply` never does work `plan` did not
+/// announce. The refusal also covers a path taken between that second
+/// observation and the `mkdir`: a `Create` succeeds only when this call is the
+/// one that created the directory.
+///
+/// On agreement it performs **exactly** that action: nothing for `Unchanged`;
+/// `mkdir` for `Create`, with `path` at `mode` and missing ancestors at
 /// [`Mode::DEFAULT_DIR`]; [`set_mode`] for `Modify`; and nothing at all for
 /// `Conflict`, which is reported rather than raised because it is a verdict
-/// `plan` already printed. It never does work the comparison did not name, so
-/// `plan` must use [`observe`] + [`compare_dir`], not this.
+/// `plan` already printed. `plan` must use [`observe`] + [`compare_dir`], not
+/// this.
+///
+/// It returns what a ledger needs to reverse it: the action, the observation
+/// it acted on — so the mode a `Modify` overwrote is `prior.mode` — and the
+/// directories it created, deepest first.
+///
+/// Two windows remain. A `chmod` landing between the second observation and
+/// the [`set_mode`] is overwritten, as for any mode change (decision 6). And
+/// when a `Create` is refused because the path was taken after the second
+/// observation, an ancestor this call had already created is left in place,
+/// empty, exactly as [`stage`] leaves one for an abandoned write.
 ///
 /// # Errors
 ///
-/// [`Error::Read`] when the path or its parent cannot be stat'd, and
+/// [`Error::Changed`] when the path is no longer what `plan` saw;
+/// [`Error::Read`] when the path or its parent cannot be stat'd; and
 /// [`Error::Write`] when a directory cannot be created or chmod'd.
-pub fn ensure_dir(path: &Path, mode: Mode) -> Result<Action, Error> {
-    let observed = observe(path)?;
-    let outcome = compare_dir(&observed, mode);
+pub fn ensure_dir(path: &Path, mode: Mode, planned: &Observed) -> Result<EnsuredDir, Error> {
+    let fresh = observe(path)?;
+    act_on_dir(path, mode, planned, fresh)
+}
+
+/// What [`ensure_dir`] did, and what a ledger needs to reverse it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsuredDir {
+    /// The action performed — the one `plan` announced.
+    pub action: Action,
+    /// What was at the path immediately before, which is what `plan` saw. For
+    /// a `Modify` its `mode` is the mode that was overwritten.
+    pub prior: Observed,
+    /// The directories this call created, deepest first — the path itself
+    /// and any ancestor it had to invent — which is the order a reversal
+    /// removes them in. Empty unless `action` is `Create`.
+    pub created_dirs: Vec<PathBuf>,
+}
+
+/// The half of [`ensure_dir`] after its own observation, separate so a test can
+/// change the disk between the two.
+fn act_on_dir(
+    path: &Path,
+    mode: Mode,
+    planned: &Observed,
+    fresh: Observed,
+) -> Result<EnsuredDir, Error> {
+    let announced = compare_dir(planned, mode);
+    let outcome = compare_dir(&fresh, mode);
+    // Equal outcomes are equal verdicts: the action, the mode found for a
+    // `Modify`, and the cause of a `Conflict` are all part of one.
+    if outcome != announced {
+        return Err(Error::Changed {
+            path: path.to_path_buf(),
+            detail: format!("plan saw {}, and it is now {}", seen(planned), seen(&fresh)),
+        });
+    }
+
+    let mut created_dirs = Vec::new();
     match outcome.action {
         Action::Create => {
-            create_missing_dirs(path, mode)?;
+            created_dirs = create_missing_dirs(path, mode)?;
+            // The path itself is the deepest entry when this call made it. When
+            // it is not there, something took the path between the observation
+            // and the `mkdir` — somebody else's directory, or not a directory at
+            // all — and neither is the create `plan` announced.
+            if created_dirs.first().map(PathBuf::as_path) != Some(path) {
+                let now = optional_metadata(path)?
+                    .map_or(Kind::Absent, |meta| Kind::from(meta.file_type()));
+                return Err(Error::Changed {
+                    path: path.to_path_buf(),
+                    detail: format!(
+                        "plan saw nothing, and {now} took the path before bx could create it"
+                    ),
+                });
+            }
             tracing::debug!(path = %path.display(), %mode, "created a directory");
         }
         Action::Modify => set_mode(path, mode)?,
         _ => {}
     }
-    Ok(outcome.action)
+    Ok(EnsuredDir {
+        action: outcome.action,
+        prior: fresh,
+        created_dirs,
+    })
+}
+
+/// What an observation of a directory target found, in the words a refusal
+/// uses.
+fn seen(observed: &Observed) -> String {
+    if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
+        return format!("a parent that does not resolve ({reason})");
+    }
+    match (observed.kind, observed.mode) {
+        (Kind::Dir, Some(mode)) => format!("a directory at {mode}"),
+        (kind, _) => kind.to_string(),
+    }
 }
 
 /// Refuse unless `prior.path` is still what [`observe`] found there: the same
@@ -2392,20 +2479,122 @@ mod tests {
         compare_dir(&observe(&home.child(rel)).expect("observe"), mode)
     }
 
+    /// `plan` for a directory target, then `apply` on what that plan saw, with
+    /// nothing changing in between.
+    fn apply_dir(path: &Path, mode: Mode) -> Result<EnsuredDir, Error> {
+        let planned = observe(path).expect("plan observes");
+        ensure_dir(path, mode, &planned)
+    }
+
+    #[test]
+    fn ensure_dir_refuses_a_mode_changed_after_plan_saw_nothing_to_do() {
+        let home = guarded_home();
+        let dir = home.child(".ssh");
+        std::fs::create_dir(&dir).expect("mkdir");
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("chmod");
+        let planned = observe(&dir).expect("plan observes");
+        assert_eq!(
+            compare_dir(&planned, Mode::PRIVATE_DIR).action,
+            Action::Unchanged,
+        );
+
+        set_mode(&dir, Mode::DEFAULT_DIR).expect("somebody widens it after plan");
+
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned)
+            .expect_err("plan announced nothing, so apply may do nothing");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(err.path(), dir);
+        assert_eq!(
+            mode_of_path(&dir),
+            Mode::DEFAULT_DIR,
+            "apply did not chmod a directory plan never said it would touch",
+        );
+    }
+
+    #[test]
+    fn ensure_dir_refuses_a_directory_that_appeared_after_plan_announced_a_create() {
+        let home = guarded_home();
+        let dir = home.child("shared");
+        let planned = observe(&dir).expect("plan observes");
+        assert_eq!(
+            compare_dir(&planned, Mode::PRIVATE_DIR).action,
+            Action::Create
+        );
+
+        std::fs::create_dir(&dir).expect("another tool makes it");
+        set_mode(&dir, Mode::from_bits(0o777)).expect("at its own mode");
+
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned)
+            .expect_err("plan announced a create, not a chmod of somebody else's directory");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(mode_of_path(&dir), Mode::from_bits(0o777));
+    }
+
+    #[test]
+    fn ensure_dir_refuses_a_file_that_took_the_path_before_its_mkdir() {
+        let home = guarded_home();
+        let dir = home.child("d");
+        let planned = observe(&dir).expect("plan observes");
+        // Apply's own observation agrees with plan's...
+        let fresh = observe(&dir).expect("apply observes");
+        assert_eq!(
+            compare_dir(&fresh, Mode::PRIVATE_DIR),
+            compare_dir(&planned, Mode::PRIVATE_DIR),
+        );
+        // ...and then a file lands before the mkdir does.
+        seed(&dir, b"a file\n", Mode::DEFAULT_FILE);
+
+        let err = act_on_dir(&dir, Mode::PRIVATE_DIR, &planned, fresh)
+            .expect_err("a file where a directory was to be created is not a create");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&dir).expect("read"), b"a file\n");
+        assert_eq!(mode_of_path(&dir), Mode::DEFAULT_FILE);
+    }
+
+    #[test]
+    fn ensure_dir_returns_what_it_overwrote_and_what_it_created() {
+        let home = guarded_home();
+        let dir = home.child("a/b/c");
+
+        let created = apply_dir(&dir, Mode::PRIVATE_DIR).expect("create");
+        assert_eq!(created.action, Action::Create);
+        assert_eq!(created.prior.kind, Kind::Absent);
+        assert_eq!(
+            created.created_dirs,
+            [home.child("a/b/c"), home.child("a/b"), home.child("a")],
+            "deepest first, the path itself included, for a reversal to remove",
+        );
+
+        set_mode(&dir, Mode::DEFAULT_DIR).expect("widen");
+        let closed = apply_dir(&dir, Mode::PRIVATE_DIR).expect("modify");
+        assert_eq!(closed.action, Action::Modify);
+        assert_eq!(
+            closed.prior.mode,
+            Some(Mode::DEFAULT_DIR),
+            "the mode it overwrote, for the ledger to restore",
+        );
+        assert!(closed.created_dirs.is_empty());
+
+        let unchanged = apply_dir(&dir, Mode::PRIVATE_DIR).expect("unchanged");
+        assert_eq!(unchanged.action, Action::Unchanged);
+        assert_eq!(unchanged.prior.mode, Some(Mode::PRIVATE_DIR));
+        assert!(unchanged.created_dirs.is_empty());
+    }
+
     #[test]
     fn ensure_dir_creates_at_the_declared_mode_and_closes_the_drift_plan_announced() {
         let home = guarded_home();
         let dir = home.child(".ssh");
 
         assert_eq!(
-            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("create"),
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("create").action,
             Action::Create,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
 
         // Idempotence: the second call changes nothing and reports nothing.
         assert_eq!(
-            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("again"),
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("again").action,
             Action::Unchanged,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
@@ -2428,7 +2617,7 @@ mod tests {
 
         // ...and closed by apply, which does exactly that and nothing else.
         assert_eq!(
-            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("drift"),
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("drift").action,
             planned.action,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
@@ -2456,7 +2645,9 @@ mod tests {
 
         // And apply performs the create plan announced.
         assert_eq!(
-            ensure_dir(&home.child("declared/dir"), Mode::PRIVATE_DIR).expect("apply"),
+            apply_dir(&home.child("declared/dir"), Mode::PRIVATE_DIR)
+                .expect("apply")
+                .action,
             outcome.action,
         );
         assert_eq!(mode_of_path(&home.child("declared/dir")), Mode::PRIVATE_DIR);
@@ -2479,7 +2670,9 @@ mod tests {
             Action::Conflict,
         );
         assert_eq!(
-            ensure_dir(&home.child("d"), Mode::PRIVATE_DIR).expect("a verdict"),
+            apply_dir(&home.child("d"), Mode::PRIVATE_DIR)
+                .expect("a verdict")
+                .action,
             Action::Conflict,
         );
         assert!(std::fs::symlink_metadata(home.child("nowhere")).is_err());
@@ -2604,7 +2797,9 @@ mod tests {
     fn ensure_dir_creates_implicit_ancestors_at_the_default_dir_mode() {
         let home = guarded_home();
         assert_eq!(
-            ensure_dir(&home.child("a/b/c"), Mode::PRIVATE_DIR).expect("create"),
+            apply_dir(&home.child("a/b/c"), Mode::PRIVATE_DIR)
+                .expect("create")
+                .action,
             Action::Create,
         );
         assert_eq!(mode_of_path(&home.child("a")), Mode::DEFAULT_DIR);
@@ -2618,7 +2813,7 @@ mod tests {
         let path = home.child("f");
         seed(&path, b"x", Mode::DEFAULT_FILE);
         assert_eq!(
-            ensure_dir(&path, Mode::PRIVATE_DIR).expect("report"),
+            apply_dir(&path, Mode::PRIVATE_DIR).expect("report").action,
             Action::Conflict,
         );
         assert_eq!(std::fs::read(&path).expect("read"), b"x");
@@ -2633,7 +2828,9 @@ mod tests {
         std::os::unix::fs::symlink("real", home.child("link")).expect("symlink");
 
         assert_eq!(
-            ensure_dir(&home.child("link"), Mode::PRIVATE_DIR).expect("report"),
+            apply_dir(&home.child("link"), Mode::PRIVATE_DIR)
+                .expect("report")
+                .action,
             Action::Conflict,
         );
         assert_eq!(
@@ -2972,7 +3169,9 @@ mod tests {
         std::os::unix::fs::symlink("nowhere", home.child("d")).expect("symlink");
 
         assert_eq!(
-            ensure_dir(&home.child("d/a"), Mode::PRIVATE_DIR).expect("a verdict, not an error"),
+            apply_dir(&home.child("d/a"), Mode::PRIVATE_DIR)
+                .expect("a verdict, not an error")
+                .action,
             Action::Conflict,
         );
         assert!(

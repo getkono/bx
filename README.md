@@ -102,11 +102,12 @@ or a login banner without anyone parsing its output:
   own config directory, one `source` line in `.zshrc`.
 - `bx` never points a tool at a `bx`-owned directory, and never sets an
   environment variable that moves a tool's config, data, or cache outside a root
-  you declared. The check is on the value the variable is given, not on its
-  name: declare your scratch mount as a root and your toolchain caches may live
-  there; declare nothing and nothing moves at all. It will write a tool's env
-  var only when that is the tool's own configuration interface and it has no
-  config file at all.
+  you declared. It sets only variables it knows how to judge, and judges each
+  value for what it is — a location, a program, a search list or a setting:
+  declare your scratch mount as a root and your toolchain caches may live there;
+  declare nothing and nothing moves at all. It will write a tool's env var only
+  when that is the tool's own configuration interface and it has no config file
+  at all.
 - Uninstalling is a supported operation, not an afterthought.
 
 ### Idempotent and reversible

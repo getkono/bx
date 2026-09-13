@@ -1204,7 +1204,12 @@ impl Session {
         mode: Mode,
         ownership: &Ownership,
     ) -> Result<(), Error> {
-        let staged = fs::stage(&dest, mode)?;
+        // #8's `stage` now takes the observation plan compared and the set of
+        // directories the apply has created. Until the request carries plan's
+        // observation, the session observes for itself and stages with a set
+        // of its own, which is the behaviour before the merge.
+        let planned = fs::observe(&dest)?;
+        let staged = fs::stage(&dest, mode, &planned, &mut fs::CreatedDirs::new())?;
         let temp = staged.temp_path().to_path_buf();
         self.crash.reached(index, Phase::AfterStage);
 

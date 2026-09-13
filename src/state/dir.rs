@@ -198,10 +198,17 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
 /// for the name first and renaming second, which the lock makes sound against
 /// every other bx.
 ///
+/// The lock must be the one of the directory holding `path` — see
+/// [`check_lock`] — or nothing is renamed.
+///
 /// # Errors
 ///
-/// The first failure that is not "that name is taken".
-pub(crate) fn move_aside(path: &Path, _lock: &ExclusiveLock) -> std::io::Result<PathBuf> {
+/// [`std::io::ErrorKind::InvalidInput`] for another directory's lock, and
+/// otherwise the first failure that is not "that name is taken".
+pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<PathBuf> {
+    check_lock(path, lock).map_err(|refused| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, refused.to_string())
+    })?;
     let mut n: u64 = 0;
     loop {
         let candidate = StateDir::quarantine_nth(path, n);
@@ -221,8 +228,89 @@ pub(crate) fn move_aside(path: &Path, _lock: &ExclusiveLock) -> std::io::Result<
     }
 }
 
+/// Every quarantine of `path` present now, in the order [`move_aside`] makes
+/// them: `<name>.corrupt`, then `<name>.corrupt.1`, `<name>.corrupt.2`, ….
+///
+/// Found by listing the directory, not by probing names until one is missing,
+/// so a gap — `.corrupt` deleted, `.corrupt.1` kept — hides nothing after it.
+/// Only a name [`StateDir::quarantine_nth`] would give is counted.
+///
+/// # Errors
+///
+/// [`Error::Read`] if the directory exists and cannot be listed: an empty list
+/// there would be a guess.
+pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, Error> {
+    let (Some(root), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
+        return Ok(Vec::new());
+    };
+    let unlistable = |source| Error::Read {
+        path: root.to_path_buf(),
+        source,
+    };
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(unlistable(source)),
+    };
+    let prefix = format!("{name}.corrupt");
+    let mut found = Vec::new();
+    for entry in entries {
+        let file = entry.map_err(unlistable)?.file_name();
+        let Some(rest) = file.to_str().and_then(|file| file.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let n = match rest.strip_prefix('.').map(str::parse::<u64>) {
+            None if rest.is_empty() => 0,
+            Some(Ok(n)) if n > 0 && rest == format!(".{n}") => n,
+            _ => continue,
+        };
+        found.push((n, StateDir::quarantine_nth(path, n)));
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, aside)| aside).collect())
+}
+
+/// Refuse `lock` unless it is the lock of the state directory holding `path`.
+///
+/// Every operation that demands an [`ExclusiveLock`] demands it for one
+/// directory. A quarantine or a save under another directory's lock is as
+/// unguarded as one under none: another bx holding *this* directory's lock can
+/// be saving the very file being moved.
+///
+/// # Errors
+///
+/// [`Error::WrongLock`], naming both lock files.
+pub(crate) fn check_lock(path: &Path, lock: &ExclusiveLock) -> Result<(), Error> {
+    let root = path.parent().unwrap_or_else(|| Path::new(""));
+    if lock.guards(root) {
+        return Ok(());
+    }
+    Err(Error::WrongLock {
+        held: lock.path().to_path_buf(),
+        needed: StateDir::new(root.to_path_buf()).lock(),
+    })
+}
+
+/// Whether users other than the owner can read or write a directory of `mode`
+/// — the question asked of a linked directory bx may not `chmod`.
+///
+/// Search permission alone is not counted. It lets another user open a name
+/// they already know, and every file this module keeps in the state directory
+/// is `0600`, so `0711` exposes nothing and refusing it would be untrue.
+///
+/// Group permission is counted even when the group is a user-private one, as
+/// on Fedora's default `umask 002`. Whether a group has exactly one member is
+/// a question for the account database, which bx does not consult, so a
+/// group-readable or group-writable target is refused.
+fn open_beyond_owner(mode: Mode) -> bool {
+    mode.bits() & 0o066 != 0
+}
+
 /// Check that an existing `path` is a directory, and narrow it to `mode` if it
 /// is reachable by anyone but its owner.
+///
+/// A directory reached through a symlink is never narrowed: it is refused if
+/// [`open_beyond_owner`], and otherwise left exactly as it is.
 fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
     let read_failed = |source| Error::Read {
         path: path.to_path_buf(),
@@ -242,14 +330,18 @@ fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
         });
     }
     let found = Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
-    if found.is_shared() && linked {
+    if linked {
         // Never `chmod` through a link: the directory it names is not one bx
-        // created, and may be shared with other users. Leaving it wide would
-        // put prior copies of private files where others can read them, so
-        // the only answer left is to refuse and say why.
-        return Err(Error::SharedLinkedDir {
-            path: path.to_path_buf(),
-        });
+        // created, and may be shared with other users. Leaving it open would
+        // put prior copies of private files where others can list or replace
+        // them, so the only answer left is to refuse and say why.
+        if open_beyond_owner(found) {
+            return Err(Error::SharedLinkedDir {
+                path: path.to_path_buf(),
+                mode: found,
+            });
+        }
+        return Ok(());
     }
     if found.is_shared() {
         tracing::warn!(
@@ -499,6 +591,72 @@ mod tests {
     }
 
     #[test]
+    fn another_directorys_lock_moves_nothing_aside() {
+        // Review round 4: `move_aside` ignored which directory its lock
+        // guarded, so A's lock quarantined B's ledger while B's own bx could be
+        // saving it.
+        let a = guarded_home();
+        let b = guarded_home();
+        let lock_a = ExclusiveLock::acquire(&StateDir::resolve(a.path())).expect("A's lock");
+        let dir_b = StateDir::resolve(b.path());
+        dir_b.ensure().expect("ensure");
+        std::fs::write(dir_b.ledger(), b"damaged").expect("seed");
+
+        let err = move_aside(&dir_b.ledger(), &lock_a).expect_err("must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not the lock"), "{err}");
+        assert_eq!(std::fs::read(dir_b.ledger()).expect("in place"), b"damaged");
+        assert!(!StateDir::quarantine(&dir_b.ledger()).exists());
+
+        let lock_b = ExclusiveLock::acquire(&dir_b).expect("B's lock");
+        let aside = move_aside(&dir_b.ledger(), &lock_b).expect("B's own lock moves it");
+        assert_eq!(aside, StateDir::quarantine(&dir_b.ledger()));
+    }
+
+    #[test]
+    fn a_linked_state_directory_is_refused_for_read_or_write_beyond_its_owner_and_nothing_else() {
+        // Review round 4: the refusal counted execute bits, so a `0711` target
+        // was refused as "readable beyond its owner", which is untrue.
+        fn link_to(mode: u32) -> (crate::testing::GuardedHome, PathBuf, StateDir) {
+            let home = guarded_home();
+            let target = home.child("elsewhere");
+            std::fs::create_dir_all(&target).expect("target");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+            std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+            std::os::unix::fs::symlink(&target, home.child(".local/state/bx")).expect("symlink");
+            let dir = StateDir::resolve(home.path());
+            (home, target, dir)
+        }
+
+        // Search permission exposes no name nobody knows and no 0600 file.
+        for mode in [0o700, 0o711, 0o701, 0o710] {
+            let (_home, target, dir) = link_to(mode);
+            dir.ensure()
+                .unwrap_or_else(|e| panic!("{mode:04o} refused: {e}"));
+            assert_eq!(mode_of(&target), Mode::from_bits(mode), "never chmodded");
+            assert_eq!(mode_of(&dir.restore()), Mode::PRIVATE_DIR);
+        }
+
+        // Group or other read or write is refused — group included, whether or
+        // not the group is a user-private one. 0775 is Fedora's umask-002 default.
+        for mode in [0o775, 0o770, 0o750, 0o720, 0o705, 0o703] {
+            let (_home, target, dir) = link_to(mode);
+            let err = dir.ensure().expect_err("must refuse");
+            assert!(
+                matches!(&err, Error::SharedLinkedDir { mode: found, .. }
+                    if *found == Mode::from_bits(mode)),
+                "{mode:04o}: got {err}",
+            );
+            let message = err.to_string();
+            assert!(message.contains(&format!("{mode:04o}")), "{message}");
+            assert!(message.contains("read or write"), "{message}");
+            assert_eq!(mode_of(&target), Mode::from_bits(mode), "never chmodded");
+            assert!(!target.join("restore").exists(), "nothing was put in it");
+        }
+    }
+
+    #[test]
     fn a_symlinked_state_directory_is_accepted() {
         let home = guarded_home();
         let real = home.child("elsewhere");
@@ -526,10 +684,14 @@ mod tests {
 
         let err = dir.ensure().expect_err("must refuse");
         assert!(
-            matches!(&err, Error::SharedLinkedDir { path } if path == dir.root()),
+            matches!(
+                &err,
+                Error::SharedLinkedDir { path, mode }
+                    if path == dir.root() && *mode == Mode::from_bits(0o755)
+            ),
             "got {err}",
         );
-        assert!(err.to_string().contains("0700"), "{err}");
+        assert!(err.to_string().contains("chmod go-rw"), "{err}");
         assert_eq!(mode_of(&shared), Mode::from_bits(0o755), "left as it was");
         assert!(!shared.join("restore").exists(), "nothing was put in it");
     }

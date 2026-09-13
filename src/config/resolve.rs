@@ -132,8 +132,9 @@ pub struct Resolved {
 /// [`Error::BadValue`] for a defect in the committed repo: a malformed
 /// placeholder, a reference to a value no layer declares, a `default` that
 /// references a later value, a `default` that is not of its kind with no
-/// account answer involved, or a target field that substitution makes invalid
-/// with no account answer in it; and for two ready targets that name one file.
+/// account answer involved, a target field that substitution makes invalid
+/// with no account answer in it, or a `file` that references a `path` value,
+/// answered or not; and for two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -190,6 +191,10 @@ fn resolve_target(
     values: &ResolvedValues,
     conflicts: &[Conflict],
 ) -> Result<Resolution<Target>, Error> {
+    if let Body::File(file) = &target.body {
+        refuse_path_value_in_file(target, &file.to_string_lossy(), values)?;
+    }
+
     let mut unset: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
     let mut invalid: Vec<String> = Vec::new();
@@ -287,6 +292,44 @@ fn resolve_target(
             let hint = values.answers_hint(&problem, &names);
             block(BlockReason::InvalidValue { names }, hint)
         }
+    }
+}
+
+/// Refuse a `file` that references a `path` value.
+///
+/// A `path` value is absolute by construction, and `file` names a file relative
+/// to the config repo root. Opening `file`, the substituted text can never be
+/// repo-relative whatever the answer; further in, it names repo content by an
+/// account's absolute location. No answer fixes either, so it is the layer's
+/// defect and a load error naming the target, whether or not the value has an
+/// answer yet — not a blocked target whose hint advises changing one.
+///
+/// A malformed placeholder is left to the probe, which reports it with the
+/// rest of the target's defects.
+fn refuse_path_value_in_file(
+    target: &Target,
+    file: &str,
+    values: &ResolvedValues,
+) -> Result<(), Error> {
+    let path_value = super::values::placeholders(file)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|name| {
+            values
+                .decl(name)
+                .is_some_and(|decl| decl.kind == super::values::ValueKind::Path)
+        });
+    match path_value {
+        None => Ok(()),
+        Some(name) => Err(Error::BadValue {
+            origin: target.origin.clone(),
+            message: format!(
+                "target `{}`: `file` references `{name}`, a `path` value; a `path` value \
+                 is always absolute and `file` is relative to the config repo root, so no \
+                 answer could make it name a file in the repo; reference a `string` value",
+                target.path
+            ),
+        }),
     }
 }
 
@@ -610,6 +653,50 @@ mod tests {
             ready(&ordinary, 0).body,
             Body::File(PathBuf::from("cfg/work/gitconfig")),
             "the case this spelling exists for still resolves"
+        );
+    }
+
+    #[test]
+    fn a_file_body_may_not_reference_a_path_value() {
+        // A `path` value is absolute by construction and `file` is relative to
+        // the repo root. Opening `file`, it can never name a repo file whatever
+        // the answer; inside it, it names repo content by an account's absolute
+        // location. Either way no answer fixes it, so it is refused at load,
+        // naming the target's line, before anything is answered.
+        const LAYER: &str = "[[value]]\n\
+                             name = \"cfg_dir\"\n\
+                             kind = \"path\"\n\
+                             [[target]]\n\
+                             path = \"~/.gitconfig\"\n\
+                             file = \"FILE\"\n\
+                             [[target]]\n\
+                             path = \"~/.zshrc\"\n\
+                             content = \"setopt\"\n";
+
+        for file in ["{{cfg_dir}}/gitconfig", "cfg/{{cfg_dir}}/gitconfig"] {
+            for local in [None, Some("[values]\ncfg_dir = \"/var/mnt/cfg\"\n")] {
+                let message = resolved(&LAYER.replace("FILE", file), local)
+                    .expect_err("a `path` value in `file` is the layer's defect");
+                for part in [
+                    "bx.toml:4",
+                    "`cfg_dir`",
+                    "a `path` value",
+                    "relative to the config repo",
+                ] {
+                    assert!(message.contains(part), "{file} {local:?} {part}: {message}");
+                }
+            }
+        }
+
+        // The same spelling with a `string` value is the case `file` substitution
+        // exists for.
+        let string = LAYER
+            .replace("kind = \"path\"", "kind = \"string\"")
+            .replace("FILE", "cfg/{{cfg_dir}}/gitconfig");
+        let ordinary = resolved(&string, Some("[values]\ncfg_dir = \"work\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig"))
         );
     }
 

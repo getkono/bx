@@ -592,46 +592,52 @@ pub enum PlaceholderError {
 /// all four. An unmatched closing pair is ordinary content — there is no escape
 /// for it and none is needed, because a closing pair is only special once a
 /// placeholder is open.
+///
+/// Every step names the byte the next one starts at, and that byte is asserted
+/// to be past this one. A cursor that stopped advancing would loop forever — and
+/// in the escape branch grow `pieces` without bound while it did — so a defect
+/// in the arithmetic is a panic naming the byte, never a hang.
 fn scan(text: &str) -> Result<Vec<Piece<'_>>, PlaceholderError> {
     let mut pieces = Vec::new();
     let mut literal_from = 0;
     let mut at = 0;
 
     while at < text.len() {
-        if !text[at..].starts_with("{{") {
+        let next = if !text[at..].starts_with("{{") {
             // Advance one *character*, so a multi-byte character can never be
             // split and indexed into the middle of.
-            at += text[at..].chars().next().map_or(1, char::len_utf8);
-            continue;
-        }
-
-        if text[at..].starts_with("{{{{") {
+            at + text[at..].chars().next().map_or(1, char::len_utf8)
+        } else if text[at..].starts_with("{{{{") {
             // Flush the run *including* the first brace pair, which is exactly
             // the literal the escape stands for. Nothing is synthesised.
             pieces.push(Piece::Literal(&text[literal_from..at + 2]));
-            at += 4;
-            literal_from = at;
-            continue;
-        }
+            literal_from = at + 4;
+            literal_from
+        } else {
+            let open = at + 2;
+            let Some(close) = text[open..].find("}}").map(|rel| open + rel) else {
+                return Err(PlaceholderError::Unterminated { at });
+            };
+            let name = &text[open..close];
+            if !is_value_name(name) {
+                return Err(PlaceholderError::IllegalName {
+                    name: name.to_string(),
+                    at,
+                });
+            }
 
-        let open = at + 2;
-        let Some(close) = text[open..].find("}}").map(|rel| open + rel) else {
-            return Err(PlaceholderError::Unterminated { at });
+            if literal_from < at {
+                pieces.push(Piece::Literal(&text[literal_from..at]));
+            }
+            pieces.push(Piece::Name(name));
+            literal_from = close + 2;
+            literal_from
         };
-        let name = &text[open..close];
-        if !is_value_name(name) {
-            return Err(PlaceholderError::IllegalName {
-                name: name.to_string(),
-                at,
-            });
-        }
-
-        if literal_from < at {
-            pieces.push(Piece::Literal(&text[literal_from..at]));
-        }
-        pieces.push(Piece::Name(name));
-        at = close + 2;
-        literal_from = at;
+        assert!(
+            next > at,
+            "the placeholder scan did not advance past byte {at}"
+        );
+        at = next;
     }
 
     if literal_from < text.len() {

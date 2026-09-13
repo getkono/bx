@@ -11,7 +11,9 @@
 //! one can be committed by accident; the state directory is not a working tree
 //! and never becomes one. So `local.toml` lives in the state directory, and a
 //! `local.toml` found inside the config repo is **never loaded** — it is
-//! reported by [`stray_local`] so `bx doctor` can name the move.
+//! reported by [`stray_local`] so `bx doctor` can name the move. A state
+//! directory that is itself inside the repo is refused outright, rather than
+//! loading its `local.toml` or silently dropping it.
 //!
 //! # Why the local layer is a full layer
 //!
@@ -71,6 +73,13 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 /// is the hole Invariant 5 exists to close; [`stray_local`] is how it gets
 /// reported instead of silently ignored.
 ///
+/// That includes the local layer itself. A state directory inside the repo —
+/// `XDG_STATE_HOME` equal to `XDG_CONFIG_HOME` makes it the repo — is
+/// [`Error::LocalInRepo`], whether or not a `local.toml` is there yet: loading
+/// it would be the hole above, and skipping it would silently drop the
+/// account's layer. Compared lexically after [`paths::normalize`], like every
+/// other path rule in the crate, so a symlinked alias of the repo is not caught.
+///
 /// # Only a clean answer skips the local layer
 ///
 /// `local.toml` is examined the way [`super::layer_files`] examines a global
@@ -83,8 +92,9 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 ///
 /// # Errors
 ///
-/// Whatever [`super::layer_files`] returns, and [`Error::Io`] naming
-/// `local.toml` when it cannot be examined.
+/// Whatever [`super::layer_files`] returns, [`Error::LocalInRepo`] when the
+/// state directory lies inside the repo, and [`Error::Io`] naming `local.toml`
+/// when it cannot be examined.
 pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut paths: Vec<PathBuf> = super::layer_files(repo)?
         .into_iter()
@@ -92,6 +102,12 @@ pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error>
         .collect();
 
     let local = local_layer_path(state_dir);
+    if paths::normalize(&local).starts_with(paths::normalize(repo)) {
+        return Err(Error::LocalInRepo {
+            local,
+            repo: repo.to_path_buf(),
+        });
+    }
     if super::examine(&local)?.is_some_and(|meta| meta.is_file()) {
         paths.push(local);
     }
@@ -258,6 +274,62 @@ mod tests {
             paths,
             [repo.join("bx.toml")],
             "neither the root nor the modules copy is a layer"
+        );
+    }
+
+    /// A state directory inside the repo is refused, naming both, never loaded.
+    ///
+    /// With `XDG_STATE_HOME` equal to `XDG_CONFIG_HOME` the state directory *is*
+    /// the repo. `layer_paths` used to push `repo/local.toml` back in as the
+    /// local layer after filtering it out of the globals, so account answers
+    /// were merged out of the publishable tree while `stray_local` reported the
+    /// same file as a stray.
+    #[test]
+    fn a_state_directory_inside_the_repo_is_refused_naming_both() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        let config_home = home.child(".config");
+        let state = state_dir(home.path(), Some(config_home.as_os_str()));
+        assert_eq!(state, repo, "the configuration this case is about");
+        home.write(".config/bx/bx.toml", "");
+        let local = home.write(".config/bx/local.toml", "[values]\nscratch_root = \"/x\"\n");
+
+        let message = layer_paths(&repo, &state)
+            .expect_err("a local layer inside the repo is not loaded")
+            .to_string();
+        assert!(message.contains(&local.display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("inside the config repo {}", repo.display())),
+            "{message}"
+        );
+        load_layer_set(&repo, &state, home.path()).expect_err("nor through the loader");
+        assert_eq!(
+            stray_local(&repo).unwrap(),
+            Some(local),
+            "and doctor still names it"
+        );
+
+        // Refused before anything is written there: the first `bx init` would
+        // otherwise put this account's answers into the publishable tree.
+        std::fs::remove_file(repo.join(LOCAL_FILE)).expect("rm");
+        layer_paths(&repo, &state).expect_err("refused with no local.toml yet");
+        layer_paths(&repo, &repo.join("modules")).expect_err("anywhere under the repo");
+        layer_paths(&repo, &home.child(".config/elsewhere/../bx"))
+            .expect_err("however the state directory is spelled");
+    }
+
+    /// Guards against over-reach: a sibling that shares the repo's name prefix
+    /// is not inside it.
+    #[test]
+    fn a_state_directory_beside_the_repo_is_not_inside_it() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        let local = home.write(".config/bx-state/local.toml", "");
+
+        assert_eq!(
+            layer_paths(&repo, &home.child(".config/bx-state")).unwrap(),
+            [repo.join("bx.toml"), local]
         );
     }
 

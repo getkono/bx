@@ -1177,7 +1177,12 @@ impl ResolvedValues {
     ///
     /// Consults only the values resolved so far, which is every value a text
     /// that expanded can reference. Deduplicated, in the order reached.
-    fn account_inputs(&self, text: &str) -> Vec<String> {
+    ///
+    /// Every name returned was answered in the account's layer, so
+    /// [`ResolvedValues::answers_hint`] can name the line it is on. Empty means
+    /// no account answer went into `text`: whatever is wrong with the result is
+    /// the committed repo's.
+    pub(crate) fn account_inputs(&self, text: &str) -> Vec<String> {
         let mut inputs: Vec<String> = Vec::new();
         let reached = placeholders(text)
             .unwrap_or_default()
@@ -1194,6 +1199,26 @@ impl ResolvedValues {
             }
         }
         inputs
+    }
+
+    /// What to do about an entry this account's answers made unusable.
+    ///
+    /// `problem` says what is wrong with the entry; each of `names`, an answer
+    /// the account wrote as [`ResolvedValues::account_inputs`] reports it, is
+    /// named with its line, which is in the file the account can edit. Not a
+    /// `bx init` invocation, for the reason [`ResolvedValues::invalid_hint`]
+    /// gives.
+    #[must_use]
+    pub(crate) fn answers_hint(&self, problem: &str, names: &[String]) -> String {
+        let answers = names
+            .iter()
+            .filter_map(|name| {
+                self.get(name)
+                    .map(|value| format!("the answer to `{name}` at {}", value.origin))
+            })
+            .collect::<Vec<_>>()
+            .join(" and ");
+        format!("{problem}, because of {answers}; change that answer")
     }
 
     /// What to do about an entry blocked by [`Unresolved::Invalid`] on `names`.
@@ -1248,7 +1273,7 @@ impl ResolvedValues {
 
     /// Put `names` into declaration order, so two reports of one problem read
     /// the same way regardless of which field was substituted first.
-    fn in_declaration_order(&self, mut names: Vec<String>) -> Vec<String> {
+    pub(crate) fn in_declaration_order(&self, mut names: Vec<String>) -> Vec<String> {
         names.sort_by_key(|name| self.index_of(name).unwrap_or(usize::MAX));
         names.dedup();
         names
@@ -1706,11 +1731,31 @@ mod tests {
         // Clamped, `~/../../..` is `/`, and an `is_root` value answered that way
         // makes every destination on the filesystem admissible with nothing on
         // screen to say so.
-        for climbing in ["~/..", "~/../../..", "~/.ssh/../../etc"] {
+        for climbing in [
+            "~/..",
+            "~/../../..",
+            "~/.ssh/../../etc",
+            "~//..",
+            "~//../etc",
+            "~///../etc",
+        ] {
             let message =
                 check(ValueKind::Path, climbing).expect_err(&format!("{climbing} was accepted"));
             assert!(message.contains("not climb out of"), "{message}");
         }
+
+        // Through the entry point `bx init` calls, which once answered
+        // `~//../etc` with `/var/home/example/etc`.
+        let values =
+            ResolvedValues::resolve(vec![a_decl("scratch", ValueKind::Path)], &[], &a_home())
+                .unwrap();
+        let message = values
+            .check_answer("scratch", "~//../etc")
+            .expect_err("a doubled separator is still a climb out of the home");
+        assert!(
+            message.to_string().contains("not climb out of"),
+            "{message}"
+        );
         assert_eq!(
             check(ValueKind::Path, "~/.cache/../scratch").unwrap(),
             "/var/home/example/scratch",

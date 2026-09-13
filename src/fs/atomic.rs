@@ -2206,8 +2206,12 @@ mod tests {
         // whose own directory it may not be able to read.
         set_mode(home.path(), Mode::DEFAULT_DIR).expect("open the home to traversal");
         let exe = home.child("bx-test");
-        std::fs::copy(std::env::current_exe().expect("the test binary"), &exe)
-            .expect("copy the test binary");
+        // A copy rather than a hard link: the build's own file need not be
+        // executable by anyone else either. A full disk cannot hold the copy,
+        // and that is the scenario not being constructible, not a failure.
+        if let Err(e) = std::fs::copy(std::env::current_exe().expect("the test binary"), &exe) {
+            return skip(&format!("the test binary could not be copied: {e}"));
+        }
         set_mode(&exe, Mode::from_bits(0o755)).expect("chmod the copy");
         let dir = home.child("shared");
         std::fs::create_dir(&dir).expect("mkdir");

@@ -3333,6 +3333,26 @@ mod tests {
                 "{value:?}"
             );
         }
+        // A second word with an `=` in it is a second assignment only when
+        // what precedes the `=` is a name; otherwise it is a command's
+        // argument, which the grammar does not read either.
+        for value in ["nvim --wait=1", "/x a-b=c", "/x 2a=b", "/x =b"] {
+            assert_eq!(
+                reason_of(&check("EDITOR", value, &rooted())),
+                Some(Reason::Unreadable),
+                "{value:?}"
+            );
+        }
+        // A value that begins like a path is judged as one even for a name
+        // that does not say it holds a location: `~` alone is the home, and
+        // `/a://b` starts at the filesystem root however URL-like its middle.
+        for value in ["~", "/a://b"] {
+            assert_eq!(
+                reason_of(&check("UV_PYTHON", value, &rooted())),
+                Some(Reason::OutsideDeclaredRoots),
+                "{value:?}"
+            );
+        }
         for value in ["/x A=1", "/x\tA=1", "'/x' A=1"] {
             assert_eq!(
                 reason_of(&check("EDITOR", value, &rooted())),

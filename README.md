@@ -115,7 +115,10 @@ or a login banner without anyone parsing its output:
 - `plan` shows a real diff before anything is written. Nothing is written
   without it being shown first.
 - Every write is journalled and recorded, including the original bytes of
-  whatever it replaced, so `bx rm` restores exactly what was there.
+  whatever it replaced, so `bx rm` restores exactly those bytes and that file
+  mode. It does not restore a replaced file's extended attributes, POSIX ACL,
+  SELinux label, owner and group, or timestamps: replacing a file creates a new
+  one, and none of these are recorded.
 - An interrupted `apply` is detected on the next run and either completed or
   rolled back. No torn files, ever.
 - Two `bx` processes cannot corrupt each other.

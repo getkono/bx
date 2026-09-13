@@ -190,6 +190,20 @@ pub enum Error {
         /// Where the target renders.
         rendered: PathBuf,
     },
+    /// A session was asked to write a target it has already written.
+    ///
+    /// One write per target per session is what lets a report judge each
+    /// [`Intent`] against the destination on its own while a rollback undoes
+    /// them in reverse: with two, the report compares the destination against
+    /// the first write's states after the second has replaced them.
+    #[error(
+        "{} was already written in this bx session, and a session writes a target once",
+        .target.as_str()
+    )]
+    Repeated {
+        /// The target written twice.
+        target: Portable,
+    },
     /// The state directory failed.
     #[error(transparent)]
     State(#[from] crate::state::Error),
@@ -564,6 +578,7 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
 ///   temporary file is a `.bx-` file beside the destination, the only place
 ///   [`crate::fs::stage`] puts one; and each created directory is a parent of
 ///   the destination that is neither the home nor above it.
+/// * **One write per target.** See [`Error::Repeated`].
 fn refusal(records: &[Record]) -> Option<&'static str> {
     let (first, rest) = records.split_first()?;
     let Record::Begin(begin) = first else {
@@ -587,6 +602,7 @@ fn refusal(records: &[Record]) -> Option<&'static str> {
         tracing::warn!(error = %refused, "a journal record stores a path its session's home refuses");
         return Some("it records a path that is not portable against its session's home");
     }
+    let mut targets = std::collections::HashSet::new();
     for (at, record) in rest.iter().enumerate() {
         match record {
             Record::Begin(_) => return Some("it has a second session header"),
@@ -596,6 +612,9 @@ fn refusal(records: &[Record]) -> Option<&'static str> {
             Record::Intent(intent) => {
                 if let Some(why) = misplaced(intent, home) {
                     return Some(why);
+                }
+                if !targets.insert(&intent.target) {
+                    return Some("it records two writes to one target");
                 }
             }
             Record::Done(_) | Record::End(_) => {}
@@ -817,6 +836,8 @@ pub struct Session {
     written: usize,
     /// Set by the first write that fails. See [`Session::apply`].
     poisoned: bool,
+    /// Every target a request has been admitted for, so none is written twice.
+    touched: std::collections::HashSet<Portable>,
     crash: Crash,
     /// Called with the destination just before a write is published, so a test
     /// can make the publish fail the way a concurrent change to the destination
@@ -912,6 +933,7 @@ impl Session {
             home: home.to_path_buf(),
             written: 0,
             poisoned: false,
+            touched: std::collections::HashSet::new(),
             crash: Crash::from_env(),
             #[cfg(test)]
             before_publish: None,
@@ -979,7 +1001,8 @@ impl Session {
     /// # Errors
     ///
     /// [`Error::Misplaced`] when the request's destination is not where its
-    /// target renders, [`Error::Write`] when the destination cannot be written
+    /// target renders, [`Error::Repeated`] when this session already wrote the
+    /// target, [`Error::Write`] when the destination cannot be written
     /// or is not a file bx may replace, [`Error::State`] when the prior bytes
     /// cannot be stored or recorded, [`Error::Io`] when the journal cannot be
     /// appended to, and [`Error::Poisoned`] when an earlier write in this
@@ -1016,14 +1039,23 @@ impl Session {
     /// Refuse a request no journal bx believes could describe.
     ///
     /// [`load`] refuses a journal whose intent's destination is not where its
-    /// target renders, so a session never writes one.
-    fn admit(&self, target: &Portable, dest: &Path) -> Result<(), Error> {
+    /// target renders, or that writes one target twice, so a session never
+    /// writes either. A refusal poisons the session like any other failed
+    /// write — decision 7 of the pull request that introduced the rule — though
+    /// nothing has been touched: the rule does not depend on where in the
+    /// sequence an error came from.
+    fn admit(&mut self, target: &Portable, dest: &Path) -> Result<(), Error> {
         let rendered = target.render(&self.home);
         if dest != rendered {
             return Err(Error::Misplaced {
                 target: target.clone(),
                 dest: dest.to_path_buf(),
                 rendered,
+            });
+        }
+        if !self.touched.insert(target.clone()) {
+            return Err(Error::Repeated {
+                target: target.clone(),
             });
         }
         Ok(())
@@ -2422,6 +2454,48 @@ pub(crate) mod tests {
             load(&state.journal()).expect("load").intents().count(),
             0,
             "nothing was journalled",
+        );
+    }
+
+    #[test]
+    fn a_journal_that_writes_one_target_twice_is_unreadable() {
+        let home = guarded_home();
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let path = dir.path().join("journal.mpk");
+        let (target, dest) = target(home.path(), ".conf");
+        let intent = Intent {
+            target: target.clone(),
+            dest,
+            temp: None,
+            before: Prior::Absent,
+            after: Written::Absent,
+            created_dirs: Vec::new(),
+            mechanism: None,
+            ledger_written: None,
+        };
+        let once = vec![
+            Record::Begin(Begin {
+                kind: SessionKind::Apply,
+                home: home.path().to_path_buf(),
+                scope: Vec::new(),
+            }),
+            Record::Intent(intent.clone()),
+            Record::Done(Done {
+                target: target.clone(),
+            }),
+        ];
+        raw_journal(&path, &once);
+        assert_eq!(
+            load(&path).expect("load"),
+            Loaded::Unterminated(once.clone())
+        );
+
+        let mut twice = once;
+        twice.push(Record::Intent(intent));
+        raw_journal(&path, &twice);
+        assert_eq!(
+            load(&path).expect("load"),
+            Loaded::Unreadable { moved_to: None }
         );
     }
 

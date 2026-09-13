@@ -262,7 +262,12 @@ impl Outcome {
 /// writing command does it, under the lock.
 ///
 /// What it reports for each write is decided by the same function [`recover`]
-/// acts on, so a report and the recovery that follows cannot disagree.
+/// acts on, over the same journal, so a report and a recovery that find the
+/// same destinations and the same saved ledger reach the same verdict. They
+/// can still differ when something changes in between — this is a snapshot —
+/// and a journal that writes one target twice, over which a per-intent report
+/// and a reverse-order rollback would disagree, is refused by the loader and
+/// never written by a session.
 ///
 /// It takes **no lock**, deliberately, so `plan` stays usable while an `apply`
 /// runs — and that means a journal it finds may belong to a session that is in
@@ -516,8 +521,10 @@ enum Step {
 ///
 /// The single decision site. [`pending`] reports the [`Unfinished`] and
 /// [`resolve`] carries out the [`Step`], so what a read-only command says and
-/// what a writing one does cannot disagree — for a terminated journal as much as
-/// an unterminated one.
+/// what a writing one does are one verdict — for a terminated journal as much
+/// as an unterminated one. Each intent is judged on its own, which is sound
+/// because no journal recovery believes writes a target twice
+/// ([`journal::Error::Repeated`]).
 ///
 /// `home` is `Some` for a terminated journal, whose ledger entries are rebuilt
 /// with paths made portable against it, and `None` for an unterminated one,
@@ -2183,6 +2190,42 @@ mod tests {
                 "{case}: the user's empty directory was removed"
             );
         }
+    }
+
+    #[test]
+    fn a_target_written_twice_in_one_session_is_refused_so_report_and_recovery_agree() {
+        // Review round 3, item 4. The second write used to land: the report then
+        // judged the first intent against the second write's bytes and said
+        // blocked, while the reverse-order rollback undid both and succeeded.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "B0\n", Mode::DEFAULT_FILE);
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(write_to(home.path(), ".conf", "B1\n", Mode::DEFAULT_FILE))
+            .expect("the first write");
+        let refused = session
+            .apply(write_to(home.path(), ".conf", "B2\n", Mode::DEFAULT_FILE))
+            .expect_err("the second write to the same target");
+        assert!(
+            matches!(refused, journal::Error::Repeated { .. }),
+            "got {refused}"
+        );
+        assert_eq!(peek(&dest).expect("the first write").0, b"B1\n");
+        assert!(matches!(
+            session.finish(),
+            Err(journal::Error::Poisoned { .. })
+        ));
+
+        let report = pending(&state).expect("pending").expect("interrupted");
+        assert_eq!(report.unfinished.len(), 1);
+        assert!(report.blocked().next().is_none());
+        let outcome = recover(&state).expect("recover");
+        assert_eq!(outcome, Outcome::RolledBack { undone: 1 });
+        assert_eq!(peek(&dest).expect("rolled back").0, b"B0\n");
     }
 
     #[test]

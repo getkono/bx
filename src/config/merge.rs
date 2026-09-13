@@ -27,7 +27,16 @@
 //! substituted, normalised path. A path waiting on a value with no usable
 //! answer names no file yet; it is keyed by its spelling, and a toggle reaches
 //! it by that spelling. One layer naming one file twice, under any two
-//! spellings, is an error, as it is under one.
+//! spellings, is an error, as it is under one — when no account answer went
+//! into either spelling.
+//!
+//! When one did, the collision is the account's. `bx.toml` declaring
+//! `~/.config/{{profile}}/s` and `~/.config/default/s` names two files as
+//! written, and `profile = "default"` makes them one. Failing the load would
+//! name a committed file the account cannot edit and take every unrelated
+//! target with it, so instead both entries are kept and recorded as a
+//! [`Conflict`], and resolution blocks each one, naming both lines and the
+//! answer's. A later layer that names the file settles it.
 //!
 //! # Toggles: how an account opts out cheaply
 //!
@@ -363,43 +372,120 @@ impl TargetKey {
     }
 }
 
+/// A file one layer names more than once, only because of this account's answers.
+///
+/// Every pair of spellings is two files as written, and an answer made them
+/// one. That is the account's to change, so it is not a load error:
+/// [`super::resolve`] blocks every target for the file, naming each spelling's
+/// line and each answer's. A pair no answer went into is the repo's own defect
+/// and still fails the merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Conflict {
+    /// The file, as the substituted, normalised path the targets resolve to.
+    pub(crate) file: String,
+    /// The answers that made the spellings meet, in declaration order.
+    pub(crate) names: Vec<String>,
+    /// What to do, spelled by [`ResolvedValues::answers_hint`].
+    pub(crate) hint: String,
+}
+
+/// One statement a layer made about a target: a full entry, or a toggle.
+struct Said {
+    /// The file it names.
+    key: TargetKey,
+    /// Its path as written.
+    spelling: String,
+    /// Where it was written.
+    origin: Origin,
+}
+
+/// A [`Conflict`] while the layers are still being folded.
+struct Clash {
+    /// The layer whose statements collided.
+    layer: std::path::PathBuf,
+    /// The file they collided on.
+    key: TargetKey,
+    /// Every statement in that layer naming the file, in the order read.
+    statements: Vec<(String, Origin)>,
+    /// The answers that went into them.
+    names: Vec<String>,
+}
+
+impl Clash {
+    /// The conflict resolution reads, with its hint spelled.
+    fn into_conflict(self, values: &ResolvedValues) -> Conflict {
+        let (TargetKey::File(file) | TargetKey::AsWritten(file)) = self.key;
+        let spellings = self
+            .statements
+            .iter()
+            .map(|(spelling, origin)| format!("`{spelling}` at {origin}"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let names = values.in_declaration_order(self.names);
+        let problem = format!(
+            "`[[target]]` {spellings} name one file, `{file}`, and one layer may name a \
+             file once"
+        );
+        Conflict {
+            hint: values.answers_hint(&problem, &names),
+            file,
+            names,
+        }
+    }
+}
+
 impl Merged<Target, TargetKey> {
     /// Fold one layer's targets and target toggles in, keyed by the file each
     /// one names.
     ///
+    /// One layer naming one file twice would leave the outcome to an order
+    /// nothing in the file states. When an account answer made the two
+    /// spellings meet, the statements are recorded as a [`Clash`] rather than
+    /// applied: both entries are kept, and every entry for the file is held
+    /// enabled, so resolution blocks each one in its own position instead of
+    /// hiding it. A later layer that names the file settles it — a full entry
+    /// replaces every entry for it, and a toggle flips every one.
+    ///
     /// # Errors
     ///
     /// [`Error::BadValue`] when a toggle names a file no earlier layer declares,
-    /// or when this one layer names one file twice under two spellings — the
-    /// parser's own duplicate check compares spellings, and cannot see that
-    /// `~/{{acct}}/x` and `~/one/x` are one file.
-    fn absorb_layer(&mut self, layer: &Layer, values: &ResolvedValues) -> Result<(), Error> {
-        // The positions this layer has set. A later layer replacing an entry is
-        // the mechanism; one layer setting a file twice is a conflict whose
-        // outcome would depend on an order nothing in the file states.
-        let mut set_here: Vec<usize> = Vec::new();
+    /// or when this one layer names one file twice under two spellings with no
+    /// account answer in either — the parser's own duplicate check compares
+    /// spellings, and cannot see that `~/{{acct}}/x` and `~/one/x` are one file.
+    fn absorb_layer(
+        &mut self,
+        layer: &Layer,
+        values: &ResolvedValues,
+        clashes: &mut Vec<Clash>,
+    ) -> Result<(), Error> {
+        // What this layer has said so far, statement by statement.
+        let mut said: Vec<Said> = Vec::new();
+        // Entries beyond the first for a file a full entry here replaced. They
+        // are dropped when the layer is done, so no position moves mid-layer.
+        let mut settled: Vec<usize> = Vec::new();
 
         for target in &layer.config.targets {
-            let key = TargetKey::of(target.path.as_str(), values);
-            let index = match self.position(&key) {
+            let spelling = target.path.as_str();
+            let key = TargetKey::of(spelling, values);
+            match self.position(&key) {
+                None => self.entries.push((key.clone(), target.clone())),
                 Some(index) => {
-                    let earlier = &self.entries[index].1;
-                    refuse_twice(
-                        &set_here,
-                        index,
-                        earlier,
-                        target.path.as_str(),
-                        &target.origin,
-                    )?;
-                    self.entries[index] = (key, target.clone());
-                    index
+                    let statement = (spelling, &target.origin);
+                    if clash(&said, &key, statement, values, &layer.file, clashes)? {
+                        self.entries.push((key.clone(), target.clone()));
+                        self.set_enabled_for(&key, true);
+                    } else {
+                        self.entries[index] = (key.clone(), target.clone());
+                        settled.extend(self.positions(&key).into_iter().skip(1));
+                        clashes.retain(|clash| clash.key != key);
+                    }
                 }
-                None => {
-                    self.entries.push((key, target.clone()));
-                    self.entries.len() - 1
-                }
-            };
-            set_here.push(index);
+            }
+            said.push(Said {
+                key,
+                spelling: spelling.to_string(),
+                origin: target.origin.clone(),
+            });
         }
 
         for toggle in &layer.config.toggles {
@@ -408,19 +494,52 @@ impl Merged<Target, TargetKey> {
             match toggle.section {
                 Section::Target => {
                     let key = TargetKey::of(&toggle.key, values);
-                    let index = self
-                        .position(&key)
-                        .ok_or_else(|| unknown_toggle(toggle, &self.as_written_note()))?;
-                    let earlier = &self.entries[index].1;
-                    refuse_twice(&set_here, index, earlier, &toggle.key, &toggle.origin)?;
-                    self.entries[index].1.set_enabled(toggle.enabled);
-                    set_here.push(index);
+                    if self.position(&key).is_none() {
+                        return Err(unknown_toggle(toggle, &self.as_written_note()));
+                    }
+                    let statement = (toggle.key.as_str(), &toggle.origin);
+                    if clash(&said, &key, statement, values, &layer.file, clashes)? {
+                        self.set_enabled_for(&key, true);
+                    } else {
+                        self.set_enabled_for(&key, toggle.enabled);
+                    }
+                    said.push(Said {
+                        key,
+                        spelling: toggle.key.clone(),
+                        origin: toggle.origin.clone(),
+                    });
                 }
                 Section::Value => {}
             }
         }
 
+        settled.sort_unstable();
+        settled.dedup();
+        for index in settled.into_iter().rev() {
+            self.entries.remove(index);
+        }
+
         Ok(())
+    }
+
+    /// Every position holding `key`, in order. More than one only while a
+    /// [`Clash`] keeps two entries for one file.
+    fn positions(&self, key: &TargetKey) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, (held, _))| held == key)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Set the flag on every entry for `key`.
+    fn set_enabled_for(&mut self, key: &TargetKey, enabled: bool) {
+        for (held, entry) in &mut self.entries {
+            if held == key {
+                entry.set_enabled(enabled);
+            }
+        }
     }
 
     /// Which spelling reaches a target whose file is not known yet, if any is.
@@ -442,25 +561,71 @@ impl Merged<Target, TargetKey> {
     }
 }
 
-/// Refuse a second entry for one file from one layer.
-fn refuse_twice(
-    set_here: &[usize],
-    index: usize,
-    earlier: &Target,
-    spelling: &str,
-    origin: &Origin,
-) -> Result<(), Error> {
-    if !set_here.contains(&index) {
-        return Ok(());
+/// Whether a statement names a file its own layer has already named.
+///
+/// `Ok(false)` when nothing said earlier in this layer names the file, which
+/// leaves the statement to replace or toggle as usual. When something does,
+/// every such pair needs an account answer in at least one of its two
+/// spellings: a pair with none collides for every account, which is the repo's
+/// defect and fails the merge. Otherwise the collision is the account's, it is
+/// recorded against this layer, replacing what was recorded for the file so far
+/// with every statement this layer has made about it, and the answer is
+/// `Ok(true)`.
+fn clash(
+    said: &[Said],
+    key: &TargetKey,
+    (spelling, origin): (&str, &Origin),
+    values: &ResolvedValues,
+    layer: &Path,
+    clashes: &mut Vec<Clash>,
+) -> Result<bool, Error> {
+    let earlier: Vec<&Said> = said
+        .iter()
+        .filter(|statement| statement.key == *key)
+        .collect();
+    if earlier.is_empty() {
+        return Ok(false);
     }
-    Err(Error::BadValue {
+
+    let mine = values.account_inputs(spelling);
+    let mut names = mine.clone();
+    for statement in &earlier {
+        let theirs = values.account_inputs(&statement.spelling);
+        if mine.is_empty() && theirs.is_empty() {
+            return Err(refuse_twice(statement, spelling, origin));
+        }
+        for name in theirs {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+
+    let mut statements: Vec<(String, Origin)> = earlier
+        .iter()
+        .map(|statement| (statement.spelling.clone(), statement.origin.clone()))
+        .collect();
+    statements.push((spelling.to_string(), origin.clone()));
+    clashes.retain(|clash| !(clash.key == *key && clash.layer == layer));
+    clashes.push(Clash {
+        layer: layer.to_path_buf(),
+        key: key.clone(),
+        statements,
+        names,
+    });
+    Ok(true)
+}
+
+/// A second statement for one file from one layer, with no answer to blame.
+fn refuse_twice(earlier: &Said, spelling: &str, origin: &Origin) -> Error {
+    Error::BadValue {
         origin: origin.clone(),
         message: format!(
             "`[[target]]` `{spelling}` names the same file as `{}` at {} in this same \
              layer; one layer may name a file once, and a later layer replaces it",
-            earlier.path, earlier.origin
+            earlier.spelling, earlier.origin
         ),
-    })
+    }
 }
 
 /// Fold the ordered layer set into one configuration.
@@ -474,7 +639,9 @@ fn refuse_twice(
 ///
 /// [`Error::BadValue`] when a committed layer carries a `[values]` table, when a
 /// toggle names a key no earlier layer introduced, when one layer names one
-/// file twice, or for any defect [`ResolvedValues::resolve`] reports.
+/// file twice with no account answer in either spelling, or for any defect
+/// [`ResolvedValues::resolve`] reports. The same collision with an answer in it
+/// is not an error; it is carried to [`super::resolve`] as a [`Conflict`].
 pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut values: Merged<ValueDecl> = Merged::default();
     let mut assignments: Vec<ValueAssignment> = Vec::new();
@@ -514,8 +681,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let resolved = ResolvedValues::resolve(values.clone(), &assignments, home)?;
 
     let mut targets: Merged<Target, TargetKey> = Merged::default();
+    let mut clashes: Vec<Clash> = Vec::new();
     for layer in layers {
-        targets.absorb_layer(layer, &resolved)?;
+        targets.absorb_layer(layer, &resolved, &mut clashes)?;
     }
 
     Ok(Config {
@@ -524,6 +692,10 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         value_assignments: assignments,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
+        conflicts: clashes
+            .into_iter()
+            .map(|clash| clash.into_conflict(&resolved))
+            .collect(),
     })
 }
 

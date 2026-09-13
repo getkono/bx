@@ -9,13 +9,16 @@
 //! 2. a temporary file **in the destination directory**, so the later `rename`
 //!    is same-filesystem and therefore atomic. A `/tmp` on another mount would
 //!    turn it into a copy-then-delete with a visible half-written window.
-//! 3. the mode set with `fchmod` **before any content is written**.
-//! 4. the content written, then `fsync`ed.
+//! 3. the mode set with `fchmod` **before any content is written** — all of it
+//!    but a declared setuid or setgid bit, which a write would clear.
+//! 4. the content written, the set-id bits added if declared, then `fsync`ed.
 //! 5. the prior state recorded — [`Filled::new_entry`] assembles it and
 //!    [`crate::state::Ledger::record`] makes it durable — **before** the
 //!    rename, so a crash after the rename still has a recoverable prior state.
-//! 6. `rename`.
-//! 7. an `fsync` of the **destination directory**, so the rename itself
+//! 6. the destination `lstat`ed again and compared with what step 1 saw, and
+//!    the write refused if it changed.
+//! 7. `rename`.
+//! 8. an `fsync` of the **destination directory**, so the rename itself
 //!    survives a power loss. This is the step implementations omit, and without
 //!    it the directory entry can be lost even though the file's data was
 //!    synced.
@@ -34,6 +37,15 @@
 //! can only narrow that, so the temporary file is never *wider* than its final
 //! mode at any instant either.
 //!
+//! The one exception is a declared setuid or setgid bit. The kernel clears
+//! both on a write by a process without `CAP_FSETID`, so a set-id bit set
+//! before the content would be gone after it: the second `plan` would read
+//! `Modify`, and the ledger would record a mode that is not on disk. [`stage`]
+//! sets every other bit, and [`Staged::fill`] adds the set-id bits after the
+//! content and before the `fsync`. The empty file is therefore *narrower* than
+//! its declared mode, never wider, and the content is at exactly that mode
+//! before it is durable or visible at the destination.
+//!
 //! # Why the write is staged rather than one call
 //!
 //! [`stage`] → [`Staged::fill`] → [`Filled::publish`] exposes the boundary
@@ -45,6 +57,45 @@
 //! and it cannot let a test observe the mode of the temporary file while it is
 //! still empty. [`Staged::commit`] is the shorthand for callers with nothing to
 //! interpose.
+//!
+//! # What is checked before the rename, and what is not
+//!
+//! Staging widens the gap between looking at the destination and replacing
+//! it: the content is written and synced, the ledger records the prior, and a
+//! journal appends its intent, all in between. An editor that saves in that gap
+//! would lose the save to the rename, and the prior bx recorded would predate
+//! it, so `rm` could not bring it back either. [`observe`] therefore records a
+//! [`Stamp`] — device, inode, size, and modification and status-change times to
+//! the nanosecond — and [`Filled::publish`] `lstat`s the destination again as
+//! the last step before the rename, refusing with [`Error::Changed`] unless it
+//! is the same file, unchanged, or still absent.
+//!
+//! That narrows the gap to the distance between one `lstat` and one
+//! `rename(2)`; it does not close it. A change landing in those microseconds is
+//! still replaced. Closing it needs `renameat2(RENAME_EXCHANGE)`, a check of
+//! what came out, and an exchange back on a mismatch — which would publish bx's
+//! content for an instant even when refusing, and is not done. A timestamp
+//! that does not move is also not seen: on a filesystem with coarse timestamps,
+//! an in-place edit of the same length within one clock tick of the
+//! observation leaves the stamp identical. Kernels with multigrain timestamps
+//! give a fine-grained time to a change made just after the file's times were
+//! queried, which is exactly what `observe` did.
+//!
+//! # What "restores exactly" covers
+//!
+//! The prior state is the displaced file's **bytes and its twelve mode bits**,
+//! and that is what `rm` restores. Replacing a file creates a new inode, and
+//! nothing else of the old one is carried over or recorded: not its extended
+//! attributes (`user.*`), not its POSIX ACL (`system.posix_acl_access`), and
+//! not its SELinux label, owner and group, or timestamps. A file bx replaced,
+//! and a file `rm` restored, has none of them.
+//!
+//! Deliberately. Copying an ACL onto the replacement would grant access the
+//! declared mode does not — a named-user entry survives a `0640` — and a
+//! declared mode is authoritative. Recording any of it needs a field in the
+//! ledger's prior, which belongs to the state directory rather than to the
+//! writer. `a_replaced_file_keeps_neither_its_xattrs_nor_its_acl` pins the
+//! behaviour, so changing it is a decision rather than an accident.
 //!
 //! # What the tests here do and do not establish
 //!
@@ -149,6 +200,24 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// What is at the path is no longer what bx observed there, so acting on
+    /// the observation would replace or change something bx never looked at.
+    ///
+    /// Raised by [`Filled::publish`] when the destination changed between
+    /// [`stage`] and the rename — an editor saving, a symlink swapped in, a
+    /// file appearing where there was none — and by [`ensure_dir`] when a
+    /// directory target is no longer what `plan` saw. Nothing is replaced: the
+    /// temporary file is removed and the path keeps what is there now.
+    #[error(
+        "{} changed after bx looked at it ({detail}); nothing was replaced. Run plan again",
+        .path.display()
+    )]
+    Changed {
+        /// The path that changed.
+        path: PathBuf,
+        /// What bx saw, and what is there now.
+        detail: String,
+    },
     /// A path the ledger would record cannot be made portable against the
     /// home: it is not valid UTF-8, or the home is not absolute.
     ///
@@ -176,6 +245,7 @@ impl Error {
             | Self::UnusableParent { path, .. }
             | Self::Read { path, .. }
             | Self::Write { path, .. }
+            | Self::Changed { path, .. }
             | Self::NotPortable { path, .. } => path,
         }
     }
@@ -198,6 +268,14 @@ pub struct Observed {
     pub bytes: Option<Vec<u8>>,
     /// The destination's immediate parent directory.
     pub parent: Option<Parent>,
+    /// Which file this was and when it last changed, or `None` when nothing is
+    /// there.
+    ///
+    /// What [`Filled::publish`] checks the destination against immediately
+    /// before the rename, so a file that changed after it was observed is not
+    /// replaced, and a prior state recorded from this observation is never
+    /// older than the file it displaces.
+    pub stamp: Option<Stamp>,
 }
 
 impl Observed {
@@ -228,6 +306,40 @@ impl Observed {
     #[must_use]
     pub fn digest(&self) -> Option<ContentHash> {
         self.bytes.as_deref().map(ContentHash::of)
+    }
+}
+
+/// Which file a path named, and when that file last changed, as one `lstat`
+/// reported it.
+///
+/// Device and inode say *which* file: an editor that saves by writing a new
+/// file and renaming it over the old one, or a symlink swapped in, changes
+/// them. Size, and the modification and status-change times to the
+/// nanosecond, say whether that file changed *in place*: a write moves `mtime`,
+/// and a `chmod`, a `chown`, a new hard link or an extended attribute moves
+/// `ctime`. Compared whole and never interpreted, so there is no field a
+/// caller could compare on its own and get a different answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    /// The stamp of the file `meta` describes.
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
     }
 }
 
@@ -325,6 +437,7 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
             mode: None,
             bytes: None,
             parent: Some(observed_parent),
+            stamp: None,
         });
     }
     let parent = Some(observed_parent);
@@ -336,6 +449,7 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
             mode: None,
             bytes: None,
             parent,
+            stamp: None,
         });
     };
 
@@ -355,6 +469,10 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
         mode: Some(mode_of(&meta)),
         bytes,
         parent,
+        // From the `lstat` taken before the read, so a change that lands
+        // between the two makes the stamp older than the bytes, and the check
+        // before the rename refuses rather than trusting either.
+        stamp: Some(Stamp::of(&meta)),
     })
 }
 
@@ -544,6 +662,9 @@ impl Pending {
 /// Begin a write: a temporary file in the destination directory, at `mode`,
 /// with no content.
 ///
+/// A declared setuid or setgid bit is the exception: it is left off until
+/// [`Staged::fill`] has written the content, because the write would clear it.
+///
 /// Missing parent directories are created at [`Mode::DEFAULT_DIR`] — a target
 /// deep under `~/.config` must not need a directory declaration for every
 /// component. An *existing* directory is never chmod'd: it is the user's. When
@@ -598,9 +719,10 @@ pub fn stage(dest: &Path, mode: Mode) -> Result<Staged, Error> {
         })?;
 
     // Before any content. `tempfile` creates at 0600 and `fchmod` is not masked
-    // by the umask, so the file is at its final mode while it is still empty and
-    // was never wider than that at any instant.
-    fchmod(temp.as_file(), mode, temp.path())?;
+    // by the umask, so the file is at its final permission bits while it is
+    // still empty and was never wider than them at any instant. The set-id bits
+    // wait for `fill`: the write clears them — see `SET_ID`.
+    fchmod(temp.as_file(), without_set_id(mode), temp.path())?;
 
     Ok(Staged(Pending {
         temp,
@@ -624,7 +746,10 @@ impl Staged {
         self.0.temp_path()
     }
 
-    /// The mode the temporary file already has.
+    /// The mode this write declares.
+    ///
+    /// The temporary file already has it, except for a setuid or setgid bit,
+    /// which [`Staged::fill`] adds after the content.
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.0.mode
@@ -649,6 +774,13 @@ impl Staged {
             source,
         };
         self.0.temp.write_all(bytes).map_err(&fail)?;
+        // After the content and before the sync, so the sync covers it. A
+        // set-id bit set earlier would already be gone: the kernel clears
+        // S_ISUID, and S_ISGID alongside group execute, on a write by a process
+        // without CAP_FSETID.
+        if self.0.mode.bits() & SET_ID != 0 {
+            fchmod(self.0.temp.as_file(), self.0.mode, &temp_path)?;
+        }
         durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(&fail)?;
         let written = ContentHash::of(bytes);
         Ok(Filled {
@@ -775,16 +907,31 @@ impl Filled {
     /// that failure happens while the destination is still untouched, which is
     /// what [`write_atomically`]'s contract promises for an `Err`.
     ///
+    /// Immediately before the rename the destination is `lstat`ed again and
+    /// compared with the [`Stamp`] [`stage`] observed. Anything else there — an
+    /// edit saved in place or by rename, a symlink swapped in, a file where
+    /// there was none, a file removed — is refused rather than replaced, so a
+    /// write never destroys bytes bx did not observe and the recorded prior is
+    /// never older than what it displaces. The window between that `lstat` and
+    /// the `rename(2)` remains; see the module documentation.
+    ///
     /// # Errors
     ///
-    /// [`Error::Write`] wrapping the failing `open` of the directory, `rename`,
-    /// or `fsync`. The temporary file is removed either way. Only a failing
-    /// `fsync` of the directory is returned after the destination was replaced.
+    /// [`Error::Changed`] when the destination is no longer what [`stage`]
+    /// observed; nothing is replaced. [`Error::Write`] wrapping the failing
+    /// `open` of the directory, `rename`, or `fsync`. The temporary file is
+    /// removed either way. Only a failing `fsync` of the directory is returned
+    /// after the destination was replaced.
     pub fn publish(self) -> Result<(), Error> {
         let Self {
-            pending: Pending {
-                temp, dest, mode, ..
-            },
+            pending:
+                Pending {
+                    temp,
+                    dest,
+                    mode,
+                    prior,
+                    ..
+                },
             ..
         } = self;
 
@@ -794,6 +941,9 @@ impl Filled {
             source,
         };
         let handle = durable::Dir::open(dir).map_err(dir_fail)?;
+        // The last thing before the rename, so the window it leaves open is as
+        // narrow as it can be. Refusing drops `temp`, which removes it.
+        verify_unchanged(&prior)?;
         durable::rename(temp, &dest).map_err(|e| Error::Write {
             path: dest.clone(),
             source: e.error,
@@ -814,7 +964,8 @@ impl Filled {
 /// Replace `path` with `bytes`, atomically, at `mode`.
 ///
 /// After this returns, `path` holds either all of `bytes` or — if the write
-/// failed — exactly what it held before. No temporary file is left behind in
+/// failed — exactly what it held before, or, for [`Error::Changed`], whatever
+/// changed it after bx looked. No temporary file is left behind in
 /// either case, and the rename is durable: a power loss after the call cannot
 /// resurrect the previous content.
 ///
@@ -918,30 +1069,142 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// Make `path` the directory at `mode` that [`compare_dir`] announced — the
 /// `apply` half of a declared directory target.
 ///
-/// It observes, runs [`compare_dir`], and performs **exactly** the action that
-/// comparison returns, which it also returns: nothing for `Unchanged`; `mkdir`
-/// for `Create`, with `path` at `mode` and missing ancestors at
+/// `planned` is the observation `plan` compared — the [`Observed`] it handed to
+/// [`compare_dir`]. `ensure_dir` observes the path again and refuses with
+/// [`Error::Changed`] unless [`compare_dir`] reaches the same verdict from both:
+/// the same action, the same mode found for a `Modify`, the same cause for a
+/// `Conflict`. A directory chmod'd after `plan` printed `Unchanged`, a directory
+/// that appeared after `plan` printed `Create`, and a file that took the path
+/// are refused rather than acted on, so `apply` never does work `plan` did not
+/// announce. The refusal also covers a path taken between that second
+/// observation and the `mkdir`: a `Create` succeeds only when this call is the
+/// one that created the directory.
+///
+/// On agreement it performs **exactly** that action: nothing for `Unchanged`;
+/// `mkdir` for `Create`, with `path` at `mode` and missing ancestors at
 /// [`Mode::DEFAULT_DIR`]; [`set_mode`] for `Modify`; and nothing at all for
 /// `Conflict`, which is reported rather than raised because it is a verdict
-/// `plan` already printed. It never does work the comparison did not name, so
-/// `plan` must use [`observe`] + [`compare_dir`], not this.
+/// `plan` already printed. `plan` must use [`observe`] + [`compare_dir`], not
+/// this.
+///
+/// It returns what a ledger needs to reverse it: the action, the observation
+/// it acted on — so the mode a `Modify` overwrote is `prior.mode` — and the
+/// directories it created, deepest first.
+///
+/// Two windows remain. A `chmod` landing between the second observation and
+/// the [`set_mode`] is overwritten, as for any mode change (decision 6). And
+/// when a `Create` is refused because the path was taken after the second
+/// observation, an ancestor this call had already created is left in place,
+/// empty, exactly as [`stage`] leaves one for an abandoned write.
 ///
 /// # Errors
 ///
-/// [`Error::Read`] when the path or its parent cannot be stat'd, and
+/// [`Error::Changed`] when the path is no longer what `plan` saw;
+/// [`Error::Read`] when the path or its parent cannot be stat'd; and
 /// [`Error::Write`] when a directory cannot be created or chmod'd.
-pub fn ensure_dir(path: &Path, mode: Mode) -> Result<Action, Error> {
-    let observed = observe(path)?;
-    let outcome = compare_dir(&observed, mode);
+pub fn ensure_dir(path: &Path, mode: Mode, planned: &Observed) -> Result<EnsuredDir, Error> {
+    let fresh = observe(path)?;
+    act_on_dir(path, mode, planned, fresh)
+}
+
+/// What [`ensure_dir`] did, and what a ledger needs to reverse it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsuredDir {
+    /// The action performed — the one `plan` announced.
+    pub action: Action,
+    /// What was at the path immediately before, which is what `plan` saw. For
+    /// a `Modify` its `mode` is the mode that was overwritten.
+    pub prior: Observed,
+    /// The directories this call created, deepest first — the path itself
+    /// and any ancestor it had to invent — which is the order a reversal
+    /// removes them in. Empty unless `action` is `Create`.
+    pub created_dirs: Vec<PathBuf>,
+}
+
+/// The half of [`ensure_dir`] after its own observation, separate so a test can
+/// change the disk between the two.
+fn act_on_dir(
+    path: &Path,
+    mode: Mode,
+    planned: &Observed,
+    fresh: Observed,
+) -> Result<EnsuredDir, Error> {
+    let announced = compare_dir(planned, mode);
+    let outcome = compare_dir(&fresh, mode);
+    // Equal outcomes are equal verdicts: the action, the mode found for a
+    // `Modify`, and the cause of a `Conflict` are all part of one.
+    if outcome != announced {
+        return Err(Error::Changed {
+            path: path.to_path_buf(),
+            detail: format!("plan saw {}, and it is now {}", seen(planned), seen(&fresh)),
+        });
+    }
+
+    let mut created_dirs = Vec::new();
     match outcome.action {
         Action::Create => {
-            create_missing_dirs(path, mode)?;
+            created_dirs = create_missing_dirs(path, mode)?;
+            // The path itself is the deepest entry when this call made it. When
+            // it is not there, something took the path between the observation
+            // and the `mkdir` — somebody else's directory, or not a directory at
+            // all — and neither is the create `plan` announced.
+            if created_dirs.first().map(PathBuf::as_path) != Some(path) {
+                let now = optional_metadata(path)?
+                    .map_or(Kind::Absent, |meta| Kind::from(meta.file_type()));
+                return Err(Error::Changed {
+                    path: path.to_path_buf(),
+                    detail: format!(
+                        "plan saw nothing, and {now} took the path before bx could create it"
+                    ),
+                });
+            }
             tracing::debug!(path = %path.display(), %mode, "created a directory");
         }
         Action::Modify => set_mode(path, mode)?,
         _ => {}
     }
-    Ok(outcome.action)
+    Ok(EnsuredDir {
+        action: outcome.action,
+        prior: fresh,
+        created_dirs,
+    })
+}
+
+/// What an observation of a directory target found, in the words a refusal
+/// uses.
+fn seen(observed: &Observed) -> String {
+    if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
+        return format!("a parent that does not resolve ({reason})");
+    }
+    match (observed.kind, observed.mode) {
+        (Kind::Dir, Some(mode)) => format!("a directory at {mode}"),
+        (kind, _) => kind.to_string(),
+    }
+}
+
+/// Refuse unless `prior.path` is still what [`observe`] found there: the same
+/// file with the same [`Stamp`], or still nothing at all.
+///
+/// # Errors
+///
+/// [`Error::Changed`] naming what moved, and [`Error::Read`] when the path can
+/// no longer be stat'd.
+fn verify_unchanged(prior: &Observed) -> Result<(), Error> {
+    let now = optional_metadata(&prior.path)?
+        .map(|meta| (Kind::from(meta.file_type()), Stamp::of(&meta)));
+    let then = prior.stamp.map(|stamp| (prior.kind, stamp));
+    if now == then {
+        return Ok(());
+    }
+    let detail = match (then, now) {
+        (_, None) => "it has been removed",
+        (None, Some(_)) => "nothing was there, and something is now",
+        (Some(_), Some(_)) => "it has been modified or replaced",
+    };
+    Err(Error::Changed {
+        path: prior.path.clone(),
+        detail: detail.to_string(),
+    })
 }
 
 /// The directory `path` will be written into.
@@ -1173,6 +1436,22 @@ fn create_dir_at(path: &Path, mode: Mode) -> Result<bool, Error> {
     // `mkdir`'s mode argument is masked by the umask; `chmod` is not.
     set_mode(path, mode)?;
     Ok(true)
+}
+
+/// The setuid and setgid bits.
+///
+/// The only mode bits a write can take away. The kernel clears S_ISUID, and
+/// S_ISGID when group execute is set, on the first write to a file by a process
+/// without `CAP_FSETID`, so a set-id mode applied before the content is gone
+/// once the content lands. [`stage`] leaves them off the empty file and
+/// [`Staged::fill`] adds them after the content and before the `fsync`, which
+/// keeps both promises: never wider than the declared mode while empty, and
+/// exactly the declared mode by the time anything can see the content.
+const SET_ID: u32 = 0o6000;
+
+/// `mode` without its setuid and setgid bits — see [`SET_ID`].
+const fn without_set_id(mode: Mode) -> Mode {
+    Mode::from_bits(mode.bits() & !SET_ID)
 }
 
 /// `fchmod`, so the mode is the declared one and not the declared one masked by
@@ -1580,6 +1859,40 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_setuid_or_setgid_bit_survives_the_write_that_fills_the_file() {
+        // The kernel clears S_ISUID, and S_ISGID alongside group execute, on the
+        // first write to a file by a process without CAP_FSETID. A mode set
+        // before the content therefore loses those bits the moment the content
+        // lands: the second plan reads `Modify`, and the ledger records a mode
+        // that is not on disk. Under root the bits survive either way, so this
+        // cannot fail there — which is not a reason to skip it.
+        for bits in [0o4755, 0o2755, 0o6755] {
+            let home = guarded_home();
+            let dest = home.child("tool");
+            let mode = Mode::from_bits(bits);
+
+            let staged = stage(&dest, mode).expect("stage");
+            assert_eq!(
+                mode_of_path(staged.temp_path()).bits() & !mode.bits(),
+                0,
+                "{mode}: the empty temporary file is never wider than the declared mode",
+            );
+            let filled = staged.fill(b"#!/bin/sh\nexit 0\n").expect("fill");
+            assert_eq!(mode_of_path(filled.temp_path()), mode, "{mode}: after fill");
+            assert_eq!(filled.mode(), mode);
+            filled.publish().expect("publish");
+
+            assert_eq!(mode_of_path(&dest), mode, "{mode}: on disk");
+            let observed = observe(&dest).expect("observe");
+            assert_eq!(
+                compare(&observed, &desired(b"#!/bin/sh\nexit 0\n", mode)).action,
+                Action::Unchanged,
+                "{mode}: the second plan is empty",
+            );
+        }
+    }
+
+    #[test]
     fn a_declared_mode_beats_the_process_umask() {
         let _serialised = UMASK
             .lock()
@@ -1816,14 +2129,214 @@ mod tests {
         let home = guarded_home();
         let dest = home.child("f");
         let staged = stage(&dest, Mode::DEFAULT_FILE).expect("stage");
-        // A directory cannot be replaced by a rename from a regular file, so
-        // `persist` fails after the temporary file has been written in full.
+        // Something occupies the destination after it was observed, so the
+        // publish fails after the temporary file has been written in full —
+        // refused by the check before the rename, which is the one a rename
+        // over a directory would also have failed.
         std::fs::create_dir(&dest).expect("occupy");
 
         let err = staged.commit(b"x").expect_err("must fail");
         assert_eq!(err.path(), dest);
-        assert!(matches!(err, Error::Write { .. }), "{err:?}");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(names_in(home.path()), vec![OsString::from("f")]);
+    }
+
+    #[test]
+    fn a_destination_edited_between_fill_and_publish_is_refused_and_keeps_the_edit() {
+        // The window a journal widens: between the observation `stage` takes
+        // and the rename, an editor saves. Replacing the file then destroys the
+        // save, and the prior bx recorded predates it, so `rm` cannot bring it
+        // back either — Invariant 1 and Invariant 4 at once.
+        let in_place: fn(&Path) = |dest| {
+            std::fs::write(dest, b"the user's edit\n").expect("the user saves in place");
+        };
+        let by_rename: fn(&Path) = |dest| {
+            // Same length as what was there, so only which file it is changed.
+            let saved = dest.with_file_name("editor-swap");
+            std::fs::write(&saved, b"v2\n").expect("the editor writes its copy");
+            std::fs::rename(&saved, dest).expect("and renames it over the original");
+        };
+
+        for (how, save) in [("in place", in_place), ("by rename", by_rename)] {
+            let home = guarded_home();
+            let dest = home.child(".conf");
+            seed(&dest, b"v1\n", Mode::DEFAULT_FILE);
+
+            let filled = stage(&dest, Mode::DEFAULT_FILE)
+                .expect("stage")
+                .fill(b"bx\n")
+                .expect("fill");
+            let temp = filled.temp_path().to_path_buf();
+            save(&dest);
+            let saved = std::fs::read(&dest).expect("read the save");
+
+            let err = filled
+                .publish()
+                .expect_err("a destination that changed after it was observed is not replaced");
+            assert!(matches!(err, Error::Changed { .. }), "{how}: {err:?}");
+            assert_eq!(err.path(), dest, "{how}");
+            assert_eq!(
+                std::fs::read(&dest).expect("read"),
+                saved,
+                "{how}: the user's save survives",
+            );
+            assert!(!temp.exists(), "{how}: the temporary file is removed");
+            assert_eq!(
+                names_in(home.path()),
+                vec![OsString::from(".conf")],
+                "{how}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlink_swapped_in_between_fill_and_publish_is_refused_and_survives() {
+        let home = guarded_home();
+        let dest = home.child(".conf");
+        let other = home.child("elsewhere");
+        seed(&dest, b"v1\n", Mode::DEFAULT_FILE);
+        seed(&other, b"the link's target\n", Mode::DEFAULT_FILE);
+
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"bx\n")
+            .expect("fill");
+        let temp = filled.temp_path().to_path_buf();
+        // Decision 2 refuses a link at the final component; observing a file
+        // there first must not turn into replacing a link that arrived later.
+        std::fs::remove_file(&dest).expect("rm");
+        std::os::unix::fs::symlink("elsewhere", &dest).expect("symlink");
+
+        let err = filled
+            .publish()
+            .expect_err("the link is not bx's to replace");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert!(
+            std::fs::symlink_metadata(&dest)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the link is intact",
+        );
+        assert_eq!(
+            std::fs::read_link(&dest).expect("readlink"),
+            Path::new("elsewhere")
+        );
+        assert_eq!(std::fs::read(&other).expect("read"), b"the link's target\n");
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn a_file_that_appears_where_there_was_none_is_not_replaced() {
+        let home = guarded_home();
+        let dest = home.child(".conf");
+
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"bx\n")
+            .expect("fill");
+        assert_eq!(filled.prior().stamp, None, "nothing was there to stamp");
+        std::fs::write(&dest, b"another tool's\n").expect("another tool creates it");
+
+        let err = filled
+            .publish()
+            .expect_err("bx announced a create, and there is now a file to replace");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"another tool's\n");
+        assert_eq!(names_in(home.path()), vec![OsString::from(".conf")]);
+    }
+
+    /// A POSIX ACL in the kernel's `system.posix_acl_access` encoding: version
+    /// 2, then `(tag, perm, id)` per entry, little-endian, sorted by tag.
+    fn posix_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut encoded = 2_u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            encoded.extend(tag.to_le_bytes());
+            encoded.extend(perm.to_le_bytes());
+            encoded.extend(id.to_le_bytes());
+        }
+        encoded
+    }
+
+    #[test]
+    fn a_replaced_file_keeps_neither_its_xattrs_nor_its_acl() {
+        // A documented exclusion from "restores exactly", pinned so that
+        // changing it is a decision: see the module documentation.
+        use rustix::fs::{XattrFlags, getxattr, setxattr};
+
+        const USER_ATTR: &str = "user.bx-test";
+        const ACL_ACCESS: &str = "system.posix_acl_access";
+        const UNDEFINED_ID: u32 = u32::MAX;
+
+        let home = guarded_home();
+        let dest = home.child(".conf");
+        seed(&dest, b"v1\n", Mode::DEFAULT_FILE);
+
+        // What this filesystem can hold decides what there is to pin. An ACL
+        // naming uid 65534 is refused with EINVAL where that uid is unmapped.
+        let has_user_attr =
+            match setxattr(dest.as_path(), USER_ATTR, b"theirs", XattrFlags::empty()) {
+                Ok(()) => true,
+                Err(e) if e == Errno::OPNOTSUPP => false,
+                Err(e) => panic!("setxattr {USER_ATTR}: {e}"),
+            };
+        let acl = posix_acl(&[
+            (0x01, 6, UNDEFINED_ID), // user::rw-
+            (0x02, 4, 65534),        // user:nobody:r--
+            (0x04, 4, UNDEFINED_ID), // group::r--
+            (0x10, 4, UNDEFINED_ID), // mask::r--
+            (0x20, 4, UNDEFINED_ID), // other::r--
+        ]);
+        let has_acl = match setxattr(dest.as_path(), ACL_ACCESS, &acl, XattrFlags::empty()) {
+            Ok(()) => true,
+            Err(e) if e == Errno::OPNOTSUPP || e == Errno::INVAL => false,
+            Err(e) => panic!("setxattr {ACL_ACCESS}: {e}"),
+        };
+        let attrs: Vec<&str> = [(USER_ATTR, has_user_attr), (ACL_ACCESS, has_acl)]
+            .into_iter()
+            .filter_map(|(name, set)| set.then_some(name))
+            .collect();
+        if attrs.is_empty() {
+            // Neither can exist here, so neither can be lost.
+            return;
+        }
+
+        let attr = |name: &str| -> Option<Vec<u8>> {
+            let mut buf = [0_u8; 256];
+            match getxattr(dest.as_path(), name, &mut buf) {
+                Ok(len) => Some(buf[..len].to_vec()),
+                Err(e) if e == Errno::NODATA => None,
+                Err(e) => panic!("getxattr {name}: {e}"),
+            }
+        };
+        for name in &attrs {
+            assert!(attr(name).is_some(), "{name} is on the user's file");
+        }
+
+        let staged = stage(&dest, Mode::DEFAULT_FILE).expect("stage");
+        let prior = staged.prior().clone();
+        staged.commit(b"bx\n").expect("commit");
+        for name in &attrs {
+            assert_eq!(
+                attr(name),
+                None,
+                "{name} is not carried onto the replacement"
+            );
+        }
+
+        // The prior is bytes and mode, so restoring from it brings the bytes
+        // and the mode back, and nothing else.
+        write_atomically(
+            &dest,
+            prior.bytes.as_deref().expect("prior bytes"),
+            prior.mode.expect("prior mode"),
+        )
+        .expect("restore");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"v1\n");
+        assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
+        for name in &attrs {
+            assert_eq!(attr(name), None, "{name} is not restored either");
+        }
     }
 
     #[test]
@@ -2075,20 +2588,122 @@ mod tests {
         compare_dir(&observe(&home.child(rel)).expect("observe"), mode)
     }
 
+    /// `plan` for a directory target, then `apply` on what that plan saw, with
+    /// nothing changing in between.
+    fn apply_dir(path: &Path, mode: Mode) -> Result<EnsuredDir, Error> {
+        let planned = observe(path).expect("plan observes");
+        ensure_dir(path, mode, &planned)
+    }
+
+    #[test]
+    fn ensure_dir_refuses_a_mode_changed_after_plan_saw_nothing_to_do() {
+        let home = guarded_home();
+        let dir = home.child(".ssh");
+        std::fs::create_dir(&dir).expect("mkdir");
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("chmod");
+        let planned = observe(&dir).expect("plan observes");
+        assert_eq!(
+            compare_dir(&planned, Mode::PRIVATE_DIR).action,
+            Action::Unchanged,
+        );
+
+        set_mode(&dir, Mode::DEFAULT_DIR).expect("somebody widens it after plan");
+
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned)
+            .expect_err("plan announced nothing, so apply may do nothing");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(err.path(), dir);
+        assert_eq!(
+            mode_of_path(&dir),
+            Mode::DEFAULT_DIR,
+            "apply did not chmod a directory plan never said it would touch",
+        );
+    }
+
+    #[test]
+    fn ensure_dir_refuses_a_directory_that_appeared_after_plan_announced_a_create() {
+        let home = guarded_home();
+        let dir = home.child("shared");
+        let planned = observe(&dir).expect("plan observes");
+        assert_eq!(
+            compare_dir(&planned, Mode::PRIVATE_DIR).action,
+            Action::Create
+        );
+
+        std::fs::create_dir(&dir).expect("another tool makes it");
+        set_mode(&dir, Mode::from_bits(0o777)).expect("at its own mode");
+
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned)
+            .expect_err("plan announced a create, not a chmod of somebody else's directory");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(mode_of_path(&dir), Mode::from_bits(0o777));
+    }
+
+    #[test]
+    fn ensure_dir_refuses_a_file_that_took_the_path_before_its_mkdir() {
+        let home = guarded_home();
+        let dir = home.child("d");
+        let planned = observe(&dir).expect("plan observes");
+        // Apply's own observation agrees with plan's...
+        let fresh = observe(&dir).expect("apply observes");
+        assert_eq!(
+            compare_dir(&fresh, Mode::PRIVATE_DIR),
+            compare_dir(&planned, Mode::PRIVATE_DIR),
+        );
+        // ...and then a file lands before the mkdir does.
+        seed(&dir, b"a file\n", Mode::DEFAULT_FILE);
+
+        let err = act_on_dir(&dir, Mode::PRIVATE_DIR, &planned, fresh)
+            .expect_err("a file where a directory was to be created is not a create");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&dir).expect("read"), b"a file\n");
+        assert_eq!(mode_of_path(&dir), Mode::DEFAULT_FILE);
+    }
+
+    #[test]
+    fn ensure_dir_returns_what_it_overwrote_and_what_it_created() {
+        let home = guarded_home();
+        let dir = home.child("a/b/c");
+
+        let created = apply_dir(&dir, Mode::PRIVATE_DIR).expect("create");
+        assert_eq!(created.action, Action::Create);
+        assert_eq!(created.prior.kind, Kind::Absent);
+        assert_eq!(
+            created.created_dirs,
+            [home.child("a/b/c"), home.child("a/b"), home.child("a")],
+            "deepest first, the path itself included, for a reversal to remove",
+        );
+
+        set_mode(&dir, Mode::DEFAULT_DIR).expect("widen");
+        let closed = apply_dir(&dir, Mode::PRIVATE_DIR).expect("modify");
+        assert_eq!(closed.action, Action::Modify);
+        assert_eq!(
+            closed.prior.mode,
+            Some(Mode::DEFAULT_DIR),
+            "the mode it overwrote, for the ledger to restore",
+        );
+        assert!(closed.created_dirs.is_empty());
+
+        let unchanged = apply_dir(&dir, Mode::PRIVATE_DIR).expect("unchanged");
+        assert_eq!(unchanged.action, Action::Unchanged);
+        assert_eq!(unchanged.prior.mode, Some(Mode::PRIVATE_DIR));
+        assert!(unchanged.created_dirs.is_empty());
+    }
+
     #[test]
     fn ensure_dir_creates_at_the_declared_mode_and_closes_the_drift_plan_announced() {
         let home = guarded_home();
         let dir = home.child(".ssh");
 
         assert_eq!(
-            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("create"),
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("create").action,
             Action::Create,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
 
         // Idempotence: the second call changes nothing and reports nothing.
         assert_eq!(
-            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("again"),
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("again").action,
             Action::Unchanged,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
@@ -2111,7 +2726,7 @@ mod tests {
 
         // ...and closed by apply, which does exactly that and nothing else.
         assert_eq!(
-            ensure_dir(&dir, Mode::PRIVATE_DIR).expect("drift"),
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("drift").action,
             planned.action,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
@@ -2139,7 +2754,9 @@ mod tests {
 
         // And apply performs the create plan announced.
         assert_eq!(
-            ensure_dir(&home.child("declared/dir"), Mode::PRIVATE_DIR).expect("apply"),
+            apply_dir(&home.child("declared/dir"), Mode::PRIVATE_DIR)
+                .expect("apply")
+                .action,
             outcome.action,
         );
         assert_eq!(mode_of_path(&home.child("declared/dir")), Mode::PRIVATE_DIR);
@@ -2162,7 +2779,9 @@ mod tests {
             Action::Conflict,
         );
         assert_eq!(
-            ensure_dir(&home.child("d"), Mode::PRIVATE_DIR).expect("a verdict"),
+            apply_dir(&home.child("d"), Mode::PRIVATE_DIR)
+                .expect("a verdict")
+                .action,
             Action::Conflict,
         );
         assert!(std::fs::symlink_metadata(home.child("nowhere")).is_err());
@@ -2287,7 +2906,9 @@ mod tests {
     fn ensure_dir_creates_implicit_ancestors_at_the_default_dir_mode() {
         let home = guarded_home();
         assert_eq!(
-            ensure_dir(&home.child("a/b/c"), Mode::PRIVATE_DIR).expect("create"),
+            apply_dir(&home.child("a/b/c"), Mode::PRIVATE_DIR)
+                .expect("create")
+                .action,
             Action::Create,
         );
         assert_eq!(mode_of_path(&home.child("a")), Mode::DEFAULT_DIR);
@@ -2301,7 +2922,7 @@ mod tests {
         let path = home.child("f");
         seed(&path, b"x", Mode::DEFAULT_FILE);
         assert_eq!(
-            ensure_dir(&path, Mode::PRIVATE_DIR).expect("report"),
+            apply_dir(&path, Mode::PRIVATE_DIR).expect("report").action,
             Action::Conflict,
         );
         assert_eq!(std::fs::read(&path).expect("read"), b"x");
@@ -2316,7 +2937,9 @@ mod tests {
         std::os::unix::fs::symlink("real", home.child("link")).expect("symlink");
 
         assert_eq!(
-            ensure_dir(&home.child("link"), Mode::PRIVATE_DIR).expect("report"),
+            apply_dir(&home.child("link"), Mode::PRIVATE_DIR)
+                .expect("report")
+                .action,
             Action::Conflict,
         );
         assert_eq!(
@@ -2655,7 +3278,9 @@ mod tests {
         std::os::unix::fs::symlink("nowhere", home.child("d")).expect("symlink");
 
         assert_eq!(
-            ensure_dir(&home.child("d/a"), Mode::PRIVATE_DIR).expect("a verdict, not an error"),
+            apply_dir(&home.child("d/a"), Mode::PRIVATE_DIR)
+                .expect("a verdict, not an error")
+                .action,
             Action::Conflict,
         );
         assert!(

@@ -115,9 +115,11 @@ pub struct Fingerprints {
 impl Fingerprints {
     /// Read the cache without taking a lock.
     ///
-    /// A damaged `fingerprints.mpk` is quarantined and this returns an empty
-    /// cache. Losing a cache costs a recomputation, which is exactly what a
-    /// cache is allowed to cost.
+    /// A damaged `fingerprints.mpk` yields an empty cache with
+    /// [`super::Health::Damaged`], and is **left where it is**: a reader with no
+    /// lock cannot know that the path still names the bytes it read, so it
+    /// renames nothing. Losing a cache costs a recomputation, which is exactly
+    /// what a cache is allowed to cost. A writer uses [`Fingerprints::open`].
     ///
     /// # Errors
     ///
@@ -126,7 +128,20 @@ impl Fingerprints {
     /// caller is free to treat the failure as a cache miss, but it has to
     /// decide that itself rather than have a rename decide it.
     pub fn read(dir: &StateDir) -> Result<Loaded<Self>, Error> {
-        store::load(&dir.fingerprints(), KIND, VERSION)
+        store::load(&dir.fingerprints(), KIND, VERSION, None)
+    }
+
+    /// Read the cache under the exclusive lock, quarantining a damaged one.
+    ///
+    /// The lock is what lets a damaged `fingerprints.mpk` be moved aside — see
+    /// [`super::Health::Reset`] — so its bytes are kept rather than silently
+    /// replaced by the next [`Fingerprints::save`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Fingerprints::read`].
+    pub fn open(dir: &StateDir, lock: &ExclusiveLock) -> Result<Loaded<Self>, Error> {
+        store::load(&dir.fingerprints(), KIND, VERSION, Some(lock))
     }
 
     /// The fingerprint recorded under `key`.
@@ -306,7 +321,15 @@ mod tests {
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
         std::fs::write(dir.fingerprints(), b"\x00\x01 not an envelope").expect("seed");
 
-        let loaded = Fingerprints::read(&dir).expect("read");
+        // A lockless reader reports the damage and moves nothing.
+        let read = Fingerprints::read(&dir).expect("read");
+        assert_eq!(read.health, Health::Damaged(Damage::Malformed));
+        assert!(read.value.is_empty());
+        assert!(dir.fingerprints().exists());
+        assert!(!dir.root().join("fingerprints.mpk.corrupt").exists());
+
+        // The lock holder moves it aside.
+        let loaded = Fingerprints::open(&dir, &lock).expect("open");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
         assert!(dir.root().join("fingerprints.mpk.corrupt").exists());
@@ -338,7 +361,7 @@ mod tests {
         let loaded = Fingerprints::read(&dir).expect("read");
         assert_eq!(
             loaded.health,
-            Health::Reset(Damage::WrongKind {
+            Health::Damaged(Damage::WrongKind {
                 found: "bx.ledger".to_string(),
             }),
         );

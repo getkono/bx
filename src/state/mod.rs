@@ -20,10 +20,18 @@
 //!
 //! A machine-owned file that becomes an error the user cannot clear is a defect,
 //! so damaged *contents* are never fatal. A truncated, garbled, wrong-kind or
-//! future-versioned file is moved aside to a fixed `<name>.corrupt`, reported
-//! through `tracing::warn!`, and replaced by the empty default; the next save
-//! writes a clean file. The damaged bytes are kept, never deleted, so a human or
-//! `bx doctor` can still look at them. See [`Damage`] and [`Health`].
+//! future-versioned file is reported through `tracing::warn!` and replaced by
+//! the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
+//! the first free `<name>.corrupt`, `<name>.corrupt.1`, … — never over an earlier
+//! quarantine — and the next save writes a clean file. A lockless reader moves
+//! nothing ([`Health::Damaged`]): a rename by path could move aside a file a
+//! writer saved after the read. The damaged bytes are kept, never deleted, so a
+//! human or `bx doctor` can still look at them. See [`Damage`] and [`Health`].
+//!
+//! A stored value refused for a reason that says nothing about its bytes — a
+//! ledger checked against a home spelled differently from the one it was
+//! written under — is not damage either: [`Error::ForeignPath`] reaches the
+//! caller, and nothing is renamed.
 //!
 //! A file that **cannot be read** is a different thing and is handled the
 //! opposite way. `EACCES` left behind by a `sudo bx`, `EIO` from a failing
@@ -116,6 +124,20 @@ pub enum Error {
         /// The lock file.
         path: PathBuf,
     },
+    /// Something other than the plain file bx creates occupies the lock path.
+    ///
+    /// A symlink, a second hard link, a FIFO or a device. The lock file's body
+    /// is truncated on every exclusive acquisition, so opening any of these
+    /// could empty a file the user wrote; bx refuses and names the path.
+    #[error(
+        "{} is not a plain file bx created (a symlink, a hard link or a special file); \
+         bx will not open it. Move it aside and run bx again",
+        .path.display()
+    )]
+    LockNotAFile {
+        /// The lock path.
+        path: PathBuf,
+    },
     /// The lock file could not be opened or locked.
     #[error("locking {}: {source}", .path.display())]
     Lock {
@@ -139,6 +161,60 @@ pub enum Error {
         #[source]
         source: crate::paths::Error,
     },
+    /// A stored path cannot be used with the home it was checked against.
+    ///
+    /// Almost always the same account with its home spelled another way — a
+    /// `/home` → `/var/home` alias, or `HOME=/` — rather than a damaged file,
+    /// so it is refused rather than degraded. Nothing is renamed or reset: the
+    /// ledger is left exactly where it is, and bx stops, because proceeding
+    /// against an empty ledger would record bx's own output as every prior.
+    #[error(
+        "{} stores the path {stored}, which cannot be used with the home {}: {source}. \
+         Nothing was changed; run bx with the home spelled as it was when bx wrote it",
+        .path.display(),
+        .home.display()
+    )]
+    ForeignPath {
+        /// The state file holding the path.
+        path: PathBuf,
+        /// The home it was checked against.
+        home: PathBuf,
+        /// The path as it is stored.
+        stored: String,
+        /// Why it cannot be used with that home.
+        #[source]
+        source: Box<crate::paths::Error>,
+    },
+    /// A state file's path is a symbolic link to something that does not exist.
+    ///
+    /// Not "no state": the likeliest cause is state kept on storage that is not
+    /// there right now, and reading it as fresh would let the next save replace
+    /// the link — and the priors behind it — with an empty ledger.
+    #[error(
+        "{} is a symbolic link to something that does not exist; bx will not read that as \
+         having no state. Restore what it points at, or remove the link",
+        .path.display()
+    )]
+    DanglingLink {
+        /// The state file.
+        path: PathBuf,
+    },
+    /// The state directory is a symbolic link to a directory readable beyond
+    /// its owner.
+    ///
+    /// bx narrows a directory it created, but never changes the mode of one it
+    /// reached through a link, which may be shared with other users; and it will
+    /// not keep prior copies of private files in a directory others can read.
+    #[error(
+        "{} is a symbolic link to a directory readable beyond its owner; bx will not change \
+         the mode of a directory it did not create, nor keep your files in it. Make the \
+         target 0700, or replace the link",
+        .path.display()
+    )]
+    SharedLinkedDir {
+        /// The linked directory.
+        path: PathBuf,
+    },
     /// A ledger entry references a restore snapshot that is not on disk.
     #[error("the restore snapshot {digest} is missing from {}", .path.display())]
     RestoreMissing {
@@ -154,5 +230,21 @@ pub enum Error {
         digest: ContentHash,
         /// The snapshot that failed to match it.
         path: PathBuf,
+    },
+    /// Someone other than bx changed a file bx shares with the user — through
+    /// a managed region or an include line — and a record would have adopted
+    /// the changed file, bx's own lines included, as what the user last had.
+    ///
+    /// Nothing is recorded and nothing is stored. See [`Ledger::record`].
+    #[error(
+        "{target} changed since bx last wrote it, and bx shares that file through a managed \
+         region or an include line, so it still holds bx's own lines; bx will not record it \
+         as your original. Nothing was recorded"
+    )]
+    PriorConflict {
+        /// The target, as the ledger keys it.
+        target: String,
+        /// The digest of the changed bytes that were not adopted.
+        displaced: ContentHash,
     },
 }

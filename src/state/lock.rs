@@ -95,8 +95,45 @@ impl fmt::Display for Holder {
 pub struct ExclusiveLock {
     /// Kept open for the lock's lifetime; closing it releases the lock.
     fd: OwnedFd,
-    /// The lock file, for error messages.
+    /// The lock file this locked: its path, for error messages, and its
+    /// identity, for [`ExclusiveLock::guards`].
+    held: HeldLock,
+}
+
+/// The lock file an [`ExclusiveLock`] locked: its path, and its device and
+/// inode as they were when it was locked.
+///
+/// Kept by a [`super::Ledger`], which does not keep the guard, so every write
+/// through it can ask again whether the lock file it was opened under is still
+/// the one at the lock path. An outside `mv` or `rm` of a held lock file lets a
+/// second bx create and lock a new file at the same path, and the first guard
+/// then excludes nobody.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldLock {
+    /// The lock file's path.
     path: PathBuf,
+    /// Its `stat` when it was locked. Only `st_dev` and `st_ino` are compared.
+    stat: rustix::fs::Stat,
+}
+
+impl HeldLock {
+    /// The lock file's path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether this is still the lock file of the state directory at `root`.
+    ///
+    /// Decided by identity — the device and inode that were locked against
+    /// those of `root`'s lock file now — never by spelling. A directory reached
+    /// through a symlink is still recognised, and a lock file replaced since it
+    /// was locked, or one that is not there, is not.
+    pub(crate) fn guards(&self, root: &Path) -> bool {
+        let Ok(there) = rustix::fs::lstat(StateDir::new(root.to_path_buf()).lock()) else {
+            return false;
+        };
+        self.stat.st_dev == there.st_dev && self.stat.st_ino == there.st_ino
+    }
 }
 
 /// A shared lock on the state directory, held for as long as this lives.
@@ -124,10 +161,13 @@ impl ExclusiveLock {
     /// created or locked.
     pub fn acquire(dir: &StateDir) -> Result<Self, Error> {
         let path = dir.lock();
-        let fd = open_lock_file(dir, &path)?;
+        let (fd, stat) = open_lock_file(dir, &path)?;
         take(&fd, &path, FlockOperation::NonBlockingLockExclusive)?;
         identify(&fd);
-        Ok(Self { fd, path })
+        Ok(Self {
+            fd,
+            held: HeldLock { path, stat },
+        })
     }
 
     /// Take the exclusive lock, or return `None` if it is held.
@@ -142,23 +182,15 @@ impl ExclusiveLock {
     /// The lock file this guard holds.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.held.path
     }
 
-    /// Whether this guard is the lock of the state directory at `root`.
-    ///
-    /// Decided by identity — the device and inode of the locked descriptor
-    /// against those of `root`'s lock file — never by spelling. A directory
-    /// reached through a symlink is still recognised, and a lock file replaced
-    /// since it was locked, or one that is not there, is not.
-    pub(crate) fn guards(&self, root: &Path) -> bool {
-        let Ok(held) = rustix::fs::fstat(&self.fd) else {
-            return false;
-        };
-        let Ok(there) = rustix::fs::lstat(StateDir::new(root.to_path_buf()).lock()) else {
-            return false;
-        };
-        held.st_dev == there.st_dev && held.st_ino == there.st_ino
+    /// The lock file this guard locked: what decides, by identity, whether
+    /// this guard is the lock of a given state directory — see
+    /// [`HeldLock::guards`] — and what a caller keeps to check that again after
+    /// handing the guard back.
+    pub(crate) fn held(&self) -> &HeldLock {
+        &self.held
     }
 }
 
@@ -170,7 +202,7 @@ impl SharedLock {
     /// As [`ExclusiveLock::acquire`].
     pub fn acquire(dir: &StateDir) -> Result<Self, Error> {
         let path = dir.lock();
-        let fd = open_lock_file(dir, &path)?;
+        let (fd, _) = open_lock_file(dir, &path)?;
         take(&fd, &path, FlockOperation::NonBlockingLockShared)?;
         Ok(Self { fd, path })
     }
@@ -213,7 +245,10 @@ fn optional<T>(result: Result<T, Error>) -> Result<Option<T>, Error> {
 /// regular file with exactly one link, so a hard link to a user's file, a FIFO
 /// or a device is refused too. A lock file found readable beyond its owner is
 /// narrowed to `0600`, as the state directory itself is.
-fn open_lock_file(dir: &StateDir, path: &Path) -> Result<OwnedFd, Error> {
+///
+/// Returns the descriptor and its `stat`, whose device and inode identify the
+/// file locked through it.
+fn open_lock_file(dir: &StateDir, path: &Path) -> Result<(OwnedFd, rustix::fs::Stat), Error> {
     ensure_dir(dir.root(), Mode::PRIVATE_DIR)?;
     let failed = |source: Errno| Error::Lock {
         path: path.to_path_buf(),
@@ -247,7 +282,7 @@ fn open_lock_file(dir: &StateDir, path: &Path) -> Result<OwnedFd, Error> {
         );
         rustix::fs::fchmod(&fd, Mode::PRIVATE_FILE.into()).map_err(failed)?;
     }
-    Ok(fd)
+    Ok((fd, stat))
 }
 
 /// Attempt one non-blocking `flock`.
@@ -404,18 +439,18 @@ mod tests {
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
-        assert!(lock.guards(dir.root()));
+        assert!(lock.held().guards(dir.root()));
 
         // The same directory spelled through a link is the same directory.
         let alias = home.child("alias");
         std::os::unix::fs::symlink(dir.root(), &alias).expect("alias");
-        assert!(lock.guards(&alias));
+        assert!(lock.held().guards(&alias));
 
         // Another directory, with or without a lock file of its own, is not.
         let other = StateDir::new(home.child("other"));
-        assert!(!lock.guards(other.root()));
+        assert!(!lock.held().guards(other.root()));
         drop(ExclusiveLock::acquire(&other).expect("the other lock file"));
-        assert!(!lock.guards(other.root()));
+        assert!(!lock.held().guards(other.root()));
     }
 
     #[test]

@@ -391,6 +391,41 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_link_that_loops_or_runs_through_a_file_degrades_like_a_dangling_one() {
+        // Review round 5: only a link to nothing degraded. A link that loops
+        // (`ELOOP`) or whose path runs through a file (`ENOTDIR`) was still the
+        // fatal `Error::Read`, which losing a cache never warrants.
+        for looped in [true, false] {
+            let home = guarded_home();
+            let dir = StateDir::resolve(home.path());
+            dir.ensure().expect("ensure");
+            let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+            let far = if looped {
+                dir.fingerprints()
+            } else {
+                home.write("a-file", "not a directory");
+                home.child("a-file/fingerprints.mpk")
+            };
+            std::os::unix::fs::symlink(&far, dir.fingerprints()).expect("symlink");
+
+            let read = Fingerprints::read(&dir).unwrap_or_else(|e| panic!("looped {looped}: {e}"));
+            assert_eq!(read.health, Health::Damaged(Damage::DanglingLink));
+            assert_eq!(std::fs::read_link(dir.fingerprints()).expect("link"), far);
+
+            let opened =
+                Fingerprints::open(&dir, &lock).unwrap_or_else(|e| panic!("looped {looped}: {e}"));
+            assert_eq!(opened.health, Health::Reset(Damage::DanglingLink));
+            let aside = StateDir::quarantine(&dir.fingerprints());
+            assert_eq!(std::fs::read_link(&aside).expect("the link, moved"), far);
+            opened.value.save(&dir, &lock).expect("save");
+            assert_eq!(
+                Fingerprints::read(&dir).expect("read").health,
+                Health::Loaded
+            );
+        }
+    }
+
+    #[test]
     fn a_cache_from_a_newer_bx_degrades_to_recomputation() {
         // Review round 4 made a newer ledger a refusal. The cache is the file
         // recomputation rebuilds, so it keeps degrading.

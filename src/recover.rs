@@ -362,16 +362,15 @@ pub fn before_writing(state: &StateDir) -> Result<Outcome, Error> {
 /// # Errors
 ///
 /// [`Error::State`] when the lock cannot be taken and [`Error::Journal`] when
-/// the journal cannot be moved — including
-/// [`journal::Error::AsideOccupied`] when a journal abandoned earlier still
-/// holds the name, which is refused rather than overwritten.
+/// the journal cannot be moved. A journal abandoned earlier is never renamed
+/// over: this one takes the next free set-aside name.
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
-    let _lock = ExclusiveLock::acquire(state)?;
+    let lock = ExclusiveLock::acquire(state)?;
     let path = state.journal();
     if !path.exists() {
         return Ok(None);
     }
-    let aside = journal::set_aside(&path)?;
+    let aside = journal::set_aside(&path, &lock)?;
     tracing::warn!(
         path = %path.display(),
         moved_to = %aside.display(),
@@ -389,13 +388,10 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         Loaded::Terminated(_) => true,
         Loaded::Unterminated(_) | Loaded::Torn { .. } => false,
     };
-    // A journal that lost bytes is set aside at the end rather than unlinked, so
-    // a set-aside name that is already taken refuses now, before anything is
-    // touched, rather than after the rollback.
+    // A journal that lost bytes is set aside at the end rather than unlinked.
+    // The set-aside name is always free — the first unused numbered one — so
+    // nothing needs checking before the rollback.
     let torn = matches!(loaded, Loaded::Torn { .. });
-    if torn {
-        journal::free_aside(&path)?;
-    }
     let home = rebuild_home(&loaded, complete, &path)?;
 
     // Only a terminated journal's bookkeeping touches the ledger, and it is the
@@ -478,7 +474,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     // were discarded from is kept: they may have been a frame that damage, not a
     // crash, cut short, and the file is the only record of what it hid.
     if torn {
-        let aside = journal::set_aside(&path)?;
+        let aside = journal::set_aside(&path, lock)?;
         tracing::warn!(
             path = %path.display(),
             moved_to = %aside.display(),
@@ -2237,9 +2233,11 @@ mod tests {
     }
 
     #[test]
-    fn abandoning_twice_refuses_rather_than_overwrite_the_first_set_aside_journal() {
-        // Review round 3, item 5. The set-aside name is fixed, and the second
-        // abandon renamed its journal over the first.
+    fn abandoning_twice_keeps_both_set_aside_journals() {
+        // Review round 3, item 5. The set-aside name was fixed, and the second
+        // abandon renamed its journal over the first. Round 3 refused the
+        // second abandon instead; since #7's numbered names integrated, it
+        // succeeds and takes the next free name, and both journals survive.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let mut kept = Vec::new();
@@ -2262,22 +2260,17 @@ mod tests {
             }
         }
 
-        let refused = abandon(&state).expect_err("the name is taken");
-        assert!(
-            matches!(
-                refused,
-                Error::Journal(journal::Error::AsideOccupied { .. })
-            ),
-            "got {refused}"
-        );
+        let second = abandon(&state)
+            .expect("the second abandon succeeds")
+            .expect("set aside");
+        assert_eq!(second, StateDir::quarantine_nth(&state.journal(), 1));
+        assert!(!state.journal().exists(), "the interruption is cleared");
         assert_eq!(
             std::fs::read(StateDir::quarantine(&state.journal())).expect("the first"),
             kept[0],
         );
-        assert_eq!(
-            std::fs::read(state.journal()).expect("the second, in place"),
-            kept[1],
-        );
+        assert_eq!(std::fs::read(&second).expect("the second"), kept[1]);
+        assert_eq!(recover(&state).expect("recover"), Outcome::Nothing);
     }
 
     /// A session that modified `~/.conf` and died, and its journal's bytes.
@@ -2358,7 +2351,10 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_journal_whose_set_aside_name_is_taken_refuses_before_touching_anything() {
+    fn a_torn_journal_whose_first_set_aside_name_is_taken_is_recovered_and_kept_beside_it() {
+        // Round 3 refused this recovery until the user moved the earlier file.
+        // With #7's numbered names nothing is in the way: the rollback runs and
+        // the torn journal takes the next free name, the earlier file intact.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let (dest, mut bytes) = interrupted_modify(&state, home.path());
@@ -2367,23 +2363,6 @@ mod tests {
         let aside = StateDir::quarantine(&state.journal());
         std::fs::write(&aside, b"the first").expect("a journal set aside earlier");
 
-        let refused = recover(&state).expect_err("the name is taken");
-        assert!(
-            matches!(
-                refused,
-                Error::Journal(journal::Error::AsideOccupied { .. })
-            ),
-            "got {refused}"
-        );
-        assert_eq!(
-            peek(&dest).expect("not rolled back yet").0,
-            b"bx new\n",
-            "nothing was touched",
-        );
-        assert_eq!(std::fs::read(&aside).expect("kept"), b"the first");
-        assert_eq!(std::fs::read(state.journal()).expect("in place"), bytes);
-
-        std::fs::remove_file(&aside).expect("the user moves it");
         assert_eq!(
             recover(&state).expect("recover"),
             Outcome::RolledBack { undone: 1 }
@@ -2392,7 +2371,12 @@ mod tests {
             peek(&dest).expect("rolled back").0,
             b"the user's original\n"
         );
-        assert_eq!(std::fs::read(&aside).expect("set aside"), bytes);
+        assert!(!state.journal().exists());
+        assert_eq!(std::fs::read(&aside).expect("kept"), b"the first");
+        assert_eq!(
+            std::fs::read(StateDir::quarantine_nth(&state.journal(), 1)).expect("set aside"),
+            bytes,
+        );
     }
 
     #[test]

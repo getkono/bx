@@ -69,6 +69,7 @@ mod store;
 use std::path::PathBuf;
 
 pub use dir::StateDir;
+pub(crate) use dir::move_aside;
 pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use ledger::RestoreRef;

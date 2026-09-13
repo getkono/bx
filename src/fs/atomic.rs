@@ -15,8 +15,10 @@
 //! 5. the prior state recorded — [`Filled::new_entry`] assembles it and
 //!    [`crate::state::Ledger::record`] makes it durable — **before** the
 //!    rename, so a crash after the rename still has a recoverable prior state.
-//! 6. `rename`.
-//! 7. an `fsync` of the **destination directory**, so the rename itself
+//! 6. the destination `lstat`ed again and compared with what step 1 saw, and
+//!    the write refused if it changed.
+//! 7. `rename`.
+//! 8. an `fsync` of the **destination directory**, so the rename itself
 //!    survives a power loss. This is the step implementations omit, and without
 //!    it the directory entry can be lost even though the file's data was
 //!    synced.
@@ -55,6 +57,29 @@
 //! and it cannot let a test observe the mode of the temporary file while it is
 //! still empty. [`Staged::commit`] is the shorthand for callers with nothing to
 //! interpose.
+//!
+//! # What is checked before the rename, and what is not
+//!
+//! Staging widens the gap between looking at the destination and replacing
+//! it: the content is written and synced, the ledger records the prior, and a
+//! journal appends its intent, all in between. An editor that saves in that gap
+//! would lose the save to the rename, and the prior bx recorded would predate
+//! it, so `rm` could not bring it back either. [`observe`] therefore records a
+//! [`Stamp`] — device, inode, size, and modification and status-change times to
+//! the nanosecond — and [`Filled::publish`] `lstat`s the destination again as
+//! the last step before the rename, refusing with [`Error::Changed`] unless it
+//! is the same file, unchanged, or still absent.
+//!
+//! That narrows the gap to the distance between one `lstat` and one
+//! `rename(2)`; it does not close it. A change landing in those microseconds is
+//! still replaced. Closing it needs `renameat2(RENAME_EXCHANGE)`, a check of
+//! what came out, and an exchange back on a mismatch — which would publish bx's
+//! content for an instant even when refusing, and is not done. A timestamp
+//! that does not move is also not seen: on a filesystem with coarse timestamps,
+//! an in-place edit of the same length within one clock tick of the
+//! observation leaves the stamp identical. Kernels with multigrain timestamps
+//! give a fine-grained time to a change made just after the file's times were
+//! queried, which is exactly what `observe` did.
 //!
 //! # What the tests here do and do not establish
 //!
@@ -159,6 +184,24 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// What is at the path is no longer what bx observed there, so acting on
+    /// the observation would replace or change something bx never looked at.
+    ///
+    /// Raised by [`Filled::publish`] when the destination changed between
+    /// [`stage`] and the rename — an editor saving, a symlink swapped in, a
+    /// file appearing where there was none — and by [`ensure_dir`] when a
+    /// directory target is no longer what `plan` saw. Nothing is replaced: the
+    /// temporary file is removed and the path keeps what is there now.
+    #[error(
+        "{} changed after bx looked at it ({detail}); nothing was replaced. Run plan again",
+        .path.display()
+    )]
+    Changed {
+        /// The path that changed.
+        path: PathBuf,
+        /// What bx saw, and what is there now.
+        detail: String,
+    },
     /// A path the ledger would record cannot be made portable against the
     /// home: it is not valid UTF-8, or the home is not absolute.
     ///
@@ -186,6 +229,7 @@ impl Error {
             | Self::UnusableParent { path, .. }
             | Self::Read { path, .. }
             | Self::Write { path, .. }
+            | Self::Changed { path, .. }
             | Self::NotPortable { path, .. } => path,
         }
     }
@@ -208,6 +252,14 @@ pub struct Observed {
     pub bytes: Option<Vec<u8>>,
     /// The destination's immediate parent directory.
     pub parent: Option<Parent>,
+    /// Which file this was and when it last changed, or `None` when nothing is
+    /// there.
+    ///
+    /// What [`Filled::publish`] checks the destination against immediately
+    /// before the rename, so a file that changed after it was observed is not
+    /// replaced, and a prior state recorded from this observation is never
+    /// older than the file it displaces.
+    pub stamp: Option<Stamp>,
 }
 
 impl Observed {
@@ -238,6 +290,40 @@ impl Observed {
     #[must_use]
     pub fn digest(&self) -> Option<ContentHash> {
         self.bytes.as_deref().map(ContentHash::of)
+    }
+}
+
+/// Which file a path named, and when that file last changed, as one `lstat`
+/// reported it.
+///
+/// Device and inode say *which* file: an editor that saves by writing a new
+/// file and renaming it over the old one, or a symlink swapped in, changes
+/// them. Size, and the modification and status-change times to the
+/// nanosecond, say whether that file changed *in place*: a write moves `mtime`,
+/// and a `chmod`, a `chown`, a new hard link or an extended attribute moves
+/// `ctime`. Compared whole and never interpreted, so there is no field a
+/// caller could compare on its own and get a different answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    /// The stamp of the file `meta` describes.
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
     }
 }
 
@@ -335,6 +421,7 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
             mode: None,
             bytes: None,
             parent: Some(observed_parent),
+            stamp: None,
         });
     }
     let parent = Some(observed_parent);
@@ -346,6 +433,7 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
             mode: None,
             bytes: None,
             parent,
+            stamp: None,
         });
     };
 
@@ -365,6 +453,10 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
         mode: Some(mode_of(&meta)),
         bytes,
         parent,
+        // From the `lstat` taken before the read, so a change that lands
+        // between the two makes the stamp older than the bytes, and the check
+        // before the rename refuses rather than trusting either.
+        stamp: Some(Stamp::of(&meta)),
     })
 }
 
@@ -799,16 +891,31 @@ impl Filled {
     /// that failure happens while the destination is still untouched, which is
     /// what [`write_atomically`]'s contract promises for an `Err`.
     ///
+    /// Immediately before the rename the destination is `lstat`ed again and
+    /// compared with the [`Stamp`] [`stage`] observed. Anything else there — an
+    /// edit saved in place or by rename, a symlink swapped in, a file where
+    /// there was none, a file removed — is refused rather than replaced, so a
+    /// write never destroys bytes bx did not observe and the recorded prior is
+    /// never older than what it displaces. The window between that `lstat` and
+    /// the `rename(2)` remains; see the module documentation.
+    ///
     /// # Errors
     ///
-    /// [`Error::Write`] wrapping the failing `open` of the directory, `rename`,
-    /// or `fsync`. The temporary file is removed either way. Only a failing
-    /// `fsync` of the directory is returned after the destination was replaced.
+    /// [`Error::Changed`] when the destination is no longer what [`stage`]
+    /// observed; nothing is replaced. [`Error::Write`] wrapping the failing
+    /// `open` of the directory, `rename`, or `fsync`. The temporary file is
+    /// removed either way. Only a failing `fsync` of the directory is returned
+    /// after the destination was replaced.
     pub fn publish(self) -> Result<(), Error> {
         let Self {
-            pending: Pending {
-                temp, dest, mode, ..
-            },
+            pending:
+                Pending {
+                    temp,
+                    dest,
+                    mode,
+                    prior,
+                    ..
+                },
             ..
         } = self;
 
@@ -818,6 +925,9 @@ impl Filled {
             source,
         };
         let handle = durable::Dir::open(dir).map_err(dir_fail)?;
+        // The last thing before the rename, so the window it leaves open is as
+        // narrow as it can be. Refusing drops `temp`, which removes it.
+        verify_unchanged(&prior)?;
         durable::rename(temp, &dest).map_err(|e| Error::Write {
             path: dest.clone(),
             source: e.error,
@@ -838,7 +948,8 @@ impl Filled {
 /// Replace `path` with `bytes`, atomically, at `mode`.
 ///
 /// After this returns, `path` holds either all of `bytes` or — if the write
-/// failed — exactly what it held before. No temporary file is left behind in
+/// failed — exactly what it held before, or, for [`Error::Changed`], whatever
+/// changed it after bx looked. No temporary file is left behind in
 /// either case, and the rename is durable: a power loss after the call cannot
 /// resurrect the previous content.
 ///
@@ -966,6 +1077,31 @@ pub fn ensure_dir(path: &Path, mode: Mode) -> Result<Action, Error> {
         _ => {}
     }
     Ok(outcome.action)
+}
+
+/// Refuse unless `prior.path` is still what [`observe`] found there: the same
+/// file with the same [`Stamp`], or still nothing at all.
+///
+/// # Errors
+///
+/// [`Error::Changed`] naming what moved, and [`Error::Read`] when the path can
+/// no longer be stat'd.
+fn verify_unchanged(prior: &Observed) -> Result<(), Error> {
+    let now = optional_metadata(&prior.path)?
+        .map(|meta| (Kind::from(meta.file_type()), Stamp::of(&meta)));
+    let then = prior.stamp.map(|stamp| (prior.kind, stamp));
+    if now == then {
+        return Ok(());
+    }
+    let detail = match (then, now) {
+        (_, None) => "it has been removed",
+        (None, Some(_)) => "nothing was there, and something is now",
+        (Some(_), Some(_)) => "it has been modified or replaced",
+    };
+    Err(Error::Changed {
+        path: prior.path.clone(),
+        detail: detail.to_string(),
+    })
 }
 
 /// The directory `path` will be written into.
@@ -1890,14 +2026,121 @@ mod tests {
         let home = guarded_home();
         let dest = home.child("f");
         let staged = stage(&dest, Mode::DEFAULT_FILE).expect("stage");
-        // A directory cannot be replaced by a rename from a regular file, so
-        // `persist` fails after the temporary file has been written in full.
+        // Something occupies the destination after it was observed, so the
+        // publish fails after the temporary file has been written in full —
+        // refused by the check before the rename, which is the one a rename
+        // over a directory would also have failed.
         std::fs::create_dir(&dest).expect("occupy");
 
         let err = staged.commit(b"x").expect_err("must fail");
         assert_eq!(err.path(), dest);
-        assert!(matches!(err, Error::Write { .. }), "{err:?}");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(names_in(home.path()), vec![OsString::from("f")]);
+    }
+
+    #[test]
+    fn a_destination_edited_between_fill_and_publish_is_refused_and_keeps_the_edit() {
+        // The window a journal widens: between the observation `stage` takes
+        // and the rename, an editor saves. Replacing the file then destroys the
+        // save, and the prior bx recorded predates it, so `rm` cannot bring it
+        // back either — Invariant 1 and Invariant 4 at once.
+        let in_place: fn(&Path) = |dest| {
+            std::fs::write(dest, b"the user's edit\n").expect("the user saves in place");
+        };
+        let by_rename: fn(&Path) = |dest| {
+            // Same length as what was there, so only which file it is changed.
+            let saved = dest.with_file_name("editor-swap");
+            std::fs::write(&saved, b"v2\n").expect("the editor writes its copy");
+            std::fs::rename(&saved, dest).expect("and renames it over the original");
+        };
+
+        for (how, save) in [("in place", in_place), ("by rename", by_rename)] {
+            let home = guarded_home();
+            let dest = home.child(".conf");
+            seed(&dest, b"v1\n", Mode::DEFAULT_FILE);
+
+            let filled = stage(&dest, Mode::DEFAULT_FILE)
+                .expect("stage")
+                .fill(b"bx\n")
+                .expect("fill");
+            let temp = filled.temp_path().to_path_buf();
+            save(&dest);
+            let saved = std::fs::read(&dest).expect("read the save");
+
+            let err = filled
+                .publish()
+                .expect_err("a destination that changed after it was observed is not replaced");
+            assert!(matches!(err, Error::Changed { .. }), "{how}: {err:?}");
+            assert_eq!(err.path(), dest, "{how}");
+            assert_eq!(
+                std::fs::read(&dest).expect("read"),
+                saved,
+                "{how}: the user's save survives",
+            );
+            assert!(!temp.exists(), "{how}: the temporary file is removed");
+            assert_eq!(
+                names_in(home.path()),
+                vec![OsString::from(".conf")],
+                "{how}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlink_swapped_in_between_fill_and_publish_is_refused_and_survives() {
+        let home = guarded_home();
+        let dest = home.child(".conf");
+        let other = home.child("elsewhere");
+        seed(&dest, b"v1\n", Mode::DEFAULT_FILE);
+        seed(&other, b"the link's target\n", Mode::DEFAULT_FILE);
+
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"bx\n")
+            .expect("fill");
+        let temp = filled.temp_path().to_path_buf();
+        // Decision 2 refuses a link at the final component; observing a file
+        // there first must not turn into replacing a link that arrived later.
+        std::fs::remove_file(&dest).expect("rm");
+        std::os::unix::fs::symlink("elsewhere", &dest).expect("symlink");
+
+        let err = filled
+            .publish()
+            .expect_err("the link is not bx's to replace");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert!(
+            std::fs::symlink_metadata(&dest)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the link is intact",
+        );
+        assert_eq!(
+            std::fs::read_link(&dest).expect("readlink"),
+            Path::new("elsewhere")
+        );
+        assert_eq!(std::fs::read(&other).expect("read"), b"the link's target\n");
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn a_file_that_appears_where_there_was_none_is_not_replaced() {
+        let home = guarded_home();
+        let dest = home.child(".conf");
+
+        let filled = stage(&dest, Mode::DEFAULT_FILE)
+            .expect("stage")
+            .fill(b"bx\n")
+            .expect("fill");
+        assert_eq!(filled.prior().stamp, None, "nothing was there to stamp");
+        std::fs::write(&dest, b"another tool's\n").expect("another tool creates it");
+
+        let err = filled
+            .publish()
+            .expect_err("bx announced a create, and there is now a file to replace");
+        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"another tool's\n");
+        assert_eq!(names_in(home.path()), vec![OsString::from(".conf")]);
     }
 
     #[test]

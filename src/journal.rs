@@ -171,6 +171,25 @@ pub enum Error {
         /// The journal that records the session.
         path: PathBuf,
     },
+    /// A request's destination is not where its target renders against the
+    /// session's home.
+    ///
+    /// Refused because a journal recording it could never be believed: recovery
+    /// acts only on a destination that is exactly its target's.
+    #[error(
+        "bx will not write {} for {}, which renders to {}",
+        .dest.display(),
+        .target.as_str(),
+        .rendered.display()
+    )]
+    Misplaced {
+        /// The target the request named.
+        target: Portable,
+        /// The destination it asked for.
+        dest: PathBuf,
+        /// Where the target renders.
+        rendered: PathBuf,
+    },
     /// The state directory failed.
     #[error(transparent)]
     State(#[from] crate::state::Error),
@@ -268,7 +287,8 @@ pub struct Intent {
     ///
     /// Recorded rather than recomputed: recovery unlinks the one path the
     /// journal names and can therefore never remove a file bx cannot prove it
-    /// created. Deleting by pattern in a directory the user owns is the wrong
+    /// created. A journal whose temporary file is not a `.bx-` file beside
+    /// `dest` is not believed at all. Deleting by pattern in a directory the user owns is the wrong
     /// default for a tool whose first invariant is never to destroy a byte the
     /// user wrote.
     pub temp: Option<PathBuf>,
@@ -509,7 +529,7 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
         }
     }
 
-    if let Some(why) = foreign_path(&records) {
+    if let Some(why) = refusal(&records) {
         return Ok(Err(why));
     }
 
@@ -520,32 +540,41 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
     }))
 }
 
-/// Why the journal stores a path its own session could not have written, if it
-/// does.
+/// Why the journal could not have been written by a bx session, if it could
+/// not.
 ///
-/// Decoding a [`Portable`] applies every rule that needs no home. The one that
-/// does cannot run in a decoder: `/<home>/.gitconfig` is well-formed, and on
-/// the account whose home that is, a second key for `~/.gitconfig`. The home a
-/// journal was written under is its [`Begin`]'s, so every stored `Portable` —
-/// the `Begin`'s scope, each [`Intent`]'s target and each [`Done`]'s — goes
-/// through [`Portable::check_against`] with it, as does the home itself. A
-/// journal that fails is bytes bx never wrote, and the caller treats it as
-/// unreadable: [`load`] leaves it in place and [`load_exclusive`] sets it
-/// aside. It is never believed, so it can never drive a rollback.
+/// A journal is believed only as far as a session could have written it,
+/// because everything recovery does with one — unlink a temporary file, rewrite
+/// or unlink a destination, remove directories — is done to the paths it
+/// stores. A journal that fails any rule below is bytes bx never wrote, and the
+/// caller treats it as unreadable: [`load`] leaves it in place and
+/// [`load_exclusive`] sets it aside. It is never believed, so it can never
+/// drive a rollback.
 ///
-/// A journal with no `Begin` has no home to check against. Recovery already
-/// refuses the one kind of those that would need one (a terminated journal
-/// with no header), and a rollback acts on the rendered destinations alone.
-fn foreign_path(records: &[Record]) -> Option<&'static str> {
-    let begin = records.iter().find_map(|record| match record {
-        Record::Begin(begin) => Some(begin),
-        _ => None,
-    })?;
+/// * **A header first, and only first.** Every other rule needs the home, and
+///   the home is the [`Begin`]'s. A session writes exactly one, as the file's
+///   first frame, and writes nothing after its [`End`].
+/// * **Portable paths.** Decoding a [`Portable`] applies every rule that needs
+///   no home. The one that does cannot run in a decoder: `/<home>/.gitconfig`
+///   is well-formed, and on the account whose home that is, a second key for
+///   `~/.gitconfig`. So the header's home, its scope, and each [`Intent`]'s and
+///   [`Done`]'s target go through [`Portable::check_against`].
+/// * **An intent's paths are its target's.** The destination is exactly where
+///   the target renders, which [`Session::apply`] also refuses to break; the
+///   temporary file is a `.bx-` file beside the destination, the only place
+///   [`crate::fs::stage`] puts one; and each created directory is a parent of
+///   the destination that is neither the home nor above it.
+fn refusal(records: &[Record]) -> Option<&'static str> {
+    let (first, rest) = records.split_first()?;
+    let Record::Begin(begin) = first else {
+        return Some("it records a session with no header before it");
+    };
     if let Err(error) = Portable::parse_in("~", &begin.home) {
         tracing::warn!(%error, "the journal's session header names an unusable home");
         return Some("its session header names a home that is not an absolute UTF-8 path");
     }
-    let refused = records
+    let home = begin.home.as_path();
+    if let Some(refused) = records
         .iter()
         .flat_map(|record| match record {
             Record::Begin(begin) => begin.scope.iter().collect::<Vec<_>>(),
@@ -553,9 +582,57 @@ fn foreign_path(records: &[Record]) -> Option<&'static str> {
             Record::Done(done) => vec![&done.target],
             Record::End(_) => Vec::new(),
         })
-        .find_map(|portable| portable.check_against(&begin.home).err())?;
-    tracing::warn!(error = %refused, "a journal record stores a path its session's home refuses");
-    Some("it records a path that is not portable against its session's home")
+        .find_map(|portable| portable.check_against(home).err())
+    {
+        tracing::warn!(error = %refused, "a journal record stores a path its session's home refuses");
+        return Some("it records a path that is not portable against its session's home");
+    }
+    for (at, record) in rest.iter().enumerate() {
+        match record {
+            Record::Begin(_) => return Some("it has a second session header"),
+            Record::End(_) if at + 1 < rest.len() => {
+                return Some("a record follows the end of its session");
+            }
+            Record::Intent(intent) => {
+                if let Some(why) = misplaced(intent, home) {
+                    return Some(why);
+                }
+            }
+            Record::Done(_) | Record::End(_) => {}
+        }
+    }
+    None
+}
+
+/// Why an intent stores a path its own target could not have, if it does.
+fn misplaced(intent: &Intent, home: &Path) -> Option<&'static str> {
+    let dest = &intent.dest;
+    if *dest != intent.target.render(home) {
+        return Some("an intent's destination is not where its target renders");
+    }
+    if let Some(temp) = &intent.temp {
+        let staged = temp != dest
+            && temp.parent() == dest.parent()
+            && temp
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(fs::TEMP_PREFIX));
+        if !staged {
+            return Some(
+                "an intent's temporary file is not a bx temporary file beside its destination",
+            );
+        }
+    }
+    if intent
+        .created_dirs
+        .iter()
+        .any(|dir| dir == dest || !dest.starts_with(dir) || home.starts_with(dir))
+    {
+        return Some(
+            "an intent's created directory is not a parent of its destination below the home",
+        );
+    }
+    None
 }
 
 /// Why there is no whole record at an offset.
@@ -901,10 +978,12 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// [`Error::Write`] when the destination cannot be written or is not a file
-    /// bx may replace, [`Error::State`] when the prior bytes cannot be stored or
-    /// recorded, [`Error::Io`] when the journal cannot be appended to, and
-    /// [`Error::Poisoned`] when an earlier write in this session failed.
+    /// [`Error::Misplaced`] when the request's destination is not where its
+    /// target renders, [`Error::Write`] when the destination cannot be written
+    /// or is not a file bx may replace, [`Error::State`] when the prior bytes
+    /// cannot be stored or recorded, [`Error::Io`] when the journal cannot be
+    /// appended to, and [`Error::Poisoned`] when an earlier write in this
+    /// session failed.
     pub fn apply(&mut self, request: Request) -> Result<(), Error> {
         if self.poisoned {
             return Err(self.poisoned_error());
@@ -917,6 +996,10 @@ impl Session {
             mode,
             ownership,
         } = request;
+        if let Err(e) = self.admit(&target, &dest) {
+            self.poisoned = true;
+            return Err(e);
+        }
         self.crash.reached(index, Phase::BeforeStage);
         let applied = match content {
             Content::Bytes(bytes) => self.write(index, target, dest, &bytes, mode, &ownership),
@@ -927,6 +1010,22 @@ impl Session {
             return Err(e);
         }
         self.written += 1;
+        Ok(())
+    }
+
+    /// Refuse a request no journal bx believes could describe.
+    ///
+    /// [`load`] refuses a journal whose intent's destination is not where its
+    /// target renders, so a session never writes one.
+    fn admit(&self, target: &Portable, dest: &Path) -> Result<(), Error> {
+        let rendered = target.render(&self.home);
+        if dest != rendered {
+            return Err(Error::Misplaced {
+                target: target.clone(),
+                dest: dest.to_path_buf(),
+                rendered,
+            });
+        }
         Ok(())
     }
 
@@ -2297,6 +2396,33 @@ pub(crate) mod tests {
         ];
         raw_journal(&path, &records);
         assert_eq!(load(&path).expect("load"), Loaded::Unterminated(records));
+    }
+
+    #[test]
+    fn a_request_whose_destination_is_not_where_its_target_renders_is_refused() {
+        // Review round 3, item 2. The loader refuses such a journal, so a
+        // session that wrote one would leave an interruption nothing recovers.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut request = write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE);
+        request.dest = home.child(".elsewhere");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let refused = session.apply(request).expect_err("refused");
+        assert!(matches!(refused, Error::Misplaced { .. }), "got {refused}");
+        assert!(!home.child(".elsewhere").exists());
+        assert!(!home.child(".conf").exists());
+        assert!(matches!(
+            session.apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)),
+            Err(Error::Poisoned { .. }),
+        ));
+        drop(session);
+        assert_eq!(
+            load(&state.journal()).expect("load").intents().count(),
+            0,
+            "nothing was journalled",
+        );
     }
 
     #[test]

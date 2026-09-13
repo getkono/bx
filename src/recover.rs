@@ -78,8 +78,12 @@ pub enum Error {
     /// A destination could not be read or written.
     #[error(transparent)]
     Write(#[from] fs::Error),
-    /// The journal records a write with no session header before it, so the
-    /// home its paths were rendered against is unknown.
+    /// A terminated journal has no session header, so the home its paths were
+    /// rendered against is unknown.
+    ///
+    /// Not reachable from a journal on disk, which [`journal::load`] refuses
+    /// when its first frame is not its header; kept so that a terminated
+    /// journal without one could only ever be refused, never rolled back.
     #[error("the journal {} records a write with no session header", .path.display())]
     Headless {
         /// The journal.
@@ -410,12 +414,19 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         intents.reverse();
     }
     for (intent, landed) in intents {
-        // A temporary file the journal names is this write's, whatever is
-        // decided below. One it does not name is never touched.
-        if !complete && let Some(temp) = &intent.temp {
+        let (step, report) = decide(state, intent, home, ledger.as_deref(), landed)?;
+        // A temporary file the journal names is this write's, and goes once
+        // recovery is acting on the write at all: a blocked write is not
+        // recovery's to touch, its temporary file included. The loader has
+        // already refused a journal whose temporary file is not a `.bx-` file
+        // beside its destination, and one the journal does not name is never
+        // touched.
+        if !complete
+            && !matches!(step, Step::Blocked)
+            && let Some(temp) = &intent.temp
+        {
             journal::unlink(temp)?;
         }
-        let (step, report) = decide(state, intent, home, ledger.as_deref(), landed)?;
         match step {
             Step::Blocked => {
                 conflicts.push(report);
@@ -1676,7 +1687,7 @@ mod tests {
     }
 
     #[test]
-    fn a_terminated_journal_that_records_a_write_with_no_header_is_an_error() {
+    fn a_journal_that_records_a_write_with_no_header_is_set_aside_not_replayed() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         state.ensure().expect("ensure");
@@ -1699,12 +1710,17 @@ mod tests {
                 Record::End(End { written: 1 }),
             ],
         );
+        let bytes = std::fs::read(state.journal()).expect("the journal");
 
-        let err = pending(&state).expect_err("the report refuses it just as recovery does");
-        assert!(matches!(err, Error::Headless { .. }), "got {err}");
-        let err = recover(&state).expect_err("a headless journal cannot be replayed");
-        assert!(matches!(err, Error::Headless { .. }), "got {err}");
-        assert!(state.journal().exists());
+        // No header, so no home to check a single stored path against: bytes bx
+        // never wrote, for a report and for recovery alike.
+        assert!(pending(&state).expect("pending").is_none());
+        assert_eq!(recover(&state).expect("recover"), Outcome::Nothing);
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&state.journal())).expect("kept"),
+            bytes,
+        );
+        assert!(!state.journal().exists());
     }
 
     #[test]
@@ -2041,6 +2057,162 @@ mod tests {
         }
         assert_eq!(SessionKind::Apply.to_string(), "apply");
         assert_eq!(SessionKind::Restore.to_string(), "restore");
+    }
+
+    /// An intent to create `rel` under `home`, as a session would journal it.
+    fn intent_for(home: &Path, rel: &str) -> Intent {
+        let (target, dest) = target(home, rel);
+        Intent {
+            target,
+            dest,
+            temp: None,
+            before: Prior::Absent,
+            after: Written::Present {
+                digest: ContentHash::of(b"bx\n"),
+                mode: Mode::DEFAULT_FILE,
+            },
+            created_dirs: Vec::new(),
+            mechanism: Some(Mechanism::Own),
+            ledger_written: None,
+        }
+    }
+
+    #[test]
+    fn a_journal_whose_paths_are_not_its_targets_is_set_aside_and_touches_nothing() {
+        // Review round 3, item 2. Each of these was believed: rollback acted on
+        // the stored destination, temporary file and created directories with
+        // nothing tying them to the intent's target, and a journal with no
+        // header was checked against nothing at all.
+        let guard = guarded_home();
+        let evil = b"EVIL\n";
+        let reference = RestoreRef {
+            digest: ContentHash::of(evil),
+            mode: Mode::DEFAULT_FILE,
+            len: 5,
+        };
+        let theirs = Written::Present {
+            digest: ContentHash::of(b"theirs\n"),
+            mode: Mode::DEFAULT_FILE,
+        };
+        for case in [
+            "a destination outside the home",
+            "a destination that is another file",
+            "a temporary file that is the user's",
+            "a bx temporary file in another directory",
+            "a created directory that is not a parent",
+            "a created directory that is the home",
+            "no header",
+        ] {
+            let root = guard.child(case.replace(' ', "-"));
+            let home = root.join("home");
+            let state = StateDir::resolve(&home);
+            state.ensure().expect("ensure");
+            std::fs::write(state.restore().join(reference.blob_name()), evil).expect("a blob");
+            let outside = root.join("outside/victim.conf");
+            let victim = home.join(".victim.conf");
+            let stray = home.join("sub/.bx-theirs");
+            let empty = home.join("empty");
+            for file in [&outside, &victim, &stray] {
+                plant_file(file, "theirs\n", Mode::DEFAULT_FILE);
+            }
+            std::fs::create_dir_all(&empty).expect("the user's empty directory");
+
+            let mut intent = intent_for(&home, ".conf");
+            match case {
+                "a destination outside the home" => {
+                    intent.dest.clone_from(&outside);
+                    intent.before = Prior::Existed(reference.clone());
+                    intent.after = theirs;
+                }
+                "a destination that is another file" => {
+                    intent.dest.clone_from(&victim);
+                    intent.after = theirs;
+                }
+                "a temporary file that is the user's" => intent.temp = Some(victim.clone()),
+                "a bx temporary file in another directory" => intent.temp = Some(stray.clone()),
+                "a created directory that is not a parent" => {
+                    intent.created_dirs = vec![empty.clone()];
+                }
+                "a created directory that is the home" => intent.created_dirs = vec![home.clone()],
+                _ => {
+                    intent = intent_for(&home, ".victim.conf");
+                    intent.after = theirs;
+                }
+            }
+            let records = if case == "no header" {
+                vec![Record::Intent(intent)]
+            } else {
+                vec![
+                    Record::Begin(Begin {
+                        kind: SessionKind::Apply,
+                        home: home.clone(),
+                        scope: Vec::new(),
+                    }),
+                    Record::Intent(intent),
+                ]
+            };
+            raw_journal(&state.journal(), &records);
+            let bytes = std::fs::read(state.journal()).expect("the journal");
+
+            assert_eq!(
+                crate::journal::load(&state.journal()).expect("load"),
+                Loaded::Unreadable { moved_to: None },
+                "{case}",
+            );
+            assert!(pending(&state).expect("pending").is_none(), "{case}");
+            assert_eq!(
+                recover(&state).expect("recover"),
+                Outcome::Nothing,
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read(StateDir::quarantine(&state.journal())).expect("kept"),
+                bytes,
+                "{case}",
+            );
+            for file in [&outside, &victim, &stray] {
+                assert_eq!(
+                    peek(file).map(|(bytes, _)| bytes),
+                    Some(b"theirs\n".to_vec()),
+                    "{case}: {} was touched",
+                    file.display(),
+                );
+            }
+            assert!(
+                empty.is_dir(),
+                "{case}: the user's empty directory was removed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocked_write_keeps_its_temporary_file() {
+        // Review round 3, item 2: the temporary file was unlinked before the
+        // decision, so a blocked write lost it on every re-run.
+        let guard = guarded_home();
+        let home = guard.child("crashed");
+        plant_crash_fixture(&home);
+        assert!(!spawn_crash_child(&home, 0, "after-intent").status.success());
+        let state = StateDir::resolve(&home);
+        let temp = crate::journal::load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .expect("one intent")
+            .temp
+            .clone()
+            .expect("a staged temp file");
+        plant_file(
+            &home.join(".bxrc"),
+            "edited after the crash\n",
+            Mode::PRIVATE_FILE,
+        );
+
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::Blocked { .. }
+        ));
+        assert!(temp.is_file(), "a blocked write is not recovery's to touch");
     }
 
     #[test]

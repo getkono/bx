@@ -361,28 +361,16 @@ pub fn before_writing(state: &StateDir) -> Result<Outcome, Error> {
 /// # Errors
 ///
 /// [`Error::State`] when the lock cannot be taken and [`Error::Journal`] when
-/// the journal cannot be moved.
+/// the journal cannot be moved — including
+/// [`journal::Error::AsideOccupied`] when a journal abandoned earlier still
+/// holds the name, which is refused rather than overwritten.
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
     let _lock = ExclusiveLock::acquire(state)?;
     let path = state.journal();
     if !path.exists() {
         return Ok(None);
     }
-    let aside = StateDir::quarantine(&path);
-    // Opened before the rename, as `journal::unlink` opens before its unlink: in
-    // a directory that can be written but not read, an open placed after the
-    // rename fails with the journal already moved aside.
-    let dir = path
-        .parent()
-        .map(|dir| journal::open_dir(dir).map(|handle| (dir, handle)))
-        .transpose()?;
-    std::fs::rename(&path, &aside).map_err(|source| journal::Error::Io {
-        path: path.clone(),
-        source,
-    })?;
-    if let Some((dir, handle)) = &dir {
-        journal::sync_dir(handle, dir)?;
-    }
+    let aside = journal::set_aside(&path)?;
     tracing::warn!(
         path = %path.display(),
         moved_to = %aside.display(),
@@ -2226,6 +2214,50 @@ mod tests {
         let outcome = recover(&state).expect("recover");
         assert_eq!(outcome, Outcome::RolledBack { undone: 1 });
         assert_eq!(peek(&dest).expect("rolled back").0, b"B0\n");
+    }
+
+    #[test]
+    fn abandoning_twice_refuses_rather_than_overwrite_the_first_set_aside_journal() {
+        // Review round 3, item 5. The set-aside name is fixed, and the second
+        // abandon renamed its journal over the first.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut kept = Vec::new();
+        for rel in [".one", ".two"] {
+            let dest = home.child(rel);
+            plant_file(&dest, "orig\n", Mode::DEFAULT_FILE);
+            interrupted(
+                &state,
+                home.path(),
+                vec![write_to(home.path(), rel, "bx\n", Mode::DEFAULT_FILE)],
+            );
+            plant_file(&dest, "user edit\n", Mode::DEFAULT_FILE);
+            assert!(matches!(
+                recover(&state).expect("recover"),
+                Outcome::Blocked { .. }
+            ));
+            kept.push(std::fs::read(state.journal()).expect("the journal"));
+            if kept.len() == 1 {
+                abandon(&state).expect("abandon").expect("set aside");
+            }
+        }
+
+        let refused = abandon(&state).expect_err("the name is taken");
+        assert!(
+            matches!(
+                refused,
+                Error::Journal(journal::Error::AsideOccupied { .. })
+            ),
+            "got {refused}"
+        );
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&state.journal())).expect("the first"),
+            kept[0],
+        );
+        assert_eq!(
+            std::fs::read(state.journal()).expect("the second, in place"),
+            kept[1],
+        );
     }
 
     #[test]

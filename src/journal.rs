@@ -204,6 +204,23 @@ pub enum Error {
         /// The target written twice.
         target: Portable,
     },
+    /// A journal was to be set aside, and the name it is set aside under
+    /// already holds a journal set aside earlier.
+    ///
+    /// Refused rather than renamed over: that earlier file may be the only
+    /// record of an interrupted session. Moving it is the user's call.
+    #[error(
+        "cannot set aside {}: {} already holds a journal set aside earlier; \
+         move that file somewhere else and run bx again",
+        .path.display(),
+        .aside.display()
+    )]
+    AsideOccupied {
+        /// The journal that was to be set aside, still in place.
+        path: PathBuf,
+        /// The name it would have taken.
+        aside: PathBuf,
+    },
     /// The state directory failed.
     #[error(transparent)]
     State(#[from] crate::state::Error),
@@ -366,8 +383,8 @@ pub enum Loaded {
     /// It carries no information, so there is nothing to recover and nothing
     /// recovery could damage, and the caller treats this exactly as
     /// [`Loaded::Absent`]. [`load_exclusive`] moves the bytes aside — never
-    /// deletes them — and [`load`], which runs without the lock, leaves them
-    /// where they are. What the write may have completed is then recomputed by
+    /// deletes them, and never over a journal set aside earlier — and [`load`],
+    /// which runs without the lock, leaves them where they are. What the write may have completed is then recomputed by
     /// `plan`, which reports a file bx wrote but never recorded as a conflict:
     /// skipped, never overwritten.
     Unreadable {
@@ -481,11 +498,13 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
 ///
 /// # Errors
 ///
-/// As [`load`].
+/// As [`load`], and [`Error::AsideOccupied`] for an unreadable journal whose
+/// set-aside name is already taken: the journal is left in place, and so is
+/// what holds the name.
 pub fn load_exclusive(path: &Path, _lock: &ExclusiveLock) -> Result<Loaded, Error> {
     Ok(match inspect(path)? {
         Ok(loaded) => loaded,
-        Err(why) => quarantine(path, why),
+        Err(why) => quarantine(path, why)?,
     })
 }
 
@@ -688,9 +707,13 @@ fn frame(bytes: &[u8], at: usize) -> Result<(Record, usize), Damage> {
 }
 
 /// Move a journal that carries no information aside, and say so.
-fn quarantine(path: &Path, why: &str) -> Loaded {
-    let aside = StateDir::quarantine(path);
-    match std::fs::rename(path, &aside) {
+///
+/// # Errors
+///
+/// [`Error::AsideOccupied`] when the name it would take is already taken.
+fn quarantine(path: &Path, why: &str) -> Result<Loaded, Error> {
+    let aside = free_aside(path)?;
+    Ok(match std::fs::rename(path, &aside) {
         Ok(()) => {
             tracing::error!(
                 path = %path.display(),
@@ -715,7 +738,7 @@ fn quarantine(path: &Path, why: &str) -> Loaded {
             );
             Loaded::Unreadable { moved_to: None }
         }
-    }
+    })
 }
 
 /// The append-only log itself.
@@ -1427,6 +1450,56 @@ pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
         sync_dir(handle, dir)?;
     }
     Ok(())
+}
+
+/// The name a journal at `path` is set aside under, if nothing holds it yet.
+///
+/// Every caller holds the state directory's [`ExclusiveLock`], so no other bx
+/// can take the name between this check and the rename that follows it.
+///
+/// # Errors
+///
+/// [`Error::AsideOccupied`] when something is already there, and [`Error::Io`]
+/// when whether something is there cannot be told.
+pub(crate) fn free_aside(path: &Path) -> Result<PathBuf, Error> {
+    let aside = StateDir::quarantine(path);
+    match std::fs::symlink_metadata(&aside) {
+        Ok(_) => Err(Error::AsideOccupied {
+            path: path.to_path_buf(),
+            aside,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(aside),
+        Err(source) => Err(Error::Io {
+            path: aside,
+            source,
+        }),
+    }
+}
+
+/// Move a journal aside, durably, and never over one set aside earlier.
+///
+/// # Errors
+///
+/// [`Error::AsideOccupied`] when the name is taken, and [`Error::Io`] for the
+/// failing `open` of the directory, `rename` or `fsync`. Only a failing `fsync`
+/// is returned after the journal was moved.
+pub(crate) fn set_aside(path: &Path) -> Result<PathBuf, Error> {
+    let aside = free_aside(path)?;
+    // Opened before the rename, as `unlink` opens before its unlink: in a
+    // directory that can be written but not read, an open placed after the
+    // rename fails with the journal already moved aside.
+    let dir = path
+        .parent()
+        .map(|dir| open_dir(dir).map(|handle| (dir, handle)))
+        .transpose()?;
+    std::fs::rename(path, &aside).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if let Some((dir, handle)) = &dir {
+        sync_dir(handle, dir)?;
+    }
+    Ok(aside)
 }
 
 /// Remove directories bx created, deepest first, stopping at the first that is
@@ -2496,6 +2569,30 @@ pub(crate) mod tests {
         assert_eq!(
             load(&path).expect("load"),
             Loaded::Unreadable { moved_to: None }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_journal_is_never_set_aside_over_an_earlier_one() {
+        // Review round 3, item 5. The set-aside name is fixed, and opening a
+        // session renamed the unreadable journal over the earlier one.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let aside = StateDir::quarantine(&state.journal());
+        std::fs::write(&aside, b"the first").expect("a journal set aside earlier");
+        std::fs::write(state.journal(), b"GARBAGE!").expect("an unreadable journal");
+
+        let refused = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
+            .expect_err("refused");
+        assert!(
+            matches!(refused, Error::AsideOccupied { .. }),
+            "got {refused}"
+        );
+        assert_eq!(std::fs::read(&aside).expect("kept"), b"the first");
+        assert_eq!(
+            std::fs::read(state.journal()).expect("left in place"),
+            b"GARBAGE!",
         );
     }
 

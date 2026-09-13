@@ -31,9 +31,10 @@ wrong even if it passes CI.
    in delimited managed regions, or in files bx owns because the user said so.
 2. **Native locations unless the configuration declares otherwise.** Never point
    a tool at a bx-owned directory. Never move a tool's config, data, or cache
-   outside a root the configuration declares. `env_guard` enforces this on the
-   **value** a variable is given, never on the variable's name, and every
-   generated shell fragment must pass through it. Declare no root and no
+   outside a root the configuration declares. `env_guard` enforces this, and
+   every generated shell fragment must pass through it: a fragment may set only
+   variables bx knows how to judge, and each value is judged for what it is — a
+   location, a program, a search list or a setting. Declare no root and no
    relocation is allowed at all. Containment is decided lexically, never by
    touching the filesystem, because invariant 3 forbids a verdict that depends
    on what happens to exist.

@@ -41,9 +41,10 @@
 //! same atomic writer. Re-reading the table after any crash produces the same
 //! verdict, or the "nothing to do" verdict.
 //!
-//! One ordering rule makes that hold: **the journal is unlinked last**, after
-//! every step has succeeded. Crash before that and the next run repeats a
-//! recovery that converges; crash after it and there was nothing left to do.
+//! One ordering rule makes that hold: **the journal is unlinked last** — or set
+//! aside last, when bytes were discarded from it — after every step has
+//! succeeded. Crash before that and the next run repeats a recovery that
+//! converges; crash after it and there was nothing left to do.
 //!
 //! # When recovery is blocked
 //!
@@ -291,7 +292,7 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
     let complete = match loaded {
         Loaded::Absent | Loaded::Unreadable { .. } => return Ok(None),
         Loaded::Terminated(_) => true,
-        Loaded::Unterminated(_) => false,
+        Loaded::Unterminated(_) | Loaded::Torn { .. } => false,
     };
     let home = rebuild_home(&loaded, complete, &path)?;
 
@@ -386,8 +387,15 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     let complete = match loaded {
         Loaded::Absent | Loaded::Unreadable { .. } => return Ok(Outcome::Nothing),
         Loaded::Terminated(_) => true,
-        Loaded::Unterminated(_) => false,
+        Loaded::Unterminated(_) | Loaded::Torn { .. } => false,
     };
+    // A journal that lost bytes is set aside at the end rather than unlinked, so
+    // a set-aside name that is already taken refuses now, before anything is
+    // touched, rather than after the rollback.
+    let torn = matches!(loaded, Loaded::Torn { .. });
+    if torn {
+        journal::free_aside(&path)?;
+    }
     let home = rebuild_home(&loaded, complete, &path)?;
 
     // Only a terminated journal's bookkeeping touches the ledger, and it is the
@@ -466,8 +474,20 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         ledger.save()?;
     }
     // Last of all, and only once every step has succeeded. This is the rule that
-    // makes recovery re-runnable without a journal of its own.
-    journal::unlink(&path)?;
+    // makes recovery re-runnable without a journal of its own. A journal bytes
+    // were discarded from is kept: they may have been a frame that damage, not a
+    // crash, cut short, and the file is the only record of what it hid.
+    if torn {
+        let aside = journal::set_aside(&path)?;
+        tracing::warn!(
+            path = %path.display(),
+            moved_to = %aside.display(),
+            "the recovered journal ended in bytes that were not a whole frame; \
+             it was kept rather than deleted",
+        );
+    } else {
+        journal::unlink(&path)?;
+    }
 
     Ok(if complete {
         tracing::info!(
@@ -774,8 +794,8 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        crash_phases, finish_crash_phases, peek, permissions_refuse, plant_file, raw_journal, seal,
-        target, write_to,
+        crash_phases, finish_crash_phases, frame_starts, peek, permissions_refuse, plant_file,
+        raw_journal, seal, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
@@ -2258,6 +2278,121 @@ mod tests {
             std::fs::read(state.journal()).expect("the second, in place"),
             kept[1],
         );
+    }
+
+    /// A session that modified `~/.conf` and died, and its journal's bytes.
+    fn interrupted_modify(state: &StateDir, home: &Path) -> (PathBuf, Vec<u8>) {
+        let dest = home.join(".conf");
+        plant_file(&dest, "the user's original\n", Mode::DEFAULT_FILE);
+        interrupted(
+            state,
+            home,
+            vec![write_to(home, ".conf", "bx new\n", Mode::DEFAULT_FILE)],
+        );
+        (dest, std::fs::read(state.journal()).expect("the journal"))
+    }
+
+    #[test]
+    fn a_damaged_frame_length_never_loses_the_journal() {
+        // Review round 3, item 3. A length byte flipped in either frame read as
+        // a torn tail: recovery rolled back nothing and unlinked the journal,
+        // leaving the user's original only as a blob nothing named.
+        let guard = guarded_home();
+        for (case, frame) in [("the first frame", 0), ("a later frame", 1)] {
+            let home = guard.child(case.replace(' ', "-"));
+            let state = StateDir::resolve(&home);
+            let (dest, mut bytes) = interrupted_modify(&state, &home);
+            let start = frame_starts(&bytes)[frame];
+            // About 8 MiB: under the frame bound, and past the end of the file.
+            bytes[start + 2] = 0x80;
+            std::fs::write(state.journal(), &bytes).expect("damage the journal");
+
+            let report = pending(&state).expect("pending");
+            let outcome = recover(&state).expect("recover");
+            if frame == 0 {
+                assert!(report.is_none(), "{case}");
+                assert_eq!(outcome, Outcome::Nothing, "{case}: not believed");
+            } else {
+                assert_eq!(report.expect("interrupted").unfinished.len(), 0, "{case}");
+                assert_eq!(outcome, Outcome::RolledBack { undone: 0 }, "{case}");
+            }
+            assert!(!state.journal().exists(), "{case}");
+            assert_eq!(
+                std::fs::read(StateDir::quarantine(&state.journal()))
+                    .expect("set aside, never unlinked"),
+                bytes,
+                "{case}",
+            );
+            assert_eq!(peek(&dest).expect("left as it is").0, b"bx new\n", "{case}");
+        }
+    }
+
+    #[test]
+    fn a_byte_flipped_inside_a_frame_is_not_believed() {
+        // Review round 3, item 3. Without a checksum this still decoded, as the
+        // mode the rollback then put the user's original back at.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (dest, mut bytes) = interrupted_modify(&state, home.path());
+        let mode = bytes
+            .windows(8)
+            .position(|window| window == [0xa4, b'm', b'o', b'd', b'e', 0xcd, 0x01, 0xa4])
+            .expect("the prior's mode, 0o644, as MessagePack");
+        bytes[mode + 7] = 0xa5;
+        std::fs::write(state.journal(), &bytes).expect("damage the journal");
+
+        assert_eq!(
+            crate::journal::load(&state.journal()).expect("load"),
+            Loaded::Unreadable { moved_to: None },
+        );
+        assert!(pending(&state).expect("pending").is_none());
+        assert_eq!(recover(&state).expect("recover"), Outcome::Nothing);
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&state.journal())).expect("kept"),
+            bytes,
+        );
+        assert_eq!(
+            peek(&dest),
+            Some((b"bx new\n".to_vec(), Mode::DEFAULT_FILE)),
+        );
+    }
+
+    #[test]
+    fn a_torn_journal_whose_set_aside_name_is_taken_refuses_before_touching_anything() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (dest, mut bytes) = interrupted_modify(&state, home.path());
+        bytes.truncate(bytes.len() - 1);
+        std::fs::write(state.journal(), &bytes).expect("tear the last frame");
+        let aside = StateDir::quarantine(&state.journal());
+        std::fs::write(&aside, b"the first").expect("a journal set aside earlier");
+
+        let refused = recover(&state).expect_err("the name is taken");
+        assert!(
+            matches!(
+                refused,
+                Error::Journal(journal::Error::AsideOccupied { .. })
+            ),
+            "got {refused}"
+        );
+        assert_eq!(
+            peek(&dest).expect("not rolled back yet").0,
+            b"bx new\n",
+            "nothing was touched",
+        );
+        assert_eq!(std::fs::read(&aside).expect("kept"), b"the first");
+        assert_eq!(std::fs::read(state.journal()).expect("in place"), bytes);
+
+        std::fs::remove_file(&aside).expect("the user moves it");
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { undone: 1 }
+        );
+        assert_eq!(
+            peek(&dest).expect("rolled back").0,
+            b"the user's original\n"
+        );
+        assert_eq!(std::fs::read(&aside).expect("set aside"), bytes);
     }
 
     #[test]

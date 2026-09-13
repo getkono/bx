@@ -33,6 +33,11 @@
 //! `fsync` had returned, the frame is on disk; if it had not, the write it
 //! announces had not begun.
 //!
+//! Safe to discard is not safe to forget. Bytes that stop short of a whole frame
+//! are also what a damaged length looks like, and that would hide every frame
+//! after it, so a journal [`load`] discarded anything from is [`Loaded::Torn`],
+//! and recovery sets it aside rather than unlinking it.
+//!
 //! # The on-disk ledger does not move until the session ends
 //!
 //! [`crate::state::Ledger::record`] only mutates the ledger in memory, and
@@ -64,6 +69,16 @@
 //! test is exact rather than probabilistic, and a run of NUL bytes left by a
 //! filesystem cannot decode as a record.
 //!
+//! A length tells a torn frame from a whole one. It cannot tell a whole frame
+//! from a damaged one, and a byte flipped inside a MessagePack body usually
+//! still decodes — as a different mode, digest or path, which a rollback would
+//! then act on. So each frame also carries a checksum between its length and
+//! its body: the first four bytes of the SHA-256 of both. SHA-256 because the
+//! restore store already hashes with it, so nothing is added to the build; four
+//! bytes because it guards against damage, where a one-in-four-billion miss is
+//! enough. A journal written to mislead is refused by what it says, not by how
+//! it is framed.
+//!
 //! # Created through [`crate::fs::atomic`], appended to in place
 //!
 //! A journal comes into existence whole. Its header and its [`Begin`] frame are
@@ -86,8 +101,8 @@
 //! The first write in a session that returns an error *poisons* it: every later
 //! [`Session::apply`] and [`Session::finish`] is refused, so the journal stays
 //! for recovery to roll back. A failed append may have left a torn frame at the
-//! tail, and a frame appended after it would be invisible to [`load`] — an
-//! Intent recovery could never see. A failed publish leaves an Intent with no
+//! tail, and a frame appended after it would make the journal unreadable to
+//! [`load`] — an Intent recovery could never act on. A failed publish leaves an Intent with no
 //! Done, which an `End` frame and a ledger save would close out as though it
 //! had landed.
 
@@ -113,7 +128,10 @@ const FORMAT: u8 = 1;
 /// The header's width: [`MAGIC`] plus one version byte.
 const HEADER: usize = MAGIC.len() + 1;
 
-/// The widest frame that will be written or read.
+/// The width of a frame's checksum. See the module documentation.
+const CHECK: usize = 4;
+
+/// The widest frame body that will be written or read.
 ///
 /// A bound, not a budget: it is what stops four bytes of garbage from asking for
 /// a gigabyte allocation. Records hold digests, modes and paths, never file
@@ -377,11 +395,29 @@ pub enum Loaded {
     Terminated(Vec<Record>),
     /// The journal has no [`End`]: the session was interrupted.
     Unterminated(Vec<Record>),
-    /// The bytes cannot be the start of a bx journal: a wrong header, a format
-    /// this build does not know, or a whole first frame that is not a record.
+    /// The journal has no [`End`], and ends in bytes that are not a whole
+    /// frame: the session was interrupted while it appended one.
     ///
-    /// It carries no information, so there is nothing to recover and nothing
-    /// recovery could damage, and the caller treats this exactly as
+    /// The whole frames before them are what [`Loaded::Unterminated`] would
+    /// hold, and recovery rolls them back the same way. The difference is what
+    /// becomes of the file. A frame a crash tore announces a write that had not
+    /// begun, but bytes that stop short are also what a damaged length looks
+    /// like, and that would hide every frame after it. So once recovery is done
+    /// with a journal it discarded anything from, it sets the file aside rather
+    /// than unlinking it.
+    Torn {
+        /// The whole frames, in the order they were written.
+        records: Vec<Record>,
+        /// How many bytes after them were not a whole frame.
+        discarded: usize,
+    },
+    /// The bytes are not a journal a bx session could have written: a wrong
+    /// header or format, a first frame that is not whole, a later frame whose
+    /// checksum or decoding fails, bytes after its [`End`], or a record that
+    /// stores a path its session could not have written. See [`load`].
+    ///
+    /// It is not believed, so recovery does nothing with it, and the caller
+    /// treats this exactly as
     /// [`Loaded::Absent`]. [`load_exclusive`] moves the bytes aside — never
     /// deletes them, and never over a journal set aside earlier — and [`load`],
     /// which runs without the lock, leaves them where they are. What the write may have completed is then recomputed by
@@ -441,7 +477,9 @@ impl Loaded {
     #[must_use]
     pub fn records(&self) -> &[Record] {
         match self {
-            Self::Terminated(records) | Self::Unterminated(records) => records,
+            Self::Terminated(records)
+            | Self::Unterminated(records)
+            | Self::Torn { records, .. } => records,
             Self::Absent | Self::Unreadable { .. } => &[],
         }
     }
@@ -449,21 +487,32 @@ impl Loaded {
     /// Whether a session is unresolved: recorded, and not known to be cleared.
     #[must_use]
     pub const fn is_interrupted(&self) -> bool {
-        matches!(self, Self::Terminated(_) | Self::Unterminated(_))
+        matches!(
+            self,
+            Self::Terminated(_) | Self::Unterminated(_) | Self::Torn { .. }
+        )
     }
 }
 
 /// Read a journal, classifying anything a crash can leave behind, and move
 /// nothing.
 ///
-/// A torn *tail* frame is discarded: the ordering discipline in
+/// A torn *tail* — bytes after the last whole frame that stop short of one — is
+/// discarded and reported as [`Loaded::Torn`]: the ordering discipline in
 /// [`Session::apply`] means a frame whose `fsync` had not returned announces a
 /// write that had not begun. A file that is only a prefix of a header, or a
-/// header and a prefix of its first frame, is a session that wrote nothing —
-/// [`Loaded::Unterminated`] with no records — because a torn first frame says
-/// exactly as little as a torn tail. Only bytes that cannot be the start of a bx
-/// journal are [`Loaded::Unreadable`]: a wrong magic, a format this build does
-/// not know, or a first frame that is whole and does not decode.
+/// header alone, is a session that wrote nothing: [`Loaded::Unterminated`] with
+/// no records.
+///
+/// Everything else that is not whole frames is [`Loaded::Unreadable`]: a wrong
+/// magic or format; a first frame that is torn or damaged, which no crash
+/// leaves, because [`Journal::create`] renames the header and the first frame
+/// into place together; a later frame whose checksum or decoding fails, which a
+/// process crash does not leave either, because every append is one `write` of
+/// a whole frame at the end of the file; and bytes after an [`End`]. A
+/// filesystem that zero-fills an unsynced tail after a power loss can leave the
+/// third, and that journal is set aside with the rest: damage bx cannot place is
+/// not believed, even where believing it would have been right.
 ///
 /// This is the read [`crate::recover::pending`] makes without the state lock,
 /// so it never renames, unlinks or writes: the journal it is looking at may
@@ -540,22 +589,33 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
 
     let mut records = Vec::new();
     let mut at = HEADER;
+    let mut discarded = 0;
     while at < bytes.len() {
         match frame(&bytes, at) {
             Ok((record, next)) => {
                 records.push(record);
                 at = next;
             }
-            // A first frame that is all there and still not a record is not a
-            // write a crash cut short: it is bytes bx never wrote.
-            Err(Damage::Invalid) if records.is_empty() => {
-                return Ok(Err("no record decodes where the first frame should be"));
+            // The header and the first frame are renamed into place together,
+            // so no crash leaves the one without the other whole.
+            Err(_) if records.is_empty() => {
+                return Ok(Err("its first frame is not a whole record"));
             }
-            Err(_) => {
-                tracing::debug!(
+            // Every append is one write of a whole frame at the end of the file,
+            // so a crash only ever cuts the last frame short. A whole frame that
+            // is not what bx wrote is damage, and it may be hiding what follows.
+            Err(Damage::Invalid) => return Ok(Err("a frame after its first is damaged")),
+            Err(Damage::Torn) if matches!(records.last(), Some(Record::End(_))) => {
+                return Ok(Err("bytes follow the end of its session"));
+            }
+            Err(Damage::Torn) => {
+                discarded = bytes.len() - at;
+                tracing::warn!(
                     path = %path.display(),
-                    discarded = bytes.len() - at,
-                    "discarding a torn trailing journal frame",
+                    discarded,
+                    "the write-ahead journal ends in a torn frame; the whole frames \
+                     before it are kept, and the file is set aside rather than \
+                     deleted once it is recovered",
                 );
                 break;
             }
@@ -568,6 +628,8 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
 
     Ok(Ok(if matches!(records.last(), Some(Record::End(_))) {
         Loaded::Terminated(records)
+    } else if discarded > 0 {
+        Loaded::Torn { records, discarded }
     } else {
         Loaded::Unterminated(records)
     }))
@@ -675,35 +737,54 @@ fn misplaced(intent: &Intent, home: &Path) -> Option<&'static str> {
 
 /// Why there is no whole record at an offset.
 enum Damage {
-    /// The bytes stop before the frame does: a write a crash cut short.
+    /// The bytes stop before the frame does: a write a crash cut short, or a
+    /// length that was damaged.
     Torn,
-    /// The frame is all there, and it is not a record.
+    /// The frame is all there, and it is not what bx wrote: its checksum or its
+    /// decoding fails, or its length is past the bound.
     Invalid,
 }
 
-/// Decode the frame at `at`.
+/// Decode the frame at `at`: a little-endian `u32` length, a [`CHECK`]-byte
+/// checksum, and a MessagePack body of that length.
 fn frame(bytes: &[u8], at: usize) -> Result<(Record, usize), Damage> {
     let prefix_end = at.checked_add(size_of::<u32>()).ok_or(Damage::Invalid)?;
+    let body_start = prefix_end.checked_add(CHECK).ok_or(Damage::Invalid)?;
     let prefix: [u8; 4] = bytes
         .get(at..prefix_end)
         .ok_or(Damage::Torn)?
         .try_into()
         .map_err(|_| Damage::Torn)?;
+    let sum = bytes.get(prefix_end..body_start).ok_or(Damage::Torn)?;
     let len = usize::try_from(u32::from_le_bytes(prefix)).map_err(|_| Damage::Invalid)?;
     // Past the bound is garbage however many bytes follow, and is what stops four
     // bytes of garbage asking for a gigabyte.
     //
-    // A zero length has no test of its own. An encoded record is at least one
-    // byte, so a zero-length body is an empty slice, and an empty slice never
-    // decodes: a run of NUL bytes is `Invalid` through the decode below, which
-    // `a_run_of_nul_bytes_is_not_a_valid_frame` pins.
+    // A zero length has no test of its own. An empty body's checksum is not four
+    // NUL bytes, and an empty slice never decodes, so a run of NUL bytes is
+    // `Invalid` twice over, which `a_run_of_nul_bytes_is_not_a_valid_frame` pins.
     if len > MAX_FRAME {
         return Err(Damage::Invalid);
     }
-    let end = prefix_end.checked_add(len).ok_or(Damage::Invalid)?;
-    let body = bytes.get(prefix_end..end).ok_or(Damage::Torn)?;
+    let end = body_start.checked_add(len).ok_or(Damage::Invalid)?;
+    let body = bytes.get(body_start..end).ok_or(Damage::Torn)?;
+    if checksum(prefix, body).as_slice() != sum {
+        return Err(Damage::Invalid);
+    }
     let record = rmp_serde::from_slice::<Record>(body).map_err(|_| Damage::Invalid)?;
     Ok((record, end))
+}
+
+/// The checksum a frame carries: the first [`CHECK`] bytes of the SHA-256 of its
+/// length prefix and its body.
+fn checksum(prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(prefix);
+    hasher.update(body);
+    let mut sum = [0; CHECK];
+    sum.copy_from_slice(&hasher.finalize()[..CHECK]);
+    sum
 }
 
 /// Move a journal that carries no information aside, and say so.
@@ -825,16 +906,18 @@ impl Journal {
     }
 }
 
-/// One record as a frame: its length as a little-endian `u32`, then its
-/// MessagePack encoding.
+/// One record as a frame: its length as a little-endian `u32`, its checksum,
+/// then its MessagePack encoding.
 fn encode(record: &Record) -> Result<Vec<u8>, Error> {
     let payload = rmp_serde::to_vec_named(record).map_err(|source| Error::Encode { source })?;
     let len = u32::try_from(payload.len())
         .ok()
         .filter(|_| payload.len() <= MAX_FRAME)
         .ok_or(Error::FrameTooLarge { len: payload.len() })?;
-    let mut frame = Vec::with_capacity(size_of::<u32>() + payload.len());
-    frame.extend_from_slice(&len.to_le_bytes());
+    let prefix = len.to_le_bytes();
+    let mut frame = Vec::with_capacity(size_of::<u32>() + CHECK + payload.len());
+    frame.extend_from_slice(&prefix);
+    frame.extend_from_slice(&checksum(prefix, &payload));
     frame.extend_from_slice(&payload);
     Ok(frame)
 }
@@ -1733,10 +1816,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nul_bytes_after_a_whole_frame_end_the_log_rather_than_decoding() {
+    fn nul_bytes_after_a_whole_frame_make_the_journal_unreadable() {
+        // A process crash never leaves them: every append is one write of a
+        // whole frame. A filesystem that zero-fills an unsynced tail after a
+        // power loss can, and damage bx cannot place is set aside, not trusted.
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("journal.mpk");
-        let begin = Record::Begin(some_begin());
         drop(Journal::create(&path, some_begin()).expect("create"));
 
         let mut bytes = std::fs::read(&path).expect("read");
@@ -1745,7 +1830,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             load(&path).expect("load"),
-            Loaded::Unterminated(vec![begin])
+            Loaded::Unreadable { moved_to: None }
         );
     }
 
@@ -1863,19 +1948,26 @@ pub(crate) mod tests {
             std::fs::write(&path, &whole[..cut]).expect("write");
             let loaded = load(&path).expect("load");
 
-            // Short of the first whole frame, inside the header or inside the
-            // Begin, is a session that wrote nothing rather than damage.
+            // A cut inside the header is a session that wrote nothing. A cut
+            // inside the Begin is damage no crash leaves, because the journal is
+            // created whole. A cut anywhere later keeps every whole frame, and
+            // says how much it discarded.
             let kept: usize = boundaries.iter().filter(|end| **end <= cut).count();
-            assert_eq!(
-                loaded.records(),
-                &records[..kept],
-                "cut at {cut} should keep exactly {kept} whole frame(s)",
-            );
-            assert_eq!(
-                matches!(loaded, Loaded::Terminated(_)),
-                kept == records.len(),
-                "cut at {cut} is terminated only once the End frame is whole",
-            );
+            let expected = if cut <= HEADER {
+                Loaded::Unterminated(Vec::new())
+            } else if kept == 0 {
+                Loaded::Unreadable { moved_to: None }
+            } else if kept == records.len() {
+                Loaded::Terminated(records.to_vec())
+            } else if boundaries[kept - 1] == cut {
+                Loaded::Unterminated(records[..kept].to_vec())
+            } else {
+                Loaded::Torn {
+                    records: records[..kept].to_vec(),
+                    discarded: cut - boundaries[kept - 1],
+                }
+            };
+            assert_eq!(loaded, expected, "cut at {cut}");
         }
     }
 
@@ -2662,7 +2754,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_torn_first_frame_is_an_empty_interrupted_session_not_corruption() {
+    fn a_torn_header_is_an_empty_session_and_a_torn_first_frame_is_set_aside() {
         let dir = tempfile::tempdir().expect("a tempdir");
         let state = StateDir::new(dir.path().join("state"));
         let lock = ExclusiveLock::acquire(&state).expect("lock");
@@ -2670,18 +2762,30 @@ pub(crate) mod tests {
         drop(Journal::create(&whole, some_begin()).expect("create"));
         let bytes = std::fs::read(&whole).expect("read");
 
-        // Every cut short of the first whole frame: inside the header, inside
-        // the frame's length prefix, and inside its body.
+        // Every cut short of the first whole frame. Inside the header it is a
+        // session that wrote nothing. Past the header it is damage: the header
+        // and the first frame are renamed into place together, so no crash
+        // leaves the one without the other whole.
         for cut in 0..bytes.len() {
             let path = state.root().join(format!("torn-{cut}.mpk"));
             std::fs::write(&path, &bytes[..cut]).expect("write");
-            assert_eq!(
-                load_exclusive(&path, &lock).expect("load"),
-                Loaded::Unterminated(Vec::new()),
-                "a cut at {cut} is a session that wrote nothing",
-            );
-            assert!(path.is_file(), "a cut at {cut} stays in place");
-            assert!(!StateDir::quarantine(&path).exists());
+            let aside = StateDir::quarantine(&path);
+            let loaded = load_exclusive(&path, &lock).expect("load");
+            if cut <= HEADER {
+                assert_eq!(loaded, Loaded::Unterminated(Vec::new()), "a cut at {cut}");
+                assert!(path.is_file(), "a cut at {cut} stays in place");
+                assert!(!aside.exists());
+            } else {
+                assert_eq!(
+                    loaded,
+                    Loaded::Unreadable {
+                        moved_to: Some(aside.clone())
+                    },
+                    "a cut at {cut}",
+                );
+                assert!(!path.exists(), "a cut at {cut} is set aside");
+                assert_eq!(std::fs::read(&aside).expect("kept"), &bytes[..cut]);
+            }
         }
     }
 
@@ -2734,9 +2838,12 @@ pub(crate) mod tests {
         torn.extend_from_slice(&whole[after_torn..]);
         std::fs::write(&path, &torn).expect("write");
 
+        // With a checksum on every frame the loader also sees that what follows
+        // the torn frame is not a frame: the later one stays invisible, and the
+        // journal is unreadable rather than silently short.
         assert_eq!(
-            load(&path).expect("load").records(),
-            &[Record::Begin(some_begin())],
+            load(&path).expect("load"),
+            Loaded::Unreadable { moved_to: None }
         );
     }
 
@@ -2940,6 +3047,41 @@ pub(crate) mod tests {
             home: PathBuf::from("/home/someone"),
             scope: Vec::new(),
         }
+    }
+
+    /// Where each whole frame in a journal's bytes starts.
+    pub(crate) fn frame_starts(bytes: &[u8]) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut at = HEADER;
+        while let Ok((_, next)) = frame(bytes, at) {
+            starts.push(at);
+            at = next;
+        }
+        starts
+    }
+
+    #[test]
+    fn every_frame_carries_a_checksum_of_its_length_and_body() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let path = dir.path().join("journal.mpk");
+        drop(Journal::create(&path, some_begin()).expect("create"));
+        let bytes = std::fs::read(&path).expect("read");
+
+        let prefix: [u8; 4] = bytes[HEADER..HEADER + 4].try_into().expect("a length");
+        let body = &bytes[HEADER + 4 + CHECK..];
+        assert_eq!(
+            usize::try_from(u32::from_le_bytes(prefix)).expect("small"),
+            body.len()
+        );
+        assert_eq!(
+            &bytes[HEADER + 4..HEADER + 4 + CHECK],
+            checksum(prefix, body)
+        );
+        let mut whole = [0; 32];
+        whole.copy_from_slice(&<sha2::Sha256 as sha2::Digest>::digest(
+            [prefix.as_slice(), body].concat(),
+        ));
+        assert_eq!(checksum(prefix, body), whole[..CHECK]);
     }
 
     /// Write a journal exactly as given: a header, then each record as a frame.

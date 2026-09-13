@@ -303,7 +303,22 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
     // holds, exactly as its rebuild does. Every state file is replaced by
     // rename, so this read needs no lock.
     let ledger = match home {
-        Some(home) => Some(LedgerView::read(state, home)?.value),
+        // A mis-spelled home is `Error::ForeignPath` and stops the report, as
+        // it stops the recovery. A damaged ledger is only reported here: a
+        // reader without the lock moves nothing, and the recovery that holds
+        // the lock quarantines it and rebuilds into an empty ledger, which is
+        // the ledger this report judges against too.
+        Some(home) => {
+            let read = LedgerView::read(state, home)?;
+            if let Some(damage) = read.health.damage() {
+                tracing::warn!(
+                    ?damage,
+                    "the ledger is damaged; it is left in place, and the next writing bx run \
+                     moves it aside before recovering",
+                );
+            }
+            Some(read.value)
+        }
         None => None,
     };
     let mut unfinished = Vec::new();
@@ -2236,6 +2251,104 @@ mod tests {
         let outcome = recover(&state).expect("recover");
         assert_eq!(outcome, Outcome::RolledBack { undone: 1 });
         assert_eq!(peek(&dest).expect("rolled back").0, b"B0\n");
+    }
+
+    #[test]
+    fn recovery_under_another_spelling_of_the_home_refuses_and_moves_nothing() {
+        // Stack integration of #7's round 3: a ledger storing a path the home
+        // cannot use is `Error::ForeignPath`, never a reset. A terminated
+        // journal's rebuild opens the ledger under the lock with the journal's
+        // home, so it must stop there with the ledger and the journal in place.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let alias = home.child("alias");
+        std::os::unix::fs::symlink(home.path(), &alias).expect("alias");
+        plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+        seal(&state.journal(), 1);
+        {
+            // The ledger as a run under the other spelling left it: a target it
+            // named absolutely, which this spelling folds into its home.
+            let lock = ExclusiveLock::acquire(&state).expect("lock");
+            let mut ledger = Ledger::open(&state, &lock, &alias).expect("open").value;
+            let key = Portable::from_path(&home.child(".foo"), &alias).expect("portable");
+            assert!(key.as_str().starts_with('/'), "{key}");
+            ledger
+                .record(NewEntry::new(
+                    key,
+                    ContentHash::of(b"bx"),
+                    Mode::DEFAULT_FILE,
+                    Mechanism::Own,
+                ))
+                .expect("record");
+            ledger.save().expect("save");
+        }
+        let ledger = std::fs::read(state.ledger()).expect("the ledger");
+        let journal = std::fs::read(state.journal()).expect("the journal");
+        let dest = peek(&home.child(".conf"));
+
+        let foreign =
+            |err: &Error| matches!(err, Error::State(crate::state::Error::ForeignPath { .. }));
+        let err = pending(&state).expect_err("the report stops too");
+        assert!(foreign(&err), "got {err}");
+        let err = recover(&state).expect_err("a mis-spelled home stops the run");
+        assert!(foreign(&err), "got {err}");
+        let err = before_writing(&state).expect_err("and every writing command");
+        assert!(foreign(&err), "got {err}");
+
+        assert_eq!(std::fs::read(state.ledger()).expect("in place"), ledger);
+        assert_eq!(std::fs::read(state.journal()).expect("in place"), journal);
+        assert!(!StateDir::quarantine(&state.ledger()).exists());
+        assert!(!StateDir::quarantine(&state.journal()).exists());
+        assert_eq!(peek(&home.child(".conf")), dest);
+    }
+
+    #[test]
+    fn a_damaged_ledger_is_only_reported_without_the_lock_and_quarantined_under_it() {
+        // Stack integration of #7's round 3: a lockless read returns
+        // `Health::Damaged` and moves nothing; only the lock holder quarantines.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+        seal(&state.journal(), 1);
+        std::fs::write(state.ledger(), b"not a ledger").expect("damage the ledger");
+
+        let interruption = pending(&state).expect("pending").expect("interrupted");
+        assert!(interruption.complete);
+        assert!(interruption.unfinished.iter().all(|write| write.resolvable));
+        assert_eq!(
+            std::fs::read(state.ledger()).expect("left in place"),
+            b"not a ledger"
+        );
+        assert!(!StateDir::quarantine(&state.ledger()).exists());
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 }
+        );
+        assert_eq!(
+            std::fs::read(StateDir::quarantine(&state.ledger())).expect("quarantined"),
+            b"not a ledger",
+        );
+        let rebuilt = LedgerView::read(&state, home.path()).expect("read");
+        assert_eq!(rebuilt.health, crate::state::Health::Loaded);
+        assert_eq!(
+            rebuilt
+                .value
+                .get(&target(home.path(), ".conf").0)
+                .expect("the entry")
+                .written,
+            ContentHash::of(b"new\n"),
+        );
     }
 
     #[test]

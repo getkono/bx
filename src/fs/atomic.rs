@@ -81,6 +81,22 @@
 //! give a fine-grained time to a change made just after the file's times were
 //! queried, which is exactly what `observe` did.
 //!
+//! # What "restores exactly" covers
+//!
+//! The prior state is the displaced file's **bytes and its twelve mode bits**,
+//! and that is what `rm` restores. Replacing a file creates a new inode, and
+//! nothing else of the old one is carried over or recorded: not its extended
+//! attributes (`user.*`), not its POSIX ACL (`system.posix_acl_access`), and
+//! not its SELinux label, owner and group, or timestamps. A file bx replaced,
+//! and a file `rm` restored, has none of them.
+//!
+//! Deliberately. Copying an ACL onto the replacement would grant access the
+//! declared mode does not — a named-user entry survives a `0640` — and a
+//! declared mode is authoritative. Recording any of it needs a field in the
+//! ledger's prior, which belongs to the state directory rather than to the
+//! writer. `a_replaced_file_keeps_neither_its_xattrs_nor_its_acl` pins the
+//! behaviour, so changing it is a decision rather than an accident.
+//!
 //! # What the tests here do and do not establish
 //!
 //! The *observable* half is pinned throughout: the temporary file is in the
@@ -2228,6 +2244,99 @@ mod tests {
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(std::fs::read(&dest).expect("read"), b"another tool's\n");
         assert_eq!(names_in(home.path()), vec![OsString::from(".conf")]);
+    }
+
+    /// A POSIX ACL in the kernel's `system.posix_acl_access` encoding: version
+    /// 2, then `(tag, perm, id)` per entry, little-endian, sorted by tag.
+    fn posix_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut encoded = 2_u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            encoded.extend(tag.to_le_bytes());
+            encoded.extend(perm.to_le_bytes());
+            encoded.extend(id.to_le_bytes());
+        }
+        encoded
+    }
+
+    #[test]
+    fn a_replaced_file_keeps_neither_its_xattrs_nor_its_acl() {
+        // A documented exclusion from "restores exactly", pinned so that
+        // changing it is a decision: see the module documentation.
+        use rustix::fs::{XattrFlags, getxattr, setxattr};
+
+        const USER_ATTR: &str = "user.bx-test";
+        const ACL_ACCESS: &str = "system.posix_acl_access";
+        const UNDEFINED_ID: u32 = u32::MAX;
+
+        let home = guarded_home();
+        let dest = home.child(".conf");
+        seed(&dest, b"v1\n", Mode::DEFAULT_FILE);
+
+        // What this filesystem can hold decides what there is to pin. An ACL
+        // naming uid 65534 is refused with EINVAL where that uid is unmapped.
+        let has_user_attr =
+            match setxattr(dest.as_path(), USER_ATTR, b"theirs", XattrFlags::empty()) {
+                Ok(()) => true,
+                Err(e) if e == Errno::OPNOTSUPP => false,
+                Err(e) => panic!("setxattr {USER_ATTR}: {e}"),
+            };
+        let acl = posix_acl(&[
+            (0x01, 6, UNDEFINED_ID), // user::rw-
+            (0x02, 4, 65534),        // user:nobody:r--
+            (0x04, 4, UNDEFINED_ID), // group::r--
+            (0x10, 4, UNDEFINED_ID), // mask::r--
+            (0x20, 4, UNDEFINED_ID), // other::r--
+        ]);
+        let has_acl = match setxattr(dest.as_path(), ACL_ACCESS, &acl, XattrFlags::empty()) {
+            Ok(()) => true,
+            Err(e) if e == Errno::OPNOTSUPP || e == Errno::INVAL => false,
+            Err(e) => panic!("setxattr {ACL_ACCESS}: {e}"),
+        };
+        let attrs: Vec<&str> = [(USER_ATTR, has_user_attr), (ACL_ACCESS, has_acl)]
+            .into_iter()
+            .filter_map(|(name, set)| set.then_some(name))
+            .collect();
+        if attrs.is_empty() {
+            // Neither can exist here, so neither can be lost.
+            return;
+        }
+
+        let attr = |name: &str| -> Option<Vec<u8>> {
+            let mut buf = [0_u8; 256];
+            match getxattr(dest.as_path(), name, &mut buf) {
+                Ok(len) => Some(buf[..len].to_vec()),
+                Err(e) if e == Errno::NODATA => None,
+                Err(e) => panic!("getxattr {name}: {e}"),
+            }
+        };
+        for name in &attrs {
+            assert!(attr(name).is_some(), "{name} is on the user's file");
+        }
+
+        let staged = stage(&dest, Mode::DEFAULT_FILE).expect("stage");
+        let prior = staged.prior().clone();
+        staged.commit(b"bx\n").expect("commit");
+        for name in &attrs {
+            assert_eq!(
+                attr(name),
+                None,
+                "{name} is not carried onto the replacement"
+            );
+        }
+
+        // The prior is bytes and mode, so restoring from it brings the bytes
+        // and the mode back, and nothing else.
+        write_atomically(
+            &dest,
+            prior.bytes.as_deref().expect("prior bytes"),
+            prior.mode.expect("prior mode"),
+        )
+        .expect("restore");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"v1\n");
+        assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
+        for name in &attrs {
+            assert_eq!(attr(name), None, "{name} is not restored either");
+        }
     }
 
     #[test]

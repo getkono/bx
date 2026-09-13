@@ -463,6 +463,33 @@ mod tests {
     }
 
     #[test]
+    fn a_holder_is_never_read_through_a_symlink_at_the_lock_path() {
+        // Coverage review, round 5: dropping `read_holder`'s own `O_NOFOLLOW`
+        // left every lock test green. Acquisition refuses a link at the lock
+        // path when it opens it, before a refused lock reads any holder, so the
+        // reader is called on the swapped path directly: it must not report
+        // the bytes of whatever the link names.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        let err = ExclusiveLock::acquire(&dir).expect_err("a second acquisition is refused");
+        assert!(
+            matches!(&err, Error::Locked { holder, .. } if holder.pid != 0),
+            "got {err}"
+        );
+
+        let decoy = home.child("decoy");
+        std::fs::write(&decoy, "4242 impostor\n").expect("a plausible holder line");
+        std::fs::rename(dir.lock(), home.child("moved-lock")).expect("move the lock file");
+        std::os::unix::fs::symlink(&decoy, dir.lock()).expect("symlink");
+
+        let err = ExclusiveLock::acquire(&dir).expect_err("still refused");
+        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
+        assert_eq!(read_holder(&dir.lock()), Holder::unknown());
+        drop(lock);
+    }
+
+    #[test]
     fn a_second_exclusive_acquisition_is_refused() {
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());

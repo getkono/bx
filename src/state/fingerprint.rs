@@ -259,6 +259,7 @@ mod tests {
         let mut fingerprints = Fingerprints::default();
         assert!(fingerprints.set("k", Fingerprint::hashed(b"v1")).is_none());
         assert!(fingerprints.matches("k", &Fingerprint::hashed(b"v1")));
+        assert!(!fingerprints.is_empty(), "an entry exists");
 
         let previous = fingerprints.set("k", Fingerprint::hashed(b"v2"));
         assert_eq!(previous, Some(Fingerprint::hashed(b"v1")));

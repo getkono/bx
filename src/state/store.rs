@@ -943,6 +943,7 @@ mod tests {
         std::fs::write(&third, b"after a gap").expect("seed");
         for decoy in [
             "v.mpk.corrupt.01",
+            "v.mpk.corrupt.0",
             "v.mpk.corrupt.+3",
             "v.mpk.corrupt.x",
             "v.mpk.corrupt.",

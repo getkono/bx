@@ -225,7 +225,7 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
     };
     loop {
         let candidate = StateDir::quarantine_nth(path, n);
-        match rustix::fs::renameat_with(CWD, path, CWD, &candidate, RenameFlags::NOREPLACE) {
+        match rename_noreplace(path, &candidate) {
             Ok(()) => return Ok(candidate),
             Err(Errno::EXIST) => {}
             Err(Errno::INVAL) if std::fs::symlink_metadata(&candidate).is_err() => {
@@ -238,6 +238,57 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
         n = n
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("no free quarantine name"))?;
+    }
+}
+
+/// `renameat2(from, to, RENAME_NOREPLACE)`.
+///
+/// One call site, so a test can make it answer as a filesystem without the flag
+/// does — see [`noreplace_seam`] — and reach [`move_aside`]'s check-then-rename
+/// fallback, which no filesystem a test can create would exercise.
+fn rename_noreplace(from: &Path, to: &Path) -> rustix::io::Result<()> {
+    #[cfg(test)]
+    if noreplace_seam::unsupported(to) {
+        return Err(Errno::INVAL);
+    }
+    rustix::fs::renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)
+}
+
+/// A test-only, per-thread switch that makes [`rename_noreplace`] report
+/// `EINVAL`, as a filesystem that does not support `RENAME_NOREPLACE` does.
+#[cfg(test)]
+pub(crate) mod noreplace_seam {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    /// Called with each rename's destination; `true` reports `EINVAL`.
+    type Seam = Box<dyn FnMut(&Path) -> bool>;
+
+    thread_local! {
+        static SEAM: RefCell<Option<Seam>> = const { RefCell::new(None) };
+    }
+
+    /// Whether the seam installed on this thread says `RENAME_NOREPLACE` is
+    /// unsupported for `to`. With none installed, it is supported.
+    pub(super) fn unsupported(to: &Path) -> bool {
+        SEAM.with(|slot| match slot.borrow_mut().as_mut() {
+            Some(seam) => seam(to),
+            None => false,
+        })
+    }
+
+    /// Run `f` with `seam` installed on this thread, removing it afterwards
+    /// even if `f` panics.
+    pub(crate) fn with<T>(seam: impl FnMut(&Path) -> bool + 'static, f: impl FnOnce() -> T) -> T {
+        struct Remove;
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                SEAM.with(|slot| slot.borrow_mut().take());
+            }
+        }
+        SEAM.with(|slot| *slot.borrow_mut() = Some(Box::new(seam)));
+        let _remove = Remove;
+        f()
     }
 }
 
@@ -663,6 +714,58 @@ mod tests {
         assert_eq!(
             StateDir::quarantine_nth(Path::new("/s/bx/ledger.mpk"), 12),
             PathBuf::from("/s/bx/ledger.mpk.corrupt.12"),
+        );
+    }
+
+    #[test]
+    fn without_rename_noreplace_the_fallback_skips_a_taken_name_and_replaces_no_quarantine() {
+        // Coverage review, round 5: the check-then-rename fallback for a
+        // filesystem that rejects `RENAME_NOREPLACE` with `EINVAL` never ran,
+        // and both mutants of its occupied-name guard survived. The listing
+        // already counts every occupied name, so the guard matters only for a
+        // name taken between the listing and the rename: the seam reports
+        // `EINVAL` for every rename, and takes the first candidate it is
+        // offered, the way a racing writer would.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        let path = dir.path().join("v.mpk");
+        let earlier = StateDir::quarantine_nth(&path, 1);
+        std::fs::write(&earlier, b"an earlier quarantine").expect("seed");
+        std::fs::write(&path, b"damaged").expect("seed");
+
+        let raced = StateDir::quarantine_nth(&path, 2);
+        let taken = raced.clone();
+        let mut calls = 0;
+        let aside = noreplace_seam::with(
+            move |candidate| {
+                calls += 1;
+                assert!(calls <= 8, "the fallback never settled on a name");
+                if candidate == taken.as_path() && !taken.exists() {
+                    std::fs::write(&taken, b"taken after the listing").expect("race");
+                }
+                true
+            },
+            || move_aside(&path, &lock),
+        )
+        .expect("moved aside through the fallback");
+
+        assert_eq!(aside, StateDir::quarantine_nth(&path, 3));
+        assert_eq!(std::fs::read(&aside).expect("moved"), b"damaged");
+        assert_eq!(
+            std::fs::read(&raced).expect("kept"),
+            b"taken after the listing"
+        );
+        assert_eq!(
+            std::fs::read(&earlier).expect("kept"),
+            b"an earlier quarantine"
+        );
+        assert!(std::fs::symlink_metadata(&path).is_err(), "the file moved");
+
+        // Without the seam, the same directory takes the next number natively.
+        std::fs::write(&path, b"damaged again").expect("seed");
+        assert_eq!(
+            move_aside(&path, &lock).expect("moved aside"),
+            StateDir::quarantine_nth(&path, 4),
         );
     }
 

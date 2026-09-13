@@ -2602,9 +2602,12 @@ mod tests {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        assert_eq!(ledger.len(), 0);
+        assert!(ledger.is_empty());
         for name in ["~/z", "~/a", "~/m"] {
             ledger.record(entry(name, b"x")).expect("record");
         }
+        assert_eq!(ledger.len(), 3);
         let order: Vec<_> = ledger.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(order, vec!["~/a", "~/m", "~/z"]);
     }

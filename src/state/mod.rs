@@ -339,20 +339,32 @@ pub enum Error {
     /// mode reported is that file's, and it is refused only while the directory
     /// holding it can be searched by others too. A link that leads to no
     /// regular file exposes nothing here.
+    ///
+    /// The refusal judges those two modes and no ancestor, so it is
+    /// conservative: a private ancestor can already keep every other account
+    /// out. The message therefore states the modes and says the file can be
+    /// reached wherever its directories allow, never that anyone can open it,
+    /// and its remedy names the directory the link resolves to, whose mode is
+    /// the one to change.
     #[error(
-        "{} is a symbolic link to a directory users other than its owner can search (mode \
-         {mode}), and {} in it can be read or written by them (mode {file_mode}): anyone who \
-         knows its name can open it. bx will not change the mode of a directory it did not \
-         create, nor of a file you wrote. Make the file private (chmod 600 {}), or remove search \
-         permission from the directory (chmod go-x {})",
+        "{} is a symbolic link to {}, a directory whose mode lets users other than its owner \
+         search it (mode {mode}), and {} in it has a mode that lets them read or write it (mode \
+         {file_mode}), so it can be reached by other accounts wherever its directories allow. \
+         bx will not change the mode of a directory it did not create, nor of a file you wrote. \
+         Make the file private (chmod 600 {}), or remove search permission from the linked \
+         directory (chmod go-x {})",
         .path.display(),
+        .target.display(),
         .file.display(),
         .file.display(),
-        .path.display()
+        .target.display()
     )]
     ExposedLocalLayer {
         /// The linked directory.
         path: PathBuf,
+        /// The directory the link resolves to, or the link itself if it no
+        /// longer resolves by the time the refusal is reported.
+        target: PathBuf,
         /// The mode of the directory the link names.
         mode: Mode,
         /// `local.toml` inside it.

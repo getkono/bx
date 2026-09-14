@@ -471,6 +471,9 @@ fn check_local_layer(dir: &Path, mode: Mode) -> Result<(), Error> {
     if open_beyond_owner(file_mode) {
         return Err(Error::ExposedLocalLayer {
             path: dir.to_path_buf(),
+            // Resolved only once refused, for the remedy: the verdict above
+            // does not depend on it, and a link gone since stands for itself.
+            target: std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
             mode,
             file,
             file_mode,
@@ -958,7 +961,7 @@ mod tests {
             assert!(
                 matches!(
                     &err,
-                    Error::ExposedLocalLayer { path, mode, file, file_mode: found }
+                    Error::ExposedLocalLayer { path, mode, file, file_mode: found, .. }
                         if path == dir.root() && *mode == Mode::from_bits(dir_mode)
                             && *file == dir.local_toml()
                             && *found == Mode::from_bits(file_mode)
@@ -1049,7 +1052,7 @@ mod tests {
                 assert!(
                     matches!(
                         &err,
-                        Error::ExposedLocalLayer { path, mode, file, file_mode }
+                        Error::ExposedLocalLayer { path, mode, file, file_mode, .. }
                             if path == dir.root() && *mode == Mode::from_bits(0o711)
                                 && *file == dir.local_toml()
                                 && *file_mode == Mode::from_bits(0o644)
@@ -1062,6 +1065,60 @@ mod tests {
             }
             assert_eq!(mode_of(&real), Mode::from_bits(0o644), "never chmodded");
         }
+    }
+
+    #[test]
+    fn an_exposed_local_toml_behind_a_private_ancestor_is_refused_without_claiming_anyone_can_open_it()
+     {
+        // r3 round 2b (decision 47): the refusal judges only the linked
+        // directory and the file, which is conservative; but its message said
+        // "anyone who knows its name can open it", which is false when an
+        // ancestor no other account can search stands in the way.
+        let home = guarded_home();
+        let private = home.child("private");
+        let target = private.join("state");
+        std::fs::create_dir_all(&target).expect("target");
+        let file = target.join("local.toml");
+        std::fs::write(&file, "[vars]\n").expect("local.toml");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o711))
+            .expect("chmod dir");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod parent");
+        std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+        std::os::unix::fs::symlink(&target, home.child(".local/state/bx")).expect("symlink");
+        let dir = StateDir::resolve(home.path());
+        let real = std::fs::canonicalize(&target).expect("canonical target");
+
+        let err = dir.ensure().expect_err("the refusal stays");
+        assert!(
+            matches!(
+                &err,
+                Error::ExposedLocalLayer { path, target, mode, file, file_mode }
+                    if path == dir.root() && *target == real
+                        && *mode == Mode::from_bits(0o711)
+                        && *file == dir.local_toml()
+                        && *file_mode == Mode::from_bits(0o644)
+            ),
+            "got {err}",
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("anyone who knows its name can open it"),
+            "claims anyone can open it: {message}",
+        );
+        for needle in [
+            "0711".to_string(),
+            "0644".to_string(),
+            format!("chmod 600 {}", dir.local_toml().display()),
+            format!("chmod go-x {}", real.display()),
+        ] {
+            assert!(message.contains(&needle), "missing {needle:?}: {message}");
+        }
+        assert_eq!(mode_of(&target), Mode::from_bits(0o711), "never chmodded");
+        assert_eq!(mode_of(&file), Mode::from_bits(0o644), "never chmodded");
+        assert!(!target.join("restore").exists(), "nothing was put in it");
     }
 
     #[test]

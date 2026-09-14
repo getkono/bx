@@ -365,19 +365,23 @@ enum Kind {
     Setting(Setting),
 }
 
-/// The values a [`Kind::Setting`] accepts. None of them can hold a `/`, a `~`,
-/// a `:`, a blank, a URL, or `.` or `..`, so no setting names a path; they
-/// differ only in whether a bare word is admitted.
+/// The values a [`Kind::Setting`] accepts, each the shape its tool reads. None
+/// of them can hold a `/`, a `~`, a `:`, a blank, a URL, or `.` or `..`, so no
+/// setting names a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Setting {
     /// `0`, `1`, `true` or `false`, and no other word.
     Switch,
-    /// Digits, optionally followed by one of `K`, `M`, `G` or `T` — a count or
-    /// a size — and no other word.
-    Amount,
-    /// One bare word: a letter or digit, then letters, digits, `.`, `_`, `+`
-    /// and `-`. For a name whose tool reads the word as a mode or a locale.
-    Word,
+    /// A count of things: a decimal from 1 to 1024, with no leading zero.
+    Count,
+    /// A size: one to six digits with no leading zero, then exactly one of
+    /// `K`, `M`, `G` or `T`.
+    Size,
+    /// Exactly one of the listed words, as its tool spells them.
+    OneOf(&'static [&'static str]),
+    /// A locale name: one bare word — a letter or digit, then letters, digits,
+    /// `.`, `_`, `+` and `-`.
+    Locale,
 }
 
 impl Setting {
@@ -385,13 +389,23 @@ impl Setting {
     fn admits(self, value: &str) -> bool {
         match self {
             Self::Switch => matches!(value, "0" | "1" | "true" | "false"),
-            Self::Amount => {
-                let digits = value.strip_suffix(['K', 'M', 'G', 'T']).unwrap_or(value);
-                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+            Self::Count => {
+                is_decimal(value, 4) && value.parse::<u16>().is_ok_and(|count| count <= 1024)
             }
-            Self::Word => is_bare_word(value),
+            Self::Size => value
+                .strip_suffix(['K', 'M', 'G', 'T'])
+                .is_some_and(|digits| is_decimal(digits, 6)),
+            Self::OneOf(words) => words.contains(&value),
+            Self::Locale => is_bare_word(value),
         }
     }
+}
+
+/// Whether `text` is a decimal of one to `digits` digits with no leading zero.
+fn is_decimal(text: &str, digits: usize) -> bool {
+    (1..=digits).contains(&text.len())
+        && !text.starts_with('0')
+        && text.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Every variable name bx may generate, in byte order, with what it holds.
@@ -414,8 +428,9 @@ impl Setting {
 ///   program cargo runs `rustc` through.
 /// * `PATH` and `INFOPATH`, searched for programs and documents.
 /// * `SSH_AUTH_SOCK`, the running ssh agent.
-/// * `SCCACHE_CACHE_SIZE` and `MISE_JOBS` (amounts), `UV_NO_CACHE` and
-///   `MISE_VERBOSE` (switches), `CARGO_TERM_COLOR` and `LANG` (words).
+/// * `SCCACHE_CACHE_SIZE` (a size), `MISE_JOBS` (a count), `UV_NO_CACHE` and
+///   `MISE_VERBOSE` (switches), `CARGO_TERM_COLOR` (`auto`, `always` or
+///   `never`) and `LANG` (a locale).
 ///
 /// `SHELL`, `MANPATH` and `HOME` would belong here and do not: each is a
 /// [`SHELL_NAMES`] entry, which may not be assigned at all.
@@ -432,7 +447,10 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("BUN_INSTALL_CACHE_DIR", Kind::Location),
     ("CACHE_DIR", Kind::Location),
     ("CARGO_HOME", Kind::Location),
-    ("CARGO_TERM_COLOR", Kind::Setting(Setting::Word)),
+    (
+        "CARGO_TERM_COLOR",
+        Kind::Setting(Setting::OneOf(&["auto", "always", "never"])),
+    ),
     ("DATA_DIR", Kind::Location),
     ("DOTNET_CLI_HOME", Kind::Location),
     ("EDITOR", Kind::Program),
@@ -443,10 +461,10 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("HOMEBREW_LOGS", Kind::Location),
     ("HOMEBREW_TEMP", Kind::Location),
     ("INFOPATH", Kind::SearchList),
-    ("LANG", Kind::Setting(Setting::Word)),
+    ("LANG", Kind::Setting(Setting::Locale)),
     ("MISE_CACHE_DIR", Kind::Location),
     ("MISE_DATA_DIR", Kind::Location),
-    ("MISE_JOBS", Kind::Setting(Setting::Amount)),
+    ("MISE_JOBS", Kind::Setting(Setting::Count)),
     ("MISE_VERBOSE", Kind::Setting(Setting::Switch)),
     ("NPM_CONFIG_CACHE", Kind::Location),
     ("NUGET_HTTP_CACHE_PATH", Kind::Location),
@@ -457,7 +475,7 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("PNPM_CONFIG_STORE_DIR", Kind::Location),
     ("RUSTC_WRAPPER", Kind::Program),
     ("RUSTUP_HOME", Kind::Location),
-    ("SCCACHE_CACHE_SIZE", Kind::Setting(Setting::Amount)),
+    ("SCCACHE_CACHE_SIZE", Kind::Setting(Setting::Size)),
     ("SCCACHE_DIR", Kind::Location),
     ("SCRATCH_HOME", Kind::Location),
     ("SSH_AUTH_SOCK", Kind::Socket),
@@ -2817,11 +2835,11 @@ mod tests {
         // directory may legitimately live outside the scratch root, and must
         // then be covered by a root of its own rather than waved through.
         assert_eq!(emittable("SCCACHE_DIR"), Some(Kind::Location));
-        // The setting that shares its prefix is an amount, and a name that
+        // The setting that shares its prefix is a size, and a name that
         // shares it and is not in the table is not emittable at all.
         assert_eq!(
             emittable("SCCACHE_CACHE_SIZE"),
-            Some(Kind::Setting(Setting::Amount))
+            Some(Kind::Setting(Setting::Size))
         );
         assert_eq!(emittable("SCCACHE_SERVER_UDS"), None);
 
@@ -2936,8 +2954,10 @@ mod tests {
         }
         assert_eq!(
             emittable("SCCACHE_CACHE_SIZE"),
-            Some(Kind::Setting(Setting::Amount))
+            Some(Kind::Setting(Setting::Size))
         );
+        assert_eq!(emittable("MISE_JOBS"), Some(Kind::Setting(Setting::Count)));
+        assert_eq!(emittable("LANG"), Some(Kind::Setting(Setting::Locale)));
         assert_eq!(
             emittable("MISE_VERBOSE"),
             Some(Kind::Setting(Setting::Switch))
@@ -3906,8 +3926,10 @@ mod tests {
             Kind::SearchList,
             Kind::Socket,
             Kind::Setting(Setting::Switch),
-            Kind::Setting(Setting::Amount),
-            Kind::Setting(Setting::Word),
+            Kind::Setting(Setting::Count),
+            Kind::Setting(Setting::Size),
+            Kind::Setting(Setting::OneOf(&["auto", "always", "never"])),
+            Kind::Setting(Setting::Locale),
         ] {
             assert!(
                 EMITTABLE.iter().any(|(_, listed)| *listed == kind),
@@ -4040,6 +4062,12 @@ mod tests {
             ("LANG", "C.UTF-8"),
             ("LANG", "en_US.UTF-8"),
             ("LANG", "9"),
+            ("CARGO_TERM_COLOR", "auto"),
+            ("CARGO_TERM_COLOR", "never"),
+            ("MISE_JOBS", "1"),
+            ("MISE_JOBS", "1024"),
+            ("SCCACHE_CACHE_SIZE", "1K"),
+            ("SCCACHE_CACHE_SIZE", "999999T"),
         ] {
             for roots in [rooted(), RootSet::strict()] {
                 assert_eq!(
@@ -4072,6 +4100,23 @@ mod tests {
             ("CARGO_TERM_COLOR", "https://example.invalid"),
             ("LANG", "\"C UTF-8\""),
             ("LANG", "sr_RS@latin"),
+            // Each setting holds only what its tool accepts (round 6): cargo
+            // knows three colour modes, mise a job count, sccache a size with
+            // a unit.
+            ("CARGO_TERM_COLOR", "bogus"),
+            ("CARGO_TERM_COLOR", "Always"),
+            ("CARGO_TERM_COLOR", "1"),
+            ("MISE_JOBS", "4K"),
+            ("MISE_JOBS", "0"),
+            ("MISE_JOBS", "1025"),
+            ("MISE_JOBS", "99999999999999999999"),
+            ("MISE_JOBS", "08"),
+            ("SCCACHE_CACHE_SIZE", "100"),
+            ("SCCACHE_CACHE_SIZE", "0G"),
+            ("SCCACHE_CACHE_SIZE", "1000000G"),
+            ("SCCACHE_CACHE_SIZE", "010G"),
+            ("SCCACHE_CACHE_SIZE", "10g"),
+            ("SCCACHE_CACHE_SIZE", "K"),
         ] {
             assert_eq!(
                 reason_of(&check(name, value, &rooted())),

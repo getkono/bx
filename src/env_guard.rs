@@ -497,6 +497,9 @@ const INHERITED: &str = "\0";
 /// rather than a root: invariant 2's first sentence — never point a tool at a
 /// bx-owned directory — is unconditional, so it holds even inside a declared
 /// root and even when the declared root is the home. See [`RootSet::owns`].
+/// And it carries bx's config repo, which bx does not own — it is the user's
+/// committed tree — but which no tool may be pointed into either, for the same
+/// unconditional reason. See [`RootSet::with_config_repos`].
 ///
 /// Containment is decided **lexically**, never by touching the filesystem.
 /// `canonicalize` would make the verdict depend on what exists and on what is
@@ -516,6 +519,7 @@ pub struct RootSet {
     roots: Vec<PathBuf>,
     inadmissible: Vec<PathBuf>,
     owned: Vec<PathBuf>,
+    repos: Vec<PathBuf>,
 }
 
 impl RootSet {
@@ -533,6 +537,7 @@ impl RootSet {
             roots: Vec::new(),
             inadmissible: Vec::new(),
             owned: Vec::new(),
+            repos: Vec::new(),
         }
     }
 
@@ -562,11 +567,13 @@ impl RootSet {
             }
         }
         let owned = vec![paths::normalize(&layers::state_dir(&home, None))];
+        let repos = vec![paths::normalize(&paths::config_root_in(&home, None))];
         Self {
             home: Some(home),
             roots: admitted,
             inadmissible,
             owned,
+            repos,
         }
     }
 
@@ -601,6 +608,32 @@ impl RootSet {
         self
     }
 
+    /// The same set, additionally treating each of `dirs` as bx's config repo.
+    ///
+    /// The twin of [`RootSet::owning`]: [`RootSet::new`] puts the repo where
+    /// the home puts it, `~/.config/bx`, and a caller that has read an
+    /// environment's `XDG_CONFIG_HOME` passes the repo it found here. Adding,
+    /// never replacing.
+    #[must_use]
+    pub fn with_config_repos(mut self, dirs: &[PathBuf]) -> Self {
+        self.repos
+            .extend(dirs.iter().map(|dir| paths::normalize(dir)));
+        self
+    }
+
+    /// Whether `path` is bx's config repo, or lies inside it.
+    ///
+    /// The repo is committed, and safe to make public: a tool that writes
+    /// there may commit what it writes, credentials included (invariant 5),
+    /// and a program or a search-list entry there runs whatever was committed.
+    /// A set without a home treats every `.config/bx` as a repo, as
+    /// [`RootSet::owns`] does every default state directory.
+    fn in_config_repo(&self, path: &Path) -> bool {
+        let normalised = paths::normalize(path);
+        self.repos.iter().any(|dir| normalised.starts_with(dir))
+            || (self.home.is_none() && passes_through(&normalised, &[".config", "bx"]))
+    }
+
     /// Whether `path` is a directory bx owns, or lies inside one.
     ///
     /// bx's state directory holds the ledger, the fingerprints and the journal:
@@ -619,7 +652,7 @@ impl RootSet {
     pub fn owns(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);
         self.owned.iter().any(|dir| normalised.starts_with(dir))
-            || (self.home.is_none() && passes_through_a_default_state_dir(&normalised))
+            || (self.home.is_none() && passes_through(&normalised, &[".local", "state", "bx"]))
     }
 
     /// Whether `path` lies inside some declared root.
@@ -665,14 +698,17 @@ impl RootSet {
     }
 }
 
-/// Whether a normalised `path` has `.local`, `state` and `bx` as three
-/// consecutive components: the default state directory under some home.
-fn passes_through_a_default_state_dir(path: &Path) -> bool {
-    let default = [".local", "state", "bx"].map(|part| Component::Normal(OsStr::new(part)));
+/// Whether a normalised `path` has `parts` as consecutive components — so
+/// `.local`, `state`, `bx` is the default state directory under some home.
+fn passes_through(path: &Path, parts: &[&str]) -> bool {
+    let wanted: Vec<Component<'_>> = parts
+        .iter()
+        .map(|part| Component::Normal(OsStr::new(part)))
+        .collect();
     path.components()
         .collect::<Vec<_>>()
-        .windows(default.len())
-        .any(|window| window == default)
+        .windows(wanted.len())
+        .any(|window| window == wanted.as_slice())
 }
 
 /// Whether a declared root may widen the guard at all.
@@ -723,7 +759,8 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// Each names a different user action — declare a root, fix the declared root,
 /// split the line, write the line in the grammar the guard reads, use a name
 /// the shell does not manage, use a name bx may generate, move the value out of
-/// bx's own directory, move it inside a declared root, write an absolute path,
+/// bx's own directory, move it out of bx's config repo, move it inside a
+/// declared root, write an absolute path,
 /// give a program no arguments, give a setting a value it accepts, define the
 /// referenced variable earlier, fix the line
 /// that assigned it, shorten it — so a caller that only knew *which* variable
@@ -760,6 +797,10 @@ pub enum Reason {
     /// It points at a directory bx owns, whatever the roots say.
     #[error("points inside a directory bx owns")]
     BxOwnedDirectory,
+    /// It points inside bx's config repo — a committed tree, safe to make
+    /// public — whatever the roots say.
+    #[error("points inside bx's config repo, which is committed and may be public")]
+    InsideConfigRepo,
     /// It resolves to a path, but not one inside any declared root.
     #[error("resolves outside every declared root")]
     OutsideDeclaredRoots,
@@ -902,6 +943,9 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// * a **socket** is an absolute path outside bx's own directories;
 /// * a **setting** holds a value of its [`Setting`] shape.
 ///
+/// No path of any kind may lie inside bx's state directory
+/// ([`Reason::BxOwnedDirectory`]) or its config repo
+/// ([`Reason::InsideConfigRepo`]), checked in that order and before any root.
 /// A value that does not resolve cannot be shown to be any of those, and is
 /// refused for why it does not.
 ///
@@ -1091,8 +1135,9 @@ fn refuses_entry(path: &Path, roots: &RootSet) -> Option<Reason> {
         .or_else(|| (!roots.contains(path)).then_some(Reason::OutsideDeclaredRoots))
 }
 
-/// Why one resolved path may not be named at all — relative, or inside a
-/// directory bx owns — whether or not it must also lie inside a root.
+/// Why one resolved path may not be named at all — relative, inside a
+/// directory bx owns, or inside bx's config repo — whether or not it must
+/// also lie inside a root.
 fn refuses_unanchored(path: &Path, roots: &RootSet) -> Option<Reason> {
     if !path.is_absolute() {
         return Some(Reason::NotAbsolute);
@@ -1101,6 +1146,9 @@ fn refuses_unanchored(path: &Path, roots: &RootSet) -> Option<Reason> {
     // user declared widens where tools may live, never who owns bx's own state.
     if roots.owns(path) {
         return Some(Reason::BxOwnedDirectory);
+    }
+    if roots.in_config_repo(path) {
+        return Some(Reason::InsideConfigRepo);
     }
     None
 }
@@ -4092,6 +4140,87 @@ mod tests {
     }
 
     #[test]
+    fn nothing_may_point_into_bxs_config_repo() {
+        // The repo is committed, and README calls it safe to make public: a
+        // tool writing there could commit its credentials (invariant 5), and a
+        // program or a search list there runs whatever was committed.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for (name, value) in [
+            ("CARGO_HOME", "~/.config/bx/cargo"),
+            ("CARGO_HOME", "~/.config/bx"),
+            ("EDITOR", "~/.config/bx/ed"),
+            ("PATH", "~/.config/bx/bin:$PATH"),
+            ("SSH_AUTH_SOCK", "~/.config/bx/a.sock"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &home_rooted)),
+                Some(Reason::InsideConfigRepo),
+                "{name}={value}"
+            );
+        }
+        // A sibling whose name merely extends it is not the repo.
+        assert_eq!(
+            check("CARGO_HOME", "~/.config/bxtra", &home_rooted),
+            Verdict::Allowed
+        );
+        // With no home, every default repo is refused, whoever's home.
+        assert_eq!(
+            reason_of(&check("PATH", "/home/o/.config/bx/bin", &RootSet::strict())),
+            Some(Reason::InsideConfigRepo)
+        );
+        assert_eq!(
+            check("PATH", "/home/o/.config/bxtra/bin", &RootSet::strict()),
+            Verdict::Allowed
+        );
+        // A repo the environment moved is refused once the caller says so,
+        // inside a declared root, and the home's default stays refused.
+        let moved = rooted().with_config_repos(&[PathBuf::from("/var/mnt/scratch/example/cfg/bx")]);
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/mnt/scratch/example/cfg/bx/c",
+                &moved
+            )),
+            Some(Reason::InsideConfigRepo)
+        );
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/mnt/scratch/example/cfg/./bx/../bx/c",
+                &moved
+            )),
+            Some(Reason::InsideConfigRepo)
+        );
+        assert_eq!(
+            check("CARGO_HOME", "/var/mnt/scratch/example/cfg/c", &moved),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            reason_of(&check("EDITOR", "/var/home/example/.config/bx/ed", &moved)),
+            Some(Reason::InsideConfigRepo)
+        );
+        // A home of `/x` whose whole tree is a root: the repo under it is
+        // still refused.
+        let x = RootSet::new(Path::new("/x"), &[PathBuf::from("~")]);
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "/x/.config/bx/cargo", &x)),
+            Some(Reason::InsideConfigRepo)
+        );
+        assert_eq!(check("CARGO_HOME", "/x/cargo", &x), Verdict::Allowed);
+        // bx's state directory is checked first: it is the stronger claim.
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/home/example/.local/state/bx",
+                &home_rooted
+                    .clone()
+                    .with_config_repos(&[PathBuf::from("/var/home/example/.local/state/bx")])
+            )),
+            Some(Reason::BxOwnedDirectory)
+        );
+    }
+
+    #[test]
     fn bash_truncates_the_history_file_when_a_fragment_assigns_histfilesize() {
         // The mechanism behind reserving `HISTFILESIZE`: bash truncates the
         // history file the moment the name is assigned, in a non-interactive
@@ -4839,7 +4968,12 @@ mod tests {
         // bx's state directory, worked out here rather than asked of the
         // guard: under the test home, or wherever the shell's own absolute
         // `XDG_STATE_HOME` moved it.
-        let mut owned = vec![Path::new(HOME).join(".local/state/bx")];
+        // bx's config repo counts as well: a tool pointed into it writes into a
+        // committed tree, or runs what was committed there.
+        let mut owned = vec![
+            Path::new(HOME).join(".local/state/bx"),
+            Path::new(HOME).join(".config/bx"),
+        ];
         if let Some(state) = after
             .get("XDG_STATE_HOME")
             .filter(|state| Path::new(state).is_absolute())
@@ -5092,6 +5226,8 @@ mod tests {
                 RootSet::strict(),
             ),
             ("export XDG_CONFIG_HOME=~/.local/state", home_rooted.clone()),
+            // Round 6: a tool pointed into bx's config repo.
+            ("export CARGO_HOME=~/.config/bx/cargo", home_rooted.clone()),
         ];
         let bare_words: Vec<String> = R5_READ_AS_LOCATIONS
             .iter()

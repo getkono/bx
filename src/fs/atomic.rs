@@ -214,7 +214,9 @@ pub enum Error {
     /// the rename — an editor saving, a symlink swapped in, a file appearing
     /// where there was none — and by [`ensure_dir`] when a directory target is
     /// no longer what `plan` saw. Nothing is replaced: the
-    /// temporary file is removed and the path keeps what is there now.
+    /// temporary file is removed — unless its directory no longer permits
+    /// removal, when the `.bx-` file is left for recovery — and the path keeps
+    /// what is there now.
     #[error(
         "{} changed after bx looked at it ({detail}); nothing was replaced. Run plan again",
         .path.display()
@@ -1116,8 +1118,10 @@ impl Filled {
     /// [`Error::Changed`] when the destination is no longer what [`stage`]
     /// observed; nothing is replaced. [`Error::Write`] wrapping the failing
     /// `open` of the directory, `rename`, or `fsync`. The temporary file is
-    /// removed either way. Only a failing `fsync` of the directory is returned
-    /// after the destination was replaced.
+    /// removed either way, unless the directory no longer permits removal,
+    /// which also fails the rename; the `.bx-` file is then left for recovery.
+    /// Only a failing `fsync` of the directory is returned after the
+    /// destination was replaced.
     pub fn publish(self) -> Result<(), Error> {
         let Self {
             pending:
@@ -4413,17 +4417,45 @@ mod tests {
 
     #[test]
     fn a_failed_rename_syncs_no_directory() {
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so the rename is not refused.
+            return;
+        }
         let home = guarded_home();
-        let dest = home.child("f");
+        let dir = home.child("d");
+        let dest = dir.join("f");
+        seed(&dest, b"theirs", Mode::DEFAULT_FILE);
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("chmod");
         let filled = stage_now(&dest, Mode::DEFAULT_FILE)
             .expect("stage")
             .fill(b"x")
             .expect("fill");
-        std::fs::create_dir(&dest).expect("occupy");
+        let temp = filled.temp_path().to_path_buf();
+        // Read and search but no write: the directory still opens and the
+        // destination is still what stage observed, so the rename itself is
+        // the call that fails.
+        set_mode(&dir, Mode::from_bits(0o500)).expect("chmod");
 
         let (published, events) = durable::recording(|| filled.publish());
-        published.expect_err("a directory is in the way");
-        assert_eq!(events, [durable::Event::OpenDir(home.path().to_path_buf())]);
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for the assertions");
+
+        let err = published.expect_err("an unwritable directory refuses the rename");
+        let Error::Write { path, source } = &err else {
+            panic!("expected a write error, got {err:?}");
+        };
+        assert_eq!(path, &dest, "the rename's error names the destination");
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            events,
+            [durable::Event::OpenDir(dir.clone())],
+            "no rename landed and no directory was synced",
+        );
+        assert_eq!(std::fs::read(&dest).expect("read"), b"theirs");
+        assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
+        // The directory that refused the rename refused the unlink too.
+        assert!(temp.exists(), "the temporary file is left for recovery");
+        std::fs::remove_file(&temp).expect("clean up the leftover");
+        assert_eq!(names_in(&dir), vec![OsString::from("f")]);
     }
 
     #[test]

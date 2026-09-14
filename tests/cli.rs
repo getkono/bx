@@ -100,6 +100,36 @@ fn t23_plan_without_a_config_repo_exits_one_and_says_what_to_run() {
 }
 
 #[test]
+fn decision_21_a_home_spelled_with_a_parent_component_is_refused_naming_home() {
+    // P42R1-D6. A raw HOME that climbs out and back in failed every plan and
+    // apply with an error about the target's path, never about HOME.
+    let home = guarded_home();
+    seed(home.path(), A_TARGET);
+    let parent = home.path().parent().expect("the tempdir's parent");
+    let spelled = parent
+        .join("..")
+        .join(parent.file_name().expect("the parent's name"))
+        .join(home.path().file_name().expect("the home's name"));
+    let before = snapshot(home.path());
+
+    for args in [&["plan"][..], &["apply", "--yes"]] {
+        let output = bx(&spelled, args);
+
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("HOME has a `..` component"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(
+        snapshot(home.path()),
+        before,
+        "a refused HOME changed the home"
+    );
+}
+
+#[test]
 fn decision_4_apply_without_yes_and_no_terminal_exits_one_having_shown_the_plan() {
     let home = guarded_home();
     seed(home.path(), A_TARGET);

@@ -72,10 +72,11 @@ impl Env {
     ///
     /// # Errors
     ///
-    /// [`Error::Home`] when `$HOME` is unset, empty or relative.
+    /// [`Error::Home`] when `$HOME` is unset, empty or relative, and
+    /// [`Error::HomeParentComponent`] when it has a `..` component.
     pub fn from_process() -> Result<Self, Error> {
         Ok(Self {
-            home: paths::home()?,
+            home: usable_home(paths::home()?)?,
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
             no_color: no_color(std::env::var_os("NO_COLOR").as_deref()),
@@ -84,6 +85,21 @@ impl Env {
             stderr_tty: std::io::stderr().is_terminal(),
         })
     }
+}
+
+/// `home`, refused when it has a `..` component.
+///
+/// Not normalised: `/a/..` is not `/` when `/a` is a symlink, and every path bx
+/// writes is rendered against the home, so a home bx cannot name exactly is
+/// refused here, naming `HOME`, rather than by the first target beneath it.
+fn usable_home(home: PathBuf) -> Result<PathBuf, Error> {
+    if home
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(Error::HomeParentComponent(home));
+    }
+    Ok(home)
 }
 
 /// Whether a `NO_COLOR` value asks for no colour: set, to anything but the
@@ -195,6 +211,14 @@ pub enum Error {
     /// `$HOME` is not usable.
     #[error(transparent)]
     Home(#[from] paths::Error),
+    /// `$HOME` climbs out of a directory and back in, so bx cannot name the
+    /// home exactly.
+    #[error(
+        "HOME has a `..` component: {}; bx renders every path against HOME and will not guess \
+         which directory it names. Set HOME without `..`",
+        .0.display()
+    )]
+    HomeParentComponent(PathBuf),
     /// There is no config repo.
     #[error("no bx config repo at {}; run `bx init` to create one", .0.display())]
     RepoMissing(PathBuf),
@@ -860,6 +884,30 @@ pub(crate) mod tests {
         let note = decide::guard_fragment(&fragment, &inputs.roots).expect("refused");
         let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();
         assert!(note.contains(&inside), "{note}");
+    }
+
+    #[test]
+    fn decision_21_a_home_with_a_parent_component_is_refused_and_any_other_is_kept() {
+        let climbing = "/var/home/../home/u";
+        let refused = usable_home(PathBuf::from(climbing)).expect_err("a `..` home");
+        assert!(
+            matches!(&refused, Error::HomeParentComponent(path) if path == Path::new(climbing)),
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .starts_with("HOME has a `..` component: /var/home/../home/u;"),
+            "{refused}"
+        );
+
+        // Kept exactly as spelled: bx does not normalise a home.
+        for kept in ["/var/home/u", "/var/home/u/", "/var//home/./u"] {
+            assert_eq!(
+                usable_home(PathBuf::from(kept)).expect("kept"),
+                PathBuf::from(kept)
+            );
+        }
     }
 
     #[test]

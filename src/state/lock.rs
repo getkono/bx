@@ -490,6 +490,41 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_refused_for_anything_but_contention_is_an_error_naming_the_file() {
+        // r3 round 1 (C2): a `flock` failure other than `EWOULDBLOCK` was
+        // never reached, so reading it as success went unnoticed.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        std::fs::write(dir.lock(), b"").expect("seed");
+        // An `O_PATH` descriptor names the file but cannot lock it: `EBADF`.
+        let fd = rustix::fs::open(dir.lock(), OFlags::PATH | OFlags::CLOEXEC, RawMode::empty())
+            .expect("an O_PATH descriptor");
+        for operation in [
+            FlockOperation::NonBlockingLockExclusive,
+            FlockOperation::NonBlockingLockShared,
+        ] {
+            let err = take(&fd, &dir.lock(), operation).expect_err("EBADF is not a lock");
+            assert!(
+                matches!(&err, Error::Lock { path, source }
+                    if *path == dir.lock()
+                        && source.raw_os_error() == Some(Errno::BADF.raw_os_error())),
+                "got {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_holder_line_that_cannot_be_read_is_an_unknown_holder() {
+        // r3 round 1 (C2): a failing `pread` was never reached. A directory
+        // opens `O_RDONLY`, and reading it fails with `EISDIR`.
+        let home = guarded_home();
+        let unreadable = home.child("a-directory");
+        std::fs::create_dir_all(&unreadable).expect("mkdir");
+        assert_eq!(read_holder(&unreadable), Holder::unknown());
+    }
+
+    #[test]
     fn a_second_exclusive_acquisition_is_refused() {
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());

@@ -79,6 +79,11 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 /// it would be the hole above, and skipping it would silently drop the
 /// account's layer. Compared lexically after [`paths::normalize`], like every
 /// other path rule in the crate, so a symlinked alias of the repo is not caught.
+/// That is decision 27 — resolving links would make layer resolution read the
+/// filesystem — and
+/// `a_state_directory_reached_through_a_symlinked_alias_of_the_repo_is_not_refused`
+/// pins it. The `local.toml` writer entry A8 adds inherits the same limit: it
+/// must not take this check as proof that the file it writes is outside the repo.
 ///
 /// # Only a clean answer skips the local layer
 ///
@@ -331,6 +336,30 @@ mod tests {
             layer_paths(&repo, &home.child(".config/bx-state")).unwrap(),
             [repo.join("bx.toml"), local]
         );
+    }
+
+    /// The limit of the lexical check, pinned. `alias` is the repo under
+    /// another spelling, so `alias/state` is inside it on disk but not as
+    /// written, and it is accepted. Resolving symlinks here is a deliberate
+    /// change to this test (decision 27), not a quiet change of behaviour.
+    #[test]
+    fn a_state_directory_reached_through_a_symlinked_alias_of_the_repo_is_not_refused() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        let alias = home.child("alias");
+        std::os::unix::fs::symlink(&repo, &alias).expect("symlink");
+        assert_eq!(
+            alias.canonicalize().expect("the alias resolves"),
+            repo.canonicalize().expect("the repo resolves"),
+            "the fixture must really be one directory under two spellings"
+        );
+        home.write(".config/bx/state/local.toml", "");
+
+        let paths = layer_paths(&repo, &alias.join("state"))
+            .expect("not refused: the check compares spellings");
+
+        assert_eq!(paths.last(), Some(&alias.join("state").join(LOCAL_FILE)));
     }
 
     #[test]

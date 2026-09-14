@@ -1214,8 +1214,15 @@ impl ResolvedValues {
     /// named with its line, which is in the file the account can edit. Not a
     /// `bx init` invocation, for the reason [`ResolvedValues::invalid_hint`]
     /// gives.
+    ///
+    /// `texts` are the entry's fields as written. A value they reference that
+    /// is not answered itself but carries an answer in through its committed
+    /// `default` — `q` defaulting to `{{p}}`, with `p` answered — is named too,
+    /// with its declaration's line, because answering it directly is the other
+    /// act that clears the entry. With no such value the hint names the
+    /// answers alone.
     #[must_use]
-    pub(crate) fn answers_hint(&self, problem: &str, names: &[String]) -> String {
+    pub(crate) fn answers_hint(&self, problem: &str, texts: &[&str], names: &[String]) -> String {
         let answers = names
             .iter()
             .filter_map(|name| {
@@ -1224,7 +1231,55 @@ impl ResolvedValues {
             })
             .collect::<Vec<_>>()
             .join(" and ");
-        format!("{problem}, because of {answers}; change that answer")
+
+        let mut between: Vec<String> = Vec::new();
+        for text in texts {
+            self.derived_between(text, &mut between);
+        }
+        if between.is_empty() {
+            return format!("{problem}, because of {answers}; change that answer");
+        }
+        let between = self.in_declaration_order(between);
+        let defaults = between
+            .iter()
+            .filter_map(|name| self.decl(name))
+            .map(|decl| format!("the default of `{}` at {}", decl.name, decl.origin))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let direct = between
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        format!(
+            "{problem}, because of {answers}, carried in by {defaults}; change that answer, \
+             or answer {direct} directly"
+        )
+    }
+
+    /// Collect into `into` every value `text` reaches that carries an account
+    /// answer in through its own `default` without being answered itself,
+    /// following those defaults down.
+    fn derived_between(&self, text: &str, into: &mut Vec<String>) {
+        for name in placeholders(text).unwrap_or_default() {
+            let Some(index) = self.index_of(name) else {
+                continue;
+            };
+            let Answer::Given { from_account, .. } = &self.answers[index] else {
+                continue;
+            };
+            // Empty: built from committed text alone. Its own name: answered.
+            if from_account.is_empty()
+                || from_account.iter().any(|input| input == name)
+                || into.iter().any(|held| held == name)
+            {
+                continue;
+            }
+            into.push(name.to_string());
+            if let Some(default) = &self.decls[index].default {
+                self.derived_between(&default.to_string(), into);
+            }
+        }
     }
 
     /// What to do about an entry blocked by [`Unresolved::Invalid`] on `names`.

@@ -431,8 +431,13 @@ impl Clash {
             "`[[target]]` {spellings} name one file, `{file}`, and one layer may name a \
              file once"
         );
+        let texts: Vec<&str> = self
+            .statements
+            .iter()
+            .map(|(spelling, _)| spelling.as_str())
+            .collect();
         Conflict {
-            hint: values.answers_hint(&problem, &names),
+            hint: values.answers_hint(&problem, &texts, &names),
             file,
             names,
         }

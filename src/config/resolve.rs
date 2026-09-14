@@ -289,7 +289,7 @@ fn resolve_target(
                 });
             }
             let names = in_declaration_order(values, causes);
-            let hint = values.answers_hint(&problem, &names);
+            let hint = values.answers_hint(&problem, &[raw.as_str()], &names);
             block(BlockReason::InvalidValue { names }, hint)
         }
     }
@@ -304,6 +304,12 @@ fn resolve_target(
 /// defect and a load error naming the target, whether or not the value has an
 /// answer yet — not a blocked target whose hint advises changing one.
 ///
+/// The same holds for a value whose committed `default` is built from a `path`
+/// value, however many defaults lie between: `s` defaulting to `{{b}}` carries
+/// `b`'s absolute text into `file`. Each default is followed as written,
+/// whether or not it applies for this account, so the refusal is the same for
+/// every account; the message names each declaration on the way.
+///
 /// A malformed placeholder is left to the probe, which reports it with the
 /// rest of the target's defects.
 fn refuse_path_value_in_file(
@@ -311,26 +317,76 @@ fn refuse_path_value_in_file(
     file: &str,
     values: &ResolvedValues,
 ) -> Result<(), Error> {
-    let path_value = super::values::placeholders(file)
+    let names = super::values::placeholders(file).unwrap_or_default();
+    let direct = names.iter().find_map(|name| {
+        values
+            .decl(name)
+            .filter(|decl| decl.kind == super::values::ValueKind::Path)
+            .map(|decl| vec![decl])
+    });
+    let chain = direct.or_else(|| {
+        let mut seen: Vec<String> = Vec::new();
+        names
+            .iter()
+            .find_map(|name| path_value_behind(values, name, &mut seen))
+    });
+    let Some(chain) = chain else {
+        return Ok(());
+    };
+
+    let steps: String = chain
+        .windows(2)
+        .map(|pair| {
+            format!(
+                ", whose default at {} is built from `{}`",
+                pair[0].origin, pair[1].name
+            )
+        })
+        .collect();
+    let not_built = if chain.len() > 1 {
+        " that is not built from one"
+    } else {
+        ""
+    };
+    Err(Error::BadValue {
+        origin: target.origin.clone(),
+        message: format!(
+            "target `{}`: `file` references `{}`{steps}, a `path` value; a `path` value \
+             is always absolute and `file` is relative to the config repo root, so no \
+             answer could make it name a file in the repo; reference a `string` value\
+             {not_built}",
+            target.path, chain[0].name
+        ),
+    })
+}
+
+/// The declarations from `name` down its committed defaults to a `path` value.
+///
+/// Depth first, each default's references in the order written. `seen` keeps a
+/// default that reaches back to a name already walked from being walked again:
+/// a default an answer overrides is never expanded, so nothing else refused it.
+fn path_value_behind<'a>(
+    values: &'a ResolvedValues,
+    name: &str,
+    seen: &mut Vec<String>,
+) -> Option<Vec<&'a super::values::ValueDecl>> {
+    if seen.iter().any(|walked| walked == name) {
+        return None;
+    }
+    seen.push(name.to_string());
+    let decl = values.decl(name)?;
+    if decl.kind == super::values::ValueKind::Path {
+        return Some(vec![decl]);
+    }
+    let default = decl.default.as_ref()?.to_string();
+    super::values::placeholders(&default)
         .unwrap_or_default()
         .into_iter()
-        .find(|name| {
-            values
-                .decl(name)
-                .is_some_and(|decl| decl.kind == super::values::ValueKind::Path)
-        });
-    match path_value {
-        None => Ok(()),
-        Some(name) => Err(Error::BadValue {
-            origin: target.origin.clone(),
-            message: format!(
-                "target `{}`: `file` references `{name}`, a `path` value; a `path` value \
-                 is always absolute and `file` is relative to the config repo root, so no \
-                 answer could make it name a file in the repo; reference a `string` value",
-                target.path
-            ),
-        }),
-    }
+        .find_map(|next| path_value_behind(values, next, seen))
+        .map(|mut chain| {
+            chain.insert(0, decl);
+            chain
+        })
 }
 
 /// Why [`substituted`] could not rebuild a target.
@@ -694,6 +750,79 @@ mod tests {
             .replace("kind = \"path\"", "kind = \"string\"")
             .replace("FILE", "cfg/{{cfg_dir}}/gitconfig");
         let ordinary = resolved(&string, Some("[values]\ncfg_dir = \"work\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig"))
+        );
+    }
+
+    #[test]
+    fn a_file_body_may_not_reach_a_path_value_through_a_default() {
+        // `s` is a `string`, but its committed default is `{{b}}`, a `path`
+        // value. Checking only the kind of the name written in `file` let
+        // `cfg/{{s}}/gitconfig` resolve to a repo file carrying the account's
+        // absolute location, and blocked `{{s}}/gitconfig` with a hint naming
+        // only `b`. The declaration is the layer's defect whatever is answered,
+        // `s` included, so it is refused at load and the chain is named.
+        const LAYER: &str = "[[value]]\n\
+                             name = \"b\"\n\
+                             kind = \"path\"\n\
+                             [[value]]\n\
+                             name = \"s\"\n\
+                             kind = \"string\"\n\
+                             default = \"{{b}}\"\n\
+                             [[target]]\n\
+                             path = \"~/.gitconfig\"\n\
+                             file = \"FILE\"\n\
+                             [[target]]\n\
+                             path = \"~/.zshrc\"\n\
+                             content = \"setopt\"\n";
+
+        for file in ["{{s}}/gitconfig", "cfg/{{s}}/gitconfig"] {
+            for local in [
+                None,
+                Some("[values]\nb = \"/var/mnt/cfg\"\n"),
+                Some("[values]\ns = \"work\"\n"),
+            ] {
+                let message = resolved(&LAYER.replace("FILE", file), local)
+                    .expect_err("a `path` value reached through a default is the layer's defect");
+                for part in [
+                    "bx.toml:8",
+                    "`file` references `s`, whose default at bx.toml:4 is built from `b`, \
+                     a `path` value",
+                    "relative to the config repo",
+                    "reference a `string` value that is not built from one",
+                ] {
+                    assert!(message.contains(part), "{file} {local:?} {part}: {message}");
+                }
+            }
+        }
+
+        // Three steps: `t` defaults to `{{s}}`, which defaults to `{{b}}`.
+        let chained = LAYER
+            .replace(
+                "[[target]]\npath = \"~/.gitconfig\"",
+                "[[value]]\nname = \"t\"\nkind = \"string\"\ndefault = \"{{s}}\"\n\
+                 [[target]]\npath = \"~/.gitconfig\"",
+            )
+            .replace("FILE", "cfg/{{t}}/gitconfig");
+        let message = resolved(&chained, Some("[values]\nb = \"/var/mnt/cfg\"\n"))
+            .expect_err("however many defaults lie between");
+        assert!(
+            message.contains(
+                "bx.toml:12: target `~/.gitconfig`: `file` references `t`, whose default at \
+                 bx.toml:8 is built from `s`, whose default at bx.toml:4 is built from `b`, \
+                 a `path` value"
+            ),
+            "{message}"
+        );
+
+        // A `string` default built from no `path` value is still the case
+        // `file` substitution exists for.
+        let plain = LAYER
+            .replace("default = \"{{b}}\"", "default = \"work\"")
+            .replace("FILE", "cfg/{{s}}/gitconfig");
+        let ordinary = resolved(&plain, None).unwrap();
         assert_eq!(
             ready(&ordinary, 0).body,
             Body::File(PathBuf::from("cfg/work/gitconfig"))
@@ -1200,6 +1329,56 @@ mod tests {
             }
         }
         assert_eq!(ready(&default, 2).path.as_str(), "~/.zshrc");
+    }
+
+    #[test]
+    fn a_clash_through_a_derived_value_names_the_declaration_between() {
+        // `q` defaults to `{{p}}`, so `~/{{p}}/s` and `~/{{q}}/s` are one file for
+        // every answer to `p`. Naming only `p` left out the act that clears it:
+        // answering `q`. `r` is built from a committed default alone, so no
+        // answer is carried through it and it is not named.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[value]]\nname = \"r\"\nkind = \"string\"\ndefault = \"s\"\n\
+                             [[target]]\npath = \"~/{{p}}/s\"\ncontent = \"P\"\n\
+                             [[target]]\npath = \"~/{{q}}/{{r}}\"\ncontent = \"Q\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let derived = resolved(LAYER, Some("[values]\np = \"work\"\n"))
+            .expect("an account's answer does not fail the load");
+        for index in [0, 1] {
+            let entry = blocked(&derived, index);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["p".to_string()]
+                }
+            );
+            for part in [
+                "`~/{{p}}/s` at bx.toml:12",
+                "`~/{{q}}/{{r}}` at bx.toml:15",
+                "because of the answer to `p` at local.toml:2, carried in by the default of \
+                 `q` at bx.toml:4; change that answer, or answer `q` directly",
+            ] {
+                assert!(entry.hint.contains(part), "{index} {part}: {}", entry.hint);
+            }
+            assert!(!entry.hint.contains("`r`"), "{index}: {}", entry.hint);
+        }
+        ready(&derived, 2);
+
+        // With `q` answered too, nothing is carried in: the hint names both
+        // answers and says nothing more.
+        let answered = resolved(LAYER, Some("[values]\np = \"work\"\nq = \"work\"\n"))
+            .expect("an account's answers do not fail the load");
+        let entry = blocked(&answered, 0);
+        assert!(
+            entry.hint.ends_with(
+                "because of the answer to `p` at local.toml:2 and the answer to `q` at \
+                 local.toml:3; change that answer"
+            ),
+            "{}",
+            entry.hint
+        );
     }
 
     #[test]

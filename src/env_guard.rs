@@ -538,9 +538,12 @@ const INHERITED: &str = "\0";
 /// has a `..` component at all ([`Reason::ParentComponent`]), so the unsound
 /// case is left to the declared roots themselves.
 ///
-/// Containment is also **one-directional**: a value inside a root is admitted,
-/// and a value that *contains* a root — `~/.local/state`, the parent of bx's
-/// own directory — is judged by where it points, not by what lies beneath it.
+/// Containment in a root is **one-directional**: a value inside a root is
+/// admitted, whatever lies beneath it. bx's own directories are the exception,
+/// and are judged **both ways**: a location may neither lie inside one nor
+/// contain one ([`Reason::ContainsBxDirectory`]), because a tool clears its
+/// own directory — `uv cache clean` on `UV_CACHE_DIR=~/.local/state` deletes
+/// bx's ledger with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootSet {
     home: Option<PathBuf>,
@@ -660,6 +663,15 @@ impl RootSet {
         let normalised = paths::normalize(path);
         self.repos.iter().any(|dir| normalised.starts_with(dir))
             || (self.home.is_none() && passes_through(&normalised, &[".config", "bx"]))
+    }
+
+    /// Whether `path` contains, or is, a directory bx owns or a config repo.
+    fn holds_bx_directory(&self, path: &Path) -> bool {
+        let normalised = paths::normalize(path);
+        self.owned
+            .iter()
+            .chain(&self.repos)
+            .any(|dir| dir.starts_with(&normalised))
     }
 
     /// Whether `path` is a directory bx owns, or lies inside one.
@@ -787,7 +799,8 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// Each names a different user action — declare a root, fix the declared root,
 /// split the line, write the line in the grammar the guard reads, use a name
 /// the shell does not manage, use a name bx may generate, move the value out of
-/// bx's own directory, move it out of bx's config repo, write a path without
+/// bx's own directory, move it out of bx's config repo, point it beside bx's
+/// directories rather than around them, write a path without
 /// `..` or anything a tool expands, move it inside a declared root, write an absolute path,
 /// give a program no arguments, give a setting a value it accepts, define the
 /// referenced variable earlier, give the guard a home, fix the line
@@ -835,6 +848,11 @@ pub enum Reason {
     /// public — whatever the roots say.
     #[error("points inside bx's config repo, which is committed and may be public")]
     InsideConfigRepo,
+    /// A location that contains bx's state directory or its config repo. The
+    /// tool it is given to clears it — a cache clean, a prune — and deletes
+    /// bx's record, or the user's repo, along with its own files.
+    #[error("contains bx's state directory or its config repo, which the tool may clear")]
+    ContainsBxDirectory,
     /// It resolves to a path, but not one inside any declared root.
     #[error("resolves outside every declared root")]
     OutsideDeclaredRoots,
@@ -999,7 +1017,8 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// No path of any kind may have a `..` component ([`Reason::ParentComponent`])
 /// or lie inside bx's state directory ([`Reason::BxOwnedDirectory`]) or its
 /// config repo ([`Reason::InsideConfigRepo`]), checked in that order and before
-/// any root. No location may hold `$`, `{` or `%` once the shell has resolved
+/// any root. No location may contain either of bx's directories
+/// ([`Reason::ContainsBxDirectory`]). No location may hold `$`, `{` or `%` once the shell has resolved
 /// it ([`Reason::ToolExpandable`]): the guard judges the shape, because it
 /// cannot know which tool expands what.
 /// A value that does not resolve cannot be shown to be any of those, and is
@@ -1206,6 +1225,12 @@ fn refuses_entry(path: &Path, roots: &RootSet) -> Option<Reason> {
             path.to_string_lossy()
                 .contains(['$', '{', '%'])
                 .then_some(Reason::ToolExpandable)
+        })
+        // bx's directories outrank the roots in this direction too.
+        .or_else(|| {
+            roots
+                .holds_bx_directory(path)
+                .then_some(Reason::ContainsBxDirectory)
         })
         .or_else(|| (!roots.contains(path)).then_some(Reason::OutsideDeclaredRoots))
 }
@@ -2082,10 +2107,12 @@ mod tests {
                 "{value}"
             );
         }
-        // The parent, and a sibling whose name merely extends it, are not bx's.
+        // The parent is not bx's either, but it contains bx's state directory,
+        // and a tool that clears it clears bx's record (r3 round 2). A sibling
+        // whose name merely extends it is fine.
         assert_eq!(
-            check("CARGO_HOME", "~/.local/state", &home_rooted),
-            Verdict::Allowed
+            reason_of(&check("CARGO_HOME", "~/.local/state", &home_rooted)),
+            Some(Reason::ContainsBxDirectory)
         );
         assert_eq!(
             check("CARGO_HOME", "~/.local/state/bxtra", &home_rooted),
@@ -2175,6 +2202,10 @@ mod tests {
         assert_eq!(
             Reason::ParentComponent.to_string(),
             "has a `..` component, so where it points cannot be shown"
+        );
+        assert_eq!(
+            Reason::ContainsBxDirectory.to_string(),
+            "contains bx's state directory or its config repo, which the tool may clear"
         );
         assert_eq!(
             Reason::ToolExpandable.to_string(),
@@ -4618,6 +4649,87 @@ mod tests {
     }
 
     #[test]
+    fn a_location_may_not_contain_bxs_own_directories() {
+        use Reason::{BxOwnedDirectory, ContainsBxDirectory, InsideConfigRepo};
+        // A tool clears its own cache: `uv cache clean` on an approved
+        // `UV_CACHE_DIR=~/.local/state` deleted bx's ledger with it
+        // (invariant 4). So a location may neither be inside bx's directories
+        // nor contain them.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        assert_eq!(
+            reasons("export UV_CACHE_DIR=~/.local/state\n", &home_rooted),
+            vec![(1, ContainsBxDirectory)]
+        );
+        for (name, value) in [
+            ("UV_CACHE_DIR", "~/.config"),
+            ("SCCACHE_DIR", "~/.local/state"),
+            ("GOMODCACHE", "~/.local"),
+            ("XDG_CACHE_HOME", "~/.local/state"),
+            ("CARGO_HOME", "~"),
+            ("GOPATH", "/var/home/example/go:/var/home/example/.local"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &home_rooted)),
+                Some(ContainsBxDirectory),
+                "{name}={value}"
+            );
+        }
+        // bx's directories themselves keep their own reasons, and a sibling
+        // or a directory beside them is fine.
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "~/.local/state/bx", &home_rooted)),
+            Some(BxOwnedDirectory)
+        );
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "~/.config/bx", &home_rooted)),
+            Some(InsideConfigRepo)
+        );
+        for value in [
+            "~/.local/share",
+            "~/.local/state/bxtra",
+            "~/.config/other",
+            "~/.cache",
+        ] {
+            assert_eq!(
+                check("CARGO_HOME", value, &home_rooted),
+                Verdict::Allowed,
+                "{value}"
+            );
+        }
+        // Directories the caller adds count the same way.
+        let moved = rooted()
+            .owning(&[PathBuf::from("/var/mnt/scratch/example/state/bx")])
+            .with_config_repos(&[PathBuf::from("/var/mnt/scratch/example/cfg/bx")]);
+        for value in [
+            "/var/mnt/scratch/example/state",
+            "/var/mnt/scratch/example/cfg",
+            "/var/mnt/scratch/example",
+        ] {
+            assert_eq!(
+                reason_of(&check("CARGO_HOME", value, &moved)),
+                Some(ContainsBxDirectory),
+                "{value}"
+            );
+            assert_eq!(
+                check("CARGO_HOME", value, &rooted()),
+                Verdict::Allowed,
+                "{value}"
+            );
+        }
+        // A program, a search list or a socket is not cleared by its tool.
+        for (name, value) in [
+            ("EDITOR", "/var/home/example/.local"),
+            ("PATH", "/var/home/example/.local:$PATH"),
+            ("SSH_AUTH_SOCK", "/var/home/example/.config"),
+        ] {
+            assert_eq!(check(name, value, &home_rooted), Verdict::Allowed, "{name}");
+        }
+        // The operator fragment contains none of them.
+        assert_eq!(scan_with(OPERATOR_FRAGMENT, &rooted()), vec![]);
+        assert_eq!(scan(OPERATOR_FRAGMENT).len(), 25);
+    }
+
+    #[test]
     fn bash_truncates_the_history_file_when_a_fragment_assigns_histfilesize() {
         // The mechanism behind reserving `HISTFILESIZE`: bash truncates the
         // history file the moment the name is assigned, in a non-interactive
@@ -4651,7 +4763,7 @@ mod tests {
 
     #[test]
     fn a_name_no_table_holds_is_refused_and_a_location_is_judged_whatever_its_shape() {
-        use Reason::{NotAbsolute, NotEmittable, OutsideDeclaredRoots};
+        use Reason::{NotAbsolute, NotEmittable};
         // Round 4 judged these by value: allowed inside a root. Round 5 does
         // not know what they hold, so it refuses each whatever it is given.
         for name in R4_UNLISTED_RELOCATIONS {
@@ -4672,7 +4784,8 @@ mod tests {
             ("..", NotAbsolute),
             ("build/cache", NotAbsolute),
             ("a:.", NotAbsolute),
-            ("~", OutsideDeclaredRoots),
+            // The home contains bx's directories (r3 round 2).
+            ("~", Reason::ContainsBxDirectory),
             ("\"~x\"", NotAbsolute),
             ("/var/mnt/scratch/example:a", NotAbsolute),
             ("file:///var/mnt/scratch/example", NotAbsolute),
@@ -4962,15 +5075,17 @@ mod tests {
                 "{value:?}"
             );
         }
-        // Given to a location, `~` alone is the home, and `/a://b` starts at
-        // the filesystem root however URL-like its middle.
-        for value in ["~", "/a://b"] {
-            assert_eq!(
-                reason_of(&check("CARGO_HOME", value, &rooted())),
-                Some(Reason::OutsideDeclaredRoots),
-                "{value:?}"
-            );
-        }
+        // Given to a location, `~` alone is the home, which contains bx's
+        // directories (r3 round 2), and `/a://b` starts at the filesystem root
+        // however URL-like its middle.
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "~", &rooted())),
+            Some(Reason::ContainsBxDirectory)
+        );
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "/a://b", &rooted())),
+            Some(Reason::OutsideDeclaredRoots)
+        );
         for value in ["/x A=1", "/x\tA=1", "'/x' A=1"] {
             assert_eq!(
                 reason_of(&check("EDITOR", value, &rooted())),
@@ -5385,6 +5500,11 @@ mod tests {
             let path = paths::normalize(Path::new(entry));
             !path.is_absolute() || owned.iter().any(|dir| path.starts_with(dir))
         };
+        // A location whose tool clears it clears whatever it contains.
+        let holds_bx = |entry: &str| {
+            let path = paths::normalize(Path::new(entry));
+            path.is_absolute() && owned.iter().any(|dir| dir.starts_with(&path))
+        };
         let entries: Vec<&str> = value.split(':').collect();
         if TEST_SEARCHED_OR_REACHED.contains(&name) {
             entries.iter().any(|entry| unanchored(entry))
@@ -5403,13 +5523,13 @@ mod tests {
             // A tool that reads one path reads the whole value, `:` and all.
             let whole_escapes = !TEST_COLON_LISTS.contains(&name)
                 && (read_as_location || pathish(value))
-                && (unanchored(value) || !roots.contains(Path::new(value)));
+                && (unanchored(value) || holds_bx(value) || !roots.contains(Path::new(value)));
             repo_lands_in_state
                 || whole_escapes
                 || ((read_as_location || entries.iter().any(|entry| pathish(entry)))
-                    && entries
-                        .iter()
-                        .any(|entry| unanchored(entry) || !roots.contains(Path::new(entry))))
+                    && entries.iter().any(|entry| {
+                        unanchored(entry) || holds_bx(entry) || !roots.contains(Path::new(entry))
+                    }))
         }
     }
 
@@ -5633,6 +5753,8 @@ mod tests {
                 RootSet::strict(),
             ),
             ("export XDG_CONFIG_HOME=~/.local/state", home_rooted.clone()),
+            // r3 round 2: a location that contains bx's state directory.
+            ("export UV_CACHE_DIR=~/.local/state", home_rooted.clone()),
             // Round 6: a tool pointed into bx's config repo.
             ("export CARGO_HOME=~/.config/bx/cargo", home_rooted.clone()),
             // Round 6: a location whose entries are inside the root and whose

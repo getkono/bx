@@ -24,7 +24,7 @@ use std::ffi::OsString;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
-pub use diff::{Diff, DiffKind, TEXT_LIMIT, Why};
+pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
 
 use crate::config::resolve::{self, Resolved};
 use crate::config::{self, Origin, layers, merge};

@@ -1216,6 +1216,89 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn decision_14_an_unreadable_restore_snapshot_is_named_by_its_portable_path() {
+        let home = guarded_home();
+        home.write(".conf", "old\n");
+        let inputs = inputs(&home, &inline("~/.conf", "new\\n"));
+        // An apply that dies once its write is published: the journal stands
+        // over "new\n", and rolling it back needs the snapshot of "old\n".
+        let target = Portable::parse_in("~/.conf", home.path()).expect("a portable target");
+        let dest = home.child(".conf");
+        let mut session = Session::open(
+            inputs.state(),
+            SessionKind::Apply,
+            home.path(),
+            vec![target.clone()],
+        )
+        .expect("a session");
+        session
+            .apply(Request {
+                target,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"new\n".to_vec(),
+                    planned: fs::observe(&dest).expect("observe"),
+                },
+                mode: FileMode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("the write");
+        drop(session);
+
+        let digest = crate::state::ContentHash::of(b"old\n");
+        let blob = inputs.state().restore().join(digest.to_hex());
+        let portable = PathBuf::from(format!("~/.local/state/bx/restore/{}", digest.to_hex()));
+        let absolute = home.path().to_string_lossy().into_owned();
+        let corrupt = || std::fs::write(&blob, "not what it claims to be").expect("corrupt it");
+        let remove = || std::fs::remove_file(&blob).expect("remove it");
+        let cases: [(&dyn Fn(), state::Error); 2] = [
+            (
+                &corrupt,
+                state::Error::RestoreCorrupt {
+                    digest,
+                    path: portable.clone(),
+                },
+            ),
+            (
+                &remove,
+                state::Error::RestoreMissing {
+                    digest,
+                    path: portable,
+                },
+            ),
+        ];
+        for (damage, want) in cases {
+            damage();
+
+            let report = plan(&inputs);
+
+            assert_eq!(report.actions(), vec![Action::Conflict]);
+            let note = report.changes[0].note.as_deref().expect("a note");
+            assert_eq!(note, want.to_string());
+            let shown = diff::render(
+                &report,
+                View::Plan,
+                Palette::resolve(true, false),
+                home.path(),
+            );
+            assert!(shown.contains(note), "{shown}");
+            assert!(!shown.contains(&absolute), "{shown}");
+
+            // Recovery's own error keeps the absolute path.
+            let error = run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect_err("blocked");
+            assert!(
+                matches!(error, Error::Recover(recover::Error::Blocked { .. })),
+                "{error:?}"
+            );
+            assert!(
+                error.to_string().contains(&blob.display().to_string()),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&dest).expect("untouched"), b"new\n");
+        }
+    }
+
+    #[test]
     fn t15_apply_refuses_a_held_state_directory_and_plan_reports_it_running() {
         let home = guarded_home();
         let inputs = inputs(&home, &inline("~/.a", "x\\n"));

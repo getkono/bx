@@ -343,9 +343,15 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
         }
         None => None,
     };
+    // What this returns is what `plan` prints, so a note names a path the way
+    // plan output does, against the home the session wrote against. A journal
+    // with no header has no write to name.
+    let spelling = loaded
+        .begin()
+        .map_or(Spelling::Absolute, |begin| Spelling::Portable(&begin.home));
     let mut unfinished = Vec::new();
     for (intent, landed) in loaded.landed() {
-        unfinished.push(decide(state, intent, home, ledger.as_ref(), landed)?.1);
+        unfinished.push(decide(state, intent, home, ledger.as_ref(), landed, spelling)?.1);
     }
     Ok(Some(Interrupted {
         kind,
@@ -463,7 +469,14 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         intents.reverse();
     }
     for (intent, landed) in intents {
-        let (step, report) = decide(state, intent, home, ledger.as_deref(), landed)?;
+        let (step, report) = decide(
+            state,
+            intent,
+            home,
+            ledger.as_deref(),
+            landed,
+            Spelling::Absolute,
+        )?;
         // A temporary file the journal names is this write's, and goes once
         // recovery is acting on the write at all: a blocked write is not
         // recovery's to touch, its temporary file included. The loader has
@@ -594,7 +607,10 @@ enum Step {
 /// with paths made portable against it, and `None` for an unterminated one,
 /// which is rolled back. `ledger` is the ledger a rebuild would record into —
 /// the saved one, for a report — and is only read for a terminated journal.
-/// `landed` is whether a `Done` follows the intent.
+/// `landed` is whether a `Done` follows the intent. `spelling` is how a note
+/// names a path: [`pending`] builds the rows `plan` prints, which spell paths
+/// under the home portably, and [`resolve`] builds recovery's own report,
+/// which keeps them absolute. The verdict never depends on it.
 ///
 /// # A rebuild over a ledger that was already saved
 ///
@@ -621,6 +637,7 @@ fn decide(
     home: Option<&Path>,
     ledger: Option<&LedgerView>,
     landed: bool,
+    spelling: Spelling<'_>,
 ) -> Result<(Step, Unfinished), Error> {
     let standing = standing(intent, &look(&intent.dest)?);
     let report = |resolvable: bool, note: String| Unfinished {
@@ -637,16 +654,18 @@ fn decide(
         return Ok(match (standing, &intent.before) {
             (Standing::Prior, _) => (Step::Keep, report(true, rolls_back())),
             (Standing::Written, Prior::Absent) => (Step::Unlink, report(true, rolls_back())),
-            (Standing::Written, Prior::Existed(reference)) => match snapshot(state, reference)? {
-                Ok(bytes) => (
-                    Step::Rewrite {
-                        bytes,
-                        mode: reference.mode,
-                    },
-                    report(true, rolls_back()),
-                ),
-                Err(why) => (Step::Blocked, report(false, why)),
-            },
+            (Standing::Written, Prior::Existed(reference)) => {
+                match snapshot(state, reference, spelling)? {
+                    Ok(bytes) => (
+                        Step::Rewrite {
+                            bytes,
+                            mode: reference.mode,
+                        },
+                        report(true, rolls_back()),
+                    ),
+                    Err(why) => (Step::Blocked, report(false, why)),
+                }
+            }
             (Standing::Vanished | Standing::Diverged | Standing::Foreign, _) => {
                 (Step::Blocked, report(false, note(intent, standing)))
             }
@@ -696,7 +715,7 @@ fn decide(
     }
     let prior = match &intent.before {
         Prior::Absent => PriorBytes::Absent,
-        Prior::Existed(reference) => match snapshot(state, reference)? {
+        Prior::Existed(reference) => match snapshot(state, reference, spelling)? {
             Ok(bytes) => PriorBytes::Bytes {
                 bytes,
                 mode: reference.mode,
@@ -727,20 +746,53 @@ fn decide(
     Ok((Step::Record(entry), report(true, recorded())))
 }
 
+/// How a note [`decide`] builds spells a path it names.
+#[derive(Debug, Clone, Copy)]
+enum Spelling<'a> {
+    /// As it is. Recovery's own report, which its error and its log print.
+    Absolute,
+    /// `~/…` under this home and absolute outside it, as `plan` prints a row.
+    Portable(&'a Path),
+}
+
+impl Spelling<'_> {
+    /// `path`, spelled this way.
+    fn path(self, path: PathBuf) -> PathBuf {
+        match self {
+            Self::Absolute => path,
+            Self::Portable(home) => PathBuf::from(crate::paths::to_portable(&path, home)),
+        }
+    }
+}
+
 /// The bytes a [`RestoreRef`] names, digest-verified, or why they cannot be had.
 ///
 /// A missing or corrupt snapshot is a verdict — recovery will not guess at the
-/// bytes a write displaced — and any other failure is an error.
-fn snapshot(state: &StateDir, reference: &RestoreRef) -> Result<Result<Vec<u8>, String>, Error> {
+/// bytes a write displaced — and any other failure is an error. The verdict's
+/// text names the snapshot's path as `spelling` spells it, rebuilt from the
+/// error's own path rather than from its text.
+fn snapshot(
+    state: &StateDir,
+    reference: &RestoreRef,
+    spelling: Spelling<'_>,
+) -> Result<Result<Vec<u8>, String>, Error> {
+    use crate::state::Error::{RestoreCorrupt, RestoreMissing};
+
     // `restore_bytes` reads the content-addressed blob and consults no entry, so
     // an empty view reads it exactly as the ledger would, and a read-only report
     // needs no lock to do it.
     match LedgerView::default().restore_bytes(state, reference) {
         Ok(bytes) => Ok(Ok(bytes)),
-        Err(
-            e @ (crate::state::Error::RestoreMissing { .. }
-            | crate::state::Error::RestoreCorrupt { .. }),
-        ) => Ok(Err(e.to_string())),
+        Err(RestoreMissing { digest, path }) => Ok(Err(RestoreMissing {
+            digest,
+            path: spelling.path(path),
+        }
+        .to_string())),
+        Err(RestoreCorrupt { digest, path }) => Ok(Err(RestoreCorrupt {
+            digest,
+            path: spelling.path(path),
+        }
+        .to_string())),
         Err(e) => Err(e.into()),
     }
 }
@@ -3537,7 +3589,14 @@ mod tests {
         let mut intent = intent_for(home.path(), ".config/app/a.toml");
         intent.created_dirs = vec![home.path().join(std::ffi::OsStr::from_bytes(b"\xff"))];
 
-        let err = match decide(&state, &intent, Some(home.path()), None, true) {
+        let err = match decide(
+            &state,
+            &intent,
+            Some(home.path()),
+            None,
+            true,
+            Spelling::Absolute,
+        ) {
             Err(err) => err,
             Ok((_, report)) => panic!("rebuilt: {report:?}"),
         };

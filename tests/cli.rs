@@ -163,6 +163,132 @@ fn apply_over_a_damaged_ledger_it_cannot_move_aside_exits_one_and_writes_nothing
     assert!(!state.join("journal.mpk").exists(), "a session began");
 }
 
+/// What one path is: a directory, a file and its bytes, a link and what it
+/// names, or anything else.
+#[derive(Debug, PartialEq, Eq)]
+enum Shape {
+    Dir,
+    File(Vec<u8>),
+    Link(std::path::PathBuf),
+    Other,
+}
+
+/// Every path under `root`, `root` itself included, with its shape and its
+/// permission bits, in path order.
+fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, Shape, u32)> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&path).expect("lstat");
+        let kind = meta.file_type();
+        let shape = if kind.is_dir() {
+            for entry in std::fs::read_dir(&path).expect("read a directory") {
+                stack.push(entry.expect("an entry").path());
+            }
+            Shape::Dir
+        } else if kind.is_symlink() {
+            Shape::Link(std::fs::read_link(&path).expect("readlink"))
+        } else if kind.is_file() {
+            Shape::File(std::fs::read(&path).expect("read a file"))
+        } else {
+            Shape::Other
+        };
+        found.push((path, shape, meta.permissions().mode() & 0o7777));
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// Set `path`'s permission bits.
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+#[test]
+fn plan_with_no_state_directory_creates_nothing() {
+    let home = guarded_home();
+    seed(home.path(), A_TARGET);
+    let state = home.child(".local/state/bx");
+    let before = snapshot(home.path());
+
+    let output = bx(home.path(), &["plan"]);
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(snapshot(home.path()), before, "plan changed the home");
+    assert!(!state.exists(), "plan created the state directory");
+    assert!(
+        !home.child(".local").exists(),
+        "plan created a parent of it"
+    );
+}
+
+#[test]
+fn plan_leaves_a_wide_state_directory_and_its_lock_file_exactly_as_they_are() {
+    // Decision 8: `plan` asked the lock through `SharedLock::try_acquire`,
+    // which tightened the state directory to 0700 and the lock file to 0600.
+    let home = guarded_home();
+    seed(home.path(), A_TARGET);
+    let state = home.child(".local/state/bx");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    chmod(&state, 0o755);
+    std::fs::write(state.join("lock"), b"").expect("the lock file");
+    chmod(&state.join("lock"), 0o644);
+    let before = snapshot(home.path());
+
+    let output = bx(home.path(), &["plan"]);
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(snapshot(home.path()), before, "plan changed the home");
+}
+
+#[test]
+fn plan_over_a_damaged_state_directory_elsewhere_changes_neither_it_nor_the_home() {
+    // Every read `plan` makes of the state directory — the lock, the journal,
+    // the ledger — against files a writing run would move aside or narrow.
+    let home = guarded_home();
+    let elsewhere = guarded_home();
+    seed(home.path(), A_TARGET);
+    let state = elsewhere.child("bx");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    for (name, bytes) in [
+        ("lock", &b"4242 bx\n"[..]),
+        ("journal.mpk", b"not a journal"),
+        ("ledger.mpk", b"not a ledger"),
+        ("fingerprints.mpk", b"not fingerprints"),
+    ] {
+        std::fs::write(state.join(name), bytes).expect("a state file");
+        chmod(&state.join(name), 0o644);
+    }
+    chmod(&state, 0o755);
+    let before = (snapshot(home.path()), snapshot(elsewhere.path()));
+
+    let output = Command::cargo_bin("bx")
+        .expect("the bx binary")
+        .arg("plan")
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env("XDG_STATE_HOME", elsewhere.path())
+        .env_remove("NO_COLOR")
+        .output()
+        .expect("run bx");
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stdout(&output).starts_with("An interrupted bx session left a journal"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(
+        (snapshot(home.path()), snapshot(elsewhere.path())),
+        before,
+        "plan changed the home or the state directory"
+    );
+}
+
 #[test]
 fn bare_bx_is_the_status_view_with_plan_exit_codes() {
     let home = guarded_home();

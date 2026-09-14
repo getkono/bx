@@ -357,13 +357,12 @@ pub fn exit(report: &Report, mode: Mode) -> Exit {
 
 /// What a read-only run learns from the state directory before deciding.
 ///
-/// The lock is only asked about when its file already exists, so `plan` on a
-/// fresh account creates nothing. An `apply` holding the directory is reported
-/// as running, and its journal is not an interruption.
+/// The lock is asked about through [`SharedLock::probe`], which creates,
+/// narrows and writes nothing, so `plan` leaves the state directory exactly as
+/// it found it — or absent. An `apply` holding the directory is reported as
+/// running, and its journal is not an interruption.
 fn look_at_state(inputs: &Inputs, report: &mut Report) -> Result<(), Error> {
-    if inputs.state.lock().symlink_metadata().is_ok()
-        && SharedLock::try_acquire(&inputs.state)?.is_none()
-    {
+    if SharedLock::probe(&inputs.state)?.is_held() {
         report.apply_running = true;
         return Ok(());
     }

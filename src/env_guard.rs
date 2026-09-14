@@ -534,7 +534,9 @@ const INHERITED: &str = "\0";
 /// normalisation is unsound across a symlink: `<root>/link/../x`, where `link`
 /// points outside the root, is judged inside it, and so is a declared root that
 /// is itself a symlink to `/`. That is accepted rather than fixed, because the
-/// only fix is the one invariant 3 rules out.
+/// only fix is the one invariant 3 rules out — and a value bx may write never
+/// has a `..` component at all ([`Reason::ParentComponent`]), so the unsound
+/// case is left to the declared roots themselves.
 ///
 /// Containment is also **one-directional**: a value inside a root is admitted,
 /// and a value that *contains* a root — `~/.local/state`, the parent of bx's
@@ -785,8 +787,8 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// Each names a different user action — declare a root, fix the declared root,
 /// split the line, write the line in the grammar the guard reads, use a name
 /// the shell does not manage, use a name bx may generate, move the value out of
-/// bx's own directory, move it out of bx's config repo, move it inside a
-/// declared root, write an absolute path,
+/// bx's own directory, move it out of bx's config repo, write a path without
+/// `..` or anything a tool expands, move it inside a declared root, write an absolute path,
 /// give a program no arguments, give a setting a value it accepts, define the
 /// referenced variable earlier, give the guard a home, fix the line
 /// that assigned it, shorten it — so a caller that only knew *which* variable
@@ -840,6 +842,18 @@ pub enum Reason {
     /// shown to be somewhere is needed. For a list, one of its entries is.
     #[error("is not an absolute path")]
     NotAbsolute,
+    /// A path with a `..` component, in any kind that holds one. It can climb
+    /// out of where it appears to point — across a symlink, or past text a
+    /// tool expands before it resolves the path — and nothing bx generates
+    /// needs one.
+    #[error("has a `..` component, so where it points cannot be shown")]
+    ParentComponent,
+    /// A location that still holds `$`, `{` or `%` once the shell has resolved
+    /// it. Tools expand those themselves — npm and pnpm `${NAME}`, NuGet
+    /// `%NAME%` — into a path nothing judged, and nothing bx generates needs
+    /// one.
+    #[error("holds `$`, `{{` or `%`, which the tool may expand itself into a path nothing judged")]
+    ToolExpandable,
     /// A program given something other than exactly one absolute path or one
     /// bare command name: an argument, a `:` list, a URL, nothing at all.
     #[error("is not one program — an absolute path or a bare command name, with no arguments")]
@@ -982,9 +996,12 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// * a **socket** is an absolute path outside bx's own directories;
 /// * a **setting** holds a value of its [`Setting`] shape.
 ///
-/// No path of any kind may lie inside bx's state directory
-/// ([`Reason::BxOwnedDirectory`]) or its config repo
-/// ([`Reason::InsideConfigRepo`]), checked in that order and before any root.
+/// No path of any kind may have a `..` component ([`Reason::ParentComponent`])
+/// or lie inside bx's state directory ([`Reason::BxOwnedDirectory`]) or its
+/// config repo ([`Reason::InsideConfigRepo`]), checked in that order and before
+/// any root. No location may hold `$`, `{` or `%` once the shell has resolved
+/// it ([`Reason::ToolExpandable`]): the guard judges the shape, because it
+/// cannot know which tool expands what.
 /// A value that does not resolve cannot be shown to be any of those, and is
 /// refused for why it does not.
 ///
@@ -1185,15 +1202,27 @@ fn is_bare_word(value: &str) -> bool {
 /// relocation target, or `None` if it may.
 fn refuses_entry(path: &Path, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, roots)
+        .or_else(|| {
+            path.to_string_lossy()
+                .contains(['$', '{', '%'])
+                .then_some(Reason::ToolExpandable)
+        })
         .or_else(|| (!roots.contains(path)).then_some(Reason::OutsideDeclaredRoots))
 }
 
-/// Why one resolved path may not be named at all — relative, inside a
-/// directory bx owns, or inside bx's config repo — whether or not it must
+/// Why one resolved path may not be named at all — relative, climbing, inside
+/// a directory bx owns, or inside bx's config repo — whether or not it must
 /// also lie inside a root.
 fn refuses_unanchored(path: &Path, roots: &RootSet) -> Option<Reason> {
     if !path.is_absolute() {
         return Some(Reason::NotAbsolute);
+    }
+    // Read before normalisation, which would fold the `..` away.
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Some(Reason::ParentComponent);
     }
     // Before the root test, and therefore ahead of any declaration: a root the
     // user declared widens where tools may live, never who owns bx's own state.
@@ -2144,6 +2173,14 @@ mod tests {
         );
         assert_eq!(Reason::NotAbsolute.to_string(), "is not an absolute path");
         assert_eq!(
+            Reason::ParentComponent.to_string(),
+            "has a `..` component, so where it points cannot be shown"
+        );
+        assert_eq!(
+            Reason::ToolExpandable.to_string(),
+            "holds `$`, `{` or `%`, which the tool may expand itself into a path nothing judged"
+        );
+        assert_eq!(
             Reason::UnresolvedReference.to_string(),
             "refers to a variable this fragment has not assigned"
         );
@@ -2417,13 +2454,19 @@ mod tests {
         // `DATA_DIR='$CACHE_DIR'` holds the characters `$CACHE_DIR`, and a
         // shell that later expands `$DATA_DIR` yields them and stops. Expanding
         // them again would judge a path no shell produces. Both helpers are
-        // locations, so each is judged as one; the line that uses the literal
-        // inside the root is not refused.
+        // locations, so each is judged as one. The line that uses the literal
+        // inside the root holds a `$` a tool could expand itself, so since r3
+        // round 2 it is refused for that, and not for where a second
+        // expansion would point.
         let content =
             format!("CACHE_DIR=/etc\nDATA_DIR='$CACHE_DIR'\nexport CARGO_HOME={ROOT}/$DATA_DIR\n");
         assert_eq!(
             reasons(&content, &rooted()),
-            vec![(1, Reason::OutsideDeclaredRoots), (2, Reason::NotAbsolute)]
+            vec![
+                (1, Reason::OutsideDeclaredRoots),
+                (2, Reason::NotAbsolute),
+                (3, Reason::ToolExpandable)
+            ]
         );
         // Expanded once, `$DATA_DIR/cargo` is `$CACHE_DIR/cargo`: relative.
         // Expanded twice it would be inside the root and approved.
@@ -4302,7 +4345,7 @@ mod tests {
         assert_eq!(
             reason_of(&check(
                 "CARGO_HOME",
-                "/var/mnt/scratch/example/cfg/./bx/../bx/c",
+                "/var/mnt/scratch/example/cfg/./bx/c",
                 &moved
             )),
             Some(Reason::InsideConfigRepo)
@@ -4339,15 +4382,15 @@ mod tests {
     #[test]
     fn a_location_is_the_one_path_its_tool_reads() {
         // cargo reads `CARGO_HOME` as one path, `:` and all. Each entry of this
-        // value normalises inside the root, and the whole string does not: `x:`
-        // is one component, and the three `..` climb out past it.
-        let climbing = "/var/mnt/scratch/example/x:/../../../var/mnt/scratch/example/y";
+        // value is inside the root, and the whole string is not: `example:` is
+        // one component, a sibling of the root.
+        let joined = "/var/mnt/scratch/example:/var/mnt/scratch/example/y";
         assert_eq!(
-            reason_of(&check("CARGO_HOME", climbing, &rooted())),
+            reason_of(&check("CARGO_HOME", joined, &rooted())),
             Some(Reason::OutsideDeclaredRoots)
         );
         // `GOPATH` is a list go splits at `:`, so each entry is the path.
-        assert_eq!(check("GOPATH", climbing, &rooted()), Verdict::Allowed);
+        assert_eq!(check("GOPATH", joined, &rooted()), Verdict::Allowed);
         assert_eq!(
             reason_of(&check(
                 "GOPATH",
@@ -4356,22 +4399,16 @@ mod tests {
             )),
             Some(Reason::OutsideDeclaredRoots)
         );
-        // The whole path passes the checks an entry does, bx's directories
-        // first: each entry here is inside a root, and the whole value is bx's
-        // state directory, or inside its config repo.
-        let two = RootSet::new(Path::new(HOME), &[PathBuf::from("~"), PathBuf::from("/bx")]);
-        let into_state = "/var/home/example/.local/state/q:/../bx";
-        let into_repo = "/var/home/example/.config/q:/../bx/c";
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", into_state, &two)),
-            Some(Reason::BxOwnedDirectory)
-        );
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", into_repo, &two)),
-            Some(Reason::InsideConfigRepo)
-        );
-        for value in [into_state, into_repo] {
-            assert_eq!(check("GOPATH", value, &two), Verdict::Allowed, "{value}");
+        // The review's climbing case: its entries normalise inside the root
+        // and the whole string outside it. Since r3 round 2 its `..` is refused
+        // before either, whichever kind holds it.
+        let climbing = "/var/mnt/scratch/example/x:/../../../var/mnt/scratch/example/y";
+        for name in ["CARGO_HOME", "GOPATH"] {
+            assert_eq!(
+                reason_of(&check(name, climbing, &rooted())),
+                Some(Reason::ParentComponent),
+                "{name}"
+            );
         }
         // An entry that is refused keeps its own reason, and a value with no
         // `:` is one path either way.
@@ -4489,6 +4526,94 @@ mod tests {
         assert_eq!(
             reasons(snippet, &RootSet::strict()),
             [8, 12, 13, 14, 15, 16, 17].map(|line| (line, Reason::Unreadable))
+        );
+    }
+
+    #[test]
+    fn a_path_a_tool_may_expand_or_that_climbs_is_refused() {
+        use Reason::{NoRootsDeclared, ParentComponent, ToolExpandable};
+        // The review's npm fragment, judged at the guard. A real shell holds
+        // the cache value as the literal below, so the real-shell tests cannot
+        // see what happens next: npm expands `${EDITOR}` inside the value
+        // itself, resolves `<root>//../../../../../../var/home/example/.local/state/bx`,
+        // and writes its logs into bx's state directory. So the guard refuses
+        // the shape rather than modelling each tool: no location holds `$`,
+        // `{` or `%` once the shell has resolved it, and no path of any kind
+        // has a `..` component.
+        let roots = RootSet::new(Path::new(HOME), &[PathBuf::from("/var/home/example/r")]);
+        let fragment = "export EDITOR=/../../../../../..\n\
+             export NPM_CONFIG_CACHE='/var/home/example/r/${EDITOR}/var/home/example/.local/state/bx'\n";
+        assert_eq!(
+            reasons(fragment, &roots),
+            vec![(1, ParentComponent), (2, ToolExpandable)]
+        );
+        // Each expansion character, in a location and in any entry of a list
+        // of locations, quoted so that the shell leaves it alone.
+        for value in [
+            "'/var/mnt/scratch/example/${X}'",
+            "'/var/mnt/scratch/example/$X'",
+            "\"/var/mnt/scratch/example/{a}\"",
+            "/var/mnt/scratch/example/%APPDATA%",
+            "'/var/mnt/scratch/example/go:/var/mnt/scratch/example/$X'",
+        ] {
+            for name in ["CARGO_HOME", "GOPATH", "NUGET_PACKAGES"] {
+                assert_eq!(
+                    reason_of(&check(name, value, &rooted())),
+                    Some(ToolExpandable),
+                    "{name}={value}"
+                );
+            }
+        }
+        // A `..` in every path-valued kind, even where it lands inside a root.
+        for (name, value) in [
+            ("CARGO_HOME", "/var/mnt/scratch/example/a/../cargo"),
+            (
+                "GOPATH",
+                "/var/mnt/scratch/example/go:/var/mnt/scratch/example/a/../b",
+            ),
+            ("EDITOR", "/usr/bin/../bin/nvim"),
+            ("PATH", "/usr/local/../bin:$PATH"),
+            ("SSH_AUTH_SOCK", "/run/user/../agent"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &rooted())),
+                Some(ParentComponent),
+                "{name}={value}"
+            );
+        }
+        // A kind that needs no root is refused for it with no root too; a
+        // location is refused for having no root first.
+        for (name, value) in [
+            ("EDITOR", "/usr/bin/../bin/nvim"),
+            ("PATH", "/usr/local/../bin:$PATH"),
+            ("SSH_AUTH_SOCK", "/run/user/../agent"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &RootSet::strict())),
+                Some(ParentComponent),
+                "{name}={value}"
+            );
+        }
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/mnt/scratch/example/a/../cargo",
+                &RootSet::strict()
+            )),
+            Some(NoRootsDeclared)
+        );
+        // A `.` component, and dots inside a name, are neither.
+        assert_eq!(
+            check(
+                "CARGO_HOME",
+                "/var/mnt/scratch/example/./a..b/cargo",
+                &rooted()
+            ),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            check("EDITOR", "/opt/a..b/nvim", &rooted()),
+            Verdict::Allowed
         );
     }
 

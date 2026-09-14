@@ -4848,7 +4848,10 @@ pub(crate) mod tests {
                         ])
                         .env(READ_CHILD_HOME, &home)
                         .env(READ_CHILD_CALL, call)
-                        .env_remove("LLVM_PROFILE_FILE")
+                        // Inherited, unlike the crash harness's: this child
+                        // exits normally and writes a profile, which belongs
+                        // where coverage put the parent's, not in the working
+                        // directory under a default name.
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped())
                         .spawn()

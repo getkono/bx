@@ -779,6 +779,15 @@ mod tests {
                 ] {
                     assert!(message.contains(part), "{file} {local:?} {part}: {message}");
                 }
+                // One step: nothing lies between, so the advice stops at the kind.
+                assert!(
+                    message.ends_with(
+                        "`file` references `cfg_dir`, a `path` value; a `path` value is always \
+                         absolute and `file` is relative to the config repo root, so no answer \
+                         could make it name a file in the repo; reference a `string` value"
+                    ),
+                    "{file} {local:?}: {message}"
+                );
             }
         }
 
@@ -1517,6 +1526,35 @@ mod tests {
             "{}",
             entry.hint
         );
+    }
+
+    #[test]
+    fn a_clash_through_two_derived_values_names_both_declarations() {
+        // `q` and `r` both default to `{{p}}`, so `~/{{q}}/s` and `~/{{r}}/s` are
+        // one file for every answer to `p`. Either declaration answered directly
+        // clears it, so the hint names both, each once, in declaration order.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[value]]\nname = \"r\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[target]]\npath = \"~/{{q}}/s\"\ncontent = \"Q\"\n\
+                             [[target]]\npath = \"~/{{r}}/s\"\ncontent = \"R\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let resolved = resolved(LAYER, Some("[values]\np = \"work\"\n"))
+            .expect("an account's answer does not fail the load");
+        for index in [0, 1] {
+            let entry = blocked(&resolved, index);
+            assert!(
+                entry.hint.ends_with(
+                    "because of the answer to `p` at local.toml:2, carried in by the default \
+                     of `q` at bx.toml:4 and the default of `r` at bx.toml:8; change that \
+                     answer, or answer `q` or `r` directly"
+                ),
+                "{index}: {}",
+                entry.hint
+            );
+        }
+        ready(&resolved, 2);
     }
 
     #[test]

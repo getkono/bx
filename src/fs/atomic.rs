@@ -4963,7 +4963,16 @@ mod tests {
     fn the_directories_a_write_invented_are_recorded_deepest_first() {
         let home = guarded_home();
         let dest = home.child(".config/a/b/f");
-        let filled = stage_now(&dest, Mode::DEFAULT_FILE)
+        let mut created = CreatedDirs::new();
+        assert!(
+            !created.contains(&home.child(".config")),
+            "a fresh set contains nothing",
+        );
+        // Declared by a directory target, but never made by anything.
+        let declared_only = home.child("declared-only");
+        created.declare(&declared_only, Mode::PRIVATE_DIR);
+        let planned = observe(&dest).expect("plan observes");
+        let filled = stage(&dest, Mode::DEFAULT_FILE, &planned, &mut created)
             .expect("stage")
             .fill(b"x")
             .expect("fill");
@@ -4994,6 +5003,22 @@ mod tests {
             "nothing was displaced, and that is not the same as empty bytes",
         );
         filled.publish().expect("publish");
+
+        for made in [".config/a/b", ".config/a", ".config"] {
+            assert!(created.contains(&home.child(made)), "{made} was made here");
+        }
+        assert!(
+            !created.contains(&home.child(".config/a/sibling")),
+            "a sibling of a directory this apply made is not one it made",
+        );
+        assert!(
+            !created.contains(home.path()),
+            "an existing parent the write did not create is not contained",
+        );
+        assert!(
+            !created.contains(&declared_only),
+            "a declared directory nothing made is not contained",
+        );
     }
 
     #[test]

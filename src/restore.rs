@@ -953,6 +953,42 @@ mod tests {
     }
 
     #[test]
+    fn every_outcome_names_the_target_it_is_about() {
+        // r3 coverage C4. `Restored::target` was reached only for `Unmanaged`
+        // and `Conflict`.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        plant_file(&home.child(".reverted"), "theirs\n", Mode::DEFAULT_FILE);
+        let reverted = managed(&state, home.path(), ".reverted", "bx\n", Mode::DEFAULT_FILE);
+        let removed = managed(&state, home.path(), ".removed", "bx\n", Mode::DEFAULT_FILE);
+        let gone = managed(&state, home.path(), ".gone", "bx\n", Mode::DEFAULT_FILE);
+        std::fs::remove_file(home.child(".gone")).expect("the user removes it");
+        let conflict = managed(&state, home.path(), ".conflict", "bx\n", Mode::DEFAULT_FILE);
+        plant_file(&home.child(".conflict"), "edited\n", Mode::DEFAULT_FILE);
+        let unmanaged = target(home.path(), ".unmanaged").0;
+        let targets = vec![reverted, removed, gone, unmanaged, conflict];
+
+        let done = restore(&state, home.path(), &targets).expect("rm");
+        assert!(
+            matches!(
+                done.as_slice(),
+                [
+                    Restored::Reverted { .. },
+                    Restored::Removed { .. },
+                    Restored::AlreadyGone { .. },
+                    Restored::Unmanaged { .. },
+                    Restored::Conflict { .. },
+                ]
+            ),
+            "{done:?}"
+        );
+        assert_eq!(
+            done.iter().map(Restored::target).collect::<Vec<_>>(),
+            targets.iter().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn restore_is_journalled_and_an_interrupted_restore_recovers() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());

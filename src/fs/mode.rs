@@ -471,6 +471,18 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_of_the_wrong_type_is_told_the_form_to_write() {
+        // Neither a string nor an integer: serde reports the type it found and
+        // what the visitor expected, so the expectation is the whole remedy.
+        let err = toml_edit::de::from_str::<Declared>("mode = true").expect_err("must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("expected one to four octal digits in quotes, like \"0600\""),
+            "{message}",
+        );
+    }
+
+    #[test]
     fn the_four_parser_rejections_survive_the_serde_layer() {
         for raw in ["8", "0688", "+644", "00644"] {
             let err = toml_edit::de::from_str::<Declared>(&format!("mode = \"{raw}\""))

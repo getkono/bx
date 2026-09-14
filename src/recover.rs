@@ -3380,6 +3380,40 @@ mod tests {
     }
 
     #[test]
+    fn a_rollback_under_a_created_directory_replaced_with_a_symlink_completes() {
+        // r3 round 1, D1. Pruning the created directory failed with ENOTDIR
+        // after the unlink, so every writing run failed and the journal stood.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(
+                home.path(),
+                "d/a.conf",
+                "bx\n",
+                Mode::DEFAULT_FILE,
+            )],
+        );
+        std::fs::rename(home.child("d"), home.child("real")).expect("move the directory");
+        std::os::unix::fs::symlink(home.child("real"), home.child("d")).expect("link it back");
+
+        assert_eq!(
+            before_writing(&state).expect("recover"),
+            Outcome::RolledBack { undone: 1 },
+        );
+        assert!(!state.journal().exists());
+        assert!(peek(&home.child("real/a.conf")).is_none());
+        assert!(
+            std::fs::symlink_metadata(home.child("d"))
+                .expect("the link stays")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(before_writing(&state).expect("again"), Outcome::Nothing);
+    }
+
+    #[test]
     fn only_a_destination_in_a_recorded_state_is_resolvable() {
         for (standing, resolvable) in [
             (Standing::Prior, true),

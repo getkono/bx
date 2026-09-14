@@ -1126,8 +1126,9 @@ pub enum Content {
     /// No file at all.
     ///
     /// The destination is unlinked and `created_dirs` are removed, deepest
-    /// first, while they are empty and no entry the ledger still holds names
-    /// them. Absence is not emptiness: a file bx created is removed, never
+    /// first, while they are empty directories and no entry the ledger still
+    /// holds names them; one that is no longer a directory is left. Absence is
+    /// not emptiness: a file bx created is removed, never
     /// truncated. The target is always dropped from the ledger — there is
     /// nothing left for bx to own. A claimed directory something else still
     /// holds is tried again when the session finishes, and handed to a
@@ -1822,11 +1823,12 @@ pub(crate) fn set_aside(path: &Path, lock: &ExclusiveLock) -> Result<PathBuf, Er
 ///
 /// The stop is the point: a directory that has acquired anything else is no
 /// longer only bx's, and removing it would delete something bx did not put
-/// there.
+/// there. One that is no longer a directory at all stops the walk the same way.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] for a failure that is neither "already gone" nor "not empty".
+/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
+/// "not a directory".
 pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
     for dir in dirs {
         if !remove_if_empty(dir)? {
@@ -1838,9 +1840,16 @@ pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
 
 /// Remove a directory bx created if it is empty, and say whether it is gone.
 ///
+/// A path that is no longer a directory — a symlink the user put in its
+/// place, or a file where it or one of its parents was — still stands, and is
+/// no longer bx's: it is left, as [`hand_off_claims`] leaves it. `rmdir` never
+/// follows its last component, so that is decided by the one call that would
+/// otherwise remove it, with no window between a look and the removal.
+///
 /// # Errors
 ///
-/// [`Error::Io`] for a failure that is neither "already gone" nor "not empty".
+/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
+/// "not a directory".
 fn remove_if_empty(dir: &Path) -> Result<bool, Error> {
     match std::fs::remove_dir(dir) {
         Ok(()) => {
@@ -1858,6 +1867,16 @@ fn remove_if_empty(dir: &Path) -> Result<bool, Error> {
         {
             Ok(false)
         }
+        Err(e)
+            if e.raw_os_error().map(rustix::io::Errno::from_raw_os_error)
+                == Some(rustix::io::Errno::NOTDIR) =>
+        {
+            tracing::debug!(
+                dir = %dir.display(),
+                "left a directory bx created that is no longer a directory",
+            );
+            Ok(false)
+        }
         Err(source) => Err(Error::Io {
             path: dir.to_path_buf(),
             source,
@@ -1870,13 +1889,15 @@ fn remove_if_empty(dir: &Path) -> Result<bool, Error> {
 ///
 /// `dirs` are claims — possibly several targets' — so unlike [`prune_dirs`] a
 /// directory that is not empty does not stop the walk: it is skipped and the
-/// rest are tried. Its parents are not empty either, so they stay too. A
-/// directory an entry names is somebody's target, whoever claimed it, and is
-/// never removed here.
+/// rest are tried. Its parents are not empty either, so they stay too. A claim
+/// that is no longer a directory is skipped the same way, and dropped with its
+/// target. A directory an entry names is somebody's target, whoever claimed
+/// it, and is never removed here.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] for a failure that is neither "already gone" nor "not empty".
+/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
+/// "not a directory".
 pub(crate) fn prune_claims<'a>(
     ledger: &LedgerView,
     home: &Path,
@@ -4303,6 +4324,43 @@ pub(crate) mod tests {
         let err = err.expect_err("neither gone nor not empty");
         assert!(matches!(err, Error::Io { .. }), "got {err}");
         assert!(child.is_dir());
+    }
+
+    #[test]
+    fn a_claimed_directory_that_is_no_longer_a_directory_is_left_and_the_walk_goes_on() {
+        // r3 round 1, D1. `rmdir` on a symlink or a file is ENOTDIR, which was
+        // an error: `rm` unlinked the file through the link and then failed,
+        // and a rollback failed the same way on every run.
+        let dir = tempfile::tempdir().expect("a tempdir");
+
+        // A claimed directory the user replaced with a link to an empty one.
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("the real directory");
+        let link = dir.path().join("d");
+        std::os::unix::fs::symlink(&real, &link).expect("the link");
+        prune_dirs(std::slice::from_ref(&link)).expect("a link is not bx's directory");
+        prune_claims(
+            &LedgerView::default(),
+            dir.path(),
+            std::slice::from_ref(&link),
+        )
+        .expect("nor is it a claim to remove");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link stays")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(real.is_dir(), "and so does the directory it names");
+
+        // A claimed ancestor replaced by a regular file: the claim beneath it
+        // cannot be a directory either.
+        let file = dir.path().join("a");
+        std::fs::write(&file, "the user's\n").expect("a file where a directory was");
+        let claims = [file.join("b"), file.clone()];
+        prune_dirs(&claims).expect("prune");
+        prune_claims(&LedgerView::default(), dir.path(), &claims).expect("prune the claims");
+        assert_eq!(std::fs::read(&file).expect("kept"), b"the user's\n");
     }
 
     #[test]

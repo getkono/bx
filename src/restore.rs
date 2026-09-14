@@ -17,7 +17,8 @@
 //!   "there is no file" and "there is an empty file" are different states, and
 //!   only one of them is what the user had. Directories bx created are then
 //!   removed deepest-first while they are empty; one another managed file
-//!   still holds is handed to that file's entry, so its own `rm` removes it.
+//!   still holds is handed to that file's entry, so its own `rm` removes it,
+//!   and one the user replaced with something that is not a directory is left.
 //!   The file is unlinked only while it is still the one the plan observed.
 //! * **Never overwrite a later edit.** The destination's current digest is
 //!   compared with the digest bx recorded when it last wrote the file. If they
@@ -1310,6 +1311,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["~/.config"],
             "the claim on its parent is handed to it",
+        );
+    }
+
+    #[test]
+    fn rm_under_a_claimed_directory_the_user_replaced_with_a_symlink_finishes() {
+        // r3 round 1, D1. The file went through the link, pruning the claimed
+        // directory failed with ENOTDIR, and the session was left for a rollback
+        // that put the file back: every `rm` after that did the same.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let portable = managed(&state, home.path(), "d/a.conf", "bx\n", Mode::DEFAULT_FILE);
+        std::fs::rename(home.child("d"), home.child("real")).expect("move the directory");
+        std::os::unix::fs::symlink(home.child("real"), home.child("d")).expect("link it back");
+
+        let done = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(done.as_slice(), [Restored::Removed { .. }]),
+            "{done:?}"
+        );
+        assert!(
+            peek(&home.child("real/a.conf")).is_none(),
+            "bx's file is gone"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.child("d"))
+                .expect("the link stays")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(home.child("real").is_dir(), "and so does what it names");
+        assert!(!state.journal().exists(), "the session finished");
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+
+        let again = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(again.as_slice(), [Restored::Unmanaged { .. }]),
+            "{again:?}"
         );
     }
 

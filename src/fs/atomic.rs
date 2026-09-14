@@ -653,6 +653,9 @@ pub struct Outcome {
     /// except when the parent is a symlink, which a directory target refuses.
     /// Then the note names the directory the link resolves to and says to
     /// `chmod` that directory itself.
+    ///
+    /// A directory under the home is named `~/…`, never by its absolute path;
+    /// see [`compare`].
     pub parent_note: Option<String>,
 }
 
@@ -674,8 +677,13 @@ pub struct Outcome {
 ///   for it: it compares nothing with `plan`.
 /// * [`Action::Conflict`] — a directory, a symlink, or anything else that is
 ///   not a regular file.
+///
+/// `home` only names things: a directory the parent note mentions is written
+/// `~/…` when it is under `home`, through [`crate::paths::to_portable`],
+/// because `plan` prints the note and plan output names no absolute home. A
+/// directory outside it stays absolute. Nothing in the verdict depends on it.
 #[must_use]
-pub fn compare(observed: &Observed, desired: &Desired<'_>) -> Outcome {
+pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outcome {
     // A parent that does not resolve settles the verdict on its own: there is
     // no directory to write into and none bx can create, so announcing
     // anything but a conflict would announce work `apply` cannot do.
@@ -694,16 +702,16 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>) -> Outcome {
         if !mode.is_wider_than(desired.mode) {
             return None;
         }
+        let shown = crate::paths::to_portable(&parent.path, home);
         if let Some(resolved) = &parent.resolved {
             // Declaring the link as a directory target would be refused, so
             // the report names the directory that can actually be narrowed.
+            let resolved = crate::paths::to_portable(resolved, home);
             return Some(format!(
-                "{} is a symlink to {}, which is {mode}, wider than the {} this file declares; \
-                 bx will not chmod a directory through a link, so chmod {} itself",
-                parent.path.display(),
-                resolved.display(),
+                "{shown} is a symlink to {resolved}, which is {mode}, wider than the {} this \
+                 file declares; bx will not chmod a directory through a link, so chmod \
+                 {resolved} itself",
                 desired.mode,
-                resolved.display(),
             ));
         }
         let verb = if parent.exists() {
@@ -712,8 +720,7 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>) -> Outcome {
             "will be created at"
         };
         Some(format!(
-            "{} {verb} {mode}, wider than the {} this file declares",
-            parent.path.display(),
+            "{shown} {verb} {mode}, wider than the {} this file declares",
             desired.mode,
         ))
     });
@@ -2071,7 +2078,7 @@ mod tests {
     fn outcome_for(home: &GuardedHome, rel: &str, bytes: &[u8], mode: Mode) -> Outcome {
         let path = home.child(rel);
         let observed = observe(&path).expect("observe");
-        compare(&observed, &desired(bytes, mode))
+        compare(&observed, &desired(bytes, mode), home.path())
     }
 
     #[test]
@@ -2247,10 +2254,7 @@ mod tests {
         // and shares every substring checked above it.
         assert_eq!(
             outcome.parent_note,
-            Some(format!(
-                "{} is 0755, wider than the 0600 this file declares",
-                home.child(".ssh").display()
-            )),
+            Some("~/.ssh is 0755, wider than the 0600 this file declares".to_string()),
         );
     }
 
@@ -2321,7 +2325,11 @@ mod tests {
             "the resolved directory's 0700, not the link's own 0777",
         );
 
-        let outcome = compare(&observed, &desired(b"Host *\n", Mode::PRIVATE_FILE));
+        let outcome = compare(
+            &observed,
+            &desired(b"Host *\n", Mode::PRIVATE_FILE),
+            home.path(),
+        );
         assert_eq!(outcome.parent_note, None, "a hardened parent is no finding");
 
         // The asymmetry, stated as an assertion: the *destination* is still
@@ -2545,7 +2553,12 @@ mod tests {
             assert_eq!(mode_of_path(&dest), mode, "{mode}: on disk");
             let observed = observe(&dest).expect("observe");
             assert_eq!(
-                compare(&observed, &desired(b"#!/bin/sh\nexit 0\n", mode)).action,
+                compare(
+                    &observed,
+                    &desired(b"#!/bin/sh\nexit 0\n", mode),
+                    home.path()
+                )
+                .action,
                 Action::Unchanged,
                 "{mode}: the second plan is empty",
             );
@@ -2960,7 +2973,12 @@ mod tests {
         assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
         let observed = observe(&dest).expect("observe");
         assert_eq!(
-            compare(&observed, &desired(b"same\n", Mode::DEFAULT_FILE)).action,
+            compare(
+                &observed,
+                &desired(b"same\n", Mode::DEFAULT_FILE),
+                home.path()
+            )
+            .action,
             Action::Unchanged,
             "the second plan is empty",
         );
@@ -3142,7 +3160,7 @@ mod tests {
             seed(&dest, b"v1\n", Mode::DEFAULT_FILE);
             let planned = observe(&dest).expect("plan observes");
             assert_eq!(
-                compare(&planned, &desired(b"bx\n", Mode::DEFAULT_FILE)).action,
+                compare(&planned, &desired(b"bx\n", Mode::DEFAULT_FILE), home.path()).action,
                 Action::Modify,
                 "{how}",
             );
@@ -3530,7 +3548,7 @@ mod tests {
         let chmodded = home.child("chmodded");
         seed(&chmodded, b"Host *\n", Mode::DEFAULT_FILE);
         let planned_a = observe(&chmodded).expect("plan observes");
-        let outcome = compare(&planned_a, &want);
+        let outcome = compare(&planned_a, &want, home.path());
         assert_eq!(outcome.action, Action::Modify);
         assert!(!outcome.content_drift, "only the mode drifted");
         set_mode(&chmodded, Mode::from_bits(0o640)).expect("the user's chmod after plan");
@@ -3541,7 +3559,10 @@ mod tests {
         let replaced = home.child("replaced");
         seed(&replaced, b"Host *\n", Mode::DEFAULT_FILE);
         let planned_b = observe(&replaced).expect("plan observes");
-        assert_eq!(compare(&planned_b, &want).action, Action::Modify);
+        assert_eq!(
+            compare(&planned_b, &want, home.path()).action,
+            Action::Modify
+        );
         std::fs::remove_file(&replaced).expect("rm");
         std::fs::create_dir(&replaced).expect("a directory takes the path");
         set_mode(&replaced, Mode::DEFAULT_DIR).expect("at its own mode");
@@ -3899,7 +3920,12 @@ mod tests {
             Action::Create
         );
         assert_eq!(
-            compare(&planned_file, &desired(b"Host *\n", Mode::PRIVATE_FILE)).action,
+            compare(
+                &planned_file,
+                &desired(b"Host *\n", Mode::PRIVATE_FILE),
+                home.path(),
+            )
+            .action,
             Action::Create,
         );
 
@@ -4943,7 +4969,7 @@ mod tests {
         // The one read, shared by the comparison and the apply.
         let want = desired(b"Host *\n", Mode::PRIVATE_FILE);
         let planned = observe(&dest).expect("observe");
-        let outcome = compare(&planned, &want);
+        let outcome = compare(&planned, &want, home.path());
         assert_eq!(outcome.action, Action::Modify);
         assert!(!outcome.content_drift);
 
@@ -4978,7 +5004,7 @@ mod tests {
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host *\n");
         // Idempotent: the second plan is empty.
         assert_eq!(
-            compare(&observe(&dest).expect("observe again"), &want).action,
+            compare(&observe(&dest).expect("observe again"), &want, home.path()).action,
             Action::Unchanged,
         );
 
@@ -5184,6 +5210,50 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_note_names_directories_under_home_portably() {
+        let home = guarded_home();
+        // `resolved` is a realpath, so it is under the home only if the home
+        // path is itself one. Fail loudly rather than pass on no evidence.
+        assert_eq!(
+            std::fs::canonicalize(home.path()).expect("realpath of the home"),
+            home.path(),
+            "the guarded home must be a canonical path for this test to mean anything",
+        );
+        let absolute_home = home.path().display().to_string();
+
+        std::fs::create_dir(home.child(".ssh")).expect("mkdir");
+        set_mode(&home.child(".ssh"), Mode::DEFAULT_DIR).expect("chmod");
+        std::fs::create_dir_all(home.child("dotfiles/dot_gnupg")).expect("mkdir");
+        set_mode(&home.child("dotfiles/dot_gnupg"), Mode::DEFAULT_DIR).expect("chmod");
+        std::os::unix::fs::symlink("dotfiles/dot_gnupg", home.child(".gnupg")).expect("symlink");
+
+        for (rel, expected) in [
+            (
+                ".ssh/config",
+                "~/.ssh is 0755, wider than the 0600 this file declares",
+            ),
+            (
+                ".aws/credentials",
+                "~/.aws will be created at 0755, wider than the 0600 this file declares",
+            ),
+            (
+                ".gnupg/gpg.conf",
+                "~/.gnupg is a symlink to ~/dotfiles/dot_gnupg, which is 0755, wider than the \
+                 0600 this file declares; bx will not chmod a directory through a link, so \
+                 chmod ~/dotfiles/dot_gnupg itself",
+            ),
+        ] {
+            let outcome = outcome_for(&home, rel, b"x", Mode::PRIVATE_FILE);
+            let note = outcome.parent_note.expect("the parent must be reported");
+            assert!(
+                !note.contains(&absolute_home),
+                "{rel}: `bx plan` prints this note, so it names no absolute home: {note}",
+            );
+            assert_eq!(note, expected, "{rel}");
+        }
+    }
+
+    #[test]
     fn a_wide_symlinked_parent_names_the_directory_to_chmod() {
         let home = guarded_home();
         std::fs::create_dir_all(home.child("dotfiles/dot_ssh")).expect("mkdir");
@@ -5192,10 +5262,9 @@ mod tests {
 
         let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
         let note = outcome.parent_note.expect("the parent must be reported");
-        let resolved = std::fs::canonicalize(home.child("dotfiles/dot_ssh")).expect("realpath");
         assert!(
-            note.contains(&resolved.display().to_string()),
-            "the note names the directory the link resolves to: {note}",
+            note.contains("so chmod ~/dotfiles/dot_ssh itself"),
+            "the note names the directory the link resolves to, portably: {note}",
         );
         assert!(note.contains("chmod"), "{note}");
     }

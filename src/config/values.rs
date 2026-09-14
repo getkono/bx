@@ -1278,9 +1278,20 @@ impl ResolvedValues {
     /// following those defaults down.
     fn derived_between(&self, text: &str, into: &mut Vec<String>) {
         for name in placeholders(text).unwrap_or_default() {
+            // Never taken today: every text reaching here names only declared
+            // values. A clash's spellings are all keyed as one file, so each
+            // substituted, and a field is reported broken only after its
+            // substitution succeeded. A default followed below was expanded
+            // when its value resolved, and an undeclared name there fails the
+            // load. Kept as `continue`, not a panic, for a future caller.
             let Some(index) = self.index_of(name) else {
                 continue;
             };
+            // Never taken today either. Substitution succeeds only when every
+            // name is `Answer::Given`, which holds for both kinds of text above.
+            // A default is followed only for a value `Given` from that default,
+            // and a value's default expands only when every name in it is
+            // `Given`; otherwise that value is `Unset`, `Disabled` or `Invalid`.
             let Answer::Given { from_account, .. } = &self.answers[index] else {
                 continue;
             };

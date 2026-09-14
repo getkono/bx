@@ -4266,6 +4266,57 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&dest).expect("read"), b"the user's edit\n");
     }
 
+    #[test]
+    fn a_removal_names_how_its_destination_moved_since_plan() {
+        // r3 coverage C2. Only "modified or replaced" was ever produced.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (gone, gone_dest) = target(home.path(), ".gone");
+        plant_file(&gone_dest, "bx created\n", Mode::DEFAULT_FILE);
+        let was_there = fs::observe(&gone_dest).expect("plan's observation");
+        std::fs::remove_file(&gone_dest).expect("the user removes it");
+        let (appeared, appeared_dest) = target(home.path(), ".appeared");
+        let nothing = fs::observe(&appeared_dest).expect("plan's observation");
+        plant_file(&appeared_dest, "the user's\n", Mode::DEFAULT_FILE);
+
+        for (portable, dest, planned, detail) in [
+            (gone, gone_dest, was_there, "it has been removed"),
+            (
+                appeared,
+                appeared_dest.clone(),
+                nothing,
+                "nothing was there, and something is now",
+            ),
+        ] {
+            let mut session =
+                Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+            let err = session
+                .apply(Request {
+                    target: portable,
+                    dest: dest.clone(),
+                    content: Content::Absent {
+                        created_dirs: Vec::new(),
+                        planned,
+                    },
+                    mode: Mode::DEFAULT_FILE,
+                    ownership: Ownership::Released,
+                })
+                .expect_err(detail);
+            assert!(
+                matches!(&err, Error::Write(fs::Error::Changed { path, detail: said }) if *path == dest && said.as_str() == detail),
+                "got {err}"
+            );
+            drop(session);
+            assert_eq!(
+                load(&state.journal()).expect("load").intents().count(),
+                0,
+                "{detail}: refused before its Intent"
+            );
+            crate::recover::recover(&state).expect("clear the refused session");
+        }
+        assert_eq!(peek(&appeared_dest).expect("kept").0, b"the user's\n");
+    }
+
     /// An Intent that says bx created `dest` holding `bytes`.
     fn created(target: &Portable, dest: &Path, bytes: &[u8]) -> Record {
         Record::Intent(Intent {

@@ -195,6 +195,9 @@ pub struct Report {
     pub apply_running: bool,
     /// Whether this run wrote.
     pub executed: bool,
+    /// What recovery did, when an `apply` found an interrupted session, was
+    /// approved, recovered it, and stopped there.
+    pub recovered: Option<recover::Outcome>,
 }
 
 impl Report {
@@ -312,15 +315,25 @@ impl From<recover::Error> for Error {
 /// Decide every target, report, and — in [`Mode::Apply`], once `approve` says
 /// so — write.
 ///
+/// An interrupted session comes first, in both modes, and is then all a run
+/// does. Its rows are what recovery would do to each write the session
+/// announced, and no configured target is decided against a disk recovery is
+/// about to change: `plan` shows the rows, and `apply` refuses before any
+/// recovery when a write cannot be accounted for, asks `approve` otherwise, and
+/// once approved recovers and stops. The next run decides.
+///
 /// `approve` is shown the report and asked only when there is a write to make,
 /// and never in [`Mode::Plan`]. Declining leaves the report unexecuted and
-/// nothing written: no session is opened and no journal is created.
+/// nothing written: nothing is rolled back, no session is opened and no journal
+/// is created.
 ///
 /// # Errors
 ///
 /// Whatever recovery, loading the ledger, reading a body, observing a
-/// destination, `approve`, or the session returns. A failed write leaves its
-/// journal for the next writing run to roll back.
+/// destination, `approve`, or the session returns, and [`Error::Recover`] with
+/// [`recover::Error::Blocked`] from `apply` over an interrupted write recovery
+/// cannot account for. A failed write leaves its journal for the next writing
+/// run to roll back.
 pub fn run(
     inputs: &Inputs,
     mode: Mode,
@@ -328,11 +341,22 @@ pub fn run(
 ) -> Result<Report, Error> {
     refuse_irregular_state_files(&inputs.state)?;
     let mut report = Report::default();
-    match mode {
-        Mode::Plan => look_at_state(inputs, &mut report)?,
-        Mode::Apply => {
-            recover::before_writing(&inputs.state)?;
+    look_at_state(inputs, &mut report)?;
+    if let Some(interrupted) = report.interrupted.clone() {
+        report.changes = interrupted_rows(inputs, &interrupted)?;
+        if mode == Mode::Plan {
+            return Ok(report);
         }
+        // Refused on what `pending` found, before recovery runs at all, so a
+        // blocked session rolls nothing back.
+        let blocked: Vec<_> = interrupted.blocked().cloned().collect();
+        if !blocked.is_empty() {
+            return Err(recover::Error::Blocked { conflicts: blocked }.into());
+        }
+        if approve(&report)? {
+            report.recovered = Some(recover::before_writing(&inputs.state)?);
+        }
+        return Ok(report);
     }
 
     let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
@@ -350,10 +374,7 @@ pub fn run(
     }
 
     match mode {
-        Mode::Plan => {
-            mark_interrupted(&mut report);
-            Ok(report)
-        }
+        Mode::Plan => Ok(report),
         Mode::Apply => {
             if ops.is_empty() || !approve(&report)? {
                 return Ok(report);
@@ -374,12 +395,16 @@ pub fn run(
 /// its actions otherwise. An executed `apply` has done its pending work, so
 /// only a row still needing attention keeps it pending. An `apply` that wrote
 /// nothing — declined, or with nothing to do — exits by its actions, so a
-/// declined prompt over pending work exits 2.
+/// declined prompt over pending work exits 2. An `apply` that recovered an
+/// interrupted session stopped there, with every configured target still
+/// undecided, so it exits [`Exit::Pending`] too: the machine is not converged
+/// until the next `apply`.
 #[must_use]
 pub fn exit(report: &Report, mode: Mode) -> Exit {
     let actions = report.actions();
     match mode {
         Mode::Plan if report.interrupted.is_some() => Exit::Pending,
+        Mode::Apply if report.recovered.is_some() => Exit::Pending,
         Mode::Apply if report.executed => {
             if actions.iter().any(|action| action.needs_attention()) {
                 Exit::Pending
@@ -421,31 +446,114 @@ fn look_at_state(inputs: &Inputs, report: &mut Report) -> Result<(), Error> {
     Ok(())
 }
 
-/// Every target an interrupted session names is a conflict until a writing
-/// run resolves it.
-fn mark_interrupted(report: &mut Report) {
-    let Some(interrupted) = &report.interrupted else {
-        return;
-    };
+/// The rows an interrupted session gives a run: what recovery would do to each
+/// write the session announced, in the order it announced them.
+///
+/// A write in a session that did not finish, and that recovery can resolve on
+/// its own, is rolled back. Its row is a modify with the diff from what is on
+/// disk to what was there before — every line removed, for a file the session
+/// created — and names the directories the session created that recovery
+/// removes where empty. A write in a session that finished is only recorded,
+/// which touches no file, so its row is unchanged. A write recovery cannot
+/// account for is a conflict whose note names abandon.
+///
+/// The prior bytes a diff shows are read from the journal and its restore
+/// snapshot, lockless, as `pending` read them. A snapshot that cannot be read
+/// now leaves the row without a diff rather than guessing at one.
+fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Change>, Error> {
+    let loaded = journal::load(&inputs.state.journal())?;
+    let mut rows = Vec::with_capacity(interrupted.unfinished.len());
     for unfinished in &interrupted.unfinished {
-        let found = report
-            .changes
-            .iter_mut()
-            .find(|change| change.target == unfinished.target.as_str());
-        match found {
-            Some(change) => {
-                change.action = unfinished.action();
-                change.note = Some(unfinished.note.clone());
-            }
-            None => report.changes.push(Change {
-                target: unfinished.target.as_str().to_string(),
-                origin: Origin::unknown(&interrupted.journal),
-                action: unfinished.action(),
-                diff: None,
-                note: Some(unfinished.note.clone()),
-            }),
+        let target = unfinished.target.as_str();
+        let origin = inputs
+            .resolved
+            .targets
+            .iter()
+            .find_map(|resolution| match resolution {
+                resolve::Resolution::Ready(ready) if ready.path.as_str() == target => {
+                    Some(ready.origin.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| Origin::unknown(&interrupted.journal));
+        let row = |action, diff, note: String| Change {
+            target: target.to_string(),
+            origin: origin.clone(),
+            action,
+            diff,
+            note: Some(note),
+        };
+
+        if !unfinished.resolvable {
+            let note = if unfinished.note.contains("abandon") {
+                unfinished.note.clone()
+            } else {
+                format!(
+                    "{}; recovery cannot put it back, so the interrupted session has to be \
+                     abandoned",
+                    unfinished.note
+                )
+            };
+            rows.push(row(Action::Conflict, None, note));
+            continue;
         }
+        if interrupted.complete {
+            rows.push(row(Action::Unchanged, None, unfinished.note.clone()));
+            continue;
+        }
+
+        let intent = loaded
+            .intents()
+            .find(|intent| intent.target == unfinished.target);
+        let observed = crate::fs::observe(&unfinished.dest)?;
+        let written = unfinished.standing == recover::Standing::Written;
+        let (diff, what) = match (written, intent.map(|intent| &intent.before)) {
+            (true, Some(state::Prior::Existed(reference))) => {
+                let prior = LedgerView::default()
+                    .restore_bytes(&inputs.state, reference)
+                    .ok();
+                let mode = observed
+                    .mode
+                    .filter(|mode| *mode != reference.mode)
+                    .map(|mode| (mode, reference.mode));
+                (
+                    prior.and_then(|prior| {
+                        Diff::between(target, observed.bytes.as_deref(), &prior, mode)
+                    }),
+                    "rolls back: puts back what was there before",
+                )
+            }
+            (true, Some(state::Prior::Absent)) => (
+                Diff::between(target, observed.bytes.as_deref(), b"", None),
+                "rolls back: removes the file the session created",
+            ),
+            (true, None) => (None, "rolls back what the session wrote"),
+            (false, _) => (None, "rolls back: it already holds what was there before"),
+        };
+        let dirs: Vec<String> = intent
+            .map(|intent| {
+                intent
+                    .created_dirs
+                    .iter()
+                    .rev()
+                    .filter(|dir| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()))
+                    .map(|dir| paths::to_portable(dir, &inputs.home))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let note = if dirs.is_empty() {
+            what.to_string()
+        } else {
+            format!("{what}; removes {} where empty", dirs.join(", "))
+        };
+        let action = if written || !dirs.is_empty() {
+            Action::Modify
+        } else {
+            Action::Unchanged
+        };
+        rows.push(row(action, diff, note));
     }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -1320,7 +1428,20 @@ pub(crate) mod tests {
             );
             assert_eq!(exit(&found, Mode::Plan), Exit::Pending, "{at}");
 
-            run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("the recovering apply");
+            // Decision 18: the first apply only recovers, and stops there.
+            let recovering =
+                run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("the recovering apply");
+            assert!(
+                recovering.recovered.is_some(),
+                "{at}: nothing was recovered"
+            );
+            assert!(
+                !recovering.executed,
+                "{at}: the recovering apply also applied"
+            );
+            assert_eq!(exit(&recovering, Mode::Apply), Exit::Pending, "{at}");
+            // The next apply decides against the recovered disk.
+            run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("the apply after recovery");
             // The journal's one recorded exception, which its own crash harness
             // pins: a crash between `stage` and the Intent naming the staged
             // file orphans that one `.bx-` temporary, and recovery removes only
@@ -1349,7 +1470,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn t14_a_standing_interruption_is_reported_as_conflicts_and_plan_writes_nothing() {
+    fn t14_a_standing_interruption_is_reported_as_its_roll_back_and_plan_writes_nothing() {
+        // Decision 18 reverses this test's earlier expectation, that every
+        // interrupted write is a conflict. A write recovery resolves on its own
+        // is announced as the roll back `apply` makes, with its diff, and no
+        // configured target is decided against the disk before it.
         let guard = guarded_home();
         let home = guard.child("home");
         seed_crash(&home);
@@ -1364,14 +1489,27 @@ pub(crate) mod tests {
 
         let interrupted = report.interrupted.as_ref().expect("an interruption");
         assert_eq!(interrupted.unfinished.len(), CRASH_WRITES);
+        assert_eq!(
+            report.changes.len(),
+            CRASH_WRITES,
+            "a configured target was decided: {:?}",
+            report.changes
+        );
         for unfinished in &interrupted.unfinished {
             let change = report
                 .changes
                 .iter()
                 .find(|change| change.target == unfinished.target.as_str())
                 .expect("a row for every unfinished write");
-            assert_eq!(change.action, Action::Conflict);
-            assert_eq!(change.note.as_deref(), Some(unfinished.note.as_str()));
+            assert_eq!(change.action, Action::Modify, "{change:?}");
+            assert!(
+                change
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.starts_with("rolls back")),
+                "{change:?}"
+            );
+            assert!(change.diff.is_some(), "{change:?}");
         }
         assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
         assert_eq!(snapshot(&home, &[]), before, "plan changed the tree");
@@ -1379,7 +1517,7 @@ pub(crate) mod tests {
         // A target the configuration no longer names is still reported.
         seed(&home, "");
         let report = plan(&load(&home));
-        assert_eq!(report.actions(), vec![Action::Conflict; CRASH_WRITES]);
+        assert_eq!(report.actions(), vec![Action::Modify; CRASH_WRITES]);
         assert_eq!(report.changes[0].origin.line, 0);
     }
 
@@ -1442,7 +1580,9 @@ pub(crate) mod tests {
 
             assert_eq!(report.actions(), vec![Action::Conflict]);
             let note = report.changes[0].note.as_deref().expect("a note");
-            assert_eq!(note, want.to_string());
+            // Decision 18 adds that the session has to be abandoned.
+            assert!(note.starts_with(&want.to_string()), "{note}");
+            assert!(note.contains("abandon"), "{note}");
             let shown = diff::render(
                 &report,
                 View::Plan,
@@ -1452,15 +1592,23 @@ pub(crate) mod tests {
             assert!(shown.contains(note), "{shown}");
             assert!(!shown.contains(&absolute), "{shown}");
 
-            // Recovery's own error keeps the absolute path.
+            // Decision 18: apply refuses on what `pending` found, before any
+            // recovery runs, so it names the snapshot as plan does and writes
+            // nothing.
             let error = run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect_err("blocked");
             assert!(
                 matches!(error, Error::Recover(recover::Error::Blocked { .. })),
                 "{error:?}"
             );
+            assert!(error.to_string().contains(&want.to_string()), "{error}");
+            assert_eq!(std::fs::read(&dest).expect("untouched"), b"new\n");
+            assert!(inputs.state().journal().exists(), "the journal went");
+
+            // Recovery's own error keeps the absolute path.
+            let recovery = recover::before_writing(inputs.state()).expect_err("blocked");
             assert!(
-                error.to_string().contains(&blob.display().to_string()),
-                "{error}"
+                recovery.to_string().contains(&blob.display().to_string()),
+                "{recovery}"
             );
             assert_eq!(std::fs::read(&dest).expect("untouched"), b"new\n");
         }
@@ -1677,10 +1825,14 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&target).expect("kept"), b"raced\n");
         assert!(StateDir::resolve(home.path()).journal().exists());
 
-        // The next writing run rolls the first write back before deciding.
+        // The next writing run only rolls the first write back (decision 18),
+        // and the one after it decides.
+        let recovering = apply(&inputs);
+        assert!(recovering.recovered.is_some(), "{recovering:?}");
+        assert!(!recovering.executed);
+        assert!(!StateDir::resolve(home.path()).journal().exists());
         let next = apply(&inputs);
         assert_eq!(next.actions(), vec![Action::Create, Action::Conflict]);
-        assert!(!StateDir::resolve(home.path()).journal().exists());
     }
 
     fn report_of(actions: &[Action]) -> Report {

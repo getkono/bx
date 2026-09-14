@@ -74,6 +74,8 @@ fn apply_with(
 
     if !shown {
         emit(out, &report, View::Plan, env)?;
+    } else if let Some(outcome) = &report.recovered {
+        writeln!(out, "{}", recovered(&report, outcome)).map_err(Error::Output)?;
     } else if report.executed {
         let written = report
             .changes
@@ -85,6 +87,34 @@ fn apply_with(
         writeln!(out, "Nothing was written.").map_err(Error::Output)?;
     }
     Ok(plan::exit(&report, Mode::Apply))
+}
+
+/// What an `apply` that recovered an interrupted session, and did nothing else,
+/// says it did.
+fn recovered(report: &Report, outcome: &crate::recover::Outcome) -> String {
+    use crate::recover::Outcome;
+
+    let done = match outcome {
+        Outcome::RolledBack { undone } => {
+            format!("Rolled back {undone} write(s) from an interrupted session")
+        }
+        Outcome::Recorded { entries } => {
+            format!("Recorded {entries} write(s) an interrupted session made")
+        }
+        // A blocked recovery is an error, never an outcome `apply` reports.
+        Outcome::Nothing | Outcome::Blocked { .. } => {
+            if report
+                .interrupted
+                .as_ref()
+                .is_some_and(|interrupted| interrupted.unreadable)
+            {
+                "Set aside the journal bx could not read".to_string()
+            } else {
+                "Found nothing left to recover".to_string()
+            }
+        }
+    };
+    format!("{done}; nothing else was applied; run `bx plan` again.")
 }
 
 /// Load, decide read-only, and show.
@@ -250,6 +280,41 @@ mod tests {
 
         assert!(matches!(error, Error::NeedsConfirmation), "{error:?}");
         assert!(!home.child(".a").exists());
+    }
+
+    #[test]
+    fn decision_18_an_apply_that_only_recovered_says_what_it_did() {
+        use crate::recover::{Interrupted, Outcome};
+
+        let report = Report::default();
+        assert_eq!(
+            recovered(&report, &Outcome::RolledBack { undone: 2 }),
+            "Rolled back 2 write(s) from an interrupted session; nothing else was applied; \
+             run `bx plan` again."
+        );
+        assert_eq!(
+            recovered(&report, &Outcome::Recorded { entries: 1 }),
+            "Recorded 1 write(s) an interrupted session made; nothing else was applied; run \
+             `bx plan` again."
+        );
+        assert!(
+            recovered(&report, &Outcome::Nothing).starts_with("Found nothing left to recover;")
+        );
+
+        let unreadable = Report {
+            interrupted: Some(Interrupted {
+                kind: crate::journal::SessionKind::Apply,
+                journal: std::path::PathBuf::from("/state/journal.mpk"),
+                complete: false,
+                unreadable: true,
+                unfinished: Vec::new(),
+            }),
+            ..Report::default()
+        };
+        assert!(
+            recovered(&unreadable, &Outcome::Nothing)
+                .starts_with("Set aside the journal bx could not read;")
+        );
     }
 
     #[test]

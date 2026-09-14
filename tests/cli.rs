@@ -346,6 +346,169 @@ fn plan_and_apply_name_an_unusable_parent_by_its_portable_path() {
     );
 }
 
+/// The layer the interrupted session in [`crashed`] was applying.
+const CRASHED_LAYER: &str = "[[target]]\npath = \"~/.config/made/new.conf\"\ncontent = \"made\\n\"\n\
+                             [[target]]\npath = \"~/.owned\"\ncontent = \"after\\n\"\n";
+
+/// Leave `home` as an `apply` that died mid-session leaves it: bx owns
+/// `~/.owned` holding `before`, and a session that created
+/// `~/.config/made/new.conf` and rewrote `~/.owned` to `after` never finished.
+fn crashed(home: &Path) {
+    seed(
+        home,
+        "[[target]]\npath = \"~/.owned\"\ncontent = \"before\\n\"\n",
+    );
+    let seeded = bx(home, &["apply", "--yes"]);
+    assert_eq!(seeded.status.code(), Some(0), "{}", stderr(&seeded));
+    seed(home, CRASHED_LAYER);
+
+    let state = bx::state::StateDir::resolve(home);
+    let mut session =
+        bx::journal::Session::open(&state, bx::journal::SessionKind::Apply, home, Vec::new())
+            .expect("a session");
+    for (rel, bytes) in [(".config/made/new.conf", "made\n"), (".owned", "after\n")] {
+        let dest = home.join(rel);
+        session
+            .apply(bx::journal::Request {
+                target: bx::paths::Portable::parse_in(&format!("~/{rel}"), home)
+                    .expect("a portable target"),
+                dest: dest.clone(),
+                content: bx::journal::Content::Bytes {
+                    bytes: bytes.as_bytes().to_vec(),
+                    planned: bx::fs::observe(&dest).expect("observe"),
+                },
+                mode: bx::fs::Mode::DEFAULT_FILE,
+                ownership: bx::journal::Ownership::Owned(bx::state::Mechanism::Own),
+            })
+            .expect("the write");
+    }
+    drop(session);
+}
+
+#[test]
+fn decision_18_plan_over_an_interrupted_session_announces_the_roll_back_and_nothing_else() {
+    // P42R1-D2 (A1). Plan showed conflict rows with no diff, and apply then
+    // rolled back and created and modified the targets it had not shown.
+    let home = guarded_home();
+    crashed(home.path());
+    let before = snapshot(home.path());
+
+    let output = bx(home.path(), &["plan"]);
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let shown = stdout(&output);
+    assert!(shown.contains("  ~ ~/.owned  ("), "{shown}");
+    assert!(shown.contains("    -after\n    +before\n"), "{shown}");
+    assert!(shown.contains("  ~ ~/.config/made/new.conf  ("), "{shown}");
+    assert!(shown.contains("    -made\n"), "{shown}");
+    assert!(
+        shown.contains("run `bx plan` again after `bx apply` rolls these back"),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("  + ~/.config/made/new.conf"),
+        "a target was decided against the disk before the roll back: {shown}"
+    );
+    assert_eq!(snapshot(home.path()), before, "plan changed the home");
+}
+
+#[test]
+fn decision_18_an_apply_that_is_not_confirmed_rolls_nothing_back() {
+    // P42R1-D1 (A2). The recovery ran before the question, so a refused apply
+    // had already rewritten ~/.owned and deleted new.conf.
+    let home = guarded_home();
+    crashed(home.path());
+    let before = snapshot(home.path());
+
+    let output = bx(home.path(), &["apply"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("    -after\n    +before\n"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("rerun with --yes"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(snapshot(home.path()), before, "an unconfirmed apply wrote");
+}
+
+#[test]
+fn decision_18_a_confirmed_apply_rolls_back_then_stops_and_the_next_apply_converges() {
+    // P42R1-D1 (A3). The recovering apply went on to write the targets.
+    let home = guarded_home();
+    crashed(home.path());
+
+    let recovered = bx(home.path(), &["apply", "--yes"]);
+
+    assert_eq!(recovered.status.code(), Some(2), "{}", stderr(&recovered));
+    assert!(
+        stdout(&recovered).contains(
+            "Rolled back 2 write(s) from an interrupted session; nothing else was applied"
+        ),
+        "{}",
+        stdout(&recovered)
+    );
+    assert_eq!(
+        std::fs::read(home.child(".owned")).expect("put back"),
+        b"before\n"
+    );
+    assert!(
+        !home.child(".config/made").exists(),
+        "the created directory stayed"
+    );
+    assert!(
+        !home.child(".local/state/bx/journal.mpk").exists(),
+        "the journal stayed"
+    );
+
+    let planned = bx(home.path(), &["plan"]);
+    assert_eq!(planned.status.code(), Some(2), "{}", stderr(&planned));
+    assert!(
+        stdout(&planned).contains("  + ~/.config/made/new.conf  ("),
+        "{}",
+        stdout(&planned)
+    );
+    assert!(
+        stdout(&planned).contains("  ~ ~/.owned  ("),
+        "{}",
+        stdout(&planned)
+    );
+
+    let applied = bx(home.path(), &["apply", "--yes"]);
+    assert_eq!(applied.status.code(), Some(0), "{}", stderr(&applied));
+    assert!(stdout(&applied).ends_with("Applied 2 change(s).\n"));
+    assert_eq!(bx(home.path(), &["plan"]).status.code(), Some(0));
+}
+
+#[test]
+fn decision_18_an_apply_over_a_blocked_interruption_refuses_before_rolling_anything_back() {
+    // P42R1-D4 (B). The banner said apply refuses, but apply rolled back the
+    // resolvable writes first — deleting new.conf — and then refused.
+    let home = guarded_home();
+    crashed(home.path());
+    std::fs::write(home.child(".owned"), "user edit\n").expect("the user's edit");
+
+    let planned = bx(home.path(), &["plan"]);
+    assert_eq!(planned.status.code(), Some(2), "{}", stderr(&planned));
+    assert!(stdout(&planned).contains("abandon"), "{}", stdout(&planned));
+
+    let before = snapshot(home.path());
+    let refused = bx(home.path(), &["apply", "--yes"]);
+
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("cannot account for"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(snapshot(home.path()), before, "a refused apply wrote");
+    assert!(home.child(".config/made/new.conf").exists());
+}
+
 #[test]
 fn bare_bx_is_the_status_view_with_plan_exit_codes() {
     let home = guarded_home();

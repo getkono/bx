@@ -263,23 +263,23 @@ fn banner(report: &Report) -> Option<String> {
     let kind = interrupted.kind;
     let blocked = interrupted.blocked().count();
     Some(if interrupted.unreadable {
-        "An interrupted bx session left a journal bx cannot read; the next `bx apply` sets it \
-         aside before it writes anything."
+        "An interrupted bx session left a journal bx cannot read. `bx apply` sets it aside and \
+         writes nothing else; run `bx plan` again after `bx apply` sets it aside."
             .to_string()
     } else if blocked > 0 {
         format!(
             "An interrupted bx {kind} left {blocked} file(s) bx cannot account for; `bx apply` \
-             refuses until they are resolved."
+             refuses, and rolls nothing back, until they are resolved."
         )
     } else if interrupted.complete {
         format!(
-            "An interrupted bx {kind} wrote everything but did not record it; the next \
-             `bx apply` records it before it writes anything."
+            "An interrupted bx {kind} wrote everything but did not record it. `bx apply` \
+             records it and writes nothing else; run `bx plan` again after `bx apply` records it."
         )
     } else {
         format!(
-            "An interrupted bx {kind} was found; the next `bx apply` rolls it back before it \
-             writes anything."
+            "An interrupted bx {kind} was found. `bx apply` rolls back what is shown below and \
+             writes nothing else; run `bx plan` again after `bx apply` rolls these back."
         )
     })
 }
@@ -737,10 +737,12 @@ mod tests {
             interrupted: Some(interrupted(vec![unfinished(true)])),
             ..Report::default()
         };
+        // Decision 18: apply rolls back only what is shown and writes nothing
+        // else, so the banner says to plan again afterwards.
         assert_eq!(
             first_line(&rolled),
-            "An interrupted bx apply was found; the next `bx apply` rolls it back before it \
-             writes anything."
+            "An interrupted bx apply was found. `bx apply` rolls back what is shown below and \
+             writes nothing else; run `bx plan` again after `bx apply` rolls these back."
         );
 
         let mut complete = interrupted(vec![unfinished(true)]);
@@ -749,7 +751,7 @@ mod tests {
             interrupted: Some(complete),
             ..Report::default()
         };
-        assert!(first_line(&complete).contains("records it before"));
+        assert!(first_line(&complete).contains("records it and writes nothing else"));
 
         let blocked = Report {
             interrupted: Some(interrupted(vec![unfinished(true), unfinished(false)])),

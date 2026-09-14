@@ -167,12 +167,27 @@ impl Restored {
 /// Decide what `rm` will do to one target, reading the destination and writing
 /// nothing.
 ///
+/// A destination that cannot be stat'd or read, or whose parent cannot be, is
+/// a [`Restoration::Conflict`], not an error: bx cannot compare it with what it
+/// wrote, so `rm` writes nothing there, forgets nothing, and restores the
+/// rest — and this preview says so, as `rm` does.
+///
 /// # Errors
 ///
-/// [`Error::Read`] when the destination cannot be stat'd or read.
+/// [`Error::Read`] for a destination path that cannot be observed at all: one
+/// with no parent, or with a `..` component.
 pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Error> {
     let dest = entry.path.render(home);
-    let observed = fs::observe(&dest)?;
+    let observed = match fs::observe(&dest) {
+        Ok(observed) => observed,
+        Err(fs::Error::Read { source, .. }) => {
+            return Ok(Restoration::Conflict {
+                note: format!("cannot be read: {source}; bx wrote nothing and forgets nothing"),
+                dest,
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     match (observed.kind, observed.digest()) {
         (Kind::Absent, _) => Ok(match &entry.prior {
@@ -230,11 +245,19 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
 /// target bx has never written is [`Restored::Unmanaged`], which is what makes
 /// running `rm` twice a no-op the second time.
 ///
+/// A destination that cannot be read is one of those conflicts: bx cannot
+/// compare it with what it wrote, so it writes nothing there and forgets
+/// nothing.
+///
 /// # Errors
 ///
 /// [`Error::Recover`] when an earlier interruption cannot be resolved,
-/// [`Error::Journal`] when the session fails, and [`Error::Read`] when a
-/// destination cannot be read.
+/// [`Error::Journal`] when the session fails, [`Error::State`] when a prior
+/// snapshot cannot be read for a reason other than being missing or corrupt,
+/// and [`Error::Read`] when a destination cannot be looked at at all. Each of
+/// these stops `rm` where it is and leaves its journal, so the next writing
+/// run rolls back every target this `rm` had already restored: nothing is left
+/// half-done, and running `rm` again restores them.
 pub fn restore(
     state: &StateDir,
     home: &Path,
@@ -855,6 +878,78 @@ mod tests {
         assert!(!done[1].is_conflict());
         assert_eq!(peek(&home.child(".a")).expect("skipped").0, b"a-edited\n");
         assert_eq!(peek(&home.child(".b")).expect("restored").0, b"b-theirs\n");
+    }
+
+    #[test]
+    fn a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore() {
+        // r3 round 1, Q. `plan_restore` returned `Error::Read` for a destination
+        // it could not read, and `restore` dropped its session with `?`: the
+        // journal stood, and the next writing run rolled back every target this
+        // `rm` had already restored.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut targets = Vec::new();
+        for rel in [".a", ".b", ".c"] {
+            plant_file(
+                &home.child(rel),
+                &format!("{rel} theirs\n"),
+                Mode::DEFAULT_FILE,
+            );
+            targets.push(managed(
+                &state,
+                home.path(),
+                rel,
+                &format!("{rel} bx\n"),
+                Mode::DEFAULT_FILE,
+            ));
+        }
+        let unreadable = home.child(".b");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        if std::fs::read(&unreadable).is_ok() {
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod back");
+            eprintln!(
+                "skipped: this process reads through file permissions, so the failure cannot be produced"
+            );
+            return;
+        }
+
+        let done = restore(&state, home.path(), &targets);
+        let entry = entry_for(&state, home.path(), &targets[1]);
+        let planned = entry.as_ref().map(|entry| plan_restore(entry, home.path()));
+        // Before any assertion, so the tempdir can be removed whatever happens.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod back");
+
+        let done = done.expect("an unreadable destination does not stop rm");
+        assert!(
+            matches!(
+                done.as_slice(),
+                [
+                    Restored::Reverted { .. },
+                    Restored::Conflict { .. },
+                    Restored::Reverted { .. }
+                ]
+            ),
+            "{done:?}"
+        );
+        let Restored::Conflict { note, .. } = &done[1] else {
+            unreachable!()
+        };
+        assert!(note.contains("cannot be read"), "{note}");
+        assert_eq!(peek(&home.child(".a")).expect("restored").0, b".a theirs\n");
+        assert_eq!(peek(&home.child(".c")).expect("restored").0, b".c theirs\n");
+        assert_eq!(peek(&unreadable).expect("left").0, b".b bx\n");
+        assert!(!state.journal().exists(), "the session finished");
+        assert!(entry.is_some(), "bx forgets nothing about the conflict");
+        assert!(entry_for(&state, home.path(), &targets[0]).is_none());
+        assert!(
+            matches!(planned, Some(Ok(Restoration::Conflict { .. }))),
+            "the preview says what rm did: {planned:?}"
+        );
     }
 
     #[test]

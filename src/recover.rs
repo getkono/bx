@@ -435,7 +435,8 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         Loaded::Unterminated(_) | Loaded::Torn { .. } => false,
     };
     // A journal that lost bytes is set aside at the end rather than unlinked.
-    // The set-aside name is always free — the first unused numbered one — so
+    // The set-aside name is always free — the number after the highest
+    // present, past any name taken since — so
     // nothing needs checking before the rollback.
     let torn = matches!(loaded, Loaded::Torn { .. });
     let home = rebuild_home(&loaded, complete, &path)?;

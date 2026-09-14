@@ -215,6 +215,13 @@ pub enum Error {
     /// its own journal by renaming over these bytes, and a recovery that went
     /// on would clear the way for one. The bytes are left exactly where they
     /// are, and every writing command refuses until they can be moved.
+    ///
+    /// It is the journal's counterpart of
+    /// [`crate::state::Error::CannotQuarantine`], which stops bx the same way
+    /// for a damaged ledger or fingerprint store: both are the one
+    /// `state::move_aside` failing, for the same causes — a state
+    /// directory bx cannot write, or a path with no room for the `.corrupt`
+    /// suffix — and neither renames, resets or writes anything.
     #[error(
         "the write-ahead journal {} cannot be read and could not be set aside ({source}); \
          it was left in place, and bx will not write until it can be moved",
@@ -614,8 +621,8 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
     })
 }
 
-/// [`load`], and move an unreadable journal aside to the first free of
-/// `journal.mpk.corrupt`, `journal.mpk.corrupt.1`, ….
+/// [`load`], and move an unreadable journal aside, to the number after the
+/// highest of `journal.mpk.corrupt`, `journal.mpk.corrupt.1`, … present.
 ///
 /// The [`ExclusiveLock`] is the proof that no session can be creating or
 /// appending to the journal while it is moved. A reader without it could rename
@@ -914,9 +921,9 @@ fn checksum(nonce: &[u8; NONCE], prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
 
 /// Move a journal that carries no information aside, and say so.
 ///
-/// The name is the first free one, taken with `RENAME_NOREPLACE` by
-/// [`crate::state::move_aside`], so an earlier set-aside journal is never
-/// replaced.
+/// The name is the number after the highest set-aside name present, taken
+/// with `RENAME_NOREPLACE` by [`crate::state::move_aside`], so an earlier
+/// set-aside journal is never replaced.
 ///
 /// # Errors
 ///
@@ -1869,8 +1876,8 @@ pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
 
 /// Move a journal aside, durably, and never over one set aside earlier.
 ///
-/// The name is the first free of `journal.mpk.corrupt`,
-/// `journal.mpk.corrupt.1`, …, taken with `RENAME_NOREPLACE` by
+/// The name is the number after the highest of `journal.mpk.corrupt`,
+/// `journal.mpk.corrupt.1`, … present, taken with `RENAME_NOREPLACE` by
 /// [`crate::state::move_aside`] under the state directory's
 /// [`ExclusiveLock`]. A second set-aside therefore succeeds, and every earlier
 /// one survives intact.

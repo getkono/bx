@@ -1103,7 +1103,8 @@ impl Filled {
     /// into it does not, so in a `0300` directory an open placed after the
     /// rename would fail with the new content already in place. Opened first,
     /// that failure happens while the destination is still untouched, which is
-    /// what [`write_atomically`]'s contract promises for an `Err`.
+    /// what [`write_atomically`]'s contract promises for every `Err` but a
+    /// failing `fsync` of the directory.
     ///
     /// Immediately before the rename the destination is `lstat`ed again and
     /// compared with the [`Stamp`] [`stage`] observed. Anything else there — an
@@ -1163,11 +1164,15 @@ impl Filled {
 
 /// Replace `path` with `bytes`, atomically, at `mode`.
 ///
-/// After this returns, `path` holds either all of `bytes` or — if the write
-/// failed — exactly what it held before, or, for [`Error::Changed`], whatever
-/// changed it after bx looked. No temporary file is left behind in
-/// either case, and the rename is durable: a power loss after the call cannot
-/// resurrect the previous content.
+/// After an `Ok`, `path` holds all of `bytes`, and the rename is durable: a
+/// power loss after the call cannot resurrect the previous content. After an
+/// `Err`, `path` holds exactly what it held before, or, for
+/// [`Error::Changed`], whatever changed it after bx looked — with one
+/// exception. A failing `fsync` of the destination directory is reported after
+/// the rename, so that [`Error::Write`] comes back with `path` already holding
+/// all of `bytes`, in a rename a power loss may still undo. No temporary file
+/// is left behind in any case, unless the directory no longer permits its
+/// removal — see [`Filled::publish`].
 ///
 /// The shorthand for [`observe`] + [`stage`] + [`Staged::commit`], for a caller
 /// whose `plan` and `apply` are this one call. A caller that printed a plan
@@ -5146,7 +5151,7 @@ mod tests {
         assert_eq!(
             std::fs::read(&dest).expect("read"),
             b"v1",
-            "an Err means the destination holds exactly what it held before",
+            "an Err from before the rename means the destination holds exactly what it held before",
         );
         assert_eq!(names_in(&dir), vec![OsString::from("f")]);
     }

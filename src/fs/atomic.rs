@@ -3645,7 +3645,13 @@ mod tests {
 
         let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned, &mut CreatedDirs::new())
             .expect_err("plan announced nothing, so apply may do nothing");
-        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        let Error::Changed { detail, .. } = &err else {
+            panic!("expected Changed, got {err:?}");
+        };
+        assert_eq!(
+            detail, "plan saw a directory at 0700, and it is now a directory at 0755",
+            "the refusal says what each observation found",
+        );
         assert_eq!(err.path(), dir);
         assert_eq!(
             mode_of_path(&dir),
@@ -3669,7 +3675,13 @@ mod tests {
 
         let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned, &mut CreatedDirs::new())
             .expect_err("plan announced a create, not a chmod of somebody else's directory");
-        assert!(matches!(err, Error::Changed { .. }), "{err:?}");
+        let Error::Changed { detail, .. } = &err else {
+            panic!("expected Changed, got {err:?}");
+        };
+        assert_eq!(
+            detail,
+            "plan saw nothing, and it is now a directory at 0777"
+        );
         assert_eq!(mode_of_path(&dir), Mode::from_bits(0o777));
     }
 

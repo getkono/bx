@@ -5210,6 +5210,39 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_that_opens_but_refuses_the_temporary_file_fails_the_write_naming_it() {
+        // Integration of #7 @b70d40e (r3), porting ec3a544: every other
+        // permission failure here is either before the directory opens or
+        // after the temporary file exists, so the temporary file's own
+        // creation failing was never otherwise reached.
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so the condition cannot be staged.
+            return;
+        }
+        let home = guarded_home();
+        let dir = home.child("d");
+        let dest = dir.join("f");
+        seed(&dest, b"before", Mode::DEFAULT_FILE);
+        // Read and search, no write: the directory opens `O_RDONLY |
+        // O_DIRECTORY`, and no temporary file can be created in it.
+        set_mode(&dir, Mode::from_bits(0o500)).expect("chmod");
+
+        let result = write_atomically(&dest, b"after", Mode::DEFAULT_FILE);
+        let names = names_in(&dir);
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for cleanup");
+
+        let err = result.expect_err("a directory refusing the temporary file fails the write");
+        assert!(matches!(&err, Error::Write { .. }), "{err:?}");
+        assert_eq!(err.path(), dir, "the error names the directory");
+        assert_eq!(
+            std::fs::read(&dest).expect("read"),
+            b"before",
+            "a failed write leaves the previous file exactly as it was",
+        );
+        assert_eq!(names, vec![OsString::from("f")], "no temporary file");
+    }
+
+    #[test]
     fn a_parent_note_names_directories_under_home_portably() {
         let home = guarded_home();
         // `resolved` is a realpath, so it is under the home only if the home

@@ -29,9 +29,11 @@
 //! it by that spelling. One layer naming one file twice, under any two
 //! spellings, is an error, as it is under one — when no account answer went
 //! into either spelling, or when the two spellings are one path before any
-//! answer goes in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`). A `..` that
-//! cancels a placeholder's segment is no such proof: `~/.config/{{p}}/../s`
-//! reads as `~/.config/s` only while `p` holds no `/`.
+//! answer goes in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`), which is
+//! judged by reducing both under stand-ins for every answer's shape. A `..` that
+//! cancels a placeholder's segment proves nothing on its own:
+//! `~/.config/{{p}}/../s` reads as `~/.config/s` only while `p` holds no `/`,
+//! which a `bool` never does and a `string` may.
 //!
 //! When one did, the collision is the account's. `bx.toml` declaring
 //! `~/.config/{{profile}}/s` and `~/.config/default/s` names two files as
@@ -74,7 +76,7 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::target::Target;
-use super::values::{ResolvedValues, ValueAssignment, ValueDecl};
+use super::values::{ResolvedValues, ValueAssignment, ValueDecl, ValueKind, fill, placeholders};
 use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
 
@@ -586,11 +588,11 @@ impl Merged<Target, TargetKey> {
 /// `Ok(false)` when nothing said earlier in this layer names the file, which
 /// leaves the statement to replace or toggle as usual. When something does,
 /// every such pair has to be the account's doing. A pair with no account answer
-/// in either spelling, or whose two spellings reduce to one text with their
-/// placeholders left in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`), names
-/// one file for every account whatever is answered, which is the repo's defect
-/// and fails the merge. A reduction that cancelled a placeholder proves nothing
-/// (see [`as_written`]). Otherwise the collision is the account's, it is
+/// in either spelling, or whose two spellings are one path before any answer
+/// goes in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`; see
+/// [`one_path_as_written`]), names one file for every account whatever is
+/// answered, which is the repo's defect and fails the merge. Otherwise the
+/// collision is the account's, it is
 /// recorded against this layer, replacing what was recorded for the file so far
 /// with every statement this layer has made about it, and the answer is
 /// `Ok(true)`.
@@ -612,14 +614,13 @@ fn clash(
 
     let mine = values.account_inputs(spelling);
     let mut names = mine.clone();
-    let reduced = as_written(spelling, values.home());
     for statement in &earlier {
         let theirs = values.account_inputs(&statement.spelling);
         // No answer in either spelling, or two spellings that are one path
         // before any answer goes in: either way the pair names one file for
         // every account, and no answer could clear it.
         if (mine.is_empty() && theirs.is_empty())
-            || (reduced.is_some() && as_written(&statement.spelling, values.home()) == reduced)
+            || one_path_as_written(spelling, &statement.spelling, values)
         {
             return Err(refuse_twice(statement, spelling, origin));
         }
@@ -645,20 +646,75 @@ fn clash(
     Ok(true)
 }
 
-/// A target spelling reduced by the lexical rule, with its placeholders left in.
+/// The most placeholders that may hold a `/` a pair is tried under.
 ///
-/// Two spellings that reduce to one text name one file whatever the answers
-/// are, so an answer in them is not what made them meet.
+/// Each doubles the stand-in combinations. A pair past it is not proven one
+/// path, and is judged after substitution like any other pair.
+const STAND_IN_LIMIT: usize = 12;
+
+/// Whether two spellings name one file whatever is answered.
 ///
-/// `None` when the reduction dropped a placeholder: a `..` cancelled the
-/// segment it sat in, and an answer holding a `/` would not have been
-/// cancelled, so the reduced text is not what every answer names. A spelling
-/// the lexical rule refuses is compared as written.
-fn as_written(spelling: &str, home: &Path) -> Option<String> {
-    match Portable::parse_in(spelling, home) {
-        Err(_) => Some(spelling.to_string()),
-        Ok(path) if path.as_str().matches("{{").count() < spelling.matches("{{").count() => None,
-        Ok(path) => Some(path.as_str().to_string()),
+/// Every placeholder is replaced by a stand-in and both spellings are reduced
+/// by the lexical rule. A single-segment stand-in is tried for every
+/// placeholder, and a multi-segment one, holding a `/`, for each whose answer
+/// may hold one: every kind but `bool`, and a name no layer declares. The pair
+/// is one path exactly when it reduces to one text under every combination.
+/// `~/.config/{{p}}/./s` against `~/.config/{{p}}/s` is, and so is
+/// `~/.config/{{flag}}/../s` against `~/.config/s` for a `bool`; for a
+/// `string` the second is not, because `p = "a/b"` makes it `~/.config/a/s`.
+///
+/// A stand-in segment opens with a NUL, which a file name cannot hold, so it
+/// meets a literal segment only if a layer spelled a NUL out, and each carries
+/// its name, so two placeholders never meet each other. A `path` stand-in is
+/// rooted, as every `path` answer is.
+fn one_path_as_written(first: &str, second: &str, values: &ResolvedValues) -> bool {
+    let mut names = placeholders(first).unwrap_or_default();
+    for name in placeholders(second).unwrap_or_default() {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let kind = |name: &str| values.decl(name).map(|decl| decl.kind);
+    let wide: Vec<&str> = names
+        .into_iter()
+        .filter(|name| kind(name) != Some(ValueKind::Bool))
+        .collect();
+    if wide.len() > STAND_IN_LIMIT {
+        return false;
+    }
+
+    (0..1_usize << wide.len()).all(|combination| {
+        let stand_in = |name: &str| {
+            let root = if kind(name) == Some(ValueKind::Path) {
+                "/"
+            } else {
+                ""
+            };
+            let multi = wide
+                .iter()
+                .position(|held| *held == name)
+                .is_some_and(|bit| combination & (1 << bit) != 0);
+            if multi {
+                format!("{root}\0{name}/\0{name}\0")
+            } else {
+                format!("{root}\0{name}")
+            }
+        };
+        reduced(first, &stand_in, values.home()) == reduced(second, &stand_in, values.home())
+    })
+}
+
+/// `spelling` with its placeholders stood in for, reduced by the lexical rule.
+///
+/// As filled when the lexical rule refuses it, and as written when it is not a
+/// well-formed template.
+fn reduced(spelling: &str, stand_in: &impl Fn(&str) -> String, home: &Path) -> String {
+    let Some(filled) = fill(spelling, stand_in) else {
+        return spelling.to_string();
+    };
+    match Portable::parse_in(&filled, home) {
+        Ok(path) => path.as_str().to_string(),
+        Err(_) => filled,
     }
 }
 

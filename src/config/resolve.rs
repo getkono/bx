@@ -1600,6 +1600,48 @@ mod tests {
     }
 
     #[test]
+    fn a_dotdot_pair_that_is_one_path_for_every_answer_is_the_layer_s_defect() {
+        // A `bool` holds no `/`, so `~/.config/{{flag}}/../s` is `~/.config/s`
+        // for both answers. And `{{p}}/..` against `{{p}}/./..` stay one path
+        // whether `p` holds a `/` or not. Neither pair is the answer's doing, so
+        // each fails the load rather than blocking with advice no answer could
+        // follow.
+        const BOOL: &str = "[[value]]\nname = \"flag\"\nkind = \"bool\"\n\
+                            [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                            [[target]]\npath = \"~/.config/{{flag}}/../s\"\nenabled = false\n\
+                            [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        for flag in ["true", "false"] {
+            let message = resolved(BOOL, Some(&format!("[values]\nflag = {flag}\n")))
+                .expect_err("one path for every answer is the layer's defect");
+            for part in [
+                "bx.toml:7",
+                "names the same file as `~/.config/s` at bx.toml:4",
+                "in this same layer",
+            ] {
+                assert!(message.contains(part), "{flag} {part}: {message}");
+            }
+        }
+
+        const TWICE: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                             [[target]]\npath = \"~/.config/a/s\"\ncontent = \"AS\"\n\
+                             [[target]]\npath = \"~/.config/{{p}}/../s\"\nenabled = false\n\
+                             [[target]]\npath = \"~/.config/{{p}}/./../s\"\nenabled = true\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        for p in ["a", "a/b"] {
+            let message = resolved(TWICE, Some(&format!("[values]\np = \"{p}\"\n")))
+                .expect_err("one path for every answer is the layer's defect");
+            for part in [
+                "bx.toml:13",
+                "names the same file as `~/.config/{{p}}/../s` at bx.toml:10",
+                "in this same layer",
+            ] {
+                assert!(message.contains(part), "{p} {part}: {message}");
+            }
+        }
+    }
+
+    #[test]
     fn a_later_layer_that_names_the_file_settles_what_an_answer_made_one_layer_name_twice() {
         // The account has the last word: a full entry for the file replaces
         // both, and a toggle switches both off.

@@ -663,6 +663,21 @@ pub fn placeholders(text: &str) -> Result<Vec<&str>, PlaceholderError> {
     Ok(names)
 }
 
+/// `text` with every `{{name}}` replaced by what `stand_in` gives for it.
+///
+/// For comparing spellings before any answer goes in, so it looks nothing up
+/// and cannot fail on a name. `None` when `text` is not a well-formed template.
+pub(crate) fn fill(text: &str, stand_in: impl Fn(&str) -> String) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    for piece in scan(text).ok()? {
+        match piece {
+            Piece::Literal(literal) => out.push_str(literal),
+            Piece::Name(name) => out.push_str(&stand_in(name)),
+        }
+    }
+    Some(out)
+}
+
 /// Why a string could not be substituted.
 ///
 /// The split is this entry's core safety property. [`Unresolved::Unset`] is a

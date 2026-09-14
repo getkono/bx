@@ -1039,6 +1039,10 @@ struct Judged {
     /// The value a shell would give the name, or why it cannot be known. This
     /// is what a later reference to the name resolves to.
     resolved: Result<String, Reason>,
+    /// For a search list, the value with each unassigned reference to its own
+    /// name standing for the inherited list. This is what the list's next
+    /// reference to itself extends, and `None` for every other kind.
+    extended: Option<String>,
 }
 
 /// The verdict on `name = value`, for [`check`] and [`scan_with`] alike.
@@ -1046,6 +1050,7 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
     let refused = |reason| Judged {
         reason: Some(reason),
         resolved: Err(reason),
+        extended: None,
     };
     // The shape is read for every variable: a line the grammar does not read
     // may do anything, whatever its first name is.
@@ -1060,26 +1065,29 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
         return refused(Reason::ReservedName);
     }
     let resolved = word.resolve(scope, roots.home());
-    let reason = match emittable(name) {
+    let kind = emittable(name);
+    // A search list is judged with its own inherited self standing in for
+    // itself, which no other name's reference to it may do.
+    let extended =
+        (kind == Some(Kind::SearchList)).then(|| word.expand(scope, roots.home(), Some(name)));
+    let reason = match kind {
         None => Some(Reason::NotEmittable),
-        Some(kind) => judge(kind, name, &word, &resolved, scope, roots),
+        Some(kind) => judge(kind, extended.as_ref().unwrap_or(&resolved), roots),
     };
-    Judged { reason, resolved }
+    Judged {
+        reason,
+        resolved,
+        extended: extended.and_then(Result::ok),
+    }
 }
 
-/// Why `resolved` — what `word` gives `name` — may not be given to a variable
-/// of `kind`, or `None` if it may.
-fn judge(
-    kind: Kind,
-    name: &str,
-    word: &Word<'_>,
-    resolved: &Result<String, Reason>,
-    scope: &Scope,
-    roots: &RootSet,
-) -> Option<Reason> {
+/// Why `resolved` may not be given to a variable of `kind`, or `None` if it
+/// may. For a search list, `resolved` holds [`INHERITED`] wherever the list
+/// refers to what the shell inherited.
+fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Option<Reason> {
     let anchored = |entry: &str| refuses_unanchored(Path::new(entry), roots);
     match kind {
-        Kind::SearchList => within(&word.expand(scope, roots.home(), Some(name)), |list| {
+        Kind::SearchList => within(resolved, |list| {
             list.split(':')
                 .filter(|entry| *entry != INHERITED)
                 .find_map(anchored)
@@ -1176,6 +1184,10 @@ struct Scope {
     /// Whether a refused line has passed. After one nothing is known, because
     /// the guard did not read what it assigned or unset.
     lost: bool,
+    /// What each search list the fragment assigned extends, [`INHERITED`]
+    /// standing for the list the shell inherited. Every assignment sets or
+    /// removes its name's entry, and a refused line clears them all.
+    extended: HashMap<String, String>,
 }
 
 impl Scope {
@@ -1209,6 +1221,19 @@ impl Scope {
         !self.lost && !self.learned.contains_key(name)
     }
 
+    /// What a search list's reference to its own `name` expands to while the
+    /// list is judged: the inherited list, or the list the fragment's earlier
+    /// extensions of it made, or else whatever [`Scope::lookup`] says.
+    fn own_list(&self, name: &str, home: Option<&Path>) -> Result<String, Reason> {
+        if self.inherits(name) {
+            return Ok(INHERITED.to_string());
+        }
+        match self.extended.get(name) {
+            Some(list) => Ok(list.clone()),
+            None => self.lookup(name, home),
+        }
+    }
+
     /// Learn what an assignment the walk has just judged gave its name.
     ///
     /// Only *after* judging it, as a shell does: the right-hand side sees the
@@ -1222,6 +1247,14 @@ impl Scope {
                 self.forget_everything();
             }
             _ => {
+                match judged.extended {
+                    Some(list) => {
+                        self.extended.insert(name.to_string(), list);
+                    }
+                    None => {
+                        self.extended.remove(name);
+                    }
+                }
                 self.learned
                     .insert(name.to_string(), judged.resolved.map_err(as_reference));
             }
@@ -1231,6 +1264,7 @@ impl Scope {
     /// After a line the guard did not read, know nothing.
     fn forget_everything(&mut self) {
         self.learned.clear();
+        self.extended.clear();
         self.lost = true;
     }
 }
@@ -1324,8 +1358,9 @@ impl Word<'_> {
         self.expand(scope, home, None)
     }
 
-    /// [`Word::resolve`], except that a reference to `inherited` which the
-    /// fragment has not assigned expands to [`INHERITED`].
+    /// [`Word::resolve`], except that a reference to `inherited` expands as
+    /// [`Scope::own_list`] says: to [`INHERITED`] if the fragment has not
+    /// assigned it, and to its earlier extension if one was made.
     fn expand(
         &self,
         scope: &Scope,
@@ -1340,8 +1375,8 @@ impl Word<'_> {
         for part in &self.parts {
             match part {
                 Part::Text(text) => out.push_str(text),
-                Part::Reference(name) if inherited == Some(*name) && scope.inherits(name) => {
-                    out.push_str(INHERITED);
+                Part::Reference(name) if inherited == Some(*name) => {
+                    out.push_str(&scope.own_list(name, home)?);
                 }
                 Part::Reference(name) => out.push_str(&scope.lookup(name, home)?),
             }
@@ -4293,6 +4328,52 @@ mod tests {
     }
 
     #[test]
+    fn a_search_list_extended_twice_still_extends_the_inherited_list() {
+        use Reason::{NotAbsolute, Unreadable, UnreadableReference, UnresolvedReference};
+        for roots in [rooted(), RootSet::strict()] {
+            for (content, expected) in [
+                // The second `$PATH` is the first extension of the inherited
+                // list, which is the user's and is not judged.
+                ("export PATH=/a:$PATH\nexport PATH=/b:$PATH\n", vec![]),
+                (
+                    "PATH=/a:$PATH\nPATH=/b:$PATH\nexport PATH=/c:$PATH\n",
+                    vec![],
+                ),
+                (
+                    "export INFOPATH=/a:$INFOPATH\nexport INFOPATH=/b:$INFOPATH\n",
+                    vec![],
+                ),
+                // What the first extension added is still judged.
+                (
+                    "export PATH=/a:$PATH\nexport PATH=./x:$PATH\n",
+                    vec![(2, NotAbsolute)],
+                ),
+                (
+                    "export PATH=./x:$PATH\nexport PATH=/b:$PATH\n",
+                    vec![(1, NotAbsolute), (2, NotAbsolute)],
+                ),
+                // Another name still cannot use it: its value is not known.
+                (
+                    "export PATH=/a:$PATH\nexport EDITOR=$PATH\n",
+                    vec![(2, UnresolvedReference)],
+                ),
+                // A list assigned outright replaces the extension.
+                (
+                    "export PATH=/a:$PATH\nexport PATH=/usr/bin\nexport PATH=./x:$PATH\n",
+                    vec![(3, NotAbsolute)],
+                ),
+                // After a line the guard could not read, nothing is inherited.
+                (
+                    "export PATH=/a:$PATH\ntrue\nexport PATH=/b:$PATH\n",
+                    vec![(2, Unreadable), (3, UnreadableReference)],
+                ),
+            ] {
+                assert_eq!(reasons(content, &roots), expected, "{content:?}");
+            }
+        }
+    }
+
+    #[test]
     fn bash_truncates_the_history_file_when_a_fragment_assigns_histfilesize() {
         // The mechanism behind reserving `HISTFILESIZE`: bash truncates the
         // history file the moment the name is assigned, in a non-interactive
@@ -5185,6 +5266,7 @@ mod tests {
         "X=a,b@c%d+e-f.g:h\nY=\nZ=''\nW=\"\"\nexport V=$X$X\n",
         "X=/var/mnt/scratch/example\nX=$X/b\nexport CARGO_HOME=$X/cargo\n",
         "export PATH=\"$HOME/.local/bin:/usr/bin\"\n",
+        "export PATH=/a:$PATH\nexport PATH=/b:$PATH\n",
         "export XDG_STATE_HOME=~/.local/state/bx\n",
         "export npm_config_cache=/etc/evil\nexport TMPDIR=/tmp\n",
         "X=\"it's\"\nY='say \"hi\"'\nZ='a\\b'\nW='$(echo pwned)'\nV=\"{a,b} *\"\n",

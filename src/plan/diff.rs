@@ -102,13 +102,60 @@ impl Diff {
 }
 
 /// A unified diff with [`CONTEXT`] lines of context, headed by `target`.
+///
+/// A line ends at `\n` and nowhere else, so a `\r` stays inside its line: a
+/// change of line ending is a changed line, and a lone `\r` does not start a
+/// new one. Every line of the result ends with exactly one `\n`, a last line
+/// that had none is followed by `\ No newline at end of file`, and the target
+/// in the file headers is escaped as a row names it, so the text splits back
+/// into its lines on `\n` alone.
 fn unified(target: &str, old: &str, new: &str) -> String {
-    let diff = TextDiff::from_lines(old, new);
-    diff.unified_diff()
-        .context_radius(CONTEXT)
-        .missing_newline_hint(true)
-        .header(&format!("{target} (on disk)"), &format!("{target} (bx)"))
-        .to_string()
+    let old: Vec<&str> = old.split_inclusive('\n').collect();
+    let new: Vec<&str> = new.split_inclusive('\n').collect();
+    let diff = TextDiff::configure()
+        .newline_terminated(true)
+        .diff_slices(&old, &new);
+    let target = escape(target);
+    let mut unified = diff.unified_diff();
+    unified.context_radius(CONTEXT);
+    let mut out = String::new();
+    for (index, hunk) in unified.iter_hunks().enumerate() {
+        if index == 0 {
+            let _ = writeln!(out, "--- {target} (on disk)\n+++ {target} (bx)");
+        }
+        let _ = writeln!(out, "{}", hunk.header());
+        for change in hunk.iter_changes() {
+            let value = change.value();
+            let line = value.strip_suffix('\n');
+            let _ = writeln!(out, "{}{}", change.tag(), line.unwrap_or(value));
+            if line.is_none() {
+                out.push_str("\\ No newline at end of file\n");
+            }
+        }
+    }
+    out
+}
+
+/// `text` with every control character but a tab spelled out — `\r`, `\n`,
+/// `\x1b` — so nothing a file or a path holds can move the cursor, colour the
+/// terminal, or start a line the rendering did not.
+fn escape(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(|c| c != '\t' && c.is_control()) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\t' => out.push(c),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:02x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Which rows a rendering shows.
@@ -250,12 +297,12 @@ fn row(out: &mut String, change: &Change, palette: Palette, home: &Path) {
         out,
         "{ROW_INDENT}{} {}  ({}:{})",
         palette.paint(style, &change.action.symbol().to_string()),
-        change.target,
-        paths::to_portable(&change.origin.file, home),
+        escape(&change.target),
+        escape(&paths::to_portable(&change.origin.file, home)),
         change.origin.line,
     );
     if let Some(note) = &change.note {
-        let _ = write!(out, " {note}");
+        let _ = write!(out, " {}", escape(note));
     }
     out.push('\n');
 
@@ -264,7 +311,10 @@ fn row(out: &mut String, change: &Change, palette: Palette, home: &Path) {
     };
     match &diff.kind {
         DiffKind::Text(text) => {
-            for (index, line) in text.lines().enumerate() {
+            // Split on `\n` alone, as `unified` wrote it: a `\r` is part of its
+            // line, and is shown escaped with every other control character.
+            let lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
+            for (index, line) in lines.enumerate() {
                 let style = match line.as_bytes().first() {
                     // The first two lines are the `---` and `+++` file headers.
                     _ if index < 2 => Some(HEADER),
@@ -273,10 +323,11 @@ fn row(out: &mut String, change: &Change, palette: Palette, home: &Path) {
                     Some(b'@') => Some(QUIET),
                     _ => None,
                 };
+                let line = escape(line);
                 out.push_str(DIFF_INDENT);
                 match style {
-                    Some(style) => out.push_str(&palette.paint(style, line)),
-                    None => out.push_str(line),
+                    Some(style) => out.push_str(&palette.paint(style, &line)),
+                    None => out.push_str(&line),
                 }
                 out.push('\n');
             }
@@ -548,6 +599,95 @@ mod tests {
             empty,
             "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
         );
+    }
+
+    /// `report` rendered for plan, plain, against the test home.
+    fn plain(report: &Report) -> String {
+        render(report, View::Plan, Palette::PLAIN, Path::new(HOME))
+    }
+
+    #[test]
+    fn decision_19_a_line_ending_change_on_an_owned_file_is_shown() {
+        // P42R1-D3. Lines were split with `str::lines`, which drops a `\r`
+        // before the `\n`, so a CRLF-only change showed identical lines.
+        let home = crate::testing::guarded_home();
+        crate::plan::tests::own(
+            home.path(),
+            ".w",
+            b"a\r\nb\r\n",
+            crate::state::Mechanism::Own,
+        );
+        let inputs =
+            crate::plan::tests::inputs(&home, &crate::plan::tests::inline("~/.w", "a\\nb\\n"));
+
+        let report =
+            crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false)).expect("plan");
+
+        assert_eq!(report.actions(), vec![Action::Modify]);
+        let rendered = render(&report, View::Plan, Palette::PLAIN, home.path());
+        assert!(
+            rendered.contains("    -a\\r\n    -b\\r\n    +a\n    +b\n"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains('\r'), "{rendered:?}");
+    }
+
+    #[test]
+    fn decision_19_a_lone_carriage_return_is_shown_inside_its_line() {
+        let mut modify = change("~/.cr", 1, Action::Modify);
+        modify.diff = Diff::between("~/.cr", Some(b"one\ntwo\n"), b"one\rtwo\n", None);
+
+        let rendered = plain(&Report {
+            changes: vec![modify],
+            ..Report::default()
+        });
+
+        assert!(
+            rendered.contains("    -one\n    -two\n    +one\\rtwo\n"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains('\r'), "{rendered:?}");
+    }
+
+    #[test]
+    fn decision_19_control_bytes_are_shown_escaped_and_a_tab_is_kept() {
+        let mut create = change("~/.e", 1, Action::Create);
+        create.diff = Diff::between("~/.e", None, b"\x1b[31mred\tx\x7f\n", None);
+
+        let rendered = plain(&Report {
+            changes: vec![create],
+            ..Report::default()
+        });
+
+        assert!(
+            rendered.contains("    +\\x1b[31mred\tx\\x7f\n"),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\x1b') && !rendered.contains('\x7f'),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn decision_19_a_newline_in_a_path_stays_on_its_row() {
+        let mut create = change("~/.a\nb", 1, Action::Create);
+        create.diff = Diff::between("~/.a\nb", None, b"x\n", None);
+
+        let rendered = plain(&Report {
+            changes: vec![create],
+            ..Report::default()
+        });
+
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines[0], "  + ~/.a\\nb  (~/.config/bx/bx.toml:1)",
+            "{rendered:?}"
+        );
+        assert_eq!(lines[1], "    --- ~/.a\\nb (on disk)", "{rendered:?}");
+        assert_eq!(lines[2], "    +++ ~/.a\\nb (bx)", "{rendered:?}");
+        assert_eq!(lines[4], "    +x", "{rendered:?}");
+        assert_eq!(lines.len(), 6, "{rendered:?}");
     }
 
     fn interrupted(unfinished: Vec<Unfinished>) -> Interrupted {

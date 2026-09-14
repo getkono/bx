@@ -509,7 +509,9 @@ fn degrade<T: Default>(
 ///
 /// [`Error::Encode`] if the value cannot be encoded — a bug, not a user
 /// condition — and [`Error::CreateDir`] or [`Error::Write`] for a filesystem
-/// failure. A failure leaves the previous file exactly as it was.
+/// failure. A failure leaves the previous file exactly as it was, except a
+/// failing `fsync` of the directory after the rename, which is returned with
+/// the new file already in place — see [`write_atomically`].
 pub(crate) fn save<T: Serialize>(
     path: &Path,
     kind: &'static str,

@@ -208,7 +208,9 @@ impl Fingerprints {
     /// # Errors
     ///
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
-    /// leaves the previous cache exactly as it was.
+    /// leaves the previous cache exactly as it was, except a failing `fsync` of
+    /// the state directory after the rename, which is returned with the new
+    /// cache already in place — see [`crate::fs::write_atomically`].
     ///
     /// [`Error::WrongLock`] if `lock` is not `dir`'s own lock; nothing is
     /// written.

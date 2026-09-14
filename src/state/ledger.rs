@@ -860,7 +860,9 @@ impl Ledger {
     /// # Errors
     ///
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
-    /// leaves the previous ledger exactly as it was.
+    /// leaves the previous ledger exactly as it was, except a failing `fsync`
+    /// of the state directory after the rename, which is returned with the new
+    /// ledger already in place — see [`write_atomically`].
     ///
     /// [`Error::WrongLock`] if the lock file this ledger was opened under has
     /// been replaced or removed since; nothing is written.

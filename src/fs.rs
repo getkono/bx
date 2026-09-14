@@ -19,6 +19,7 @@
 //! mode written into one.
 
 use std::io::Write as _;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode as RawMode, OFlags};
@@ -133,10 +134,14 @@ impl From<Mode> for RawMode {
 
 /// Replace `path` with `bytes`, atomically, at `mode`.
 ///
-/// After this returns, `path` holds either all of `bytes` or — if the write
-/// failed — exactly what it held before. No temporary file is left behind in
-/// either case, and the rename is durable: a power loss after the call cannot
-/// resurrect the previous content.
+/// After this returns `Ok`, `path` holds all of `bytes`, and the rename is
+/// durable: a power loss after the call cannot resurrect the previous content.
+/// After it returns an error, `path` holds exactly what it held before — with
+/// one exception. The destination directory is opened before the temporary
+/// file is created, so failing to open it fails the write with nothing
+/// changed; but its `fsync` is the last step, after the rename, and a failing
+/// directory `fsync` is returned with `path` already holding `bytes`, their
+/// durability not established. No temporary file is left behind in any case.
 ///
 /// The parent directory must already exist; this function creates no
 /// directories, because the decision of what mode a new directory gets belongs
@@ -164,6 +169,9 @@ impl From<Mode> for RawMode {
 /// wrapping the first failing syscall otherwise.
 pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Error> {
     let dir = parent_of(path)?;
+    // Opened before anything is created, so a directory that cannot be opened
+    // for its fsync fails the write while the previous file is still in place.
+    let dir_fd = open_dir(dir)?;
     let mut temp = new_temp(dir)?;
 
     let write = |source| Error::Write {
@@ -177,7 +185,10 @@ pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Err
     rustix::fs::fchmod(temp.as_file(), mode.into()).map_err(|e| write(e.into()))?;
     temp.as_file().sync_all().map_err(write)?;
     temp.persist(path).map_err(|e| write(e.error))?;
-    fsync_dir(dir)
+    rustix::fs::fsync(&dir_fd).map_err(|source| Error::Write {
+        path: dir.to_path_buf(),
+        source: source.into(),
+    })
 }
 
 /// The directory `path` will be written into.
@@ -199,19 +210,18 @@ fn new_temp(dir: &Path) -> Result<NamedTempFile, Error> {
     })
 }
 
-/// `fsync` a directory, so a rename inside it survives a power loss.
-fn fsync_dir(dir: &Path) -> Result<(), Error> {
-    let fail = |source: rustix::io::Errno| Error::Write {
-        path: dir.to_path_buf(),
-        source: source.into(),
-    };
-    let fd = rustix::fs::open(
+/// Open `dir` for the `fsync` that makes a rename inside it survive a power
+/// loss.
+fn open_dir(dir: &Path) -> Result<OwnedFd, Error> {
+    rustix::fs::open(
         dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         RawMode::empty(),
     )
-    .map_err(fail)?;
-    rustix::fs::fsync(&fd).map_err(fail)
+    .map_err(|source| Error::Write {
+        path: dir.to_path_buf(),
+        source: source.into(),
+    })
 }
 
 #[cfg(test)]
@@ -303,6 +313,44 @@ mod tests {
         let err = write_atomically(&path, b"x", Mode::DEFAULT_FILE).expect_err("must fail");
         assert_eq!(err.path(), path);
         let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("f")]);
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_opened_fails_the_write_before_the_rename() {
+        // r3 round 1 (O2): the directory was opened for its fsync only after
+        // the rename, so a directory that permits creating and renaming a file
+        // but not opening it returned an error with the new bytes in place.
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("d");
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("f");
+        std::fs::write(&path, b"before").expect("seed");
+        // Writable and searchable, so a temporary file could be created and
+        // renamed; not readable, so it cannot be opened `O_RDONLY`.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+        let result = write_atomically(&path, b"after", Mode::DEFAULT_FILE);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restore");
+
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"before",
+            "a failed write leaves the previous file exactly as it was",
+        );
+        let err = result.expect_err("an unopenable directory fails the write");
+        assert!(
+            matches!(&err, Error::Write { path: at, source }
+                if *at == root && source.kind() == std::io::ErrorKind::PermissionDenied),
+            "got {err}",
+        );
+        let names: Vec<_> = std::fs::read_dir(&root)
             .expect("read_dir")
             .map(|e| e.expect("entry").file_name())
             .collect();

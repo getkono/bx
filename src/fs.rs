@@ -358,6 +358,29 @@ mod tests {
     }
 
     #[test]
+    fn the_destination_directory_is_opened_as_a_directory_and_closed_on_exec() {
+        // r3 round 1, mutation run: dropping `O_DIRECTORY`, or `O_DIRECTORY`
+        // and `O_CLOEXEC`, from the directory open left every test green. A
+        // file opens without `O_DIRECTORY`, and a descriptor without
+        // `O_CLOEXEC` is inherited by a child another thread spawns while the
+        // write is under way.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fd = open_dir(dir.path()).expect("a directory opens");
+        let flags = rustix::io::fcntl_getfd(&fd).expect("F_GETFD");
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC), "{flags:?}");
+
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").expect("seed");
+        let err = open_dir(&file).expect_err("a file is not a directory");
+        assert!(
+            matches!(&err, Error::Write { path, source }
+                if *path == file
+                    && source.raw_os_error() == Some(rustix::io::Errno::NOTDIR.raw_os_error())),
+            "got {err}",
+        );
+    }
+
+    #[test]
     fn the_temporary_file_is_created_in_the_destination_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let temp = new_temp(dir.path()).expect("temp");

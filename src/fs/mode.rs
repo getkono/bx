@@ -178,6 +178,17 @@ impl Mode {
 
         self.bits() & GROUP_AND_OTHER & !declared.bits() != 0
     }
+
+    /// Whether every bit of `required` is set in this mode.
+    ///
+    /// The question `compare` asks a file target's declared mode: it must
+    /// grant its owner `0400`, or bx could not read back what it wrote. Special
+    /// bits count like any other, so `2775` includes `0700` and `0600` does
+    /// not.
+    #[must_use]
+    pub const fn includes(self, required: Self) -> bool {
+        self.bits() & required.bits() == required.bits()
+    }
 }
 
 impl FromStr for Mode {
@@ -562,6 +573,22 @@ mod tests {
         assert!(!Mode::from_bits(0o700).grants_more_than(Mode::from_bits(0o500)));
         // Where `is_wider_than` and this differ: execute alone.
         assert!(!Mode::from_bits(0o711).is_wider_than(Mode::PRIVATE_DIR));
+    }
+
+    #[test]
+    fn a_mode_includes_exactly_the_bits_it_sets() {
+        assert!(Mode::PRIVATE_DIR.includes(Mode::PRIVATE_DIR));
+        assert!(Mode::from_bits(0o2775).includes(Mode::PRIVATE_DIR));
+        assert!(Mode::PRIVATE_FILE.includes(Mode::from_bits(0o400)));
+        assert!(Mode::from_bits(0o400).includes(Mode::from_bits(0o400)));
+        for bits in [0o600, 0o500, 0o300, 0o077, 0o7077] {
+            assert!(
+                !Mode::from_bits(bits).includes(Mode::PRIVATE_DIR),
+                "{bits:04o} does not include 0700",
+            );
+        }
+        assert!(!Mode::from_bits(0o200).includes(Mode::from_bits(0o400)));
+        assert!(!Mode::from_bits(0o373).includes(Mode::from_bits(0o400)));
     }
 
     #[test]

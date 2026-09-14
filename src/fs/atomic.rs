@@ -428,8 +428,9 @@ impl Observed {
 
     /// The digest of the bytes that are there now, for a regular file.
     ///
-    /// What a mode-only change records as `written`: the content is not being
-    /// replaced, so the bytes bx leaves behind are the bytes already there.
+    /// For a mode-only `Modify` this is the `written` its ledger entry records:
+    /// that change is applied through [`stage`] with the bytes already there,
+    /// so [`Filled::written`] is the digest of the same bytes.
     #[must_use]
     pub fn digest(&self) -> Option<ContentHash> {
         self.bytes.as_deref().map(ContentHash::of)
@@ -662,7 +663,13 @@ pub struct Outcome {
 /// * [`Action::Create`] — nothing is there.
 /// * [`Action::Modify`] — a regular file whose bytes **or** mode differ. A mode
 ///   difference alone is still a `Modify`, with `content_drift == false`, and
-///   `apply` closes it with [`set_mode`] rather than by rewriting the file.
+///   `apply` closes it like any other `Modify`: [`stage`] with this
+///   observation as `planned` and the desired mode, committed with the desired
+///   bytes — the same bytes, for a mode-only drift. `stage` refuses with
+///   [`Error::Changed`] unless the file still has the kind and [`Stamp`] this
+///   observation recorded, so a `chmod`, an edit or a directory landing after
+///   `plan` is refused rather than overwritten. [`set_mode`] is not the apply
+///   for it: it compares nothing with `plan`.
 /// * [`Action::Conflict`] — a directory, a symlink, or anything else that is
 ///   not a regular file.
 #[must_use]
@@ -1084,8 +1091,10 @@ impl Filled {
     ///
     /// A hard link to the destination is **not** followed: the destination is
     /// replaced by name, so any other link to the old inode keeps the old
-    /// content. That is inherent to an atomic rename and is why a mode-only
-    /// change goes through [`set_mode`] instead.
+    /// content and the old mode. That is inherent to an atomic rename, and it
+    /// holds for a mode-only `Modify` too, which is applied through [`stage`]
+    /// like any other so that it is refused when the file changed after `plan`
+    /// — see [`compare`].
     ///
     /// The destination directory is opened **before** the rename and `fsync`ed
     /// after it. Opening a directory needs read permission on it and renaming
@@ -1169,14 +1178,20 @@ pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Err
     stage(path, mode, &planned, &mut CreatedDirs::new())?.commit(bytes)
 }
 
-/// Set the mode of an existing file or directory, in place.
+/// Set the mode of an existing file or directory, in place, unconditionally.
 ///
-/// This is how a mode-only drift is closed. A rewrite would be wrong twice
-/// over: it replaces the inode, breaking any hard link the user made and any
-/// process holding the file open, and it would announce a `Modify` whose diff
-/// is empty, which `plan` cannot render honestly. `chmod` is the minimal
-/// operation that closes the drift, and it is fully reversible from the mode
-/// recorded before it.
+/// It compares nothing with `plan`: it takes no planned observation, and it
+/// looks at the path only to refuse a symlink. Whatever is there when it runs
+/// — a file the user chmod'd after `plan`, or a directory that replaced the
+/// file `plan` saw — is chmod'd. So it is **not** how a file target's
+/// mode-only `Modify` is applied; that goes through [`stage`], which refuses a
+/// destination that changed after `plan` (see [`compare`]).
+///
+/// Within this module it is called only where the verdict is already settled:
+/// by [`ensure_dir`] for a directory target's `Modify`, after its own check
+/// that the directory is still what `plan` saw, and on a directory
+/// `create_dir_at` has just made, to make its declared mode authoritative over
+/// the `umask`.
 ///
 /// # Errors
 ///
@@ -1300,7 +1315,8 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// `plan` is still refused.
 ///
 /// Two windows remain. A `chmod` landing between the second observation and
-/// the [`set_mode`] is overwritten, as for any mode change (decision 6). And
+/// the [`set_mode`] is overwritten, as for any directory mode change (decision
+/// 6). And
 /// when a `Create` is refused because the path was taken after the second
 /// observation, an ancestor this call had already created is left in place,
 /// empty, exactly as [`stage`] leaves one for an abandoned write.
@@ -3367,8 +3383,80 @@ mod tests {
         }
     }
 
+    /// `apply` for a file target's `Modify`, acting on the observation `plan`
+    /// compared: staged against it and committed with the desired bytes,
+    /// whether the drift is in the content, the mode, or both.
+    fn apply_file_modify(
+        planned: &Observed,
+        dest: &Path,
+        desired: &Desired<'_>,
+    ) -> Result<(), Error> {
+        stage(dest, desired.mode, planned, &mut CreatedDirs::new())?.commit(desired.bytes)
+    }
+
     #[test]
-    fn set_mode_closes_a_mode_drift_without_replacing_the_inode() {
+    fn a_mode_only_modify_changed_after_plan_is_refused_and_keeps_the_change() {
+        // Invariants 4 and 7 for the smallest Modify there is: plan announced
+        // `mode 0644 -> 0600` against one file, and apply may act only on that
+        // file, unchanged.
+        let home = guarded_home();
+        let want = desired(b"Host *\n", Mode::PRIVATE_FILE);
+
+        // (a) The user chmods the file after plan printed its line.
+        let chmodded = home.child("chmodded");
+        seed(&chmodded, b"Host *\n", Mode::DEFAULT_FILE);
+        let planned_a = observe(&chmodded).expect("plan observes");
+        let outcome = compare(&planned_a, &want);
+        assert_eq!(outcome.action, Action::Modify);
+        assert!(!outcome.content_drift, "only the mode drifted");
+        set_mode(&chmodded, Mode::from_bits(0o640)).expect("the user's chmod after plan");
+        let result_a = apply_file_modify(&planned_a, &chmodded, &want);
+        let mode_a = mode_of_path(&chmodded);
+
+        // (b) The file is replaced by a directory after plan printed its line.
+        let replaced = home.child("replaced");
+        seed(&replaced, b"Host *\n", Mode::DEFAULT_FILE);
+        let planned_b = observe(&replaced).expect("plan observes");
+        assert_eq!(compare(&planned_b, &want).action, Action::Modify);
+        std::fs::remove_file(&replaced).expect("rm");
+        std::fs::create_dir(&replaced).expect("a directory takes the path");
+        set_mode(&replaced, Mode::DEFAULT_DIR).expect("at its own mode");
+        std::fs::write(replaced.join("inside"), b"theirs").expect("with an entry");
+        let result_b = apply_file_modify(&planned_b, &replaced, &want);
+        let mode_b = mode_of_path(&replaced);
+
+        assert!(
+            matches!(
+                (&result_a, &result_b),
+                (Err(Error::Changed { .. }), Err(Error::Changed { .. }))
+            ),
+            "(a) chmod 0640 after plan: {result_a:?}, file now {mode_a}; \
+             (b) directory after plan: {result_b:?}, directory now {mode_b}",
+        );
+        assert_eq!(
+            mode_a,
+            Mode::from_bits(0o640),
+            "(a) the user's chmod stands"
+        );
+        assert_eq!(std::fs::read(&chmodded).expect("read"), b"Host *\n");
+        assert_eq!(
+            mode_b,
+            Mode::DEFAULT_DIR,
+            "(b) the directory keeps its mode"
+        );
+        assert_eq!(
+            std::fs::read(replaced.join("inside")).expect("the entry is still readable"),
+            b"theirs",
+        );
+        assert_eq!(
+            names_in(home.path()),
+            vec![OsString::from("chmodded"), OsString::from("replaced")],
+            "no temporary file is left",
+        );
+    }
+
+    #[test]
+    fn set_mode_changes_the_mode_in_place_without_replacing_the_inode() {
         let home = guarded_home();
         let dest = home.child("f");
         seed(&dest, b"v1", Mode::DEFAULT_FILE);
@@ -4684,42 +4772,57 @@ mod tests {
     #[test]
     fn a_prior_mode_is_recordable_for_a_mode_only_change() {
         let home = guarded_home();
-        let (_dir, _lock, mut ledger) = ledger_for(&home);
+        let (dir, _lock, mut ledger) = ledger_for(&home);
         let dest = home.child(".ssh/config");
         seed(&dest, b"Host *\n", Mode::DEFAULT_FILE);
 
-        // The one read, shared by the comparison and the record.
-        let observed = observe(&dest).expect("observe");
-        let outcome = compare(&observed, &desired(b"Host *\n", Mode::PRIVATE_FILE));
+        // The one read, shared by the comparison and the apply.
+        let want = desired(b"Host *\n", Mode::PRIVATE_FILE);
+        let planned = observe(&dest).expect("observe");
+        let outcome = compare(&planned, &want);
         assert_eq!(outcome.action, Action::Modify);
         assert!(!outcome.content_drift);
 
+        // Applied like any other Modify: staged against plan's observation,
+        // with the same bytes at the new mode.
+        let filled = stage(&dest, want.mode, &planned, &mut CreatedDirs::new())
+            .expect("stage")
+            .fill(want.bytes)
+            .expect("fill");
         let recorded = ledger
             .record(
-                NewEntry::new(
-                    Portable::from_path(&dest, home.path()).expect("portable"),
-                    observed.digest().expect("a regular file has a digest"),
-                    Mode::PRIVATE_FILE,
-                    Mechanism::Own,
-                )
-                .with_prior(observed.prior_bytes()),
+                filled
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry"),
             )
             .expect("record")
             .clone();
-        set_mode(&dest, Mode::PRIVATE_FILE).expect("close the drift");
+        filled.publish().expect("publish");
 
         let Prior::Existed(reference) = &recorded.prior else {
             panic!("the prior state must be Existed, got {:?}", recorded.prior);
         };
         assert_eq!(reference.mode, Mode::DEFAULT_FILE);
         assert_eq!(
-            recorded.written,
-            ContentHash::of(b"Host *\n"),
-            "a mode-only change leaves the content it found",
+            Some(recorded.written),
+            planned.digest(),
+            "a mode-only change writes back the content it found",
+        );
+        assert_eq!(recorded.written, ContentHash::of(b"Host *\n"));
+        assert_eq!(recorded.mode, Mode::PRIVATE_FILE);
+        assert_eq!(mode_of_path(&dest), Mode::PRIVATE_FILE);
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host *\n");
+        // Idempotent: the second plan is empty.
+        assert_eq!(
+            compare(&observe(&dest).expect("observe again"), &want).action,
+            Action::Unchanged,
         );
 
-        // Reversing it is a chmod back, and the content never moved.
-        set_mode(&dest, reference.mode).expect("reverse");
+        // Reversing it restores the prior bytes at the prior mode.
+        let bytes = ledger
+            .restore_bytes(&dir, reference)
+            .expect("the prior bytes are durable");
+        write_atomically(&dest, &bytes, reference.mode).expect("reverse");
         assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host *\n");
     }

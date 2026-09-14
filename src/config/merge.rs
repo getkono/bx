@@ -2091,6 +2091,474 @@ mod tests {
         assert!(merged.targets.is_empty());
     }
 
+    /// A target toggle switching `path` off.
+    fn toggle_toml(path: &str) -> String {
+        format!("[[target]]\npath = \"{path}\"\nenabled = false\n")
+    }
+
+    /// The `profile` declaration the toggle-clash fixtures share, lines 1-3.
+    const PROFILE: &str = "[[value]]\nname = \"profile\"\nkind = \"string\"\n";
+
+    /// What a toggle-clash hint says once no answer is recommended, after the
+    /// toggle or toggles it names.
+    const CANNOT_SHOW_ONE: &str = ": bx cannot show that it names a declared target for every \
+                                   answer, so another answer may leave it toggling a file no \
+                                   earlier layer declares";
+    const CANNOT_SHOW_SEVERAL: &str = ": bx cannot show that they name declared targets for every \
+                                       answer, so another answer may leave them toggling files no \
+                                       earlier layer declares";
+    const CANNOT_SHOW_ANY: &str = "; keep one of these toggles and remove the rest: bx cannot \
+                                   show that any of them names a declared target for every \
+                                   answer, so another answer may leave one toggling a file no \
+                                   earlier layer declares";
+
+    /// The layers merged and resolved with no conflict, no block and no error:
+    /// a configuration that loads. The ready targets, as path and body.
+    fn loads(layers: &[Layer]) -> Vec<(String, crate::config::target::Body)> {
+        use crate::config::resolve::{Resolution, resolve};
+
+        let config = merge(layers).unwrap_or_else(|e| panic!("the merge failed: {e}"));
+        assert!(config.conflicts.is_empty(), "{:#?}", config.conflicts);
+        resolve(&config, &home())
+            .unwrap_or_else(|e| panic!("the resolution failed: {e}"))
+            .targets
+            .into_iter()
+            .map(|resolution| match resolution {
+                Resolution::Ready(target) => (target.path.as_str().to_string(), target.body),
+                Resolution::Blocked(entry) => panic!("blocked: {}", entry.hint),
+            })
+            .collect()
+    }
+
+    /// The account's layer: `profile` answered, then one toggle per spelling,
+    /// the first at line 3 and each next three lines on.
+    fn profile_toggles(answer: &str, toggles: &[&str]) -> Layer {
+        local(&format!(
+            "[values]\nprofile = \"{answer}\"\n{}",
+            toggles
+                .iter()
+                .map(|path| toggle_toml(path))
+                .collect::<String>()
+        ))
+    }
+
+    #[test]
+    fn a_toggle_clash_no_answer_can_clear_names_the_toggle_to_remove() {
+        // Issue #46. `~/.config/{{profile}}/s` reaches the declared
+        // `~/.config/default/s` only while `profile` is `default`, the answer
+        // that makes it meet the literal toggle. "Change that answer" cannot be
+        // followed: any other answer leaves that toggle naming a file nothing
+        // declares, which fails the whole load. Removing it can.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "{PROFILE}{}{}",
+                    target_toml("~/.config/default/s", "D"),
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let both = ["~/.config/default/s", "~/.config/{{profile}}/s"];
+        let layers = [base(), profile_toggles("default", &both)];
+
+        let config = merge(&layers).unwrap_or_else(|e| {
+            panic!("an answer that names one file twice failed the merge: {e}")
+        });
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        assert_eq!(
+            config.conflicts[0].hint,
+            format!(
+                "`[[target]]` `~/.config/default/s` at local.toml:3 and \
+                 `~/.config/{{{{profile}}}}/s` at local.toml:6 name one file, \
+                 `~/.config/default/s`, and one layer may name a file once, because of the \
+                 answer to `profile` at local.toml:2; remove the toggle \
+                 `~/.config/{{{{profile}}}}/s` at local.toml:6{CANNOT_SHOW_ONE}"
+            )
+        );
+        assert_eq!(
+            merge(&layers).unwrap(),
+            config,
+            "the merge is deterministic"
+        );
+
+        // The hint's advice loads.
+        assert_eq!(
+            loads(&[base(), profile_toggles("default", &both[..1])]),
+            [(
+                "~/.zshrc".to_string(),
+                crate::config::target::Body::Inline("setopt".to_string())
+            )]
+        );
+
+        // The advice it replaced does not.
+        let message = failure(&[base(), profile_toggles("other", &both)]);
+        assert!(
+            message.contains("toggles `~/.config/{{profile}}/s`, which no earlier layer declares"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_literal_toggle_meeting_a_placeholder_target_only_through_an_answer_is_the_one_to_remove() {
+        // The mirror of the reproduction: the placeholder spelling is the
+        // declared one, so the literal toggle is the one an answer strands.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "{PROFILE}{}{}",
+                    target_toml("~/.config/{{profile}}/s", "P"),
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let both = ["~/.config/default/s", "~/.config/{{profile}}/s"];
+
+        let config = merge(&[base(), profile_toggles("default", &both)]).unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(
+            hint.ends_with(&format!(
+                "; remove the toggle `~/.config/default/s` at local.toml:3{CANNOT_SHOW_ONE}"
+            )),
+            "{hint}"
+        );
+        assert!(!hint.contains("change that answer"), "{hint}");
+
+        assert_eq!(
+            loads(&[base(), profile_toggles("default", &both[1..])]).len(),
+            1,
+            "only `~/.zshrc` is left"
+        );
+        let message = failure(&[base(), profile_toggles("other", &both)]);
+        assert!(
+            message.contains("toggles `~/.config/default/s`, which no earlier layer declares"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_full_entry_and_a_toggle_that_reaches_it_only_through_an_answer_name_the_toggle() {
+        // The toggle meets a full entry its own layer wrote. Only the toggle can
+        // be stranded by another answer: a full entry creates its file.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!("{PROFILE}{}", target_toml("~/.zshrc", "setopt")),
+            )
+        };
+        let entry = target_toml("~/.config/{{profile}}/s", "L");
+
+        let config = merge(&[
+            base(),
+            local(&format!(
+                "[values]\nprofile = \"default\"\n{entry}{}",
+                toggle_toml("~/.config/default/s")
+            )),
+        ])
+        .unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(
+            hint.ends_with(&format!(
+                "because of the answer to `profile` at local.toml:2; remove the toggle \
+                 `~/.config/default/s` at local.toml:6{CANNOT_SHOW_ONE}"
+            )),
+            "{hint}"
+        );
+
+        assert_eq!(
+            loads(&[
+                base(),
+                local(&format!("[values]\nprofile = \"default\"\n{entry}"))
+            ]),
+            [
+                (
+                    "~/.zshrc".to_string(),
+                    crate::config::target::Body::Inline("setopt".to_string())
+                ),
+                (
+                    "~/.config/default/s".to_string(),
+                    crate::config::target::Body::Inline("L".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn several_toggles_that_reach_a_full_entry_only_through_an_answer_are_each_named() {
+        // Two toggles, each two files as written with the full entry and with
+        // each other, and each stranded by some other answer.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "{PROFILE}[[value]]\nname = \"q\"\nkind = \"string\"\n{}",
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let answers = "[values]\nprofile = \"default\"\nq = \"a\"\n";
+        let entry = target_toml("~/.config/{{profile}}/s", "L");
+
+        let config = merge(&[
+            base(),
+            local(&format!(
+                "{answers}{entry}{}{}",
+                toggle_toml("~/.config/default/s"),
+                toggle_toml("~/.config/{{q}}/../default/s")
+            )),
+        ])
+        .unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        assert_eq!(
+            config.conflicts[0].hint,
+            format!(
+                "`[[target]]` `~/.config/{{{{profile}}}}/s` at local.toml:4 and \
+                 `~/.config/default/s` at local.toml:7 and \
+                 `~/.config/{{{{q}}}}/../default/s` at local.toml:10 name one file, \
+                 `~/.config/default/s`, and one layer may name a file once, because of the \
+                 answer to `profile` at local.toml:2 and the answer to `q` at local.toml:3; \
+                 remove the toggles `~/.config/default/s` at local.toml:7 and \
+                 `~/.config/{{{{q}}}}/../default/s` at local.toml:10{CANNOT_SHOW_SEVERAL}"
+            )
+        );
+
+        assert_eq!(
+            loads(&[base(), local(&format!("{answers}{entry}"))]).len(),
+            2,
+            "`~/.zshrc` and the full entry"
+        );
+    }
+
+    #[test]
+    fn toggles_that_each_reach_a_target_only_through_an_answer_keep_one() {
+        // `two_toggles_that_each_cancel_a_placeholder_meet_for_one_answer_only`'s
+        // toggles. Neither is the declared spelling, so neither is the one to
+        // keep: either is. With the target declared in an earlier layer the
+        // two toggles are the whole clash, so keeping one clears it.
+        const DECLS: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\n";
+        let first = "[[target]]\npath = \"~/.config/{{p}}/../s\"\nenabled = false\n";
+        let second = "[[target]]\npath = \"~/.config/{{q}}/../s\"\nenabled = true\n";
+        let answers = || local("[values]\np = \"a\"\nq = \"b\"\n");
+        let earlier = |toggles: &str| {
+            [
+                global(
+                    "bx.toml",
+                    &format!("{DECLS}{}", target_toml("~/.config/s", "S")),
+                ),
+                global("modules/10-toggles.toml", toggles),
+                answers(),
+            ]
+        };
+
+        let config = merge(&earlier(&format!("{first}{second}"))).unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(hint.ends_with(CANNOT_SHOW_ANY), "{hint}");
+        assert!(
+            hint.starts_with(
+                "`[[target]]` `~/.config/{{p}}/../s` at modules/10-toggles.toml:1 and \
+                 `~/.config/{{q}}/../s` at modules/10-toggles.toml:4 name one file"
+            ),
+            "{hint}"
+        );
+        assert!(loads(&earlier(first)).is_empty(), "the one target is off");
+
+        // In that test's own layout the target is declared beside the toggles,
+        // so the full entry is in the clash too: keeping one toggle would leave
+        // it clashing with the entry, and the hint names both toggles instead.
+        let beside = |toggles: &str| {
+            [
+                global(
+                    "bx.toml",
+                    &format!("{DECLS}{}{toggles}", target_toml("~/.config/s", "S")),
+                ),
+                answers(),
+            ]
+        };
+        let config = merge(&beside(&format!("{first}{second}"))).unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(
+            hint.ends_with(&format!(
+                "; remove the toggles `~/.config/{{{{p}}}}/../s` at bx.toml:10 and \
+                 `~/.config/{{{{q}}}}/../s` at bx.toml:13{CANNOT_SHOW_SEVERAL}"
+            )),
+            "{hint}"
+        );
+        assert_eq!(loads(&beside("")).len(), 1, "the entry alone loads");
+        assert!(
+            !merge(&beside(first)).unwrap().conflicts.is_empty(),
+            "keeping one toggle beside the entry still clashes"
+        );
+    }
+
+    #[test]
+    fn a_toggle_pair_the_written_form_misses_gets_the_removal_hint() {
+        // `~/.c/{{p}}x/../s` and `~/.c/{{p}}y/../s` name one file for every
+        // answer, but the written form does not decide it: the pair is among
+        // the known examples in the final statement of the forms the written
+        // form does not decide, in pull request #16's review notes. So the
+        // clash is not refused, and no answer clears it. The removal hint does
+        // not rest on the form: keeping either toggle loads.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "[[value]]\nname = \"p\"\nkind = \"string\"\n{}{}",
+                    target_toml("~/.c/s", "S"),
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let toggles = ["~/.c/{{p}}x/../s", "~/.c/{{p}}y/../s"];
+        let answered = |answer: &str, toggles: &[&str]| {
+            local(&format!(
+                "[values]\np = \"{answer}\"\n{}",
+                toggles
+                    .iter()
+                    .map(|path| toggle_toml(path))
+                    .collect::<String>()
+            ))
+        };
+
+        let config = merge(&[base(), answered("a", &toggles)]).unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(
+            hint.ends_with(&format!(
+                "because of the answer to `p` at local.toml:2{CANNOT_SHOW_ANY}"
+            )),
+            "{hint}"
+        );
+
+        for kept in toggles {
+            assert_eq!(
+                loads(&[base(), answered("a", &[kept])]),
+                [(
+                    "~/.zshrc".to_string(),
+                    crate::config::target::Body::Inline("setopt".to_string())
+                )],
+                "{kept}"
+            );
+        }
+        let message = failure(&[base(), answered("a/b", &toggles)]);
+        assert!(
+            message.contains("which no earlier layer declares"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_toggle_clash_a_different_answer_clears_keeps_the_answer_hint() {
+        // Every toggle here is one path as written with a declared spelling, so
+        // an answer that parts the pair leaves both toggles naming declared
+        // files. The second row spells the toggle unfolded and the third glues
+        // a `path` value: only a comparison of written forms, not of text, sees
+        // either as the declared spelling.
+        let profile_targets = format!(
+            "{PROFILE}{}{}{}",
+            target_toml("~/.config/default/s", "D"),
+            target_toml("~/.config/{{profile}}/s", "P"),
+            target_toml("~/.zshrc", "setopt")
+        );
+        let path_targets = format!(
+            "[[value]]\nname = \"r\"\nkind = \"path\"\n{}{}{}",
+            target_toml("/opt/default/conf", "D"),
+            target_toml("/opt/{{r}}/conf", "R"),
+            target_toml("~/.zshrc", "setopt")
+        );
+        for (declared, name, clashing, clearing, toggles) in [
+            (
+                &profile_targets,
+                "profile",
+                "default",
+                "other",
+                ["~/.config/default/s", "~/.config/{{profile}}/s"],
+            ),
+            (
+                &profile_targets,
+                "profile",
+                "default",
+                "other",
+                ["~/.config/default/s", "~/.config/{{profile}}/./s"],
+            ),
+            (
+                &path_targets,
+                "r",
+                "/default",
+                "/other",
+                ["/opt/default/conf", "/opt{{r}}/conf"],
+            ),
+        ] {
+            let layers = |answer: &str| {
+                [
+                    global("bx.toml", declared),
+                    local(&format!(
+                        "[values]\n{name} = \"{answer}\"\n{}",
+                        toggles
+                            .iter()
+                            .map(|path| toggle_toml(path))
+                            .collect::<String>()
+                    )),
+                ]
+            };
+
+            let config = merge(&layers(clashing))
+                .unwrap_or_else(|e| panic!("{}: the merge failed: {e}", toggles[1]));
+            assert!(!config.conflicts.is_empty(), "{}", toggles[1]);
+            for conflict in &config.conflicts {
+                assert!(
+                    conflict.hint.ends_with(&format!(
+                        "because of the answer to `{name}` at local.toml:2; change that answer"
+                    )),
+                    "{}: {}",
+                    toggles[1],
+                    conflict.hint
+                );
+            }
+
+            assert_eq!(loads(&layers(clearing)).len(), 1, "{}", toggles[1]);
+        }
+    }
+
+    #[test]
+    fn a_clash_recorded_against_an_earlier_layer_keeps_its_answer_hint() {
+        // A later layer's toggle that reaches the file only through the answer
+        // changes nothing about the hint `bx.toml`'s own clash carries, whether
+        // that later layer clashes itself or not.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "{PROFILE}{}{}{}",
+                    target_toml("~/.config/default/s", "D"),
+                    target_toml("~/.config/{{profile}}/s", "P"),
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let committed = "`[[target]]` `~/.config/default/s` at bx.toml:4 and \
+                         `~/.config/{{profile}}/s` at bx.toml:7 name one file, \
+                         `~/.config/default/s`, and one layer may name a file once, because of \
+                         the answer to `profile` at local.toml:2; change that answer";
+
+        for (toggles, conflicts) in [
+            (&["~/.config/{{profile}}x/../default/s"][..], 1),
+            (
+                &["~/.config/{{profile}}x/../default/s", "~/.config/default/s"][..],
+                2,
+            ),
+        ] {
+            let config = merge(&[base(), profile_toggles("default", toggles)]).unwrap();
+            assert_eq!(config.conflicts.len(), conflicts, "{:#?}", config.conflicts);
+            assert_eq!(config.conflicts[0].hint, committed, "{toggles:?}");
+        }
+    }
+
     #[test]
     fn an_empty_layer_set_merges_to_an_empty_configuration() {
         assert_eq!(merge(&[]).unwrap(), Config::default());

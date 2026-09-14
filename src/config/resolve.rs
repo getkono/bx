@@ -364,9 +364,13 @@ fn refuse_path_value_in_file(
 
 /// The declarations from `name` down its committed defaults to a `path` value.
 ///
-/// Depth first, each default's references in the order written. `seen` keeps a
-/// default that reaches back to a name already walked from being walked again:
-/// a default an answer overrides is never expanded, so nothing else refused it.
+/// Depth first, each default's references in the order written. `seen` stops
+/// the walk at a name it has already walked, and it is reachable.
+/// [`Unresolved::Forward`](super::values::Unresolved::Forward) keeps every
+/// *expanded* default acyclic, since a default may reference only an earlier
+/// declaration. But a default an answer overrides is never expanded, so
+/// `default = "{{q}}"` on an answered `q` reaches this walk unrefused, and
+/// without `seen` the walk would recurse until the stack ran out.
 fn path_value_behind<'a>(
     values: &'a ResolvedValues,
     name: &str,
@@ -752,6 +756,23 @@ mod tests {
             ready(&ordinary, 0).body,
             Body::File(PathBuf::from("cfg/work/gitconfig")),
             "the case this spelling exists for still resolves"
+        );
+    }
+
+    #[test]
+    fn a_file_body_through_an_answered_value_whose_default_names_itself_resolves() {
+        // An answer overrides its declaration's default, so that default is never
+        // expanded and `Unresolved::Forward` never refuses it. The walk for a
+        // `path` value behind `file` reads committed defaults, answered or not,
+        // so it has to stop at a name it has already walked.
+        const LAYER: &str = "[[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{q}}\"\n\
+                             [[target]]\npath = \"~/.gitconfig\"\nfile = \"cfg/{{q}}/gitconfig\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\nq = \"work\"\n"))
+            .expect("an answered value's unexpanded default does not fail the load");
+        assert_eq!(
+            ready(&answered, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig"))
         );
     }
 

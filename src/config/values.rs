@@ -1300,6 +1300,10 @@ impl ResolvedValues {
                 continue;
             };
             // Empty: built from committed text alone. Its own name: answered.
+            // Already held: reached a second time, through another default.
+            // That guard never meets a cycle: only an unanswered value's default
+            // is followed, and that default was expanded, so
+            // `Unresolved::Forward` kept it referencing earlier values only.
             if from_account.is_empty()
                 || from_account.iter().any(|input| input == name)
                 || into.iter().any(|held| held == name)

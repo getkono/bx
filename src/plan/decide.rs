@@ -264,6 +264,12 @@ fn ownership(
         (Action::Modify, Some(entry)) if observed.digest() != Some(entry.written) => {
             conflict("edited since bx last wrote it".to_string())
         }
+        // The bytes are bx's, and the mode is not the one bx set: the user
+        // changed it, and a rewrite would undo that. A change to the declared
+        // mode alone leaves the disk at the ledger's mode and stays a modify.
+        (Action::Modify, Some(entry)) if observed.mode != Some(entry.mode) => {
+            conflict("its mode changed since bx wrote it".to_string())
+        }
         _ => (action, note),
     }
 }

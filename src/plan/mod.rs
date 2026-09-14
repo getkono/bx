@@ -1050,6 +1050,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn decision_22_a_mode_the_user_changed_on_a_file_bx_owns_is_a_conflict() {
+        // P42R1-D7. A user's chmod narrowing a file bx owns was re-widened:
+        // ownership compared the digest only.
+        let home = guarded_home();
+        own(home.path(), ".a", b"token\n", Mechanism::Own);
+        std::fs::set_permissions(home.child(".a"), std::fs::Permissions::from_mode(0o600))
+            .expect("the user's chmod");
+        let inputs = inputs(&home, &inline("~/.a", "token\\n"));
+
+        let report = plan(&inputs);
+
+        assert_eq!(report.actions(), vec![Action::Conflict]);
+        assert!(
+            report.changes[0]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("its mode changed since bx wrote it")),
+            "{:?}",
+            report.changes[0].note
+        );
+        let applied = apply(&inputs);
+        assert!(!applied.executed, "nothing is written over the user's mode");
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("the file")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(mode(&home.child(".a")), 0o600);
+
+        // Declaring the mode the user chose is converged, not a conflict.
+        let declared = inputs_for_mode(&home, "0600");
+        assert_eq!(plan(&declared).actions(), vec![Action::Unchanged]);
+    }
+
+    /// `~/.a` holding `token\n` at the declared `mode`.
+    fn inputs_for_mode(home: &GuardedHome, mode: &str) -> Inputs {
+        inputs(
+            home,
+            &format!("[[target]]\npath = \"~/.a\"\ncontent = \"token\\n\"\nmode = \"{mode}\"\n"),
+        )
+    }
+
+    #[test]
     fn t12_everything_apply_writes_is_reversed_exactly_by_restore() {
         let home = guarded_home();
         home.write("mine.txt", "user\n");

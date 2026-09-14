@@ -5095,6 +5095,163 @@ mod tests {
     }
 
     #[test]
+    fn no_character_outside_the_allowlist_passes_any_path_valued_kind() {
+        // The r3 round 3 self-sweep. Every round from 3 to 6 reopened this
+        // class — a character a tool reads its own way — so every path-valued
+        // kind is tried against every character class a value can carry. The
+        // grammar refuses some before any kind is judged (`Unreadable`); every
+        // other one is refused by name. None is approved.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let kinds = [
+            ("CARGO_HOME", "/var/mnt/scratch/example/a{C}b", rooted()),
+            (
+                "GOPATH",
+                "/var/mnt/scratch/example/go:/var/mnt/scratch/example/a{C}b",
+                rooted(),
+            ),
+            ("SCRATCH_HOME", "/var/home/example/a{C}b", home_rooted),
+            ("PATH", "/usr/a{C}b:/usr/bin", RootSet::strict()),
+            ("INFOPATH", "/usr/share/a{C}b", RootSet::strict()),
+            ("SSH_AUTH_SOCK", "/run/a{C}b", RootSet::strict()),
+        ];
+        let characters = [
+            '\\', '$', '{', '}', '%', '~', '@', '!', '*', '?', '[', ']', ' ', '\t', '"', '\'', '`',
+            '#', '=', ',', ';', '&', '|', '<', '>', '(', ')', '^', 'é', '\u{0}', '\u{7}', '\u{1b}',
+            '\r', '\u{7f}', ':',
+        ];
+        for (name, template, roots) in &kinds {
+            for character in characters {
+                let value = template.replace("{C}", &character.to_string());
+                // Single-quoted, the grammar holds every printable character
+                // but the quote itself literally.
+                for written in [format!("'{value}'"), format!("\"{value}\""), value.clone()] {
+                    let reason = reason_of(&check(name, &written, roots));
+                    let splits = matches!(*name, "CARGO_HOME" | "GOPATH" | "PATH" | "INFOPATH");
+                    match reason {
+                        Some(Reason::UnlistedCharacter(found)) => {
+                            assert_eq!(found, character, "{name}={written:?}");
+                        }
+                        // The grammar's own refusal, before any kind.
+                        Some(Reason::Unreadable) => {}
+                        // A `:` splits a list, leaving the relative entry `b`.
+                        Some(Reason::NotAbsolute) if character == ':' && splits => {}
+                        // A bare `$b` is a reference, and `~b` is not the home.
+                        Some(Reason::UnresolvedReference) if character == '$' => {}
+                        other => panic!("{name}={written:?} gave {other:?}"),
+                    }
+                }
+            }
+        }
+        // Components: `..` is refused in every path-valued kind, `.` and `//`
+        // fold away, and a trailing `/` names the same directory.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for (name, value, roots, expected) in [
+            (
+                "CARGO_HOME",
+                "~/a/../b",
+                &home_rooted,
+                Some(Reason::ParentComponent),
+            ),
+            (
+                "GOPATH",
+                "/var/home/example/go:/var/home/example/..",
+                &home_rooted,
+                Some(Reason::ParentComponent),
+            ),
+            (
+                "SCRATCH_HOME",
+                "~/..",
+                &home_rooted,
+                Some(Reason::ParentComponent),
+            ),
+            (
+                "EDITOR",
+                "/usr/bin/../nvim",
+                &home_rooted,
+                Some(Reason::ParentComponent),
+            ),
+            (
+                "PATH",
+                "/usr/..:$PATH",
+                &home_rooted,
+                Some(Reason::ParentComponent),
+            ),
+            (
+                "SSH_AUTH_SOCK",
+                "/run/../agent",
+                &home_rooted,
+                Some(Reason::ParentComponent),
+            ),
+            ("CARGO_HOME", ".", &home_rooted, Some(Reason::NotAbsolute)),
+            ("SCRATCH_HOME", ".", &home_rooted, Some(Reason::NotAbsolute)),
+            ("PATH", ".:$PATH", &home_rooted, Some(Reason::NotAbsolute)),
+            (
+                "SSH_AUTH_SOCK",
+                ".",
+                &home_rooted,
+                Some(Reason::NotAbsolute),
+            ),
+            ("CARGO_HOME", "~/./cargo", &home_rooted, None),
+            ("CARGO_HOME", "~//cargo", &home_rooted, None),
+            ("CARGO_HOME", "~/cargo/", &home_rooted, None),
+            ("SCRATCH_HOME", "~//s/./t/", &home_rooted, None),
+            (
+                "CARGO_HOME",
+                "~/.local/state/bx/",
+                &home_rooted,
+                Some(Reason::BxOwnedDirectory),
+            ),
+            (
+                "CARGO_HOME",
+                "~/.local//state/./",
+                &home_rooted,
+                Some(Reason::ContainsBxDirectory),
+            ),
+            ("SCRATCH_HOME", "~/.local//state/./", &home_rooted, None),
+            (
+                "SCRATCH_HOME",
+                "~/.config/bx/",
+                &home_rooted,
+                Some(Reason::InsideConfigRepo),
+            ),
+            (
+                "PATH",
+                "/var/home/example/.local/state/bx//bin:$PATH",
+                &home_rooted,
+                Some(Reason::BxOwnedDirectory),
+            ),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, roots)),
+                expected,
+                "{name}={value}"
+            );
+        }
+        // An anchor does not carry a tool-read location past the containment
+        // check: the location is judged at its own line, whatever it refers to.
+        for (content, expected) in [
+            (
+                "export DATA_DIR=~\nexport XDG_DATA_HOME=$DATA_DIR\n",
+                vec![(2, Reason::ContainsBxDirectory)],
+            ),
+            (
+                "export CACHE_DIR=~/.local\nexport GOPATH=~/go:$CACHE_DIR\n",
+                vec![(2, Reason::ContainsBxDirectory)],
+            ),
+            (
+                "export CACHE_DIR=~/.local\nexport GOPATH=\"${CACHE_DIR}\"\n",
+                vec![(2, Reason::ContainsBxDirectory)],
+            ),
+            (
+                "export SCRATCH_HOME=~/.local/state\nexport SCCACHE_DIR=$SCRATCH_HOME/x\n",
+                vec![],
+            ),
+        ] {
+            assert_eq!(reasons(content, &home_rooted), expected, "{content:?}");
+        }
+    }
+
+    #[test]
     fn bash_truncates_the_history_file_when_a_fragment_assigns_histfilesize() {
         // The mechanism behind reserving `HISTFILESIZE`: bash truncates the
         // history file the moment the name is assigned, in a non-interactive

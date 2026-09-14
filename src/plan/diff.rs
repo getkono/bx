@@ -364,6 +364,17 @@ mod tests {
     }
 
     #[test]
+    fn t17_an_on_disk_side_at_the_limit_is_still_shown() {
+        // The limit is inclusive on both sides, not only on the side bx writes.
+        let at = "a\n".repeat(TEXT_LIMIT / 2);
+        assert_eq!(at.len(), TEXT_LIMIT);
+        assert!(matches!(
+            Diff::between("~/.a", Some(at.as_bytes()), b"new\n", None).map(|d| d.kind),
+            Some(DiffKind::Text(_))
+        ));
+    }
+
+    #[test]
     fn t17_a_non_utf8_side_is_summarised_as_binary() {
         assert_eq!(
             Diff::between("~/.a", None, &[0xff, 0xfe], None).map(|d| d.kind),

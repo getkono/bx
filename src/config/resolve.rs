@@ -1828,10 +1828,115 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_past_the_stand_in_limit_is_judged_after_substitution() {
-        // Every placeholder that may hold a `/` doubles the combinations tried.
-        // Up to the limit a pair that is one path as written fails the load;
-        // past it the pair is not tried, and blocks like any other.
+    fn a_dotdot_run_past_a_placeholder_is_judged_after_substitution() {
+        // A run of `..` after a placeholder reaches as far as the answer is deep.
+        // `/opt/{{p}}/../../../s` and `/opt/{{p}}/../../../../s` both name `/s`
+        // for `p = "a"` or `"a/b"`, and `p = "a/b/c"` parts them; `{{r}}/../../s`
+        // and `{{r}}/../../../s` meet for `r = "/srv/d"` and part for
+        // `"/srv/d/e"`. Where they meet it is the answer's doing, so the file
+        // blocks and the load goes on.
+        let outcome = |base: &str, top: &str, local: &str| -> Result<Resolved, String> {
+            let layers = vec![
+                layer("base.toml", LayerKind::Global, base)?,
+                layer("bx.toml", LayerKind::Global, top)?,
+                layer("local.toml", LayerKind::Local, local)?,
+            ];
+            let merged = merge(&layers, &home()).map_err(|e| e.to_string())?;
+            resolve(&merged, &home()).map_err(|e| e.to_string())
+        };
+        // A base layer, the layer holding the pair, and each answer with whether
+        // the pair meets under it.
+        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, bool)]);
+        let cases: [Case<'_>; 2] = [
+            (
+                "[[target]]\npath = \"/s\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"/opt/s\"\ncontent = \"O\"\n",
+                "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                 [[target]]\npath = \"/opt/{{p}}/../../../s\"\nenabled = false\n\
+                 [[target]]\npath = \"/opt/{{p}}/../../../../s\"\nenabled = false\n",
+                &[
+                    ("p = \"a\"", true),
+                    ("p = \"a/b\"", true),
+                    ("p = \"a/b/c\"", false),
+                ],
+            ),
+            (
+                "[[target]]\npath = \"/s\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"/srv/s\"\ncontent = \"O\"\n",
+                "[[value]]\nname = \"r\"\nkind = \"path\"\n\
+                 [[target]]\npath = \"{{r}}/../../s\"\nenabled = false\n\
+                 [[target]]\npath = \"{{r}}/../../../s\"\nenabled = false\n",
+                &[("r = \"/srv/d\"", true), ("r = \"/srv/d/e\"", false)],
+            ),
+        ];
+
+        for (base, top, answers) in cases {
+            for (answer, meet) in answers {
+                let resolved = outcome(base, top, &format!("[values]\n{answer}\n"))
+                    .unwrap_or_else(|e| panic!("{answer} failed the whole load: {e}"));
+                let blocked: Vec<&str> = resolved
+                    .targets
+                    .iter()
+                    .filter_map(|target| match target {
+                        Resolution::Blocked(entry) => Some(entry.key.as_str()),
+                        Resolution::Ready(_) => None,
+                    })
+                    .collect();
+                let expected: &[&str] = if *meet { &["/s"] } else { &[] };
+                assert_eq!(blocked, expected, "{answer}");
+            }
+        }
+    }
+
+    #[test]
+    fn toggles_one_path_past_a_placeholder_fail_the_load_for_every_answer() {
+        // `{{p}}/../../s` and `{{p}}/.././../s` differ only by a `.`: whenever
+        // they name a file they name the same one, so no answer parts them and
+        // the pair is the layer's defect. `{{p}}/s` and `{{p}}/./s` are the same
+        // with the placeholder opening the spelling, which `p = "~"` roots.
+        for prefix in ["~/", "~/x/y/"] {
+            let layer = format!(
+                "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                 [[target]]\npath = \"{prefix}s\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"{prefix}{{{{p}}}}/../../s\"\nenabled = false\n\
+                 [[target]]\npath = \"{prefix}{{{{p}}}}/.././../s\"\nenabled = true\n"
+            );
+            for answer in ["a/b", "b/c", "a", "a/b/c", "."] {
+                let message = resolved(&layer, Some(&format!("[values]\np = \"{answer}\"\n")))
+                    .expect_err("no answer loads this layer");
+                if matches!(answer, "a/b" | "b/c") {
+                    for part in [
+                        format!("names the same file as `{prefix}{{{{p}}}}/../../s`"),
+                        "in this same layer".to_string(),
+                    ] {
+                        assert!(
+                            message.contains(&part),
+                            "{prefix} {answer} {part}: {message}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let lead = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                    [[target]]\npath = \"~/s\"\ncontent = \"S\"\n\
+                    [[target]]\npath = \"{{p}}/s\"\nenabled = false\n\
+                    [[target]]\npath = \"{{p}}/./s\"\nenabled = true\n";
+        let message = resolved(lead, Some("[values]\np = \"~\"\n"))
+            .expect_err("one path for every answer is the layer's defect");
+        for part in [
+            "names the same file as `{{p}}/s` at bx.toml:7",
+            "in this same layer",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_pair_with_many_placeholders_is_decided_like_any_other() {
+        // Nothing about the rule grows with the placeholders in a spelling: a
+        // pair carrying thirteen that is one path as written fails the load like
+        // a pair carrying one.
         let layer = |count: usize| {
             let decls: String = (1..=count)
                 .map(|i| format!("[[value]]\nname = \"v{i}\"\nkind = \"string\"\n"))
@@ -1848,15 +1953,12 @@ mod tests {
             )
         };
 
-        let (at, answers) = layer(12);
-        let message =
-            resolved(&at, Some(&answers)).expect_err("at the limit the pair is still tried");
-        assert!(message.contains("in this same layer"), "{message}");
-
-        let (past, answers) = layer(13);
-        let resolved = resolved(&past, Some(&answers)).expect("past the limit the pair blocks");
-        blocked(&resolved, 0);
-        ready(&resolved, 1);
+        for count in [1, 13] {
+            let (text, answers) = layer(count);
+            let message = resolved(&text, Some(&answers))
+                .expect_err("one path for every answer is the layer's defect");
+            assert!(message.contains("in this same layer"), "{count}: {message}");
+        }
     }
 
     #[test]

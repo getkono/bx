@@ -30,10 +30,10 @@
 //! spellings, is an error, as it is under one — when no account answer went
 //! into either spelling, or when the two spellings are one path before any
 //! answer goes in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`), which is
-//! judged by reducing both under stand-ins for every answer's shape. A `..` that
-//! cancels a placeholder's segment proves nothing on its own:
-//! `~/.config/{{p}}/../s` reads as `~/.config/s` only while `p` holds no `/`,
-//! which a `bool` never does and a `string` may.
+//! decided exactly by reducing each spelling with its placeholders unanswered.
+//! A `..` cancels a placeholder's segment only for a `bool`, which is always
+//! one segment: `~/.config/{{p}}/../s` reads as `~/.config/s` only while `p`
+//! holds one segment, which a `string` need not.
 //!
 //! When one did, the collision is the account's. `bx.toml` declaring
 //! `~/.config/{{profile}}/s` and `~/.config/default/s` names two files as
@@ -76,7 +76,7 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::target::Target;
-use super::values::{ResolvedValues, ValueAssignment, ValueDecl, ValueKind, fill, placeholders};
+use super::values::{Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan};
 use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
 
@@ -646,76 +646,136 @@ fn clash(
     Ok(true)
 }
 
-/// The most placeholders that may hold a `/` a pair is tried under.
-///
-/// Each doubles the stand-in combinations. A pair past it is not proven one
-/// path, and is judged after substitution like any other pair.
-const STAND_IN_LIMIT: usize = 12;
-
 /// Whether two spellings name one file whatever is answered.
 ///
-/// Every placeholder is replaced by a stand-in and both spellings are reduced
-/// by the lexical rule. A single-segment stand-in is tried for every
-/// placeholder, and a multi-segment one, holding a `/`, for each whose answer
-/// may hold one: every kind but `bool`, and a name no layer declares. The pair
-/// is one path exactly when it reduces to one text under every combination.
-/// `~/.config/{{p}}/./s` against `~/.config/{{p}}/s` is, and so is
-/// `~/.config/{{flag}}/../s` against `~/.config/s` for a `bool`; for a
-/// `string` the second is not, because `p = "a/b"` makes it `~/.config/a/s`.
+/// Exactly when their [`written_form`]s are identical. The same answers put
+/// into one form give one text, so identical forms name one file for every
+/// answer, or no file for any. Forms that differ are parted by some answer, so
+/// the collision is one the account can clear.
 ///
-/// A stand-in segment opens with a NUL, which a file name cannot hold, so it
-/// meets a literal segment only if a layer spelled a NUL out, and each carries
-/// its name, so two placeholders never meet each other. A `path` stand-in is
-/// rooted, as every `path` answer is.
+/// Only spellings whose keys are one [`TargetKey::File`] are compared here, so
+/// every placeholder in either is declared, enabled and answered: a
+/// substitution that failed would have keyed the spelling as written.
 fn one_path_as_written(first: &str, second: &str, values: &ResolvedValues) -> bool {
-    let mut names = placeholders(first).unwrap_or_default();
-    for name in placeholders(second).unwrap_or_default() {
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
-    let kind = |name: &str| values.decl(name).map(|decl| decl.kind);
-    let wide: Vec<&str> = names
-        .into_iter()
-        .filter(|name| kind(name) != Some(ValueKind::Bool))
-        .collect();
-    if wide.len() > STAND_IN_LIMIT {
-        return false;
-    }
-
-    (0..1_usize << wide.len()).all(|combination| {
-        let stand_in = |name: &str| {
-            let root = if kind(name) == Some(ValueKind::Path) {
-                "/"
-            } else {
-                ""
-            };
-            let multi = wide
-                .iter()
-                .position(|held| *held == name)
-                .is_some_and(|bit| combination & (1 << bit) != 0);
-            if multi {
-                format!("{root}\0{name}/\0{name}\0")
-            } else {
-                format!("{root}\0{name}")
-            }
-        };
-        reduced(first, &stand_in, values.home()) == reduced(second, &stand_in, values.home())
-    })
+    written_form(first, values).is_some_and(|form| Some(form) == written_form(second, values))
 }
 
-/// `spelling` with its placeholders stood in for, reduced by the lexical rule.
+/// A spelling reduced by the lexical rule, with its placeholders unanswered.
+#[derive(Debug, PartialEq, Eq)]
+struct WrittenForm<'a> {
+    root: Root<'a>,
+    segments: Vec<Segment<'a>>,
+}
+
+/// Where a [`WrittenForm`] is rooted.
+#[derive(Debug, PartialEq, Eq)]
+enum Root<'a> {
+    /// `/`, or a lone `path` value opening the spelling: every `path` answer is
+    /// absolute, so `{{r}}/s` and `/{{r}}/s` are one path.
+    Absolute,
+    /// `~`.
+    Home,
+    /// Whatever the answers make of the first segment, which the lexical rule
+    /// cannot see into: `{{p}}/s` is rooted at `~` for `p = "~"`, at `/` for
+    /// `p = ""`, and not rooted for `p = "a"`. Whether anything follows it
+    /// matters as well, since `p = ""` makes `{{p}}` nothing and `{{p}}/.` `/`.
+    Opening {
+        first: Vec<Piece<'a>>,
+        followed: bool,
+    },
+}
+
+/// One segment of a [`WrittenForm`].
+#[derive(Debug, PartialEq, Eq)]
+enum Segment<'a> {
+    /// One ordinary segment whatever is answered: literal text, or text whose
+    /// only placeholders are `bool`s, whose answers are never empty and never
+    /// hold a `/`. A `..` cancels it.
+    Fixed(Vec<Piece<'a>>),
+    /// A segment holding a placeholder an answer may make empty, `.`, `..`, or
+    /// several segments. Nothing cancels it.
+    Opaque(Vec<Piece<'a>>),
+    /// A `..` that nothing written before it can be shown to cancel.
+    Up,
+}
+
+/// `spelling` reduced by the lexical rule, deciding nothing an answer decides.
 ///
-/// As filled when the lexical rule refuses it, and as written when it is not a
-/// well-formed template.
-fn reduced(spelling: &str, stand_in: &impl Fn(&str) -> String, home: &Path) -> String {
-    let Some(filled) = fill(spelling, stand_in) else {
-        return spelling.to_string();
-    };
-    match Portable::parse_in(&filled, home) {
-        Ok(path) => path.as_str().to_string(),
-        Err(_) => filled,
+/// A `.` and an empty segment fold, and a `..` cancels the [`Segment::Fixed`]
+/// before it. A `..` after anything else stays in the form, except at `/`, where
+/// there is nothing above to climb to; under `~` it is the climb out of the home
+/// that no answer rescues.
+///
+/// A segment is compared by its pieces. A new literal piece starts only after a
+/// `{{{{` escape, so a segment spelled `.` or `..` is always one literal piece.
+///
+/// `None` when `spelling` is not a well-formed template. That is defensive: a
+/// spelling keyed as a file substituted, and substitution scans the same text.
+fn written_form<'a>(spelling: &'a str, values: &ResolvedValues) -> Option<WrittenForm<'a>> {
+    let mut split: Vec<Vec<Piece<'a>>> = Vec::new();
+    let mut current: Vec<Piece<'a>> = Vec::new();
+    for piece in scan(spelling).ok()? {
+        match piece {
+            Piece::Literal(text) => {
+                for (index, chunk) in text.split('/').enumerate() {
+                    if index > 0 {
+                        split.push(std::mem::take(&mut current));
+                    }
+                    if !chunk.is_empty() {
+                        current.push(Piece::Literal(chunk));
+                    }
+                }
+            }
+            name @ Piece::Name(_) => current.push(name),
+        }
     }
+    split.push(current);
+
+    // A name no layer declares is taken as the widest kind. That too is
+    // defensive, for the reason `None` is.
+    let is = |piece: &Piece<'_>, kind: ValueKind| {
+        matches!(piece, Piece::Name(name)
+            if values.decl(name).is_some_and(|decl| decl.kind == kind))
+    };
+    let mut split = split.into_iter();
+    let first = split.next().unwrap_or_default();
+    let followed = !split.as_slice().is_empty();
+    let mut segments = Vec::new();
+    let root = if first.is_empty() && followed {
+        Root::Absolute
+    } else if first == [Piece::Literal("~")] {
+        Root::Home
+    } else if matches!(first.as_slice(), [only] if is(only, ValueKind::Path)) {
+        segments.push(Segment::Opaque(first));
+        Root::Absolute
+    } else {
+        Root::Opening { first, followed }
+    };
+
+    for segment in split {
+        if segment.is_empty() || segment == [Piece::Literal(".")] {
+            continue;
+        }
+        if segment == [Piece::Literal("..")] {
+            match segments.last() {
+                Some(Segment::Fixed(_)) => {
+                    segments.pop();
+                }
+                None if root == Root::Absolute => {}
+                _ => segments.push(Segment::Up),
+            }
+            continue;
+        }
+        let fixed = segment
+            .iter()
+            .all(|piece| matches!(piece, Piece::Literal(_)) || is(piece, ValueKind::Bool));
+        segments.push(if fixed {
+            Segment::Fixed(segment)
+        } else {
+            Segment::Opaque(segment)
+        });
+    }
+    Some(WrittenForm { root, segments })
 }
 
 /// A second statement for one file from one layer, with no answer to blame.
@@ -1436,6 +1496,185 @@ mod tests {
     }
 
     #[test]
+    fn one_path_as_written_agrees_with_every_answer_in_a_fuzzed_set() {
+        // Soundness: a pair the rule calls one path has one key, or no key, under
+        // every answer below. Completeness over that set: a pair it does not call
+        // one path, which some answer gives one key, is parted by another answer,
+        // so the block its hint describes is one an answer can clear. The pairs
+        // come from a fixed seed, so every run tries the same ones.
+        use crate::config::values::AssignedValue;
+        use std::collections::HashSet;
+
+        let decl = |name: &str, kind: ValueKind| ValueDecl {
+            name: name.into(),
+            description: None,
+            kind,
+            required: false,
+            is_root: false,
+            default: None,
+            enabled: true,
+            origin: Origin::unknown(Path::new("bx.toml")),
+        };
+        let decls = || {
+            vec![
+                decl("p", ValueKind::String),
+                decl("q", ValueKind::String),
+                decl("f", ValueKind::Bool),
+                decl("r", ValueKind::Path),
+            ]
+        };
+        let assign = |name: &str, value: AssignedValue| ValueAssignment {
+            name: name.into(),
+            value,
+            origin: Origin::unknown(Path::new("local.toml")),
+        };
+        // Deep answers first: they part most pairs, so most pairs stop early.
+        let strings = [
+            "a/b/c/d/e/f/g/h",
+            "/a/b/c/d/e/f/g/h",
+            "a",
+            "a/b",
+            "",
+            ".",
+            "..",
+            "../..",
+            "/a",
+            "~",
+            "~/a",
+            "a/",
+            "a/..",
+        ];
+        let others = ["b/c/d/e/f/g/h/i", "b", ""];
+        let roots = ["/srv/d/e/f/g/h/i/j", "/srv", "/", "/var/home/example"];
+        let mut answers = Vec::new();
+        for p in strings {
+            for q in others {
+                for r in roots {
+                    for f in [true, false] {
+                        let given = [
+                            assign("p", AssignedValue::String(p.into())),
+                            assign("q", AssignedValue::String(q.into())),
+                            assign("f", AssignedValue::Bool(f)),
+                            assign("r", AssignedValue::String(r.into())),
+                        ];
+                        if let Ok(values) = ResolvedValues::resolve(decls(), &given, &home()) {
+                            answers.push((format!("p={p:?} q={q:?} f={f} r={r:?}"), values));
+                        }
+                    }
+                }
+            }
+        }
+
+        let segments = [
+            "x",
+            "y",
+            ".",
+            "..",
+            "..",
+            "..",
+            "",
+            "~",
+            "{{p}}",
+            "{{q}}",
+            "a{{p}}",
+            "{{p}}b",
+            "{{p}}{{q}}",
+            "{{f}}",
+            "x{{f}}",
+            "{{r}}",
+        ];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut pick = move |n: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(seed >> 33).expect("a 31-bit value fits") % n
+        };
+
+        let (mut proven, mut parted) = (0, 0);
+        let mut unsound: Vec<String> = Vec::new();
+        let mut incomplete: Vec<String> = Vec::new();
+        let mut tried = HashSet::new();
+        for _ in 0..3000 {
+            let root = ["~/", "/", ""][pick(3)];
+            let len = 1 + pick(5);
+            let mut first: Vec<&str> = (0..len).map(|_| segments[pick(segments.len())]).collect();
+            if root.is_empty() {
+                first[0] = ["{{r}}", "{{p}}"][pick(2)];
+            }
+            let mut second = first.clone();
+            for _ in 0..=pick(3) {
+                let at = if second.len() > 1 {
+                    (1 + pick(second.len())).min(second.len())
+                } else {
+                    second.len()
+                };
+                match pick(6) {
+                    0 => second.insert(at, "."),
+                    1 => second.insert(at, ".."),
+                    2 if second.len() > 1 && at < second.len() => {
+                        second.remove(at);
+                    }
+                    3 if at < second.len() => second[at] = segments[pick(segments.len())],
+                    4 => {
+                        second.insert(at, "..");
+                        second.insert(at, "x");
+                    }
+                    _ => second.insert(at, ""),
+                }
+            }
+            let a = format!("{root}{}", first.join("/"));
+            let mut b = format!("{root}{}", second.join("/"));
+            // A leading `/` before a placeholder that opens the spelling.
+            if root.is_empty() && pick(4) == 0 {
+                b.insert(0, '/');
+            }
+            if a == b || !tried.insert((a.clone(), b.clone())) {
+                continue;
+            }
+
+            let one_path = one_path_as_written(&a, &b, &answers[0].1);
+            let mut met = false;
+            let mut apart = None;
+            for (label, values) in &answers {
+                let (key_a, key_b) = (TargetKey::of(&a, values), TargetKey::of(&b, values));
+                match (&key_a, &key_b) {
+                    (TargetKey::File(x), TargetKey::File(y)) if x == y => met = true,
+                    (TargetKey::AsWritten(_), TargetKey::AsWritten(_)) => {}
+                    _ => {
+                        apart = Some(format!("{label}: {key_a:?} against {key_b:?}"));
+                        break;
+                    }
+                }
+            }
+            match (one_path, apart) {
+                (true, Some(why)) => unsound.push(format!("{a:?} and {b:?}, parted by {why}")),
+                (true, None) => proven += 1,
+                (false, Some(_)) => parted += 1,
+                (false, None) if met => incomplete.push(format!("{a:?} and {b:?}")),
+                (false, None) => {}
+            }
+        }
+
+        assert!(
+            unsound.is_empty(),
+            "{} pairs called one path were parted by an answer:\n{}",
+            unsound.len(),
+            unsound[..unsound.len().min(10)].join("\n")
+        );
+        assert!(
+            incomplete.is_empty(),
+            "{} pairs no answer parts were not called one path:\n{}",
+            incomplete.len(),
+            incomplete[..incomplete.len().min(10)].join("\n")
+        );
+        assert!(
+            proven >= 100 && parted >= 100,
+            "the set must exercise both verdicts: {proven} one path, {parted} parted"
+        );
+    }
+
+    #[test]
     fn two_toggles_that_each_cancel_a_placeholder_meet_for_one_answer_only() {
         // `~/.config/{{p}}/../s` and `~/.config/{{q}}/../s` are `~/.config/s`
         // while `p` and `q` each hold one segment, and two files once either
@@ -1460,17 +1699,17 @@ mod tests {
     }
 
     #[test]
-    fn a_spelling_the_lexical_rule_refuses_under_a_stand_in_is_compared_as_filled() {
-        // `~/{{p}}/../../s` climbs out of the home while `p` is one segment, so
-        // under that stand-in neither toggle reduces: each is compared as filled,
-        // and the two texts differ. For `p = "a/b"` both are `~/s`, which is the
-        // answer's collision. The second pair spreads the climb over two
-        // placeholders, so only both being one segment makes it.
+    fn toggles_one_path_past_a_placeholder_are_the_layer_s_defect_whatever_climbs() {
+        // `~/{{p}}/../../s` and `~/{{p}}/.././../s` differ only by a `.`, so
+        // whatever `p` holds they name one file, or both climb out of the home
+        // and name none. No answer can part them: it is the layer's defect, even
+        // though a one-segment `p` makes neither a portable path. The second pair
+        // spreads the climb over two placeholders.
         for (first, second) in [
             ("~/{{p}}/../../s", "~/{{p}}/.././../s"),
             ("~/{{p}}/{{q}}/../../../s", "~/{{p}}/{{q}}/../.././../s"),
         ] {
-            let config = merge(&[
+            let message = failure(&[
                 global(
                     "bx.toml",
                     &format!(
@@ -1482,10 +1721,15 @@ mod tests {
                     ),
                 ),
                 local("[values]\np = \"a/b\"\nq = \"c\"\n"),
-            ])
-            .unwrap_or_else(|e| panic!("{second}: an answer's collision failed the merge: {e}"));
-            assert_eq!(config.conflicts.len(), 1, "{second}");
-            assert_eq!(config.conflicts[0].file, "~/s", "{second}");
+            ]);
+            assert!(
+                message.contains(&format!("names the same file as `{first}`")),
+                "{second}: {message}"
+            );
+            assert!(
+                message.contains("in this same layer"),
+                "{second}: {message}"
+            );
         }
     }
 

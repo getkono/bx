@@ -113,8 +113,9 @@ impl StateDir {
     ///
     /// A later quarantine of the same file never reuses an occupied name, nor
     /// refills a gap: [`move_aside`] takes the number after the highest of
-    /// `<name>.corrupt`, `<name>.corrupt.1`, `<name>.corrupt.2`, … present.
-    /// Numbered rather than timestamped, so the name a given sequence of damage
+    /// `<name>.corrupt`, `<name>.corrupt.1`, `<name>.corrupt.2`, … present —
+    /// or, past a number with no successor that bx never makes, the lowest free
+    /// one. Numbered rather than timestamped, so the name a given sequence of damage
     /// produces is deterministic; in creation order, so the last is the newest;
     /// and never over an earlier one, because the earlier one may be the only
     /// index there is to the user's restore blobs.
@@ -198,6 +199,9 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
 /// `<name>.corrupt` itself when there is none — and never a gap a deleted
 /// quarantine left. So the quarantines present are always numbered in the order
 /// they were made, and the last is the newest, whichever a human has removed.
+/// The one exception is a number with no successor, `<name>.corrupt.<u64::MAX>`,
+/// which bx itself never makes: past it the lowest free number is taken, so a
+/// crafted name can break the order but never block a quarantine.
 ///
 /// The rename is `RENAME_NOREPLACE`, so an existing quarantine is never
 /// destroyed — not by an earlier bx's leftovers, and not by a race; a name
@@ -218,9 +222,12 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
         std::io::Error::new(std::io::ErrorKind::InvalidInput, refused.to_string())
     })?;
     let mut n: u64 = match numbered(path)?.last() {
-        Some(highest) => highest
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other("no free quarantine name"))?,
+        // Only a name bx never makes — `<name>.corrupt.<u64::MAX>` — has no
+        // number after it. Refusing there would let one crafted file block
+        // every later quarantine, so the count starts again at `0` instead and
+        // skips every taken name below, which lands on the lowest free number:
+        // a directory cannot hold 2^64 entries, so one always exists.
+        Some(highest) => highest.checked_add(1).unwrap_or(0),
         None => 0,
     };
     loop {
@@ -767,6 +774,28 @@ mod tests {
             move_aside(&path, &lock).expect("moved aside"),
             StateDir::quarantine_nth(&path, 4),
         );
+    }
+
+    #[test]
+    fn a_quarantine_number_that_cannot_be_followed_leaves_the_lowest_free_one() {
+        // r3 round 1 (L1a): a name bx never makes, `<name>.corrupt.<u64::MAX>`,
+        // left no number after the highest, so every later quarantine of the
+        // file failed with "no free quarantine name".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        let path = dir.path().join("v.mpk");
+        let crafted = StateDir::quarantine_nth(&path, u64::MAX);
+        std::fs::write(&crafted, b"crafted").expect("seed");
+
+        std::fs::write(&path, b"damaged").expect("seed");
+        let aside = move_aside(&path, &lock).expect("a free name exists");
+        assert_eq!(aside, StateDir::quarantine(&path));
+        assert_eq!(std::fs::read(&aside).expect("moved"), b"damaged");
+
+        std::fs::write(&path, b"damaged again").expect("seed");
+        let aside = move_aside(&path, &lock).expect("a free name exists");
+        assert_eq!(aside, StateDir::quarantine_nth(&path, 1));
+        assert_eq!(std::fs::read(&crafted).expect("kept"), b"crafted");
     }
 
     #[test]

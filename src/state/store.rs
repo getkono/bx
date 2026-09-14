@@ -21,7 +21,9 @@
 //! the highest quarantine present, with `RENAME_NOREPLACE`, so a second damaged
 //! ledger cannot destroy the first — which may be the only index there is to the
 //! user's restore blobs — and a gap left by a deleted one is never refilled, so
-//! the numbers present are always in the order the quarantines were made.
+//! the numbers present are always in the order the quarantines were made. Only
+//! a number with no successor, which bx never makes, breaks that order: past it
+//! the lowest free number is taken, so a crafted name never blocks a quarantine.
 //!
 //! # A refusal is not damage
 //!
@@ -896,6 +898,26 @@ mod tests {
         std::fs::write(&path, b"fifth").expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.quarantined, vec![StateDir::quarantine(&path)]);
+    }
+
+    #[test]
+    fn a_quarantine_number_with_no_successor_does_not_block_the_next_quarantine() {
+        // r3 round 1 (L1a): with `v.mpk.corrupt.18446744073709551615` present,
+        // the number after the highest overflowed, nothing was moved aside,
+        // and the load still said the file had been quarantined.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let crafted = StateDir::quarantine_nth(&path, u64::MAX);
+        std::fs::write(&crafted, b"crafted").expect("seed");
+        std::fs::write(&path, b"garbage").expect("seed");
+
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
+        let first = StateDir::quarantine(&path);
+        assert_eq!(std::fs::read(&first).expect("moved aside"), b"garbage");
+        assert_eq!(std::fs::read(&crafted).expect("left alone"), b"crafted");
+        assert_eq!(loaded.quarantined, vec![first, crafted]);
+        assert!(std::fs::symlink_metadata(&path).is_err(), "the file moved");
     }
 
     #[test]

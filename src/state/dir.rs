@@ -740,6 +740,22 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_mkdir_refuses_is_reported_naming_it() {
+        // r3 round 1 (C6): every earlier failure was in the ancestors, so a
+        // `mkdir` of the directory itself failing was never reached, and
+        // reading it as success survived mutation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let long = dir.path().join("d".repeat(256));
+        let err = ensure_dir(&long, Mode::PRIVATE_DIR).expect_err("a 256-byte name");
+        assert!(
+            matches!(&err, Error::CreateDir { path, source }
+                if *path == long
+                    && source.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error())),
+            "got {err}",
+        );
+    }
+
+    #[test]
     fn a_quarantine_name_appends_rather_than_replacing_the_extension() {
         assert_eq!(
             StateDir::quarantine(Path::new("/s/bx/ledger.mpk")),

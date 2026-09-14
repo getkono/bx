@@ -151,6 +151,12 @@ pub(super) fn decide(
             )
         })
         .flatten();
+    // A create makes every missing parent on the way to its target, and the
+    // row names each, so plan announces every directory apply creates.
+    let note = match action {
+        Action::Create => join([created_dirs(&observed, ctx.home), note]),
+        _ => note,
+    };
     let change = row(action, diff, note);
     let op = action.is_pending().then(|| Op {
         target: target.path.clone(),
@@ -160,6 +166,40 @@ pub(super) fn decide(
         mode,
     });
     Ok((change, op))
+}
+
+/// The directories a write to `observed` creates, shallowest first — the order
+/// `apply` makes them in — each with the mode it is made at, or `None` when
+/// the parent is already there.
+///
+/// The observation says whether the parent is absent and the mode it would be
+/// made at, and nothing declares a directory's mode in this entry, so every
+/// missing ancestor is made at that mode. Which ancestors are missing is read
+/// here with the walk `stage` makes before creating them.
+fn created_dirs(observed: &Observed, home: &Path) -> Option<String> {
+    let parent = observed.parent.as_ref()?;
+    let crate::fs::ParentState::Absent(mode) = &parent.state else {
+        return None;
+    };
+    let mut missing: Vec<&Path> = parent
+        .path
+        .ancestors()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .take_while(|dir| {
+            matches!(
+                std::fs::symlink_metadata(dir),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+        .collect();
+    missing.reverse();
+    (!missing.is_empty()).then(|| {
+        let named: Vec<String> = missing
+            .iter()
+            .map(|dir| format!("{} {mode}", paths::to_portable(dir, home)))
+            .collect();
+        format!("creates {}", named.join(", "))
+    })
 }
 
 /// The bytes a target wants, or why it cannot have any yet.

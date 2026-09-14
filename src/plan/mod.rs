@@ -1095,6 +1095,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn decision_23_a_create_names_every_directory_apply_creates_with_its_mode() {
+        // P42R1-D8. `apply` creates a target's missing parents, and no row
+        // said so, so plan did not announce every write apply made.
+        let home = guarded_home();
+        let inputs = inputs(
+            &home,
+            &[
+                inline("~/.config/made/deep/new.conf", "x\\n"),
+                inline("~/.b", "b\\n"),
+            ]
+            .concat(),
+        );
+
+        let report = plan(&inputs);
+
+        assert_eq!(report.actions(), vec![Action::Create, Action::Create]);
+        assert_eq!(
+            report.changes[0].note.as_deref(),
+            Some("creates ~/.config/made 0755, ~/.config/made/deep 0755")
+        );
+        assert_eq!(report.changes[1].note, None, "the home is already there");
+        assert!(
+            !home.child(".config/made").exists(),
+            "plan created a parent"
+        );
+
+        assert!(apply(&inputs).executed);
+        for dir in [".config/made", ".config/made/deep"] {
+            let meta = std::fs::symlink_metadata(home.child(dir)).expect("created");
+            assert!(meta.is_dir(), "{dir}");
+            assert_eq!(meta.permissions().mode() & 0o7777, 0o755, "{dir}");
+        }
+    }
+
+    #[test]
     fn t12_everything_apply_writes_is_reversed_exactly_by_restore() {
         let home = guarded_home();
         home.write("mine.txt", "user\n");

@@ -17,7 +17,8 @@
 //!   "there is no file" and "there is an empty file" are different states, and
 //!   only one of them is what the user had. Directories bx created are then
 //!   removed deepest-first while they are empty; one another managed file
-//!   still holds is handed to that file's entry, so its own `rm` removes it.
+//!   still holds is handed to that file's entry, so its own `rm` removes it,
+//!   and one the user replaced with something that is not a directory is left.
 //!   The file is unlinked only while it is still the one the plan observed.
 //! * **Never overwrite a later edit.** The destination's current digest is
 //!   compared with the digest bx recorded when it last wrote the file. If they
@@ -166,12 +167,27 @@ impl Restored {
 /// Decide what `rm` will do to one target, reading the destination and writing
 /// nothing.
 ///
+/// A destination that cannot be stat'd or read, or whose parent cannot be, is
+/// a [`Restoration::Conflict`], not an error: bx cannot compare it with what it
+/// wrote, so `rm` writes nothing there, forgets nothing, and restores the
+/// rest — and this preview says so, as `rm` does.
+///
 /// # Errors
 ///
-/// [`Error::Read`] when the destination cannot be stat'd or read.
+/// [`Error::Read`] for a destination path that cannot be observed at all: one
+/// with no parent, or with a `..` component.
 pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Error> {
     let dest = entry.path.render(home);
-    let observed = fs::observe(&dest)?;
+    let observed = match fs::observe(&dest) {
+        Ok(observed) => observed,
+        Err(fs::Error::Read { source, .. }) => {
+            return Ok(Restoration::Conflict {
+                note: format!("cannot be read: {source}; bx wrote nothing and forgets nothing"),
+                dest,
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     match (observed.kind, observed.digest()) {
         (Kind::Absent, _) => Ok(match &entry.prior {
@@ -229,11 +245,19 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
 /// target bx has never written is [`Restored::Unmanaged`], which is what makes
 /// running `rm` twice a no-op the second time.
 ///
+/// A destination that cannot be read is one of those conflicts: bx cannot
+/// compare it with what it wrote, so it writes nothing there and forgets
+/// nothing.
+///
 /// # Errors
 ///
 /// [`Error::Recover`] when an earlier interruption cannot be resolved,
-/// [`Error::Journal`] when the session fails, and [`Error::Read`] when a
-/// destination cannot be read.
+/// [`Error::Journal`] when the session fails, [`Error::State`] when a prior
+/// snapshot cannot be read for a reason other than being missing or corrupt,
+/// and [`Error::Read`] when a destination cannot be looked at at all. Each of
+/// these stops `rm` where it is and leaves its journal, so the next writing
+/// run rolls back every target this `rm` had already restored: nothing is left
+/// half-done, and running `rm` again restores them.
 pub fn restore(
     state: &StateDir,
     home: &Path,
@@ -857,6 +881,114 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore() {
+        // r3 round 1, Q. `plan_restore` returned `Error::Read` for a destination
+        // it could not read, and `restore` dropped its session with `?`: the
+        // journal stood, and the next writing run rolled back every target this
+        // `rm` had already restored.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut targets = Vec::new();
+        for rel in [".a", ".b", ".c"] {
+            plant_file(
+                &home.child(rel),
+                &format!("{rel} theirs\n"),
+                Mode::DEFAULT_FILE,
+            );
+            targets.push(managed(
+                &state,
+                home.path(),
+                rel,
+                &format!("{rel} bx\n"),
+                Mode::DEFAULT_FILE,
+            ));
+        }
+        let unreadable = home.child(".b");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        if std::fs::read(&unreadable).is_ok() {
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod back");
+            eprintln!(
+                "skipped: this process reads through file permissions, so the failure cannot be produced"
+            );
+            return;
+        }
+
+        let done = restore(&state, home.path(), &targets);
+        let entry = entry_for(&state, home.path(), &targets[1]);
+        let planned = entry.as_ref().map(|entry| plan_restore(entry, home.path()));
+        // Before any assertion, so the tempdir can be removed whatever happens.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod back");
+
+        let done = done.expect("an unreadable destination does not stop rm");
+        assert!(
+            matches!(
+                done.as_slice(),
+                [
+                    Restored::Reverted { .. },
+                    Restored::Conflict { .. },
+                    Restored::Reverted { .. }
+                ]
+            ),
+            "{done:?}"
+        );
+        let Restored::Conflict { note, .. } = &done[1] else {
+            unreachable!()
+        };
+        assert!(note.contains("cannot be read"), "{note}");
+        assert_eq!(peek(&home.child(".a")).expect("restored").0, b".a theirs\n");
+        assert_eq!(peek(&home.child(".c")).expect("restored").0, b".c theirs\n");
+        assert_eq!(peek(&unreadable).expect("left").0, b".b bx\n");
+        assert!(!state.journal().exists(), "the session finished");
+        assert!(entry.is_some(), "bx forgets nothing about the conflict");
+        assert!(entry_for(&state, home.path(), &targets[0]).is_none());
+        assert!(
+            matches!(planned, Some(Ok(Restoration::Conflict { .. }))),
+            "the preview says what rm did: {planned:?}"
+        );
+    }
+
+    #[test]
+    fn every_outcome_names_the_target_it_is_about() {
+        // r3 coverage C4. `Restored::target` was reached only for `Unmanaged`
+        // and `Conflict`.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        plant_file(&home.child(".reverted"), "theirs\n", Mode::DEFAULT_FILE);
+        let reverted = managed(&state, home.path(), ".reverted", "bx\n", Mode::DEFAULT_FILE);
+        let removed = managed(&state, home.path(), ".removed", "bx\n", Mode::DEFAULT_FILE);
+        let gone = managed(&state, home.path(), ".gone", "bx\n", Mode::DEFAULT_FILE);
+        std::fs::remove_file(home.child(".gone")).expect("the user removes it");
+        let conflict = managed(&state, home.path(), ".conflict", "bx\n", Mode::DEFAULT_FILE);
+        plant_file(&home.child(".conflict"), "edited\n", Mode::DEFAULT_FILE);
+        let unmanaged = target(home.path(), ".unmanaged").0;
+        let targets = vec![reverted, removed, gone, unmanaged, conflict];
+
+        let done = restore(&state, home.path(), &targets).expect("rm");
+        assert!(
+            matches!(
+                done.as_slice(),
+                [
+                    Restored::Reverted { .. },
+                    Restored::Removed { .. },
+                    Restored::AlreadyGone { .. },
+                    Restored::Unmanaged { .. },
+                    Restored::Conflict { .. },
+                ]
+            ),
+            "{done:?}"
+        );
+        assert_eq!(
+            done.iter().map(Restored::target).collect::<Vec<_>>(),
+            targets.iter().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn restore_is_journalled_and_an_interrupted_restore_recovers() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -1271,6 +1403,44 @@ mod tests {
     }
 
     #[test]
+    fn a_forgotten_targets_claims_are_handed_to_an_entry_still_beneath_them() {
+        // r3 coverage C1. `rm` of a file bx created that is already gone
+        // forgets the entry and keeps its claims for the hand-off; nothing
+        // pinned that those claims reach it.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (a, b) = (".config/app/a.toml", ".config/app/b.toml");
+        let ta = managed(&state, home.path(), a, "a\n", Mode::DEFAULT_FILE);
+        let tb = managed(&state, home.path(), b, "b\n", Mode::DEFAULT_FILE);
+        let claims = |portable: &Portable| {
+            entry_for(&state, home.path(), portable)
+                .expect("managed")
+                .created_dirs
+                .iter()
+                .map(|dir| dir.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(claims(&ta), ["~/.config/app", "~/.config"]);
+        assert!(claims(&tb).is_empty(), "only the first write claims");
+        std::fs::remove_file(home.child(a)).expect("the user removes a");
+
+        let done = restore(&state, home.path(), std::slice::from_ref(&ta)).expect("rm a");
+        assert!(
+            matches!(done.as_slice(), [Restored::AlreadyGone { .. }]),
+            "{done:?}"
+        );
+        assert!(entry_for(&state, home.path(), &ta).is_none());
+        assert!(
+            home.child(".config/app").is_dir(),
+            "plan announced no removal"
+        );
+        assert_eq!(claims(&tb), ["~/.config/app", "~/.config"]);
+
+        restore(&state, home.path(), std::slice::from_ref(&tb)).expect("rm b");
+        assert!(!home.child(".config").exists());
+    }
+
+    #[test]
     fn a_claimed_directory_a_live_entry_names_is_never_pruned() {
         // Review round 5, item 4, and #8's open question: whichever entry
         // claims a directory, one the ledger still holds as a target stays.
@@ -1311,6 +1481,109 @@ mod tests {
             ["~/.config"],
             "the claim on its parent is handed to it",
         );
+    }
+
+    #[test]
+    fn rm_under_a_claimed_directory_the_user_replaced_with_a_symlink_finishes() {
+        // r3 round 1, D1. The file went through the link, pruning the claimed
+        // directory failed with ENOTDIR, and the session was left for a rollback
+        // that put the file back: every `rm` after that did the same.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let portable = managed(&state, home.path(), "d/a.conf", "bx\n", Mode::DEFAULT_FILE);
+        std::fs::rename(home.child("d"), home.child("real")).expect("move the directory");
+        std::os::unix::fs::symlink(home.child("real"), home.child("d")).expect("link it back");
+
+        let done = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(done.as_slice(), [Restored::Removed { .. }]),
+            "{done:?}"
+        );
+        assert!(
+            peek(&home.child("real/a.conf")).is_none(),
+            "bx's file is gone"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.child("d"))
+                .expect("the link stays")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(home.child("real").is_dir(), "and so does what it names");
+        assert!(!state.journal().exists(), "the session finished");
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+
+        let again = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(again.as_slice(), [Restored::Unmanaged { .. }]),
+            "{again:?}"
+        );
+    }
+
+    #[test]
+    fn a_prior_snapshot_that_cannot_be_read_stops_rm_and_restores_nothing() {
+        // r3 coverage C10. A missing or corrupt snapshot is a conflict; any
+        // other failure to read one stops `rm`, as its documentation says.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+        let portable = managed(&state, home.path(), ".conf", "bx's\n", Mode::DEFAULT_FILE);
+        let blob = state.restore().join(ContentHash::of(b"theirs\n").to_hex());
+        std::fs::remove_file(&blob).expect("remove the snapshot");
+        std::fs::create_dir(&blob).expect("a directory where the snapshot was");
+
+        let err =
+            restore(&state, home.path(), std::slice::from_ref(&portable)).expect_err("rm stops");
+        assert!(
+            matches!(err, Error::State(crate::state::Error::Read { .. })),
+            "got {err}"
+        );
+        assert_eq!(peek(&dest).expect("untouched").0, b"bx's\n");
+        assert!(entry_for(&state, home.path(), &portable).is_some());
+    }
+
+    #[test]
+    fn a_write_rm_cannot_make_is_the_sessions_own_error() {
+        // r3 coverage C11. `restore_one` returns the session's failure for a
+        // removal and for a revert, not the `Poisoned` a later `finish` gives.
+        let guard = guarded_home();
+        for revert in [false, true] {
+            let case = if revert { "revert" } else { "remove" };
+            let home = guard.child(case);
+            std::fs::create_dir_all(&home).expect("the home");
+            let state = StateDir::resolve(&home);
+            let rel = "locked/app.conf";
+            if revert {
+                plant_file(&home.join(rel), "theirs\n", Mode::DEFAULT_FILE);
+            }
+            let portable = managed(&state, &home, rel, "bx\n", Mode::DEFAULT_FILE);
+            let locked = home.join("locked");
+            fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make it read-only");
+            if !crate::journal::tests::permissions_refuse(&locked) {
+                fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
+                return;
+            }
+            let result = restore(&state, &home, std::slice::from_ref(&portable));
+            // Before any assertion, so the tempdir can be removed whatever happens.
+            fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
+
+            let err = result.expect_err(case);
+            if revert {
+                assert!(
+                    matches!(err, Error::Journal(journal::Error::Write(_))),
+                    "{case}: got {err}"
+                );
+            } else {
+                assert!(
+                    matches!(err, Error::Journal(journal::Error::Io { .. })),
+                    "{case}: got {err}"
+                );
+            }
+            assert_eq!(peek(&home.join(rel)).expect("untouched").0, b"bx\n");
+            assert!(state.journal().exists(), "{case}: left for the next run");
+            assert!(entry_for(&state, &home, &portable).is_some(), "{case}");
+        }
     }
 
     #[test]

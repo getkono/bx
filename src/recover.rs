@@ -435,7 +435,8 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         Loaded::Unterminated(_) | Loaded::Torn { .. } => false,
     };
     // A journal that lost bytes is set aside at the end rather than unlinked.
-    // The set-aside name is always free — the first unused numbered one — so
+    // The set-aside name is always free — the number after the highest
+    // present, past any name taken since — so
     // nothing needs checking before the rollback.
     let torn = matches!(loaded, Loaded::Torn { .. });
     let home = rebuild_home(&loaded, complete, &path)?;
@@ -854,8 +855,8 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        crash_phases, finish_crash_phases, frame_starts, peek, permissions_refuse, plant_file,
-        raw_journal, seal, target, write_to,
+        crash_phases, finish_crash_phases, frame_starts, names_in, peek, permissions_refuse,
+        plant_file, raw_journal, seal, state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
@@ -1769,6 +1770,44 @@ mod tests {
     }
 
     #[test]
+    fn a_prior_snapshot_that_cannot_be_read_stops_recovery_as_an_error() {
+        // r3 coverage C10. A missing or corrupt snapshot is a verdict; any
+        // other failure to read one is an error, for the report and the
+        // recovery alike, and nothing is changed.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+        let blob = state.restore().join(ContentHash::of(b"old\n").to_hex());
+        std::fs::remove_file(&blob).expect("remove the snapshot");
+        std::fs::create_dir(&blob).expect("a directory where the snapshot was");
+
+        let reported = pending(&state);
+        assert!(
+            matches!(
+                reported,
+                Err(Error::State(crate::state::Error::Read { .. }))
+            ),
+            "got {reported:?}"
+        );
+        let recovered = recover(&state);
+        assert!(
+            matches!(
+                recovered,
+                Err(Error::State(crate::state::Error::Read { .. }))
+            ),
+            "got {recovered:?}"
+        );
+        assert_eq!(peek(&dest).expect("untouched").0, b"new\n");
+        assert!(state.journal().exists(), "the journal is kept");
+    }
+
+    #[test]
     fn a_journal_that_records_a_write_with_no_header_is_set_aside_not_replayed() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -1808,6 +1847,19 @@ mod tests {
             bytes,
         );
         assert!(!state.journal().exists());
+    }
+
+    #[test]
+    fn a_terminated_journal_with_no_header_has_no_home_to_rebuild_against() {
+        // r3 coverage C12. The loader refuses a journal whose first frame is
+        // not its header, so no journal on disk reaches this. Pinned on a
+        // hand-built value, so such a journal can only be refused, never rebuilt.
+        let path = Path::new("/nonexistent/journal.mpk");
+        let headless = Loaded::Terminated(vec![Record::End(End { written: 0 })]);
+        assert!(
+            matches!(rebuild_home(&headless, true, path), Err(Error::Headless { path: refused }) if refused == path),
+        );
+        assert!(matches!(rebuild_home(&headless, false, path), Ok(None)));
     }
 
     #[test]
@@ -2534,6 +2586,64 @@ mod tests {
                 .expect("the entry")
                 .written,
             ContentHash::of(b"new\n"),
+        );
+    }
+
+    #[test]
+    fn a_damaged_ledger_that_cannot_be_moved_aside_stops_recovery_and_keeps_the_journal() {
+        // Stack integration of #8 @62de0aa, which carries #7's r3 round 1:
+        // `Ledger::open` refuses a damaged ledger it cannot move aside with
+        // `state::Error::CannotQuarantine`. A terminated journal's bookkeeping
+        // opens the ledger, so recovery must stop there: the ledger keeps its
+        // bytes, and the journal stays for the run after the ledger is moved.
+        let home = guarded_home();
+        let made = StateDir::resolve(home.path());
+        plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &made,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+        seal(&made.journal(), 1);
+        std::fs::write(made.ledger(), b"not a ledger").expect("damage the ledger");
+        let journal = std::fs::read(made.journal()).expect("the journal");
+        // Written where a session's names fit, then moved to where no
+        // set-aside name does.
+        let state = state_beyond_set_aside_names(&home);
+        std::fs::create_dir_all(state.root().parent().expect("a parent")).expect("its parents");
+        std::fs::rename(made.root(), state.root()).expect("move the state directory");
+
+        let recovered = recover(&state);
+        assert!(
+            matches!(
+                &recovered,
+                Err(Error::State(crate::state::Error::CannotQuarantine {
+                    path,
+                    damage: crate::state::Damage::Malformed,
+                    ..
+                })) if *path == state.ledger()
+            ),
+            "got {recovered:?}"
+        );
+        assert_eq!(
+            std::fs::read(state.ledger()).expect("kept"),
+            b"not a ledger",
+            "the damaged ledger's bytes are unchanged"
+        );
+        assert_eq!(
+            std::fs::read(state.journal()).expect("kept"),
+            journal,
+            "the journal stays for the next run"
+        );
+        assert_eq!(
+            names_in(state.root()),
+            ["journal.mpk", "ledger.mpk", "lock", "restore", "shell"],
+            "nothing was set aside or saved"
+        );
+        assert_eq!(
+            peek(&home.child(".conf")).map(|(bytes, _)| bytes),
+            Some(b"new\n".to_vec()),
+            "a terminated session's write is not rolled back"
         );
     }
 
@@ -3376,6 +3486,63 @@ mod tests {
         assert!(
             !home.child(".config").exists(),
             "every directory bx created is gone"
+        );
+    }
+
+    #[test]
+    fn a_rollback_under_a_created_directory_replaced_with_a_symlink_completes() {
+        // r3 round 1, D1. Pruning the created directory failed with ENOTDIR
+        // after the unlink, so every writing run failed and the journal stood.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(
+                home.path(),
+                "d/a.conf",
+                "bx\n",
+                Mode::DEFAULT_FILE,
+            )],
+        );
+        std::fs::rename(home.child("d"), home.child("real")).expect("move the directory");
+        std::os::unix::fs::symlink(home.child("real"), home.child("d")).expect("link it back");
+
+        assert_eq!(
+            before_writing(&state).expect("recover"),
+            Outcome::RolledBack { undone: 1 },
+        );
+        assert!(!state.journal().exists());
+        assert!(peek(&home.child("real/a.conf")).is_none());
+        assert!(
+            std::fs::symlink_metadata(home.child("d"))
+                .expect("the link stays")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(before_writing(&state).expect("again"), Outcome::Nothing);
+    }
+
+    #[test]
+    fn a_rebuild_whose_created_directory_cannot_be_made_portable_is_an_error() {
+        // r3 coverage C3. The loader refuses a journal whose created directory
+        // is not a parent of its destination below its UTF-8 home, so no
+        // journal on disk reaches this. Pinned at `decide`, so such a directory
+        // is never dropped from a rebuilt entry.
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut intent = intent_for(home.path(), ".config/app/a.toml");
+        intent.created_dirs = vec![home.path().join(std::ffi::OsStr::from_bytes(b"\xff"))];
+
+        let err = match decide(&state, &intent, Some(home.path()), None, true) {
+            Err(err) => err,
+            Ok((_, report)) => panic!("rebuilt: {report:?}"),
+        };
+        assert!(
+            matches!(&err, Error::Write(fs::Error::NotPortable { path, .. }) if *path == intent.created_dirs[0]),
+            "got {err}"
         );
     }
 

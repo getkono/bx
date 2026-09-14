@@ -228,6 +228,16 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_low_nibble_after_a_good_high_one_is_rejected() {
+        // r3 round 1 (C9): every earlier bad pair failed on its high nibble,
+        // so the low nibble's check was never reached on its own.
+        let low = format!("0z{}", "0".repeat(62));
+        assert_eq!(ContentHash::from_hex(&low), None);
+        let last = format!("{}0z", "0".repeat(62));
+        assert_eq!(ContentHash::from_hex(&last), None);
+    }
+
+    #[test]
     fn hex_is_lowercase_but_uppercase_parses() {
         let hash = ContentHash::of(b"case");
         let upper = hash.to_hex().to_uppercase();

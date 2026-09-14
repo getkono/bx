@@ -209,6 +209,31 @@ pub enum Error {
         /// The newest format this build understands.
         supported: u8,
     },
+    /// A journal bx cannot believe could not be moved aside.
+    ///
+    /// Refused rather than read as absent: a session opened over it creates
+    /// its own journal by renaming over these bytes, and a recovery that went
+    /// on would clear the way for one. The bytes are left exactly where they
+    /// are, and every writing command refuses until they can be moved.
+    ///
+    /// It is the journal's counterpart of
+    /// [`crate::state::Error::CannotQuarantine`], which stops bx the same way
+    /// for a damaged ledger or fingerprint store: both are the one
+    /// `state::move_aside` failing, for the same causes — a state
+    /// directory bx cannot write, or a path with no room for the `.corrupt`
+    /// suffix — and neither renames, resets or writes anything.
+    #[error(
+        "the write-ahead journal {} cannot be read and could not be set aside ({source}); \
+         it was left in place, and bx will not write until it can be moved",
+        .path.display()
+    )]
+    CannotSetAside {
+        /// The journal.
+        path: PathBuf,
+        /// Why it could not be moved.
+        #[source]
+        source: std::io::Error,
+    },
     /// A session was asked to start while an unresolved interruption stands.
     ///
     /// The escape is [`crate::recover::recover`], which every writing command
@@ -265,6 +290,23 @@ pub enum Error {
     Repeated {
         /// The target written twice.
         target: Portable,
+    },
+    /// A removal named, as a directory bx created for its target, a path that
+    /// is not a parent of the target's destination below the home.
+    ///
+    /// Refused because the journal recording it could never be believed —
+    /// [`load`] applies the same rule — and because pruning it could remove a
+    /// directory that is not bx's. Nothing is observed, stored or touched.
+    #[error(
+        "bx will not remove {} for {}: it is not a parent directory of the target below the home",
+        .dir.display(),
+        .target.as_str()
+    )]
+    StrayCreatedDir {
+        /// The target the removal named.
+        target: Portable,
+        /// The directory it named.
+        dir: PathBuf,
     },
     /// The state directory failed.
     #[error(transparent)]
@@ -454,10 +496,11 @@ pub enum Loaded {
     /// aside earlier — and [`load`], which runs without the lock, leaves them
     /// where they are. What the write may have completed is then recomputed by
     /// `plan`, which reports a file bx wrote but never recorded as a conflict:
-    /// skipped, never overwritten.
+    /// skipped, never overwritten. A journal [`load_exclusive`] cannot move
+    /// aside is never this value, but [`Error::CannotSetAside`].
     Unreadable {
-        /// Where the bytes were kept, or `None` if they were not moved: the read
-        /// held no lock, or the rename failed.
+        /// Where the bytes were kept, or `None` if they were not moved because
+        /// the read held no lock.
         moved_to: Option<PathBuf>,
     },
 }
@@ -578,8 +621,8 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
     })
 }
 
-/// [`load`], and move an unreadable journal aside to the first free of
-/// `journal.mpk.corrupt`, `journal.mpk.corrupt.1`, ….
+/// [`load`], and move an unreadable journal aside, to the number after the
+/// highest of `journal.mpk.corrupt`, `journal.mpk.corrupt.1`, … present.
 ///
 /// The [`ExclusiveLock`] is the proof that no session can be creating or
 /// appending to the journal while it is moved. A reader without it could rename
@@ -589,13 +632,15 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
 ///
 /// # Errors
 ///
-/// As [`load`]. A journal that cannot be moved aside is still reported as
-/// [`Loaded::Unreadable`], with `moved_to: None`, and left in place.
+/// As [`load`], and [`Error::CannotSetAside`] for an unreadable journal that
+/// cannot be moved aside, which is left in place. It is not reported as
+/// [`Loaded::Unreadable`]: every caller treats that as nothing standing, and
+/// [`Session::open`] would create its own journal over the bytes.
 pub fn load_exclusive(path: &Path, lock: &ExclusiveLock) -> Result<Loaded, Error> {
-    Ok(match inspect(path)? {
-        Ok(loaded) => loaded,
+    match inspect(path)? {
+        Ok(loaded) => Ok(loaded),
         Err(why) => quarantine(path, why, lock),
-    })
+    }
 }
 
 /// Classify the bytes at `path`: what a session, or a crash of one, left there,
@@ -787,16 +832,23 @@ fn misplaced(intent: &Intent, home: &Path) -> Option<&'static str> {
             );
         }
     }
-    if intent
-        .created_dirs
-        .iter()
-        .any(|dir| dir == dest || !dest.starts_with(dir) || home.starts_with(dir))
-    {
+    if stray_created_dir(dest, home, &intent.created_dirs).is_some() {
         return Some(
             "an intent's created directory is not a parent of its destination below the home",
         );
     }
     None
+}
+
+/// The first of `dirs` that is not a strict parent of `dest` below `home`, if
+/// one is not.
+///
+/// The one rule for a directory bx may claim it created for a destination,
+/// shared by the loader, which refuses a journal breaking it, and by
+/// [`Session::apply`], which refuses a removal that would write such a journal.
+fn stray_created_dir<'a>(dest: &Path, home: &Path, dirs: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    dirs.iter()
+        .find(|dir| *dir == dest || !dest.starts_with(dir) || home.starts_with(dir))
 }
 
 /// Why there is no whole record at an offset.
@@ -869,10 +921,17 @@ fn checksum(nonce: &[u8; NONCE], prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
 
 /// Move a journal that carries no information aside, and say so.
 ///
-/// The name is the first free one, taken with `RENAME_NOREPLACE` by
-/// [`crate::state::move_aside`], so an earlier set-aside journal is never
-/// replaced.
-fn quarantine(path: &Path, why: &str, lock: &ExclusiveLock) -> Loaded {
+/// The name is the number after the highest set-aside name present, taken
+/// with `RENAME_NOREPLACE` by [`crate::state::move_aside`], so an earlier
+/// set-aside journal is never replaced.
+///
+/// # Errors
+///
+/// [`Error::CannotSetAside`] when the move fails. The journal is left where it
+/// is, and it is an error rather than a value its caller could read as
+/// "nothing stands": [`Session::open`] would then create its own journal over
+/// the bytes by rename.
+fn quarantine(path: &Path, why: &str, lock: &ExclusiveLock) -> Result<Loaded, Error> {
     match crate::state::move_aside(path, lock) {
         Ok(aside) => {
             tracing::error!(
@@ -884,19 +943,23 @@ fn quarantine(path: &Path, why: &str, lock: &ExclusiveLock) -> Loaded {
                  overwritten.",
                 path.display(),
             );
-            Loaded::Unreadable {
+            Ok(Loaded::Unreadable {
                 moved_to: Some(aside),
-            }
+            })
         }
         Err(source) => {
             tracing::error!(
                 path = %path.display(),
                 %source,
-                "discarding the write-ahead journal {}: {why}. \
-                 It could not be moved aside.",
+                "the write-ahead journal {} cannot be believed: {why}. \
+                 It could not be moved aside, so it is left in place and \
+                 nothing is written over it.",
                 path.display(),
             );
-            Loaded::Unreadable { moved_to: None }
+            Err(Error::CannotSetAside {
+                path: path.to_path_buf(),
+                source,
+            })
         }
     }
 }
@@ -1126,8 +1189,9 @@ pub enum Content {
     /// No file at all.
     ///
     /// The destination is unlinked and `created_dirs` are removed, deepest
-    /// first, while they are empty and no entry the ledger still holds names
-    /// them. Absence is not emptiness: a file bx created is removed, never
+    /// first, while they are empty directories and no entry the ledger still
+    /// holds names them; one that is no longer a directory is left. Absence is
+    /// not emptiness: a file bx created is removed, never
     /// truncated. The target is always dropped from the ledger — there is
     /// nothing left for bx to own. A claimed directory something else still
     /// holds is tried again when the session finishes, and handed to a
@@ -1164,7 +1228,9 @@ impl Session {
     ///
     /// [`Error::InProgress`] when a journal already stands — recover first.
     /// [`Error::FutureVersion`] when the journal that stands was written by a
-    /// newer bx: nothing is set aside. [`Error::State`] when the directory
+    /// newer bx: nothing is set aside. [`Error::CannotSetAside`] when the
+    /// journal that stands cannot be believed and cannot be moved aside: it is
+    /// left in place, never replaced. [`Error::State`] when the directory
     /// cannot be made or locked, and [`Error::Io`] when the journal cannot be
     /// written.
     pub fn open(
@@ -1281,8 +1347,9 @@ impl Session {
     /// [`Error::Misplaced`] when the request's destination is not where its
     /// target renders, [`Error::State`] with
     /// [`crate::state::Error::ForeignRecord`] when the target is spelled
-    /// absolutely under the home, [`Error::Repeated`] when this session already wrote the
-    /// target, [`Error::Write`] when the destination cannot be written, is not
+    /// absolutely under the home, [`Error::StrayCreatedDir`] when a removal names a
+    /// created directory that is not a parent of its destination below the home,
+    /// [`Error::Repeated`] when this session already wrote the target, [`Error::Write`] when the destination cannot be written, is not
     /// a file bx may replace, or is no longer what the request's plan observed
     /// ([`crate::fs::Error::Changed`]), [`Error::State`] when the prior bytes
     /// cannot be stored or recorded, [`Error::Io`] when the journal cannot be
@@ -1300,7 +1367,11 @@ impl Session {
             mode,
             ownership,
         } = request;
-        if let Err(e) = self.admit(&target, &dest) {
+        let claimed: &[PathBuf] = match &content {
+            Content::Bytes { .. } => &[],
+            Content::Absent { created_dirs, .. } => created_dirs,
+        };
+        if let Err(e) = self.admit(&target, &dest, claimed) {
             self.poisoned = true;
             return Err(e);
         }
@@ -1337,7 +1408,17 @@ impl Session {
     /// it under its `~` spelling, and the same file under that spelling would
     /// pass [`Error::Repeated`]. It is refused as
     /// [`crate::state::Error::ForeignRecord`] before anything is touched.
-    fn admit(&mut self, target: &Portable, dest: &Path) -> Result<(), Error> {
+    ///
+    /// A removal's `created_dirs` are what it prunes and what its Intent
+    /// records, so each must be a strict parent of the destination below the
+    /// home — the loader's rule — or the removal is [`Error::StrayCreatedDir`],
+    /// before anything is observed, stored or touched.
+    fn admit(
+        &mut self,
+        target: &Portable,
+        dest: &Path,
+        created_dirs: &[PathBuf],
+    ) -> Result<(), Error> {
         let rendered = target.render(&self.home);
         if dest != rendered {
             return Err(Error::Misplaced {
@@ -1353,6 +1434,12 @@ impl Session {
                 stored: target.as_str().to_string(),
                 source: Box::new(source),
             })?;
+        if let Some(dir) = stray_created_dir(dest, &self.home, created_dirs) {
+            return Err(Error::StrayCreatedDir {
+                target: target.clone(),
+                dir: dir.clone(),
+            });
+        }
         if !self.touched.insert(target.clone()) {
             return Err(Error::Repeated {
                 target: target.clone(),
@@ -1789,8 +1876,8 @@ pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
 
 /// Move a journal aside, durably, and never over one set aside earlier.
 ///
-/// The name is the first free of `journal.mpk.corrupt`,
-/// `journal.mpk.corrupt.1`, …, taken with `RENAME_NOREPLACE` by
+/// The name is the number after the highest of `journal.mpk.corrupt`,
+/// `journal.mpk.corrupt.1`, … present, taken with `RENAME_NOREPLACE` by
 /// [`crate::state::move_aside`] under the state directory's
 /// [`ExclusiveLock`]. A second set-aside therefore succeeds, and every earlier
 /// one survives intact.
@@ -1822,11 +1909,12 @@ pub(crate) fn set_aside(path: &Path, lock: &ExclusiveLock) -> Result<PathBuf, Er
 ///
 /// The stop is the point: a directory that has acquired anything else is no
 /// longer only bx's, and removing it would delete something bx did not put
-/// there.
+/// there. One that is no longer a directory at all stops the walk the same way.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] for a failure that is neither "already gone" nor "not empty".
+/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
+/// "not a directory".
 pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
     for dir in dirs {
         if !remove_if_empty(dir)? {
@@ -1838,9 +1926,16 @@ pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
 
 /// Remove a directory bx created if it is empty, and say whether it is gone.
 ///
+/// A path that is no longer a directory — a symlink the user put in its
+/// place, or a file where it or one of its parents was — still stands, and is
+/// no longer bx's: it is left, as [`hand_off_claims`] leaves it. `rmdir` never
+/// follows its last component, so that is decided by the one call that would
+/// otherwise remove it, with no window between a look and the removal.
+///
 /// # Errors
 ///
-/// [`Error::Io`] for a failure that is neither "already gone" nor "not empty".
+/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
+/// "not a directory".
 fn remove_if_empty(dir: &Path) -> Result<bool, Error> {
     match std::fs::remove_dir(dir) {
         Ok(()) => {
@@ -1858,6 +1953,16 @@ fn remove_if_empty(dir: &Path) -> Result<bool, Error> {
         {
             Ok(false)
         }
+        Err(e)
+            if e.raw_os_error().map(rustix::io::Errno::from_raw_os_error)
+                == Some(rustix::io::Errno::NOTDIR) =>
+        {
+            tracing::debug!(
+                dir = %dir.display(),
+                "left a directory bx created that is no longer a directory",
+            );
+            Ok(false)
+        }
         Err(source) => Err(Error::Io {
             path: dir.to_path_buf(),
             source,
@@ -1870,13 +1975,15 @@ fn remove_if_empty(dir: &Path) -> Result<bool, Error> {
 ///
 /// `dirs` are claims — possibly several targets' — so unlike [`prune_dirs`] a
 /// directory that is not empty does not stop the walk: it is skipped and the
-/// rest are tried. Its parents are not empty either, so they stay too. A
-/// directory an entry names is somebody's target, whoever claimed it, and is
-/// never removed here.
+/// rest are tried. Its parents are not empty either, so they stay too. A claim
+/// that is no longer a directory is skipped the same way, and dropped with its
+/// target. A directory an entry names is somebody's target, whoever claimed
+/// it, and is never removed here.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] for a failure that is neither "already gone" nor "not empty".
+/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
+/// "not a directory".
 pub(crate) fn prune_claims<'a>(
     ledger: &LedgerView,
     home: &Path,
@@ -3147,6 +3254,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_journal_with_a_second_session_header_is_unreadable() {
+        // r3 coverage C5.
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let path = dir.path().join("journal.mpk");
+        let begin = Record::Begin(some_begin());
+        raw_journal(&path, &[begin.clone(), begin]);
+        assert_eq!(
+            load(&path).expect("load"),
+            Loaded::Unreadable { moved_to: None }
+        );
+    }
+
+    #[test]
     fn an_unreadable_journal_is_never_set_aside_over_an_earlier_one() {
         // Review round 3, item 5. The set-aside name was fixed, and opening a
         // session renamed the unreadable journal over the earlier one. Round 3
@@ -3372,6 +3492,58 @@ pub(crate) mod tests {
             load(&state.journal()).expect("load"),
             Loaded::Unterminated(_)
         ));
+    }
+
+    #[test]
+    fn a_failed_removal_intent_append_poisons_the_session_and_unlinks_nothing() {
+        // r3 coverage C7. The write path's failed append is pinned above; the
+        // removal's was not.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".conf");
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first
+            .apply(write_to(
+                home.path(),
+                ".conf",
+                "bx created\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        first.finish().expect("finish");
+
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+        session.journal.file = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let err = session
+            .apply(Request {
+                target: portable.clone(),
+                dest: dest.clone(),
+                content: Content::Absent {
+                    created_dirs: Vec::new(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Released,
+            })
+            .expect_err("a full disk fails the removal's Intent append");
+        assert!(
+            matches!(&err, Error::Io { path, .. } if *path == state.journal()),
+            "got {err}"
+        );
+        assert_eq!(peek(&dest).expect("not unlinked").0, b"bx created\n");
+        assert!(
+            session.ledger().get(&portable).is_some(),
+            "nothing was removed, so nothing is forgotten"
+        );
+        let finished = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
     }
 
     #[test]
@@ -3848,7 +4020,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_journal_that_cannot_be_moved_aside_is_still_read_as_absent() {
+    fn a_journal_that_cannot_be_moved_aside_is_an_error_and_stays_in_place() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         state.ensure().expect("ensure");
@@ -3865,12 +4037,111 @@ pub(crate) mod tests {
         let loaded = load_exclusive(&state.journal(), &lock);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
 
-        assert_eq!(loaded.expect("load"), Loaded::Unreadable { moved_to: None });
+        let err = loaded.expect_err("a journal that cannot be moved aside is refused");
+        assert!(
+            matches!(&err, Error::CannotSetAside { path, .. } if *path == state.journal()),
+            "got {err}"
+        );
         assert_eq!(
             std::fs::read(state.journal()).expect("still in place"),
             b"GARBAGE!",
         );
         assert!(!StateDir::quarantine(&state.journal()).exists());
+    }
+
+    #[test]
+    fn an_unreadable_journal_that_cannot_be_set_aside_is_refused_and_never_replaced() {
+        // r3, routed from #7's repair planning. `load_exclusive` reported a
+        // journal it could not move aside as `Unreadable { moved_to: None }`,
+        // which is not an interruption, so `Session::open` created its own
+        // journal over it by rename and the bytes were gone.
+        let home = guarded_home();
+        // Every set-aside name is longer than the kernel accepts, so the move
+        // fails with no permission bit involved, and a session could write.
+        // (A crafted `journal.mpk.corrupt.<u64::MAX>` no longer blocks it:
+        // `move_aside` takes the lowest free name past that number.)
+        let state = state_beyond_set_aside_names(&home);
+        state.ensure().expect("ensure");
+        std::fs::write(state.journal(), b"GARBAGE!").expect("an unreadable journal");
+
+        let opened = Session::open(&state, SessionKind::Apply, home.path(), Vec::new());
+        assert_eq!(
+            std::fs::read(state.journal()).expect("kept"),
+            b"GARBAGE!",
+            "the unreadable journal's bytes are still at its path"
+        );
+        assert!(
+            matches!(
+                &opened,
+                Err(Error::CannotSetAside { source, .. })
+                    if source.raw_os_error()
+                        == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+            ),
+            "got {opened:?}"
+        );
+
+        let recovered = crate::recover::before_writing(&state);
+        assert!(
+            matches!(
+                recovered,
+                Err(crate::recover::Error::Journal(Error::CannotSetAside { .. }))
+            ),
+            "got {recovered:?}"
+        );
+        assert_eq!(std::fs::read(state.journal()).expect("kept"), b"GARBAGE!");
+        assert!(
+            crate::recover::pending(&state)
+                .expect("pending")
+                .expect("still reported")
+                .unreadable
+        );
+        assert_eq!(
+            names_in(state.root()),
+            ["journal.mpk", "lock", "restore", "shell"],
+            "nothing was set aside and no session wrote"
+        );
+    }
+
+    #[test]
+    fn a_damaged_ledger_that_cannot_be_moved_aside_stops_a_session_before_its_journal() {
+        // Stack integration of #8 @62de0aa, which carries #7's r3 round 1:
+        // `Ledger::open` refuses a damaged ledger it cannot move aside with
+        // `state::Error::CannotQuarantine` instead of resetting it. A session
+        // opened over one must stop there, before its journal exists, so no
+        // later save can write over the bytes.
+        let home = guarded_home();
+        let state = state_beyond_set_aside_names(&home);
+        state.ensure().expect("ensure");
+        std::fs::write(state.ledger(), b"not a ledger").expect("damage the ledger");
+
+        let opened = Session::open(&state, SessionKind::Apply, home.path(), Vec::new());
+        assert!(
+            matches!(
+                &opened,
+                Err(Error::State(crate::state::Error::CannotQuarantine {
+                    path,
+                    damage: crate::state::Damage::Malformed,
+                    source,
+                })) if *path == state.ledger()
+                    && source.raw_os_error()
+                        == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+            ),
+            "got {opened:?}"
+        );
+        assert_eq!(
+            std::fs::read(state.ledger()).expect("kept"),
+            b"not a ledger",
+            "the damaged ledger's bytes are unchanged"
+        );
+        assert_eq!(
+            names_in(state.root()),
+            ["ledger.mpk", "lock", "restore", "shell"],
+            "no journal, no set-aside and no saved ledger"
+        );
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_some(),
+            "the refused session released the lock"
+        );
     }
 
     /// Whether a directory without write permission refuses this process.
@@ -3888,6 +4159,52 @@ pub(crate) mod tests {
             "skipped: this process writes through directory permissions, so the failure cannot be produced"
         );
         false
+    }
+
+    /// A state directory, not yet created, whose files' paths fit Linux's
+    /// `PATH_MAX` and whose set-aside names do not.
+    ///
+    /// Every [`crate::state::move_aside`] of its journal or ledger then fails
+    /// with ENAMETOOLONG, whoever the process runs as — "a name too long for a
+    /// quarantine suffix", as `state` puts it — while each can still be read,
+    /// written and locked. `fingerprints.mpk` is the one state file out of
+    /// reach.
+    pub(crate) fn state_beyond_set_aside_names(home: &crate::testing::GuardedHome) -> StateDir {
+        /// `PATH_MAX`, which counts the terminating NUL.
+        const PATH_MAX: usize = 4096;
+        const ROOT: usize = 4080;
+        let mut root = home.path().as_os_str().to_os_string();
+        assert!(root.len() < ROOT - 256, "a home short enough to extend");
+        while ROOT - root.len() > 256 {
+            root.push(format!("/{}", "d".repeat(200)));
+        }
+        root.push(format!("/{}", "b".repeat(ROOT - root.len() - 1)));
+        let state = StateDir::new(PathBuf::from(root));
+        assert_eq!(state.root().as_os_str().len(), ROOT);
+        for file in [state.journal(), state.ledger()] {
+            assert!(file.as_os_str().len() < PATH_MAX, "{} fits", file.display());
+            assert!(
+                StateDir::quarantine(&file).as_os_str().len() >= PATH_MAX,
+                "its set-aside name does not"
+            );
+        }
+        state
+    }
+
+    /// The names in `dir`, sorted.
+    pub(crate) fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("list")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
     }
 
     /// A session header for a journal that needs one and does not care what it
@@ -4118,6 +4435,57 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&dest).expect("read"), b"the user's edit\n");
     }
 
+    #[test]
+    fn a_removal_names_how_its_destination_moved_since_plan() {
+        // r3 coverage C2. Only "modified or replaced" was ever produced.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (gone, gone_dest) = target(home.path(), ".gone");
+        plant_file(&gone_dest, "bx created\n", Mode::DEFAULT_FILE);
+        let was_there = fs::observe(&gone_dest).expect("plan's observation");
+        std::fs::remove_file(&gone_dest).expect("the user removes it");
+        let (appeared, appeared_dest) = target(home.path(), ".appeared");
+        let nothing = fs::observe(&appeared_dest).expect("plan's observation");
+        plant_file(&appeared_dest, "the user's\n", Mode::DEFAULT_FILE);
+
+        for (portable, dest, planned, detail) in [
+            (gone, gone_dest, was_there, "it has been removed"),
+            (
+                appeared,
+                appeared_dest.clone(),
+                nothing,
+                "nothing was there, and something is now",
+            ),
+        ] {
+            let mut session =
+                Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+            let err = session
+                .apply(Request {
+                    target: portable,
+                    dest: dest.clone(),
+                    content: Content::Absent {
+                        created_dirs: Vec::new(),
+                        planned,
+                    },
+                    mode: Mode::DEFAULT_FILE,
+                    ownership: Ownership::Released,
+                })
+                .expect_err(detail);
+            assert!(
+                matches!(&err, Error::Write(fs::Error::Changed { path, detail: said }) if *path == dest && said.as_str() == detail),
+                "got {err}"
+            );
+            drop(session);
+            assert_eq!(
+                load(&state.journal()).expect("load").intents().count(),
+                0,
+                "{detail}: refused before its Intent"
+            );
+            crate::recover::recover(&state).expect("clear the refused session");
+        }
+        assert_eq!(peek(&appeared_dest).expect("kept").0, b"the user's\n");
+    }
+
     /// An Intent that says bx created `dest` holding `bytes`.
     fn created(target: &Portable, dest: &Path, bytes: &[u8]) -> Record {
         Record::Intent(Intent {
@@ -4303,6 +4671,165 @@ pub(crate) mod tests {
         let err = err.expect_err("neither gone nor not empty");
         assert!(matches!(err, Error::Io { .. }), "got {err}");
         assert!(child.is_dir());
+    }
+
+    #[test]
+    fn a_claimed_directory_that_is_no_longer_a_directory_is_left_and_the_walk_goes_on() {
+        // r3 round 1, D1. `rmdir` on a symlink or a file is ENOTDIR, which was
+        // an error: `rm` unlinked the file through the link and then failed,
+        // and a rollback failed the same way on every run.
+        let dir = tempfile::tempdir().expect("a tempdir");
+
+        // A claimed directory the user replaced with a link to an empty one.
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("the real directory");
+        let link = dir.path().join("d");
+        std::os::unix::fs::symlink(&real, &link).expect("the link");
+        prune_dirs(std::slice::from_ref(&link)).expect("a link is not bx's directory");
+        prune_claims(
+            &LedgerView::default(),
+            dir.path(),
+            std::slice::from_ref(&link),
+        )
+        .expect("nor is it a claim to remove");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link stays")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(real.is_dir(), "and so does the directory it names");
+
+        // A claimed ancestor replaced by a regular file: the claim beneath it
+        // cannot be a directory either.
+        let file = dir.path().join("a");
+        std::fs::write(&file, "the user's\n").expect("a file where a directory was");
+        let claims = [file.join("b"), file.clone()];
+        prune_dirs(&claims).expect("prune");
+        prune_claims(&LedgerView::default(), dir.path(), &claims).expect("prune the claims");
+        assert_eq!(std::fs::read(&file).expect("kept"), b"the user's\n");
+    }
+
+    #[test]
+    fn a_removal_naming_a_directory_that_is_not_its_parent_is_refused_before_anything_is_touched() {
+        // r3 round 1, D2. The session checked a removal's destination but not
+        // its created directories, so it pruned an empty directory of the user's
+        // and wrote an Intent the loader refuses: the journal was then set
+        // aside, and the removed file was never put back.
+        let guard = guarded_home();
+        for case in [
+            "an unrelated directory",
+            "the home",
+            "the destination itself",
+            "a directory above the home",
+        ] {
+            let home = guard.child(case.replace(' ', "-"));
+            std::fs::create_dir_all(&home).expect("the home");
+            let state = StateDir::resolve(&home);
+            let (portable, dest) = target(&home, ".conf");
+            let mut first =
+                Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+            first
+                .apply(write_to(&home, ".conf", "bx created\n", Mode::DEFAULT_FILE))
+                .expect("apply");
+            first.finish().expect("finish");
+            let users = home.join("projects/empty");
+            std::fs::create_dir_all(&users).expect("the user's empty directory");
+            let stray = match case {
+                "an unrelated directory" => users.clone(),
+                "the home" => home.clone(),
+                "the destination itself" => dest.clone(),
+                _ => guard.path().to_path_buf(),
+            };
+
+            let mut session =
+                Session::open(&state, SessionKind::Restore, &home, Vec::new()).expect("open");
+            let err = session
+                .apply(Request {
+                    target: portable.clone(),
+                    dest: dest.clone(),
+                    content: Content::Absent {
+                        created_dirs: vec![stray.clone()],
+                        planned: fs::observe(&dest).expect("plan's observation"),
+                    },
+                    mode: Mode::DEFAULT_FILE,
+                    ownership: Ownership::Released,
+                })
+                .expect_err(case);
+            assert!(
+                matches!(&err, Error::StrayCreatedDir { target, dir } if *target == portable && *dir == stray),
+                "{case}: got {err}"
+            );
+            assert!(users.is_dir(), "{case}: the user's directory stays");
+            assert_eq!(peek(&dest).expect("untouched").0, b"bx created\n", "{case}");
+            let again = session
+                .apply(write_to(&home, ".other", "x\n", Mode::DEFAULT_FILE))
+                .expect_err("the session is poisoned");
+            assert!(
+                matches!(again, Error::Poisoned { .. }),
+                "{case}: got {again}"
+            );
+            drop(session);
+
+            let loaded = load(&state.journal()).expect("load");
+            assert!(
+                !matches!(loaded, Loaded::Unreadable { .. }),
+                "{case}: {loaded:?}"
+            );
+            assert_eq!(loaded.intents().count(), 0, "{case}: nothing was announced");
+            assert_eq!(
+                crate::recover::recover(&state).expect("recover"),
+                crate::recover::Outcome::RolledBack { undone: 0 },
+                "{case}"
+            );
+            assert!(
+                LedgerView::read(&state, &home)
+                    .expect("read the ledger")
+                    .value
+                    .get(&portable)
+                    .is_some(),
+                "{case}: bx still manages the file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_that_cannot_be_made_portable_is_an_error_not_dropped() {
+        // r3 coverage C3. No admitted removal and no believed journal reaches
+        // this since D2: every claim is a parent of a destination rendered
+        // under an absolute UTF-8 home, and every forgotten claim is a stored
+        // `Portable` rendered under it. Pinned at the function, with a home
+        // `Portable::from_path` refuses, so a claim is never silently lost.
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let outside = tempfile::tempdir().expect("a directory outside the home");
+        let dir = outside.path().join("made");
+        std::fs::create_dir_all(&dir).expect("the claimed directory");
+        let heir =
+            Portable::from_path(&dir.join("heir.conf"), home.path()).expect("an absolute target");
+        let lock = ExclusiveLock::acquire(&state).expect("lock");
+        let mut ledger = Ledger::open(&state, &lock, home.path())
+            .expect("open the ledger")
+            .value;
+        ledger
+            .record(NewEntry::new(
+                heir,
+                ContentHash::of(b"x\n"),
+                Mode::DEFAULT_FILE,
+                Mechanism::Own,
+            ))
+            .expect("an entry beneath the claim");
+        let unusable = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff"));
+
+        let err = hand_off_claims(&mut ledger, &unusable, [&dir])
+            .expect_err("the claim cannot be made portable");
+        assert!(
+            matches!(&err, Error::Write(fs::Error::NotPortable { path, .. }) if *path == dir),
+            "got {err}"
+        );
     }
 
     #[test]

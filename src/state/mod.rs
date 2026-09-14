@@ -23,10 +23,18 @@
 //! file is reported through `tracing::warn!` and replaced by the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
 //! the quarantine number after the highest present — `<name>.corrupt`, then
 //! `<name>.corrupt.1`, … — never over an earlier quarantine and never into a
-//! gap one left, and the next save writes a clean file. A lockless reader moves
-//! nothing ([`Health::Damaged`]): a rename by path could move aside a file a
-//! writer saved after the read. The damaged bytes are kept, never deleted, so a
-//! human or `bx doctor` can still look at them. See [`Damage`] and [`Health`].
+//! gap one left (past a number with no successor, which bx never makes, the
+//! lowest free number), and the next save writes a clean file. A lockless
+//! reader moves nothing ([`Health::Damaged`]): a rename by path could move
+//! aside a file a writer saved after the read. The damaged bytes are kept,
+//! never deleted, so a human or `bx doctor` can still look at them. See
+//! [`Damage`] and [`Health`].
+//!
+//! The one damaged file that stops bx is one the lock holder cannot move
+//! aside — a state directory it cannot write, a name too long for a
+//! quarantine suffix. Resetting it would leave the damaged bytes at the name
+//! the next save writes, so that is [`Error::CannotQuarantine`], and nothing
+//! is renamed, reset or written.
 //! Every load lists the quarantines present in [`Loaded::quarantined`],
 //! whatever its health, so a run that quarantined a file and stopped before its
 //! save does not leave the next one looking at [`Health::Fresh`] and nothing
@@ -327,6 +335,11 @@ pub enum Error {
     /// which protects the file whatever its mode; a linked one is never
     /// narrowed, so while it is searchable bx requires the file to be private,
     /// and changes neither mode itself.
+    ///
+    /// A `local.toml` that is itself a link is judged where the file is: the
+    /// mode reported is that file's, and it is refused only while the directory
+    /// holding it can be searched by others too. A link that leads to no
+    /// regular file exposes nothing here.
     #[error(
         "{} is a symbolic link to a directory users other than its owner can search (mode \
          {mode}), and {} in it can be read or written by them (mode {file_mode}): anyone who \
@@ -347,6 +360,31 @@ pub enum Error {
         file: PathBuf,
         /// That file's mode.
         file_mode: Mode,
+    },
+    /// A state file is damaged, and the holder of the exclusive lock could not
+    /// move it aside.
+    ///
+    /// Damage degrades to the empty default only once the damaged bytes are
+    /// kept under a quarantine name; reporting [`Health::Reset`] with the file
+    /// still in place would let the next save write over it. So nothing is
+    /// renamed, reset or written, and bx stops: the file may be the only index
+    /// there is to the user's restore blobs.
+    #[error(
+        "{} is damaged ({damage}), and bx could not move it aside: {source}. Nothing was \
+         changed. Move it aside by hand, to {}.corrupt (or {}.corrupt.<n> if that is taken), \
+         and run bx again",
+        .path.display(),
+        .path.display(),
+        .path.display()
+    )]
+    CannotQuarantine {
+        /// The damaged state file, left where it is.
+        path: PathBuf,
+        /// What is wrong with it.
+        damage: Damage,
+        /// Why it could not be moved aside.
+        #[source]
+        source: std::io::Error,
     },
     /// A ledger entry references a restore snapshot that is not on disk.
     #[error("the restore snapshot {digest} is missing from {}", .path.display())]

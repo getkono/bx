@@ -4079,6 +4079,42 @@ mod tests {
         assert_eq!(mode_of_path(&dir), Mode::from_bits(0o777));
     }
 
+    #[test]
+    fn ensure_dir_refuses_a_parent_that_stopped_resolving_after_plan_observed() {
+        let home = guarded_home();
+        let parent = home.child("dotfiles");
+        std::fs::create_dir(&parent).expect("mkdir parent");
+        set_mode(&parent, Mode::DEFAULT_DIR).expect("chmod parent");
+        let dir = parent.join("sub");
+        std::fs::create_dir(&dir).expect("mkdir");
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("chmod");
+        let planned = observe(&dir).expect("plan observes");
+        assert_eq!(
+            compare_dir(&planned, Mode::PRIVATE_DIR).action,
+            Action::Unchanged,
+        );
+
+        // Somebody replaces the parent with a dangling symlink between `plan`
+        // and `apply`: the same race `seen()` names for a file target's
+        // parent, here on a directory target's own second observation.
+        std::fs::remove_dir_all(&parent).expect("remove parent");
+        std::os::unix::fs::symlink("nowhere", &parent).expect("symlink");
+
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned, &mut CreatedDirs::new())
+            .expect_err("plan announced unchanged through a parent that no longer resolves");
+        let Error::Changed { detail, .. } = &err else {
+            panic!("expected Changed, got {err:?}");
+        };
+        assert!(
+            detail.contains("a parent that does not resolve"),
+            "{detail}",
+        );
+        assert!(
+            detail.contains(&parent.display().to_string()),
+            "the detail must name the parent that does not resolve: {detail}",
+        );
+    }
+
     /// What `plan` prints for a directory target whose mode denies its owner
     /// `0100`, declared `0600`.
     const DIR_0600_NOTE: &str = "declares 0600, which denies its owner search (0100): bx lists a \

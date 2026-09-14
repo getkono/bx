@@ -338,7 +338,8 @@ enum Kind {
     /// directories. A bare word, a relative path and a URL are all relative to
     /// wherever the shell happens to be, and are refused. Every `:`-separated
     /// entry is held to the same checks first, which costs only a path with a
-    /// `:` in it.
+    /// `:` in it. Every character is an ASCII letter or digit, `.`, `_`, `-`,
+    /// `+` or `/`, with `:` only between entries.
     Location,
     /// A list of locations its tool splits at `:` and reads entry by entry —
     /// `GOPATH`. Every entry is judged as a [`Kind::Location`] is, and the
@@ -357,11 +358,13 @@ enum Kind {
     /// name that the fragment has not assigned — the `$PATH` in
     /// `PATH="$HOME/.local/bin:$PATH"` — stands for the list the shell
     /// inherited, which is the user's and is not judged, but only as a whole
-    /// entry: `$PATH/bin` is relative to nothing bx can know. Needs no root.
+    /// entry: `$PATH/bin` is relative to nothing bx can know. Each entry holds
+    /// only the characters a location's entries do. Needs no root.
     SearchList,
     /// The socket of an agent that is already running: an absolute path
-    /// outside bx's own directories. It says where to reach a process, not
-    /// where a tool keeps anything, so it needs no root.
+    /// outside bx's own directories, of the characters a location's entries
+    /// hold and no `:`. It says where to reach a process, not where a tool
+    /// keeps anything, so it needs no root.
     Socket,
     /// A behaviour setting, which names no file at all.
     Setting(Setting),
@@ -800,8 +803,8 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// split the line, write the line in the grammar the guard reads, use a name
 /// the shell does not manage, use a name bx may generate, move the value out of
 /// bx's own directory, move it out of bx's config repo, point it beside bx's
-/// directories rather than around them, write a path without
-/// `..` or anything a tool expands, move it inside a declared root, write an absolute path,
+/// directories rather than around them, write a path of plain characters with
+/// no `..`, move it inside a declared root, write an absolute path,
 /// give a program no arguments, give a setting a value it accepts, define the
 /// referenced variable earlier, give the guard a home, fix the line
 /// that assigned it, shorten it — so a caller that only knew *which* variable
@@ -866,12 +869,15 @@ pub enum Reason {
     /// needs one.
     #[error("has a `..` component, so where it points cannot be shown")]
     ParentComponent,
-    /// A location that still holds `$`, `{` or `%` once the shell has resolved
-    /// it. Tools expand those themselves — npm and pnpm `${NAME}`, NuGet
-    /// `%NAME%` — into a path nothing judged, and nothing bx generates needs
-    /// one.
-    #[error("holds `$`, `{{` or `%`, which the tool may expand itself into a path nothing judged")]
-    ToolExpandable,
+    /// A path — a location, an entry of a list, a socket — holding a character
+    /// other than those every path bx writes is made of: ASCII letters and
+    /// digits, `.`, `_`, `-`, `+` and `/`, and `:` only between the entries of
+    /// a list. Tools read other characters their own way — npm and pnpm expand
+    /// `${NAME}`, NuGet `%NAME%`, and bun takes `\` for a separator — into a
+    /// path nothing judged, and nothing bx generates needs one. It names the
+    /// first such character.
+    #[error("holds {0:?}, a character no path bx writes may hold")]
+    UnlistedCharacter(char),
     /// A program given something other than exactly one absolute path or one
     /// bare command name: an argument, a `:` list, a URL, nothing at all.
     #[error("is not one program — an absolute path or a bare command name, with no arguments")]
@@ -1014,13 +1020,15 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// * a **socket** is an absolute path outside bx's own directories;
 /// * a **setting** holds a value of its [`Setting`] shape.
 ///
-/// No path of any kind may have a `..` component ([`Reason::ParentComponent`])
-/// or lie inside bx's state directory ([`Reason::BxOwnedDirectory`]) or its
-/// config repo ([`Reason::InsideConfigRepo`]), checked in that order and before
-/// any root. No location may contain either of bx's directories
-/// ([`Reason::ContainsBxDirectory`]). No location may hold `$`, `{` or `%` once the shell has resolved
-/// it ([`Reason::ToolExpandable`]): the guard judges the shape, because it
-/// cannot know which tool expands what.
+/// No path of any kind may have a `..` component ([`Reason::ParentComponent`]),
+/// hold a character other than an ASCII letter or digit, `.`, `_`, `-`, `+`
+/// and `/` — with `:` only between a list's entries —
+/// ([`Reason::UnlistedCharacter`]), or lie inside bx's state directory
+/// ([`Reason::BxOwnedDirectory`]) or its config repo
+/// ([`Reason::InsideConfigRepo`]), checked in that order and before any root.
+/// No location may contain either of bx's directories
+/// ([`Reason::ContainsBxDirectory`]). The characters are an allowlist because
+/// the guard cannot know which tool reads which other character its own way.
 /// A value that does not resolve cannot be shown to be any of those, and is
 /// refused for why it does not.
 ///
@@ -1151,7 +1159,7 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
 /// may. For a search list, `resolved` holds [`INHERITED`] wherever the list
 /// refers to what the shell inherited.
 fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Option<Reason> {
-    let anchored = |entry: &str| refuses_unanchored(Path::new(entry), roots);
+    let anchored = |entry: &str| refuses_unanchored(entry, None, roots);
     match kind {
         Kind::SearchList => within(resolved, |list| {
             list.split(':')
@@ -1163,11 +1171,12 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
             within(resolved, |value| {
                 let entries = value
                     .split(':')
-                    .find_map(|entry| refuses_entry(Path::new(entry), roots));
-                // A location's tool reads the whole value as one path.
+                    .find_map(|entry| refuses_entry(entry, None, roots));
+                // A location's tool reads the whole value as one path, whose
+                // `:` its entries were judged apart at.
                 entries.or_else(|| {
                     (kind == Kind::Location)
-                        .then(|| refuses_entry(Path::new(value), roots))
+                        .then(|| refuses_entry(value, Some(':'), roots))
                         .flatten()
                 })
             })
@@ -1198,7 +1207,7 @@ fn within(
 /// be a bare command name.
 fn refuses_program(value: &str, roots: &RootSet) -> Option<Reason> {
     if value.contains('/') && value.chars().all(|c| c == '/' || is_word_char(c)) {
-        refuses_unanchored(Path::new(value), roots)
+        refuses_unanchored(value, None, roots)
     } else if is_bare_word(value) {
         None
     } else {
@@ -1218,27 +1227,27 @@ fn is_bare_word(value: &str) -> bool {
 }
 
 /// Why one resolved path — a value, or one entry of a list — may not be a
-/// relocation target, or `None` if it may.
-fn refuses_entry(path: &Path, roots: &RootSet) -> Option<Reason> {
-    refuses_unanchored(path, roots)
-        .or_else(|| {
-            path.to_string_lossy()
-                .contains(['$', '{', '%'])
-                .then_some(Reason::ToolExpandable)
-        })
+/// relocation target, or `None` if it may. `separator` is the list separator
+/// it may still hold, as [`refuses_unanchored`] reads it.
+fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
+    refuses_unanchored(path, separator, roots)
         // bx's directories outrank the roots in this direction too.
         .or_else(|| {
             roots
-                .holds_bx_directory(path)
+                .holds_bx_directory(Path::new(path))
                 .then_some(Reason::ContainsBxDirectory)
         })
-        .or_else(|| (!roots.contains(path)).then_some(Reason::OutsideDeclaredRoots))
+        .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
 }
 
-/// Why one resolved path may not be named at all — relative, climbing, inside
-/// a directory bx owns, or inside bx's config repo — whether or not it must
-/// also lie inside a root.
-fn refuses_unanchored(path: &Path, roots: &RootSet) -> Option<Reason> {
+/// Why one resolved path may not be named at all — relative, climbing, made of
+/// a character no path bx writes holds, inside a directory bx owns, or inside
+/// bx's config repo — whether or not it must also lie inside a root.
+///
+/// `separator` is the one further character the text may hold: `Some(':')`
+/// only for a whole location value, whose entries were judged apart at it.
+fn refuses_unanchored(text: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
+    let path = Path::new(text);
     if !path.is_absolute() {
         return Some(Reason::NotAbsolute);
     }
@@ -1248,6 +1257,14 @@ fn refuses_unanchored(path: &Path, roots: &RootSet) -> Option<Reason> {
         .any(|component| component == Component::ParentDir)
     {
         return Some(Reason::ParentComponent);
+    }
+    // An allowlist, not a list of known-bad characters: the shell has resolved
+    // the value, and a tool may read any other character its own way.
+    if let Some(unlisted) = text
+        .chars()
+        .find(|&c| !(c == '/' || is_word_char(c) || Some(c) == separator))
+    {
+        return Some(Reason::UnlistedCharacter(unlisted));
     }
     // Before the root test, and therefore ahead of any declaration: a root the
     // user declared widens where tools may live, never who owns bx's own state.
@@ -2208,8 +2225,8 @@ mod tests {
             "contains bx's state directory or its config repo, which the tool may clear"
         );
         assert_eq!(
-            Reason::ToolExpandable.to_string(),
-            "holds `$`, `{` or `%`, which the tool may expand itself into a path nothing judged"
+            Reason::UnlistedCharacter('\\').to_string(),
+            "holds '\\\\', a character no path bx writes may hold"
         );
         assert_eq!(
             Reason::UnresolvedReference.to_string(),
@@ -2391,12 +2408,22 @@ mod tests {
     fn whitespace_in_a_value_is_not_a_second_assignment() {
         // The refusal is for another `NAME=`, not for a space: a quoted path
         // with a space in it, and a trailing comment, both still resolve.
-        for content in [
-            "export CARGO_HOME=\"/var/mnt/scratch/example/my cache\"\n",
-            "export CARGO_HOME=/var/mnt/scratch/example/cargo # written by bx\n",
-        ] {
-            assert_eq!(scan_with(content, &rooted()), vec![], "{content}");
-        }
+        // Since r3 round 3 the space is itself refused, by name, as a
+        // character no path bx writes holds, and never as a second assignment.
+        assert_eq!(
+            reasons(
+                "export CARGO_HOME=\"/var/mnt/scratch/example/my cache\"\n",
+                &rooted()
+            ),
+            vec![(1, Reason::UnlistedCharacter(' '))]
+        );
+        assert_eq!(
+            scan_with(
+                "export CARGO_HOME=/var/mnt/scratch/example/cargo # written by bx\n",
+                &rooted()
+            ),
+            vec![]
+        );
     }
 
     #[test]
@@ -2496,7 +2523,7 @@ mod tests {
             vec![
                 (1, Reason::OutsideDeclaredRoots),
                 (2, Reason::NotAbsolute),
-                (3, Reason::ToolExpandable)
+                (3, Reason::UnlistedCharacter('$'))
             ]
         );
         // Expanded once, `$DATA_DIR/cargo` is `$CACHE_DIR/cargo`: relative.
@@ -2590,9 +2617,15 @@ mod tests {
                 "{value}"
             );
         }
+        // Quoted, it is text, and since r3 round 3 a character no path bx
+        // writes holds.
         assert_eq!(
-            check("CARGO_HOME", "\"/var/mnt/scratch/example/a#b\"", &rooted()),
-            Verdict::Allowed
+            reason_of(&check(
+                "CARGO_HOME",
+                "\"/var/mnt/scratch/example/a#b\"",
+                &rooted()
+            )),
+            Some(Reason::UnlistedCharacter('#'))
         );
     }
 
@@ -3345,13 +3378,27 @@ mod tests {
     fn a_single_assignment_with_an_equals_sign_in_its_value_is_not_two() {
         // Each assigns one variable. The `=` is inside the value, so the old
         // remedy — split the line — was impossible to follow.
-        for line in [
-            "export CARGO_HOME=\"/var/mnt/scratch/example/-j8 V=1\"",
-            "export CARGO_HOME='/var/mnt/scratch/example/-j8 V=1'",
-            "export CARGO_HOME=/var/mnt/scratch/example/cargo # keep=this",
-            "export CARGO_HOME=\"/var/mnt/scratch/example/a b=c/cargo\"",
+        // Since r3 round 3 a space in a location is refused by name; what is
+        // pinned is that none of these is read as two assignments.
+        for (line, expected) in [
+            (
+                "export CARGO_HOME=\"/var/mnt/scratch/example/-j8 V=1\"",
+                vec![(1, Reason::UnlistedCharacter(' '))],
+            ),
+            (
+                "export CARGO_HOME='/var/mnt/scratch/example/-j8 V=1'",
+                vec![(1, Reason::UnlistedCharacter(' '))],
+            ),
+            (
+                "export CARGO_HOME=/var/mnt/scratch/example/cargo # keep=this",
+                vec![],
+            ),
+            (
+                "export CARGO_HOME=\"/var/mnt/scratch/example/a b=c/cargo\"",
+                vec![(1, Reason::UnlistedCharacter(' '))],
+            ),
         ] {
-            assert_eq!(scan_with(line, &rooted()), vec![], "{line}");
+            assert_eq!(reasons(line, &rooted()), expected, "{line}");
         }
         // Unquoted, the same text is two assignments to a shell, and says so.
         assert_eq!(
@@ -3382,7 +3429,11 @@ mod tests {
                 Some(Reason::Unreadable),
             ),
             ("MAKEFLAGS", "\"-j8 V=1\"", Some(Reason::NotEmittable)),
-            ("CARGO_HOME", "\"/var/mnt/scratch/example/a b\"", None),
+            (
+                "CARGO_HOME",
+                "\"/var/mnt/scratch/example/a b\"",
+                Some(Reason::UnlistedCharacter(' ')),
+            ),
             ("CARGO_HOME", "$(pwd)", Some(Reason::Unreadable)),
             ("CARGO_HOME", "/etc", Some(Reason::OutsideDeclaredRoots)),
         ] {
@@ -4227,7 +4278,7 @@ mod tests {
         ] {
             for value in [
                 "/run/user/1000/gnupg/S.gpg-agent.ssh",
-                "\"/run/an agent/socket\"",
+                "\"/run/agent/socket\"",
             ] {
                 assert_eq!(
                     check("SSH_AUTH_SOCK", value, &roots),
@@ -4562,7 +4613,7 @@ mod tests {
 
     #[test]
     fn a_path_a_tool_may_expand_or_that_climbs_is_refused() {
-        use Reason::{NoRootsDeclared, ParentComponent, ToolExpandable};
+        use Reason::{NoRootsDeclared, ParentComponent, UnlistedCharacter};
         // The review's npm fragment, judged at the guard. A real shell holds
         // the cache value as the literal below, so the real-shell tests cannot
         // see what happens next: npm expands `${EDITOR}` inside the value
@@ -4576,7 +4627,7 @@ mod tests {
              export NPM_CONFIG_CACHE='/var/home/example/r/${EDITOR}/var/home/example/.local/state/bx'\n";
         assert_eq!(
             reasons(fragment, &roots),
-            vec![(1, ParentComponent), (2, ToolExpandable)]
+            vec![(1, ParentComponent), (2, UnlistedCharacter('$'))]
         );
         // Each expansion character, in a location and in any entry of a list
         // of locations, quoted so that the shell leaves it alone.
@@ -4590,7 +4641,12 @@ mod tests {
             for name in ["CARGO_HOME", "GOPATH", "NUGET_PACKAGES"] {
                 assert_eq!(
                     reason_of(&check(name, value, &rooted())),
-                    Some(ToolExpandable),
+                    Some(UnlistedCharacter(
+                        value
+                            .chars()
+                            .find(|c| "${%".contains(*c))
+                            .expect("an expansion character")
+                    )),
                     "{name}={value}"
                 );
             }
@@ -4727,6 +4783,146 @@ mod tests {
         // The operator fragment contains none of them.
         assert_eq!(scan_with(OPERATOR_FRAGMENT, &rooted()), vec![]);
         assert_eq!(scan(OPERATOR_FRAGMENT).len(), 25);
+    }
+
+    #[test]
+    fn a_path_holds_only_the_characters_every_path_bx_writes_is_made_of() {
+        use Reason::{NotAProgram, UnlistedCharacter};
+        // The review's bun value. bun takes `\` for a path separator on
+        // Linux, so to bun this one component climbs out of the root into bx's
+        // state directory, and `bun pm cache rm` deleted the ledger. To the
+        // guard it was a single component inside the root, with no `..` and
+        // none of `$`, `{` or `%`: a list of known-bad characters missed it.
+        let climb = r"'/var/mnt/scratch/example/a\..\..\..\..\..\var\home\example\.local\state\bx'";
+        for name in ["BUN_INSTALL_CACHE_DIR", "BUN_INSTALL"] {
+            assert_eq!(
+                reason_of(&check(name, climb, &rooted())),
+                Some(UnlistedCharacter('\\')),
+                "{name}"
+            );
+        }
+        // Every other character is refused by name, in a location and in an
+        // entry of a list of locations.
+        for (value, unlisted) in [
+            ("'/var/mnt/scratch/example/${X}'", '$'),
+            ("\"/var/mnt/scratch/example/{a}\"", '{'),
+            ("/var/mnt/scratch/example/%APPDATA%", '%'),
+            ("\"/var/mnt/scratch/example/my cache\"", ' '),
+            ("\"/var/mnt/scratch/example/a~b\"", '~'),
+            ("/var/mnt/scratch/example/a@b", '@'),
+            ("/var/mnt/scratch/example/a,b", ','),
+            ("\"/var/mnt/scratch/example/a#b\"", '#'),
+            ("'/var/mnt/scratch/example/a=b'", '='),
+        ] {
+            for name in ["CARGO_HOME", "GOPATH"] {
+                assert_eq!(
+                    reason_of(&check(name, value, &rooted())),
+                    Some(UnlistedCharacter(unlisted)),
+                    "{name}={value}"
+                );
+            }
+        }
+        // A search-list entry and a socket hold the same characters, and need
+        // no root. A socket is one path, so a `:` in it is refused too.
+        for roots in [rooted(), RootSet::strict()] {
+            for (name, value, unlisted) in [
+                ("PATH", r"'/usr/a\b:/usr/bin'", '\\'),
+                ("PATH", "\"/usr/my bin:$PATH\"", ' '),
+                ("INFOPATH", "/usr/share/a@b:$INFOPATH", '@'),
+                ("SSH_AUTH_SOCK", "\"/run/an agent/socket\"", ' '),
+                ("SSH_AUTH_SOCK", "/run/a:b", ':'),
+                ("SSH_AUTH_SOCK", r"'/run/a\b'", '\\'),
+            ] {
+                assert_eq!(
+                    reason_of(&check(name, value, &roots)),
+                    Some(UnlistedCharacter(unlisted)),
+                    "{name}={value}"
+                );
+            }
+        }
+        // `:` between a location's entries is the separator, not a character
+        // of any path, and every allowed character passes.
+        for (name, value) in [
+            (
+                "CARGO_HOME",
+                "/var/mnt/scratch/example/k:/var/mnt/scratch/example/l",
+            ),
+            (
+                "GOPATH",
+                "/var/mnt/scratch/example/go:/var/mnt/scratch/example/b",
+            ),
+            ("CARGO_HOME", "/var/mnt/scratch/example/a.b_c-d+e/F9"),
+        ] {
+            assert_eq!(
+                check(name, value, &rooted()),
+                Verdict::Allowed,
+                "{name}={value}"
+            );
+        }
+        for (name, value) in [
+            ("PATH", "/opt/x_y-1.2+b/bin:$PATH"),
+            ("SSH_AUTH_SOCK", "/run/user/1000/gnupg/S.gpg-agent.ssh"),
+        ] {
+            assert_eq!(
+                check(name, value, &RootSet::strict()),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        // A program keeps its own, stricter rule.
+        assert_eq!(
+            reason_of(&check("EDITOR", "\"/usr/bin/a b\"", &rooted())),
+            Some(NotAProgram)
+        );
+    }
+
+    #[test]
+    fn bun_reads_a_backslash_as_a_separator_and_the_guard_refuses_it() {
+        // The mechanism behind the character allowlist, held to a real bun when
+        // one is installed. Everything is in a temporary directory, the home
+        // included, and `bun pm cache` only prints where the cache would be.
+        let Some(bun) = installed("bun") else {
+            return;
+        };
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let root = scratch.path().join("r");
+        let home = scratch.path().join("h");
+        let state = home.join(".local/state/bx");
+        std::fs::create_dir_all(root.join("a")).expect("the root");
+        std::fs::create_dir_all(&state).expect("a stand-in state directory");
+        std::fs::write(
+            scratch.path().join("package.json"),
+            "{\"name\":\"p\",\"version\":\"0.0.0\"}\n",
+        )
+        .expect("a package to run bun in");
+        let value = format!(r"{}/a\..\..\h\.local\state\bx", root.display());
+        let output = std::process::Command::new(bun)
+            .args(["pm", "cache"])
+            .current_dir(scratch.path())
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/nonexistent")
+            .env("BUN_INSTALL_CACHE_DIR", &value)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("an installed bun runs");
+        let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            paths::normalize(Path::new(&printed)),
+            paths::normalize(&state),
+            "bun read {value:?} as {printed:?} ({}; stderr {:?})",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let roots = RootSet::new(&home, std::slice::from_ref(&root));
+        assert_eq!(
+            reason_of(&check(
+                "BUN_INSTALL_CACHE_DIR",
+                &format!("'{value}'"),
+                &roots
+            )),
+            Some(Reason::UnlistedCharacter('\\'))
+        );
     }
 
     #[test]

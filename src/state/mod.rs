@@ -22,9 +22,10 @@
 //! so damaged *contents* are never fatal. A truncated, garbled or wrong-kind
 //! file is reported through `tracing::warn!` and replaced by the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
 //! the quarantine number after the highest present — `<name>.corrupt`, then
-//! `<name>.corrupt.1`, … — never over an earlier quarantine and never into a
-//! gap one left (past a number with no successor, which bx never makes, the
-//! lowest free number), and the next save writes a clean file. A lockless
+//! `<name>.corrupt.1`, … — never over an earlier quarantine, and not into a
+//! gap one left until the top number, `<name>.corrupt.<u64::MAX>`, is present,
+//! whoever made it (from then on, the lowest free number) — and the next save
+//! writes a clean file. A lockless
 //! reader moves nothing ([`Health::Damaged`]): a rename by path could move
 //! aside a file a writer saved after the read. The damaged bytes are kept,
 //! never deleted, so a human or `bx doctor` can still look at them. See

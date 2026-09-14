@@ -29,10 +29,13 @@
 //! A quarantine never renames over an earlier one. It takes the number after
 //! the highest quarantine present, with `RENAME_NOREPLACE`, so a second damaged
 //! ledger cannot destroy the first — which may be the only index there is to the
-//! user's restore blobs — and a gap left by a deleted one is never refilled, so
-//! the numbers present are always in the order the quarantines were made. Only
-//! a number with no successor, which bx never makes, breaks that order: past it
-//! the lowest free number is taken, so a crafted name never blocks a quarantine.
+//! user's restore blobs — and a gap left by a deleted one is not refilled, so
+//! the numbers present are in the order the quarantines were made. Those last
+//! two promises end once the top number, `<name>.corrupt.<u64::MAX>`, is
+//! present, whoever made it: a crafted file, or bx itself after a crafted
+//! `<name>.corrupt.<u64::MAX - 1>`. It has no successor, so from then on each
+//! quarantine takes the lowest free number, refilling gaps, and a crafted name
+//! never blocks a quarantine. No quarantine is ever renamed over, either way.
 //!
 //! # A refusal is not damage
 //!
@@ -249,10 +252,13 @@ pub struct Loaded<T> {
     pub value: T,
     /// Where it came from.
     pub health: Health,
-    /// Every quarantine of this file in the state directory now, in the order
-    /// they were made — `<name>.corrupt`, `<name>.corrupt.1`, … — including
-    /// one this load made. A new quarantine always takes the number after the
-    /// highest present and never refills a gap, so the last is the newest.
+    /// Every quarantine of this file in the state directory now, ascending by
+    /// number — `<name>.corrupt`, `<name>.corrupt.1`, … — including one this
+    /// load made. A new quarantine takes the number after the highest present
+    /// and does not refill a gap, so this is the order they were made and the
+    /// last is the newest — until the top number, `<name>.corrupt.<u64::MAX>`,
+    /// is present, whoever made it. From then on each new quarantine takes the
+    /// lowest free number, so the newest can be listed anywhere, first included.
     ///
     /// Independent of [`Loaded::health`]. A run that quarantined the file and
     /// stopped before its save leaves the next load [`Health::Fresh`], and this
@@ -982,6 +988,78 @@ mod tests {
         assert_eq!(std::fs::read(&crafted).expect("left alone"), b"crafted");
         assert_eq!(loaded.quarantined, vec![first, crafted]);
         assert!(std::fs::symlink_metadata(&path).is_err(), "the file moved");
+    }
+
+    #[test]
+    fn once_the_top_quarantine_number_is_present_gaps_are_refilled_and_the_last_is_not_the_newest()
+    {
+        // r3 round 2 (P7R4-D1): the docs still said the quarantines listed are
+        // in the order they were made, the last the newest, and that bx never
+        // makes `<name>.corrupt.<u64::MAX>`. Both stop being true once the top
+        // number is present; the docs now say so, and this pins what they say.
+        let nth = StateDir::quarantine_nth;
+
+        // A crafted top number, three quarantines, the first removed by a
+        // human, then a fourth damaged load.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let top = nth(&path, u64::MAX);
+        std::fs::write(&top, b"crafted").expect("seed");
+        for body in [&b"first"[..], b"second", b"third"] {
+            std::fs::write(&path, body).expect("seed");
+            let loaded: Loaded<Value> = locked_load(&path).expect("load");
+            assert!(loaded.health.is_reset());
+        }
+        std::fs::remove_file(nth(&path, 0)).expect("a human removes the first");
+        std::fs::write(&path, b"fourth").expect("seed");
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert!(loaded.health.is_reset());
+        assert_eq!(
+            loaded.quarantined,
+            vec![nth(&path, 0), nth(&path, 1), nth(&path, 2), top.clone()],
+            "ascending by number, the refilled gap included",
+        );
+        assert_eq!(
+            std::fs::read(&loaded.quarantined[0]).expect("the refilled gap"),
+            b"fourth",
+            "the newest is listed first",
+        );
+        assert_eq!(
+            std::fs::read(loaded.quarantined.last().expect("a last")).expect("the top"),
+            b"crafted",
+            "the last is not the newest",
+        );
+
+        // A crafted `<u64::MAX - 1>`: bx itself makes the top number, and
+        // then takes the lowest free numbers.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let below_top = nth(&path, u64::MAX - 1);
+        std::fs::write(&below_top, b"crafted").expect("seed");
+        let mut made = Vec::new();
+        for body in [&b"first"[..], b"second", b"third"] {
+            std::fs::write(&path, body).expect("seed");
+            let loaded: Loaded<Value> = locked_load(&path).expect("load");
+            assert!(loaded.health.is_reset());
+            made.push(loaded.quarantined);
+        }
+        assert_eq!(
+            made,
+            vec![
+                vec![below_top.clone(), nth(&path, u64::MAX)],
+                vec![nth(&path, 0), below_top.clone(), nth(&path, u64::MAX)],
+                vec![
+                    nth(&path, 0),
+                    nth(&path, 1),
+                    below_top.clone(),
+                    nth(&path, u64::MAX),
+                ],
+            ],
+            "the top number, then `.corrupt`, then `.corrupt.1`",
+        );
+        for (n, body) in [(u64::MAX, &b"first"[..]), (0, b"second"), (1, b"third")] {
+            assert_eq!(std::fs::read(nth(&path, n)).expect("kept"), body);
+        }
     }
 
     #[test]

@@ -112,14 +112,17 @@ impl StateDir {
 
     /// The first quarantine path for a damaged state file: `<name>.corrupt`.
     ///
-    /// A later quarantine of the same file never reuses an occupied name, nor
-    /// refills a gap: [`move_aside`] takes the number after the highest of
-    /// `<name>.corrupt`, `<name>.corrupt.1`, `<name>.corrupt.2`, … present —
-    /// or, past a number with no successor that bx never makes, the lowest free
-    /// one. Numbered rather than timestamped, so the name a given sequence of damage
-    /// produces is deterministic; in creation order, so the last is the newest;
-    /// and never over an earlier one, because the earlier one may be the only
-    /// index there is to the user's restore blobs.
+    /// A later quarantine of the same file never reuses an occupied name:
+    /// [`move_aside`] takes the number after the highest of `<name>.corrupt`,
+    /// `<name>.corrupt.1`, `<name>.corrupt.2`, … present, so it does not refill
+    /// a gap and the last is the newest — until the top number,
+    /// `<name>.corrupt.<u64::MAX>`, is present, whoever made it. That number has
+    /// no successor, so while it is present each quarantine takes the lowest
+    /// free number instead: gaps are refilled and the numbers no longer say
+    /// which quarantine is newest. Numbered rather than timestamped, so the name
+    /// a given sequence of damage produces is deterministic; and never over an
+    /// earlier one, because the earlier one may be the only index there is to
+    /// the user's restore blobs.
     #[must_use]
     pub(crate) fn quarantine(path: &Path) -> PathBuf {
         let mut name = path.as_os_str().to_os_string();
@@ -198,11 +201,14 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
 ///
 /// The number is the one after the highest `<name>.corrupt[.<n>]` present —
 /// `<name>.corrupt` itself when there is none — and never a gap a deleted
-/// quarantine left. So the quarantines present are always numbered in the order
-/// they were made, and the last is the newest, whichever a human has removed.
-/// The one exception is a number with no successor, `<name>.corrupt.<u64::MAX>`,
-/// which bx itself never makes: past it the lowest free number is taken, so a
-/// crafted name can break the order but never block a quarantine.
+/// quarantine left. So the quarantines present are numbered in the order they
+/// were made, and the last is the newest, whichever a human has removed — until
+/// the top number, `<name>.corrupt.<u64::MAX>`, is present. Whoever made it — a
+/// crafted file, or bx itself when a crafted `<name>.corrupt.<u64::MAX - 1>` was
+/// the highest — it has no successor, so while it is present each quarantine
+/// takes the lowest free number: a gap is refilled, the numbers stop following
+/// the order the quarantines were made, and the newest can be the lowest. A
+/// crafted name can end that order, but it never blocks a quarantine.
 ///
 /// The rename is `RENAME_NOREPLACE`, so an existing quarantine is never
 /// destroyed — not by an earlier bx's leftovers, and not by a race; a name
@@ -223,8 +229,8 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
         std::io::Error::new(std::io::ErrorKind::InvalidInput, refused.to_string())
     })?;
     let mut n: u64 = match numbered(path)?.last() {
-        // Only a name bx never makes — `<name>.corrupt.<u64::MAX>` — has no
-        // number after it. Refusing there would let one crafted file block
+        // Only the top number — `<name>.corrupt.<u64::MAX>`, crafted, or made
+        // by bx after a crafted `<u64::MAX - 1>` — has no number after it. Refusing there would let one crafted file block
         // every later quarantine, so the count starts again at `0` instead and
         // skips every taken name below, which lands on the lowest free number:
         // a directory cannot hold 2^64 entries, so one always exists.
@@ -300,8 +306,10 @@ pub(crate) mod noreplace_seam {
     }
 }
 
-/// Every quarantine of `path` present now, in the order [`move_aside`] made
-/// them: `<name>.corrupt`, then `<name>.corrupt.1`, `<name>.corrupt.2`, ….
+/// Every quarantine of `path` present now, ascending by number:
+/// `<name>.corrupt`, then `<name>.corrupt.1`, `<name>.corrupt.2`, …. That is
+/// the order [`move_aside`] made them until the top number is present, and
+/// only by number after it — see [`move_aside`].
 ///
 /// Found by listing the directory, not by probing names until one is missing,
 /// so a gap — `.corrupt` deleted, `.corrupt.1` kept — hides nothing after it.
@@ -825,7 +833,7 @@ mod tests {
 
     #[test]
     fn a_quarantine_number_that_cannot_be_followed_leaves_the_lowest_free_one() {
-        // r3 round 1 (L1a): a name bx never makes, `<name>.corrupt.<u64::MAX>`,
+        // r3 round 1 (L1a): a crafted top number, `<name>.corrupt.<u64::MAX>`,
         // left no number after the highest, so every later quarantine of the
         // file failed with "no free quarantine name".
         let dir = tempfile::tempdir().expect("tempdir");

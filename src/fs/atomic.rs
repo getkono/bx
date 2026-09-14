@@ -1599,6 +1599,10 @@ fn refuse_unwritable(observed: &Observed) -> Result<(), Error> {
 /// directory exists wider than its declared mode — see
 /// [`Error::DirectoryTargetPending`].
 ///
+/// "Wider" is [`Mode::grants_more_than`]: any group or other bit the
+/// declaration does not grant, execute included, so a `0711` directory
+/// declared `0700` is refused as surely as a `0755` one.
+///
 /// Only a declared directory that exists is checked: a missing one is about
 /// to be created at its declared mode. Something there that is not a directory
 /// is left to the verdicts `plan` already printed for it.
@@ -1616,7 +1620,10 @@ fn refuse_wider_than_declared(dest: &Path, dir: &Path, created: &CreatedDirs) ->
             continue;
         };
         let found = mode_of(&meta);
-        if meta.is_dir() && found.is_wider_than(declared) {
+        // Every group and other bit, execute included: both modes are this
+        // directory's, and a traversable directory exposes a file inside it by
+        // name whatever the directory's read bits say.
+        if meta.is_dir() && found.grants_more_than(declared) {
             return Err(Error::DirectoryTargetPending {
                 path: dest.to_path_buf(),
                 dir: declared_dir.clone(),
@@ -3971,6 +3978,58 @@ mod tests {
         let planned_inside = observe(&inside).expect("plan observes");
         stage(&inside, Mode::DEFAULT_FILE, &planned_inside, &mut created)
             .expect("a narrower directory than declared is no exposure")
+            .commit(b"x")
+            .expect("commit");
+    }
+
+    #[test]
+    fn a_declared_directory_wider_only_in_its_execute_bits_is_refused() {
+        let home = guarded_home();
+        // A group or other execute bit on a directory is traversal: a 0711
+        // directory lets anyone reach a 0644 file inside it by name, which is
+        // exactly the exposure its 0700 declaration exists to close.
+        for bits in [0o711, 0o701, 0o710] {
+            let dir = home.child(format!("d{bits:o}"));
+            std::fs::create_dir(&dir).expect("mkdir");
+            set_mode(&dir, Mode::from_bits(bits)).expect("the user's own traversable directory");
+            let file = dir.join("notes");
+            let planned = observe(&file).expect("plan observes the file");
+            let mut created = CreatedDirs::new();
+            created.declare(&dir, Mode::PRIVATE_DIR);
+
+            let err = stage(&file, Mode::DEFAULT_FILE, &planned, &mut created)
+                .expect_err("a file is not published into a declared directory still traversable");
+            let Error::DirectoryTargetPending {
+                path,
+                dir: named,
+                found,
+                declared,
+            } = &err
+            else {
+                panic!("{bits:04o}: expected DirectoryTargetPending, got {err:?}");
+            };
+            assert_eq!(path, &file, "{bits:04o}");
+            assert_eq!(named, &dir, "{bits:04o}");
+            assert_eq!(*found, Mode::from_bits(bits), "{bits:04o}");
+            assert_eq!(*declared, Mode::PRIVATE_DIR, "{bits:04o}");
+            assert_eq!(
+                names_in(&dir),
+                Vec::<OsString>::new(),
+                "{bits:04o}: nothing was written"
+            );
+        }
+
+        // A directory that grants nothing its declaration does not is no
+        // exposure, even when the declaration is the wider of the two.
+        let open = home.child("open");
+        std::fs::create_dir(&open).expect("mkdir");
+        set_mode(&open, Mode::from_bits(0o750)).expect("chmod");
+        let mut created = CreatedDirs::new();
+        created.declare(&open, Mode::DEFAULT_DIR);
+        let inside = open.join("f");
+        let planned_inside = observe(&inside).expect("plan observes");
+        stage(&inside, Mode::DEFAULT_FILE, &planned_inside, &mut created)
+            .expect("0750 grants nothing a 0755 declaration does not")
             .commit(b"x")
             .expect("commit");
     }

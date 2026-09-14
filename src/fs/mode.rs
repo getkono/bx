@@ -144,12 +144,39 @@ impl Mode {
     /// read the file already grants — but `0755` *is* wider than `0600`, which
     /// is the `~/.ssh` case: a directory anyone may list, holding a file only
     /// the owner may read.
+    ///
+    /// A directory against **its own declaration** is a different question,
+    /// with both sides a directory's mode, and [`Mode::grants_more_than`]
+    /// answers it with execute compared.
     #[must_use]
     pub const fn is_wider_than(self, narrower: Self) -> bool {
         /// Group and other, read and write. Execute is not compared.
         const GROUP_AND_OTHER_RW: u32 = 0o066;
 
         self.bits() & GROUP_AND_OTHER_RW & !narrower.bits() != 0
+    }
+
+    /// Whether this mode grants someone other than the owner **any**
+    /// permission — read, write or execute — that `declared` does not.
+    ///
+    /// The comparison a directory is held to against the mode its own
+    /// directory target declares. Beside [`Mode::is_shared`] (does anyone else
+    /// get anything) and [`Mode::is_wider_than`] (a directory against a file
+    /// inside it, where execute is excluded), this is the third predicate, and
+    /// here execute is compared: both modes are a directory's, so a group or
+    /// other execute bit is traversal on both sides, and a `0711` directory
+    /// declared `0700` lets anyone reach a file inside it by name.
+    ///
+    /// The owner's bits and the setuid, setgid and sticky bits are not
+    /// compared: none of them grants anybody else access. So `0711` and `0755`
+    /// grant more than `0700`, while `0750` does not grant more than `0755`
+    /// and `2700` does not grant more than `0700`.
+    #[must_use]
+    pub const fn grants_more_than(self, declared: Self) -> bool {
+        /// Group and other, read, write and execute.
+        const GROUP_AND_OTHER: u32 = 0o077;
+
+        self.bits() & GROUP_AND_OTHER & !declared.bits() != 0
     }
 }
 
@@ -487,6 +514,26 @@ mod tests {
         // 0700 grants nobody else anything, so it is never wider.
         assert!(!Mode::PRIVATE_DIR.is_wider_than(Mode::PRIVATE_FILE));
         assert!(!Mode::PRIVATE_DIR.is_wider_than(Mode::from_bits(0o000)));
+    }
+
+    #[test]
+    fn a_directory_is_held_to_every_bit_of_its_declaration() {
+        // Execute is traversal on both sides, so it counts.
+        for bits in [0o711, 0o701, 0o710, 0o755] {
+            assert!(
+                Mode::from_bits(bits).grants_more_than(Mode::PRIVATE_DIR),
+                "{bits:04o} grants more than 0700",
+            );
+        }
+        // Narrower than, or equal to, the declaration grants nothing more.
+        assert!(!Mode::PRIVATE_DIR.grants_more_than(Mode::DEFAULT_DIR));
+        assert!(!Mode::from_bits(0o750).grants_more_than(Mode::DEFAULT_DIR));
+        assert!(!Mode::DEFAULT_DIR.grants_more_than(Mode::DEFAULT_DIR));
+        // The owner's bits and the special bits give nobody else anything.
+        assert!(!Mode::from_bits(0o2700).grants_more_than(Mode::PRIVATE_DIR));
+        assert!(!Mode::from_bits(0o700).grants_more_than(Mode::from_bits(0o500)));
+        // Where `is_wider_than` and this differ: execute alone.
+        assert!(!Mode::from_bits(0o711).is_wider_than(Mode::PRIVATE_DIR));
     }
 
     #[test]

@@ -5709,10 +5709,12 @@ mod tests {
 
     #[test]
     fn a_directory_that_opens_but_refuses_the_temporary_file_fails_the_write_naming_it() {
-        // Integration of #7 @b70d40e (r3), porting ec3a544: every other
-        // permission failure here is either before the directory opens or
-        // after the temporary file exists, so the temporary file's own
-        // creation failing was never otherwise reached.
+        // Integration of #7 @b70d40e (r3), porting ec3a544. In this writer
+        // `stage` creates the temporary file, and only `Filled::publish`, later,
+        // opens the directory to sync the rename. So the temporary file's own
+        // creation failing is the first thing a directory without write
+        // permission refuses: this write stops in `stage`, and the directory is
+        // never opened at all.
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so the condition cannot be staged.
             return;
@@ -5721,8 +5723,8 @@ mod tests {
         let dir = home.child("d");
         let dest = dir.join("f");
         seed(&dest, b"before", Mode::DEFAULT_FILE);
-        // Read and search, no write: the directory opens `O_RDONLY |
-        // O_DIRECTORY`, and no temporary file can be created in it.
+        // Read and search, no write: the destination can be observed, and no
+        // temporary file can be created beside it.
         set_mode(&dir, Mode::from_bits(0o500)).expect("chmod");
 
         let result = write_atomically(&dest, b"after", Mode::DEFAULT_FILE);

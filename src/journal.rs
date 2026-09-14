@@ -4095,6 +4095,48 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn a_damaged_ledger_that_cannot_be_moved_aside_stops_a_session_before_its_journal() {
+        // Stack integration of #8 @62de0aa, which carries #7's r3 round 1:
+        // `Ledger::open` refuses a damaged ledger it cannot move aside with
+        // `state::Error::CannotQuarantine` instead of resetting it. A session
+        // opened over one must stop there, before its journal exists, so no
+        // later save can write over the bytes.
+        let home = guarded_home();
+        let state = state_beyond_set_aside_names(&home);
+        state.ensure().expect("ensure");
+        std::fs::write(state.ledger(), b"not a ledger").expect("damage the ledger");
+
+        let opened = Session::open(&state, SessionKind::Apply, home.path(), Vec::new());
+        assert!(
+            matches!(
+                &opened,
+                Err(Error::State(crate::state::Error::CannotQuarantine {
+                    path,
+                    damage: crate::state::Damage::Malformed,
+                    source,
+                })) if *path == state.ledger()
+                    && source.raw_os_error()
+                        == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+            ),
+            "got {opened:?}"
+        );
+        assert_eq!(
+            std::fs::read(state.ledger()).expect("kept"),
+            b"not a ledger",
+            "the damaged ledger's bytes are unchanged"
+        );
+        assert_eq!(
+            names_in(state.root()),
+            ["ledger.mpk", "lock", "restore", "shell"],
+            "no journal, no set-aside and no saved ledger"
+        );
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_some(),
+            "the refused session released the lock"
+        );
+    }
+
     /// Whether a directory without write permission refuses this process.
     ///
     /// It does not refuse root, so a test that needs a refused rename or unlink

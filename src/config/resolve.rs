@@ -39,12 +39,19 @@
 //! A defect in the **committed** repo is not blocked but fatal — a malformed
 //! placeholder, or a reference to a value no layer declares, cannot be fixed by
 //! answering a prompt.
+//!
+//! A `file` that reaches a `path` value is refused either way, since a `path`
+//! value is absolute and `file` is relative to the repo root. When only
+//! committed declarations lead there, it is the repo's defect and fails the
+//! load. When the way there runs through this account's answer — `s =
+//! "{{b}}"` into `file = "cfg/{{s}}/x"`, with `b` a `path` value — the target
+//! is blocked, naming that answer's line, whether or not `b` is answered.
 
 use std::path::Path;
 
 use super::merge::Conflict;
 use super::target::{Attach, Body, Format, KeyPath, Target};
-use super::values::{ResolvedValues, Unresolved};
+use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
 
@@ -84,7 +91,7 @@ pub enum BlockReason {
     /// or one that, substituted into this entry, makes a field invalid — a path
     /// that climbs out of the home, a `file` that climbs out of the repo, an
     /// owned key with an empty segment or with more or fewer segments than
-    /// written.
+    /// written — or a `file` that reaches a `path` value through an answer.
     ///
     /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
     /// unanswered: the answer that needs changing is already written, and the
@@ -107,7 +114,7 @@ pub struct BlockedEntry {
     /// Why it is blocked.
     pub reason: BlockReason,
     /// What the user should do. Spelled in `values` — `init_hint`,
-    /// `disabled_hint`, `ResolvedValues::invalid_hint` or
+    /// `disabled_hint`, `path_answer_hint`, `ResolvedValues::invalid_hint` or
     /// `ResolvedValues::answers_hint` — never at a call site.
     pub hint: String,
 }
@@ -143,7 +150,14 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let targets = merged
         .targets
         .iter()
-        .map(|target| resolve_target(target, &values, &merged.conflicts))
+        .map(|target| {
+            resolve_target(
+                target,
+                &values,
+                &merged.value_assignments,
+                &merged.conflicts,
+            )
+        })
         .collect::<Result<Vec<_>, Error>>()?;
 
     refuse_shared_files(&targets)?;
@@ -186,11 +200,14 @@ fn refuse_shared_files(targets: &[Resolution<Target>]) -> Result<(), Error> {
 
 /// Substitute one target, or explain why it cannot be.
 ///
-/// `conflicts` are the files a layer named twice because of this account's
-/// answers; a target that resolves to one of them is blocked rather than ready.
+/// `assignments` are this account's answers as written, which `values` no
+/// longer holds once substituted. `conflicts` are the files a layer named twice
+/// because of this account's answers; a target that resolves to one of them is
+/// blocked rather than ready.
 fn resolve_target(
     target: &Target,
     values: &ResolvedValues,
+    assignments: &[ValueAssignment],
     conflicts: &[Conflict],
 ) -> Result<Resolution<Target>, Error> {
     if let Body::File(file) = &target.body {
@@ -228,6 +245,17 @@ fn resolve_target(
             hint,
         }))
     };
+
+    // Ahead of every other block: each of them names an act — answering a
+    // value, re-enabling one, changing an answer — that would leave this
+    // target blocked here. Behind the repo defects above, which no answer
+    // could clear.
+    if let Body::File(file) = &target.body
+        && let Some((names, hint)) =
+            refuse_path_answer_in_file(target, &file.to_string_lossy(), values, assignments)
+    {
+        return block(BlockReason::InvalidValue { names }, hint);
+    }
 
     // A switched-off declaration is reported ahead of an unanswered one: it is
     // the more specific statement about what this target is waiting for.
@@ -312,6 +340,10 @@ fn resolve_target(
 /// whether or not it applies for this account, so the refusal is the same for
 /// every account; the message names each declaration on the way.
 ///
+/// An account's answer is not read here. A way to a `path` value that runs
+/// through one is judged by [`refuse_path_answer_in_file`], and blocks the
+/// target rather than failing the load.
+///
 /// A malformed placeholder is left to the probe, which reports it with the
 /// rest of the target's defects.
 fn refuse_path_value_in_file(
@@ -391,6 +423,132 @@ fn path_value_behind<'a>(
         .find_map(|next| path_value_behind(values, next, seen))
         .map(|mut chain| {
             chain.insert(0, decl);
+            chain
+        })
+}
+
+/// Block a target whose `file` reaches a `path` value through this account's
+/// answer, returning the answers' names and the hint.
+///
+/// Called once [`refuse_path_value_in_file`] has found no way there through
+/// committed defaults alone from the same names, so every way found here runs
+/// through at least one answer. That answer is the account's to change, which
+/// is why this blocks rather than fails; the hint names each one on the way,
+/// with its line.
+fn refuse_path_answer_in_file(
+    target: &Target,
+    file: &str,
+    values: &ResolvedValues,
+    assignments: &[ValueAssignment],
+) -> Option<(Vec<String>, String)> {
+    let mut seen: Vec<String> = Vec::new();
+    let chain = super::values::placeholders(file)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|name| path_value_through_answer(values, assignments, name, &mut seen))?;
+
+    let steps: String = chain
+        .iter()
+        .map(|step| match step {
+            Step::Default(decl) => format!(
+                "`{}`, whose default at {} is built from ",
+                decl.name, decl.origin
+            ),
+            Step::Answer(decl, answer) => format!(
+                "`{}`, whose answer at {} is built from ",
+                decl.name, answer.origin
+            ),
+            Step::Terminal(decl) => format!("`{}`", decl.name),
+        })
+        .collect();
+    let problem = format!(
+        "target `{}`: `file` references {steps}, a `path` value; a `path` value is always \
+         absolute and `file` is relative to the config repo root",
+        target.path
+    );
+
+    let names = in_declaration_order(
+        values,
+        chain
+            .iter()
+            .filter_map(|step| match step {
+                Step::Answer(decl, _) => Some(decl.name.clone()),
+                Step::Default(_) | Step::Terminal(_) => None,
+            })
+            .collect(),
+    );
+    let answers: Vec<&ValueAssignment> = names
+        .iter()
+        .filter_map(|name| assignments.iter().find(|answer| &answer.name == name))
+        .collect();
+    let hint = super::values::path_answer_hint(&problem, &answers);
+    Some((names, hint))
+}
+
+/// One declaration on the way from a name in `file` to a `path` value.
+enum Step<'a> {
+    /// Left through its committed `default`.
+    Default(&'a ValueDecl),
+    /// Left through this account's answer to it.
+    Answer(&'a ValueDecl, &'a ValueAssignment),
+    /// The `path` value the way ends at.
+    Terminal(&'a ValueDecl),
+}
+
+/// The way from `name` to a `path` value, through answers and defaults.
+///
+/// Depth first. At each declaration, this account's answer is followed before
+/// the committed `default`, each one's references in the order written. The
+/// default is followed whether or not the answer overrides it, as
+/// [`path_value_behind`] follows it, so an answer `s = "{{t}}"` is refused
+/// alike whether `t` is answered or left to a default built from a `path`
+/// value. A switched-off declaration's answer is not this account's value and
+/// is not followed; its kind and default are still read, as the committed walk
+/// reads them.
+///
+/// `seen` stops the walk at a name it has already walked. It is reachable for
+/// the reason [`path_value_behind`] gives, and through answers as well: an
+/// answer may reference only an earlier value, but an overridden default
+/// referencing a later one is never expanded.
+fn path_value_through_answer<'a>(
+    values: &'a ResolvedValues,
+    assignments: &'a [ValueAssignment],
+    name: &str,
+    seen: &mut Vec<String>,
+) -> Option<Vec<Step<'a>>> {
+    if seen.iter().any(|walked| walked == name) {
+        return None;
+    }
+    seen.push(name.to_string());
+    let decl = values.decl(name)?;
+    if decl.kind == super::values::ValueKind::Path {
+        return Some(vec![Step::Terminal(decl)]);
+    }
+
+    // The same lookup `ResolvedValues::resolve` answers a declaration with.
+    let answer = assignments
+        .iter()
+        .find(|answer| answer.name == decl.name)
+        .filter(|_| decl.enabled);
+    if let Some(answer) = answer {
+        let text = answer.value.to_string();
+        let through = super::values::placeholders(&text)
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|next| path_value_through_answer(values, assignments, next, seen));
+        if let Some(mut chain) = through {
+            chain.insert(0, Step::Answer(decl, answer));
+            return Some(chain);
+        }
+    }
+
+    let default = decl.default.as_ref()?.to_string();
+    super::values::placeholders(&default)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|next| path_value_through_answer(values, assignments, next, seen))
+        .map(|mut chain| {
+            chain.insert(0, Step::Default(decl));
             chain
         })
 }

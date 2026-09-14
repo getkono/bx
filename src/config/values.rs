@@ -843,6 +843,25 @@ fn broken_answer_why(decl: &ValueDecl, assignment: &ValueAssignment, error: &Val
     )
 }
 
+/// What to do about a target whose `file` reaches a `path` value through
+/// this account's answers.
+///
+/// `problem` names the target and the way to the `path` value; each of
+/// `answers` is named with its line, which is in the file the account can
+/// edit. Unlike [`ResolvedValues::answers_hint`] it reads the answers as
+/// written, so it can name one whose value is unset or invalid: with the
+/// `path` value unanswered the answer referencing it resolves to nothing, and
+/// it is still the answer to change.
+#[must_use]
+pub(crate) fn path_answer_hint(problem: &str, answers: &[&ValueAssignment]) -> String {
+    let answers = answers
+        .iter()
+        .map(|answer| format!("the answer to `{}` at {}", answer.name, answer.origin))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!("{problem}, because of {answers}; change that answer")
+}
+
 /// Why a committed `default` has no usable text for this account.
 ///
 /// Names each answer that went into it with the line it was written on, which

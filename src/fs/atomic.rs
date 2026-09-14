@@ -2502,6 +2502,11 @@ mod tests {
             panic!("expected a read error, got {err:?}");
         };
         assert_eq!(path, &dest);
+        assert_eq!(
+            err.path(),
+            dest,
+            "Error::path() names the file this read error is about"
+        );
         assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(&dest).expect("read"), b"theirs\n");
     }
@@ -2606,6 +2611,11 @@ mod tests {
             panic!("expected UnusableParent, got {err:?}");
         };
         assert_eq!(path, &home.child(".config"));
+        assert_eq!(
+            err.path(),
+            home.child(".config"),
+            "Error::path() names the parent, too"
+        );
         assert_eq!(err.to_string(), note);
         assert!(
             std::fs::symlink_metadata(home.child("nowhere")).is_err(),

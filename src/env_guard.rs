@@ -347,13 +347,20 @@ enum Kind {
     /// `GOPATH`. Every entry is judged as a [`Kind::Location`] is, and the
     /// whole string, which no tool reads as one path, is not.
     LocationList,
-    /// A directory other assignments are written in terms of, and that no tool
-    /// reads — the operator fragment's `SCRATCH_HOME`, `CACHE_DIR` and
-    /// `DATA_DIR`. It is one path held to every check a [`Kind::Location`]'s
-    /// path is, but one: it may contain bx's own directories. No tool clears
-    /// an anchor, and every tool-read location written in terms of one is
-    /// judged at its own line, containment included. So a home that is the
-    /// scratch root, or lies under it, is still an anchor's to name.
+    /// A directory other assignments are written in terms of, and that bx has
+    /// found no tool to read: the operator fragment's `SCRATCH_HOME` and
+    /// `DATA_DIR`. A name found to be read by a tool is not an anchor.
+    /// `CACHE_DIR` is read by npm's find-cache-dir (babel-loader, nyc, ava),
+    /// which writes, and may clear, `$CACHE_DIR/<name>` for a name its
+    /// consumer picks, so it is a [`Kind::Location`] and may not contain bx's
+    /// directories. An anchor is one path held to every check a
+    /// [`Kind::Location`]'s path is, but two: it may contain bx's own
+    /// directories, and it may be a root. An approved anchor still lies inside
+    /// a root and outside bx's directories, and every tool-read location
+    /// written in terms of one is judged at its own line: containing bx's
+    /// directories, lying strictly beneath a root, and the roots. So a home
+    /// that is the scratch root, or lies under it, is still an anchor's to
+    /// name.
     Anchor,
     /// A program a tool runs, found by name or by path: exactly one word,
     /// either an absolute path outside bx's own directories or a bare command
@@ -436,9 +443,10 @@ fn is_decimal(text: &str, digits: usize) -> bool {
 ///   the operator fragment the module's tests hold the guard to:
 ///   `SCRATCH_HOME`, the anchor the fragment is written in terms of, and 22
 ///   toolchain caches and homes, of which `GOPATH` is a list of locations.
-///   `CACHE_DIR` and `DATA_DIR` are that fragment's two unexported helpers,
-///   also anchors, and `SCCACHE_DIR` is sccache's cache, the module's
-///   motivating case.
+///   `CACHE_DIR` and `DATA_DIR` are that fragment's two unexported helpers.
+///   `DATA_DIR` is an anchor too. `CACHE_DIR` is a location, because npm's
+///   find-cache-dir reads it and writes beneath it. `SCCACHE_DIR` is
+///   sccache's cache, the module's motivating case.
 /// * `EDITOR`, `VISUAL`, `PAGER`, `BROWSER`, `TERMINAL` — the program a tool
 ///   runs to edit, page, browse or open a terminal — and `RUSTC_WRAPPER`, the
 ///   program cargo runs `rustc` through.
@@ -461,7 +469,7 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("BROWSER", Kind::Program),
     ("BUN_INSTALL", Kind::Location),
     ("BUN_INSTALL_CACHE_DIR", Kind::Location),
-    ("CACHE_DIR", Kind::Anchor),
+    ("CACHE_DIR", Kind::Location),
     ("CARGO_HOME", Kind::Location),
     (
         "CARGO_TERM_COLOR",
@@ -1216,7 +1224,8 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
                 })
             })
         }),
-        // An anchor is one directory that no tool reads, so none clears it.
+        // An anchor is one directory bx has found no tool to read, so none is
+        // known to clear it or to write beside it.
         Kind::Anchor => roots
             .refuses_everything()
             .or_else(|| within(resolved, |value| refuses_anchor(value, roots))),
@@ -2576,8 +2585,9 @@ mod tests {
     fn substituted_text_is_not_expanded_again() {
         // `DATA_DIR='$CACHE_DIR'` holds the characters `$CACHE_DIR`, and a
         // shell that later expands `$DATA_DIR` yields them and stops. Expanding
-        // them again would judge a path no shell produces. Both helpers are
-        // locations, so each is judged as one. The line that uses the literal
+        // them again would judge a path no shell produces. `CACHE_DIR` is a
+        // location and `DATA_DIR` an anchor, and each is judged as one, where
+        // a single-quoted `$` is relative either way. The line that uses the literal
         // inside the root holds a `$` a tool could expand itself, so since r3
         // round 2 it is refused for that, and not for where a second
         // expansion would point.
@@ -2592,12 +2602,17 @@ mod tests {
             ]
         );
         // Expanded once, `$DATA_DIR/cargo` is `$CACHE_DIR/cargo`: relative.
-        // Expanded twice it would be inside the root and approved.
+        // Expanded twice it would be inside the root and approved. Since #45,
+        // `CACHE_DIR` is a location, and at the root itself it is refused too.
         let content =
             format!("CACHE_DIR={ROOT}\nDATA_DIR='$CACHE_DIR'\nexport CARGO_HOME=$DATA_DIR/cargo\n");
         assert_eq!(
             reasons(&content, &rooted()),
-            vec![(2, Reason::NotAbsolute), (3, Reason::NotAbsolute)]
+            vec![
+                (1, Reason::DeclaredRootItself),
+                (2, Reason::NotAbsolute),
+                (3, Reason::NotAbsolute)
+            ]
         );
     }
 
@@ -2960,7 +2975,7 @@ mod tests {
     /// The operator's own relocating exports, with the scratch mount replaced
     /// by a neutral root so nothing user-specific enters the repository
     /// (invariant 5). Every one of these was denied or leaked by the
-    /// name-based guard. All 23 exports and both helpers are locations in the
+    /// name-based guard. All 23 exports and both helpers are in the
     /// emit table.
     const OPERATOR_FRAGMENT: &str = concat!(
         "export SCRATCH_HOME=\"/var/mnt/scratch/example\"\n",
@@ -3074,9 +3089,10 @@ mod tests {
     fn the_same_fragment_is_all_violations_with_no_root_declared() {
         // A user who declares no root gets the strict guard, and the strict
         // guard refuses every location. Round 5 keeps the count at 25: the 23
-        // exports and the two helpers `CACHE_DIR` and `DATA_DIR` are all
-        // locations in the emit table, so every one is `NoRootsDeclared` and
-        // none is `NotEmittable`.
+        // exports and the two helpers `CACHE_DIR` and `DATA_DIR` are all in
+        // the emit table, as locations, a list of them, or anchors, each of
+        // which needs a root. So every one is `NoRootsDeclared` and none is
+        // `NotEmittable`.
         let found = scan(OPERATOR_FRAGMENT);
         assert_eq!(found.len(), 25);
         assert!(found.iter().all(|v| v.reason == Reason::NoRootsDeclared));
@@ -5012,7 +5028,7 @@ mod tests {
             OutsideDeclaredRoots, ParentComponent, UnlistedCharacter,
         };
         let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
-        for name in ["SCRATCH_HOME", "CACHE_DIR", "DATA_DIR"] {
+        for name in ["SCRATCH_HOME", "DATA_DIR"] {
             assert_eq!(emittable(name), Some(Kind::Anchor), "{name}");
         }
         // The operator's fragment written in terms of the home, under a `~`
@@ -5259,6 +5275,38 @@ mod tests {
     }
 
     #[test]
+    fn cache_dir_is_read_by_find_cache_dir_and_judged_as_a_location() {
+        // npm's find-cache-dir writes, and may clear, `$CACHE_DIR/<name>` for a
+        // name its consumer picks. A consumer named `bx` under
+        // `CACHE_DIR=~/.local/state` or `~/.config`, or one named `state` under
+        // `CACHE_DIR=~/.local`, reaches bx's directories. So `CACHE_DIR` may not
+        // contain them, while the two anchors no tool is known to read still may.
+        assert_eq!(emittable("CACHE_DIR"), Some(Kind::Location));
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for value in ["~/.local/state", "~/.config", "~/.local"] {
+            assert_eq!(
+                reason_of(&check("CACHE_DIR", value, &home_rooted)),
+                Some(Reason::ContainsBxDirectory),
+                "{value}"
+            );
+            for anchor in ["DATA_DIR", "SCRATCH_HOME"] {
+                assert_eq!(
+                    check(anchor, value, &home_rooted),
+                    Verdict::Allowed,
+                    "{anchor}={value}"
+                );
+            }
+        }
+        assert_eq!(
+            scan_with(
+                "export SCRATCH_HOME=~\nCACHE_DIR=$SCRATCH_HOME/cache\n",
+                &home_rooted
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
     fn ordinary_settings_programs_and_lists_stay_allowed_beside_a_root() {
         for roots in [rooted(), RootSet::strict()] {
             for (name, value) in [
@@ -5482,11 +5530,11 @@ mod tests {
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (
-                "export CACHE_DIR=~/.local\nexport GOPATH=~/go:$CACHE_DIR\n",
+                "export DATA_DIR=~/.local\nexport GOPATH=~/go:$DATA_DIR\n",
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (
-                "export CACHE_DIR=~/.local\nexport GOPATH=\"${CACHE_DIR}\"\n",
+                "export DATA_DIR=~/.local\nexport GOPATH=\"${DATA_DIR}\"\n",
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (

@@ -30,8 +30,13 @@
 //! spellings, is an error, as it is under one — when no account answer went
 //! into either spelling, or when the two spellings are one path before any
 //! answer goes in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`), which is
-//! decided exactly by reducing each spelling with its placeholders unanswered.
-//! A `..` cancels a placeholder's segment only for a `bool`, which is always
+//! decided by reducing each spelling with its placeholders unanswered. That is
+//! sound: a pair the reduction calls one path is one file for every answer. It is
+//! complete over the shapes the property test generates, not over every
+//! spelling. A `..` that cancels a segment ending in literal text glued to a
+//! placeholder leaves one path whatever that text is (`~/{{p}}x/..` against
+//! `~/{{p}}y/..`). Such a pair is not seen as one path, so it blocks as the
+//! account's collision. A `..` cancels a placeholder's segment only for a `bool`, which is always
 //! one segment: `~/.config/{{p}}/../s` reads as `~/.config/s` only while `p`
 //! holds one segment, which a `string` need not.
 //!

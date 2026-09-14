@@ -40,6 +40,11 @@
 //! bytes bx displaced to put a file back exactly as it was — or to remove one
 //! bx created, which is not the same as emptying it.
 //!
+//! [`plan`] is where those pieces meet and Invariant 7 is kept: one traversal
+//! that decides every resolved target against the ledger and the one
+//! comparison, and a diff of each decision, shared by `bx plan`, `bx apply`
+//! and the status view.
+//!
 //! # How one repo serves many accounts
 //!
 //! A developer with several Linux accounts has several *differences*, not
@@ -72,6 +77,7 @@ pub mod env_guard;
 pub mod fs;
 pub mod journal;
 pub mod paths;
+pub mod plan;
 pub mod recover;
 pub mod report;
 pub mod restore;

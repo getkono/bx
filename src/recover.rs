@@ -474,11 +474,25 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         // already refused a journal whose temporary file is not a `.bx-` file
         // beside its destination, and one the journal does not name is never
         // touched.
+        //
+        // One that cannot be removed — its directory has since stopped
+        // letting this process write — is left, with a warning, and the
+        // rollback goes on. Recovery never needs it: it holds bytes no
+        // destination was ever given, which makes it the same kind of orphan
+        // decision 11 keeps for `bx doctor`, and stopping every writing
+        // command over it would make a leftover bx does not need a reason to
+        // write nothing. `pending` names it in the write's note.
         if !complete
             && !matches!(step, Step::Blocked)
             && let Some(temp) = &intent.temp
+            && let Err(error) = journal::unlink(temp)
         {
-            journal::unlink(temp)?;
+            tracing::warn!(
+                temp = %temp.display(),
+                %error,
+                "an interrupted write's temporary file could not be removed; \
+                 it is left for bx doctor, and the rollback goes on",
+            );
         }
         match step {
             Step::Blocked => {
@@ -636,8 +650,16 @@ fn decide(
     };
 
     let Some(home) = home else {
-        let rolls_back =
-            || format!("interrupted, and {standing}; the next writing bx run rolls it back");
+        let rolls_back = || {
+            let mut note =
+                format!("interrupted, and {standing}; the next writing bx run rolls it back");
+            if let Some(name) = stuck_temp(intent) {
+                note.push_str(&format!(
+                    "; its temporary file {name} cannot be removed, and is left for bx doctor"
+                ));
+            }
+            note
+        };
         return Ok(match (standing, &intent.before) {
             (Standing::Prior, _) => (Step::Keep, report(true, rolls_back())),
             (Standing::Written, Prior::Absent) => (Step::Unlink, report(true, rolls_back())),
@@ -740,6 +762,30 @@ fn decide(
         return Ok((Step::Blocked, report(false, conflict.to_string())));
     }
     Ok((Step::Record(entry), report(true, recorded())))
+}
+
+/// The name of the temporary file `intent` names, when it is still there and
+/// its directory will not let this process remove it.
+///
+/// A prediction, for the report: [`resolve`] tries the unlink and leaves the
+/// file with a warning when it fails. Write and search permission on the
+/// directory is what an unlink needs, and `access(2)` is asked for exactly
+/// that, so a read-only filesystem is caught too.
+fn stuck_temp(intent: &Intent) -> Option<String> {
+    let temp = intent.temp.as_ref()?;
+    let dir = temp.parent()?;
+    std::fs::symlink_metadata(temp).ok()?;
+    rustix::fs::access(
+        dir,
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+    )
+    .is_err()
+    .then(|| {
+        temp.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 /// The directories in `dirs` that are still empty directories, `~`-relative.
@@ -1547,6 +1593,16 @@ mod tests {
             .clone()
             .expect("a staged temp file");
         assert!(temp.is_file(), "the crash left it behind");
+        let note = pending(&state)
+            .expect("pending")
+            .expect("interrupted")
+            .unfinished[0]
+            .note
+            .clone();
+        assert!(
+            !note.contains("temporary file"),
+            "it can be removed: {note}"
+        );
 
         recover(&state).expect("recover");
         assert!(!temp.exists(), "and recovery removed exactly it");

@@ -3616,6 +3616,86 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_named_temp_recovery_cannot_unlink_is_left_and_the_rollback_goes_on() {
+        // r3 round 2, P9R4-D3. The directory lost write permission between
+        // the Intent and the publish, so the publish failed and left the
+        // temporary file the Intent names. Recovery could not unlink it and
+        // returned an Io error on every writing run, while `pending` called
+        // the write resolvable.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn lose_write(dest: &Path) {
+            let dir = dest.parent().expect("a parent");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+                .expect("chmod 0555");
+        }
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dir = home.child(".ro");
+        let dest = home.child(".ro/x.conf");
+        plant_file(&dest, "user\n", Mode::DEFAULT_FILE);
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session.before_publish = Some(lose_write);
+        let applied = session.apply(write_to(
+            home.path(),
+            ".ro/x.conf",
+            "bx\n",
+            Mode::DEFAULT_FILE,
+        ));
+        drop(session);
+        let writable = |dir: &Path| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+        };
+        if !permissions_refuse(&dir) {
+            writable(&dir);
+            return;
+        }
+        let temp = load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .expect("the Intent")
+            .temp
+            .clone()
+            .expect("a staged temporary file");
+
+        let report = crate::recover::pending(&state);
+        let recovered = crate::recover::before_writing(&state);
+        let temp_left = temp.is_file();
+        writable(&dir);
+
+        assert!(
+            applied.is_err(),
+            "the publish fails in a read-only directory"
+        );
+        assert_eq!(
+            recovered.expect("the rollback goes on"),
+            crate::recover::Outcome::RolledBack { undone: 1 },
+        );
+        assert!(temp_left, "the temporary file is left where it is");
+        let report = report.expect("pending").expect("interrupted");
+        assert!(report.blocked().next().is_none(), "{report:?}");
+        let note = &report.unfinished[0].note;
+        assert!(note.contains("rolls it back"), "{note}");
+        let name = temp.file_name().expect("a name").to_string_lossy();
+        assert!(
+            note.contains(&format!(
+                "its temporary file {name} cannot be removed, and is left for bx doctor"
+            )),
+            "{note}"
+        );
+        assert!(!state.journal().exists(), "and the session is resolved");
+        assert_eq!(peek(&dest).expect("untouched").0, b"user\n");
+        assert_eq!(
+            crate::recover::before_writing(&state).expect("again"),
+            crate::recover::Outcome::Nothing,
+        );
+    }
+
+    #[test]
     fn a_prior_conflict_poisons_the_session_before_anything_is_published() {
         // Stack integration of #7's round 3: `Ledger::record` refuses a changed
         // file bx shares through a region with `PriorConflict`. The session

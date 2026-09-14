@@ -886,7 +886,9 @@ pub enum Reason {
     /// beside its own: uv puts executables in `$XDG_DATA_HOME/../bin`, and so
     /// does every tool built on dirs-next, which lands outside every root when
     /// the value is one. A tool given a whole root also clears everything else
-    /// the root holds. Point the value beneath the root.
+    /// the root holds. Point the value beneath the root. Every other reason
+    /// outranks it, at any entry: a list's entries are all judged for those
+    /// before any entry is judged for being a root.
     #[error("is a declared root itself, and its tool may write beside it, outside every root")]
     DeclaredRootItself,
     /// Empty, a bare word, a URL, or a relative path, where a path that can be
@@ -1203,9 +1205,17 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
         // A set with no admissible root permits no location, whatever it is.
         Kind::Location | Kind::LocationList => roots.refuses_everything().or_else(|| {
             within(resolved, |value| {
+                // Every entry is judged for every other reason before any is
+                // judged for being a root itself, so a root earlier in the
+                // list does not hide a later entry's reason (#47 round 1).
                 let entries = value
                     .split(':')
-                    .find_map(|entry| refuses_entry(entry, None, roots));
+                    .find_map(|entry| refuses_entry_placement(entry, None, roots))
+                    .or_else(|| {
+                        value
+                            .split(':')
+                            .find_map(|entry| refuses_entry_at_root(entry, roots))
+                    });
                 // A location's tool reads the whole value as one path, whose
                 // `:` its entries were judged apart at. Every entry has passed
                 // by now, so this cannot newly refuse: the whole value begins
@@ -1284,6 +1294,14 @@ fn is_bare_word(value: &str) -> bool {
 /// such a value as a path at all. Inside bx's own directories comes next, then
 /// containing them, then the roots: inside one, then beneath one.
 fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
+    refuses_entry_placement(path, separator, roots).or_else(|| refuses_entry_at_root(path, roots))
+}
+
+/// Every reason [`refuses_entry`] gives but [`Reason::DeclaredRootItself`], in
+/// its order. A list of locations is judged for these at every entry before
+/// any entry is judged for being a root itself, so a root earlier in the list
+/// does not hide a harder reason later in it.
+fn refuses_entry_placement(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, separator, roots)
         // bx's directories outrank the roots in this direction too.
         .or_else(|| {
@@ -1292,13 +1310,15 @@ fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option
                 .then_some(Reason::ContainsBxDirectory)
         })
         .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
-        // Inside a root, but with a parent in none: the path is a root itself.
-        .or_else(|| {
-            (!paths::normalize(Path::new(path))
-                .parent()
-                .is_some_and(|parent| roots.contains(parent)))
-            .then_some(Reason::DeclaredRootItself)
-        })
+}
+
+/// [`Reason::DeclaredRootItself`] if `path`, already inside a root, has a
+/// parent in none: the path is a root itself.
+fn refuses_entry_at_root(path: &str, roots: &RootSet) -> Option<Reason> {
+    (!paths::normalize(Path::new(path))
+        .parent()
+        .is_some_and(|parent| roots.contains(parent)))
+    .then_some(Reason::DeclaredRootItself)
 }
 
 /// Why a resolved [`Kind::Anchor`] may not be written, or `None` if it may:
@@ -5165,6 +5185,29 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_reason_on_any_entry_outranks_a_root_itself_on_an_earlier_one() {
+        use Reason::{BxOwnedDirectory, InsideConfigRepo, OutsideDeclaredRoots};
+        // With the home beside the root, each value's first entry is the root
+        // itself and a later entry has a reason that predates #45. Every entry
+        // is judged for those first, so the later entry's reason names the fix,
+        // as it did before the root-itself rule existed.
+        let mut judged = Vec::new();
+        let mut expected = Vec::new();
+        for name in ["GOPATH", "CARGO_HOME"] {
+            for (later, reason) in [
+                ("/var/home/example/.local/state/bx", BxOwnedDirectory),
+                ("/var/home/example/.config/bx", InsideConfigRepo),
+                ("/etc", OutsideDeclaredRoots),
+            ] {
+                let value = format!("{ROOT}:{later}");
+                judged.push((name, reason_of(&check(name, &value, &rooted()))));
+                expected.push((name, Some(reason)));
+            }
+        }
+        assert_eq!(judged, expected);
+    }
+
+    #[test]
     fn uv_puts_executables_beside_its_data_home_and_the_guard_refuses_a_root() {
         // The mechanism behind `DeclaredRootItself`, held to a real uv when one
         // is installed. `dir --bin` only prints where executables would go, and
@@ -5605,7 +5648,9 @@ mod tests {
             ("~", Reason::ContainsBxDirectory),
             ("\"~x\"", NotAbsolute),
             // Its first entry is the root itself, refused before `a` (#45).
-            ("/var/mnt/scratch/example:a", Reason::DeclaredRootItself),
+            // Since #47 round 1, `a` is judged for every other reason before
+            // any entry is judged for being a root, so `a` names the fix.
+            ("/var/mnt/scratch/example:a", NotAbsolute),
             ("/var/mnt/scratch/example/x:a", NotAbsolute),
             ("file:///var/mnt/scratch/example", NotAbsolute),
             ("1+x://y", NotAbsolute),

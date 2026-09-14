@@ -1685,6 +1685,104 @@ mod tests {
     }
 
     #[test]
+    fn a_pair_some_answer_separates_blocks_whatever_shape_separates_it() {
+        // Each pair is one file for these answers and two files for another, so
+        // each blocks the file's row rather than failing the load. What
+        // separates them differs: a placeholder only the earlier spelling
+        // holds, a placeholder that must be one segment (`~/s` against
+        // `~/.config/s`), and a placeholder that is not the first one named.
+        const EARLIER_ONLY: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                                    [[value]]\nname = \"q\"\nkind = \"string\"\n\
+                                    [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                                    [[target]]\npath = \"~/{{q}}/../.config/{{p}}/../s\"\n\
+                                    enabled = false\n\
+                                    [[target]]\npath = \"~/{{q}}/../.config/s\"\nenabled = true\n\
+                                    [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        const ONE_SEGMENT: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                                   [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                                   [[target]]\npath = \"~/.config/{{p}}/../../s\"\n\
+                                   enabled = false\n\
+                                   [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        const SECOND_NAME: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                                   [[value]]\nname = \"q\"\nkind = \"string\"\n\
+                                   [[target]]\npath = \"~/{{p}}/.config/s\"\ncontent = \"S\"\n\
+                                   [[target]]\npath = \"~/{{p}}/.config/{{q}}/../s\"\n\
+                                   enabled = false\n\
+                                   [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for (layer, answers) in [
+            (EARLIER_ONLY, "p = \"b\"\nq = \"a\"\n"),
+            (ONE_SEGMENT, "p = \"a/b\"\n"),
+            (SECOND_NAME, "p = \"x\"\nq = \"a\"\n"),
+        ] {
+            let resolved = resolved(layer, Some(&format!("[values]\n{answers}")))
+                .unwrap_or_else(|e| panic!("{answers:?} failed the whole load: {e}"));
+            let entry = blocked(&resolved, 0);
+            assert!(
+                matches!(entry.reason, BlockReason::InvalidValue { .. }),
+                "{answers:?}: {:?}",
+                entry.reason
+            );
+            ready(&resolved, 1);
+        }
+    }
+
+    #[test]
+    fn a_path_value_pair_that_is_one_path_as_written_fails_the_load() {
+        // A `path` answer is rooted, so the toggles `{{root}}/s` and
+        // `{{root}}/./s` reduce as paths and are one file for every answer. (A
+        // full entry may not open with a placeholder; a toggle names a file by
+        // the spelling it reaches.)
+        const LAYER: &str = "[[value]]\nname = \"root\"\nkind = \"path\"\n\
+                             [[target]]\npath = \"/srv/data/s\"\ncontent = \"S\"\n\
+                             [[target]]\npath = \"{{root}}/s\"\nenabled = false\n\
+                             [[target]]\npath = \"{{root}}/./s\"\nenabled = true\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let message = resolved(LAYER, Some("[values]\nroot = \"/srv/data\"\n"))
+            .expect_err("one path for every answer is the layer's defect");
+        for part in [
+            "bx.toml:10",
+            "names the same file as `{{root}}/s` at bx.toml:7",
+            "in this same layer",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_pair_past_the_stand_in_limit_is_judged_after_substitution() {
+        // Every placeholder that may hold a `/` doubles the combinations tried.
+        // Up to the limit a pair that is one path as written fails the load;
+        // past it the pair is not tried, and blocks like any other.
+        let layer = |count: usize| {
+            let decls: String = (1..=count)
+                .map(|i| format!("[[value]]\nname = \"v{i}\"\nkind = \"string\"\n"))
+                .collect();
+            let segments: String = (1..=count).map(|i| format!("/{{{{v{i}}}}}")).collect();
+            let answers: String = (1..=count).map(|i| format!("v{i} = \"a\"\n")).collect();
+            (
+                format!(
+                    "{decls}[[target]]\npath = \"~{segments}/s\"\ncontent = \"S\"\n\
+                     [[target]]\npath = \"~{segments}/./s\"\nenabled = false\n\
+                     [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n"
+                ),
+                format!("[values]\n{answers}"),
+            )
+        };
+
+        let (at, answers) = layer(12);
+        let message =
+            resolved(&at, Some(&answers)).expect_err("at the limit the pair is still tried");
+        assert!(message.contains("in this same layer"), "{message}");
+
+        let (past, answers) = layer(13);
+        let resolved = resolved(&past, Some(&answers)).expect("past the limit the pair blocks");
+        blocked(&resolved, 0);
+        ready(&resolved, 1);
+    }
+
+    #[test]
     fn a_later_layer_that_names_the_file_settles_what_an_answer_made_one_layer_name_twice() {
         // The account has the last word: a full entry for the file replaces
         // both, and a toggle switches both off.

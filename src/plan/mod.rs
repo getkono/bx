@@ -217,6 +217,19 @@ pub enum Error {
     /// A destination could not be observed.
     #[error(transparent)]
     Fs(#[from] crate::fs::Error),
+    /// `apply` has something to write, was not given `--yes`, and has no
+    /// terminal to ask on. The plan has been shown; nothing was written.
+    #[error(
+        "bx apply writes only what was confirmed, and there is no terminal to ask on; \
+         nothing was written. Review the plan above and rerun with --yes"
+    )]
+    NeedsConfirmation,
+    /// The confirmation prompt failed or was interrupted.
+    #[error("asking for confirmation: {0}")]
+    Prompt(#[source] inquire::InquireError),
+    /// The rendering could not be written to its output.
+    #[error("writing the plan: {0}")]
+    Output(#[source] std::io::Error),
 }
 
 impl From<config::Error> for Error {

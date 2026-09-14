@@ -3,6 +3,8 @@
 //! Ten commands, no manual. Everything the user needs to discover is reachable
 //! from `--help`, dynamic completion, and the prompts in `bx init`.
 
+use std::io::Write as _;
+
 use clap::{Parser, Subcommand};
 use eyre::Result;
 
@@ -36,7 +38,11 @@ enum Command {
     /// The diff `apply` would make
     Plan,
     /// Converge this machine to the repo
-    Apply,
+    Apply {
+        /// Write without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Pull, apply, push
     Sync,
     /// Set, list, and rotate secrets
@@ -57,9 +63,16 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    let env = bx::plan::Env::from_process()?;
+    let mut out = std::io::stdout().lock();
+    let exit = match command {
         // No subcommand is the status view.
-        None => todo!("status"),
+        None => bx::command::status(&env, &mut out)?,
+        Some(Command::Plan) => bx::command::plan(&env, &mut out)?,
+        Some(Command::Apply { yes }) => bx::command::apply(&env, yes, &mut out)?,
         Some(_) => todo!("command dispatch"),
-    }
+    };
+    out.flush()?;
+    std::process::exit(exit.code());
 }

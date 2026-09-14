@@ -1236,6 +1236,11 @@ impl ResolvedValues {
     /// with its declaration's line, because answering it directly is the other
     /// act that clears the entry. With no such value the hint names the
     /// answers alone.
+    ///
+    /// When `texts` are two or more spellings that name one file, a value every
+    /// one of them carries is not named: answering it moves them all together,
+    /// so they stay one file. Only a value some carry and some do not can
+    /// separate them.
     #[must_use]
     pub(crate) fn answers_hint(&self, problem: &str, texts: &[&str], names: &[String]) -> String {
         let answers = names
@@ -1247,9 +1252,20 @@ impl ResolvedValues {
             .collect::<Vec<_>>()
             .join(" and ");
 
+        let carried: Vec<Vec<String>> = texts
+            .iter()
+            .map(|text| {
+                let mut into = Vec::new();
+                self.derived_between(text, &mut into);
+                into
+            })
+            .collect();
         let mut between: Vec<String> = Vec::new();
-        for text in texts {
-            self.derived_between(text, &mut between);
+        for name in carried.iter().flatten() {
+            let separates = carried.len() == 1 || carried.iter().any(|set| !set.contains(name));
+            if separates && !between.contains(name) {
+                between.push(name.clone());
+            }
         }
         if between.is_empty() {
             return format!("{problem}, because of {answers}; change that answer");

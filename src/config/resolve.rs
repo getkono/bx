@@ -1558,6 +1558,43 @@ mod tests {
     }
 
     #[test]
+    fn a_derived_value_every_colliding_spelling_carries_is_not_offered_as_the_way_out() {
+        // `q` carries the answer to `o` into both spellings, so answering `q`
+        // directly moves both files together and they stay one file. Naming it
+        // would be advice that clears nothing, so the hint does not.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"o\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{o}}\"\n\
+                             [[target]]\npath = \"~/{{p}}/{{q}}\"\ncontent = \"P\"\n\
+                             [[target]]\npath = \"~/work/{{q}}\"\ncontent = \"W\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for local in [
+            "[values]\np = \"work\"\no = \"x\"\n",
+            "[values]\np = \"work\"\no = \"x\"\nq = \"y\"\n",
+        ] {
+            let resolved =
+                resolved(LAYER, Some(local)).expect("an account's answers do not fail the load");
+            for index in [0, 1] {
+                let entry = blocked(&resolved, index);
+                assert!(
+                    entry.hint.ends_with("; change that answer"),
+                    "{local:?} {index}: {}",
+                    entry.hint
+                );
+                for part in ["the default of `q`", "directly"] {
+                    assert!(
+                        !entry.hint.contains(part),
+                        "{local:?} {index} {part}: {}",
+                        entry.hint
+                    );
+                }
+            }
+            ready(&resolved, 2);
+        }
+    }
+
+    #[test]
     fn a_dotdot_against_a_placeholder_is_not_one_path_as_written() {
         // Reduced with its placeholder left in, `~/.config/{{p}}/../s` folds to
         // `~/.config/s`, which read as proof that the toggle and the first entry

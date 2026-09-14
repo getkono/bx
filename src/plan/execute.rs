@@ -64,9 +64,16 @@ fn progress_to(
 mod tests {
     use super::*;
 
-    /// A terminal that takes every draw and shows nothing.
-    #[derive(Debug)]
-    struct Terminal;
+    /// A terminal that keeps the text drawn on it.
+    #[derive(Debug, Clone, Default)]
+    struct Terminal(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl Terminal {
+        /// Everything drawn so far.
+        fn drawn(&self) -> String {
+            self.0.lock().expect("the drawing").clone()
+        }
+    }
 
     impl indicatif::TermLike for Terminal {
         fn width(&self) -> u16 {
@@ -89,11 +96,13 @@ mod tests {
             Ok(())
         }
 
-        fn write_line(&self, _: &str) -> std::io::Result<()> {
-            Ok(())
+        fn write_line(&self, line: &str) -> std::io::Result<()> {
+            self.write_str(line)?;
+            self.write_str("\n")
         }
 
-        fn write_str(&self, _: &str) -> std::io::Result<()> {
+        fn write_str(&self, text: &str) -> std::io::Result<()> {
+            self.0.lock().expect("the drawing").push_str(text);
             Ok(())
         }
 
@@ -117,12 +126,23 @@ mod tests {
         // P42R1-COV1. `progress(3, true)` draws on standard error, which is a
         // pipe under the test runner, so indicatif reports it hidden whatever
         // the branch chose; the branch is pinned through a terminal that is one.
-        let terminal = || ProgressDrawTarget::term_like(Box::new(Terminal));
-
-        let shown = progress_to(3, true, terminal);
+        let seen = Terminal::default();
+        let shown = progress_to(3, true, || {
+            ProgressDrawTarget::term_like(Box::new(seen.clone()))
+        });
         assert!(!shown.is_hidden());
         assert_eq!(shown.length(), Some(3));
+        shown.inc(1);
+        shown.finish_and_clear();
+        assert!(seen.drawn().contains("1/3"), "{:?}", seen.drawn());
 
-        assert!(progress_to(3, false, terminal).is_hidden());
+        let unseen = Terminal::default();
+        let hidden = progress_to(3, false, || {
+            ProgressDrawTarget::term_like(Box::new(unseen.clone()))
+        });
+        assert!(hidden.is_hidden());
+        hidden.inc(1);
+        hidden.finish_and_clear();
+        assert_eq!(unseen.drawn(), "");
     }
 }

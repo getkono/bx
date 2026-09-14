@@ -786,7 +786,7 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// bx's own directory, move it out of bx's config repo, move it inside a
 /// declared root, write an absolute path,
 /// give a program no arguments, give a setting a value it accepts, define the
-/// referenced variable earlier, fix the line
+/// referenced variable earlier, give the guard a home, fix the line
 /// that assigned it, shorten it — so a caller that only knew *which* variable
 /// was rejected could not say what to do about it. The messages name no data:
 /// the caller already holds the value and the root set, and prints them itself.
@@ -842,6 +842,10 @@ pub enum Reason {
     /// It names a variable this fragment has not assigned by this line.
     #[error("refers to a variable this fragment has not assigned")]
     UnresolvedReference,
+    /// It refers to the home — `~`, `$HOME` — and the guard was given no home
+    /// to expand it against, as [`scan`] is not.
+    #[error("refers to the home directory, and the guard was given none")]
+    NoHome,
     /// It names a variable whose assignment the guard could not read, or comes
     /// after a line the guard refused, after which nothing assigned is known.
     #[error("refers to a variable whose assignment the guard could not read")]
@@ -1224,7 +1228,7 @@ impl Scope {
         if name == "HOME" {
             return home
                 .map(|home| home.to_string_lossy().into_owned())
-                .ok_or(Reason::UnresolvedReference);
+                .ok_or(Reason::NoHome);
         }
         Err(if is_reserved(name) {
             Reason::ReservedName
@@ -1291,7 +1295,7 @@ impl Scope {
 /// could not be known.
 fn as_reference(reason: Reason) -> Reason {
     match reason {
-        Reason::UnresolvedReference | Reason::ExpansionTooLong => reason,
+        Reason::UnresolvedReference | Reason::NoHome | Reason::ExpansionTooLong => reason,
         _ => Reason::UnreadableReference,
     }
 }
@@ -2133,6 +2137,10 @@ mod tests {
         assert_eq!(
             Reason::UnresolvedReference.to_string(),
             "refers to a variable this fragment has not assigned"
+        );
+        assert_eq!(
+            Reason::NoHome.to_string(),
+            "refers to the home directory, and the guard was given none"
         );
         assert_eq!(
             Reason::InadmissibleRoot.to_string(),
@@ -4039,7 +4047,7 @@ mod tests {
         for value in ["~/bin/nvim", "$HOME/bin/nvim"] {
             assert_eq!(
                 reason_of(&check("VISUAL", value, &RootSet::strict())),
-                Some(UnresolvedReference),
+                Some(Reason::NoHome),
                 "{value}"
             );
         }
@@ -4128,7 +4136,7 @@ mod tests {
 
     #[test]
     fn a_socket_is_an_absolute_path_outside_bxs_directories() {
-        use Reason::{BxOwnedDirectory, NotAbsolute, UnresolvedReference};
+        use Reason::{BxOwnedDirectory, NoHome, NotAbsolute};
         for roots in [
             rooted(),
             RootSet::new(Path::new(HOME), &[]),
@@ -4158,7 +4166,7 @@ mod tests {
         }
         assert_eq!(
             reason_of(&check("SSH_AUTH_SOCK", "~/agent", &RootSet::strict())),
-            Some(UnresolvedReference)
+            Some(NoHome)
         );
     }
 
@@ -4416,6 +4424,42 @@ mod tests {
                 assert_eq!(reasons(content, &roots), expected, "{content:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_reference_to_the_home_with_no_home_says_so() {
+        // `scan` has no home to expand `~` or `$HOME` against. Saying that the
+        // fragment has not assigned `HOME` would send a reader looking for an
+        // assignment no fragment may make.
+        let strict = RootSet::strict();
+        for (name, value) in [
+            ("EDITOR", "$HOME/bin/nvim"),
+            ("EDITOR", "${HOME}/bin/nvim"),
+            ("VISUAL", "~/bin/nvim"),
+            ("PATH", "$HOME/bin:$PATH"),
+            ("SSH_AUTH_SOCK", "~/agent"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &strict)),
+                Some(Reason::NoHome),
+                "{name}={value}"
+            );
+        }
+        // A name that took its value from the home says the same.
+        assert_eq!(
+            reasons("export X=$HOME\nexport EDITOR=$X\n", &strict),
+            vec![(1, Reason::NotEmittable), (2, Reason::NoHome)]
+        );
+        // A set with a home expands it, and a location with no root is
+        // refused for that before its value is looked at.
+        assert_eq!(
+            check("EDITOR", "$HOME/bin/nvim", &rooted()),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "~/cargo", &strict)),
+            Some(Reason::NoRootsDeclared)
+        );
     }
 
     #[test]
@@ -4833,13 +4877,13 @@ mod tests {
             scan_with("export PATH=\"$HOME/.local/bin:$PATH\"\n", &rooted()),
             vec![]
         );
-        // Without a home, `$HOME` is unresolved rather than reserved.
+        // Without a home, `$HOME` is refused for having none, not reserved.
         assert_eq!(
             reason_of(&check("EDITOR", "$HOME", &RootSet::strict())),
-            Some(Reason::UnresolvedReference)
+            Some(Reason::NoHome)
         );
         let mut scope = Scope::default();
-        assert_eq!(scope.lookup("HOME", None), Err(Reason::UnresolvedReference));
+        assert_eq!(scope.lookup("HOME", None), Err(Reason::NoHome));
         assert_eq!(scope.lookup("RANDOM", None), Err(Reason::ReservedName));
         assert_eq!(
             scope.lookup("SCRATCH", None),

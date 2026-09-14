@@ -454,6 +454,48 @@ mod tests {
     }
 
     #[test]
+    fn an_absent_target_bx_attached_to_another_way_is_a_conflict_not_a_create() {
+        // P42R1-COV2. The ledger still names the file as one bx attached to as
+        // a region or an include line, and the file is gone. Creating it whole
+        // would make bx the owner of a file it never owned whole.
+        for (mechanism, words) in [
+            (Mechanism::Region { comment: '#' }, "a managed region"),
+            (
+                Mechanism::Include {
+                    line: "x".to_string(),
+                },
+                "an include line",
+            ),
+        ] {
+            let home = guarded_home();
+            crate::plan::tests::own(home.path(), ".a", b"old\n", mechanism);
+            std::fs::remove_file(home.child(".a")).expect("the file goes");
+            let state = crate::state::StateDir::resolve(home.path());
+            let ledger = LedgerView::read(&state, home.path())
+                .expect("the ledger")
+                .value;
+            let roots = RootSet::strict();
+            let ctx = Ctx {
+                ledger: &ledger,
+                home: home.path(),
+                repo: &home.child(".config/bx"),
+                roots: &roots,
+            };
+
+            let (change, op) =
+                decide(&Resolution::Ready(a_target(home.path(), "~/.a")), &ctx).expect("decide");
+
+            assert_eq!(change.action, Action::Conflict, "{words}");
+            assert_eq!(
+                change.note.as_deref(),
+                Some(format!("bx attached to this file as {words}").as_str())
+            );
+            assert_eq!(op, None, "{words}");
+            assert!(!home.child(".a").exists(), "{words}");
+        }
+    }
+
+    #[test]
     fn the_supported_shape_is_not_unsupported() {
         let home = guarded_home();
         assert_eq!(unsupported(&a_target(home.path(), "~/.a")), None);

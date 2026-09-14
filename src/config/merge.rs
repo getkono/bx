@@ -648,10 +648,16 @@ fn clash(
 
 /// Whether two spellings name one file whatever is answered.
 ///
-/// Exactly when their [`written_form`]s are identical. The same answers put
-/// into one form give one text, so identical forms name one file for every
-/// answer, or no file for any. Forms that differ are parted by some answer, so
-/// the collision is one the account can clear.
+/// When their [`written_form`]s are identical. The same answers put into one
+/// form give one text, so identical forms name one file for every answer, or no
+/// file for any. The converse holds for every shape the fixed-seed property test
+/// generates: there, forms that differ are parted by some answer, so the
+/// collision is one the account can clear. It is not exact. A `..` cancelling a
+/// segment that ends in literal text glued to a placeholder leaves one path
+/// whatever that text is (`~/{{p}}x/..` against `~/{{p}}y/..`), and after a
+/// `path` value whether there is glued text or not (`{{r}}x/..` against
+/// `{{r}}/..`). Such a pair is one file for every answer, yet its forms differ,
+/// so it blocks as the account's collision with a hint no answer follows.
 ///
 /// Only spellings whose keys are one [`TargetKey::File`] are compared here, so
 /// every placeholder in either is declared, enabled and answered: a
@@ -670,15 +676,20 @@ struct WrittenForm<'a> {
 /// Where a [`WrittenForm`] is rooted.
 #[derive(Debug, PartialEq, Eq)]
 enum Root<'a> {
-    /// `/`, or a lone `path` value opening the spelling: every `path` answer is
-    /// absolute, so `{{r}}/s` and `/{{r}}/s` are one path.
+    /// `/`, or a `path` value opening the spelling, alone or with text glued
+    /// after it: every `path` answer is absolute, so `{{r}}/s` and `/{{r}}/s`
+    /// are one path, as are `{{r}}.d/s` and `/{{r}}.d/s`.
     Absolute,
-    /// `~`.
+    /// `~`, or a `~` with a `path` value after it: `~{{r}}/s` and `~/{{r}}/s`
+    /// are one path.
     Home,
     /// Whatever the answers make of the first segment, which the lexical rule
     /// cannot see into: `{{p}}/s` is rooted at `~` for `p = "~"`, at `/` for
     /// `p = ""`, and not rooted for `p = "a"`. Whether anything follows it
-    /// matters as well, since `p = ""` makes `{{p}}` nothing and `{{p}}/.` `/`.
+    /// matters as well, since `p = ""` makes `{{p}}` nothing and `{{p}}/.` `/`,
+    /// but only when every piece of the segment is a `string` placeholder: any
+    /// other piece is never empty, and a text that is not empty is one path
+    /// with a separator after it or without, so `followed` is then `false`.
     Opening {
         first: Vec<Piece<'a>>,
         followed: bool,
@@ -737,6 +748,11 @@ fn written_form<'a>(spelling: &'a str, values: &ResolvedValues) -> Option<Writte
         matches!(piece, Piece::Name(name)
             if values.decl(name).is_some_and(|decl| decl.kind == kind))
     };
+    // Only a `string` answer may be empty; a literal piece never is.
+    let may_be_empty = |piece: &Piece<'_>| {
+        matches!(piece, Piece::Name(name)
+            if values.decl(name).is_none_or(|decl| decl.kind == ValueKind::String))
+    };
     let mut split = split.into_iter();
     let first = split.next().unwrap_or_default();
     let followed = !split.as_slice().is_empty();
@@ -745,10 +761,21 @@ fn written_form<'a>(spelling: &'a str, values: &ResolvedValues) -> Option<Writte
         Root::Absolute
     } else if first == [Piece::Literal("~")] {
         Root::Home
-    } else if matches!(first.as_slice(), [only] if is(only, ValueKind::Path)) {
+    } else if first.first().is_some_and(|lead| is(lead, ValueKind::Path)) {
+        // A `path` answer starts with `/`, so with or without a `/` written
+        // before it, and with or without text glued after it, the answer's
+        // own `/` roots the spelling.
         segments.push(Segment::Opaque(first));
         Root::Absolute
+    } else if first.len() > 1 && first[0] == Piece::Literal("~") && is(&first[1], ValueKind::Path) {
+        // `~{{r}}` is `~/` and the answer's segments, as `~/{{r}}` is.
+        segments.push(Segment::Opaque(first[1..].to_vec()));
+        Root::Home
     } else {
+        // What follows the opening segment parts two spellings only when an
+        // answer can make that segment nothing: a non-empty text is one path
+        // with a separator after it or without.
+        let followed = followed && first.iter().all(may_be_empty);
         Root::Opening { first, followed }
     };
 
@@ -1521,6 +1548,7 @@ mod tests {
                 decl("q", ValueKind::String),
                 decl("f", ValueKind::Bool),
                 decl("r", ValueKind::Path),
+                decl("e", ValueKind::Email),
             ]
         };
         let assign = |name: &str, value: AssignedValue| ValueAssignment {
@@ -1546,19 +1574,27 @@ mod tests {
         ];
         let others = ["b/c/d/e/f/g/h/i", "b", ""];
         let roots = ["/srv/d/e/f/g/h/i/j", "/srv", "/", "/var/home/example"];
+        // An address may hold a `/`, so it too can root a spelling or climb.
+        let emails = ["/a@b/c/d/e/f/g/h", "~/m@n"];
         let mut answers = Vec::new();
         for p in strings {
             for q in others {
                 for r in roots {
-                    for f in [true, false] {
-                        let given = [
-                            assign("p", AssignedValue::String(p.into())),
-                            assign("q", AssignedValue::String(q.into())),
-                            assign("f", AssignedValue::Bool(f)),
-                            assign("r", AssignedValue::String(r.into())),
-                        ];
-                        if let Ok(values) = ResolvedValues::resolve(decls(), &given, &home()) {
-                            answers.push((format!("p={p:?} q={q:?} f={f} r={r:?}"), values));
+                    for e in emails {
+                        for f in [true, false] {
+                            let given = [
+                                assign("p", AssignedValue::String(p.into())),
+                                assign("q", AssignedValue::String(q.into())),
+                                assign("f", AssignedValue::Bool(f)),
+                                assign("r", AssignedValue::String(r.into())),
+                                assign("e", AssignedValue::String(e.into())),
+                            ];
+                            if let Ok(values) = ResolvedValues::resolve(decls(), &given, &home()) {
+                                answers.push((
+                                    format!("p={p:?} q={q:?} f={f} r={r:?} e={e:?}"),
+                                    values,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1599,8 +1635,22 @@ mod tests {
             let root = ["~/", "/", ""][pick(3)];
             let len = 1 + pick(5);
             let mut first: Vec<&str> = (0..len).map(|_| segments[pick(segments.len())]).collect();
+            // A spelling with no root opens with a placeholder: alone, with text
+            // glued on, after a `~`, of a kind no answer makes empty, or with a
+            // second placeholder beside it.
             if root.is_empty() {
-                first[0] = ["{{r}}", "{{p}}"][pick(2)];
+                let openers = [
+                    "{{r}}",
+                    "{{p}}",
+                    "{{r}}.d",
+                    "{{r}}x",
+                    "~{{r}}",
+                    "~{{p}}",
+                    "{{e}}",
+                    "{{r}}{{p}}",
+                    "{{p}}{{r}}",
+                ];
+                first[0] = openers[pick(openers.len())];
             }
             let mut second = first.clone();
             for _ in 0..=pick(3) {

@@ -1828,6 +1828,70 @@ mod tests {
     }
 
     #[test]
+    fn a_pair_apart_only_around_its_opening_segment_fails_the_load() {
+        // Each pair names one file whatever is answered, so no answer could clear
+        // the collision and it is the layer's defect. A `path` answer is
+        // absolute, so a `/` before it adds nothing even with text glued on
+        // (`{{r}}.d/conf`), and neither does one after a `~` that precedes it
+        // (`~{{r}}/s`). An opening segment no answer makes empty (`~{{p}}`, and a
+        // lone `email`) is the same path with a separator after it or without.
+        let cases = [
+            (
+                "r",
+                "path",
+                "/srv.d/conf",
+                "{{r}}.d/conf",
+                "/{{r}}.d/conf",
+                "r = \"/srv\"",
+            ),
+            (
+                "r",
+                "path",
+                "~/srv/s",
+                "~{{r}}/s",
+                "~/{{r}}/s",
+                "r = \"/srv\"",
+            ),
+            (
+                "p",
+                "string",
+                "~/work",
+                "~{{p}}",
+                "~{{p}}/",
+                "p = \"/work\"",
+            ),
+            ("e", "email", "/a@b", "{{e}}", "{{e}}/", "e = \"/a@b\""),
+        ];
+        let mut loaded = Vec::new();
+        for (name, kind, file, first, second, answer) in cases {
+            let layer = format!(
+                "[[value]]\nname = \"{name}\"\nkind = \"{kind}\"\n\
+                 [[target]]\npath = \"{file}\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"{first}\"\nenabled = false\n\
+                 [[target]]\npath = \"{second}\"\nenabled = true\n"
+            );
+            let Err(message) = resolved(&layer, Some(&format!("[values]\n{answer}\n"))) else {
+                loaded.push(format!("{first} and {second}"));
+                continue;
+            };
+            for part in [
+                "bx.toml:10".to_string(),
+                format!("names the same file as `{first}` at bx.toml:7"),
+                "in this same layer".to_string(),
+            ] {
+                assert!(
+                    message.contains(&part),
+                    "{first} {second}: {part}: {message}"
+                );
+            }
+        }
+        assert!(
+            loaded.is_empty(),
+            "one path for every answer is the layer's defect, yet these loaded: {loaded:?}"
+        );
+    }
+
+    #[test]
     fn a_dotdot_run_past_a_placeholder_is_judged_after_substitution() {
         // A run of `..` after a placeholder reaches as far as the answer is deep.
         // `/opt/{{p}}/../../../s` and `/opt/{{p}}/../../../../s` both name `/s`

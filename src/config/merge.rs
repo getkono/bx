@@ -1732,6 +1732,50 @@ mod tests {
     }
 
     #[test]
+    fn an_opening_placeholder_an_answer_may_empty_is_parted_by_what_follows_it() {
+        // `{{p}}` and `{{p}}/.` are one file, `/srv`, for `p = "/srv"`, but
+        // `p = ""` makes the first nothing and the second `/`. Some answer parts
+        // them, so meeting is the account's doing: a conflict, not a refusal.
+        let config = merge(&[
+            global(
+                "bx.toml",
+                &format!(
+                    "[[value]]\nname = \"p\"\nkind = \"string\"\n{}\
+                     [[target]]\npath = \"{{{{p}}}}\"\nenabled = false\n\
+                     [[target]]\npath = \"{{{{p}}}}/.\"\nenabled = true\n",
+                    target_toml("/srv", "S")
+                ),
+            ),
+            local("[values]\np = \"/srv\"\n"),
+        ])
+        .unwrap_or_else(|e| panic!("an answer that names one file twice failed the merge: {e}"));
+        assert_eq!(config.conflicts.len(), 1);
+        assert_eq!(config.conflicts[0].file, "/srv");
+
+        let decl = ValueDecl {
+            name: "p".into(),
+            description: None,
+            kind: ValueKind::String,
+            required: false,
+            is_root: false,
+            default: None,
+            enabled: true,
+            origin: Origin::unknown(Path::new("bx.toml")),
+        };
+        let empty = ValueAssignment {
+            name: "p".into(),
+            value: crate::config::values::AssignedValue::String(String::new()),
+            origin: Origin::unknown(Path::new("local.toml")),
+        };
+        let values = ResolvedValues::resolve(vec![decl], &[empty], &home()).unwrap();
+        assert_ne!(
+            TargetKey::of("{{p}}", &values),
+            TargetKey::of("{{p}}/.", &values),
+            "`p = \"\"` parts the pair"
+        );
+    }
+
+    #[test]
     fn two_toggles_that_each_cancel_a_placeholder_meet_for_one_answer_only() {
         // `~/.config/{{p}}/../s` and `~/.config/{{q}}/../s` are `~/.config/s`
         // while `p` and `q` each hold one segment, and two files once either

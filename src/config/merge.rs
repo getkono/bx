@@ -1952,6 +1952,53 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_tilde_is_rooted_at_home_not_absolute() {
+        // `written_form`'s literal-`~` branch (merge.rs ~:796) is what parts a
+        // pair that climbs above the home and what keeps `~` from meeting `/`.
+        // At `/` nothing is above the root, so a bare `..` clamps away (see
+        // `a_dotdot_past_the_root_is_the_layer_s_defect_whatever_is_answered`
+        // above); under `~` the home's own parent is unknown, so it does not.
+        //
+        // The root is pinned directly, and not only through a pair's verdict:
+        // a mutant that folds `~` into `Root::Opening` gives it the same first
+        // segment and the same `followed` (a literal piece is never
+        // `may_be_empty`) as any other pure-`~` spelling, so no pair of
+        // spellings moves `one_path_as_written`'s verdict at all — the
+        // fixed-seed property test above would not catch it either.
+        let decl = ValueDecl {
+            name: "p".into(),
+            description: None,
+            kind: ValueKind::String,
+            required: false,
+            is_root: false,
+            default: None,
+            enabled: true,
+            origin: Origin::unknown(Path::new("bx.toml")),
+        };
+        let values = ResolvedValues::resolve(vec![decl], &[], &home()).unwrap();
+
+        for spelling in ["~", "~/{{p}}", "~/../{{p}}"] {
+            let form = written_form(spelling, &values).expect("well-formed");
+            assert_eq!(form.root, Root::Home, "{spelling}: {form:?}");
+        }
+
+        // (a) A pair that climbs above `~` does not prove one path: the extra
+        // `..` stays in the form instead of clamping the way it does at `/`,
+        // so the pair is judged after substitution rather than refused as the
+        // layer's defect.
+        assert!(
+            !one_path_as_written("~/../{{p}}", "~/../../{{p}}", &values),
+            "a climb above the home is not proof of one path"
+        );
+
+        // (b) `~/{{p}}` and `/{{p}}` are not one path: `~` is not `/`.
+        assert!(
+            !one_path_as_written("~/{{p}}", "/{{p}}", &values),
+            "`~` is not `/`"
+        );
+    }
+
+    #[test]
     fn one_layer_may_not_name_one_file_twice_under_two_spellings() {
         // The parser's duplicate check compares spellings, so it cannot see this.
         let message = failure(&[global(

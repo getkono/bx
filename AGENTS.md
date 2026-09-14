@@ -34,12 +34,13 @@ wrong even if it passes CI.
    outside a root the configuration declares. `env_guard` enforces this, and
    every generated environment fragment must pass through it: a fragment may set
    only variables bx knows how to judge, and each value is judged for what it is
-   — a location, a program, a search list or a setting. The shell-init snippet
-   is not an environment fragment: it is fixed text from bx's source that sets
-   only `BX_`-prefixed names, and sets every other variable by sourcing a
-   guarded environment fragment. Declare no root and no relocation is allowed
-   at all. Containment is decided lexically, never by touching the filesystem,
-   because invariant 3 forbids a verdict that depends on what happens to exist.
+   — a location, a list of locations, a program, a search list, a socket or a
+   setting. The shell-init snippet is not an environment fragment: it is fixed
+   text from bx's source that sets only `BX_`-prefixed names, and sets every
+   other variable by sourcing a guarded environment fragment. Declare no root
+   and no relocation is allowed at all. Containment is decided lexically, never
+   by touching the filesystem, because invariant 3 forbids a verdict that
+   depends on what happens to exist.
 3. **Idempotent.** `apply` twice must produce an empty second `plan`, and
    generated files must be byte-identical between runs: no timestamps, no
    nondeterministic iteration order.

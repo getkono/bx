@@ -1,9 +1,9 @@
 //! The one rule that keeps bx from breaking the tools it manages.
 //!
-//! bx *may* write an environment variable when that is a tool's own documented
-//! configuration interface and the tool has no config file — `SCCACHE_CACHE_SIZE`
-//! and `RUSTC_WRAPPER` are the motivating cases, since sccache is configured
-//! entirely by environment.
+//! bx *may* write an environment variable that is a tool's own documented
+//! configuration interface, but only a variable in bx's emit table, which grows
+//! with the generators that need it — `SCCACHE_CACHE_SIZE` and `RUSTC_WRAPPER`
+//! are the motivating cases, since sccache is configured entirely by environment.
 //!
 //! bx *may never* write a variable that moves a tool's config, data, or cache
 //! **outside a root the configuration declares**. Doing so makes the tool

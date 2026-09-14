@@ -103,11 +103,11 @@ or a login banner without anyone parsing its output:
 - `bx` never points a tool at a `bx`-owned directory, and never sets an
   environment variable that moves a tool's config, data, or cache outside a root
   you declared. It sets only variables it knows how to judge, and judges each
-  value for what it is — a location, a program, a search list or a setting:
-  declare your scratch mount as a root and your toolchain caches may live there;
-  declare nothing and nothing moves at all. It will write a tool's env var only
-  when that is the tool's own configuration interface and it has no config file
-  at all.
+  value for what it is — a location, a list of locations, a program, a search
+  list, a socket or a setting: declare your scratch mount as a root and your
+  toolchain caches may live there; declare nothing and nothing moves at all. It
+  will write only a variable in bx's emit table, which grows with the generators
+  that need it.
 - Uninstalling is a supported operation, not an afterthought.
 
 ### Idempotent and reversible

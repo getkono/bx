@@ -120,7 +120,9 @@ impl Inputs {
         let layers = layers::load_layer_set(&repo, state.root(), &home)?;
         let merged = merge::merge(&layers, &home)?;
         let resolved = resolve::resolve(&merged, &home)?;
-        let roots = RootSet::from_values(&resolved.values).owning(&[state.root().to_path_buf()]);
+        let roots = RootSet::from_values(&resolved.values)
+            .owning(&[state.root().to_path_buf()])
+            .with_config_repos(std::slice::from_ref(&repo));
         Ok(Self {
             home,
             repo,
@@ -774,6 +776,33 @@ pub(crate) mod tests {
         assert_eq!(inputs.repo(), home.child(".config/bx"));
         assert_eq!(inputs.state(), &StateDir::resolve(home.path()));
         assert!(!inputs.progress);
+    }
+
+    #[test]
+    fn a_repo_the_environment_moved_is_the_repo_a_generated_fragment_may_not_name() {
+        // The env guard's r3 round gave `RootSet` the config repo, derived
+        // from the home unless a caller that read `XDG_CONFIG_HOME` names it.
+        // The whole home is a declared root, so only the repo refuses it.
+        let home = guarded_home();
+        let xdg = home.child("cfg");
+        let repo = xdg.join("bx");
+        std::fs::create_dir_all(&repo).expect("the moved repo");
+        std::fs::write(
+            repo.join("bx.toml"),
+            "[[value]]\nname = \"all\"\nkind = \"path\"\nis_root = true\ndefault = \"~\"\n",
+        )
+        .expect("bx.toml");
+        let inputs = Inputs::load(&Env {
+            xdg_config_home: Some(xdg.into_os_string()),
+            ..env(home.path())
+        })
+        .expect("the inputs load");
+        assert_eq!(inputs.repo(), repo);
+
+        let fragment = format!("CARGO_HOME={}\n", repo.join("cargo").display());
+        let note = decide::guard_fragment(&fragment, &inputs.roots).expect("refused");
+        let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();
+        assert!(note.contains(&inside), "{note}");
     }
 
     #[test]

@@ -172,6 +172,12 @@ impl Restored {
 /// wrote, so `rm` writes nothing there, forgets nothing, and restores the
 /// rest — and this preview says so, as `rm` does.
 ///
+/// So is a destination whose parent is on the filesystem but does not resolve
+/// to a directory — a dangling symlink, or a file — whatever prior bx
+/// recorded. bx will not create the parent through or over what the user put
+/// there, and cannot tell a file that is gone from one that is out of reach.
+/// The note names the parent `~`-relative.
+///
 /// # Errors
 ///
 /// [`Error::Read`] for a destination path that cannot be observed at all: one
@@ -188,6 +194,24 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
         }
         Err(e) => return Err(e.into()),
     };
+    // A parent that does not resolve is observed as an absent destination,
+    // whichever prior bx recorded. Neither a revert nor a forget is sound
+    // there: the write cannot be made through it, and bx cannot tell whether
+    // the file is gone or only out of reach.
+    if let Some(parent) = observed
+        .parent
+        .as_ref()
+        .filter(|parent| parent.unusable().is_some())
+    {
+        return Ok(Restoration::Conflict {
+            note: format!(
+                "its parent {} does not resolve to a directory; \
+                 bx wrote nothing and forgets nothing",
+                crate::paths::to_portable(&parent.path, home),
+            ),
+            dest,
+        });
+    }
 
     match (observed.kind, observed.digest()) {
         (Kind::Absent, _) => Ok(match &entry.prior {
@@ -247,7 +271,7 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
 ///
 /// A destination that cannot be read is one of those conflicts: bx cannot
 /// compare it with what it wrote, so it writes nothing there and forgets
-/// nothing.
+/// nothing. So is one whose parent does not resolve to a directory.
 ///
 /// # Errors
 ///
@@ -950,6 +974,98 @@ mod tests {
             matches!(planned, Some(Ok(Restoration::Conflict { .. }))),
             "the preview says what rm did: {planned:?}"
         );
+    }
+
+    #[test]
+    fn an_rm_target_whose_parent_does_not_resolve_is_a_conflict_and_the_rest_still_restore() {
+        // r3 round 2, P9R4-D1. A destination whose parent does not resolve is
+        // observed as absent, so `plan_restore` said Revert (or AlreadyGone);
+        // rm's write then failed with UnusableParent and stopped the whole rm,
+        // and the next writing run rolled back the target it had restored.
+        let guard = guarded_home();
+        for displaced in [true, false] {
+            let case = format!("the second target displaced a file: {displaced}");
+            let home = guard.child(format!("displaced-{displaced}"));
+            let state = StateDir::resolve(&home);
+            plant_file(
+                &home.join(".first.conf"),
+                "user first\n",
+                Mode::DEFAULT_FILE,
+            );
+            let first = managed(
+                &state,
+                &home,
+                ".first.conf",
+                "bx first\n",
+                Mode::DEFAULT_FILE,
+            );
+            if displaced {
+                plant_file(
+                    &home.join(".linked/app.conf"),
+                    "user app\n",
+                    Mode::DEFAULT_FILE,
+                );
+            }
+            let second = managed(
+                &state,
+                &home,
+                ".linked/app.conf",
+                "bx app\n",
+                Mode::DEFAULT_FILE,
+            );
+            // `~/.linked` becomes a link into a checkout that is not mounted.
+            std::fs::remove_dir_all(home.join(".linked")).expect("rm the directory");
+            std::os::unix::fs::symlink(home.join("unmounted/linked"), home.join(".linked"))
+                .expect("link");
+
+            let entry = entry_for(&state, &home, &second).expect("managed");
+            let preview = plan_restore(&entry, &home).expect("preview");
+            let Restoration::Conflict { note, dest } = &preview else {
+                panic!("{case}: the preview is a conflict: {preview:?}");
+            };
+            assert_eq!(*dest, home.join(".linked/app.conf"), "{case}");
+            assert!(
+                note.contains("its parent ~/.linked does not resolve"),
+                "{case}: {note}"
+            );
+            assert!(!note.contains(&*home.to_string_lossy()), "{case}: {note}");
+
+            let done = restore(&state, &home, &[first.clone(), second.clone()])
+                .expect("an unusable parent does not stop rm");
+            assert!(
+                matches!(
+                    done.as_slice(),
+                    [Restored::Reverted { .. }, Restored::Conflict { .. }]
+                ),
+                "{case}: {done:?}"
+            );
+            let Restored::Conflict { note: reported, .. } = &done[1] else {
+                unreachable!()
+            };
+            assert_eq!(reported, note, "{case}: rm says what the preview said");
+            assert_eq!(
+                peek(&home.join(".first.conf")).expect("restored").0,
+                b"user first\n",
+                "{case}"
+            );
+            assert!(!state.journal().exists(), "{case}: the session finished");
+            assert!(entry_for(&state, &home, &first).is_none(), "{case}");
+            assert!(
+                entry_for(&state, &home, &second).is_some(),
+                "{case}: bx forgets nothing about the conflict"
+            );
+
+            assert_eq!(
+                crate::recover::before_writing(&state).expect("the next writing run"),
+                crate::recover::Outcome::Nothing,
+                "{case}"
+            );
+            assert_eq!(
+                peek(&home.join(".first.conf")).expect("still restored").0,
+                b"user first\n",
+                "{case}: nothing rolled back"
+            );
+        }
     }
 
     #[test]

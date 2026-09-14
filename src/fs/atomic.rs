@@ -352,6 +352,75 @@ pub enum Error {
         /// The mode its directory target declares.
         declared: Mode,
     },
+    /// A declared mode denies the owner what bx itself needs to come back to
+    /// the path: read, write and search on a directory, read on a file.
+    ///
+    /// bx lists a directory target, creates its temporary files in it and
+    /// renames them into place, and it reads a file target's bytes to compare
+    /// them. Applying such a mode would succeed once and leave every later
+    /// `plan` failing with a permission error, against Invariant 3, so it is
+    /// refused before anything is observed again, created, written or
+    /// chmod'd. [`compare`] and [`compare_dir`] announce it as an
+    /// [`Action::Conflict`] in the same words, so `apply` never reaches it for
+    /// a target `plan` printed.
+    #[error("{} {}. Nothing was changed", .path.display(), owner_locked_out(*.declared, *.needs))]
+    OwnerLockedOut {
+        /// The target, or the declared directory a write would create.
+        path: PathBuf,
+        /// The mode declared for it.
+        declared: Mode,
+        /// The owner bits bx needs: `0700` for a directory, `0400` for a file.
+        needs: Mode,
+    },
+}
+
+/// What bx needs the owner of a directory it writes into to be granted: read,
+/// to list it; write, to create temporary files in it and rename them into
+/// place; search, to reach anything inside it.
+const DIR_OWNER_NEEDS: Mode = Mode::PRIVATE_DIR;
+
+/// What bx needs the owner of a file target to be granted: read, to observe
+/// its bytes.
+const FILE_OWNER_NEEDS: Mode = Mode::from_bits(0o400);
+
+/// The words [`Error::OwnerLockedOut`] and `plan`'s conflict note share: the
+/// owner bits of `needs` that `declared` lacks, and why bx needs them.
+fn owner_locked_out(declared: Mode, needs: Mode) -> String {
+    let missing = needs.bits() & !declared.bits();
+    let names: Vec<&str> = [(0o400, "read"), (0o200, "write"), (0o100, "search")]
+        .into_iter()
+        .filter(|(bit, _)| missing & bit != 0)
+        .map(|(_, name)| name)
+        .collect();
+    let named = match names.as_slice() {
+        [init @ .., last] if !init.is_empty() => format!("{} and {last}", init.join(", ")),
+        _ => names.concat(),
+    };
+    let why = if needs == DIR_OWNER_NEEDS {
+        "bx lists a directory target, creates temporary files in it and renames them into place, \
+         so its mode must grant the owner read, write and search"
+    } else {
+        "bx reads a file target's bytes to compare them with what it wants there, so its mode \
+         must grant the owner read"
+    };
+    format!("declares {declared}, which denies its owner {named} ({missing:04o}): {why} ({needs})")
+}
+
+/// Refuse `declared` for `path` unless it grants the owner every bit of
+/// `needs` — see [`Error::OwnerLockedOut`].
+///
+/// # Errors
+///
+/// [`Error::OwnerLockedOut`].
+fn refuse_owner_locked_out(path: &Path, declared: Mode, needs: Mode) -> Result<(), Error> {
+    if declared.includes(needs) {
+        return Ok(());
+    }
+    Err(Error::OwnerLockedOut {
+        path: path.to_path_buf(),
+        declared,
+        needs,
+    })
 }
 
 /// The message of [`Error::SetIdNotKept`], or of
@@ -411,7 +480,8 @@ impl Error {
             | Self::DirectorySetIdNotKept { path, .. }
             | Self::ParentComponent(path)
             | Self::DirectoryTargetPending { path, .. }
-            | Self::UndeclaredDirectory { path, .. } => path,
+            | Self::UndeclaredDirectory { path, .. }
+            | Self::OwnerLockedOut { path, .. } => path,
         }
     }
 }
@@ -713,7 +783,9 @@ pub struct Outcome {
 ///   `plan` is refused rather than overwritten. [`set_mode`] is not the apply
 ///   for it: it compares nothing with `plan`.
 /// * [`Action::Conflict`] — a directory, a symlink, or anything else that is
-///   not a regular file.
+///   not a regular file; and, whatever is there, a declared mode that does not
+///   grant the owner read (`0400`), which [`stage`] refuses with
+///   [`Error::OwnerLockedOut`]. The note is that error's words, less the path.
 ///
 /// `home` only names things: a directory the parent note mentions is written
 /// `~/…` when it is under `home`, through [`crate::paths::to_portable`],
@@ -721,6 +793,17 @@ pub struct Outcome {
 /// directory outside it stays absolute. Nothing in the verdict depends on it.
 #[must_use]
 pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outcome {
+    // So does a declared mode bx could not read back: `stage` refuses it
+    // whatever is on disk.
+    if !desired.mode.includes(FILE_OWNER_NEEDS) {
+        return Outcome {
+            action: Action::Conflict,
+            content_drift: false,
+            mode_drift: None,
+            note: Some(owner_locked_out(desired.mode, FILE_OWNER_NEEDS)),
+            parent_note: None,
+        };
+    }
     // A parent that does not resolve settles the verdict on its own: there is
     // no directory to write into and none bx can create, so announcing
     // anything but a conflict would announce work `apply` cannot do.
@@ -896,6 +979,9 @@ impl Pending {
 ///
 /// # Errors
 ///
+/// [`Error::OwnerLockedOut`], before anything is observed or made, when `mode`
+/// does not grant the owner read, or when a missing parent it would create is
+/// declared at a mode that does not grant the owner read, write and search.
 /// [`Error::Changed`] when the destination is no longer what `planned`
 /// observed, or `planned` observed a different path. [`Error::UnusableParent`],
 /// [`Error::Symlink`] or [`Error::NotAFile`] when `planned` or the second
@@ -917,6 +1003,8 @@ pub fn stage(
     // Spelled as `observe` spells it, so `link/` is the link.
     let dest = lexical(dest)?;
     let dest = dest.as_path();
+    // The declaration before the disk: it is refused whatever is there.
+    refuse_owner_locked_out(dest, mode, FILE_OWNER_NEEDS)?;
     if planned.path != dest {
         return Err(Error::Changed {
             path: dest.to_path_buf(),
@@ -1293,9 +1381,21 @@ pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
 ///   with a `chmod` and a read-back of the special bits that stuck. The note
 ///   reads exactly `mode 0755 -> 0700`, as for a file.
 /// * [`Action::Conflict`] — anything that is not a directory, including a
-///   symlink to one: bx does not chmod a directory through a link.
+///   symlink to one: bx does not chmod a directory through a link. And,
+///   whatever is there, a declared mode that does not grant the owner read,
+///   write and search (`0700`), which [`ensure_dir`] refuses with
+///   [`Error::OwnerLockedOut`]; the note is that error's words, less the path.
 #[must_use]
 pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
+    if !mode.includes(DIR_OWNER_NEEDS) {
+        return Outcome {
+            action: Action::Conflict,
+            content_drift: false,
+            mode_drift: None,
+            note: Some(owner_locked_out(mode, DIR_OWNER_NEEDS)),
+            parent_note: None,
+        };
+    }
     if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
         return Outcome {
             action: Action::Conflict,
@@ -1354,7 +1454,10 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// and nothing at all for
 /// `Conflict`, which is reported rather than raised because it is a verdict
 /// `plan` already printed. `plan` must use [`observe`] + [`compare_dir`], not
-/// this.
+/// this. The one conflict raised instead is a declared mode that does not
+/// grant the owner read, write and search: it is a fault in the declaration
+/// rather than a verdict about the disk, so it is refused with
+/// [`Error::OwnerLockedOut`] before the path is observed again.
 ///
 /// It returns what a ledger needs to reverse it: the action, the observation
 /// it acted on — so the mode a `Modify` overwrote is `prior.mode` — and the
@@ -1383,6 +1486,9 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 ///
 /// # Errors
 ///
+/// [`Error::OwnerLockedOut`], before anything is observed or changed, when
+/// `mode`, or the mode declared for a missing ancestor it would create, does
+/// not grant the owner read, write and search;
 /// [`Error::Changed`] when the path is no longer what `plan` saw;
 /// [`Error::UndeclaredDirectory`] when an earlier call in this apply made the
 /// directory at another mode; [`Error::DirectorySetIdNotKept`] when a declared
@@ -1402,6 +1508,9 @@ pub fn ensure_dir(
     // directory a chmod through it would change.
     let path = lexical(path)?;
     let path = path.as_path();
+    // Before the path is looked at again, and before it is declared: a mode bx
+    // could not list, write into or search is no verdict about the disk.
+    refuse_owner_locked_out(path, mode, DIR_OWNER_NEEDS)?;
     let fresh = observe(path)?;
     act_on_dir(path, mode, planned, fresh, created)
 }
@@ -1952,12 +2061,21 @@ fn create_missing_dirs(
     // removed it would be deleting a directory another tool made — Invariant 1,
     // with no way to notice afterwards, because the wrong list is durable on
     // disk by the time `bx rm` reads it.
+    let modes: Vec<(&PathBuf, Mode)> = missing
+        .iter()
+        .rev()
+        .map(|path| match leaf_mode {
+            Some(mode) if path == dir => (path, mode),
+            _ => (path, created.declared(path).unwrap_or(Mode::DEFAULT_DIR)),
+        })
+        .collect();
+    // Every mode checked before the first `mkdir`, so a declared mode bx could
+    // not write into leaves nothing behind.
+    for (path, mode) in &modes {
+        refuse_owner_locked_out(path, *mode, DIR_OWNER_NEEDS)?;
+    }
     let mut made_here = Vec::with_capacity(missing.len());
-    for path in missing.iter().rev() {
-        let mode = match leaf_mode {
-            Some(mode) if path == dir => mode,
-            _ => created.declared(path).unwrap_or(Mode::DEFAULT_DIR),
-        };
+    for (path, mode) in modes {
         if let Some(made) = create_dir_at(path, mode)? {
             made_here.push((path.clone(), made));
         }
@@ -3939,6 +4057,156 @@ mod tests {
             "plan saw nothing, and it is now a directory at 0777"
         );
         assert_eq!(mode_of_path(&dir), Mode::from_bits(0o777));
+    }
+
+    /// What `plan` prints for a directory target whose mode denies its owner
+    /// `0100`, declared `0600`.
+    const DIR_0600_NOTE: &str = "declares 0600, which denies its owner search (0100): bx lists a \
+         directory target, creates temporary files in it and renames them into place, so its \
+         mode must grant the owner read, write and search (0700)";
+
+    /// The refusal a declared mode that locks its owner out gets, naming
+    /// `path` and the note `plan` printed for it.
+    fn assert_owner_locked_out(err: &Error, path: &Path, note: &str) {
+        let message = err.to_string();
+        assert!(
+            matches!(err, Error::OwnerLockedOut { path: named, .. } if named == path),
+            "expected OwnerLockedOut naming {}, got {err:?}",
+            path.display(),
+        );
+        assert_eq!(err.path(), path, "{message}");
+        assert_eq!(
+            message,
+            format!("{} {note}. Nothing was changed", path.display()),
+        );
+    }
+
+    #[test]
+    fn a_directory_target_that_denies_its_owner_rwx_is_refused_before_any_change() {
+        let home = guarded_home();
+        let ssh = home.child(".ssh");
+        std::fs::create_dir(&ssh).expect("mkdir");
+        set_mode(&ssh, Mode::PRIVATE_DIR).expect("chmod");
+        seed(&ssh.join("config"), b"Host *\n", Mode::PRIVATE_FILE);
+        let declared = Mode::from_bits(0o600);
+        let conflict = |note: &str| Outcome {
+            action: Action::Conflict,
+            content_drift: false,
+            mode_drift: None,
+            note: Some(note.to_string()),
+            parent_note: None,
+        };
+
+        // An existing ~/.ssh declared 0600: bx could never list it again.
+        let planned = observe(&ssh).expect("plan observes");
+        let announced = compare_dir(&planned, declared);
+        let applied = ensure_dir(&ssh, declared, &planned, &mut CreatedDirs::new());
+        let after = std::fs::symlink_metadata(&ssh).expect("stat");
+        set_mode(&ssh, Mode::PRIVATE_DIR).expect("unlock for the assertions");
+        assert_eq!(
+            announced,
+            conflict(DIR_0600_NOTE),
+            "plan announces the refusal"
+        );
+        let err = applied.expect_err("apply refuses a mode that locks bx out");
+        assert_owner_locked_out(&err, &ssh, DIR_0600_NOTE);
+        assert_eq!(
+            (mode_of(&after), Some(Stamp::of(&after))),
+            (Mode::PRIVATE_DIR, planned.stamp),
+            "nothing on disk changed, not even for an instant a ctime would show",
+        );
+        assert_eq!(names_in(&ssh), vec![OsString::from("config")]);
+        assert_eq!(
+            observe(&ssh.join("config")).expect("still readable").bytes,
+            Some(b"Host *\n".to_vec()),
+        );
+
+        // An absent directory declared 0500, missing write: nothing is created.
+        let aws = home.child(".aws");
+        let declared = Mode::from_bits(0o500);
+        let note = "declares 0500, which denies its owner write (0200): bx lists a directory \
+                    target, creates temporary files in it and renames them into place, so its \
+                    mode must grant the owner read, write and search (0700)";
+        let planned = observe(&aws).expect("plan observes");
+        assert_eq!(compare_dir(&planned, declared), conflict(note));
+        let err = ensure_dir(&aws, declared, &planned, &mut CreatedDirs::new())
+            .expect_err("apply refuses to create it");
+        assert_owner_locked_out(&err, &aws, note);
+        assert!(!aws.exists(), "nothing was created");
+
+        // A declared directory a write beneath it would create, declared 0400:
+        // refused by the write, before any directory is made.
+        let gnupg = home.child(".gnupg");
+        let dest = gnupg.join("gpg.conf");
+        let mut created = CreatedDirs::new();
+        created.declare(&gnupg, Mode::from_bits(0o400));
+        let planned = observe(&dest).expect("plan observes");
+        let err = stage(&dest, Mode::PRIVATE_FILE, &planned, &mut created)
+            .expect_err("stage refuses to create a directory it could not write into");
+        assert_owner_locked_out(
+            &err,
+            &gnupg,
+            "declares 0400, which denies its owner write and search (0300): bx lists a \
+             directory target, creates temporary files in it and renames them into place, so \
+             its mode must grant the owner read, write and search (0700)",
+        );
+        assert!(!gnupg.exists(), "nothing was created");
+        assert!(!created.contains(&gnupg));
+    }
+
+    #[test]
+    fn a_file_target_that_denies_its_owner_read_is_refused_before_any_change() {
+        let home = guarded_home();
+        let dir = home.child("d");
+        let declared = Mode::from_bits(0o200);
+        let note = "declares 0200, which denies its owner read (0400): bx reads a file target's \
+                    bytes to compare them with what it wants there, so its mode must grant the \
+                    owner read (0400)";
+        let conflict = Outcome {
+            action: Action::Conflict,
+            content_drift: false,
+            mode_drift: None,
+            note: Some(note.to_string()),
+            parent_note: None,
+        };
+
+        // An existing file declared 0200: its bytes could never be compared.
+        let existing = dir.join("existing");
+        seed(&existing, b"before", Mode::DEFAULT_FILE);
+        let planned = observe(&existing).expect("plan observes");
+        let announced = compare(&planned, &desired(b"after", declared), home.path());
+        let applied = stage(&existing, declared, &planned, &mut CreatedDirs::new())
+            .and_then(|staged| staged.commit(b"after"));
+        let after = std::fs::symlink_metadata(&existing).expect("stat");
+        set_mode(&existing, Mode::DEFAULT_FILE).expect("unlock for the assertions");
+        assert_eq!(announced, conflict, "plan announces the refusal");
+        let err = applied.expect_err("apply refuses a mode that locks bx out");
+        assert_owner_locked_out(&err, &existing, note);
+        assert_eq!(
+            (mode_of(&after), Some(Stamp::of(&after))),
+            (Mode::DEFAULT_FILE, planned.stamp),
+            "nothing on disk changed",
+        );
+        assert_eq!(std::fs::read(&existing).expect("read"), b"before");
+
+        // An absent file declared 0200, through the one-call writer.
+        let fresh = dir.join("fresh");
+        let planned = observe(&fresh).expect("plan observes");
+        assert_eq!(
+            compare(&planned, &desired(b"x", declared), home.path()),
+            conflict
+        );
+        let applied = write_atomically(&fresh, b"x", declared);
+        if fresh.exists() || std::fs::symlink_metadata(&fresh).is_ok() {
+            set_mode(&fresh, Mode::PRIVATE_FILE).expect("unlock for the assertions");
+        }
+        let err = applied.expect_err("apply refuses to create it");
+        assert_owner_locked_out(&err, &fresh, note);
+        assert_eq!(
+            names_in(&dir),
+            vec![OsString::from("existing")],
+            "nothing was created, and no temporary file is left",
+        );
     }
 
     #[test]

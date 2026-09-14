@@ -16,7 +16,9 @@
 //! that says who holds the lock, so a refused exclusive acquisition reports the
 //! holder's pid and program, read from the lock file's body.
 
+use std::cell::Cell;
 use std::fmt;
+use std::marker::PhantomData;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
@@ -91,6 +93,27 @@ impl fmt::Display for Holder {
 /// precondition for every write to the state directory, and
 /// [`super::Ledger::open`] demands a reference to one so that `&mut Ledger` is
 /// itself the proof the lock was taken.
+///
+/// # One thread of control at a time
+///
+/// Each guard locks its own open file description, so it excludes every other
+/// guard: another process's, and a second one this process acquires. It cannot
+/// exclude two threads sharing *this* guard. Both would hold the proof, both
+/// could judge the same damaged file, and the second's move aside would find
+/// the name already gone and report a failure that did not happen. So the
+/// guard is not [`Sync`]: a `&ExclusiveLock` cannot reach another thread, and
+/// exclusion holds per thread of control by type. It is still [`Send`], so the
+/// guard itself can move to a thread, which then holds it alone.
+///
+/// ```compile_fail
+/// fn shared_between_threads<T: Sync>() {}
+/// shared_between_threads::<bx::state::ExclusiveLock>();
+/// ```
+///
+/// ```
+/// fn moved_to_a_thread<T: Send>() {}
+/// moved_to_a_thread::<bx::state::ExclusiveLock>();
+/// ```
 #[derive(Debug)]
 pub struct ExclusiveLock {
     /// Kept open for the lock's lifetime; closing it releases the lock.
@@ -98,6 +121,9 @@ pub struct ExclusiveLock {
     /// The lock file this locked: its path, for error messages, and its
     /// identity, for [`ExclusiveLock::guards`].
     held: HeldLock,
+    /// Makes the guard `!Sync`, so it cannot be shared between threads: see
+    /// "One thread of control at a time" above.
+    not_sync: PhantomData<Cell<()>>,
 }
 
 /// The lock file an [`ExclusiveLock`] locked: its path, and its device and
@@ -167,6 +193,7 @@ impl ExclusiveLock {
         Ok(Self {
             fd,
             held: HeldLock { path, stat },
+            not_sync: PhantomData,
         })
     }
 

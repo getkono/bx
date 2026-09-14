@@ -112,14 +112,17 @@ impl StateDir {
 
     /// The first quarantine path for a damaged state file: `<name>.corrupt`.
     ///
-    /// A later quarantine of the same file never reuses an occupied name, nor
-    /// refills a gap: [`move_aside`] takes the number after the highest of
-    /// `<name>.corrupt`, `<name>.corrupt.1`, `<name>.corrupt.2`, … present —
-    /// or, past a number with no successor that bx never makes, the lowest free
-    /// one. Numbered rather than timestamped, so the name a given sequence of damage
-    /// produces is deterministic; in creation order, so the last is the newest;
-    /// and never over an earlier one, because the earlier one may be the only
-    /// index there is to the user's restore blobs.
+    /// A later quarantine of the same file never reuses an occupied name:
+    /// [`move_aside`] takes the number after the highest of `<name>.corrupt`,
+    /// `<name>.corrupt.1`, `<name>.corrupt.2`, … present, so it does not refill
+    /// a gap and the last is the newest — until the top number,
+    /// `<name>.corrupt.<u64::MAX>`, is present, whoever made it. That number has
+    /// no successor, so while it is present each quarantine takes the lowest
+    /// free number instead: gaps are refilled and the numbers no longer say
+    /// which quarantine is newest. Numbered rather than timestamped, so the name
+    /// a given sequence of damage produces is deterministic; and never over an
+    /// earlier one, because the earlier one may be the only index there is to
+    /// the user's restore blobs.
     #[must_use]
     pub(crate) fn quarantine(path: &Path) -> PathBuf {
         let mut name = path.as_os_str().to_os_string();
@@ -176,6 +179,7 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
         path: path.to_path_buf(),
         source: source.into(),
     };
+    // No parent only for `/` or an empty path: never a resolved root, `restore/` or `shell/`.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
             path: parent.to_path_buf(),
@@ -198,11 +202,14 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
 ///
 /// The number is the one after the highest `<name>.corrupt[.<n>]` present —
 /// `<name>.corrupt` itself when there is none — and never a gap a deleted
-/// quarantine left. So the quarantines present are always numbered in the order
-/// they were made, and the last is the newest, whichever a human has removed.
-/// The one exception is a number with no successor, `<name>.corrupt.<u64::MAX>`,
-/// which bx itself never makes: past it the lowest free number is taken, so a
-/// crafted name can break the order but never block a quarantine.
+/// quarantine left. So the quarantines present are numbered in the order they
+/// were made, and the last is the newest, whichever a human has removed — until
+/// the top number, `<name>.corrupt.<u64::MAX>`, is present. Whoever made it — a
+/// crafted file, or bx itself when a crafted `<name>.corrupt.<u64::MAX - 1>` was
+/// the highest — it has no successor, so while it is present each quarantine
+/// takes the lowest free number: a gap is refilled, the numbers stop following
+/// the order the quarantines were made, and the newest can be the lowest. A
+/// crafted name can end that order, but it never blocks a quarantine.
 ///
 /// The rename is `RENAME_NOREPLACE`, so an existing quarantine is never
 /// destroyed — not by an earlier bx's leftovers, and not by a race; a name
@@ -223,8 +230,8 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
         std::io::Error::new(std::io::ErrorKind::InvalidInput, refused.to_string())
     })?;
     let mut n: u64 = match numbered(path)?.last() {
-        // Only a name bx never makes — `<name>.corrupt.<u64::MAX>` — has no
-        // number after it. Refusing there would let one crafted file block
+        // Only the top number — `<name>.corrupt.<u64::MAX>`, crafted, or made
+        // by bx after a crafted `<u64::MAX - 1>` — has no number after it. Refusing there would let one crafted file block
         // every later quarantine, so the count starts again at `0` instead and
         // skips every taken name below, which lands on the lowest free number:
         // a directory cannot hold 2^64 entries, so one always exists.
@@ -300,8 +307,10 @@ pub(crate) mod noreplace_seam {
     }
 }
 
-/// Every quarantine of `path` present now, in the order [`move_aside`] made
-/// them: `<name>.corrupt`, then `<name>.corrupt.1`, `<name>.corrupt.2`, ….
+/// Every quarantine of `path` present now, ascending by number:
+/// `<name>.corrupt`, then `<name>.corrupt.1`, `<name>.corrupt.2`, …. That is
+/// the order [`move_aside`] made them until the top number is present, and
+/// only by number after it — see [`move_aside`].
 ///
 /// Found by listing the directory, not by probing names until one is missing,
 /// so a gap — `.corrupt` deleted, `.corrupt.1` kept — hides nothing after it.
@@ -327,6 +336,7 @@ pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, Error> {
 ///
 /// A missing directory holds none.
 fn numbered(path: &Path) -> std::io::Result<Vec<u64>> {
+    // Every state file StateDir names is `root.join(<UTF-8 name>)`, so the else arm is unreachable.
     let (Some(root), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
         return Ok(Vec::new());
     };
@@ -463,6 +473,9 @@ fn check_local_layer(dir: &Path, mode: Mode) -> Result<(), Error> {
     if open_beyond_owner(file_mode) {
         return Err(Error::ExposedLocalLayer {
             path: dir.to_path_buf(),
+            // Resolved only once refused, for the remedy: the verdict above
+            // does not depend on it, and a link gone since stands for itself.
+            target: std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
             mode,
             file,
             file_mode,
@@ -756,6 +769,25 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_directory_that_refuses_to_be_narrowed_is_reported_naming_it() {
+        // r3 round 2b (P7R4-COV3): `tighten`'s `chmod` failing was never
+        // reached. procfs refuses every mode change on a process's own
+        // directory, to root as well, and that directory is `0555`: shared, so
+        // `tighten` tries to narrow it, and nothing about it can change.
+        let own = std::fs::canonicalize("/proc/self").expect("this process's /proc directory");
+        let found = mode_of(&own);
+        assert!(found.is_shared(), "{own:?} is {found}");
+
+        let err = tighten(&own, Mode::PRIVATE_DIR).expect_err("procfs refuses the chmod");
+        assert!(
+            matches!(&err, Error::CreateDir { path, source }
+                if *path == own && source.raw_os_error() == Some(Errno::PERM.raw_os_error())),
+            "got {err}",
+        );
+        assert_eq!(mode_of(&own), found, "left as it was");
+    }
+
+    #[test]
     fn a_quarantine_name_appends_rather_than_replacing_the_extension() {
         assert_eq!(
             StateDir::quarantine(Path::new("/s/bx/ledger.mpk")),
@@ -825,7 +857,7 @@ mod tests {
 
     #[test]
     fn a_quarantine_number_that_cannot_be_followed_leaves_the_lowest_free_one() {
-        // r3 round 1 (L1a): a name bx never makes, `<name>.corrupt.<u64::MAX>`,
+        // r3 round 1 (L1a): a crafted top number, `<name>.corrupt.<u64::MAX>`,
         // left no number after the highest, so every later quarantine of the
         // file failed with "no free quarantine name".
         let dir = tempfile::tempdir().expect("tempdir");
@@ -950,7 +982,7 @@ mod tests {
             assert!(
                 matches!(
                     &err,
-                    Error::ExposedLocalLayer { path, mode, file, file_mode: found }
+                    Error::ExposedLocalLayer { path, mode, file, file_mode: found, .. }
                         if path == dir.root() && *mode == Mode::from_bits(dir_mode)
                             && *file == dir.local_toml()
                             && *found == Mode::from_bits(file_mode)
@@ -1041,7 +1073,7 @@ mod tests {
                 assert!(
                     matches!(
                         &err,
-                        Error::ExposedLocalLayer { path, mode, file, file_mode }
+                        Error::ExposedLocalLayer { path, mode, file, file_mode, .. }
                             if path == dir.root() && *mode == Mode::from_bits(0o711)
                                 && *file == dir.local_toml()
                                 && *file_mode == Mode::from_bits(0o644)
@@ -1054,6 +1086,60 @@ mod tests {
             }
             assert_eq!(mode_of(&real), Mode::from_bits(0o644), "never chmodded");
         }
+    }
+
+    #[test]
+    fn an_exposed_local_toml_behind_a_private_ancestor_is_refused_without_claiming_anyone_can_open_it()
+     {
+        // r3 round 2b (decision 47): the refusal judges only the linked
+        // directory and the file, which is conservative; but its message said
+        // "anyone who knows its name can open it", which is false when an
+        // ancestor no other account can search stands in the way.
+        let home = guarded_home();
+        let private = home.child("private");
+        let target = private.join("state");
+        std::fs::create_dir_all(&target).expect("target");
+        let file = target.join("local.toml");
+        std::fs::write(&file, "[vars]\n").expect("local.toml");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o711))
+            .expect("chmod dir");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod parent");
+        std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+        std::os::unix::fs::symlink(&target, home.child(".local/state/bx")).expect("symlink");
+        let dir = StateDir::resolve(home.path());
+        let real = std::fs::canonicalize(&target).expect("canonical target");
+
+        let err = dir.ensure().expect_err("the refusal stays");
+        assert!(
+            matches!(
+                &err,
+                Error::ExposedLocalLayer { path, target, mode, file, file_mode }
+                    if path == dir.root() && *target == real
+                        && *mode == Mode::from_bits(0o711)
+                        && *file == dir.local_toml()
+                        && *file_mode == Mode::from_bits(0o644)
+            ),
+            "got {err}",
+        );
+        let message = err.to_string();
+        assert!(
+            !message.contains("anyone who knows its name can open it"),
+            "claims anyone can open it: {message}",
+        );
+        for needle in [
+            "0711".to_string(),
+            "0644".to_string(),
+            format!("chmod 600 {}", dir.local_toml().display()),
+            format!("chmod go-x {}", real.display()),
+        ] {
+            assert!(message.contains(&needle), "missing {needle:?}: {message}");
+        }
+        assert_eq!(mode_of(&target), Mode::from_bits(0o711), "never chmodded");
+        assert_eq!(mode_of(&file), Mode::from_bits(0o644), "never chmodded");
+        assert!(!target.join("restore").exists(), "nothing was put in it");
     }
 
     #[test]
@@ -1123,6 +1209,39 @@ mod tests {
         let err = result.expect_err("the linked file cannot be examined");
         assert!(
             matches!(&err, Error::Read { path, .. } if *path == dir.local_toml()),
+            "got {err}",
+        );
+    }
+
+    #[test]
+    fn a_linked_local_toml_whose_real_path_cannot_be_resolved_is_an_error_naming_it() {
+        // r3 round 2b (P7R4-COV2): resolving a linked `local.toml` to find the
+        // directory that holds it failing was never reached. A link the kernel
+        // follows, to a file whose real path is longer than `PATH_MAX`, can be
+        // examined but not resolved.
+        let (home, _target, dir) = linked_state(0o711);
+        let part = "d".repeat(200);
+        let outer: PathBuf = std::iter::repeat_n(part.as_str(), 19).collect();
+        let inner: PathBuf = std::iter::repeat_n(part.as_str(), 12).collect();
+        std::fs::create_dir_all(home.child("deep").join(&outer)).expect("outer");
+        std::os::unix::fs::symlink(home.child("deep").join(&outer), home.child("short"))
+            .expect("short");
+        let near = home.child("short").join(&inner);
+        std::fs::create_dir_all(&near).expect("inner, through the short link");
+        std::fs::write(near.join("local.toml"), "[values]\n").expect("local.toml");
+        std::os::unix::fs::symlink(near.join("local.toml"), dir.local_toml()).expect("symlink");
+        assert!(
+            std::fs::metadata(dir.local_toml()).is_ok_and(|meta| meta.is_file()),
+            "the link can be followed",
+        );
+
+        let err = dir
+            .ensure()
+            .expect_err("the linked file cannot be resolved");
+        assert!(
+            matches!(&err, Error::Read { path, source }
+                if *path == dir.local_toml()
+                    && source.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error())),
             "got {err}",
         );
     }

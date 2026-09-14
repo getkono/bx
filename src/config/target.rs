@@ -288,7 +288,8 @@ pub enum KeyPathError {
 /// account's home directory: a target path is parsed against it so that a file
 /// under the home has exactly one spelling, `~/…`, and cannot acquire a second
 /// key by being written absolutely somewhere else in the layer set. See
-/// [`Portable::parse_in`].
+/// [`Portable::parse_in`]. It also decides which paths are the home or above
+/// it, where only a `dir = true` target may point.
 ///
 /// # Errors
 ///
@@ -307,19 +308,12 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
     let direction = parse_direction(&ctx, table)?;
     let format = parse_format(&ctx, table)?;
 
-    if body != Body::Dir && matches!(path.as_str(), "~" | "/") {
-        // The home and the filesystem root are directories. A file body at
-        // either is an `own` claim on a directory as if it were a file, which
-        // no writer can honour; every spelling normalises to one of these two.
-        return Err(ctx.bad(
-            table,
-            "path",
-            format!(
-                "path = {raw_path:?} is a root directory itself, so only a `dir = true` \
-                 target may name it; a file target names a file beneath it"
-            ),
-        ));
-    }
+    // The home and every directory above it, the filesystem root included, are
+    // directories. A file body at any of them is an `own` claim on a directory
+    // as if it were a file, which no writer can honour. Resolution re-applies
+    // this to the path a placeholder substitution produced.
+    refuse_file_at_home_or_above(raw_path, &path, &body, home)
+        .map_err(|message| ctx.bad(table, "path", message))?;
 
     if body == Body::Dir {
         // The same rule the flat discriminant keys already follow elsewhere: a
@@ -621,6 +615,38 @@ pub(crate) fn confine_to_repo(key: &str, raw: &str) -> Result<PathBuf, String> {
     }
 
     Ok(PathBuf::from(parts.join("/")))
+}
+
+/// Refuse a file body at the home or at any directory above it.
+///
+/// The home, its ancestors and `/` are directories, so a file body at one is an
+/// `own` claim on a directory as if it were a file, which no writer can honour.
+/// Which paths those are is decided lexically from `path` and `home`, never from
+/// the disk: `path` is `~`, or it is not under the home and the normalised home
+/// starts with it component by component, so `/var/home` is above
+/// `/var/home/example` and `/var/homes` is not. A `dir = true` target may name
+/// any of them.
+///
+/// Like [`confine_to_repo`] it has two callers: the parser, on the path as
+/// written, and [`super::resolve`], on the path a substitution produced, because
+/// `~/{{leaf}}` with `leaf` answered `.` is `~`. `shown` is the spelling to
+/// quote, and the message is returned for each caller to attach its own
+/// provenance.
+pub(crate) fn refuse_file_at_home_or_above(
+    shown: &str,
+    path: &Portable,
+    body: &Body,
+    home: &Path,
+) -> Result<(), String> {
+    let at_or_above = path.as_str() == "~"
+        || (!path.under_home() && crate::paths::normalize(home).starts_with(path.as_str()));
+    if *body != Body::Dir && at_or_above {
+        return Err(format!(
+            "path = {shown:?} is the home directory or a directory above it, so only a \
+             `dir = true` target may name it; a file target names a file beneath it"
+        ));
+    }
+    Ok(())
 }
 
 /// The body one declared key names.
@@ -945,7 +971,9 @@ mod tests {
     /// `path = "~"` and `path = "/"` with `content` parsed as whole-file
     /// targets: an `attach = "own"` claim on the home directory, or on `/`, as
     /// if it were a file. Every spelling that normalises to one of the two is the
-    /// same claim, and every kind of file body is the same mistake.
+    /// same claim, and every kind of file body is the same mistake. `/` is the
+    /// outermost of the home's ancestors, which
+    /// `a_directory_above_the_home_is_refused_as_a_file_target` covers.
     #[test]
     fn a_bare_root_is_refused_as_a_file_target() {
         for path in ["~", "~/", "~/.", "/", "//", "/.."] {
@@ -958,7 +986,7 @@ mod tests {
                 let text = format!("[[target]]\npath = \"{path}\"\n{body}");
                 let message = message(&text);
                 assert!(
-                    message.contains("a root directory itself"),
+                    message.contains("is the home directory or a directory above it"),
                     "{path:?} with {body:?}: {message}"
                 );
                 assert!(message.contains("bx.toml:2"), "{path:?}: {message}");
@@ -970,6 +998,56 @@ mod tests {
         let target = parse("[[target]]\npath = \"~\"\ndir = true\nmode = \"0700\"\n").unwrap();
         assert_eq!(target.body, Body::Dir);
         assert_eq!(target.path.as_str(), "~");
+    }
+
+    /// The home's ancestors are directories too, and so is the home by any spelling.
+    ///
+    /// Only `~` and `/` were refused: with the home at `/var/home/example`,
+    /// `path = "/var/home/example/.."` with `content` parsed as a file target at
+    /// `/var/home`, the same `own` claim on a directory as `~`. Which paths are
+    /// the home's ancestors is known from the home string, without the disk.
+    #[test]
+    fn a_directory_above_the_home_is_refused_as_a_file_target() {
+        for path in [
+            "/var",
+            "/var/home",
+            "/var/home/",
+            "/var/./home",
+            "/var/home/example/..",
+            "/var/home/example/../..",
+        ] {
+            for body in [
+                "content = \"x\"\n",
+                "file = \"files/x\"\n",
+                "attach = \"region\"\ncomment = \"#\"\ncontent = \"x\"\n",
+                "attach = \"include\"\ninclude = \"x\"\n",
+            ] {
+                let text = format!("[[target]]\npath = \"{path}\"\n{body}");
+                let message = message(&text);
+                assert!(
+                    message.contains("or a directory above it"),
+                    "{path:?} with {body:?}: {message}"
+                );
+                assert!(message.contains("bx.toml:2"), "{path:?}: {message}");
+            }
+        }
+
+        let target = parse("[[target]]\npath = \"/var/home\"\ndir = true\n").unwrap();
+        assert_eq!(target.body, Body::Dir);
+        assert_eq!(target.path.as_str(), "/var/home");
+
+        // Component-wise, not by string prefix: a sibling sharing the home's
+        // leading bytes, or the home's parent's other children, is not above it.
+        for path in [
+            "/var/home/examp",
+            "/var/homes",
+            "/var/home/other/.x",
+            "/etc/hosts",
+        ] {
+            let target = parse(&format!("[[target]]\npath = \"{path}\"\ncontent = \"x\"\n"))
+                .unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            assert_eq!(target.path.as_str(), path);
+        }
     }
 
     #[test]

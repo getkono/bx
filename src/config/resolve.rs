@@ -549,10 +549,15 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
 ///
 /// Detection looks a bare name up on `PATH` and opens an absolute path as it
 /// is; a relative name holding a `/` is never found, and an empty one would be
-/// joined onto every `PATH` directory. Checked once substituted, because an
-/// answer is where either most plausibly comes from.
+/// joined onto every `PATH` directory. A name made only of `.` and `..`
+/// segments (`/` among them) names a directory, which detection never counts
+/// as a tool. Checked once substituted, because an answer is where any of these
+/// most plausibly comes from.
 fn check_requirement(text: &str) -> Result<(), String> {
-    if text.is_empty() || (text.contains('/') && !text.starts_with('/')) {
+    let only_dots = text
+        .split('/')
+        .all(|segment| matches!(segment, "" | "." | ".."));
+    if only_dots || (text.contains('/') && !text.starts_with('/')) {
         return Err(format!(
             "`requires` names a tool by a bare name to look up on `PATH`, or by an \
              absolute path; got {text:?}"
@@ -1055,15 +1060,16 @@ mod tests {
     #[test]
     fn a_requires_that_detect_could_never_find_blocks_or_fails() {
         // Detection looks a tool up by a bare name on `PATH`, or opens an
-        // absolute path. An empty name, or a relative one holding a `/`, is
-        // never found, so the target would be reported as waiting on a tool no
-        // install could supply. Substituted text is checked like any field.
+        // absolute path. An empty name, a relative one holding a `/`, or one made
+        // only of `.` and `..` (a directory, never a tool) is never found, so the
+        // target would be reported as waiting on a tool no install could supply.
+        // Substituted text is checked like any field.
         const LAYER: &str = "[[value]]\nname = \"tool\"\nkind = \"string\"\n\
                              [[target]]\npath = \"~/.config/env\"\ncontent = \"x\"\n\
                              requires = [\"{{tool}}\"]\n\
                              [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
 
-        for answer in ["", "bin/sccache"] {
+        for answer in ["", "bin/sccache", ".", ".."] {
             let answered = resolved(LAYER, Some(&format!("[values]\ntool = \"{answer}\"\n")))
                 .unwrap_or_else(|e| panic!("{answer:?} failed the whole load: {e}"));
             let entry = blocked(&answered, 0);

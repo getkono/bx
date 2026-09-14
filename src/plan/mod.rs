@@ -20,7 +20,7 @@ mod decide;
 mod diff;
 mod execute;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
@@ -78,12 +78,18 @@ impl Env {
             home: paths::home()?,
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
-            no_color: std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+            no_color: no_color(std::env::var_os("NO_COLOR").as_deref()),
             stdout_tty: std::io::stdout().is_terminal(),
             stdin_tty: std::io::stdin().is_terminal(),
             stderr_tty: std::io::stderr().is_terminal(),
         })
     }
+}
+
+/// Whether a `NO_COLOR` value asks for no colour: set, to anything but the
+/// empty string.
+fn no_color(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
 }
 
 /// What a run decides against, loaded once.
@@ -768,6 +774,14 @@ pub(crate) mod tests {
         assert_eq!(inputs.repo(), home.child(".config/bx"));
         assert_eq!(inputs.state(), &StateDir::resolve(home.path()));
         assert!(!inputs.progress);
+    }
+
+    #[test]
+    fn no_color_is_asked_for_by_any_value_but_the_empty_string() {
+        assert!(!no_color(None));
+        assert!(!no_color(Some(OsStr::new(""))));
+        assert!(no_color(Some(OsStr::new("1"))));
+        assert!(no_color(Some(OsStr::new("0"))));
     }
 
     #[test]

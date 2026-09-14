@@ -771,6 +771,47 @@ mod tests {
     }
 
     #[test]
+    fn every_damage_says_what_is_wrong_with_the_file() {
+        // r3 round 1 (C4): two of the six texts were never asserted, and
+        // the others only in part, so an empty rendering survived mutation.
+        let cases = [
+            (Damage::Malformed, "it is not valid MessagePack"),
+            (
+                Damage::TrailingBytes,
+                "it has unexpected bytes after the end",
+            ),
+            (
+                Damage::WrongKind {
+                    found: OTHER.to_string(),
+                },
+                "it is a bx.other file",
+            ),
+            (
+                Damage::FutureVersion {
+                    found: 8,
+                    supported: 3,
+                },
+                "it is version 8, and this bx understands up to 3",
+            ),
+            (
+                Damage::DanglingLink,
+                "it is a symbolic link to something that does not exist, or that cannot be \
+                 followed",
+            ),
+            (
+                Damage::KeyMismatch {
+                    key: "~/.aaaa".to_string(),
+                    path: "~/.bbbb".to_string(),
+                },
+                "its entry for ~/.aaaa names a different path, ~/.bbbb",
+            ),
+        ];
+        for (damage, text) in cases {
+            assert_eq!(damage.to_string(), text, "{damage:?}");
+        }
+    }
+
+    #[test]
     fn a_file_of_the_wrong_kind_is_not_accepted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");

@@ -333,8 +333,11 @@ fn is_reserved(name: &str) -> bool {
 enum Kind {
     /// Where a tool keeps its config, data or cache: one path. The tool reads the whole
     /// value, `:` and all, so the whole value must be an absolute path — `~`
-    /// and `$HOME` expand to one — inside a declared root and outside bx's own
-    /// directories. A bare word, a relative path and a URL are all relative to
+    /// and `$HOME` expand to one — strictly beneath a declared root, never a
+    /// root itself, and outside bx's own directories. A tool may derive a
+    /// directory beside its own, as uv puts executables in
+    /// `$XDG_DATA_HOME/../bin`, so at a root that directory is outside every
+    /// root. A bare word, a relative path and a URL are all relative to
     /// wherever the shell happens to be, and are refused. Every `:`-separated
     /// entry is held to the same checks first, which costs only a path with a
     /// `:` in it. Every character is an ASCII letter or digit, `.`, `_`, `-`,
@@ -550,7 +553,9 @@ const INHERITED: &str = "\0";
 /// case is left to the declared roots themselves.
 ///
 /// Containment in a root is **one-directional**: a value inside a root is
-/// admitted, whatever lies beneath it. bx's own directories are the exception,
+/// admitted, whatever lies beneath it. A root contains itself, but a location
+/// may not be a root itself ([`Reason::DeclaredRootItself`]), because its tool
+/// may write beside it. bx's own directories are the exception,
 /// and are judged **both ways**: a location may neither lie inside one nor
 /// contain one ([`Reason::ContainsBxDirectory`]), because a tool clears its
 /// own directory — `uv cache clean` on `UV_CACHE_DIR=~/.local/state` deletes
@@ -812,7 +817,8 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// the shell does not manage, use a name bx may generate, move the value out of
 /// bx's own directory, move it out of bx's config repo, point it beside bx's
 /// directories rather than around them, write a path of plain characters with
-/// no `..`, move it inside a declared root, write an absolute path,
+/// no `..`, move it inside a declared root, point it beneath a declared root
+/// rather than at one, write an absolute path,
 /// give a program no arguments, give a setting a value it accepts, define the
 /// referenced variable earlier, give the guard a home, fix the line
 /// that assigned it, shorten it — so a caller that only knew *which* variable
@@ -867,6 +873,14 @@ pub enum Reason {
     /// It resolves to a path, but not one inside any declared root.
     #[error("resolves outside every declared root")]
     OutsideDeclaredRoots,
+    /// A location, or an entry of a list of locations, that is a declared root
+    /// itself rather than a path beneath one. A tool may derive a directory
+    /// beside its own: uv puts executables in `$XDG_DATA_HOME/../bin`, and so
+    /// does every tool built on dirs-next, which lands outside every root when
+    /// the value is one. A tool given a whole root also clears everything else
+    /// the root holds. Point the value beneath the root.
+    #[error("is a declared root itself, and its tool may write beside it, outside every root")]
+    DeclaredRootItself,
     /// Empty, a bare word, a URL, or a relative path, where a path that can be
     /// shown to be somewhere is needed. For a list, one of its entries is.
     #[error("is not an absolute path")]
@@ -1018,11 +1032,12 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///
 /// * a **location** needs a declared root, and every `:`-entry, and then the
 ///   whole value read as one path, must be absolute, outside bx's own
-///   directories and inside a root;
+///   directories and strictly beneath a root, never a root itself
+///   ([`Reason::DeclaredRootItself`]);
 /// * a **list of locations** is judged the same way entry by entry, and not
 ///   as a whole;
 /// * an **anchor** is judged as a location's one path, except that it may
-///   contain bx's own directories;
+///   contain bx's own directories and may be a root;
 /// * a **program** is one absolute path outside bx's own directories, or one
 ///   bare command name;
 /// * a **search list** has every entry absolute and outside bx's own
@@ -1037,7 +1052,8 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// ([`Reason::BxOwnedDirectory`]) or its config repo
 /// ([`Reason::InsideConfigRepo`]), checked in that order and before any root.
 /// No location or list of locations may contain either of bx's directories
-/// ([`Reason::ContainsBxDirectory`]); an anchor may. The characters are an allowlist because
+/// ([`Reason::ContainsBxDirectory`]), or be a root itself
+/// ([`Reason::DeclaredRootItself`]); an anchor may. The characters are an allowlist because
 /// the guard cannot know which tool reads which other character its own way.
 /// A value that does not resolve cannot be shown to be any of those, and is
 /// refused for why it does not.
@@ -1184,12 +1200,15 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
                     .find_map(|entry| refuses_entry(entry, None, roots));
                 // A location's tool reads the whole value as one path, whose
                 // `:` its entries were judged apart at. Every entry has passed
-                // by now, so this can newly refuse only as
-                // `OutsideDeclaredRoots`: the whole value begins with its first
-                // absolute entry, holds only allowed characters and `:`, and
-                // merging entries at a `:` makes a component holding `:`, which
-                // no directory bx owns or roots names, so it cannot complete a
-                // match with one that no entry already made.
+                // by now, so this cannot newly refuse: the whole value begins
+                // with its first absolute entry, holds only allowed characters
+                // and `:`, and merging entries at a `:` makes a component
+                // holding `:`, which no directory bx owns or roots names, so it
+                // cannot complete a match with one that no entry already made.
+                // And the first entry lies strictly beneath a root, so the
+                // whole value's parent begins with that entry's parent, which
+                // is inside the root. It is judged anyway, as the one path the
+                // tool reads, so that stays true if an entry's rule changes.
                 entries.or_else(|| {
                     (kind == Kind::Location)
                         .then(|| refuses_entry(value, Some(':'), roots))
@@ -1254,7 +1273,7 @@ fn is_bare_word(value: &str) -> bool {
 /// path that is relative, climbs, or holds a character outside the allowlist
 /// is refused for that before any reasoning about where it is: bx cannot read
 /// such a value as a path at all. Inside bx's own directories comes next, then
-/// containing them, then the roots.
+/// containing them, then the roots: inside one, then beneath one.
 fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, separator, roots)
         // bx's directories outrank the roots in this direction too.
@@ -1264,6 +1283,13 @@ fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option
                 .then_some(Reason::ContainsBxDirectory)
         })
         .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
+        // Inside a root, but with a parent in none: the path is a root itself.
+        .or_else(|| {
+            (!paths::normalize(Path::new(path))
+                .parent()
+                .is_some_and(|parent| roots.contains(parent)))
+            .then_some(Reason::DeclaredRootItself)
+        })
 }
 
 /// Why a resolved [`Kind::Anchor`] may not be written, or `None` if it may:
@@ -2228,6 +2254,10 @@ mod tests {
         assert_eq!(
             Reason::OutsideDeclaredRoots.to_string(),
             "resolves outside every declared root"
+        );
+        assert_eq!(
+            Reason::DeclaredRootItself.to_string(),
+            "is a declared root itself, and its tool may write beside it, outside every root"
         );
         assert_eq!(
             Reason::BxOwnedDirectory.to_string(),
@@ -4504,14 +4534,23 @@ mod tests {
     fn a_location_is_the_one_path_its_tool_reads() {
         // cargo reads `CARGO_HOME` as one path, `:` and all. Each entry of this
         // value is inside the root, and the whole string is not: `example:` is
-        // one component, a sibling of the root.
+        // one component, a sibling of the root. Since #45 its first entry is
+        // the root itself, which is refused first, for either kind. With every
+        // entry strictly beneath a root, the whole string begins with its first
+        // entry's parent, so it lies inside that root too.
         let joined = "/var/mnt/scratch/example:/var/mnt/scratch/example/y";
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", joined, &rooted())),
-            Some(Reason::OutsideDeclaredRoots)
-        );
+        for name in ["CARGO_HOME", "GOPATH"] {
+            assert_eq!(
+                reason_of(&check(name, joined, &rooted())),
+                Some(Reason::DeclaredRootItself),
+                "{name}"
+            );
+        }
+        let beneath = "/var/mnt/scratch/example/x:/var/mnt/scratch/example/y";
+        for name in ["CARGO_HOME", "GOPATH"] {
+            assert_eq!(check(name, beneath, &rooted()), Verdict::Allowed, "{name}");
+        }
         // `GOPATH` is a list go splits at `:`, so each entry is the path.
-        assert_eq!(check("GOPATH", joined, &rooted()), Verdict::Allowed);
         assert_eq!(
             reason_of(&check(
                 "GOPATH",
@@ -4795,10 +4834,12 @@ mod tests {
         let moved = rooted()
             .owning(&[PathBuf::from("/var/mnt/scratch/example/state/bx")])
             .with_config_repos(&[PathBuf::from("/var/mnt/scratch/example/cfg/bx")]);
-        for value in [
-            "/var/mnt/scratch/example/state",
-            "/var/mnt/scratch/example/cfg",
-            "/var/mnt/scratch/example",
+        // Without them, the root itself is still refused for being one (#45),
+        // which containing bx's directories outranks above.
+        for (value, unmoved) in [
+            ("/var/mnt/scratch/example/state", None),
+            ("/var/mnt/scratch/example/cfg", None),
+            ("/var/mnt/scratch/example", Some(Reason::DeclaredRootItself)),
         ] {
             assert_eq!(
                 reason_of(&check("CARGO_HOME", value, &moved)),
@@ -4806,8 +4847,8 @@ mod tests {
                 "{value}"
             );
             assert_eq!(
-                check("CARGO_HOME", value, &rooted()),
-                Verdict::Allowed,
+                reason_of(&check("CARGO_HOME", value, &rooted())),
+                unmoved,
                 "{value}"
             );
         }
@@ -5036,6 +5077,212 @@ mod tests {
         assert_eq!(
             reason_of(&check("DATA_DIR", ROOT, &RootSet::strict())),
             Some(NoRootsDeclared)
+        );
+    }
+
+    #[test]
+    fn a_location_at_a_declared_root_is_refused_because_its_tool_may_write_beside_it() {
+        use Reason::DeclaredRootItself;
+        // uv puts executables in `$XDG_DATA_HOME/../bin`. With the value at the
+        // root, that directory is beside the root and outside every one.
+        for value in [ROOT.to_string(), format!("{ROOT}/")] {
+            assert_eq!(
+                reason_of(&check("XDG_DATA_HOME", &value, &rooted())),
+                Some(DeclaredRootItself),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            reasons(
+                &format!("export SCRATCH_HOME={ROOT}\nexport XDG_DATA_HOME=$SCRATCH_HOME\n"),
+                &rooted()
+            ),
+            vec![(2, DeclaredRootItself)]
+        );
+        for value in [format!("{ROOT}/.local/share"), format!("{ROOT}/data")] {
+            assert_eq!(
+                check("XDG_DATA_HOME", &value, &rooted()),
+                Verdict::Allowed,
+                "{value}"
+            );
+        }
+        // The rule is by shape, not by name: no tool-read location may be a
+        // root, and no entry of a list of them may be either.
+        for (name, kind) in EMITTABLE {
+            if matches!(kind, Kind::Location | Kind::LocationList) {
+                assert_eq!(
+                    reason_of(&check(name, ROOT, &rooted())),
+                    Some(DeclaredRootItself),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(
+            reason_of(&check("GOPATH", &format!("{ROOT}/go:{ROOT}"), &rooted())),
+            Some(DeclaredRootItself)
+        );
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", &format!("{ROOT}:{ROOT}/x"), &rooted())),
+            Some(DeclaredRootItself)
+        );
+        // One level: a root nested in another lies beneath the outer one, and
+        // the outer one is still a root itself.
+        let nested = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from("/var/mnt/scratch"), PathBuf::from(ROOT)],
+        );
+        assert_eq!(check("XDG_DATA_HOME", ROOT, &nested), Verdict::Allowed);
+        assert_eq!(
+            reason_of(&check("XDG_DATA_HOME", "/var/mnt/scratch", &nested)),
+            Some(DeclaredRootItself)
+        );
+        // An anchor may be a root: no tool is known to read one.
+        for name in ["SCRATCH_HOME", "DATA_DIR"] {
+            assert_eq!(check(name, ROOT, &rooted()), Verdict::Allowed, "{name}");
+        }
+        // A search list and a socket need no root, so being one is no matter.
+        assert_eq!(
+            check("PATH", &format!("\"{ROOT}:$PATH\""), &rooted()),
+            Verdict::Allowed
+        );
+        assert_eq!(check("SSH_AUTH_SOCK", ROOT, &rooted()), Verdict::Allowed);
+    }
+
+    #[test]
+    fn uv_puts_executables_beside_its_data_home_and_the_guard_refuses_a_root() {
+        // The mechanism behind `DeclaredRootItself`, held to a real uv when one
+        // is installed. `dir --bin` only prints where executables would go, and
+        // the home, the root and anything uv writes are in a temporary
+        // directory.
+        let Some(uv) = installed("uv") else {
+            return;
+        };
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let root = scratch.path().join("r");
+        let home = scratch.path().join("h");
+        std::fs::create_dir_all(&root).expect("the root");
+        std::fs::create_dir_all(&home).expect("the home");
+        let roots = RootSet::new(&home, std::slice::from_ref(&root));
+        let bin_dir = |data_home: &Path, args: &[&str]| {
+            let output = std::process::Command::new(&uv)
+                .args(args)
+                .current_dir(scratch.path())
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/nonexistent")
+                .env("UV_NO_CONFIG", "1")
+                .env("XDG_DATA_HOME", data_home)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("an installed uv runs");
+            let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert!(
+                output.status.success() && !printed.is_empty(),
+                "uv {args:?} printed {printed:?} ({}; stderr {:?})",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            paths::normalize(Path::new(&printed))
+        };
+        for args in [["tool", "dir", "--bin"], ["python", "dir", "--bin"]] {
+            let beside = bin_dir(&root, &args);
+            assert_eq!(
+                beside,
+                paths::normalize(&scratch.path().join("bin")),
+                "{args:?}"
+            );
+            assert!(!roots.contains(&beside), "{args:?}");
+            let beneath = bin_dir(&root.join("share"), &args);
+            assert_eq!(beneath, paths::normalize(&root.join("bin")), "{args:?}");
+            assert!(roots.contains(&beneath), "{args:?}");
+        }
+        assert_eq!(
+            reason_of(&check("XDG_DATA_HOME", &root.display().to_string(), &roots)),
+            Some(Reason::DeclaredRootItself)
+        );
+        assert_eq!(
+            check(
+                "XDG_DATA_HOME",
+                &root.join("share").display().to_string(),
+                &roots
+            ),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn the_operator_fragment_and_a_data_home_beneath_its_root_scan_clean_in_all_three_layouts() {
+        use Reason::{ContainsBxDirectory, DeclaredRootItself};
+        // The home beside the scratch root, equal to it, and under it. A data
+        // home at the root is refused in each: beside, because uv would write
+        // beside the root; equal and under, because the root holds bx's
+        // directories, which outranks it.
+        for (roots, at_root) in [
+            (rooted(), DeclaredRootItself),
+            (
+                RootSet::new(Path::new(ROOT), &[PathBuf::from(ROOT)]),
+                ContainsBxDirectory,
+            ),
+            (
+                RootSet::new(
+                    Path::new("/var/mnt/scratch/example/home"),
+                    &[PathBuf::from(ROOT)],
+                ),
+                ContainsBxDirectory,
+            ),
+        ] {
+            assert_eq!(scan_with(OPERATOR_FRAGMENT, &roots), vec![], "{roots:?}");
+            let beneath = format!("{OPERATOR_FRAGMENT}export XDG_DATA_HOME=\"$DATA_DIR\"\n");
+            assert_eq!(scan_with(&beneath, &roots), vec![], "{roots:?}");
+            let at = format!("{OPERATOR_FRAGMENT}export XDG_DATA_HOME=\"$SCRATCH_HOME\"\n");
+            assert_eq!(reasons(&at, &roots), vec![(26, at_root)], "{roots:?}");
+        }
+        // Written in terms of the home, under a `~` root.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let at_home = OPERATOR_FRAGMENT.replacen(
+            "export SCRATCH_HOME=\"/var/mnt/scratch/example\"",
+            "export SCRATCH_HOME=\"$HOME\"",
+            1,
+        );
+        assert_ne!(at_home, OPERATOR_FRAGMENT);
+        assert_eq!(scan_with(&at_home, &home_rooted), vec![]);
+        assert_eq!(
+            reasons(
+                &format!("{at_home}export XDG_DATA_HOME=\"$SCRATCH_HOME\"\n"),
+                &home_rooted
+            ),
+            vec![(26, ContainsBxDirectory)]
+        );
+        let found = scan(OPERATOR_FRAGMENT);
+        assert_eq!(found.len(), 25);
+        assert!(found.iter().all(|v| v.reason == Reason::NoRootsDeclared));
+    }
+
+    #[test]
+    fn ordinary_settings_programs_and_lists_stay_allowed_beside_a_root() {
+        for roots in [rooted(), RootSet::strict()] {
+            for (name, value) in [
+                ("SCCACHE_CACHE_SIZE", "10G"),
+                ("MISE_JOBS", "8"),
+                ("UV_NO_CACHE", "1"),
+                ("MISE_VERBOSE", "0"),
+                ("CARGO_TERM_COLOR", "always"),
+                ("LANG", "C.UTF-8"),
+                ("EDITOR", "nvim"),
+                ("EDITOR", "/usr/bin/nvim"),
+                ("SSH_AUTH_SOCK", "/run/user/1000/ssh-agent"),
+            ] {
+                assert_eq!(
+                    check(name, value, &roots),
+                    Verdict::Allowed,
+                    "{name}={value} {roots:?}"
+                );
+            }
+        }
+        // A home is needed to expand `$HOME`, and the strict set has none.
+        assert_eq!(
+            check("PATH", "\"$HOME/.local/bin:$PATH\"", &rooted()),
+            Verdict::Allowed
         );
     }
 
@@ -5309,7 +5556,9 @@ mod tests {
             // The home contains bx's directories (r3 round 2).
             ("~", Reason::ContainsBxDirectory),
             ("\"~x\"", NotAbsolute),
-            ("/var/mnt/scratch/example:a", NotAbsolute),
+            // Its first entry is the root itself, refused before `a` (#45).
+            ("/var/mnt/scratch/example:a", Reason::DeclaredRootItself),
+            ("/var/mnt/scratch/example/x:a", NotAbsolute),
             ("file:///var/mnt/scratch/example", NotAbsolute),
             ("1+x://y", NotAbsolute),
             ("", NotAbsolute),

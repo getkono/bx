@@ -22,7 +22,8 @@
 //!
 //! **A fragment may set only a variable bx knows how to judge.** [`EMITTABLE`]
 //! is the table of every name bx may generate, and it says what each one holds
-//! — a [`Kind`]: a location, a program, a search list, a socket, or a setting.
+//! — a [`Kind`]: a location, a list of locations, a program, a search list, a
+//! socket, or a setting.
 //! The value is judged for what the name holds. Every name the table does not
 //! list is refused as [`Reason::NotEmittable`], whatever its value.
 //!
@@ -329,13 +330,18 @@ fn is_reserved(name: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// Where a tool keeps its config, data or cache, or a directory bx's own
-    /// fragment is written in terms of. Every `:`-separated entry of the value
-    /// must be an absolute path — `~` and `$HOME` expand to one — inside a
-    /// declared root and outside bx's own directories. A bare word, a relative
-    /// path and a URL are all relative to wherever the shell happens to be,
-    /// and are refused. A name that holds one path is split at `:` too, which
-    /// costs only a path with a `:` in it.
+    /// fragment is written in terms of: one path. The tool reads the whole
+    /// value, `:` and all, so the whole value must be an absolute path — `~`
+    /// and `$HOME` expand to one — inside a declared root and outside bx's own
+    /// directories. A bare word, a relative path and a URL are all relative to
+    /// wherever the shell happens to be, and are refused. Every `:`-separated
+    /// entry is held to the same checks first, which costs only a path with a
+    /// `:` in it.
     Location,
+    /// A list of locations its tool splits at `:` and reads entry by entry —
+    /// `GOPATH`. Every entry is judged as a [`Kind::Location`] is, and the
+    /// whole string, which no tool reads as one path, is not.
+    LocationList,
     /// A program a tool runs, found by name or by path: exactly one word,
     /// either an absolute path outside bx's own directories or a bare command
     /// name — a letter or digit, then letters, digits, `.`, `_`, `+` and `-`.
@@ -400,7 +406,7 @@ impl Setting {
 /// * `XDG_CACHE_HOME` and `XDG_DATA_HOME`, and the 23 relocating exports of
 ///   the operator fragment the module's tests hold the guard to:
 ///   `SCRATCH_HOME`, the root the fragment is written in terms of, and 22
-///   toolchain caches and homes.
+///   toolchain caches and homes, of which `GOPATH` is a list of locations.
 ///   `CACHE_DIR` and `DATA_DIR` are that fragment's two unexported helpers,
 ///   and `SCCACHE_DIR` is sccache's cache, the module's motivating case.
 /// * `EDITOR`, `VISUAL`, `PAGER`, `BROWSER`, `TERMINAL` — the program a tool
@@ -432,7 +438,7 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("EDITOR", Kind::Program),
     ("GOCACHE", Kind::Location),
     ("GOMODCACHE", Kind::Location),
-    ("GOPATH", Kind::Location),
+    ("GOPATH", Kind::LocationList),
     ("HOMEBREW_CACHE", Kind::Location),
     ("HOMEBREW_LOGS", Kind::Location),
     ("HOMEBREW_TEMP", Kind::Location),
@@ -934,8 +940,11 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// one it lists, the value as a shell gives it is judged for the [`Kind`] the
 /// table records:
 ///
-/// * a **location** needs a declared root, and every `:`-entry must be
-///   absolute, outside bx's own directories and inside a root;
+/// * a **location** needs a declared root, and every `:`-entry, and then the
+///   whole value read as one path, must be absolute, outside bx's own
+///   directories and inside a root;
+/// * a **list of locations** is judged the same way entry by entry, and not
+///   as a whole;
 /// * a **program** is one absolute path outside bx's own directories, or one
 ///   bare command name;
 /// * a **search list** has every entry absolute and outside bx's own
@@ -1076,11 +1085,17 @@ fn judge(
                 .find_map(anchored)
         }),
         // A set with no admissible root permits no location, whatever it is.
-        Kind::Location => roots.refuses_everything().or_else(|| {
+        Kind::Location | Kind::LocationList => roots.refuses_everything().or_else(|| {
             within(resolved, |value| {
-                value
+                let entries = value
                     .split(':')
-                    .find_map(|entry| refuses_entry(Path::new(entry), roots))
+                    .find_map(|entry| refuses_entry(Path::new(entry), roots));
+                // A location's tool reads the whole value as one path.
+                entries.or_else(|| {
+                    (kind == Kind::Location)
+                        .then(|| refuses_entry(Path::new(value), roots))
+                        .flatten()
+                })
             })
         }),
         Kind::Program => within(resolved, |value| refuses_program(value, roots)),
@@ -3851,6 +3866,7 @@ mod tests {
         }
         for kind in [
             Kind::Location,
+            Kind::LocationList,
             Kind::Program,
             Kind::SearchList,
             Kind::Socket,
@@ -3867,7 +3883,10 @@ mod tests {
         for line in OPERATOR_FRAGMENT.lines() {
             let assignment = line.strip_prefix("export ").unwrap_or(line);
             let (name, _) = assignment.split_once('=').expect("an assignment");
-            assert_eq!(emittable(name), Some(Kind::Location), "{name}");
+            assert!(
+                matches!(emittable(name), Some(Kind::Location | Kind::LocationList)),
+                "{name}"
+            );
         }
     }
 
@@ -4217,6 +4236,59 @@ mod tests {
                     .with_config_repos(&[PathBuf::from("/var/home/example/.local/state/bx")])
             )),
             Some(Reason::BxOwnedDirectory)
+        );
+    }
+
+    #[test]
+    fn a_location_is_the_one_path_its_tool_reads() {
+        // cargo reads `CARGO_HOME` as one path, `:` and all. Each entry of this
+        // value normalises inside the root, and the whole string does not: `x:`
+        // is one component, and the three `..` climb out past it.
+        let climbing = "/var/mnt/scratch/example/x:/../../../var/mnt/scratch/example/y";
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", climbing, &rooted())),
+            Some(Reason::OutsideDeclaredRoots)
+        );
+        // `GOPATH` is a list go splits at `:`, so each entry is the path.
+        assert_eq!(check("GOPATH", climbing, &rooted()), Verdict::Allowed);
+        assert_eq!(
+            reason_of(&check(
+                "GOPATH",
+                "/var/mnt/scratch/example/go:/etc/evil",
+                &rooted()
+            )),
+            Some(Reason::OutsideDeclaredRoots)
+        );
+        // The whole path passes the checks an entry does, bx's directories
+        // first: each entry here is inside a root, and the whole value is bx's
+        // state directory, or inside its config repo.
+        let two = RootSet::new(Path::new(HOME), &[PathBuf::from("~"), PathBuf::from("/bx")]);
+        let into_state = "/var/home/example/.local/state/q:/../bx";
+        let into_repo = "/var/home/example/.config/q:/../bx/c";
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", into_state, &two)),
+            Some(Reason::BxOwnedDirectory)
+        );
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", into_repo, &two)),
+            Some(Reason::InsideConfigRepo)
+        );
+        for value in [into_state, into_repo] {
+            assert_eq!(check("GOPATH", value, &two), Verdict::Allowed, "{value}");
+        }
+        // An entry that is refused keeps its own reason, and a value with no
+        // `:` is one path either way.
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/mnt/scratch/example/k:",
+                &rooted()
+            )),
+            Some(Reason::NotAbsolute)
+        );
+        assert_eq!(
+            check("CARGO_HOME", "/var/mnt/scratch/example/cargo", &rooted()),
+            Verdict::Allowed
         );
     }
 
@@ -5003,7 +5075,12 @@ mod tests {
             let read_as_location = R5_READ_AS_LOCATIONS.iter().any(|(known, _)| *known == name);
             let repo_lands_in_state =
                 name == "XDG_CONFIG_HOME" && unanchored(&format!("{value}/bx"));
+            // A tool that reads one path reads the whole value, `:` and all.
+            let whole_escapes = !TEST_COLON_LISTS.contains(&name)
+                && (read_as_location || pathish(value))
+                && (unanchored(value) || !roots.contains(Path::new(value)));
             repo_lands_in_state
+                || whole_escapes
                 || ((read_as_location || entries.iter().any(|entry| pathish(entry)))
                     && entries
                         .iter()
@@ -5027,6 +5104,10 @@ mod tests {
     /// out independently of the guard's table: every entry must be absolute
     /// and outside bx's state directory, and no root is needed.
     const TEST_SEARCHED_OR_REACHED: &[&str] = &["INFOPATH", "PATH", "SSH_AUTH_SOCK"];
+
+    /// Lists of locations their tool splits at `:`, written out independently
+    /// of the guard's table. Every other value is also read as one whole path.
+    const TEST_COLON_LISTS: &[&str] = &["GOPATH"];
 
     /// Run `content` in every installed shell and hold the guard to what each
     /// shell did. The guard must never approve a fragment after which any
@@ -5228,6 +5309,12 @@ mod tests {
             ("export XDG_CONFIG_HOME=~/.local/state", home_rooted.clone()),
             // Round 6: a tool pointed into bx's config repo.
             ("export CARGO_HOME=~/.config/bx/cargo", home_rooted.clone()),
+            // Round 6: a location whose entries are inside the root and whose
+            // whole value, which cargo reads, is not.
+            (
+                "export CARGO_HOME=/var/mnt/scratch/example/x:/../../../var/mnt/scratch/example/y",
+                rooted(),
+            ),
         ];
         let bare_words: Vec<String> = R5_READ_AS_LOCATIONS
             .iter()

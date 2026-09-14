@@ -622,7 +622,9 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
 }
 
 /// [`load`], and move an unreadable journal aside, to the number after the
-/// highest of `journal.mpk.corrupt`, `journal.mpk.corrupt.1`, … present.
+/// highest of `journal.mpk.corrupt`, `journal.mpk.corrupt.1`, … present — or,
+/// once the top number, `journal.mpk.corrupt.<u64::MAX>`, is present, the
+/// lowest free one.
 ///
 /// The [`ExclusiveLock`] is the proof that no session can be creating or
 /// appending to the journal while it is moved. A reader without it could rename
@@ -921,8 +923,9 @@ fn checksum(nonce: &[u8; NONCE], prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
 
 /// Move a journal that carries no information aside, and say so.
 ///
-/// The name is the number after the highest set-aside name present, taken
-/// with `RENAME_NOREPLACE` by [`crate::state::move_aside`], so an earlier
+/// The name is the number after the highest set-aside name present — or,
+/// once the top number is present, the lowest free one — taken with
+/// `RENAME_NOREPLACE` by [`crate::state::move_aside`], so an earlier
 /// set-aside journal is never replaced.
 ///
 /// # Errors
@@ -1877,7 +1880,8 @@ pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
 /// Move a journal aside, durably, and never over one set aside earlier.
 ///
 /// The name is the number after the highest of `journal.mpk.corrupt`,
-/// `journal.mpk.corrupt.1`, … present, taken with `RENAME_NOREPLACE` by
+/// `journal.mpk.corrupt.1`, … present — or, once the top number is present,
+/// the lowest free one — taken with `RENAME_NOREPLACE` by
 /// [`crate::state::move_aside`] under the state directory's
 /// [`ExclusiveLock`]. A second set-aside therefore succeeds, and every earlier
 /// one survives intact.

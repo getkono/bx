@@ -1460,6 +1460,36 @@ mod tests {
     }
 
     #[test]
+    fn a_spelling_the_lexical_rule_refuses_under_a_stand_in_is_compared_as_filled() {
+        // `~/{{p}}/../../s` climbs out of the home while `p` is one segment, so
+        // under that stand-in neither toggle reduces: each is compared as filled,
+        // and the two texts differ. For `p = "a/b"` both are `~/s`, which is the
+        // answer's collision. The second pair spreads the climb over two
+        // placeholders, so only both being one segment makes it.
+        for (first, second) in [
+            ("~/{{p}}/../../s", "~/{{p}}/.././../s"),
+            ("~/{{p}}/{{q}}/../../../s", "~/{{p}}/{{q}}/../.././../s"),
+        ] {
+            let config = merge(&[
+                global(
+                    "bx.toml",
+                    &format!(
+                        "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                         [[value]]\nname = \"q\"\nkind = \"string\"\n{}\
+                         [[target]]\npath = \"{first}\"\nenabled = false\n\
+                         [[target]]\npath = \"{second}\"\nenabled = true\n",
+                        target_toml("~/s", "S")
+                    ),
+                ),
+                local("[values]\np = \"a/b\"\nq = \"c\"\n"),
+            ])
+            .unwrap_or_else(|e| panic!("{second}: an answer's collision failed the merge: {e}"));
+            assert_eq!(config.conflicts.len(), 1, "{second}");
+            assert_eq!(config.conflicts[0].file, "~/s", "{second}");
+        }
+    }
+
+    #[test]
     fn one_layer_may_not_name_one_file_twice_under_two_spellings() {
         // The parser's duplicate check compares spellings, so it cannot see this.
         let message = failure(&[global(

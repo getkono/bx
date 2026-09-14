@@ -115,6 +115,7 @@ pub(super) fn decide(
             bytes: &bytes,
             mode,
         },
+        ctx.home,
     );
     let (action, note) = ownership(
         outcome.action,

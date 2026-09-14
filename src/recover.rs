@@ -55,6 +55,10 @@
 //! unlinked, so every writing command keeps refusing until it is resolved, and
 //! the message names the file, both digests it could legitimately hold, and
 //! [`abandon`] as the way out.
+//!
+//! A destination whose parent no longer resolves to a directory blocks
+//! recovery the same way: bx can neither confirm what is there nor write the
+//! undo through it, and the message names the parent and [`abandon`].
 
 use std::path::{Path, PathBuf};
 
@@ -119,6 +123,10 @@ pub enum Standing {
     Diverged,
     /// Not a regular file at all.
     Foreign,
+    /// Out of reach: its parent is on the filesystem but does not resolve to
+    /// a directory — a dangling symlink, a loop, or a file — so bx cannot
+    /// tell what is at the destination, and cannot write there.
+    Unreachable,
 }
 
 impl Standing {
@@ -137,6 +145,7 @@ impl std::fmt::Display for Standing {
             Self::Vanished => "is gone",
             Self::Diverged => "was edited after the interruption",
             Self::Foreign => "is not a regular file",
+            Self::Unreachable => "cannot be reached",
         })
     }
 }
@@ -676,6 +685,10 @@ fn decide(
             (Standing::Vanished | Standing::Diverged | Standing::Foreign, _) => {
                 (Step::Blocked, report(false, note(intent, standing)))
             }
+            // Neither state can be confirmed, and no undo can be written
+            // through the parent: a human has to look, as for a file edited
+            // since.
+            (Standing::Unreachable, _) => (Step::Blocked, report(false, unreachable(intent))),
         });
     };
 
@@ -846,13 +859,26 @@ fn rebuild_home<'a>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Found {
     Absent,
-    File { digest: ContentHash, mode: Mode },
+    File {
+        digest: ContentHash,
+        mode: Mode,
+    },
     Foreign,
+    /// Its parent does not resolve to a directory. [`fs::observe`] reports
+    /// such a destination as absent, which it may not be.
+    Unreachable,
 }
 
 /// Read a destination.
 fn look(dest: &Path) -> Result<Found, Error> {
     let observed = fs::observe(dest)?;
+    if observed
+        .parent
+        .as_ref()
+        .is_some_and(|parent| parent.unusable().is_some())
+    {
+        return Ok(Found::Unreachable);
+    }
     Ok(match (observed.kind, observed.digest(), observed.mode) {
         (Kind::Absent, _, _) => Found::Absent,
         (Kind::File, Some(digest), Some(mode)) => Found::File { digest, mode },
@@ -894,7 +920,28 @@ fn standing(intent: &Intent, found: &Found) -> Standing {
             }
         }
         Found::Foreign => Standing::Foreign,
+        Found::Unreachable => Standing::Unreachable,
     }
+}
+
+/// The message a write whose destination cannot be reached carries: the
+/// parent, `~`-relative, and the way out.
+///
+/// The parent is the target's own, spelled as the journal stores it, because
+/// a rollback has no home to fold an absolute path against.
+fn unreachable(intent: &Intent) -> String {
+    let parent = intent
+        .target
+        .as_str()
+        .rsplit_once('/')
+        .map_or("its parent", |(parent, _)| parent);
+    format!(
+        "{}: {parent} does not resolve to a directory, so bx cannot tell what is \
+         there and will not roll it back. Make {parent} a directory again, or \
+         abandon the interrupted session to have bx report it as a conflict \
+         instead.",
+        Standing::Unreachable,
+    )
 }
 
 /// The digest and mode a [`Prior`] names, or `None` for "there was no file".
@@ -2448,6 +2495,7 @@ mod tests {
             Standing::Vanished,
             Standing::Diverged,
             Standing::Foreign,
+            Standing::Unreachable,
         ] {
             assert!(!standing.to_string().is_empty());
         }
@@ -3859,6 +3907,99 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_removal_whose_parent_no_longer_resolves_is_blocked_not_an_error() {
+        // r3 round 2, P9R4-D4. The destination under a dangling link read as
+        // absent, so `pending` called the removal's rollback resolvable, and
+        // every recovery then failed writing through the link with
+        // UnusableParent, never naming `abandon`.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let request = write_to(home.path(), ".made/f.conf", "bx\n", Mode::DEFAULT_FILE);
+        let key = request.target.clone();
+        session.apply(request).expect("bx creates ~/.made/f.conf");
+        session.finish().expect("finish");
+
+        // rm's removal lands, and the process dies before its session ends.
+        let entry = LedgerView::read(&state, home.path())
+            .expect("read the ledger")
+            .value
+            .get(&key)
+            .cloned()
+            .expect("managed");
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), vec![key.clone()])
+                .expect("open");
+        let crate::restore::Restoration::Remove {
+            dest,
+            created_dirs,
+            planned,
+        } = crate::restore::plan_restore(&entry, home.path()).expect("plan")
+        else {
+            panic!("bx created it, so rm removes it");
+        };
+        session
+            .apply(Request {
+                target: key,
+                dest,
+                content: Content::Absent {
+                    created_dirs,
+                    planned: *planned,
+                },
+                mode: entry.mode,
+                ownership: Ownership::Released,
+            })
+            .expect("the removal");
+        drop(session);
+
+        // `~/.made` becomes a link to nowhere.
+        let made = home.child(".made");
+        if made.is_dir() {
+            std::fs::remove_dir(&made).expect("rm the empty directory");
+        }
+        std::os::unix::fs::symlink(home.child("nowhere"), &made).expect("link");
+
+        let report = pending(&state).expect("pending").expect("interrupted");
+        let outcome = recover(&state);
+
+        let Ok(Outcome::Blocked { conflicts }) = outcome else {
+            panic!("recovery is blocked, not an error: {outcome:?}");
+        };
+        assert_eq!(
+            conflicts, report.unfinished,
+            "the report and the recovery agree"
+        );
+        let write = &report.unfinished[0];
+        assert_eq!(write.standing, Standing::Unreachable);
+        assert!(!write.resolvable, "{write:?}");
+        assert!(
+            write
+                .note
+                .starts_with("cannot be reached: ~/.made does not resolve to a directory"),
+            "{}",
+            write.note
+        );
+        assert!(report.blocked().next().is_some());
+        assert!(write.note.contains("~/.made"), "{}", write.note);
+        assert!(write.note.contains("abandon"), "{}", write.note);
+        assert!(state.journal().exists(), "the journal is kept");
+        assert!(matches!(before_writing(&state), Err(Error::Blocked { .. })));
+        assert!(
+            std::fs::symlink_metadata(&made)
+                .expect("the link stays")
+                .file_type()
+                .is_symlink()
+        );
+
+        assert!(abandon(&state).expect("abandon").is_some());
+        assert_eq!(
+            before_writing(&state).expect("after abandon"),
+            Outcome::Nothing
+        );
+    }
+
+    #[test]
     fn only_a_destination_in_a_recorded_state_is_resolvable() {
         for (standing, resolvable) in [
             (Standing::Prior, true),
@@ -3866,6 +4007,7 @@ mod tests {
             (Standing::Vanished, false),
             (Standing::Diverged, false),
             (Standing::Foreign, false),
+            (Standing::Unreachable, false),
         ] {
             assert_eq!(standing.is_resolvable(), resolvable, "{standing:?}");
         }

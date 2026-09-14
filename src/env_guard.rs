@@ -1183,7 +1183,13 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
                     .split(':')
                     .find_map(|entry| refuses_entry(entry, None, roots));
                 // A location's tool reads the whole value as one path, whose
-                // `:` its entries were judged apart at.
+                // `:` its entries were judged apart at. Every entry has passed
+                // by now, so this can newly refuse only as
+                // `OutsideDeclaredRoots`: the whole value begins with its first
+                // absolute entry, holds only allowed characters and `:`, and
+                // merging entries at a `:` makes a component holding `:`, which
+                // no directory bx owns or roots names, so it cannot complete a
+                // match with one that no entry already made.
                 entries.or_else(|| {
                     (kind == Kind::Location)
                         .then(|| refuses_entry(value, Some(':'), roots))
@@ -1243,6 +1249,12 @@ fn is_bare_word(value: &str) -> bool {
 /// Why one resolved path — a value, or one entry of a list — may not be a
 /// relocation target, or `None` if it may. `separator` is the list separator
 /// it may still hold, as [`refuses_unanchored`] reads it.
+///
+/// The order is part of the verdict. [`refuses_unanchored`] runs first, so a
+/// path that is relative, climbs, or holds a character outside the allowlist
+/// is refused for that before any reasoning about where it is: bx cannot read
+/// such a value as a path at all. Inside bx's own directories comes next, then
+/// containing them, then the roots.
 fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, separator, roots)
         // bx's directories outrank the roots in this direction too.
@@ -5024,6 +5036,61 @@ mod tests {
         assert_eq!(
             reason_of(&check("DATA_DIR", ROOT, &RootSet::strict())),
             Some(NoRootsDeclared)
+        );
+    }
+
+    #[test]
+    fn a_path_refused_for_its_characters_is_refused_for_that_before_where_it_is() {
+        use Reason::{BxOwnedDirectory, ContainsBxDirectory, UnlistedCharacter};
+        // The order the checks run in is part of the verdict. The allowlist
+        // comes first: a value bx cannot read as a path is refused for that
+        // before any reasoning about where it is. Each of these values also
+        // contains, is, or lies inside a directory the caller added.
+        let odd = rooted()
+            .owning(&[PathBuf::from("/var/mnt/scratch/example/a b/state/bx")])
+            .with_config_repos(&[PathBuf::from("/var/mnt/scratch/example/c d/bx")]);
+        for (name, value) in [
+            ("CARGO_HOME", "\"/var/mnt/scratch/example/a b\""),
+            ("CARGO_HOME", "\"/var/mnt/scratch/example/a b/state\""),
+            ("CARGO_HOME", "\"/var/mnt/scratch/example/c d\""),
+            ("CARGO_HOME", "\"/var/mnt/scratch/example/a b/state/bx\""),
+            ("CARGO_HOME", "\"/var/mnt/scratch/example/c d/bx/x\""),
+            ("GOPATH", "\"/var/mnt/scratch/example/a b\""),
+            ("SCRATCH_HOME", "\"/var/mnt/scratch/example/a b\""),
+            ("SCRATCH_HOME", "\"/var/mnt/scratch/example/a b/state/bx\""),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &odd)),
+                Some(UnlistedCharacter(' ')),
+                "{name}={value}"
+            );
+        }
+        // Without the character the containment reasons stand, and an anchor
+        // may contain what a tool-read location may not.
+        let plain = rooted().owning(&[PathBuf::from("/var/mnt/scratch/example/ab/state/bx")]);
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "/var/mnt/scratch/example/ab", &plain)),
+            Some(ContainsBxDirectory)
+        );
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/mnt/scratch/example/ab/state/bx",
+                &plain
+            )),
+            Some(BxOwnedDirectory)
+        );
+        assert_eq!(
+            check("SCRATCH_HOME", "/var/mnt/scratch/example/ab", &plain),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            reason_of(&check(
+                "SCRATCH_HOME",
+                "/var/mnt/scratch/example/ab/state/bx",
+                &plain
+            )),
+            Some(BxOwnedDirectory)
         );
     }
 

@@ -683,6 +683,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn decision_9_every_unusable_parent_is_named_by_its_portable_path() {
+        let home = guarded_home();
+        home.write(".file", "not a directory\n");
+        std::os::unix::fs::symlink(home.child("nowhere"), home.child(".dangling"))
+            .expect("a dangling link");
+        std::os::unix::fs::symlink(home.child(".loop"), home.child(".loop")).expect("a loop");
+        let layer = [
+            inline("~/.file/inner", "x\\n"),
+            inline("~/.file/a/b", "x\\n"),
+            inline("~/.dangling/x", "x\\n"),
+            inline("~/.loop/x", "x\\n"),
+        ]
+        .concat();
+        let inputs = inputs(&home, &layer);
+
+        let report = plan(&inputs);
+
+        let notes: Vec<&str> = report
+            .changes
+            .iter()
+            .map(|change| change.note.as_deref().expect("a note"))
+            .collect();
+        assert_eq!(
+            notes[..3],
+            [
+                "~/.file is not a directory, so bx cannot write a file inside it",
+                "~/.file does not resolve to a directory, so bx cannot create ~/.file/a inside it",
+                "~/.dangling does not resolve to a directory, so bx cannot create ~/.dangling \
+                 inside it",
+            ]
+        );
+        assert!(
+            notes[3].starts_with("~/.loop does not resolve to a directory (")
+                && notes[3].ends_with("), so bx cannot write a file inside it"),
+            "{}",
+            notes[3]
+        );
+        let absolute = home.path().to_string_lossy().into_owned();
+        for note in notes {
+            assert!(!note.contains(&absolute), "{note}");
+        }
+        assert_eq!(report.actions(), vec![Action::Conflict; 4]);
+    }
+
+    #[test]
     fn t6_an_unset_required_value_blocks_its_target_with_the_init_hint() {
         let home = guarded_home();
         let layer = format!(

@@ -290,6 +290,33 @@ fn plan_over_a_damaged_state_directory_elsewhere_changes_neither_it_nor_the_home
 }
 
 #[test]
+fn plan_and_apply_name_an_unusable_parent_by_its_portable_path() {
+    // Decision 9: the note was the observation's own text, which spells the
+    // parent by its absolute path.
+    let home = guarded_home();
+    home.write(".x", "a file, not a directory\n");
+    seed(
+        home.path(),
+        "[[target]]\npath = \"~/.x/y\"\ncontent = \"y\\n\"\n",
+    );
+    let row = "  ! ~/.x/y  (~/.config/bx/bx.toml:1) ~/.x is not a directory, so bx cannot write \
+               a file inside it\n";
+    let absolute = home.path().to_string_lossy().into_owned();
+
+    for args in [&["plan"][..], &["apply", "--yes"]] {
+        let output = bx(home.path(), args);
+
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+        assert!(stdout(&output).starts_with(row), "{}", stdout(&output));
+        assert!(!stdout(&output).contains(&absolute), "{}", stdout(&output));
+    }
+    assert_eq!(
+        std::fs::read(home.child(".x")).expect("kept"),
+        b"a file, not a directory\n"
+    );
+}
+
+#[test]
 fn bare_bx_is_the_status_view_with_plan_exit_codes() {
     let home = guarded_home();
     seed(home.path(), A_TARGET);

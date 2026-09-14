@@ -18,7 +18,7 @@ use crate::config::target::{Attach, Body, Direction, Format, Gen, Target};
 use crate::env_guard::{self, RootSet};
 use crate::fs::{self, Desired, Kind, Mode, Observed};
 use crate::journal::{Content, Ownership, Request};
-use crate::paths::Portable;
+use crate::paths::{self, Portable};
 use crate::report::Action;
 use crate::state::{LedgerEntry, LedgerView, Mechanism};
 
@@ -117,11 +117,21 @@ pub(super) fn decide(
         },
         ctx.home,
     );
+    // An unusable parent's reason is the comparison's note, spelled with
+    // absolute paths; the row names them the way plan output names paths.
+    let note = observed
+        .parent
+        .as_ref()
+        .and_then(|parent| {
+            let reason = parent.unusable()?;
+            Some(portable_reason(&parent.path, reason, ctx.home))
+        })
+        .or(outcome.note);
     let (action, note) = ownership(
         outcome.action,
         &observed,
         ctx.ledger.get(&target.path),
-        join([outcome.note, outcome.parent_note]),
+        join([note, outcome.parent_note]),
     );
 
     // Only a regular file has a side to show: a directory, a link or an
@@ -265,6 +275,35 @@ const fn attached_as(mechanism: &Mechanism) -> &'static str {
         Mechanism::Region { .. } => "a managed region",
         Mechanism::Include { .. } => "an include line",
     }
+}
+
+/// Why the parent `dir` cannot hold a file, with every path in `reason`
+/// spelled as plan output spells paths: `~/…` under `home`, absolute outside.
+///
+/// The observation writes `reason` from structure it holds: the absolute
+/// spelling of `dir`, or of the ancestor of `dir` that stops it, leads, and a
+/// reason about an ancestor ends by naming `dir` as what cannot be created.
+/// Those two spellings are put back through [`paths::to_portable`] from the
+/// paths themselves — `dir` and its ancestors, never the home's text — and
+/// nothing else in the reason is touched. A reason in any other shape is
+/// replaced by one naming `dir` alone, so no absolute home reaches a row.
+fn portable_reason(dir: &Path, reason: &str, home: &Path) -> String {
+    let named = dir.ancestors().find_map(|ancestor| {
+        reason
+            .strip_prefix(&format!("{} ", ancestor.display()))
+            .map(|rest| (ancestor, rest))
+    });
+    let Some((ancestor, rest)) = named else {
+        return format!(
+            "{} does not resolve to a directory, so bx cannot write a file inside it",
+            paths::to_portable(dir, home)
+        );
+    };
+    let rest = match rest.strip_suffix(&format!("create {} inside it", dir.display())) {
+        Some(head) => format!("{head}create {} inside it", paths::to_portable(dir, home)),
+        None => rest.to_string(),
+    };
+    format!("{} {rest}", paths::to_portable(ancestor, home))
 }
 
 /// The present parts, joined with `; `, or `None` when there are none.
@@ -418,6 +457,94 @@ mod tests {
     fn the_supported_shape_is_not_unsupported() {
         let home = guarded_home();
         assert_eq!(unsupported(&a_target(home.path(), "~/.a")), None);
+    }
+
+    #[test]
+    fn decision_9_an_unusable_parent_reason_names_its_paths_portably() {
+        let home = Path::new("/var/home/u s");
+        let reason = |dir: &Path, rest: &str| format!("{} {rest}", dir.display());
+
+        // The parent itself, under the home.
+        let dir = home.join(".x");
+        assert_eq!(
+            portable_reason(
+                &dir,
+                &reason(
+                    &dir,
+                    "is not a directory, so bx cannot write a file inside it"
+                ),
+                home
+            ),
+            "~/.x is not a directory, so bx cannot write a file inside it"
+        );
+
+        // An ancestor that stops it, and the parent it cannot create — with a
+        // space in a name, so the leading spelling is matched as a path.
+        let dir = home.join("a b/c");
+        let stops = home.join("a b");
+        assert_eq!(
+            portable_reason(
+                &dir,
+                &format!(
+                    "{} does not resolve to a directory, so bx cannot create {} inside it",
+                    stops.display(),
+                    dir.display()
+                ),
+                home
+            ),
+            "~/a b does not resolve to a directory, so bx cannot create ~/a b/c inside it"
+        );
+
+        // A tail naming a directory other than the parent is left as written.
+        let other = Path::new("/elsewhere/d");
+        assert_eq!(
+            portable_reason(
+                &dir,
+                &format!(
+                    "{} does not resolve, so bx cannot create {} inside it",
+                    stops.display(),
+                    other.display()
+                ),
+                home
+            ),
+            "~/a b does not resolve, so bx cannot create /elsewhere/d inside it"
+        );
+
+        // The source text in the middle is kept.
+        let dir = home.join(".loop");
+        assert_eq!(
+            portable_reason(
+                &dir,
+                &reason(
+                    &dir,
+                    "does not resolve to a directory (os error 40), so bx cannot write a file \
+                     inside it"
+                ),
+                home
+            ),
+            "~/.loop does not resolve to a directory (os error 40), so bx cannot write a file \
+             inside it"
+        );
+
+        // Outside the home every path stays absolute.
+        let dir = Path::new("/srv/x/y");
+        let stops = Path::new("/srv/x");
+        let outside = format!(
+            "{} does not resolve to a directory, so bx cannot create {} inside it",
+            stops.display(),
+            dir.display()
+        );
+        assert_eq!(portable_reason(dir, &outside, home), outside);
+
+        // A reason in any other shape names the parent alone.
+        assert_eq!(
+            portable_reason(
+                &home.join(".z"),
+                "something went wrong at /var/home/u s/.z",
+                home
+            ),
+            "~/.z does not resolve to a directory, so bx cannot write a file inside it"
+        );
     }
 
     #[test]

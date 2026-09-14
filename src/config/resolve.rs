@@ -1917,6 +1917,55 @@ mod tests {
     }
 
     #[test]
+    fn a_path_value_glued_after_text_starts_its_own_segment() {
+        // A `path` answer always begins with `/`, so text glued before a `path`
+        // value is joined to it by that `/`: `/opt{{r}}/conf` is `/opt/srv/conf`
+        // for `r = "/srv"`, as `/opt/{{r}}/conf` is, and a `/` written before the
+        // value only doubles a separator, which folds. Each pair is one file for
+        // every answer, wherever the value sits and whatever is glued before it,
+        // so it is the layer's defect rather than a block an answer could clear.
+        let cases = [
+            ("/opt/srv/conf", "/opt{{r}}/conf", "/opt/{{r}}/conf"),
+            ("/srv/d/conf", "{{r}}{{s}}/conf", "{{r}}/{{s}}/conf"),
+            ("~/srv/conf", "{{p}}{{r}}/conf", "{{p}}/{{r}}/conf"),
+            ("~/srv/d", "~{{r}}{{s}}", "~/{{r}}/{{s}}"),
+        ];
+        let mut loaded = Vec::new();
+        for (file, first, second) in cases {
+            let layer = format!(
+                "[[value]]\nname = \"r\"\nkind = \"path\"\n\
+                 [[value]]\nname = \"s\"\nkind = \"path\"\n\
+                 [[value]]\nname = \"p\"\nkind = \"string\"\n\
+                 [[target]]\npath = \"{file}\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"{first}\"\nenabled = false\n\
+                 [[target]]\npath = \"{second}\"\nenabled = true\n"
+            );
+            let answers = "[values]\nr = \"/srv\"\ns = \"/d\"\np = \"~\"\n";
+            let message = match resolved(&layer, Some(answers)) {
+                Ok(resolved) => {
+                    loaded.push(format!("{first} and {second}: {:?}", keys(&resolved)));
+                    continue;
+                }
+                Err(message) => message,
+            };
+            for part in [
+                "bx.toml:16".to_string(),
+                format!("names the same file as `{first}` at bx.toml:13"),
+                "in this same layer".to_string(),
+            ] {
+                assert!(
+                    message.contains(&part),
+                    "{first} {second}: {part}: {message}"
+                );
+            }
+        }
+        assert!(
+            loaded.is_empty(),
+            "one path for every answer is the layer's defect, yet these loaded: {loaded:#?}"
+        );
+    }
+
+    #[test]
     fn a_dotdot_run_past_a_placeholder_is_judged_after_substitution() {
         // A run of `..` after a placeholder reaches as far as the answer is deep.
         // `/opt/{{p}}/../../../s` and `/opt/{{p}}/../../../../s` both name `/s`

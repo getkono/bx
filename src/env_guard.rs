@@ -22,8 +22,8 @@
 //!
 //! **A fragment may set only a variable bx knows how to judge.** [`EMITTABLE`]
 //! is the table of every name bx may generate, and it says what each one holds
-//! — a [`Kind`]: a location, a list of locations, a program, a search list, a
-//! socket, or a setting.
+//! — a [`Kind`]: a location, a list of locations, an anchor, a program, a
+//! search list, a socket, or a setting.
 //! The value is judged for what the name holds. Every name the table does not
 //! list is refused as [`Reason::NotEmittable`], whatever its value.
 //!
@@ -331,8 +331,7 @@ fn is_reserved(name: &str) -> bool {
 /// judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// Where a tool keeps its config, data or cache, or a directory bx's own
-    /// fragment is written in terms of: one path. The tool reads the whole
+    /// Where a tool keeps its config, data or cache: one path. The tool reads the whole
     /// value, `:` and all, so the whole value must be an absolute path — `~`
     /// and `$HOME` expand to one — inside a declared root and outside bx's own
     /// directories. A bare word, a relative path and a URL are all relative to
@@ -345,6 +344,14 @@ enum Kind {
     /// `GOPATH`. Every entry is judged as a [`Kind::Location`] is, and the
     /// whole string, which no tool reads as one path, is not.
     LocationList,
+    /// A directory other assignments are written in terms of, and that no tool
+    /// reads — the operator fragment's `SCRATCH_HOME`, `CACHE_DIR` and
+    /// `DATA_DIR`. It is one path held to every check a [`Kind::Location`]'s
+    /// path is, but one: it may contain bx's own directories. No tool clears
+    /// an anchor, and every tool-read location written in terms of one is
+    /// judged at its own line, containment included. So a home that is the
+    /// scratch root, or lies under it, is still an anchor's to name.
+    Anchor,
     /// A program a tool runs, found by name or by path: exactly one word,
     /// either an absolute path outside bx's own directories or a bare command
     /// name — a letter or digit, then letters, digits, `.`, `_`, `+` and `-`.
@@ -424,10 +431,11 @@ fn is_decimal(text: &str, digits: usize) -> bool {
 ///
 /// * `XDG_CACHE_HOME` and `XDG_DATA_HOME`, and the 23 relocating exports of
 ///   the operator fragment the module's tests hold the guard to:
-///   `SCRATCH_HOME`, the root the fragment is written in terms of, and 22
+///   `SCRATCH_HOME`, the anchor the fragment is written in terms of, and 22
 ///   toolchain caches and homes, of which `GOPATH` is a list of locations.
 ///   `CACHE_DIR` and `DATA_DIR` are that fragment's two unexported helpers,
-///   and `SCCACHE_DIR` is sccache's cache, the module's motivating case.
+///   also anchors, and `SCCACHE_DIR` is sccache's cache, the module's
+///   motivating case.
 /// * `EDITOR`, `VISUAL`, `PAGER`, `BROWSER`, `TERMINAL` — the program a tool
 ///   runs to edit, page, browse or open a terminal — and `RUSTC_WRAPPER`, the
 ///   program cargo runs `rustc` through.
@@ -450,13 +458,13 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("BROWSER", Kind::Program),
     ("BUN_INSTALL", Kind::Location),
     ("BUN_INSTALL_CACHE_DIR", Kind::Location),
-    ("CACHE_DIR", Kind::Location),
+    ("CACHE_DIR", Kind::Anchor),
     ("CARGO_HOME", Kind::Location),
     (
         "CARGO_TERM_COLOR",
         Kind::Setting(Setting::OneOf(&["auto", "always", "never"])),
     ),
-    ("DATA_DIR", Kind::Location),
+    ("DATA_DIR", Kind::Anchor),
     ("DOTNET_CLI_HOME", Kind::Location),
     ("EDITOR", Kind::Program),
     ("GOCACHE", Kind::Location),
@@ -482,7 +490,7 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("RUSTUP_HOME", Kind::Location),
     ("SCCACHE_CACHE_SIZE", Kind::Setting(Setting::Size)),
     ("SCCACHE_DIR", Kind::Location),
-    ("SCRATCH_HOME", Kind::Location),
+    ("SCRATCH_HOME", Kind::Anchor),
     ("SSH_AUTH_SOCK", Kind::Socket),
     ("TERMINAL", Kind::Program),
     ("UV_CACHE_DIR", Kind::Location),
@@ -1013,6 +1021,8 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///   directories and inside a root;
 /// * a **list of locations** is judged the same way entry by entry, and not
 ///   as a whole;
+/// * an **anchor** is judged as a location's one path, except that it may
+///   contain bx's own directories;
 /// * a **program** is one absolute path outside bx's own directories, or one
 ///   bare command name;
 /// * a **search list** has every entry absolute and outside bx's own
@@ -1026,8 +1036,8 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// ([`Reason::UnlistedCharacter`]), or lie inside bx's state directory
 /// ([`Reason::BxOwnedDirectory`]) or its config repo
 /// ([`Reason::InsideConfigRepo`]), checked in that order and before any root.
-/// No location may contain either of bx's directories
-/// ([`Reason::ContainsBxDirectory`]). The characters are an allowlist because
+/// No location or list of locations may contain either of bx's directories
+/// ([`Reason::ContainsBxDirectory`]); an anchor may. The characters are an allowlist because
 /// the guard cannot know which tool reads which other character its own way.
 /// A value that does not resolve cannot be shown to be any of those, and is
 /// refused for why it does not.
@@ -1181,6 +1191,10 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
                 })
             })
         }),
+        // An anchor is one directory that no tool reads, so none clears it.
+        Kind::Anchor => roots
+            .refuses_everything()
+            .or_else(|| within(resolved, |value| refuses_anchor(value, roots))),
         Kind::Program => within(resolved, |value| refuses_program(value, roots)),
         Kind::Socket => within(resolved, anchored),
         Kind::Setting(setting) => within(resolved, |value| {
@@ -1237,6 +1251,15 @@ fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option
                 .holds_bx_directory(Path::new(path))
                 .then_some(Reason::ContainsBxDirectory)
         })
+        .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
+}
+
+/// Why a resolved [`Kind::Anchor`] may not be written, or `None` if it may:
+/// every check [`refuses_entry`] makes of one path, but containing bx's own
+/// directories. A tool-read location written in terms of the anchor is judged
+/// for that at its own line.
+fn refuses_anchor(path: &str, roots: &RootSet) -> Option<Reason> {
+    refuses_unanchored(path, None, roots)
         .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
 }
 
@@ -1983,7 +2006,7 @@ mod tests {
         // name-based guard, denied outright — a false positive on the one
         // variable the whole configuration is written in terms of. The emit
         // table lists it as the location it is.
-        assert_eq!(emittable("SCRATCH_HOME"), Some(Kind::Location));
+        assert_eq!(emittable("SCRATCH_HOME"), Some(Kind::Anchor));
         assert_eq!(check("SCRATCH_HOME", ROOT, &rooted()), Verdict::Allowed);
     }
 
@@ -4064,6 +4087,7 @@ mod tests {
         for kind in [
             Kind::Location,
             Kind::LocationList,
+            Kind::Anchor,
             Kind::Program,
             Kind::SearchList,
             Kind::Socket,
@@ -4083,7 +4107,10 @@ mod tests {
             let assignment = line.strip_prefix("export ").unwrap_or(line);
             let (name, _) = assignment.split_once('=').expect("an assignment");
             assert!(
-                matches!(emittable(name), Some(Kind::Location | Kind::LocationList)),
+                matches!(
+                    emittable(name),
+                    Some(Kind::Location | Kind::LocationList | Kind::Anchor)
+                ),
                 "{name}"
             );
         }
@@ -4922,6 +4949,81 @@ mod tests {
                 &roots
             )),
             Some(Reason::UnlistedCharacter('\\'))
+        );
+    }
+
+    #[test]
+    fn an_anchor_may_contain_bxs_directories_and_a_tool_read_location_may_not() {
+        use Reason::{
+            BxOwnedDirectory, ContainsBxDirectory, InsideConfigRepo, NoRootsDeclared,
+            OutsideDeclaredRoots, ParentComponent, UnlistedCharacter,
+        };
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for name in ["SCRATCH_HOME", "CACHE_DIR", "DATA_DIR"] {
+            assert_eq!(emittable(name), Some(Kind::Anchor), "{name}");
+        }
+        // The operator's fragment written in terms of the home, under a `~`
+        // root: the anchor names the home, which holds bx's directories, and
+        // no tool reads or clears it.
+        let at_home = OPERATOR_FRAGMENT.replacen(
+            "export SCRATCH_HOME=\"/var/mnt/scratch/example\"",
+            "export SCRATCH_HOME=\"$HOME\"",
+            1,
+        );
+        assert_ne!(at_home, OPERATOR_FRAGMENT);
+        assert_eq!(scan_with(&at_home, &home_rooted), vec![]);
+        // The operator fragment under the three layouts: the home beside the
+        // scratch root, the home equal to it, and the home under it.
+        for roots in [
+            rooted(),
+            RootSet::new(Path::new(ROOT), &[PathBuf::from(ROOT)]),
+            RootSet::new(
+                Path::new("/var/mnt/scratch/example/home"),
+                &[PathBuf::from(ROOT)],
+            ),
+        ] {
+            assert_eq!(scan_with(OPERATOR_FRAGMENT, &roots), vec![], "{roots:?}");
+        }
+        assert_eq!(scan(OPERATOR_FRAGMENT).len(), 25);
+        // A tool-read location is still refused for containing them, whether
+        // it names the directory itself or is written in terms of an anchor
+        // that does.
+        assert_eq!(
+            reason_of(&check("UV_CACHE_DIR", "~/.local/state", &home_rooted)),
+            Some(ContainsBxDirectory)
+        );
+        assert_eq!(
+            reasons(
+                "export SCRATCH_HOME=~/.local/state\nexport UV_CACHE_DIR=$SCRATCH_HOME\n",
+                &home_rooted
+            ),
+            vec![(2, ContainsBxDirectory)]
+        );
+        // Every other check a location's one path has, an anchor keeps.
+        for (value, reason) in [
+            ("~/.local/state/bx", BxOwnedDirectory),
+            ("~/.config/bx/x", InsideConfigRepo),
+            ("~/a/../b", ParentComponent),
+            ("\"/var/home/example/a b\"", UnlistedCharacter(' ')),
+            (
+                "/var/home/example/a:/var/home/example/b",
+                UnlistedCharacter(':'),
+            ),
+            ("scratch", Reason::NotAbsolute),
+        ] {
+            assert_eq!(
+                reason_of(&check("SCRATCH_HOME", value, &home_rooted)),
+                Some(reason),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            reason_of(&check("CACHE_DIR", "/etc", &rooted())),
+            Some(OutsideDeclaredRoots)
+        );
+        assert_eq!(
+            reason_of(&check("DATA_DIR", ROOT, &RootSet::strict())),
+            Some(NoRootsDeclared)
         );
     }
 

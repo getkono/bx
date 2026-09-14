@@ -22,9 +22,10 @@
 //! so damaged *contents* are never fatal. A truncated, garbled or wrong-kind
 //! file is reported through `tracing::warn!` and replaced by the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
 //! the quarantine number after the highest present — `<name>.corrupt`, then
-//! `<name>.corrupt.1`, … — never over an earlier quarantine and never into a
-//! gap one left (past a number with no successor, which bx never makes, the
-//! lowest free number), and the next save writes a clean file. A lockless
+//! `<name>.corrupt.1`, … — never over an earlier quarantine, and not into a
+//! gap one left until the top number, `<name>.corrupt.<u64::MAX>`, is present,
+//! whoever made it (from then on, the lowest free number) — and the next save
+//! writes a clean file. A lockless
 //! reader moves nothing ([`Health::Damaged`]): a rename by path could move
 //! aside a file a writer saved after the read. The damaged bytes are kept,
 //! never deleted, so a human or `bx doctor` can still look at them. See
@@ -338,20 +339,32 @@ pub enum Error {
     /// mode reported is that file's, and it is refused only while the directory
     /// holding it can be searched by others too. A link that leads to no
     /// regular file exposes nothing here.
+    ///
+    /// The refusal judges those two modes and no ancestor, so it is
+    /// conservative: a private ancestor can already keep every other account
+    /// out. The message therefore states the modes and says the file can be
+    /// reached wherever its directories allow, never that anyone can open it,
+    /// and its remedy names the directory the link resolves to, whose mode is
+    /// the one to change.
     #[error(
-        "{} is a symbolic link to a directory users other than its owner can search (mode \
-         {mode}), and {} in it can be read or written by them (mode {file_mode}): anyone who \
-         knows its name can open it. bx will not change the mode of a directory it did not \
-         create, nor of a file you wrote. Make the file private (chmod 600 {}), or remove search \
-         permission from the directory (chmod go-x {})",
+        "{} is a symbolic link to {}, a directory whose mode lets users other than its owner \
+         search it (mode {mode}), and {} in it has a mode that lets them read or write it (mode \
+         {file_mode}), so it can be reached by other accounts wherever its directories allow. \
+         bx will not change the mode of a directory it did not create, nor of a file you wrote. \
+         Make the file private (chmod 600 {}), or remove search permission from the linked \
+         directory (chmod go-x {})",
         .path.display(),
+        .target.display(),
         .file.display(),
         .file.display(),
-        .path.display()
+        .target.display()
     )]
     ExposedLocalLayer {
         /// The linked directory.
         path: PathBuf,
+        /// The directory the link resolves to, or the link itself if it no
+        /// longer resolves by the time the refusal is reported.
+        target: PathBuf,
         /// The mode of the directory the link names.
         mode: Mode,
         /// `local.toml` inside it.

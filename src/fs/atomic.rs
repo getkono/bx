@@ -2195,6 +2195,31 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_that_does_not_resolve_governs_no_mode() {
+        // `compare` returns before asking an unusable parent for a mode, but
+        // `Parent` is public with public fields, so any caller can ask.
+        let parent = |state: ParentState| Parent {
+            path: PathBuf::from("/nowhere/d"),
+            state,
+            resolved: None,
+        };
+        assert_eq!(
+            parent(ParentState::Unusable("a dangling symlink".into())).mode(),
+            None,
+            "no directory, so no mode to govern anything",
+        );
+        assert_eq!(
+            parent(ParentState::Present(Mode::PRIVATE_DIR)).mode(),
+            Some(Mode::PRIVATE_DIR),
+        );
+        assert_eq!(
+            parent(ParentState::Absent(Mode::DEFAULT_DIR)).mode(),
+            Some(Mode::DEFAULT_DIR),
+            "the mode bx would create it at",
+        );
+    }
+
+    #[test]
     fn a_parent_wider_than_the_declared_mode_is_reported() {
         let home = guarded_home();
         // ~/.ssh at 0755 holding a 0600 config: exactly what the source

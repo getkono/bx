@@ -887,8 +887,13 @@ pub enum Reason {
     /// does every tool built on dirs-next, which lands outside every root when
     /// the value is one. A tool given a whole root also clears everything else
     /// the root holds. Point the value beneath the root. Every other reason
-    /// outranks it, at any entry: a list's entries are all judged for those
-    /// before any entry is judged for being a root.
+    /// outranks it, at any entry and in a location's whole value, but one:
+    /// every entry, and then the whole value, is judged for bx's directories,
+    /// and every entry for lying inside a root, before any entry is judged for
+    /// being a root. A location's whole value is judged for lying inside a root
+    /// only after that, and that reason never shows on its own: once no entry
+    /// is a root itself, the whole value lies inside the root its first entry
+    /// lies beneath.
     #[error("is a declared root itself, and its tool may write beside it, outside every root")]
     DeclaredRootItself,
     /// Empty, a bare word, a URL, or a relative path, where a path that can be
@@ -1205,37 +1210,45 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
         // A set with no admissible root permits no location, whatever it is.
         Kind::Location | Kind::LocationList => roots.refuses_everything().or_else(|| {
             within(resolved, |value| {
+                // A location's tool reads the whole value as one path, whose
+                // `:` its entries are judged apart at. A list's tool reads
+                // only the entries.
+                let whole = (kind == Kind::Location).then_some(value);
                 // Every entry is judged for every other reason before any is
                 // judged for being a root itself, so a root earlier in the
                 // list does not hide a later entry's reason (#47 round 1).
-                let entries = value
+                value
                     .split(':')
                     .find_map(|entry| refuses_entry_placement(entry, None, roots))
+                    // Once every entry has passed, the whole value begins with
+                    // its first absolute entry and holds only allowed
+                    // characters and `:`. Merging entries at a `:` makes a
+                    // component holding `:`, which completes a match no entry
+                    // made only with a directory whose own path holds a `:`.
+                    // The home, and so bx's directories under it, may: with
+                    // `HOME=<root>/x:<root>/y`, each entry of
+                    // `CARGO_HOME=<root>/x:<root>/y/.local/state` passes, and
+                    // the whole value, the path cargo reads, contains bx's
+                    // state directory. That reason outranks an entry that is a
+                    // root itself, as it does on one path (#47 round 2).
+                    .or_else(|| whole.and_then(|value| refuses_entry_bx(value, Some(':'), roots)))
                     .or_else(|| {
                         value
                             .split(':')
                             .find_map(|entry| refuses_entry_at_root(entry, roots))
-                    });
-                // A location's tool reads the whole value as one path, whose
-                // `:` its entries were judged apart at. Every entry has passed
-                // by now, so the whole value begins with its first absolute
-                // entry and holds only allowed characters and `:`. The first
-                // entry lies strictly beneath a root, so the whole value and
-                // its parent begin with that entry's parent, which is inside
-                // the root: this never newly refuses it as outside every root
-                // or as a root itself. Merging entries at a `:` makes a
-                // component holding `:`, which completes a match no entry made
-                // only with a directory whose own path holds a `:`. The home,
-                // and so bx's directories under it, may: with
-                // `HOME=<root>/x:<root>/y`, each entry of
-                // `CARGO_HOME=<root>/x:<root>/y/.local/state` passes, and the
-                // whole value, the path cargo reads, contains bx's state
-                // directory. So this is the one refusal of such a value.
-                entries.or_else(|| {
-                    (kind == Kind::Location)
-                        .then(|| refuses_entry(value, Some(':'), roots))
-                        .flatten()
-                })
+                    })
+                    // The first entry lies strictly beneath a root by now, so
+                    // the whole value and its parent begin with that entry's
+                    // parent, which is inside the root: this never newly
+                    // refuses the value as outside every root or as a root
+                    // itself. It stays, because it judges the path the tool
+                    // reads.
+                    .or_else(|| {
+                        whole.and_then(|value| {
+                            refuses_entry_outside(value, roots)
+                                .or_else(|| refuses_entry_at_root(value, roots))
+                        })
+                    })
             })
         }),
         // An anchor is one directory bx has found no tool to read, so none is
@@ -1288,24 +1301,26 @@ fn is_bare_word(value: &str) -> bool {
     value.starts_with(|c: char| c.is_ascii_alphanumeric()) && value.chars().all(is_word_char)
 }
 
-/// Why one resolved path — a value, or one entry of a list — may not be a
-/// relocation target, or `None` if it may. `separator` is the list separator
-/// it may still hold, as [`refuses_unanchored`] reads it.
+/// Why one resolved entry of a location value may not be a relocation target,
+/// for any reason but being a root itself ([`refuses_entry_at_root`]), or
+/// `None` if it may. `separator` is the list separator it may still hold, as
+/// [`refuses_unanchored`] reads it.
 ///
 /// The order is part of the verdict. [`refuses_unanchored`] runs first, so a
 /// path that is relative, climbs, or holds a character outside the allowlist
 /// is refused for that before any reasoning about where it is: bx cannot read
 /// such a value as a path at all. Inside bx's own directories comes next, then
-/// containing them, then the roots: inside one, then beneath one.
-fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
-    refuses_entry_placement(path, separator, roots).or_else(|| refuses_entry_at_root(path, roots))
+/// containing them, then inside a root. Beneath one comes last, and `judge`
+/// asks it of an entry only once every entry, and a location's whole value,
+/// has been judged for bx's directories, so a root earlier in a list does not
+/// hide a harder reason later in it or in the whole value.
+fn refuses_entry_placement(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
+    refuses_entry_bx(path, separator, roots).or_else(|| refuses_entry_outside(path, roots))
 }
 
-/// Every reason [`refuses_entry`] gives but [`Reason::DeclaredRootItself`], in
-/// its order. A list of locations is judged for these at every entry before
-/// any entry is judged for being a root itself, so a root earlier in the list
-/// does not hide a harder reason later in it.
-fn refuses_entry_placement(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
+/// Every reason [`refuses_entry_placement`] gives before it reasons about the
+/// roots: [`refuses_unanchored`], then containing bx's own directories.
+fn refuses_entry_bx(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, separator, roots)
         // bx's directories outrank the roots in this direction too.
         .or_else(|| {
@@ -1313,7 +1328,11 @@ fn refuses_entry_placement(path: &str, separator: Option<char>, roots: &RootSet)
                 .holds_bx_directory(Path::new(path))
                 .then_some(Reason::ContainsBxDirectory)
         })
-        .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
+}
+
+/// [`Reason::OutsideDeclaredRoots`] if `path` lies inside no declared root.
+fn refuses_entry_outside(path: &str, roots: &RootSet) -> Option<Reason> {
+    (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots)
 }
 
 /// [`Reason::DeclaredRootItself`] if `path`, already inside a root, has a
@@ -1326,9 +1345,9 @@ fn refuses_entry_at_root(path: &str, roots: &RootSet) -> Option<Reason> {
 }
 
 /// Why a resolved [`Kind::Anchor`] may not be written, or `None` if it may:
-/// every check [`refuses_entry`] makes of one path, but containing bx's own
-/// directories. A tool-read location written in terms of the anchor is judged
-/// for that at its own line.
+/// every check [`refuses_entry_placement`] makes of one path, but containing
+/// bx's own directories. A tool-read location written in terms of the anchor
+/// is judged for that at its own line.
 fn refuses_anchor(path: &str, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, None, roots)
         .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
@@ -5231,6 +5250,52 @@ mod tests {
         assert_eq!(
             reason_of(&check("CARGO_HOME", &value, &roots)),
             Some(Reason::ContainsBxDirectory)
+        );
+    }
+
+    #[test]
+    fn a_whole_value_holding_a_bx_directory_outranks_an_entry_that_is_a_root_itself() {
+        use Reason::{BxOwnedDirectory, ContainsBxDirectory, InsideConfigRepo};
+        let roots = [
+            PathBuf::from("/r1"),
+            PathBuf::from("/r2"),
+            PathBuf::from("/r3"),
+        ];
+        // A home that holds `:`. The middle entry of this value is the root
+        // `/r2`, and no entry lies in bx's state directory, but the one path
+        // cargo reads is that directory.
+        let colon_home = RootSet::new(Path::new("/r1/a:/r2:/r3/h"), &roots);
+        // A state directory and a config repo that hold `:`, as a caller that
+        // read the environment may pass them.
+        let owning_the_value =
+            RootSet::new(Path::new(HOME), &roots).owning(&[PathBuf::from("/r1/s:/r2")]);
+        let owning_beneath_it =
+            RootSet::new(Path::new(HOME), &roots).owning(&[PathBuf::from("/r1/s:/r2/st")]);
+        let repo =
+            RootSet::new(Path::new(HOME), &roots).with_config_repos(&[PathBuf::from("/r1/c:/r2")]);
+        let judged: Vec<_> = [
+            (&colon_home, "~/.local/state/bx"),
+            (&owning_the_value, "/r1/s:/r2"),
+            (&owning_beneath_it, "/r1/s:/r2"),
+            (&repo, "/r1/c:/r2"),
+        ]
+        .into_iter()
+        .map(|(set, value)| (value, reason_of(&check("CARGO_HOME", value, set))))
+        .collect();
+        assert_eq!(
+            judged,
+            vec![
+                ("~/.local/state/bx", Some(BxOwnedDirectory)),
+                ("/r1/s:/r2", Some(BxOwnedDirectory)),
+                ("/r1/s:/r2", Some(ContainsBxDirectory)),
+                ("/r1/c:/r2", Some(InsideConfigRepo)),
+            ]
+        );
+        // `GOPATH` is read entry by entry, so its whole string is not judged
+        // and the root entry still names the fix.
+        assert_eq!(
+            reason_of(&check("GOPATH", "/r1/c:/r2", &repo)),
+            Some(Reason::DeclaredRootItself)
         );
     }
 

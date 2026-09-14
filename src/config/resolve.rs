@@ -1117,7 +1117,7 @@ mod tests {
                              requires = [\"{{tool}}\"]\n\
                              [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
 
-        for answer in ["", "bin/sccache", ".", ".."] {
+        for answer in ["", "bin/sccache", ".", "..", "/"] {
             let answered = resolved(LAYER, Some(&format!("[values]\ntool = \"{answer}\"\n")))
                 .unwrap_or_else(|e| panic!("{answer:?} failed the whole load: {e}"));
             let entry = blocked(&answered, 0);

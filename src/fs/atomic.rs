@@ -436,6 +436,12 @@ fn special_bits_not_kept(path: &Path, declared: Mode, landed: Mode, directory: b
     let (named, noun) = match names.as_slice() {
         [one] => ((*one).to_string(), "bit"),
         [init @ .., last] => (format!("{} and {last}", init.join(", ")), "bits"),
+        // Unreachable by construction: `special_bits_not_kept` is only called
+        // to build `Error::SetIdNotKept` / `Error::DirectorySetIdNotKept`
+        // (`verify_set_id_kept`, `set_dir_mode`), and both only construct that
+        // error when `lost` — `declared`'s special bits minus `landed`'s — is
+        // non-empty, so `names` is never empty here. Kept so the match stays
+        // total rather than opening a panic path.
         [] => ("special".to_string(), "bits"),
     };
     let (what, outcome) = if directory {

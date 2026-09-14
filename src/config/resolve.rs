@@ -30,8 +30,9 @@
 //!
 //! So does a legal answer that makes a **target's own field** invalid once
 //! substituted: `acct = "../../.."` into `~/.config/{{acct}}/settings.json`
-//! climbs out of the home, and `seg = ""` into `owns = ["a.{{seg}}"]` leaves an
-//! empty key segment. The target is blocked naming the answer's line, and
+//! climbs out of the home, `seg = ""` into `owns = ["a.{{seg}}"]` leaves an
+//! empty key segment, and `seg = "b.c"` adds a segment, naming a deeper key
+//! than the one written. The target is blocked naming the answer's line, and
 //! nothing is written for it. The same field broken with no account answer in
 //! it — a committed `default` alone — is the repo's defect and fails the load.
 //!
@@ -82,7 +83,8 @@ pub enum BlockReason {
     /// an answer its kind refuses, one that made a committed `default` invalid,
     /// or one that, substituted into this entry, makes a field invalid — a path
     /// that climbs out of the home, a `file` that climbs out of the repo, an
-    /// owned key with an empty segment.
+    /// owned key with an empty segment or with more or fewer segments than
+    /// written.
     ///
     /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
     /// unanswered: the answer that needs changing is already written, and the
@@ -494,7 +496,23 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
                 .iter()
                 .map(|key| {
                     let raw = key.to_string();
-                    KeyPath::parse(&sub(&raw)?).map_err(|source| field(&raw, source.to_string()))
+                    let text = sub(&raw)?;
+                    let parsed =
+                        KeyPath::parse(&text).map_err(|source| field(&raw, source.to_string()))?;
+                    // `KeyPath` splits on `.`, so an answer holding one would
+                    // name a different, deeper key than the one written.
+                    let (written, now) = (key.segments().len(), parsed.segments().len());
+                    if now != written {
+                        return Err(field(
+                            &raw,
+                            format!(
+                                "`owns` key `{raw}` has {written} segments as written and {now} \
+                                 once substituted, as `{text}`; an answer may fill a segment but \
+                                 not add or remove one"
+                            ),
+                        ));
+                    }
+                    Ok(parsed)
                 })
                 .collect::<Result<Vec<_>, Broken>>()?,
         },
@@ -954,6 +972,55 @@ mod tests {
         )
         .expect_err("`editor.` from a committed default is a repo defect");
         assert!(message.contains("empty segment"), "{message}");
+    }
+
+    #[test]
+    fn a_substitution_that_changes_a_key_path_s_segment_count_blocks_or_fails() {
+        // `KeyPath` splits on `.`, so `setting = "b.c"` turned the one key
+        // `editor.{{setting}}` into `editor.b.c`: a different key, one level
+        // deeper, owned without anyone having written it. An answer may fill a
+        // segment; it may not add or remove one.
+        const LAYER: &str = "[[value]]\nname = \"setting\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
+                             content = \"{{{{}}\"\n\
+                             format = \"jsonc\"\nowns = [\"editor.{{setting}}\"]\n";
+
+        let answered = resolved(LAYER, Some("[values]\nsetting = \"b.c\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&answered, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["setting".to_string()]
+            }
+        );
+        for part in [
+            "local.toml:2",
+            "`owns` key `editor.{{setting}}` has 2 segments as written and 3 once \
+             substituted, as `editor.b.c`",
+        ] {
+            assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
+        }
+
+        let message = resolved(
+            &LAYER.replace(
+                "kind = \"string\"\n",
+                "kind = \"string\"\ndefault = \"b.c\"\n",
+            ),
+            None,
+        )
+        .expect_err("a committed default that adds a segment is a repo defect");
+        assert!(message.contains("segments"), "{message}");
+        assert!(message.contains("~/.config/zed/settings.json"), "{message}");
+
+        // Filling the segment is the case the placeholder is for.
+        let filled = resolved(LAYER, Some("[values]\nsetting = \"tab_size\"\n")).unwrap();
+        assert_eq!(
+            ready(&filled, 0).format,
+            Format::Jsonc {
+                owns: vec![KeyPath::parse("editor.tab_size").unwrap()]
+            }
+        );
     }
 
     #[test]

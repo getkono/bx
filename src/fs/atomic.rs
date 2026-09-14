@@ -2154,6 +2154,43 @@ mod tests {
     }
 
     #[test]
+    fn stage_refuses_a_directory_or_fifo_destination_as_not_a_file() {
+        // The apply half of the two conflicts above: `stage` refuses plan's
+        // verdict with the kind that is there, and touches nothing.
+        let home = guarded_home();
+        let dir = home.child("d");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::write(dir.join("inside"), b"theirs").expect("an entry of their own");
+        let fifo = home.child("p");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            Mode::PRIVATE_FILE.into(),
+            0,
+        )
+        .expect("mkfifo");
+
+        for (dest, kind) in [(&dir, Kind::Dir), (&fifo, Kind::Other)] {
+            let err = stage_now(dest, Mode::DEFAULT_FILE).expect_err("not a file bx can write");
+            let Error::NotAFile { path, kind: found } = &err else {
+                panic!("{kind:?}: expected NotAFile, got {err:?}");
+            };
+            assert_eq!(path, dest, "{kind:?}");
+            assert_eq!(*found, kind);
+            assert_eq!(err.path(), dest.as_path(), "{kind:?}");
+        }
+
+        assert_eq!(
+            names_in(home.path()),
+            vec![OsString::from("d"), OsString::from("p")],
+            "nothing written and no temporary file left",
+        );
+        assert_eq!(names_in(&dir), vec![OsString::from("inside")]);
+        assert_eq!(std::fs::read(dir.join("inside")).expect("read"), b"theirs");
+    }
+
+    #[test]
     fn a_parent_wider_than_the_declared_mode_is_reported() {
         let home = guarded_home();
         // ~/.ssh at 0755 holding a 0600 config: exactly what the source

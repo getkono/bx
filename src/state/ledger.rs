@@ -533,6 +533,10 @@ impl Ledger {
     /// [`Error::WrongLock`] if `lock` is not `dir`'s own lock. It is checked
     /// before the ledger is read, so another directory's lock never
     /// quarantines this one.
+    ///
+    /// [`Error::CannotQuarantine`] if `ledger.mpk` is damaged and cannot be
+    /// moved aside. It is left exactly where it is and nothing is reset, so no
+    /// later [`Ledger::save`] can write over the only record of the priors.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
         let dir = dir.clone();
         Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self {
@@ -2790,6 +2794,51 @@ mod tests {
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
         assert!(dir.root().join("ledger.mpk.corrupt").exists());
+    }
+
+    #[test]
+    fn a_damaged_ledger_that_cannot_be_moved_aside_stops_bx_and_is_never_saved_over() {
+        // r3 round 1 (L1b): `Ledger::open` reported `Health::Reset` when the
+        // rename failed, a caller that kept only the value saved, and the save
+        // replaced the damaged ledger — possibly the only index to the user's
+        // restore blobs — that `Reset` said had been kept.
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            // `state::store`'s 255-byte-name test pins the same rule for root.
+            return;
+        }
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
+        // Readable and searchable, so the ledger is read and judged; not
+        // writable, so it cannot be renamed.
+        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        let result = Ledger::open(&dir, &lock, home.path());
+        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore");
+        if let Ok(loaded) = &result {
+            // What a caller that keeps only the value does next.
+            loaded.value.save().expect("save");
+        }
+
+        assert_eq!(
+            std::fs::read(dir.ledger()).expect("in place"),
+            b"not messagepack",
+            "the damaged ledger is never replaced",
+        );
+        let err = result.expect_err("a ledger that cannot be moved aside stops bx");
+        assert!(
+            matches!(
+                &err,
+                Error::CannotQuarantine { path, damage: Damage::Malformed, source }
+                    if *path == dir.ledger()
+                        && source.kind() == std::io::ErrorKind::PermissionDenied
+            ),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("by hand"), "{err}");
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
     }
 
     #[test]

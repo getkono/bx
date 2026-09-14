@@ -141,6 +141,10 @@ impl Fingerprints {
     ///
     /// As [`Fingerprints::read`], and [`Error::WrongLock`] if `lock` is not
     /// `dir`'s own lock, before anything is read.
+    ///
+    /// [`Error::CannotQuarantine`] if `fingerprints.mpk` is damaged and cannot
+    /// be moved aside: it is left in place and nothing is reset, so the next
+    /// save cannot write over bytes [`super::Health::Reset`] says were kept.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock) -> Result<Loaded<Self>, Error> {
         store::load(
             &dir.fingerprints(),

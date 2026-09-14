@@ -107,8 +107,9 @@ pub struct BlockedEntry {
     /// Why it is blocked.
     pub reason: BlockReason,
     /// What the user should do. Spelled in `values` — `init_hint`,
-    /// `disabled_hint`, `ResolvedValues::invalid_hint` or
-    /// `ResolvedValues::answers_hint` — never at a call site.
+    /// `disabled_hint`, `ResolvedValues::invalid_hint`,
+    /// `ResolvedValues::answers_hint` or `ResolvedValues::removal_hint` — never
+    /// at a call site.
     pub hint: String,
 }
 

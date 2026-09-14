@@ -43,7 +43,12 @@
 //! name a committed file the account cannot edit and take every unrelated
 //! target with it, so instead both entries are kept and recorded as a
 //! [`Conflict`], and resolution blocks each one, naming both lines and the
-//! answer's. A later layer that names the file settles it.
+//! answer's. A later layer that names the file settles it. When a toggle among
+//! the statements cannot be shown to name a declared target for every answer —
+//! its spelling is not one path as written with a full entry's in its own layer
+//! or an earlier one — another answer may leave it naming a file nothing
+//! declares, which fails the load, so the hint names that toggle to remove
+//! rather than the answer to change.
 //!
 //! # Toggles: how an account opts out cheaply
 //!
@@ -396,7 +401,9 @@ pub(crate) struct Conflict {
     pub(crate) file: String,
     /// The answers that made the spellings meet, in declaration order.
     pub(crate) names: Vec<String>,
-    /// What to do, spelled by [`ResolvedValues::answers_hint`].
+    /// What to do, spelled by [`ResolvedValues::answers_hint`], or by
+    /// [`ResolvedValues::removal_hint`] when a toggle among the statements
+    /// cannot be shown to name a declared target for every answer.
     pub(crate) hint: String,
 }
 
@@ -408,6 +415,10 @@ struct Said {
     spelling: String,
     /// Where it was written.
     origin: Origin,
+    /// Whether it is a toggle bx cannot show names a declared target for
+    /// every answer (see [`anchored`]). Never a full entry, which creates the
+    /// file it names.
+    fragile: bool,
 }
 
 /// A [`Conflict`] while the layers are still being folded.
@@ -416,20 +427,26 @@ struct Clash {
     layer: std::path::PathBuf,
     /// The file they collided on.
     key: TargetKey,
-    /// Every statement in that layer naming the file, in the order read.
-    statements: Vec<(String, Origin)>,
+    /// Every statement in that layer naming the file, in the order read, each
+    /// with [`Said::fragile`].
+    statements: Vec<(String, Origin, bool)>,
     /// The answers that went into them.
     names: Vec<String>,
 }
 
 impl Clash {
     /// The conflict resolution reads, with its hint spelled.
+    ///
+    /// Changing an answer is advice only while every toggle in the clash names a
+    /// declared target whatever is answered. Otherwise another answer may leave
+    /// a toggle naming nothing, which fails the load, so the hint names the
+    /// toggles to remove instead.
     fn into_conflict(self, values: &ResolvedValues) -> Conflict {
         let (TargetKey::File(file) | TargetKey::AsWritten(file)) = self.key;
         let spellings = self
             .statements
             .iter()
-            .map(|(spelling, origin)| format!("`{spelling}` at {origin}"))
+            .map(|(spelling, origin, _)| format!("`{spelling}` at {origin}"))
             .collect::<Vec<_>>()
             .join(" and ");
         let names = values.in_declaration_order(self.names);
@@ -437,16 +454,17 @@ impl Clash {
             "`[[target]]` {spellings} name one file, `{file}`, and one layer may name a \
              file once"
         );
-        let texts: Vec<&str> = self
-            .statements
-            .iter()
-            .map(|(spelling, _)| spelling.as_str())
-            .collect();
-        Conflict {
-            hint: values.answers_hint(&problem, &texts, &names),
-            file,
-            names,
-        }
+        let hint = if self.statements.iter().any(|(_, _, fragile)| *fragile) {
+            values.removal_hint(&problem, &names, &self.statements)
+        } else {
+            let texts: Vec<&str> = self
+                .statements
+                .iter()
+                .map(|(spelling, _, _)| spelling.as_str())
+                .collect();
+            values.answers_hint(&problem, &texts, &names)
+        };
+        Conflict { hint, file, names }
     }
 }
 
@@ -475,9 +493,14 @@ impl Merged<Target, TargetKey> {
     /// spellings, and cannot see that `~/{{acct}}/x` and `~/one/x` are one file
     /// — or under two spellings that reduce to one text with their placeholders
     /// left in, which no answer could pull apart.
+    ///
+    /// `earlier` are the layers folded before this one: a toggle is compared
+    /// against their full entries' spellings, and this layer's, to decide which
+    /// hint a clash it is in gets.
     fn absorb_layer(
         &mut self,
         layer: &Layer,
+        earlier: &[Layer],
         values: &ResolvedValues,
         clashes: &mut Vec<Clash>,
     ) -> Result<(), Error> {
@@ -490,7 +513,7 @@ impl Merged<Target, TargetKey> {
             match self.position(&key) {
                 None => self.entries.push((key.clone(), target.clone())),
                 Some(index) => {
-                    let statement = (spelling, &target.origin);
+                    let statement = (spelling, &target.origin, false);
                     if clash(&said, &key, statement, values, &layer.file, clashes)? {
                         // Beside the entries already held for the file, not at
                         // the end: the file's rows stay together and in written
@@ -515,6 +538,7 @@ impl Merged<Target, TargetKey> {
                 key,
                 spelling: spelling.to_string(),
                 origin: target.origin.clone(),
+                fragile: false,
             });
         }
 
@@ -527,7 +551,8 @@ impl Merged<Target, TargetKey> {
                     if self.position(&key).is_none() {
                         return Err(unknown_toggle(toggle, &self.as_written_note()));
                     }
-                    let statement = (toggle.key.as_str(), &toggle.origin);
+                    let fragile = !anchored(&toggle.key, earlier, layer, values);
+                    let statement = (toggle.key.as_str(), &toggle.origin, fragile);
                     if clash(&said, &key, statement, values, &layer.file, clashes)? {
                         self.set_enabled_for(&key, true);
                     } else {
@@ -537,6 +562,7 @@ impl Merged<Target, TargetKey> {
                         key,
                         spelling: toggle.key.clone(),
                         origin: toggle.origin.clone(),
+                        fragile,
                     });
                 }
                 Section::Value => {}
@@ -597,11 +623,12 @@ impl Merged<Target, TargetKey> {
 /// collision is the account's, it is
 /// recorded against this layer, replacing what was recorded for the file so far
 /// with every statement this layer has made about it, and the answer is
-/// `Ok(true)`.
+/// `Ok(true)`. Each statement keeps its [`Said::fragile`] flag, which decides
+/// whether the conflict's hint names an answer or toggles to remove.
 fn clash(
     said: &[Said],
     key: &TargetKey,
-    (spelling, origin): (&str, &Origin),
+    (spelling, origin, fragile): (&str, &Origin, bool),
     values: &ResolvedValues,
     layer: &Path,
     clashes: &mut Vec<Clash>,
@@ -633,11 +660,17 @@ fn clash(
         }
     }
 
-    let mut statements: Vec<(String, Origin)> = earlier
+    let mut statements: Vec<(String, Origin, bool)> = earlier
         .iter()
-        .map(|statement| (statement.spelling.clone(), statement.origin.clone()))
+        .map(|statement| {
+            (
+                statement.spelling.clone(),
+                statement.origin.clone(),
+                statement.fragile,
+            )
+        })
         .collect();
-    statements.push((spelling.to_string(), origin.clone()));
+    statements.push((spelling.to_string(), origin.clone(), fragile));
     clashes.retain(|clash| !(clash.key == *key && clash.layer == layer));
     clashes.push(Clash {
         layer: layer.to_path_buf(),
@@ -646,6 +679,28 @@ fn clash(
         names,
     });
     Ok(true)
+}
+
+/// Whether a toggle spelled `toggle` can be shown to name a declared target for
+/// every answer: its spelling is one path as written with a full entry's, in an
+/// earlier layer or in `layer`, its own.
+///
+/// Such a toggle names that entry's file whenever the entry names one, and a
+/// declared file is never taken out of the merge, since a later entry for it
+/// replaces in place. So an answer that parts a clash leaves the toggle naming
+/// a target. Layers after `layer` do not count: at this toggle their entries
+/// are not there yet.
+///
+/// `false` says only that bx cannot show it. A toggle that meets a declared
+/// spelling through this account's answer alone is not anchored, and neither
+/// is one whose pair with a declared spelling the written form does not
+/// decide.
+fn anchored(toggle: &str, earlier: &[Layer], layer: &Layer, values: &ResolvedValues) -> bool {
+    earlier
+        .iter()
+        .chain([layer])
+        .flat_map(|layer| &layer.config.targets)
+        .any(|target| one_path_as_written(toggle, target.path.as_str(), values))
 }
 
 /// Whether two spellings name one file whatever is answered.
@@ -658,9 +713,13 @@ fn clash(
 /// complete over every spelling. The known shapes it does not decide are listed
 /// in the review notes of pull request #16.
 ///
-/// Only spellings whose keys are one [`TargetKey::File`] are compared here, so
+/// [`clash`] compares only spellings whose keys are one [`TargetKey::File`], so
 /// every placeholder in either is declared, enabled and answered: a
 /// substitution that failed would have keyed the spelling as written.
+/// [`anchored`] also compares a toggle with every declared spelling, whatever
+/// its key. Soundness does not rest on the keys, so the verdict holds there
+/// too, and a spelling with no form counts as not one path, which errs toward
+/// the removal hint, whose advice can always be followed.
 fn one_path_as_written(first: &str, second: &str, values: &ResolvedValues) -> bool {
     written_form(first, values).is_some_and(|form| Some(form) == written_form(second, values))
 }
@@ -900,8 +959,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
 
     let mut targets: Merged<Target, TargetKey> = Merged::default();
     let mut clashes: Vec<Clash> = Vec::new();
-    for layer in layers {
-        targets.absorb_layer(layer, &resolved, &mut clashes)?;
+    for (index, layer) in layers.iter().enumerate() {
+        targets.absorb_layer(layer, &layers[..index], &resolved, &mut clashes)?;
     }
 
     Ok(Config {

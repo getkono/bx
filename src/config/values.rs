@@ -1228,14 +1228,7 @@ impl ResolvedValues {
     /// separate them.
     #[must_use]
     pub(crate) fn answers_hint(&self, problem: &str, texts: &[&str], names: &[String]) -> String {
-        let answers = names
-            .iter()
-            .filter_map(|name| {
-                self.get(name)
-                    .map(|value| format!("the answer to `{name}` at {}", value.origin))
-            })
-            .collect::<Vec<_>>()
-            .join(" and ");
+        let answers = self.answers_named(names);
 
         let carried: Vec<Vec<String>> = texts
             .iter()
@@ -1271,6 +1264,72 @@ impl ResolvedValues {
             "{problem}, because of {answers}, carried in by {defaults}; change that answer, \
              or answer {direct} directly"
         )
+    }
+
+    /// What to do about a file one layer names more than once because of this
+    /// account's answers, when a toggle among the statements cannot be shown to
+    /// name a declared target whatever is answered.
+    ///
+    /// Changing the answer is not offered. Under another answer such a toggle
+    /// may name a file no earlier layer declares, which fails the whole load,
+    /// so the answer that made the clash can be the only one that loads.
+    /// Removing the toggle can always be followed: a toggle creates no entry,
+    /// so removing one leaves nothing unknown, and every statement that stays
+    /// already names the file. Nor is a value carried in by a `default` named,
+    /// as [`ResolvedValues::answers_hint`] names one: answering it directly is
+    /// changing an answer too.
+    ///
+    /// `problem` and `names` are as `answers_hint` takes them. `statements` are
+    /// the spellings in the order read, each with its line, and flagged when it
+    /// is such a toggle. Each flagged one is named; when every statement is
+    /// flagged, none is the one to keep, so the hint says to keep any one.
+    #[must_use]
+    pub(crate) fn removal_hint(
+        &self,
+        problem: &str,
+        names: &[String],
+        statements: &[(String, Origin, bool)],
+    ) -> String {
+        let answers = self.answers_named(names);
+        let unshown: Vec<String> = statements
+            .iter()
+            .filter(|(_, _, unshown)| *unshown)
+            .map(|(spelling, origin, _)| format!("`{spelling}` at {origin}"))
+            .collect();
+        if unshown.len() == statements.len() {
+            return format!(
+                "{problem}, because of {answers}; keep one of these toggles and remove the \
+                 rest: bx cannot show that any of them names a declared target for every \
+                 answer, so another answer may leave one toggling a file no earlier layer \
+                 declares"
+            );
+        }
+        if let [toggle] = unshown.as_slice() {
+            return format!(
+                "{problem}, because of {answers}; remove the toggle {toggle}: bx cannot show \
+                 that it names a declared target for every answer, so another answer may \
+                 leave it toggling a file no earlier layer declares"
+            );
+        }
+        format!(
+            "{problem}, because of {answers}; remove the toggles {}: bx cannot show that they \
+             name declared targets for every answer, so another answer may leave them \
+             toggling files no earlier layer declares",
+            unshown.join(" and ")
+        )
+    }
+
+    /// Each of `names` as the answer the account wrote and its line, joined
+    /// with "and": the phrase every answer hint gives its cause in.
+    fn answers_named(&self, names: &[String]) -> String {
+        names
+            .iter()
+            .filter_map(|name| {
+                self.get(name)
+                    .map(|value| format!("the answer to `{name}` at {}", value.origin))
+            })
+            .collect::<Vec<_>>()
+            .join(" and ")
     }
 
     /// Collect into `into` every value `text` reaches that carries an account

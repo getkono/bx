@@ -4049,13 +4049,13 @@ pub(crate) mod tests {
         // which is not an interruption, so `Session::open` created its own
         // journal over it by rename and the bytes were gone.
         let home = guarded_home();
-        let state = StateDir::resolve(home.path());
+        // Every set-aside name is longer than the kernel accepts, so the move
+        // fails with no permission bit involved, and a session could write.
+        // (A crafted `journal.mpk.corrupt.<u64::MAX>` no longer blocks it:
+        // `move_aside` takes the lowest free name past that number.)
+        let state = state_beyond_set_aside_names(&home);
         state.ensure().expect("ensure");
         std::fs::write(state.journal(), b"GARBAGE!").expect("an unreadable journal");
-        // No set-aside name follows the highest one there can be, so the move
-        // fails with no permission bit involved, and a session could write.
-        let last = StateDir::quarantine_nth(&state.journal(), u64::MAX);
-        std::fs::write(&last, b"the last name").expect("the highest set-aside name");
 
         let opened = Session::open(&state, SessionKind::Apply, home.path(), Vec::new());
         assert_eq!(
@@ -4064,7 +4064,12 @@ pub(crate) mod tests {
             "the unreadable journal's bytes are still at its path"
         );
         assert!(
-            matches!(opened, Err(Error::CannotSetAside { .. })),
+            matches!(
+                &opened,
+                Err(Error::CannotSetAside { source, .. })
+                    if source.raw_os_error()
+                        == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+            ),
             "got {opened:?}"
         );
 
@@ -4083,7 +4088,11 @@ pub(crate) mod tests {
                 .expect("still reported")
                 .unreadable
         );
-        assert_eq!(std::fs::read(&last).expect("kept"), b"the last name");
+        assert_eq!(
+            names_in(state.root()),
+            ["journal.mpk", "lock", "restore", "shell"],
+            "nothing was set aside and no session wrote"
+        );
     }
 
     /// Whether a directory without write permission refuses this process.
@@ -4101,6 +4110,52 @@ pub(crate) mod tests {
             "skipped: this process writes through directory permissions, so the failure cannot be produced"
         );
         false
+    }
+
+    /// A state directory, not yet created, whose files' paths fit Linux's
+    /// `PATH_MAX` and whose set-aside names do not.
+    ///
+    /// Every [`crate::state::move_aside`] of its journal or ledger then fails
+    /// with ENAMETOOLONG, whoever the process runs as — "a name too long for a
+    /// quarantine suffix", as `state` puts it — while each can still be read,
+    /// written and locked. `fingerprints.mpk` is the one state file out of
+    /// reach.
+    pub(crate) fn state_beyond_set_aside_names(home: &crate::testing::GuardedHome) -> StateDir {
+        /// `PATH_MAX`, which counts the terminating NUL.
+        const PATH_MAX: usize = 4096;
+        const ROOT: usize = 4080;
+        let mut root = home.path().as_os_str().to_os_string();
+        assert!(root.len() < ROOT - 256, "a home short enough to extend");
+        while ROOT - root.len() > 256 {
+            root.push(format!("/{}", "d".repeat(200)));
+        }
+        root.push(format!("/{}", "b".repeat(ROOT - root.len() - 1)));
+        let state = StateDir::new(PathBuf::from(root));
+        assert_eq!(state.root().as_os_str().len(), ROOT);
+        for file in [state.journal(), state.ledger()] {
+            assert!(file.as_os_str().len() < PATH_MAX, "{} fits", file.display());
+            assert!(
+                StateDir::quarantine(&file).as_os_str().len() >= PATH_MAX,
+                "its set-aside name does not"
+            );
+        }
+        state
+    }
+
+    /// The names in `dir`, sorted.
+    pub(crate) fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("list")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
     }
 
     /// A session header for a journal that needs one and does not care what it

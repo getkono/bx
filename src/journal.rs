@@ -5143,6 +5143,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_claim_the_heir_holds_is_not_recorded_again_and_a_refused_record_is_an_error() {
+        // r3 round 2, P9R4-CV2. Neither the skip for a claim the heir already
+        // holds nor a `record` the ledger refuses was reached. The ledger's
+        // lock file is replaced, so every `record` through it is refused with
+        // WrongLock: the skip is the only way the first case can succeed, and
+        // the second must say so rather than drop the claim.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let dir = home.child(".config/app");
+        std::fs::create_dir_all(&dir).expect("the claimed directory");
+        let claim = Portable::from_path(&dir, home.path()).expect("portable");
+        let heir = Portable::from_path(&dir.join("a.toml"), home.path()).expect("portable");
+        for holds in [true, false] {
+            let case = format!("the heir already holds the claim: {holds}");
+            let lock = ExclusiveLock::acquire(&state).expect("lock");
+            let mut ledger = Ledger::open(&state, &lock, home.path())
+                .expect("open the ledger")
+                .value;
+            ledger
+                .record(
+                    NewEntry::new(
+                        heir.clone(),
+                        ContentHash::of(b"x\n"),
+                        Mode::DEFAULT_FILE,
+                        Mechanism::Own,
+                    )
+                    .with_created_dirs(if holds {
+                        vec![claim.clone()]
+                    } else {
+                        Vec::new()
+                    }),
+                )
+                .expect("the heir");
+            let before = ledger.get(&heir).cloned().expect("recorded");
+            std::fs::rename(state.lock(), home.child(format!("moved-lock-{holds}")))
+                .expect("an outside mv of the lock file");
+            let second = ExclusiveLock::acquire(&state).expect("a second writer");
+
+            let handed = hand_off_claims(&mut ledger, home.path(), [&dir]);
+            let after = ledger.get(&heir).cloned();
+            drop(second);
+
+            if holds {
+                handed.expect("a claim the heir holds is not recorded again");
+            } else {
+                let err = handed.expect_err("a refused record is an error");
+                assert!(
+                    matches!(err, Error::State(crate::state::Error::WrongLock { .. })),
+                    "{case}: got {err}"
+                );
+            }
+            assert_eq!(after, Some(before), "{case}: nothing half-recorded");
+        }
+    }
+
+    #[test]
     fn a_session_counts_every_write_it_published() {
         // Coverage review round 5, non-blocking.
         let home = guarded_home();

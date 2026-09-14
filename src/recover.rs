@@ -4003,6 +4003,50 @@ mod tests {
     }
 
     #[test]
+    fn a_created_file_changed_after_the_crash_is_blocked_saying_it_did_not_exist() {
+        // r3 round 2, P9R4-CV3. `note`'s wording for a write that created its
+        // file was never reached. A created file that is gone again reads as
+        // `Prior`, so only an edit and a replacement block such a write.
+        fn edited(dest: &Path) {
+            plant_file(dest, "edited after the crash\n", Mode::DEFAULT_FILE);
+        }
+        fn replaced(dest: &Path) {
+            std::fs::remove_file(dest).expect("rm");
+            std::fs::create_dir(dest).expect("a directory in its place");
+        }
+
+        let guard = guarded_home();
+        for (name, change, standing) in [
+            ("edited", edited as fn(&Path), Standing::Diverged),
+            ("replaced", replaced as fn(&Path), Standing::Foreign),
+        ] {
+            let home = guard.child(name);
+            std::fs::create_dir_all(&home).expect("the home");
+            let state = StateDir::resolve(&home);
+            interrupted(
+                &state,
+                &home,
+                vec![write_to(&home, ".new.conf", "bx\n", Mode::DEFAULT_FILE)],
+            );
+            change(&home.join(".new.conf"));
+
+            let report = pending(&state).expect("pending").expect("interrupted");
+            let Outcome::Blocked { conflicts } = recover(&state).expect("recover") else {
+                panic!("{name}: recovery is blocked");
+            };
+            assert_eq!(conflicts, report.unfinished, "{name}");
+            assert_eq!(conflicts[0].standing, standing, "{name}");
+            assert!(
+                conflicts[0]
+                    .note
+                    .contains("before the interruption it did not exist, and it was being given"),
+                "{name}: {}",
+                conflicts[0].note
+            );
+        }
+    }
+
+    #[test]
     fn only_a_destination_in_a_recorded_state_is_resolvable() {
         for (standing, resolvable) in [
             (Standing::Prior, true),

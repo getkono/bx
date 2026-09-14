@@ -192,6 +192,12 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
                 dest,
             });
         }
+        // Not reached from a ledger entry. What is left of `observe`'s errors
+        // is `NoParent` and `ParentComponent`, and `render` joins a non-empty
+        // relative path onto an absolute home, so the destination always has
+        // a parent; a `Portable` is lexically normalised and holds no `..`,
+        // so only a home spelled with one could produce the second. Kept, so
+        // the match stays total without a panic.
         Err(e) => return Err(e.into()),
     };
     // A parent that does not resolve is observed as an absent destination,

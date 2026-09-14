@@ -2751,4 +2751,214 @@ mod tests {
             "two roots, because sccache is outside this account's scratch root"
         );
     }
+
+    /// `b`, a `path` value, then `s`, a `string`, then a target whose `file`
+    /// is `FILE`, and a second target that references neither.
+    const ANSWERED_PATH: &str = "[[value]]\n\
+                                 name = \"b\"\n\
+                                 kind = \"path\"\n\
+                                 [[value]]\n\
+                                 name = \"s\"\n\
+                                 kind = \"string\"\n\
+                                 [[target]]\n\
+                                 path = \"~/.config/thing\"\n\
+                                 file = \"FILE\"\n\
+                                 [[target]]\n\
+                                 path = \"~/.zshrc\"\n\
+                                 content = \"setopt\"\n";
+
+    #[test]
+    fn a_file_body_may_not_reach_a_path_value_through_an_answer() {
+        // `s` is a `string` with no default, so nothing committed reaches `b`.
+        // The account's answer `s = "{{b}}"` does, and `cfg/{{s}}/x` resolved
+        // to a repo file carrying the account's absolute location. No committed
+        // layer is at fault, so it blocks this target and names the answer.
+        for file in ["cfg/{{s}}/x", "{{s}}/x"] {
+            let layer = ANSWERED_PATH.replace("FILE", file);
+            for local in [
+                "[values]\ns = \"{{b}}\"\nb = \"/home/example/secret-machine-name\"\n",
+                // Unanswered, `b` would otherwise block the target with advice
+                // to answer it, which leads straight into this block.
+                "[values]\ns = \"{{b}}\"\n",
+            ] {
+                let resolved = resolved(&layer, Some(local))
+                    .expect("an account's answer blocks its target, not the load");
+                let entry = blocked(&resolved, 0);
+                assert_eq!(
+                    entry.reason,
+                    BlockReason::InvalidValue {
+                        names: vec!["s".to_string()]
+                    },
+                    "{file} {local}"
+                );
+                assert_eq!(
+                    entry.hint,
+                    "target `~/.config/thing`: `file` references `s`, whose answer at \
+                     local.toml:2 is built from `b`, a `path` value; a `path` value is always \
+                     absolute and `file` is relative to the config repo root, because of the \
+                     answer to `s` at local.toml:2; change that answer",
+                    "{file} {local}"
+                );
+                assert_eq!(entry.origin.to_string(), "bx.toml:7", "{file} {local}");
+                assert_eq!(
+                    ready(&resolved, 1).path.as_str(),
+                    "~/.zshrc",
+                    "{file} {local}"
+                );
+            }
+        }
+
+        // An answer built from no `path` value is the case `file` substitution
+        // exists for.
+        let ordinary = resolved(
+            &ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"),
+            Some("[values]\ns = \"work\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/x"))
+        );
+    }
+
+    #[test]
+    fn a_file_body_through_an_answer_and_a_default_names_every_step() {
+        // `t`, declared between, defaults to `{{b}}`. The walk follows an
+        // answer first, then the committed default whether or not it applies.
+        let layer = ANSWERED_PATH
+            .replace(
+                "[[value]]\nname = \"s\"",
+                "[[value]]\nname = \"t\"\nkind = \"string\"\ndefault = \"{{b}}\"\n\
+                 [[value]]\nname = \"s\"",
+            )
+            .replace("FILE", "cfg/{{s}}/x");
+
+        for local in [
+            // `t` unanswered: its default applies and carries `b` in.
+            "[values]\ns = \"{{t}}\"\nb = \"/var/mnt/cfg\"\n",
+            // `t` answered: its default does not apply, and is followed anyway,
+            // as the committed walk follows it.
+            "[values]\ns = \"{{t}}\"\nt = \"work\"\n",
+        ] {
+            let resolved = resolved(&layer, Some(local)).expect("blocked, not a load error");
+            let entry = blocked(&resolved, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["s".to_string()]
+                },
+                "{local}"
+            );
+            assert!(
+                entry.hint.starts_with(
+                    "target `~/.config/thing`: `file` references `s`, whose answer at \
+                     local.toml:2 is built from `t`, whose default at bx.toml:4 is built \
+                     from `b`, a `path` value; "
+                ),
+                "{local}: {}",
+                entry.hint
+            );
+            assert!(
+                entry.hint.ends_with(
+                    ", because of the answer to `s` at local.toml:2; change that answer"
+                ),
+                "{local}: {}",
+                entry.hint
+            );
+        }
+
+        // Two answers on the way: both are named, in declaration order.
+        let resolved = resolved(
+            &layer,
+            Some("[values]\ns = \"{{t}}\"\nt = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),
+        )
+        .expect("blocked, not a load error");
+        let entry = blocked(&resolved, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["t".to_string(), "s".to_string()]
+            }
+        );
+        assert!(
+            entry.hint.contains(
+                "`file` references `s`, whose answer at local.toml:2 is built from `t`, whose \
+                 answer at local.toml:3 is built from `b`, a `path` value"
+            ),
+            "{}",
+            entry.hint
+        );
+        assert!(
+            entry.hint.ends_with(
+                ", because of the answer to `t` at local.toml:3 and the answer to `s` at \
+                 local.toml:2; change that answer"
+            ),
+            "{}",
+            entry.hint
+        );
+    }
+
+    #[test]
+    fn a_path_answer_outside_file_still_resolves() {
+        // Only `file` is relative to the repo root. The same answer in another
+        // field of a `file` target, or in inline content, is what a `path`
+        // value is for.
+        let resolved = resolved(
+            "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+             [[value]]\nname = \"s\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/thing\"\nfile = \"cfg/x\"\n\
+             requires = [\"{{s}}/bin/tool\"]\n\
+             [[target]]\npath = \"~/.config/env\"\ncontent = \"DIR={{s}}\"\n",
+            Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/work\"\n"),
+        )
+        .unwrap();
+
+        assert_eq!(ready(&resolved, 0).requires, ["/var/mnt/work/bin/tool"]);
+        assert_eq!(ready(&resolved, 0).body, Body::File(PathBuf::from("cfg/x")));
+        assert_eq!(
+            ready(&resolved, 1).body,
+            Body::Inline("DIR=/var/mnt/work".to_string())
+        );
+    }
+
+    #[test]
+    fn a_repo_defect_in_a_target_outranks_a_path_answer_block() {
+        // The same target also names a value no layer declares. That is the
+        // committed repo's defect and fails the load; blocking the target on
+        // the account's answer instead would hide it.
+        let message = resolved(
+            &ANSWERED_PATH.replace(
+                "file = \"FILE\"\n",
+                "file = \"cfg/{{s}}/x\"\nrequires = [\"{{nowhere}}\"]\n",
+            ),
+            Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),
+        )
+        .expect_err("a repo defect fails the load");
+
+        assert!(
+            message.contains("no layer declares the value `nowhere`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_value_s_answer_is_not_walked() {
+        // A switched-off declaration's answer is not this account's value, so
+        // the target is blocked by the switch, as it was before.
+        let resolved = resolved(
+            &ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"),
+            Some(
+                "[[value]]\nname = \"s\"\nenabled = false\n\
+                 [values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&resolved, 0).reason,
+            BlockReason::DisabledValue {
+                names: vec!["s".to_string()]
+            }
+        );
+    }
 }

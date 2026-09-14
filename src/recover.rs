@@ -415,7 +415,10 @@ pub fn before_writing(state: &StateDir) -> Result<Outcome, Error> {
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
     let lock = ExclusiveLock::acquire(state)?;
     let path = state.journal();
-    if !path.exists() {
+    // Looked at without following a link: a dangling one at the journal's
+    // path is refused by every read (`journal::Error::NotAJournal`), so it
+    // has to be something this can move aside.
+    if std::fs::symlink_metadata(&path).is_err() {
         return Ok(None);
     }
     // Refused here as everywhere else it is read: abandoning a newer bx's

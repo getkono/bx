@@ -234,6 +234,26 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// What stands at the journal's path is not a regular file: a FIFO, a
+    /// device, a socket, a directory, or a symlink, dangling or not.
+    ///
+    /// Refused before anything opens it. Reading a FIFO blocks until
+    /// something writes to it, and a device such as `/dev/zero` never ends,
+    /// so every command that looks for an interrupted session would hang —
+    /// and no session writes one: [`Journal::create`] renames a regular file
+    /// into place. It is left exactly where it is, never set aside by a
+    /// recovery, and [`crate::recover::abandon`] moves it aside.
+    #[error(
+        "the write-ahead journal {} is {kind}; bx reads a journal only from a regular file, \
+         so it did not open it, and will not write until it is moved",
+        .path.display()
+    )]
+    NotAJournal {
+        /// The journal's path.
+        path: PathBuf,
+        /// What is there instead.
+        kind: crate::fs::Kind,
+    },
     /// A session was asked to start while an unresolved interruption stands.
     ///
     /// The escape is [`crate::recover::recover`], which every writing command
@@ -606,6 +626,8 @@ impl Loaded {
 /// [`Error::Io`] when the file exists and cannot be read at all. Damage is a
 /// value, not an error; only a failure to look is. [`Error::FutureVersion`]
 /// for a journal a newer bx wrote, which is not damage and is never set aside.
+/// [`Error::NotAJournal`] for a path that is not a regular file, which is
+/// never opened.
 pub fn load(path: &Path) -> Result<Loaded, Error> {
     Ok(match inspect(path)? {
         Ok(loaded) => loaded,
@@ -648,6 +670,26 @@ pub fn load_exclusive(path: &Path, lock: &ExclusiveLock) -> Result<Loaded, Error
 /// Classify the bytes at `path`: what a session, or a crash of one, left there,
 /// or why it is neither.
 fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
+    // Looked at before it is opened, following no link. See
+    // `Error::NotAJournal`.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(Error::NotAJournal {
+                path: path.to_path_buf(),
+                kind: fs::Kind::from(meta.file_type()),
+            });
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Ok(Loaded::Absent)),
+        Err(source) => {
+            return Err(Error::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    // A journal unlinked since that look — `pending` takes no lock, and a
+    // session may just have finished — is as absent as one never there.
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Ok(Loaded::Absent)),
@@ -1231,7 +1273,9 @@ impl Session {
     ///
     /// [`Error::InProgress`] when a journal already stands — recover first.
     /// [`Error::FutureVersion`] when the journal that stands was written by a
-    /// newer bx: nothing is set aside. [`Error::CannotSetAside`] when the
+    /// newer bx: nothing is set aside. [`Error::NotAJournal`] when what stands
+    /// at the journal's path is not a regular file: it is never opened.
+    /// [`Error::CannotSetAside`] when the
     /// journal that stands cannot be believed and cannot be moved aside: it is
     /// left in place, never replaced. [`Error::State`] when the directory
     /// cannot be made or locked, and [`Error::Io`] when the journal cannot be
@@ -4693,6 +4737,177 @@ pub(crate) mod tests {
             bytes,
             "and it was not replaced"
         );
+    }
+
+    /// The home a journal-read child finds its state directory under.
+    const READ_CHILD_HOME: &str = "BX_JOURNAL_READ_HOME";
+
+    /// Which read a journal-read child makes: `load`, `open` or `recover`.
+    const READ_CHILD_CALL: &str = "BX_JOURNAL_READ_CALL";
+
+    /// The reading half of
+    /// [`a_journal_that_is_not_a_regular_file_is_refused_without_being_read`].
+    ///
+    /// Run in a child so a read that never returns can be killed, and with its
+    /// address space capped, so a read of `/dev/zero` aborts on its first
+    /// gigabyte instead of taking the host's memory with it.
+    #[test]
+    #[ignore = "spawned by a_journal_that_is_not_a_regular_file_is_refused_without_being_read"]
+    fn journal_read_child() {
+        let (Some(home), Ok(call)) = (
+            std::env::var_os(READ_CHILD_HOME),
+            std::env::var(READ_CHILD_CALL),
+        ) else {
+            return;
+        };
+        rustix::process::setrlimit(
+            rustix::process::Resource::As,
+            rustix::process::Rlimit {
+                current: Some(1 << 30),
+                maximum: None,
+            },
+        )
+        .expect("cap the address space");
+        let home = PathBuf::from(home);
+        let state = StateDir::resolve(&home);
+        let path = state.journal();
+        let named = |e: &Error| matches!(e, Error::NotAJournal { path: at, .. } if *at == path);
+        let refusal = match call.as_str() {
+            "load" => load(&path)
+                .map(|_| ())
+                .map_err(|e| (named(&e), e.to_string())),
+            "open" => Session::open(&state, SessionKind::Apply, &home, Vec::new())
+                .map(|_| ())
+                .map_err(|e| (named(&e), e.to_string())),
+            "recover" => crate::recover::recover(&state).map(|_| ()).map_err(|e| {
+                let refused = matches!(&e, crate::recover::Error::Journal(inner) if named(inner));
+                (refused, e.to_string())
+            }),
+            other => panic!("no such read: {other}"),
+        };
+        println!("{call}: {refusal:?}");
+        let (refused, message) =
+            refusal.expect_err("a journal that is not a regular file is refused");
+        assert!(refused, "refused as NotAJournal: {message}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the refusal names the journal: {message}"
+        );
+        assert!(message.contains("only from a regular file"), "{message}");
+    }
+
+    #[test]
+    fn a_journal_that_is_not_a_regular_file_is_refused_without_being_read() {
+        // P42R1-D5 (journal part). The journal was read whole with a blocking
+        // read and no look at its type, so a FIFO at `journal.mpk` blocked
+        // load, Session::open and recovery forever, and a link to /dev/zero
+        // read without end.
+        fn fifo(path: &Path) {
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .expect("mkfifo");
+        }
+        fn device_link(path: &Path) {
+            std::os::unix::fs::symlink("/dev/zero", path).expect("link to /dev/zero");
+        }
+        fn dangling_link(path: &Path) {
+            std::os::unix::fs::symlink(path.with_file_name("nowhere"), path)
+                .expect("a link to nothing");
+        }
+
+        let guard = guarded_home();
+        // Every case is run before any is judged, so one read that hangs
+        // does not hide what the others do.
+        let mut failures = Vec::new();
+        for (name, plant, kind) in [
+            ("fifo", fifo as fn(&Path), fs::Kind::Other),
+            ("device-link", device_link as fn(&Path), fs::Kind::Symlink),
+            (
+                "dangling-link",
+                dangling_link as fn(&Path),
+                fs::Kind::Symlink,
+            ),
+        ] {
+            for call in ["load", "open", "recover"] {
+                let case = format!("{name} read by {call}");
+                let home = guard.child(format!("{name}-{call}"));
+                let state = StateDir::resolve(&home);
+                state.ensure().expect("the state directory");
+                plant(&state.journal());
+
+                let mut child =
+                    std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                        .args([
+                            "--exact",
+                            "--ignored",
+                            "--nocapture",
+                            "journal::tests::journal_read_child",
+                        ])
+                        .env(READ_CHILD_HOME, &home)
+                        .env(READ_CHILD_CALL, call)
+                        .env_remove("LLVM_PROFILE_FILE")
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .expect("spawn the reading child");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let finished = loop {
+                    if child.try_wait().expect("wait").is_some() {
+                        break true;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        child.kill().expect("kill the reading child");
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                };
+                let out = child.wait_with_output().expect("the child's output");
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if !finished {
+                    failures.push(format!("{case}: still reading after 60 s: {said}"));
+                    continue;
+                }
+                if !out.status.success() {
+                    failures.push(format!("{case}: {} {said}", out.status));
+                    continue;
+                }
+
+                let meta = std::fs::symlink_metadata(state.journal()).expect("left in place");
+                assert_eq!(
+                    fs::Kind::from(meta.file_type()),
+                    kind,
+                    "{case}: never replaced"
+                );
+                assert!(
+                    std::fs::symlink_metadata(StateDir::quarantine(&state.journal())).is_err(),
+                    "{case}: never set aside"
+                );
+
+                // The way out: `abandon` moves it aside without opening it,
+                // and bx writes again.
+                let aside = crate::recover::abandon(&state)
+                    .expect("abandon")
+                    .expect("something stood at the journal's path");
+                assert_eq!(
+                    fs::Kind::from(std::fs::symlink_metadata(&aside).expect("kept").file_type()),
+                    kind,
+                    "{case}: moved, not replaced"
+                );
+                assert_eq!(
+                    crate::recover::before_writing(&state).expect("bx writes again"),
+                    crate::recover::Outcome::Nothing,
+                    "{case}"
+                );
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

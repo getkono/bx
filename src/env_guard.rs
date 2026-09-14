@@ -1218,15 +1218,19 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
                     });
                 // A location's tool reads the whole value as one path, whose
                 // `:` its entries were judged apart at. Every entry has passed
-                // by now, so this cannot newly refuse: the whole value begins
-                // with its first absolute entry, holds only allowed characters
-                // and `:`, and merging entries at a `:` makes a component
-                // holding `:`, which no directory bx owns or roots names, so it
-                // cannot complete a match with one that no entry already made.
-                // And the first entry lies strictly beneath a root, so the
-                // whole value's parent begins with that entry's parent, which
-                // is inside the root. It is judged anyway, as the one path the
-                // tool reads, so that stays true if an entry's rule changes.
+                // by now, so the whole value begins with its first absolute
+                // entry and holds only allowed characters and `:`. The first
+                // entry lies strictly beneath a root, so the whole value and
+                // its parent begin with that entry's parent, which is inside
+                // the root: this never newly refuses it as outside every root
+                // or as a root itself. Merging entries at a `:` makes a
+                // component holding `:`, which completes a match no entry made
+                // only with a directory whose own path holds a `:`. The home,
+                // and so bx's directories under it, may: with
+                // `HOME=<root>/x:<root>/y`, each entry of
+                // `CARGO_HOME=<root>/x:<root>/y/.local/state` passes, and the
+                // whole value, the path cargo reads, contains bx's state
+                // directory. So this is the one refusal of such a value.
                 entries.or_else(|| {
                     (kind == Kind::Location)
                         .then(|| refuses_entry(value, Some(':'), roots))
@@ -5205,6 +5209,29 @@ mod tests {
             }
         }
         assert_eq!(judged, expected);
+    }
+
+    #[test]
+    fn a_location_whose_entries_pass_is_refused_when_its_whole_path_holds_a_home_with_a_colon() {
+        // A home may hold `:`, and so may bx's directories under it. Neither
+        // entry of this value contains bx's state directory, and the one path
+        // cargo reads does: the whole-value check is its only refusal. `GOPATH`
+        // is read entry by entry, so its whole string is not judged.
+        let home = format!("{ROOT}/x:{ROOT}/y");
+        let roots = RootSet::new(Path::new(&home), &[PathBuf::from(ROOT)]);
+        let value = format!("{ROOT}/x:{ROOT}/y/.local/state");
+        for entry in value.split(':') {
+            assert_eq!(
+                check("CARGO_HOME", entry, &roots),
+                Verdict::Allowed,
+                "{entry}"
+            );
+        }
+        assert_eq!(check("GOPATH", &value, &roots), Verdict::Allowed);
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", &value, &roots)),
+            Some(Reason::ContainsBxDirectory)
+        );
     }
 
     #[test]

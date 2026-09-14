@@ -1612,6 +1612,35 @@ mod tests {
     }
 
     #[test]
+    fn a_clash_through_a_chain_of_defaults_names_every_declaration_between() {
+        // `t` defaults to `{{q}}`, which defaults to `{{p}}`, which is answered.
+        // Answering `t` or `q` directly both separate `~/{{t}}/s` from
+        // `~/work/s`, so the hint follows the chain down and names each.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[value]]\nname = \"t\"\nkind = \"string\"\ndefault = \"{{q}}\"\n\
+                             [[target]]\npath = \"~/{{t}}/s\"\ncontent = \"T\"\n\
+                             [[target]]\npath = \"~/work/s\"\ncontent = \"W\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let resolved = resolved(LAYER, Some("[values]\np = \"work\"\n"))
+            .expect("an account's answer does not fail the load");
+        for index in [0, 1] {
+            let entry = blocked(&resolved, index);
+            assert!(
+                entry.hint.ends_with(
+                    "because of the answer to `p` at local.toml:2, carried in by the default \
+                     of `q` at bx.toml:4 and the default of `t` at bx.toml:8; change that \
+                     answer, or answer `q` or `t` directly"
+                ),
+                "{index}: {}",
+                entry.hint
+            );
+        }
+        ready(&resolved, 2);
+    }
+
+    #[test]
     fn a_derived_value_every_colliding_spelling_carries_is_not_offered_as_the_way_out() {
         // `q` carries the answer to `o` into both spellings, so answering `q`
         // directly moves both files together and they stay one file. Naming it

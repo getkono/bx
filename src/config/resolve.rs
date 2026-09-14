@@ -1805,11 +1805,14 @@ mod tests {
     }
 
     #[test]
-    fn a_path_value_pair_that_is_one_path_as_written_fails_the_load() {
-        // A `path` answer is rooted, so the toggles `{{root}}/s` and
-        // `{{root}}/./s` reduce as paths and are one file for every answer. (A
-        // full entry may not open with a placeholder; a toggle names a file by
-        // the spelling it reaches.)
+    fn a_path_value_pair_apart_only_by_a_dot_segment_fails_the_load() {
+        // The toggles `{{root}}/s` and `{{root}}/./s` share an opening segment
+        // and differ only by a `.`, which folds, so they are one file for every
+        // answer. That holds however the opening segment is rooted; the root a
+        // `path` value gives is pinned by
+        // `a_path_value_opening_a_spelling_is_rooted_at_slash`. (A full entry
+        // may not open with a placeholder; a toggle names a file by the spelling
+        // it reaches.)
         const LAYER: &str = "[[value]]\nname = \"root\"\nkind = \"path\"\n\
                              [[target]]\npath = \"/srv/data/s\"\ncontent = \"S\"\n\
                              [[target]]\npath = \"{{root}}/s\"\nenabled = false\n\
@@ -1821,6 +1824,28 @@ mod tests {
         for part in [
             "bx.toml:10",
             "names the same file as `{{root}}/s` at bx.toml:7",
+            "in this same layer",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_path_value_opening_a_spelling_is_rooted_at_slash() {
+        // `{{r}}/s` and `/{{r}}/s` differ in their opening segment, and are one
+        // file for every answer only because every `path` answer is absolute:
+        // the `/` written before it adds nothing. So the pair is the layer's
+        // defect, not a block an answer could clear.
+        const LAYER: &str = "[[value]]\nname = \"r\"\nkind = \"path\"\n\
+                             [[target]]\npath = \"/srv/s\"\ncontent = \"S\"\n\
+                             [[target]]\npath = \"{{r}}/s\"\nenabled = false\n\
+                             [[target]]\npath = \"/{{r}}/s\"\nenabled = true\n";
+
+        let message = resolved(LAYER, Some("[values]\nr = \"/srv\"\n"))
+            .expect_err("one path for every answer is the layer's defect");
+        for part in [
+            "bx.toml:10",
+            "names the same file as `{{r}}/s` at bx.toml:7",
             "in this same layer",
         ] {
             assert!(message.contains(part), "{part}: {message}");

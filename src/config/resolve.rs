@@ -1079,6 +1079,33 @@ mod tests {
     }
 
     #[test]
+    fn a_field_broken_through_a_derived_value_names_the_declaration_between() {
+        // `derived` is not answered; its default carries the answer to `base`
+        // in. The broken field is one text, so answering `derived` directly
+        // changes it and clears the entry: the hint names that declaration.
+        const LAYER: &str = "[[value]]\nname = \"base\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"derived\"\nkind = \"string\"\n\
+                             default = \"{{base}}\"\n\
+                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
+                             content = \"{{{{}}\"\n\
+                             format = \"jsonc\"\nowns = [\"a.{{derived}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\nbase = \"b.c\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&answered, 0);
+        assert!(
+            entry.hint.ends_with(
+                "because of the answer to `base` at local.toml:2, carried in by the default of \
+                 `derived` at bx.toml:4; change that answer, or answer `derived` directly"
+            ),
+            "{}",
+            entry.hint
+        );
+        ready(&answered, 1);
+    }
+
+    #[test]
     fn a_requires_that_detect_could_never_find_blocks_or_fails() {
         // Detection looks a tool up by a bare name on `PATH`, or opens an
         // absolute path. An empty name, a relative one holding a `/`, or one made

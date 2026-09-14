@@ -455,6 +455,22 @@ mod tests {
     }
 
     #[test]
+    fn an_unsigned_integer_mode_is_refused_with_the_same_reason() {
+        use serde::de::IntoDeserializer as _;
+        use serde::de::value;
+
+        // TOML hands a bare integer to `visit_i64`, but a human-readable
+        // format may hand an unsigned one to `visit_u64` — serde's own value
+        // deserializers do — and it must get the same refusal, not serde's
+        // generic "invalid type".
+        let deserializer: value::U64Deserializer<value::Error> = 600_u64.into_deserializer();
+        let err = Mode::deserialize(deserializer).expect_err("must be refused");
+        let message = err.to_string();
+        assert!(message.contains("must be quoted"), "{message}");
+        assert!(message.contains("decimal 600"), "{message}");
+    }
+
+    #[test]
     fn the_four_parser_rejections_survive_the_serde_layer() {
         for raw in ["8", "0688", "+644", "00644"] {
             let err = toml_edit::de::from_str::<Declared>(&format!("mode = \"{raw}\""))

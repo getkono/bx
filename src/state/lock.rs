@@ -771,8 +771,22 @@ mod tests {
         )
         .expect("mkfifo");
 
-        let err = SharedLock::probe(&dir).expect_err("a fifo is not a lock file");
-        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
+        // Probed on a thread, so an open that waits for a writer to open the
+        // FIFO fails this test instead of hanging the suite until it is
+        // killed. Such a thread is left blocked; the process ends it.
+        let (sent, answer) = std::sync::mpsc::channel();
+        let probed = dir.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(SharedLock::probe(&probed));
+        });
+        let err = answer
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the probe blocked opening a FIFO")
+            .expect_err("a fifo is not a lock file");
+        assert!(
+            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
+            "got {err}"
+        );
     }
 
     #[test]

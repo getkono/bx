@@ -420,7 +420,7 @@ fn judge<T: DeserializeOwned + Default>(
 /// Only meaningful once the path itself is known to be a link: without one,
 /// `ENOENT` is simply no file, and `ENOTDIR` a state directory that is not a
 /// directory.
-fn leads_nowhere(error: &std::io::Error) -> bool {
+pub(super) fn leads_nowhere(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
         || error.raw_os_error().is_some_and(|code| {
             code == rustix::io::Errno::LOOP.raw_os_error()

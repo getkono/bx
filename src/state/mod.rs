@@ -333,6 +333,11 @@ pub enum Error {
     /// which protects the file whatever its mode; a linked one is never
     /// narrowed, so while it is searchable bx requires the file to be private,
     /// and changes neither mode itself.
+    ///
+    /// A `local.toml` that is itself a link is judged where the file is: the
+    /// mode reported is that file's, and it is refused only while the directory
+    /// holding it can be searched by others too. A link that leads to no
+    /// regular file exposes nothing here.
     #[error(
         "{} is a symbolic link to a directory users other than its owner can search (mode \
          {mode}), and {} in it can be read or written by them (mode {file_mode}): anyone who \

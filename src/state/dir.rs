@@ -8,6 +8,7 @@ use rustix::io::Errno;
 
 use super::Error;
 use super::lock::{ExclusiveLock, HeldLock};
+use super::store::leads_nowhere;
 use crate::fs::Mode;
 
 /// `$XDG_STATE_HOME/bx` — bx's machine-owned half.
@@ -414,19 +415,49 @@ fn open_beyond_owner(mode: Mode) -> bool {
 /// Checked on every [`ensure_dir`] of the directory, so a `local.toml` created
 /// or widened later is refused the next time bx runs.
 ///
+/// A `local.toml` that is a symbolic link is judged where the file is. A link
+/// that leads nowhere — to nothing, round a loop, through a file — or to
+/// something that is not a regular file exposes nothing, and is the layer
+/// loader's to report. A link to a regular file exposes it only if the
+/// directory holding that file can be searched by others too; otherwise no
+/// other account can open it, whatever its mode.
+///
 /// # Errors
 ///
-/// [`Error::ExposedLocalLayer`], and [`Error::Read`] if the file's mode cannot
-/// be read.
+/// [`Error::ExposedLocalLayer`], and [`Error::Read`] if the file, or the
+/// directory a link leads to, cannot be examined.
 fn check_local_layer(dir: &Path, mode: Mode) -> Result<(), Error> {
     if mode.bits() & 0o011 == 0 {
         return Ok(());
     }
     let file = crate::config::layers::local_layer_path(dir);
-    let meta = match std::fs::metadata(&file) {
+    let meta = match std::fs::symlink_metadata(&file) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => return Err(Error::Read { path: file, source }),
+    };
+    let meta = if meta.file_type().is_symlink() {
+        let target = match std::fs::metadata(&file) {
+            Ok(target) if target.is_file() => target,
+            Ok(_) => return Ok(()),
+            Err(e) if leads_nowhere(&e) => return Ok(()),
+            Err(source) => return Err(Error::Read { path: file, source }),
+        };
+        let real = std::fs::canonicalize(&file).map_err(|source| Error::Read {
+            path: file.clone(),
+            source,
+        })?;
+        let holder = real.parent().unwrap_or_else(|| Path::new("/"));
+        let holder_meta = std::fs::metadata(holder).map_err(|source| Error::Read {
+            path: holder.to_path_buf(),
+            source,
+        })?;
+        if std::os::unix::fs::PermissionsExt::mode(&holder_meta.permissions()) & 0o011 == 0 {
+            return Ok(());
+        }
+        target
+    } else {
+        meta
     };
     let file_mode = Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
     if open_beyond_owner(file_mode) {
@@ -949,6 +980,135 @@ mod tests {
                 "never chmodded"
             );
         }
+    }
+
+    /// A home whose state directory is a link to `elsewhere/` at `mode`.
+    fn linked_state(mode: u32) -> (crate::testing::GuardedHome, PathBuf, StateDir) {
+        let home = guarded_home();
+        let target = home.child("elsewhere");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+        std::os::unix::fs::symlink(&target, home.child(".local/state/bx")).expect("symlink");
+        let dir = StateDir::resolve(home.path());
+        (home, target, dir)
+    }
+
+    #[test]
+    fn a_linked_local_toml_is_judged_where_the_file_is() {
+        // r3 round 1 (L2): the file a `local.toml` link names was judged by
+        // its mode alone, so a `0644` file in a `0700` directory no other
+        // account can reach was refused.
+        for (layers_mode, exposed) in [
+            (0o700, false),
+            (0o500, false),
+            (0o755, true),
+            (0o710, true),
+            (0o701, true),
+        ] {
+            let (home, _target, dir) = linked_state(0o711);
+            let layers = home.child("layers");
+            std::fs::create_dir_all(&layers).expect("layers");
+            let real = layers.join("local.toml");
+            std::fs::write(&real, "[values]\n").expect("local.toml");
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod file");
+            std::fs::set_permissions(&layers, std::fs::Permissions::from_mode(layers_mode))
+                .expect("chmod layers");
+            std::os::unix::fs::symlink(&real, dir.local_toml()).expect("symlink");
+
+            let result = dir.ensure();
+            std::fs::set_permissions(&layers, std::fs::Permissions::from_mode(0o700))
+                .expect("restore");
+            if exposed {
+                let err = result.expect_err(&format!("{layers_mode:04o}: others can open it"));
+                assert!(
+                    matches!(
+                        &err,
+                        Error::ExposedLocalLayer { path, mode, file, file_mode }
+                            if path == dir.root() && *mode == Mode::from_bits(0o711)
+                                && *file == dir.local_toml()
+                                && *file_mode == Mode::from_bits(0o644)
+                    ),
+                    "{layers_mode:04o}: got {err}",
+                );
+            } else {
+                result.unwrap_or_else(|e| panic!("{layers_mode:04o}: refused: {e}"));
+                drop(ExclusiveLock::acquire(&dir).expect("acquire"));
+            }
+            assert_eq!(mode_of(&real), Mode::from_bits(0o644), "never chmodded");
+        }
+    }
+
+    #[test]
+    fn a_local_toml_link_that_leads_to_no_file_exposes_nothing() {
+        // r3 round 1 (L2): `metadata` followed the link, so one that loops or
+        // runs through a file was `Error::Read` from every `ensure`, lock and
+        // save, and one to a directory was judged by the directory's mode. The
+        // layer loader reports a looping or dangling `local.toml` itself.
+        for case in ["loop", "dangling", "through a file", "a directory"] {
+            let (home, _target, dir) = linked_state(0o711);
+            let far = match case {
+                "loop" => dir.local_toml(),
+                "dangling" => home.child("nowhere.toml"),
+                "through a file" => {
+                    home.write("a-file", "not a directory");
+                    home.child("a-file/local.toml")
+                }
+                _ => {
+                    let open = home.child("a-dir");
+                    std::fs::create_dir_all(&open).expect("a-dir");
+                    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777))
+                        .expect("chmod");
+                    open
+                }
+            };
+            std::os::unix::fs::symlink(&far, dir.local_toml()).expect("symlink");
+
+            dir.ensure()
+                .unwrap_or_else(|e| panic!("{case}: ensure refused: {e}"));
+            drop(ExclusiveLock::acquire(&dir).unwrap_or_else(|e| panic!("{case}: {e}")));
+            drop(super::super::SharedLock::acquire(&dir).unwrap_or_else(|e| panic!("{case}: {e}")));
+            assert_eq!(
+                std::fs::read_link(dir.local_toml()).expect("link"),
+                far,
+                "{case}: left as it was",
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_toml_that_cannot_be_examined_is_an_error_naming_it() {
+        // r3 round 1 (C1): a failure other than "no such file" was unreached,
+        // and reading it as "no file" survived mutation.
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            return;
+        }
+        // Others can search the directory, and its owner cannot.
+        let (_home, target, dir) = linked_state(0o611);
+        let result = dir.ensure();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        let err = result.expect_err("the file cannot be looked for");
+        assert!(
+            matches!(&err, Error::Read { path, .. } if *path == dir.local_toml()),
+            "got {err}",
+        );
+
+        // A link to a file in a directory nobody can search.
+        let (home, _target, dir) = linked_state(0o711);
+        let sealed = home.child("sealed");
+        std::fs::create_dir_all(&sealed).expect("sealed");
+        std::fs::write(sealed.join("local.toml"), "[values]\n").expect("local.toml");
+        std::os::unix::fs::symlink(sealed.join("local.toml"), dir.local_toml()).expect("symlink");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let result = dir.ensure();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        let err = result.expect_err("the linked file cannot be examined");
+        assert!(
+            matches!(&err, Error::Read { path, .. } if *path == dir.local_toml()),
+            "got {err}",
+        );
     }
 
     #[test]

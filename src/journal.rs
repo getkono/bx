@@ -4707,6 +4707,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_journal_path_that_cannot_be_looked_at_is_an_error_not_an_absent_journal() {
+        // r3 round 2, restricted mutants on P42R1-D5. The look before the read
+        // treats only NotFound as "no journal": any other failure — here
+        // ENOTDIR, a state directory that is a file, which no permission
+        // setting can bypass — is an error, as the read's was before it.
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let file = dir.path().join("not-a-directory");
+        plant_file(
+            &file,
+            "a file where the state directory should be\n",
+            Mode::DEFAULT_FILE,
+        );
+        let path = file.join("journal.mpk");
+
+        let err = load(&path).expect_err("a path that cannot be looked at is not absent");
+        assert!(
+            matches!(&err, Error::Io { path: at, .. } if *at == path),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn a_journal_that_cannot_be_read_is_an_error_and_a_session_does_not_replace_it() {
         // Coverage review round 5, item 4. Read as absent, it would be replaced
         // by the next session's journal without ever being examined.

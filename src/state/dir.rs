@@ -769,6 +769,25 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_directory_that_refuses_to_be_narrowed_is_reported_naming_it() {
+        // r3 round 2b (P7R4-COV3): `tighten`'s `chmod` failing was never
+        // reached. procfs refuses every mode change on a process's own
+        // directory, to root as well, and that directory is `0555`: shared, so
+        // `tighten` tries to narrow it, and nothing about it can change.
+        let own = std::fs::canonicalize("/proc/self").expect("this process's /proc directory");
+        let found = mode_of(&own);
+        assert!(found.is_shared(), "{own:?} is {found}");
+
+        let err = tighten(&own, Mode::PRIVATE_DIR).expect_err("procfs refuses the chmod");
+        assert!(
+            matches!(&err, Error::CreateDir { path, source }
+                if *path == own && source.raw_os_error() == Some(Errno::PERM.raw_os_error())),
+            "got {err}",
+        );
+        assert_eq!(mode_of(&own), found, "left as it was");
+    }
+
+    #[test]
     fn a_quarantine_name_appends_rather_than_replacing_the_extension() {
         assert_eq!(
             StateDir::quarantine(Path::new("/s/bx/ledger.mpk")),

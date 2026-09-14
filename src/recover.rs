@@ -452,8 +452,12 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     let mut conflicts = Vec::new();
     let mut resolved = 0_usize;
     // The directories the terminated session's removals claimed. The session
-    // pruned them before its `End` frame; handing on what still stands is
-    // bookkeeping its save may not have reached.
+    // prunes them after its `End` frame, so a crash between the two leaves
+    // them standing. Handing on what still stands is bookkeeping its save may
+    // not have reached; recovery removes none of them, because a terminated
+    // session is never rolled back or finished on its behalf, and one no
+    // entry is beneath is left for `bx doctor`, as decision 11 keeps an
+    // orphaned temporary file.
     let mut released = Vec::new();
 
     let mut intents = loaded.landed();
@@ -677,7 +681,18 @@ fn decide(
         (intent.after, intent.mechanism.clone())
     else {
         // A removal, or a target the session released: nothing for bx to own.
-        return Ok((Step::Forget, report(true, recorded())));
+        let mut note = recorded();
+        if intent.after == Written::Absent {
+            let orphans = empty_claims(&intent.created_dirs, home);
+            if !orphans.is_empty() {
+                note.push_str(&format!(
+                    "; the session ended before it removed {}, which stand empty and are \
+                     left for bx doctor",
+                    orphans.join(", "),
+                ));
+            }
+        }
+        return Ok((Step::Forget, report(true, note)));
     };
     if let Some(stored) = ledger.and_then(|ledger| ledger.get(&intent.target))
         && stored.written == digest
@@ -725,6 +740,20 @@ fn decide(
         return Ok((Step::Blocked, report(false, conflict.to_string())));
     }
     Ok((Step::Record(entry), report(true, recorded())))
+}
+
+/// The directories in `dirs` that are still empty directories, `~`-relative.
+///
+/// What a removal whose session died between its `End` frame and its prune
+/// leaves behind. Recovery removes none of them — see [`resolve`] — so the
+/// report names them. A path that is not a directory, or that holds anything,
+/// is not one: it is not what the prune would have removed.
+fn empty_claims(dirs: &[PathBuf], home: &Path) -> Vec<String> {
+    dirs.iter()
+        .filter(|dir| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()))
+        .filter(|dir| std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none()))
+        .map(|dir| crate::paths::to_portable(dir, home))
+        .collect()
 }
 
 /// The bytes a [`RestoreRef`] names, digest-verified, or why they cannot be had.
@@ -903,7 +932,8 @@ mod tests {
 
     /// The four requests the crash child makes, in the order it makes them: a
     /// modify at a non-default mode, a create in a directory bx must invent, a
-    /// plain modify, and a removal of a private file.
+    /// plain modify, and a removal of a private file from a private directory
+    /// the removal claims as one bx created.
     fn crash_requests(home: &Path) -> Vec<Request> {
         vec![
             write_to(home, ".bxrc", "after bx\n", Mode::PRIVATE_FILE),
@@ -920,14 +950,14 @@ mod tests {
                 Mode::DEFAULT_FILE,
             ),
             {
-                let (target, dest) = target(home, ".gone.conf");
+                let (target, dest) = target(home, ".vault/gone.conf");
                 // Observed when the request is built, as `write_to` observes.
                 let planned = fs::observe(&dest).expect("plan's observation");
                 Request {
                     target,
                     dest,
                     content: Content::Absent {
-                        created_dirs: Vec::new(),
+                        created_dirs: vec![home.join(".vault")],
                         planned,
                     },
                     mode: Mode::PRIVATE_FILE,
@@ -947,24 +977,71 @@ mod tests {
             Mode::DEFAULT_FILE,
         );
         plant_file(
-            &home.join(".gone.conf"),
+            &home.join(".vault/gone.conf"),
             "bx made this\n",
             Mode::PRIVATE_FILE,
         );
+        // A directory the user made private after bx created it: a rollback
+        // that re-created it would do so at the default mode.
+        fs::set_mode(&home.join(".vault"), Mode::PRIVATE_DIR).expect("chmod ~/.vault");
         // `~/.config` deliberately does not exist: the middle write has to
         // invent two directories, and a rollback has to remove both.
     }
 
-    /// One destination and what is at it: the unit of the before-and-after
-    /// comparison the crash harness makes.
-    type Snapshot = Vec<(PathBuf, Option<(Vec<u8>, Mode)>)>;
+    /// The bytes and mode at one destination, or `None` where nothing is.
+    type FileState = Option<(Vec<u8>, Mode)>;
 
-    /// Bytes and mode at each destination, for the before-and-after comparison.
+    /// What the crash harness compares before and after: bytes and mode at
+    /// each destination, and the mode of each directory between a
+    /// destination and the home — the ones a write invents and the ones a
+    /// removal claims — or `None` where there is none.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Snapshot {
+        files: Vec<(PathBuf, FileState)>,
+        dirs: Vec<(PathBuf, Option<Mode>)>,
+    }
+
+    /// The mode of the directory at `path`, following no link, or `None`
+    /// when no directory is there.
+    fn dir_mode(path: &Path) -> Option<Mode> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_dir)
+            .map(|meta| Mode::from_bits(meta.permissions().mode() & 0o7777))
+    }
+
+    /// The crash harness's snapshot of `home`.
     fn crash_snapshot(home: &Path) -> Snapshot {
-        crash_requests(home)
-            .into_iter()
-            .map(|request| (request.dest.clone(), peek(&request.dest)))
-            .collect()
+        let requests = crash_requests(home);
+        let mut dirs: Vec<PathBuf> = requests
+            .iter()
+            .flat_map(|request| {
+                request
+                    .dest
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|dir| *dir != home)
+                    .map(Path::to_path_buf)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        Snapshot {
+            files: requests
+                .into_iter()
+                .map(|request| (request.dest.clone(), peek(&request.dest)))
+                .collect(),
+            dirs: dirs
+                .into_iter()
+                .map(|dir| {
+                    let mode = dir_mode(&dir);
+                    (dir, mode)
+                })
+                .collect(),
+        }
     }
 
     /// Every path under `root`, files and directories alike.
@@ -1001,14 +1078,15 @@ mod tests {
 
     /// Re-invoke this test binary, crashing at `phase` of write `index`.
     fn spawn_crash_child(home: &Path, index: usize, phase: &str) -> Output {
+        spawn_child("recover::tests::crash_child", home, index, phase)
+    }
+
+    /// Re-invoke this test binary to run the ignored test `child`, crashing
+    /// at `phase` of write `index`.
+    fn spawn_child(child: &str, home: &Path, index: usize, phase: &str) -> Output {
         let exe = std::env::current_exe().expect("the test binary");
         Command::new(exe)
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "recover::tests::crash_child",
-            ])
+            .args(["--exact", "--ignored", "--nocapture", child])
             .env(CRASH_AT, format!("{index}:{phase}"))
             .env(CRASH_HOME, home)
             // cargo-llvm-cov points this at a pattern the parent owns. The child
@@ -1039,6 +1117,121 @@ mod tests {
             session.apply(request).expect("apply");
         }
         session.finish().expect("finish");
+    }
+
+    /// The crashing half of [`a_killed_rm_rolls_back_into_the_directory_it_found`]:
+    /// `rm` of `~/.vault/key.conf`, which bx created with `~/.vault`.
+    #[test]
+    #[ignore = "spawned by a crash test; it aborts on purpose"]
+    fn rm_crash_child() {
+        let Some(home) = std::env::var_os(CRASH_HOME) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let state = StateDir::resolve(&home);
+        let key = Portable::from_path(&home.join(".vault/key.conf"), &home).expect("portable");
+        // Its outcome is the parent's to judge, from what the crash left.
+        let _ = crate::restore::restore(&state, &home, &[key]);
+    }
+
+    #[test]
+    fn a_killed_rm_rolls_back_into_the_directory_it_found() {
+        // r3 round 2, P9R4-D2. A removal pruned the directories it claimed
+        // before its session's `End`, so a rollback re-created `~/.vault` at
+        // the default mode after the user had made it `0700`. Pruning now
+        // waits for `End`; a crash between the two leaves the directory,
+        // empty, for `bx doctor`.
+        let guard = guarded_home();
+        for (index, phase) in [
+            (0, "after-intent"),
+            (0, "after-publish"),
+            (0, "after-done"),
+            (1, "after-end"),
+            (1, "after-save"),
+        ] {
+            let case = format!("{index}:{phase}");
+            let home = guard.child(format!("rm-{index}-{phase}"));
+            let state = StateDir::resolve(&home);
+            let vault = home.join(".vault");
+            let mut session =
+                Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+            let request = write_to(&home, ".vault/key.conf", "secret\n", Mode::PRIVATE_FILE);
+            let key = request.target.clone();
+            session
+                .apply(request)
+                .expect("bx creates ~/.vault/key.conf");
+            session.finish().expect("finish");
+            fs::set_mode(&vault, Mode::PRIVATE_DIR).expect("the user makes ~/.vault private");
+
+            let out = spawn_child("recover::tests::rm_crash_child", &home, index, phase);
+            assert!(
+                !out.status.success(),
+                "{case}: the child was supposed to die; it said {}",
+                String::from_utf8_lossy(&out.stdout),
+            );
+            let after_kill = dir_mode(&vault);
+            let report = pending(&state).expect("pending").expect("a journal stands");
+            assert!(report.blocked().next().is_none(), "{case}");
+            let note = report.unfinished[0].note.clone();
+            let outcome = before_writing(&state).expect("the next writing run");
+            assert!(!state.journal().exists(), "{case}");
+            let entry = LedgerView::read(&state, &home)
+                .expect("read the ledger")
+                .value
+                .get(&key)
+                .cloned();
+
+            if index == 0 {
+                assert_eq!(outcome, Outcome::RolledBack { undone: 1 }, "{case}");
+                assert_eq!(
+                    peek(&home.join(".vault/key.conf")),
+                    Some((b"secret\n".to_vec(), Mode::PRIVATE_FILE)),
+                    "{case}"
+                );
+                assert_eq!(
+                    dir_mode(&vault),
+                    Some(Mode::PRIVATE_DIR),
+                    "{case}: rolled back into the directory the rm found, at its mode"
+                );
+                assert_eq!(
+                    after_kill,
+                    Some(Mode::PRIVATE_DIR),
+                    "{case}: nothing is pruned before End"
+                );
+                assert!(entry.is_some(), "{case}: bx still manages it");
+                assert!(!note.contains("bx doctor"), "{case}: {note}");
+            } else if phase == "after-end" {
+                assert_eq!(outcome, Outcome::Recorded { entries: 1 }, "{case}");
+                assert_eq!(after_kill, Some(Mode::PRIVATE_DIR), "{case}");
+                assert!(
+                    note.contains(
+                        "before it removed ~/.vault, which stand empty and are left for bx doctor"
+                    ),
+                    "{case}: {note}"
+                );
+                assert_eq!(
+                    dir_mode(&vault),
+                    Some(Mode::PRIVATE_DIR),
+                    "{case}: recovery removes no directory"
+                );
+                assert_eq!(names_in(&vault), Vec::<String>::new(), "{case}");
+                assert!(entry.is_none(), "{case}: the removal is recorded");
+                assert!(
+                    LedgerView::read(&state, &home)
+                        .expect("read the ledger")
+                        .value
+                        .iter()
+                        .all(|(_, entry)| entry.created_dirs.is_empty()),
+                    "{case}: no entry claims the orphan"
+                );
+            } else {
+                assert_eq!(outcome, Outcome::Recorded { entries: 1 }, "{case}");
+                assert_eq!(after_kill, None, "{case}: pruned before the save");
+                assert!(!note.contains("bx doctor"), "{case}: {note}");
+                assert!(entry.is_none(), "{case}");
+            }
+            assert_eq!(before_writing(&state).expect("again"), Outcome::Nothing);
+        }
     }
 
     #[test]
@@ -1324,7 +1517,10 @@ mod tests {
             }],
         );
         assert!(!dest.exists(), "the removal completed");
-        assert!(!home.child(".config").exists());
+        assert!(
+            home.child(".config/deep").is_dir(),
+            "nothing a removal claims is pruned before its session's End",
+        );
 
         recover(&state).expect("recover");
         assert_eq!(
@@ -2103,7 +2299,7 @@ mod tests {
                 .all(|intent| intent.after != Written::Absent),
             "no removal had been announced yet",
         );
-        assert!(early.join(".gone.conf").is_file());
+        assert!(early.join(".vault/gone.conf").is_file());
 
         // One boundary after it: the intent is durable and the file is *still*
         // there. Unlinking first would leave a window in which a crash removes a
@@ -2118,10 +2314,10 @@ mod tests {
         let loaded = crate::journal::load(&StateDir::resolve(&late).journal()).expect("load");
         let intent = loaded.intents().last().expect("the removal's intent");
         assert_eq!(intent.after, Written::Absent);
-        assert_eq!(intent.dest, late.join(".gone.conf"));
+        assert_eq!(intent.dest, late.join(".vault/gone.conf"));
         assert_eq!(intent.temp, None);
         assert_eq!(
-            peek(&late.join(".gone.conf")).expect("still there"),
+            peek(&late.join(".vault/gone.conf")).expect("still there"),
             (b"bx made this\n".to_vec(), Mode::PRIVATE_FILE),
             "and the destination is still what it was",
         );
@@ -3207,6 +3403,29 @@ mod tests {
                 let interrupted = pending(&state).expect("pending").expect("a journal stands");
                 assert!(interrupted.complete, "{case}");
                 assert!(interrupted.blocked().next().is_none(), "{case}");
+                let removal_note = interrupted
+                    .unfinished
+                    .iter()
+                    .find(|write| write.dest.ends_with(".vault/gone.conf"))
+                    .expect("the removal is reported")
+                    .note
+                    .clone();
+                // The claimed directory is pruned after `End`: a crash between
+                // the two leaves it, empty and at its mode, as decision 11's
+                // kind of orphan, and recovery removes it no more than it
+                // removes an orphaned temporary file.
+                let vault = home.join(".vault");
+                let orphaned = phase == "after-end";
+                assert_eq!(
+                    dir_mode(&vault),
+                    orphaned.then_some(Mode::PRIVATE_DIR),
+                    "{case}"
+                );
+                assert_eq!(
+                    removal_note.contains("~/.vault, which stand empty and are left for bx doctor"),
+                    orphaned,
+                    "{case}: {removal_note}"
+                );
                 let outcome = recover(&state).expect("recover");
                 assert!(
                     matches!(outcome, Outcome::Recorded { .. }),
@@ -3214,14 +3433,30 @@ mod tests {
                 );
                 assert!(!state.journal().exists(), "{case}");
                 assert_eq!(recover(&state).expect("again"), Outcome::Nothing, "{case}");
+                assert_eq!(
+                    dir_mode(&vault),
+                    orphaned.then_some(Mode::PRIVATE_DIR),
+                    "{case}: recovery leaves the orphan"
+                );
+                assert!(
+                    LedgerView::read(&state, &home)
+                        .expect("read the ledger")
+                        .value
+                        .iter()
+                        .all(|(_, entry)| !entry
+                            .created_dirs
+                            .iter()
+                            .any(|dir| dir.as_str() == "~/.vault")),
+                    "{case}: no entry claims ~/.vault"
+                );
 
                 let restored = crate::restore::restore(&state, &home, &owned).expect("rm");
                 assert!(
                     restored.iter().all(|done| !done.is_conflict()),
                     "{case}: {restored:?}"
                 );
-                for ((dest, was), (_, is)) in before.iter().zip(crash_snapshot(&home)) {
-                    if dest.ends_with(".gone.conf") {
+                for ((dest, was), (_, is)) in before.files.iter().zip(crash_snapshot(&home).files) {
+                    if dest.ends_with(".vault/gone.conf") {
                         assert_eq!(is, None, "{case}: the session released and removed it");
                     } else {
                         assert_eq!(&is, was, "{case}: rm did not restore {}", dest.display());
@@ -3259,12 +3494,13 @@ mod tests {
 
                 // 1. Old or new, never torn. This is what A5's atomic write
                 //    buys, and this assertion is what proves it.
-                for (dest, found) in crash_snapshot(&home) {
+                for (dest, found) in crash_snapshot(&home).files {
                     let request = crash_requests(&home)
                         .into_iter()
                         .find(|candidate| candidate.dest == dest)
                         .expect("a fixture destination");
                     let was = before
+                        .files
                         .iter()
                         .find(|(path, _)| *path == dest)
                         .and_then(|(_, state)| state.clone());
@@ -3300,9 +3536,29 @@ mod tests {
                     "got {outcome:?} at {index}:{phase}",
                 );
 
-                // 4. Byte- and mode-identical to the pre-run snapshot.
+                // 4. Byte- and mode-identical to the pre-run snapshot, the
+                //    directories included. At the two boundaries that can
+                //    orphan a staged file (step 5), the directories stage
+                //    invented for it may stand too — and only those: a
+                //    directory that existed before is at its mode either way.
+                let orphan_possible = matches!(phase, "after-stage" | "after-fill");
+                let orphan_dest = crash_requests(&home)[index].dest.clone();
+                let beside_orphans = |mut snapshot: Snapshot| {
+                    if orphan_possible {
+                        for (dir, mode) in &mut snapshot.dirs {
+                            let invented = before
+                                .dirs
+                                .iter()
+                                .any(|(was, prior)| was == dir && prior.is_none());
+                            if invented && orphan_dest.starts_with(&*dir) {
+                                *mode = None;
+                            }
+                        }
+                    }
+                    snapshot
+                };
                 assert_eq!(
-                    crash_snapshot(&home),
+                    beside_orphans(crash_snapshot(&home)),
                     before,
                     "rollback at {index}:{phase} did not restore the fixture",
                 );
@@ -3315,7 +3571,6 @@ mod tests {
                 //    deletion bx cannot prove it is entitled to make. Such an
                 //    orphan is empty or unpublished, is attributable by its
                 //    `.bx-` prefix, and is `bx doctor`'s to report.
-                let orphan_possible = matches!(phase, "after-stage" | "after-fill");
                 let temps = leftover_temps(&home);
                 if orphan_possible {
                     assert!(
@@ -3346,7 +3601,7 @@ mod tests {
 
                 // 7. Recovery is idempotent.
                 assert_eq!(recover(&state).expect("recover twice"), Outcome::Nothing);
-                assert_eq!(crash_snapshot(&home), before);
+                assert_eq!(beside_orphans(crash_snapshot(&home)), before);
             }
         }
     }

@@ -1138,8 +1138,8 @@ pub struct Session {
     /// session, because [`crate::fs::ensure_dir`] reads it to tell a directory
     /// an earlier write made from one somebody else made since plan.
     created: fs::CreatedDirs,
-    /// Every directory a target this session removed claimed. Pruned again, as
-    /// one union, and handed on when the session finishes.
+    /// Every directory a target this session removed claimed. Pruned, as one
+    /// union, once the session's `End` is durable, and handed on.
     released: std::collections::BTreeSet<PathBuf>,
     /// Every directory a target [`Session::forget`] dropped claimed. Handed on
     /// when the session finishes, and never pruned: no removal was announced.
@@ -1191,14 +1191,14 @@ pub enum Content {
     },
     /// No file at all.
     ///
-    /// The destination is unlinked and `created_dirs` are removed, deepest
-    /// first, while they are empty directories and no entry the ledger still
-    /// holds names them; one that is no longer a directory is left. Absence is
-    /// not emptiness: a file bx created is removed, never
-    /// truncated. The target is always dropped from the ledger — there is
-    /// nothing left for bx to own. A claimed directory something else still
-    /// holds is tried again when the session finishes, and handed to a
-    /// surviving entry beneath it if it still stands: see [`Session::finish`].
+    /// The destination is unlinked, and when the session finishes, after its
+    /// `End` frame, `created_dirs` are removed, deepest first, while they are
+    /// empty directories and no entry the ledger still holds names them; one
+    /// that is no longer a directory is left. Absence is not emptiness: a file
+    /// bx created is removed, never truncated. The target is always dropped
+    /// from the ledger — there is nothing left for bx to own. A claimed
+    /// directory that still stands then is handed to a surviving entry beneath
+    /// it: see [`Session::finish`].
     Absent {
         /// Directories bx created for the target, deepest first.
         created_dirs: Vec<PathBuf>,
@@ -1544,8 +1544,8 @@ impl Session {
         Ok(())
     }
 
-    /// The removal path: check, record, journal, check again, unlink, prune,
-    /// done.
+    /// The removal path: check, record, journal, check again, unlink, done. The
+    /// directories the target claimed are pruned when the session finishes.
     ///
     /// Checked against `planned`, the observation plan decided on, twice. First
     /// before the prior is stored or the Intent announced, so a destination
@@ -1598,7 +1598,8 @@ impl Session {
         // took two `fsync`s, and an editor may have saved in between.
         refuse_moved(planned, &fs::observe(&dest)?)?;
         unlink(&dest)?;
-        prune_claims(&self.ledger, &self.home, &created_dirs)?;
+        // Pruned only once the session's `End` is durable: see
+        // `Session::finish`.
         self.released.extend(created_dirs);
         // As in `write`: the entry goes only once the file has.
         self.ledger.forget(&target);
@@ -1612,10 +1613,13 @@ impl Session {
     /// Prune the union of the directories released targets claimed, and hand
     /// what still stands to the entries beneath it.
     ///
-    /// A removal prunes its own claims at once, but only the first write under
-    /// a new directory claims it, and another target's file may still hold it
-    /// then. By the time the session finishes every removal has run, so each
-    /// claimed directory is tried again, deepest first. Nothing is assumed
+    /// A removal prunes nothing itself: a directory removed before the
+    /// session's `End` would have to be re-created by a rollback, which cannot
+    /// know the mode it had. Deferring the prune costs no later target in the
+    /// session anything, because a directory an entry the ledger still holds
+    /// names is never pruned, so no later target can need a claimed directory
+    /// gone. By the time the session finishes every removal has run, so each
+    /// claimed directory is tried once, deepest first. Nothing is assumed
     /// about which entry claimed it: it is removed when it is empty and no
     /// entry the ledger still holds names it. A claim still standing — a
     /// released one, or one of a target [`Session::forget`] dropped — is
@@ -1632,12 +1636,18 @@ impl Session {
         )
     }
 
-    /// End the session: [`End`], save the ledger, and unlink the journal last.
+    /// End the session: [`End`], settle the claimed directories, save the
+    /// ledger, and unlink the journal last.
     ///
-    /// The directories released targets claimed are settled first, before the
-    /// `End` frame: see [`Session::settle_claims`]. A crash before `End` rolls
-    /// the whole session back, which puts every removed file back with the
-    /// parents it needs.
+    /// The directories released targets claimed are settled only after the
+    /// `End` frame is durable: see [`Session::settle_claims`]. Until then no
+    /// directory a removal claimed is removed, so a crash before `End` rolls
+    /// the session back into the very directories it found, at the modes they
+    /// had — never into one re-created at the default mode. A crash between
+    /// `End` and the prune leaves those directories standing, empty, and
+    /// claimed by no entry once recovery has recorded the session: the same
+    /// kind of orphan decision 11 keeps, which recovery leaves where it is and
+    /// [`crate::recover::pending`] names.
     ///
     /// The order is the ordering rule that makes recovery idempotent. The `End`
     /// frame goes down first, so a crash before the save is a *terminated*
@@ -1657,10 +1667,10 @@ impl Session {
         if self.poisoned {
             return Err(self.poisoned_error());
         }
-        self.settle_claims()?;
         let written = self.written;
         self.journal.append(&Record::End(End { written }))?;
         self.crash.reached(written, Phase::AfterEnd);
+        self.settle_claims()?;
         self.ledger.save()?;
         self.crash.reached(written, Phase::AfterSave);
         unlink(self.journal.path())?;
@@ -1677,8 +1687,9 @@ impl Session {
 /// its final mode but holds nothing; after its content is `fsync`ed but the
 /// destination is untouched; after the intent is durable; after the destination
 /// is replaced; after the completion is durable. Two in `finish`, where every
-/// write has landed: after the `End` frame is durable, and after the ledger is
-/// saved. A `finish` boundary is reached with the number of writes as its index.
+/// write has landed: after the `End` frame is durable and before the claimed
+/// directories are pruned, and after the ledger is saved. A `finish` boundary
+/// is reached with the number of writes as its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     BeforeStage,

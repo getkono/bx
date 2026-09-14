@@ -1367,6 +1367,44 @@ mod tests {
     }
 
     #[test]
+    fn a_forgotten_targets_claims_are_handed_to_an_entry_still_beneath_them() {
+        // r3 coverage C1. `rm` of a file bx created that is already gone
+        // forgets the entry and keeps its claims for the hand-off; nothing
+        // pinned that those claims reach it.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (a, b) = (".config/app/a.toml", ".config/app/b.toml");
+        let ta = managed(&state, home.path(), a, "a\n", Mode::DEFAULT_FILE);
+        let tb = managed(&state, home.path(), b, "b\n", Mode::DEFAULT_FILE);
+        let claims = |portable: &Portable| {
+            entry_for(&state, home.path(), portable)
+                .expect("managed")
+                .created_dirs
+                .iter()
+                .map(|dir| dir.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(claims(&ta), ["~/.config/app", "~/.config"]);
+        assert!(claims(&tb).is_empty(), "only the first write claims");
+        std::fs::remove_file(home.child(a)).expect("the user removes a");
+
+        let done = restore(&state, home.path(), std::slice::from_ref(&ta)).expect("rm a");
+        assert!(
+            matches!(done.as_slice(), [Restored::AlreadyGone { .. }]),
+            "{done:?}"
+        );
+        assert!(entry_for(&state, home.path(), &ta).is_none());
+        assert!(
+            home.child(".config/app").is_dir(),
+            "plan announced no removal"
+        );
+        assert_eq!(claims(&tb), ["~/.config/app", "~/.config"]);
+
+        restore(&state, home.path(), std::slice::from_ref(&tb)).expect("rm b");
+        assert!(!home.child(".config").exists());
+    }
+
+    #[test]
     fn a_claimed_directory_a_live_entry_names_is_never_pruned() {
         // Review round 5, item 4, and #8's open question: whichever entry
         // claims a directory, one the ledger still holds as a target stays.

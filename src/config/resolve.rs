@@ -1716,7 +1716,12 @@ mod tests {
         // again, once through `profile`. With `work` the module's plain spelling
         // replaces it in place; with `default` both module spellings are the
         // file, and the second may not be appended after `~/.zshrc` — the
-        // file's rows stay in the file's slot, and nothing unrelated moves.
+        // file's rows stay together, in the file's slot and in the order
+        // written. That is all it promises: which slot is the file's depends on
+        // the answer, so a row can sit ahead of an unrelated target for one
+        // answer and behind it for another, as
+        // `a_later_row_for_a_file_can_move_ahead_of_an_unrelated_target_by_answer`
+        // shows.
         const BASE: &str = "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
                             [[target]]\npath = \"~/.config/default/s\"\ncontent = \"BASE\"\n\
                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
@@ -1763,6 +1768,35 @@ mod tests {
         blocked(&default, 1);
         ready(&default, 2);
         ready(&default, 3);
+    }
+
+    #[test]
+    fn a_later_row_for_a_file_can_move_ahead_of_an_unrelated_target_by_answer() {
+        // Decision 31 as narrowed: a file's rows are contiguous and in written
+        // order, and unrelated targets keep their order among themselves. It is
+        // not that nothing moves. With `default`, `~/.config/default/s` is the
+        // file the first row already holds, so its row joins that slot, ahead
+        // of `~/.zshrc`; with `work` it is a file of its own, and appends.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/{{p}}/s\"\ncontent = \"P\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n\
+                             [[target]]\npath = \"~/.config/default/s\"\ncontent = \"D\"\n";
+
+        let default = resolved(LAYER, Some("[values]\np = \"default\"\n"))
+            .expect("an account's answer does not fail the load");
+        assert_eq!(
+            keys(&default),
+            ["~/.config/{{p}}/s", "~/.config/default/s", "~/.zshrc"]
+        );
+        blocked(&default, 0);
+        blocked(&default, 1);
+        ready(&default, 2);
+
+        let work = resolved(LAYER, Some("[values]\np = \"work\"\n")).expect("work");
+        assert_eq!(
+            keys(&work),
+            ["~/.config/work/s", "~/.zshrc", "~/.config/default/s"]
+        );
     }
 
     #[test]

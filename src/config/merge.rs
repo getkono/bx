@@ -455,9 +455,13 @@ impl Merged<Target, TargetKey> {
     /// spellings meet, the statements are recorded as a [`Clash`] rather than
     /// applied: both entries are kept, the later one directly after the entries
     /// already held for the file rather than at the end, and every entry for the
-    /// file is held enabled, so resolution blocks each one in the file's own row
-    /// instead of hiding it or moving it past unrelated targets. A later layer that names the file settles it — a full entry
-    /// replaces every entry for it, and a toggle flips every one.
+    /// file is held enabled, so resolution blocks each one where the file's rows
+    /// are instead of hiding it. A file's rows stay contiguous and in the order
+    /// written, and unrelated targets keep their order among themselves; which
+    /// slot the file holds is decided by the answer, though, so a later row for
+    /// it can sit ahead of an unrelated target for one answer and not another.
+    /// A later layer that names the file settles it — a full entry replaces
+    /// every entry for it, and a toggle flips every one.
     ///
     /// # Errors
     ///
@@ -485,8 +489,10 @@ impl Merged<Target, TargetKey> {
                     let statement = (spelling, &target.origin);
                     if clash(&said, &key, statement, values, &layer.file, clashes)? {
                         // Beside the entries already held for the file, not at
-                        // the end: the file keeps its row, and no unrelated
-                        // target moves because of what the account answered.
+                        // the end: the file's rows stay together and in written
+                        // order. The slot is wherever the file's first row
+                        // landed, which the answer decided, so this row can sit
+                        // ahead of an unrelated target written before it.
                         let beside = self.positions(&key).into_iter().last().unwrap_or(index) + 1;
                         self.entries.insert(beside, (key.clone(), target.clone()));
                         self.set_enabled_for(&key, true);

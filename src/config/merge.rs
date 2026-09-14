@@ -1776,6 +1776,30 @@ mod tests {
     }
 
     #[test]
+    fn a_path_value_after_a_placeholder_is_not_rooted_at_home() {
+        // Only a literal `~` before a `path` value roots a spelling at `~`.
+        // `{{p}}{{r}}/s` and `~/{{r}}/s` are one file, `~/srv/s`, for `p = "~"`,
+        // but `p = ""` makes the first `/srv/s`. Some answer parts them, so
+        // meeting is the account's doing: a conflict, not a refusal.
+        let config = merge(&[
+            global(
+                "bx.toml",
+                &format!(
+                    "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                     [[value]]\nname = \"r\"\nkind = \"path\"\n{}\
+                     [[target]]\npath = \"{{{{p}}}}{{{{r}}}}/s\"\nenabled = false\n\
+                     [[target]]\npath = \"~/{{{{r}}}}/s\"\nenabled = true\n",
+                    target_toml("~/srv/s", "S")
+                ),
+            ),
+            local("[values]\np = \"~\"\nr = \"/srv\"\n"),
+        ])
+        .unwrap_or_else(|e| panic!("an answer that names one file twice failed the merge: {e}"));
+        assert_eq!(config.conflicts.len(), 1);
+        assert_eq!(config.conflicts[0].file, "~/srv/s");
+    }
+
+    #[test]
     fn two_toggles_that_each_cancel_a_placeholder_meet_for_one_answer_only() {
         // `~/.config/{{p}}/../s` and `~/.config/{{q}}/../s` are `~/.config/s`
         // while `p` and `q` each hold one segment, and two files once either

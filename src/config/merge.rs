@@ -754,6 +754,8 @@ fn written_form<'a>(spelling: &'a str, values: &ResolvedValues) -> Option<Writte
             if values.decl(name).is_none_or(|decl| decl.kind == ValueKind::String))
     };
     let mut split = split.into_iter();
+    // Never the default: the scan loop above is always followed by a final
+    // push, so `split` holds at least one segment, even for an empty spelling.
     let first = split.next().unwrap_or_default();
     let followed = !split.as_slice().is_empty();
     let mut segments = Vec::new();
@@ -772,6 +774,11 @@ fn written_form<'a>(spelling: &'a str, values: &ResolvedValues) -> Option<Writte
         segments.push(Segment::Opaque(first[1..].to_vec()));
         Root::Home
     } else {
+        // An empty spelling lands here too, as an empty opening segment with
+        // nothing after it. That is defensive: `Portable::parse_in("")` refuses
+        // it, so it is never keyed as a file and never reaches `clash`'s
+        // comparison.
+        //
         // What follows the opening segment parts two spellings only when an
         // answer can make that segment nothing: a non-empty text is one path
         // with a separator after it or without.

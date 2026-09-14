@@ -326,6 +326,19 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_is_not_bytes_is_refused_as_a_fingerprint() {
+        // r3 round 1 (C5): nothing decoded a fingerprint from anything but
+        // bytes, so `expecting` never ran and its text survived mutation.
+        let encoded = rmp_serde::to_vec(&7_u32).expect("encode");
+        let err = rmp_serde::from_slice::<Fingerprint>(&encoded)
+            .expect_err("an integer is not a fingerprint");
+        assert!(
+            err.to_string().contains("an opaque fingerprint"),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn an_empty_fingerprint_round_trips() {
         let encoded = rmp_serde::to_vec_named(&Fingerprint::raw(Vec::new())).expect("encode");
         let back: Fingerprint = rmp_serde::from_slice(&encoded).expect("decode");

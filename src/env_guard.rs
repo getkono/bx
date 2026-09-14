@@ -4424,6 +4424,12 @@ mod tests {
                     "export PATH=/a:$PATH\nexport PATH=/usr/bin\nexport PATH=./x:$PATH\n",
                     vec![(3, NotAbsolute)],
                 ),
+                // An extension that does not resolve replaces the one before
+                // it: a later extension may not reach past it to line 1's.
+                (
+                    "export PATH=/a:$PATH\nexport PATH=${UNDEFINED}:$PATH\nexport PATH=/z:$PATH\n",
+                    vec![(2, UnresolvedReference), (3, UnresolvedReference)],
+                ),
                 // After a line the guard could not read, nothing is inherited.
                 (
                     "export PATH=/a:$PATH\ntrue\nexport PATH=/b:$PATH\n",

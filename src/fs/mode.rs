@@ -181,10 +181,10 @@ impl Mode {
 
     /// Whether every bit of `required` is set in this mode.
     ///
-    /// The question a declared mode is asked before bx writes anything at it:
-    /// a directory target must grant its owner `0700` and a file target `0400`,
-    /// or bx could not come back to what it wrote. Special bits count like any
-    /// other, so `2775` includes `0700` and `0600` does not.
+    /// The question `compare` asks a file target's declared mode: it must
+    /// grant its owner `0400`, or bx could not read back what it wrote. Special
+    /// bits count like any other, so `2775` includes `0700` and `0600` does
+    /// not.
     #[must_use]
     pub const fn includes(self, required: Self) -> bool {
         self.bits() & required.bits() == required.bits()

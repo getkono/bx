@@ -376,11 +376,13 @@ pub enum Error {
     /// bx lists a directory target, creates its temporary files in it and
     /// renames them into place, and it reads a file target's bytes to compare
     /// them. Applying such a mode would succeed once and leave every later
-    /// `plan` failing with a permission error, against Invariant 3, so it is
-    /// refused before anything is observed again, created, written or
-    /// chmod'd. [`compare`] and [`compare_dir`] announce it as an
+    /// `plan` failing with a permission error, against Invariant 3, so a
+    /// directory mode is refused before anything is observed again, created
+    /// or chmod'd. [`compare`] and [`compare_dir`] announce it as an
     /// [`Action::Conflict`] in the same words, so `apply` never reaches it for
-    /// a target `plan` printed.
+    /// a target `plan` printed. A file mode is `plan`'s verdict alone:
+    /// [`stage`] writes the mode it is given, since a reversal restores a
+    /// recorded prior mode through it.
     #[error("{} {}. Nothing was changed", .path.display(), owner_locked_out(*.declared, *.needs))]
     OwnerLockedOut {
         /// The target, or the declared directory a write would create.
@@ -852,8 +854,10 @@ pub struct Outcome {
 ///   for it: it compares nothing with `plan`.
 /// * [`Action::Conflict`] — a directory, a symlink, or anything else that is
 ///   not a regular file; and, whatever is there, a declared mode that does not
-///   grant the owner read (`0400`), which [`stage`] refuses with
-///   [`Error::OwnerLockedOut`]. The note is that error's words, less the path.
+///   grant the owner read (`0400`), because bx could not read the file back to
+///   compare it. The note is [`Error::OwnerLockedOut`]'s words, less the path.
+///   [`stage`] does not refuse such a mode: a reversal restores a recorded
+///   prior mode through it as recorded.
 ///
 /// `home` only names things: a directory the parent note mentions is written
 /// `~/…` when it is under `home`, through [`crate::paths::to_portable`],
@@ -1055,9 +1059,11 @@ impl Pending {
 ///
 /// # Errors
 ///
-/// [`Error::OwnerLockedOut`], before anything is observed or made, when `mode`
-/// does not grant the owner read, or when a missing parent it would create is
-/// declared at a mode that does not grant the owner read, write and search.
+/// [`Error::OwnerLockedOut`], before anything is observed or made, when a
+/// missing parent it would create is declared at a mode that does not grant
+/// the owner read, write and search. `mode` itself is written as given, one
+/// without owner read included: it may be a prior mode a reversal restores,
+/// and whether a declared mode may lack owner read is [`compare`]'s verdict.
 /// [`Error::Changed`] when the destination is no longer what `planned`
 /// observed, or `planned` observed a different path. [`Error::UnusableParent`],
 /// [`Error::Symlink`] or [`Error::NotAFile`] when `planned` or the second
@@ -1079,8 +1085,6 @@ pub fn stage(
     // Spelled as `observe` spells it, so `link/` is the link.
     let dest = lexical(dest)?;
     let dest = dest.as_path();
-    // The declaration before the disk: it is refused whatever is there.
-    refuse_owner_locked_out(dest, mode, FILE_OWNER_NEEDS)?;
     if planned.path != dest {
         return Err(Error::Changed {
             path: dest.to_path_buf(),
@@ -3104,7 +3108,7 @@ mod tests {
             return;
         }
 
-        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_CHILD_DIR);
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_CHILD_DIR, |_| {});
     }
 
     /// Set only in the unprivileged child
@@ -3205,7 +3209,7 @@ mod tests {
             return;
         }
 
-        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_DIR_CHILD_DIR);
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_DIR_CHILD_DIR, |_| {});
     }
 
     /// The variable the preflight test's child finds its setgid directory in.
@@ -3306,7 +3310,7 @@ mod tests {
             return;
         }
 
-        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_PREFLIGHT_CHILD_DIR);
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_PREFLIGHT_CHILD_DIR, |_| {});
     }
 
     /// The refusal `set_dir_mode` returns for `dir`, declared `declared`, when
@@ -3455,6 +3459,78 @@ mod tests {
         );
     }
 
+    /// The variable the foreign-file test's child finds its directory in.
+    const FOREIGN_FILE_CHILD_DIR: &str = "BX_TEST_FOREIGN_FILE_CHILD_DIR";
+
+    #[test]
+    fn a_foreign_file_s_prior_mode_without_owner_read_is_restored_as_recorded() {
+        const NAME: &str = "fs::atomic::tests::\
+             a_foreign_file_s_prior_mode_without_owner_read_is_restored_as_recorded";
+        let theirs = b"theirs\n";
+        let recorded = Mode::from_bits(0o004);
+
+        if let Some(dir) = std::env::var_os(FOREIGN_FILE_CHILD_DIR) {
+            // The child, uid 1: the file is somebody else's, at 0004, so it
+            // reads the bytes through the other bits alone.
+            println!("{SET_ID_CHILD_RAN}");
+            let foreign = PathBuf::from(dir).join("foreign");
+            let planned = observe(&foreign).expect("observe");
+            assert_eq!(
+                (planned.kind, planned.mode, planned.bytes.as_deref()),
+                (Kind::File, Some(recorded), Some(&theirs[..])),
+            );
+
+            // apply records the prior, then replaces the file.
+            let staged = stage(
+                &foreign,
+                Mode::DEFAULT_FILE,
+                &planned,
+                &mut CreatedDirs::new(),
+            )
+            .expect("stage");
+            let prior = staged.prior().clone();
+            staged.commit(b"managed\n").expect("commit");
+            assert_eq!(prior.mode, Some(recorded), "the prior mode is recorded");
+
+            // rm restores the recorded bytes at the recorded mode.
+            let now = observe(&foreign).expect("observe");
+            stage(&foreign, recorded, &now, &mut CreatedDirs::new())
+                .expect("a recorded prior mode is staged as recorded")
+                .commit(prior.bytes.as_deref().expect("prior bytes"))
+                .expect("commit");
+            assert_eq!(mode_of_path(&foreign), recorded, "restored exactly");
+            return;
+        }
+
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, FOREIGN_FILE_CHILD_DIR, |dir| {
+            seed(&dir.join("foreign"), theirs, recorded);
+        });
+    }
+
+    #[test]
+    fn a_restore_of_a_recorded_mode_without_owner_read_is_written_as_recorded() {
+        let home = guarded_home();
+        let dest = home.child("restored");
+        seed(&dest, b"managed\n", Mode::DEFAULT_FILE);
+        let recorded = Mode::from_bits(0o004);
+        let now = observe(&dest).expect("observe");
+
+        // Declared, the mode is still plan's conflict: bx could not read the
+        // file back to compare it.
+        assert_eq!(
+            compare(&now, &desired(b"prior\n", recorded), home.path()).action,
+            Action::Conflict,
+        );
+        // Restored, it is what was there, and stage writes it as recorded.
+        stage(&dest, recorded, &now, &mut CreatedDirs::new())
+            .expect("a recorded prior mode is staged as recorded")
+            .commit(b"prior\n")
+            .expect("commit");
+        assert_eq!(mode_of_path(&dest), recorded);
+        set_mode(&dest, Mode::DEFAULT_FILE).expect("unlock for the assertion");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"prior\n");
+    }
+
     /// `EPERM`, the errno a refused `chmod` reports.
     fn libc_eperm() -> i32 {
         Errno::PERM.raw_os_error()
@@ -3517,7 +3593,11 @@ mod tests {
     ///
     /// Skips, with a message on stderr, wherever the scenario cannot be
     /// constructed; fails only when the child ran and failed.
-    fn run_unprivileged_in_a_foreign_setgid_directory(name: &str, child_env: &str) {
+    fn run_unprivileged_in_a_foreign_setgid_directory(
+        name: &str,
+        child_env: &str,
+        seed: impl FnOnce(&Path),
+    ) {
         let skip = |why: &str| eprintln!("skipped {name}: {why}");
         let home = guarded_home();
         // Another uid has to reach the directory and run this test binary,
@@ -3533,6 +3613,9 @@ mod tests {
         set_mode(&exe, Mode::from_bits(0o755)).expect("chmod the copy");
         let dir = home.child("shared");
         std::fs::create_dir(&dir).expect("mkdir");
+        // Anything the child should find there owned by this user, which is
+        // somebody else to uid 1.
+        seed(&dir);
 
         // Each step in a user namespace mapping this user to root and its
         // subordinate ids above that: give the directory group 5, make it
@@ -4674,7 +4757,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_target_that_denies_its_owner_read_is_refused_before_any_change() {
+    fn a_file_target_that_denies_its_owner_read_is_a_conflict_at_plan_time() {
         let home = guarded_home();
         let dir = home.child("d");
         let declared = Mode::from_bits(0o200);
@@ -4693,39 +4776,27 @@ mod tests {
         let existing = dir.join("existing");
         seed(&existing, b"before", Mode::DEFAULT_FILE);
         let planned = observe(&existing).expect("plan observes");
-        let announced = compare(&planned, &desired(b"after", declared), home.path());
-        let applied = stage(&existing, declared, &planned, &mut CreatedDirs::new())
-            .and_then(|staged| staged.commit(b"after"));
-        let after = std::fs::symlink_metadata(&existing).expect("stat");
-        set_mode(&existing, Mode::DEFAULT_FILE).expect("unlock for the assertions");
-        assert_eq!(announced, conflict, "plan announces the refusal");
-        let err = applied.expect_err("apply refuses a mode that locks bx out");
-        assert_owner_locked_out(&err, &existing, note);
         assert_eq!(
-            (mode_of(&after), Some(Stamp::of(&after))),
-            (Mode::DEFAULT_FILE, planned.stamp),
-            "nothing on disk changed",
+            compare(&planned, &desired(b"after", declared), home.path()),
+            conflict,
+            "plan announces the conflict",
         );
-        assert_eq!(std::fs::read(&existing).expect("read"), b"before");
 
-        // An absent file declared 0200, through the one-call writer.
+        // An absent file declared 0200: the same conflict.
         let fresh = dir.join("fresh");
         let planned = observe(&fresh).expect("plan observes");
         assert_eq!(
             compare(&planned, &desired(b"x", declared), home.path()),
             conflict
         );
-        let applied = write_atomically(&fresh, b"x", declared);
-        if fresh.exists() || std::fs::symlink_metadata(&fresh).is_ok() {
-            set_mode(&fresh, Mode::PRIVATE_FILE).expect("unlock for the assertions");
-        }
-        let err = applied.expect_err("apply refuses to create it");
-        assert_owner_locked_out(&err, &fresh, note);
-        assert_eq!(
-            names_in(&dir),
-            vec![OsString::from("existing")],
-            "nothing was created, and no temporary file is left",
-        );
+
+        // The error a caller raises for it says the same words, with the path.
+        let err = Error::OwnerLockedOut {
+            path: existing.clone(),
+            declared,
+            needs: FILE_OWNER_NEEDS,
+        };
+        assert_owner_locked_out(&err, &existing, note);
     }
 
     #[test]

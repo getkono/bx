@@ -2360,6 +2360,15 @@ mod tests {
         let note = outcome.note.expect("the cause must be named");
         assert!(note.contains(".config"), "{note}");
         assert!(note.contains("does not resolve to a directory"), "{note}");
+        // `metadata` says ENOENT, so the ancestor walk settles it, and its
+        // words name the directory bx would have had to create through the link.
+        assert!(
+            note.ends_with(&format!(
+                "so bx cannot create {} inside it",
+                home.child(".config").display()
+            )),
+            "{note}",
+        );
         assert_eq!(outcome.parent_note, None);
 
         // And `apply` refuses the same way, naming the parent rather than a
@@ -2404,6 +2413,12 @@ mod tests {
         let note = outcome.note.expect("the cause must be named");
         assert!(note.contains("loop"), "{note}");
         assert!(note.contains("does not resolve to a directory"), "{note}");
+        // `metadata` says ELOOP rather than ENOENT, and the link itself is
+        // readable, so the refusal is settled before any walk, in its own words.
+        assert!(
+            note.ends_with("so bx cannot write a file inside it"),
+            "{note}",
+        );
 
         let err =
             write_atomically(&home.child("loop/f"), b"x", Mode::DEFAULT_FILE).expect_err("refuse");

@@ -238,7 +238,8 @@ impl SharedLock {
     /// applies — a regular file with one link — so a symlink, a directory or a
     /// hard link at the lock path is refused here exactly as a writer would
     /// refuse it. One non-blocking shared `flock` then answers the question,
-    /// and is released when the descriptor closes on return.
+    /// and a lock it took is unlocked before it returns — explicitly, as both
+    /// guards' `Drop` does, so no copy of the descriptor keeps it held.
     ///
     /// A missing lock file, or a state directory that is not there, is
     /// [`Probe::Absent`]: no writer holds a lock that does not exist, because a
@@ -277,7 +278,14 @@ impl SharedLock {
             return Err(Error::LockNotAFile { path: dir.lock() });
         }
         match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockShared) {
-            Ok(()) => Ok(Probe::Free),
+            Ok(()) => {
+                // Unlocked explicitly rather than by the close: a process
+                // spawned from another thread while the descriptor is open has
+                // a copy of it until it execs, and the close alone would leave
+                // the lock held by that copy.
+                let _ = released("unlock", rustix::fs::flock(&fd, FlockOperation::Unlock));
+                Ok(Probe::Free)
+            }
             Err(Errno::WOULDBLOCK) => Ok(Probe::Held),
             Err(source) => Err(failed(source)),
         }
@@ -692,6 +700,34 @@ mod tests {
         assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Held);
         drop(writer);
         assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Free);
+    }
+
+    #[test]
+    fn a_free_probe_unlocks_before_it_closes_and_no_other_answer_has_a_lock_to_release() {
+        // A shared lock released only by closing its descriptor stays held
+        // while a process spawned in that instant, from any thread, still has
+        // a copy of the descriptor: the apply that follows a plan is then
+        // refused as locked, as `t13` once was under load. Explicit, as both
+        // guards' `Drop` is.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let mut found = None;
+
+        let calls = release_recording::record(|| found = SharedLock::probe(&dir).ok());
+        assert_eq!(found, Some(Probe::Absent));
+        assert!(calls.is_empty(), "{calls:?}");
+
+        std::fs::create_dir_all(dir.root()).expect("the state directory");
+        std::fs::write(dir.lock(), b"").expect("the lock file");
+        let calls = release_recording::record(|| found = SharedLock::probe(&dir).ok());
+        assert_eq!(found, Some(Probe::Free));
+        assert_eq!(calls, ["unlock"]);
+
+        let writer = ExclusiveLock::acquire(&dir).expect("writer");
+        let calls = release_recording::record(|| found = SharedLock::probe(&dir).ok());
+        assert_eq!(found, Some(Probe::Held));
+        assert!(calls.is_empty(), "{calls:?}");
+        drop(writer);
     }
 
     #[test]

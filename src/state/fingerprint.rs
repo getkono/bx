@@ -141,6 +141,10 @@ impl Fingerprints {
     ///
     /// As [`Fingerprints::read`], and [`Error::WrongLock`] if `lock` is not
     /// `dir`'s own lock, before anything is read.
+    ///
+    /// [`Error::CannotQuarantine`] if `fingerprints.mpk` is damaged and cannot
+    /// be moved aside: it is left in place and nothing is reset, so the next
+    /// save cannot write over bytes [`super::Health::Reset`] says were kept.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock) -> Result<Loaded<Self>, Error> {
         store::load(
             &dir.fingerprints(),
@@ -204,7 +208,9 @@ impl Fingerprints {
     /// # Errors
     ///
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
-    /// leaves the previous cache exactly as it was.
+    /// leaves the previous cache exactly as it was, except a failing `fsync` of
+    /// the state directory after the rename, which is returned with the new
+    /// cache already in place — see [`crate::fs::write_atomically`].
     ///
     /// [`Error::WrongLock`] if `lock` is not `dir`'s own lock; nothing is
     /// written.
@@ -317,6 +323,19 @@ mod tests {
         assert_eq!(encoded, vec![0xc4, 3, 1, 2, 3]);
         let back: Fingerprint = rmp_serde::from_slice(&encoded).expect("decode");
         assert_eq!(back.as_bytes(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn a_value_that_is_not_bytes_is_refused_as_a_fingerprint() {
+        // r3 round 1 (C5): nothing decoded a fingerprint from anything but
+        // bytes, so `expecting` never ran and its text survived mutation.
+        let encoded = rmp_serde::to_vec(&7_u32).expect("encode");
+        let err = rmp_serde::from_slice::<Fingerprint>(&encoded)
+            .expect_err("an integer is not a fingerprint");
+        assert!(
+            err.to_string().contains("an opaque fingerprint"),
+            "got {err}"
+        );
     }
 
     #[test]

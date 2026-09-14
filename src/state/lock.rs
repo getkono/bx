@@ -349,11 +349,63 @@ impl Drop for ExclusiveLock {
         // writes no body of its own — would name a released pid that may
         // belong to an unrelated process by then. A user acting on that
         // message acts on the wrong process.
-        let _ = rustix::fs::ftruncate(&self.fd, 0);
+        let _ = released("truncate", rustix::fs::ftruncate(&self.fd, 0));
         // Closing the descriptor would release it anyway; the explicit unlock
         // makes the release immediate and independent of any dup that may exist.
         // A failure here has nowhere to go and nothing to fix.
-        let _ = rustix::fs::flock(&self.fd, FlockOperation::Unlock);
+        let _ = released(
+            "unlock",
+            rustix::fs::flock(&self.fd, FlockOperation::Unlock),
+        );
+    }
+}
+
+/// Hand back the result of one call [`ExclusiveLock::drop`] makes, noting the
+/// call on this thread first when a test is recording.
+///
+/// The note travels in the call's own statement, so the order recorded is the
+/// order the calls ran: both of their effects are visible only once the drop
+/// is over, and nothing else can tell a truncate after the unlock from one
+/// before it.
+fn released<T>(call: &'static str, result: T) -> T {
+    #[cfg(test)]
+    release_recording::note(call);
+    #[cfg(not(test))]
+    let _ = call;
+    result
+}
+
+/// A test-only, per-thread record of the calls [`ExclusiveLock::drop`] makes.
+#[cfg(test)]
+mod release_recording {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CALLS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    }
+
+    /// Note `call`, if this thread is recording.
+    pub(super) fn note(call: &'static str) {
+        CALLS.with(|calls| {
+            if let Some(calls) = calls.borrow_mut().as_mut() {
+                calls.push(call);
+            }
+        });
+    }
+
+    /// The calls noted on this thread while `f` ran, in order. Recording
+    /// stops afterwards even if `f` panics.
+    pub(super) fn record(f: impl FnOnce()) -> Vec<&'static str> {
+        struct Stop;
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                CALLS.with(|calls| calls.borrow_mut().take());
+            }
+        }
+        CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+        let _stop = Stop;
+        f();
+        CALLS.with(|calls| calls.borrow_mut().take().unwrap_or_default())
     }
 }
 
@@ -487,6 +539,41 @@ mod tests {
         assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
         assert_eq!(read_holder(&dir.lock()), Holder::unknown());
         drop(lock);
+    }
+
+    #[test]
+    fn a_lock_refused_for_anything_but_contention_is_an_error_naming_the_file() {
+        // r3 round 1 (C2): a `flock` failure other than `EWOULDBLOCK` was
+        // never reached, so reading it as success went unnoticed.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        std::fs::write(dir.lock(), b"").expect("seed");
+        // An `O_PATH` descriptor names the file but cannot lock it: `EBADF`.
+        let fd = rustix::fs::open(dir.lock(), OFlags::PATH | OFlags::CLOEXEC, RawMode::empty())
+            .expect("an O_PATH descriptor");
+        for operation in [
+            FlockOperation::NonBlockingLockExclusive,
+            FlockOperation::NonBlockingLockShared,
+        ] {
+            let err = take(&fd, &dir.lock(), operation).expect_err("EBADF is not a lock");
+            assert!(
+                matches!(&err, Error::Lock { path, source }
+                    if *path == dir.lock()
+                        && source.raw_os_error() == Some(Errno::BADF.raw_os_error())),
+                "got {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_holder_line_that_cannot_be_read_is_an_unknown_holder() {
+        // r3 round 1 (C2): a failing `pread` was never reached. A directory
+        // opens `O_RDONLY`, and reading it fails with `EISDIR`.
+        let home = guarded_home();
+        let unreadable = home.child("a-directory");
+        std::fs::create_dir_all(&unreadable).expect("mkdir");
+        assert_eq!(read_holder(&unreadable), Holder::unknown());
     }
 
     #[test]
@@ -626,6 +713,20 @@ mod tests {
             "a reader-held lock must report an unknown holder, not a stale pid",
         );
         assert_eq!(holder.pid, 0);
+    }
+
+    #[test]
+    fn a_released_writer_clears_its_line_before_it_unlocks() {
+        // r3 round 1 (C3): the order was held by a comment. Unlocking first
+        // leaves a window in which a reader can take the lock and be refused
+        // naming the released pid, and afterwards the file is empty either
+        // way, so swapping the two calls left every test green.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let writer = ExclusiveLock::acquire(&dir).expect("writer");
+        let calls = release_recording::record(|| drop(writer));
+        assert_eq!(calls, ["truncate", "unlock"]);
+        assert_eq!(std::fs::read(dir.lock()).expect("read"), Vec::<u8>::new());
     }
 
     /// The program name [`identify`] writes, derived the same way it derives it.

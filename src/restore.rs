@@ -1718,4 +1718,155 @@ mod tests {
             );
         }
     }
+
+    /// The variable the foreign-prior child finds its directory in.
+    const FOREIGN_PRIOR_CHILD_DIR: &str = "BX_TEST_RESTORE_FOREIGN_PRIOR_DIR";
+
+    /// What the foreign-prior child prints first, so a child that never
+    /// started is told apart from one that ran and failed.
+    const FOREIGN_PRIOR_CHILD_RAN: &str = "bx-restore-foreign-prior-child-ran";
+
+    #[test]
+    fn rm_restores_a_prior_mode_without_owner_read_at_that_mode() {
+        // Integration of #8 @746fdc0. restore_one passes the recorded prior
+        // mode to stage, which refused any mode without owner read until
+        // 4a3248d, so a foreign 0004 file bx replaced could never be put back.
+        // Only somebody else's file can be read at 0004, so the apply and the
+        // rm run as another uid.
+        const NAME: &str =
+            "restore::tests::rm_restores_a_prior_mode_without_owner_read_at_that_mode";
+        let theirs = "theirs\n";
+        let recorded = Mode::from_bits(0o004);
+
+        if let Some(dir) = std::env::var_os(FOREIGN_PRIOR_CHILD_DIR) {
+            println!("{FOREIGN_PRIOR_CHILD_RAN}");
+            let home = PathBuf::from(dir).join("home");
+            let state = StateDir::resolve(&home);
+            let dest = home.join("foreign");
+
+            let portable = managed(&state, &home, "foreign", "managed\n", Mode::DEFAULT_FILE);
+            let entry = entry_for(&state, &home, &portable).expect("managed");
+            let Prior::Existed(reference) = &entry.prior else {
+                panic!("the foreign file must be the prior, got {:?}", entry.prior);
+            };
+            assert_eq!(reference.mode, recorded, "the prior mode is recorded");
+
+            let done = restore(&state, &home, std::slice::from_ref(&portable))
+                .expect("rm restores a prior mode without owner read");
+            assert!(
+                matches!(done.as_slice(), [Restored::Reverted { .. }]),
+                "{done:?}"
+            );
+            let on_disk = std::fs::symlink_metadata(&dest).expect("restored");
+            assert_eq!(
+                Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(
+                    &on_disk.permissions()
+                )),
+                recorded,
+                "restored at the recorded mode",
+            );
+            fs::set_mode(&dest, Mode::DEFAULT_FILE).expect("unlock for the assertion");
+            assert_eq!(std::fs::read(&dest).expect("read"), theirs.as_bytes());
+            assert!(entry_for(&state, &home, &portable).is_none());
+            assert!(!state.journal().exists(), "the rm session closed cleanly");
+            // What this uid made, so the parent can remove its tempdir.
+            std::fs::remove_dir_all(home.join(".local")).expect("tidy the state directory");
+            return;
+        }
+
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, FOREIGN_PRIOR_CHILD_DIR, |dir| {
+            let home = dir.join("home");
+            std::fs::create_dir(&home).expect("the home");
+            fs::set_mode(&home, Mode::from_bits(0o777)).expect("a home uid 1 can write in");
+            plant_file(&home.join("foreign"), theirs, recorded);
+        });
+    }
+
+    /// Run the test `name` again as uid 1 with no supplementary groups, inside
+    /// a user namespace, with `child_env` naming a world-writable setgid
+    /// directory owned by a group that uid is not in. `seed` fills the
+    /// directory first, as this user, who is somebody else to uid 1.
+    ///
+    /// The pattern of `fs::atomic`'s harness of the same name, whose test
+    /// module is private to it. Skips, with a message on stderr, wherever the
+    /// scenario cannot be constructed; fails only when the child ran and
+    /// failed.
+    fn run_unprivileged_in_a_foreign_setgid_directory(
+        name: &str,
+        child_env: &str,
+        seed: impl FnOnce(&Path),
+    ) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let skip = |why: &str| eprintln!("skipped {name}: {why}");
+        let home = guarded_home();
+        // Another uid has to reach the directory and run this test binary.
+        fs::set_mode(home.path(), Mode::DEFAULT_DIR).expect("open the home to traversal");
+        let exe = home.child("bx-test");
+        if let Err(e) = std::fs::copy(std::env::current_exe().expect("the test binary"), &exe) {
+            return skip(&format!("the test binary could not be copied: {e}"));
+        }
+        fs::set_mode(&exe, Mode::from_bits(0o755)).expect("chmod the copy");
+        let dir = home.child("shared");
+        std::fs::create_dir(&dir).expect("mkdir");
+        seed(&dir);
+
+        let in_namespace = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new("unshare")
+                .args(["--map-auto", "--map-root-user", "--"])
+                .args(args)
+                .env(child_env, &dir)
+                .output()
+        };
+        for step in [
+            [
+                std::ffi::OsStr::new("chown"),
+                "0:5".as_ref(),
+                dir.as_os_str(),
+            ],
+            ["chmod".as_ref(), "2777".as_ref(), dir.as_os_str()],
+        ] {
+            match in_namespace(&step) {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    return skip(&format!(
+                        "{step:?} in a user namespace failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                Err(e) => return skip(&format!("unshare could not run: {e}")),
+            }
+        }
+        let meta = std::fs::metadata(&dir).expect("stat");
+        if meta.mode() & 0o2000 == 0 || meta.gid() == rustix::process::getegid().as_raw() {
+            return skip("the directory is not setgid to a foreign group");
+        }
+
+        let child = in_namespace(&[
+            "setpriv".as_ref(),
+            "--reuid=1".as_ref(),
+            "--regid=1".as_ref(),
+            "--clear-groups".as_ref(),
+            "--".as_ref(),
+            exe.as_os_str(),
+            "--exact".as_ref(),
+            name.as_ref(),
+            "--nocapture".as_ref(),
+        ]);
+        let out = match child {
+            Ok(out) => out,
+            Err(e) => return skip(&format!("unshare could not run: {e}")),
+        };
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        if !stdout.contains(FOREIGN_PRIOR_CHILD_RAN) {
+            return skip(&format!("the unprivileged child did not start: {stderr}"));
+        }
+        assert!(
+            out.status.success(),
+            "the unprivileged child failed:\n{stdout}\n{stderr}"
+        );
+    }
 }

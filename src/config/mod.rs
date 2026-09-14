@@ -115,7 +115,9 @@ pub enum LayerKind {
 /// decides the result.
 ///
 /// A missing `bx.toml` and a missing `modules/` are both empty results, not
-/// errors — a repo may hold either, both, or neither.
+/// errors — a repo may hold either, both, or neither. A repo root that does not
+/// exist, lies beneath a non-directory, or is not a directory is
+/// [`Error::RepoMissing`].
 ///
 /// # Only a clean answer skips a file
 ///
@@ -130,10 +132,11 @@ pub enum LayerKind {
 ///
 /// # Errors
 ///
-/// [`Error::RepoMissing`] if `repo` does not exist or is not a directory, and
-/// [`Error::Io`] naming the path for any candidate that cannot be examined.
+/// [`Error::RepoMissing`] if `repo` does not exist, lies beneath a
+/// non-directory, or is not a directory, and [`Error::Io`] naming the path for
+/// any candidate that cannot be examined.
 pub fn layer_files(repo: &Path) -> Result<Vec<PathBuf>, Error> {
-    if !examine(repo)?.is_some_and(|meta| meta.is_dir()) {
+    if !examine_root(repo)?.is_some_and(|meta| meta.is_dir()) {
         return Err(Error::RepoMissing(repo.to_path_buf()));
     }
 
@@ -184,19 +187,57 @@ fn is_module_name(path: &Path) -> bool {
 /// then followed with `stat`, and `ENOENT` there is a **dangling** link, which
 /// is an error rather than an absence, because a layer someone linked in and
 /// broke is not a layer nobody wrote. Every other failure of either call —
-/// `EACCES`, `ELOOP` — is an error carrying the call's own `errno`.
+/// `EACCES`, `ELOOP` — is an error carrying the call's own `errno`. The repo
+/// root alone is examined with [`examine_root`], which also reads `ENOTDIR`
+/// from `lstat` as nothing there.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] naming `path` for anything but a clean answer.
 fn examine(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
+    examine_as(path, &[std::io::ErrorKind::NotFound])
+}
+
+/// [`examine`] for a repo root: `None` also when `lstat` says `ENOTDIR`.
+///
+/// A root beneath a regular file (`~/.config` is a file) is as missing as one
+/// that does not exist, and as one that is itself a file. Only the root reads
+/// it so: a state directory that is a file is where the account's layer has to
+/// be, so there `ENOTDIR` stays an error. Following a root symlink is unchanged,
+/// so a root linked to such a place is dangling and still an error.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming `path` for anything but a clean answer.
+fn examine_root(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
+    examine_as(
+        path,
+        &[
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ],
+    )
+}
+
+/// [`examine`], with `absent` the `lstat` error kinds that mean nothing is there.
+///
+/// The list applies to `lstat` alone; following a symlink is the same for
+/// every caller.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming `path` for anything but a clean answer.
+fn examine_as(
+    path: &Path,
+    absent: &[std::io::ErrorKind],
+) -> Result<Option<std::fs::Metadata>, Error> {
     let io = |source| Error::Io {
         path: path.to_path_buf(),
         source,
     };
     let link = match std::fs::symlink_metadata(path) {
         Ok(link) => link,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if absent.contains(&source.kind()) => return Ok(None),
         Err(source) => return Err(io(source)),
     };
     if !link.file_type().is_symlink() {
@@ -875,6 +916,33 @@ mod tests {
         let error = layer_files(&missing).expect_err("should be an error");
         assert!(matches!(error, Error::RepoMissing(ref p) if *p == missing));
         assert!(error.to_string().contains("no bx config repo at"));
+    }
+
+    /// A repo root beneath a regular file is missing, exactly as one at a file is.
+    ///
+    /// `lstat` on `dotconfig/bx` with `dotconfig` a regular file says `ENOTDIR`,
+    /// not `ENOENT`, and that came back as an io error while a regular file at
+    /// the root itself was `RepoMissing`: one fault, two answers.
+    ///
+    /// Guards the other side of R4-6: a root that is a symlink to such a place
+    /// is still dangling, and a dangling root is an io error naming the link.
+    #[test]
+    fn a_repo_beneath_a_regular_file_is_missing() {
+        let dir = repo(&[("dotconfig", "")]);
+        let beneath = dir.path().join("dotconfig/bx");
+
+        let error = layer_files(&beneath).expect_err("should be an error");
+        assert!(
+            matches!(error, Error::RepoMissing(ref p) if *p == beneath),
+            "{error:?}"
+        );
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path().join("dotconfig/x"), &link).expect("symlink");
+        match layer_files(&link) {
+            Err(Error::Io { path, .. }) => assert_eq!(path, link),
+            other => panic!("expected an io error naming the link, got {other:?}"),
+        }
     }
 
     #[test]

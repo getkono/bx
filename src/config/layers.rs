@@ -153,9 +153,10 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
 /// picked up by a `git add .`.
 ///
 /// Each place is examined the way [`super::layer_files`] examines it, so the two
-/// agree about what is there: a repo root or `modules/` that is absent or not a
-/// directory holds no stray, and a `local.toml` that is absent or not a regular
-/// file is not one. Anything that cannot be examined, such as a dangling
+/// agree about what is there: a repo root that is absent, lies beneath a
+/// non-directory, or is not a directory holds no stray, and neither does a
+/// `modules/` that is absent or not a directory; a `local.toml` that is absent
+/// or not a regular file is not one. Anything that cannot be examined, such as a dangling
 /// symlink, `EACCES` or `ELOOP`, is an error rather than `None`, because `None`
 /// tells `bx doctor` the repo is clean.
 ///
@@ -163,7 +164,7 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
 ///
 /// [`Error::Io`] naming the path that could not be examined.
 pub fn stray_local(repo: &Path) -> Result<Option<PathBuf>, Error> {
-    if !super::examine(repo)?.is_some_and(|meta| meta.is_dir()) {
+    if !super::examine_root(repo)?.is_some_and(|meta| meta.is_dir()) {
         return Ok(None);
     }
     let root = repo.join(LOCAL_FILE);
@@ -649,5 +650,22 @@ mod tests {
         home.write(".config/bx/modules", "a file, not a directory");
         std::fs::create_dir(repo.join(LOCAL_FILE)).expect("a directory named local.toml");
         assert_eq!(stray_local(&repo).unwrap(), None, "wrong kinds throughout");
+    }
+
+    /// A repo root beneath a regular file holds no stray, as `layer_files` agrees.
+    ///
+    /// `lstat` there says `ENOTDIR`, which was an io error while `layer_files`
+    /// is to call the same root missing.
+    #[test]
+    fn stray_local_beneath_a_regular_file_is_none() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config", "a file, not a directory");
+
+        assert_eq!(stray_local(&repo).unwrap(), None);
+        assert!(matches!(
+            super::super::layer_files(&repo),
+            Err(Error::RepoMissing(ref p)) if *p == repo
+        ));
     }
 }

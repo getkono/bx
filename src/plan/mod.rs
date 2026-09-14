@@ -360,11 +360,13 @@ pub fn run(
     }
 
     let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
+    let locked_dirs = decide::locked_dirs(&inputs.resolved.targets, &inputs.home);
     let ctx = decide::Ctx {
         ledger: &ledger,
         home: &inputs.home,
         repo: &inputs.repo,
         roots: &inputs.roots,
+        locked_dirs: &locked_dirs,
     };
     let mut ops = Vec::new();
     for resolution in &inputs.resolved.targets {

@@ -33,6 +33,48 @@ pub(super) struct Ctx<'a> {
     pub repo: &'a Path,
     /// The roots a generated environment fragment is judged against.
     pub roots: &'a RootSet,
+    /// Every directory target whose declared mode denies its owner write or
+    /// search, rendered, with that mode — see [`locked_dirs`].
+    pub locked_dirs: &'a [(PathBuf, Mode)],
+}
+
+/// The directory targets whose declared mode denies their owner write or
+/// search, each rendered against `home`, with its mode.
+///
+/// Nothing beneath such a directory can be created or rewritten once it has
+/// that mode, so [`decide`] refuses every write beneath one at plan time rather
+/// than letting `apply` fail in `stage`. A directory target with nothing
+/// declared beneath it keeps whatever mode it declares.
+pub(super) fn locked_dirs(targets: &[Resolution<Target>], home: &Path) -> Vec<(PathBuf, Mode)> {
+    targets
+        .iter()
+        .filter_map(|resolution| match resolution {
+            Resolution::Ready(target) if target.body == Body::Dir => {
+                let mode = target.mode?;
+                (mode.bits() & 0o300 != 0o300).then(|| (target.path.render(home), mode))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Why a write to `dest` is refused, when `dest` lies beneath a directory
+/// target whose declared mode denies its owner write or search.
+fn locked_beneath(dest: &Path, ctx: &Ctx<'_>) -> Option<String> {
+    let (dir, mode) = ctx
+        .locked_dirs
+        .iter()
+        .find(|(dir, _)| dest != dir && dest.starts_with(dir))?;
+    let denied = match (mode.bits() & 0o200 == 0, mode.bits() & 0o100 == 0) {
+        (true, true) => "write and search",
+        (true, false) => "write",
+        (false, _) => "search",
+    };
+    Some(format!(
+        "{} is a directory target declared {mode}, which denies its owner {denied}, so apply \
+         could not write a file beneath it",
+        paths::to_portable(dir, ctx.home)
+    ))
 }
 
 /// One write a decision produced.
@@ -133,6 +175,14 @@ pub(super) fn decide(
         ctx.ledger.get(&target.path),
         join([note, outcome.parent_note]),
     );
+
+    // A write beneath a directory target its owner cannot write or search is
+    // refused here, so `apply` never reaches `stage` for it. A row with no
+    // write is left as it is: there is nothing to refuse.
+    let (action, note) = match (action.is_pending(), locked_beneath(&dest, ctx)) {
+        (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
+        _ => (action, note),
+    };
 
     // Only a regular file has a side to show: a directory, a link or an
     // unusable parent is explained by the note alone.
@@ -420,6 +470,7 @@ mod tests {
             home: home.path(),
             repo: &home.child(".config/bx"),
             roots: &roots,
+            locked_dirs: &[],
         };
         let shaped = |change: fn(&mut Target)| {
             let mut target = a_target(home.path(), "~/.a");
@@ -481,6 +532,7 @@ mod tests {
             home: home.path(),
             repo: &home.child(".config/bx"),
             roots: &roots,
+            locked_dirs: &[],
         };
 
         let (change, op) =
@@ -533,6 +585,7 @@ mod tests {
                 home: home.path(),
                 repo: &home.child(".config/bx"),
                 roots: &roots,
+                locked_dirs: &[],
             };
 
             let (change, op) =
@@ -546,6 +599,87 @@ mod tests {
             assert_eq!(op, None, "{words}");
             assert!(!home.child(".a").exists(), "{words}");
         }
+    }
+
+    /// A directory target at `~/.d` declared `mode`, then `children`.
+    fn a_directory_target(mode: &str, children: &str) -> String {
+        format!("[[target]]\npath = \"~/.d\"\ndir = true\nmode = \"{mode}\"\n{children}")
+    }
+
+    /// The row `plan` gives `target` in `report`.
+    fn row_for<'r>(report: &'r crate::plan::Report, target: &str) -> &'r Change {
+        report
+            .changes
+            .iter()
+            .find(|change| change.target == target)
+            .unwrap_or_else(|| panic!("no row for {target}: {report:?}"))
+    }
+
+    #[test]
+    fn decision_24_a_file_beneath_a_directory_its_owner_cannot_write_or_search_is_a_conflict() {
+        // #8's reviewer: a file beneath a declared read-only directory was
+        // printed as a create, and apply failed writing it.
+        for (mode, denied) in [
+            ("0555", "write"),
+            ("0655", "search"),
+            ("0444", "write and search"),
+        ] {
+            let home = guarded_home();
+            let inputs = crate::plan::tests::inputs(
+                &home,
+                &a_directory_target(mode, &crate::plan::tests::inline("~/.d/f", "x\\n")),
+            );
+
+            let report = crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false))
+                .expect("plan");
+
+            let file = row_for(&report, "~/.d/f");
+            assert_eq!(file.action, Action::Conflict, "{mode}: {file:?}");
+            let note = file.note.as_deref().expect("a note");
+            assert!(
+                note.contains("~/.d")
+                    && note.contains(mode)
+                    && note.contains(&format!("owner {denied},")),
+                "{mode}: {note}"
+            );
+
+            let applied = crate::plan::run(&inputs, crate::plan::Mode::Apply, &mut |_| Ok(true))
+                .expect("apply");
+            assert!(!applied.executed, "{mode}: apply wrote");
+            assert!(
+                !home.child(".d").exists(),
+                "{mode}: apply created the directory"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_24_a_childless_directory_target_keeps_any_declared_mode() {
+        let home = guarded_home();
+        let inputs = crate::plan::tests::inputs(&home, &a_directory_target("0555", ""));
+
+        let report =
+            crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false)).expect("plan");
+
+        assert_eq!(report.actions(), vec![Action::Blocked], "{report:?}");
+    }
+
+    #[test]
+    fn decision_24_a_file_beneath_a_directory_its_owner_can_write_is_decided_as_before() {
+        let home = guarded_home();
+        let inputs = crate::plan::tests::inputs(
+            &home,
+            &a_directory_target("0755", &crate::plan::tests::inline("~/.d/f", "x\\n")),
+        );
+
+        let report =
+            crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false)).expect("plan");
+
+        assert_eq!(
+            row_for(&report, "~/.d/f").action,
+            Action::Create,
+            "{report:?}"
+        );
     }
 
     #[test]

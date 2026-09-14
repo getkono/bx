@@ -3414,6 +3414,29 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_whose_created_directory_cannot_be_made_portable_is_an_error() {
+        // r3 coverage C3. The loader refuses a journal whose created directory
+        // is not a parent of its destination below its UTF-8 home, so no
+        // journal on disk reaches this. Pinned at `decide`, so such a directory
+        // is never dropped from a rebuilt entry.
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut intent = intent_for(home.path(), ".config/app/a.toml");
+        intent.created_dirs = vec![home.path().join(std::ffi::OsStr::from_bytes(b"\xff"))];
+
+        let err = match decide(&state, &intent, Some(home.path()), None, true) {
+            Err(err) => err,
+            Ok((_, report)) => panic!("rebuilt: {report:?}"),
+        };
+        assert!(
+            matches!(&err, Error::Write(fs::Error::NotPortable { path, .. }) if *path == intent.created_dirs[0]),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn only_a_destination_in_a_recorded_state_is_resolvable() {
         for (standing, resolvable) in [
             (Standing::Prior, true),

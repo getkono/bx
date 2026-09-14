@@ -4625,6 +4625,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_claim_that_cannot_be_made_portable_is_an_error_not_dropped() {
+        // r3 coverage C3. No admitted removal and no believed journal reaches
+        // this since D2: every claim is a parent of a destination rendered
+        // under an absolute UTF-8 home, and every forgotten claim is a stored
+        // `Portable` rendered under it. Pinned at the function, with a home
+        // `Portable::from_path` refuses, so a claim is never silently lost.
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let outside = tempfile::tempdir().expect("a directory outside the home");
+        let dir = outside.path().join("made");
+        std::fs::create_dir_all(&dir).expect("the claimed directory");
+        let heir =
+            Portable::from_path(&dir.join("heir.conf"), home.path()).expect("an absolute target");
+        let lock = ExclusiveLock::acquire(&state).expect("lock");
+        let mut ledger = Ledger::open(&state, &lock, home.path())
+            .expect("open the ledger")
+            .value;
+        ledger
+            .record(NewEntry::new(
+                heir,
+                ContentHash::of(b"x\n"),
+                Mode::DEFAULT_FILE,
+                Mechanism::Own,
+            ))
+            .expect("an entry beneath the claim");
+        let unusable = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff"));
+
+        let err = hand_off_claims(&mut ledger, &unusable, [&dir])
+            .expect_err("the claim cannot be made portable");
+        assert!(
+            matches!(&err, Error::Write(fs::Error::NotPortable { path, .. }) if *path == dir),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn a_session_counts_every_write_it_published() {
         // Coverage review round 5, non-blocking.
         let home = guarded_home();

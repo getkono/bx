@@ -1686,6 +1686,62 @@ mod tests {
     }
 
     #[test]
+    fn a_prior_that_cannot_be_stored_leaves_every_entry_and_the_saved_ledger_unchanged() {
+        // r3 round 1 (C7): a failing blob write inside `record` and
+        // `adopt_current_as_prior` was never reached, so the promise that
+        // the entry is left unchanged was untested.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .record(entry("~/.own", b"bx wrote this"))
+            .expect("own");
+        ledger
+            .record(NewEntry::new(
+                target("~/.region"),
+                ContentHash::of(b"a file with bx's region"),
+                Mode::DEFAULT_FILE,
+                Mechanism::Region { comment: '#' },
+            ))
+            .expect("region");
+        ledger.save().expect("save");
+        let saved = std::fs::read(dir.ledger()).expect("read");
+        let own = ledger.get(&target("~/.own")).expect("own").clone();
+        let region = ledger.get(&target("~/.region")).expect("region").clone();
+
+        // A non-empty directory at the blob's name: no rename of a file
+        // replaces it, so the write of these bytes fails.
+        let user = b"the user changed this";
+        let occupied = dir.restore().join(ContentHash::of(user).to_hex());
+        std::fs::create_dir_all(occupied.join("keep")).expect("occupy");
+        let prior = || PriorBytes::Bytes {
+            bytes: user.to_vec(),
+            mode: Mode::DEFAULT_FILE,
+        };
+
+        let err = ledger
+            .record(entry("~/.own", b"bx wrote this").with_prior(prior()))
+            .expect_err("a re-record whose prior cannot be stored");
+        assert!(matches!(err, Error::Write(_)), "got {err}");
+        let err = ledger
+            .record(entry("~/.new", b"bx wrote this").with_prior(prior()))
+            .expect_err("a first record whose prior cannot be stored");
+        assert!(matches!(err, Error::Write(_)), "got {err}");
+        let err = ledger
+            .adopt_current_as_prior(&target("~/.region"), user, Mode::DEFAULT_FILE)
+            .expect_err("an adoption whose bytes cannot be stored");
+        assert!(matches!(err, Error::Write(_)), "got {err}");
+
+        assert_eq!(ledger.get(&target("~/.own")), Some(&own));
+        assert_eq!(ledger.get(&target("~/.region")), Some(&region));
+        assert_eq!(ledger.get(&target("~/.new")), None);
+        assert_eq!(ledger.len(), 2);
+        ledger.save().expect("save");
+        assert_eq!(std::fs::read(dir.ledger()).expect("read"), saved);
+        assert!(occupied.join("keep").is_dir(), "what held the name is kept");
+    }
+
+    #[test]
     fn a_blob_of_the_wrong_length_is_rewritten_rather_than_trusted() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);

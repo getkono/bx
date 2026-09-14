@@ -29,16 +29,13 @@
 //! it by that spelling. One layer naming one file twice, under any two
 //! spellings, is an error, as it is under one — when no account answer went
 //! into either spelling, or when the two spellings are one path before any
-//! answer goes in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`), which is
-//! decided by reducing each spelling with its placeholders unanswered. That is
-//! sound: a pair the reduction calls one path is one file for every answer. It is
-//! complete over the shapes the property test generates, not over every
-//! spelling. A `..` that cancels a segment ending in literal text glued to a
-//! placeholder leaves one path whatever that text is (`~/{{p}}x/..` against
-//! `~/{{p}}y/..`). Such a pair is not seen as one path, so it blocks as the
-//! account's collision. A `..` cancels a placeholder's segment only for a `bool`, which is always
-//! one segment: `~/.config/{{p}}/../s` reads as `~/.config/s` only while `p`
-//! holds one segment, which a `string` need not.
+//! answer goes in, which is decided by reducing each spelling with its
+//! placeholders unanswered. That is sound: a pair the reduction calls one path
+//! is one file for every answer, or none. It is complete over the shapes the
+//! fixed-seed property test generates, not over every spelling. The known
+//! shapes it does not decide are listed in the review notes of pull
+//! request #16. A `..` cancels a placeholder's segment only for a `bool`,
+//! which is always one segment, as a `string` need not be.
 //!
 //! When one did, the collision is the account's. `bx.toml` declaring
 //! `~/.config/{{profile}}/s` and `~/.config/default/s` names two files as
@@ -655,18 +652,11 @@ fn clash(
 ///
 /// When their [`written_form`]s are identical. The same answers put into one
 /// form give one text, so identical forms name one file for every answer, or no
-/// file for any. That includes a `path` value glued after other text, which
-/// names the file it would with a `/` written before it (`/opt{{r}}/conf` and
-/// `/opt/{{r}}/conf`, `{{p}}{{r}}` and `{{p}}/{{r}}`). The converse holds for
-/// every shape the fixed-seed property test generates, including gluing a
-/// `path` value onto the text before it and taking away a `/` before one:
-/// there, forms that differ are parted by some answer, so the collision is one
-/// the account can clear. It is not exact. A `..` cancelling a
-/// segment that ends in literal text glued to a placeholder leaves one path
-/// whatever that text is (`~/{{p}}x/..` against `~/{{p}}y/..`), and after a
-/// `path` value whether there is glued text or not (`{{r}}x/..` against
-/// `{{r}}/..`). Such a pair is one file for every answer, yet its forms differ,
-/// so it blocks as the account's collision with a hint no answer follows.
+/// file for any: the comparison is sound. It is complete over the shapes the
+/// fixed-seed property test generates: there, forms that differ are parted by
+/// some answer, so the collision is one the account can clear. It is not
+/// complete over every spelling. The known shapes it does not decide are listed
+/// in the review notes of pull request #16.
 ///
 /// Only spellings whose keys are one [`TargetKey::File`] are compared here, so
 /// every placeholder in either is declared, enabled and answered: a
@@ -683,20 +673,22 @@ struct WrittenForm<'a> {
 }
 
 /// Where a [`WrittenForm`] is rooted.
+///
+/// Part of the form [`one_path_as_written`] compares, which is sound and
+/// complete over the shapes the fixed-seed property test generates; the known
+/// shapes it does not decide are listed in the review notes of pull request #16.
 #[derive(Debug, PartialEq, Eq)]
 enum Root<'a> {
     /// `/`, or a `path` value opening the spelling, alone or with text glued
     /// after it. Every `path` answer is absolute, so a `path` value starts its
-    /// own segment (see [`written_form`]). `{{r}}/s` and `/{{r}}/s` are one
-    /// path, as are `{{r}}.d/s` and `/{{r}}.d/s`.
+    /// own segment (see [`written_form`]).
     Absolute,
-    /// `~`, whether a `/` or a `path` value follows it: `~{{r}}/s` and
-    /// `~/{{r}}/s` are one path.
+    /// `~`, whether a `/` or a `path` value follows it.
     Home,
     /// Whatever the answers make of the first segment, which the lexical rule
-    /// cannot see into: `{{p}}/s` is rooted at `~` for `p = "~"`, at `/` for
-    /// `p = ""`, and not rooted for `p = "a"`. Whether anything follows it
-    /// matters as well, since `p = ""` makes `{{p}}` nothing and `{{p}}/.` `/`,
+    /// cannot see into: an answer may root it at `~`, at `/`, or not at all.
+    /// Whether anything follows it matters as well, since an empty answer makes
+    /// the segment nothing, and the segment with a separator after it `/`,
     /// but only when every piece of the segment is a `string` placeholder: any
     /// other piece is never empty, and a text that is not empty is one path
     /// with a separator after it or without, so `followed` is then `false`.
@@ -721,6 +713,11 @@ enum Segment<'a> {
 }
 
 /// `spelling` reduced by the lexical rule, deciding nothing an answer decides.
+///
+/// The form is sound: identical forms name one file for every answer, or none.
+/// It is complete over the shapes the fixed-seed property test generates; the
+/// known shapes it does not decide are listed in the review notes of pull
+/// request #16.
 ///
 /// A `path` value starts its own segment wherever it sits, as though a `/` were
 /// written before it. That changes no file. A `path` answer is absolute and

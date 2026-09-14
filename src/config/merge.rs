@@ -1917,6 +1917,44 @@ mod tests {
     }
 
     #[test]
+    fn a_dotdot_past_the_root_is_the_layer_s_defect_whatever_is_answered() {
+        // At `/` there is nothing above to climb to, so a `..` left with nothing
+        // written before it to cancel is dropped. `/a/../../{{p}}` and
+        // `/a/../../../{{p}}` both name `/{{p}}`, as `/../{{p}}` and
+        // `/../../{{p}}` do, whatever `p` holds. A `path` value glued after the
+        // climb starts its own segment and clamps the same way (`/..{{r}}`
+        // against `/../../{{r}}`). No answer parts any pair, so each is the
+        // layer's defect rather than a block an answer could clear.
+        for (file, first, second) in [
+            ("/s", "/a/../../{{p}}", "/a/../../../{{p}}"),
+            ("/s", "/../{{p}}", "/../../{{p}}"),
+            ("/srv", "/..{{r}}", "/../../{{r}}"),
+        ] {
+            let message = failure(&[
+                global(
+                    "bx.toml",
+                    &format!(
+                        "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                         [[value]]\nname = \"r\"\nkind = \"path\"\n{}\
+                         [[target]]\npath = \"{first}\"\nenabled = false\n\
+                         [[target]]\npath = \"{second}\"\nenabled = true\n",
+                        target_toml(file, "S")
+                    ),
+                ),
+                local("[values]\np = \"s\"\nr = \"/srv\"\n"),
+            ]);
+            assert!(
+                message.contains(&format!("names the same file as `{first}`")),
+                "{second}: {message}"
+            );
+            assert!(
+                message.contains("in this same layer"),
+                "{second}: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn one_layer_may_not_name_one_file_twice_under_two_spellings() {
         // The parser's duplicate check compares spellings, so it cannot see this.
         let message = failure(&[global(

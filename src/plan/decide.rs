@@ -683,6 +683,37 @@ mod tests {
     }
 
     #[test]
+    fn decision_24_only_what_lies_beneath_a_locked_directory_target_is_refused() {
+        // The mutation run found unpinned that a file beside the directory,
+        // and a path beneath a file target, are not refused.
+        let home = guarded_home();
+        let layer = [
+            a_directory_target("0555", ""),
+            crate::plan::tests::inline("~/.e", "x\\n"),
+            "[[target]]\npath = \"~/.f\"\ncontent = \"x\\n\"\nmode = \"0444\"\n".to_string(),
+            crate::plan::tests::inline("~/.f/g", "x\\n"),
+        ]
+        .concat();
+        let inputs = crate::plan::tests::inputs(&home, &layer);
+
+        let report =
+            crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false)).expect("plan");
+
+        assert_eq!(
+            row_for(&report, "~/.e").action,
+            Action::Create,
+            "{report:?}"
+        );
+        assert!(
+            row_for(&report, "~/.f/g")
+                .note
+                .as_deref()
+                .is_none_or(|note| !note.contains("directory target")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
     fn the_supported_shape_is_not_unsupported() {
         let home = guarded_home();
         assert_eq!(unsupported(&a_target(home.path(), "~/.a")), None);

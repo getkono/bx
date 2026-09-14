@@ -1512,6 +1512,9 @@ pub(crate) mod tests {
                 "{change:?}"
             );
             assert!(change.diff.is_some(), "{change:?}");
+            // Each row keeps the origin of the target it rolls back.
+            let line = if change.target == "~/.owned" { 4 } else { 1 };
+            assert_eq!(change.origin.line, line, "{change:?}");
         }
         assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
         assert_eq!(snapshot(&home, &[]), before, "plan changed the tree");
@@ -1740,6 +1743,90 @@ pub(crate) mod tests {
             );
         }
         assert!(!home.child(".b").exists(), "written from a refused body");
+    }
+
+    #[test]
+    fn an_interrupted_mode_only_write_is_rolled_back_to_the_mode_it_had() {
+        // The mutation run found the roll back row's mode change unpinned.
+        let home = guarded_home();
+        own(home.path(), ".m", b"same\n", Mechanism::Own);
+        let inputs = inputs(&home, &inline("~/.m", "same\\n"));
+        let target = Portable::parse_in("~/.m", home.path()).expect("a portable target");
+        let dest = home.child(".m");
+        let mut session = Session::open(
+            inputs.state(),
+            SessionKind::Apply,
+            home.path(),
+            vec![target.clone()],
+        )
+        .expect("a session");
+        session
+            .apply(Request {
+                target,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"same\n".to_vec(),
+                    planned: fs::observe(&dest).expect("observe"),
+                },
+                mode: FileMode::PRIVATE_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("the write");
+        drop(session);
+
+        let report = plan(&inputs);
+
+        assert_eq!(report.actions(), vec![Action::Modify]);
+        assert_eq!(
+            report.changes[0].diff,
+            Some(Diff {
+                kind: DiffKind::Mode {
+                    from: FileMode::PRIVATE_FILE,
+                    to: FileMode::DEFAULT_FILE
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn an_interrupted_write_already_put_back_names_only_what_recovery_still_removes() {
+        // The mutation run found unpinned whether such a row is a modify or
+        // unchanged: only the directories the session created are left to do.
+        let guard = guarded_home();
+        let home = guard.child("home");
+        seed_crash(&home);
+        assert!(
+            !spawn_crash_child(&home, 1, "after-publish")
+                .status
+                .success()
+        );
+        std::fs::remove_file(home.join(".config/made/new.conf")).expect("put back the create");
+        std::fs::write(home.join(".owned"), "before\n").expect("put back the modify");
+
+        let report = plan(&load(&home));
+
+        let row = |target: &str| {
+            report
+                .changes
+                .iter()
+                .find(|change| change.target == target)
+                .unwrap_or_else(|| panic!("no row for {target}: {report:?}"))
+        };
+        let made = row("~/.config/made/new.conf");
+        assert_eq!(made.action, Action::Modify, "{made:?}");
+        assert_eq!(
+            made.note.as_deref(),
+            Some(
+                "rolls back: it already holds what was there before; removes ~/.config/made \
+                 where empty"
+            )
+        );
+        let owned = row("~/.owned");
+        assert_eq!(owned.action, Action::Unchanged, "{owned:?}");
+        assert_eq!(
+            owned.note.as_deref(),
+            Some("rolls back: it already holds what was there before")
+        );
     }
 
     #[test]

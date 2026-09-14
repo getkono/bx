@@ -633,6 +633,19 @@ mod tests {
     }
 
     #[test]
+    fn text_with_no_control_character_but_a_tab_is_shown_as_it_is() {
+        // The mutation run found this unpinned: `escape` could copy every
+        // string and still render the same text.
+        for text in ["plain", "a\ttab", ""] {
+            assert!(
+                matches!(escape(text), std::borrow::Cow::Borrowed(kept) if kept == text),
+                "{text:?}"
+            );
+        }
+        assert!(matches!(escape("a\rb"), std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
     fn decision_19_a_lone_carriage_return_is_shown_inside_its_line() {
         let mut modify = change("~/.cr", 1, Action::Modify);
         modify.diff = Diff::between("~/.cr", Some(b"one\ntwo\n"), b"one\rtwo\n", None);

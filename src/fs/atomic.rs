@@ -3392,6 +3392,37 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_directory_under_a_read_only_parent_is_a_write_error_naming_it() {
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so the mkdir is not refused.
+            return;
+        }
+        let home = guarded_home();
+        let dir = home.child("d");
+        std::fs::create_dir(&dir).expect("mkdir");
+        set_mode(&dir, Mode::from_bits(0o500)).expect("chmod");
+
+        let result = write_atomically(&dir.join("sub/f"), b"x", Mode::DEFAULT_FILE);
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for the assertions");
+
+        let err = result.expect_err("a read-only directory refuses the mkdir");
+        let Error::Write { path, source } = &err else {
+            panic!("expected a write error, got {err:?}");
+        };
+        assert_eq!(
+            path,
+            &dir.join("sub"),
+            "the error names the directory bx could not make",
+        );
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            names_in(&dir),
+            Vec::<OsString>::new(),
+            "nothing was made or written",
+        );
+    }
+
+    #[test]
     fn a_parent_that_cannot_be_stat_ed_is_an_error_not_an_absent_directory() {
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so there is nothing to assert.

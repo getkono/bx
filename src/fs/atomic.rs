@@ -768,8 +768,10 @@ pub struct Outcome {
 
 /// Compare what is at a destination with what bx wants there.
 ///
-/// Reads nothing: it works entirely from an [`Observed`] captured earlier, so
-/// `plan` and `apply` reach the same verdict from the same bytes.
+/// Reads nothing the verdict depends on: it works entirely from an [`Observed`]
+/// captured earlier, so `plan` and `apply` reach the same verdict from the same
+/// bytes. The one read, the realpath of `home`, only names a directory in the
+/// parent note.
 ///
 /// * [`Action::Unchanged`] — kind, bytes and mode all match.
 /// * [`Action::Create`] — nothing is there.
@@ -789,7 +791,10 @@ pub struct Outcome {
 ///
 /// `home` only names things: a directory the parent note mentions is written
 /// `~/…` when it is under `home`, through [`crate::paths::to_portable`],
-/// because `plan` prints the note and plan output names no absolute home. A
+/// because `plan` prints the note and plan output names no absolute home. The
+/// directory a symlinked parent resolves to is a realpath, so it is named
+/// against the realpath of `home` — the one read `compare` makes, and only for
+/// that note — falling back to `home` as given when it does not resolve. A
 /// directory outside it stays absolute. Nothing in the verdict depends on it.
 #[must_use]
 pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outcome {
@@ -826,7 +831,12 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
         if let Some(resolved) = &parent.resolved {
             // Declaring the link as a directory target would be refused, so
             // the report names the directory that can actually be narrowed.
-            let resolved = crate::paths::to_portable(resolved, home);
+            // It is a realpath, so it is named against the home's realpath: a
+            // home reached through a link (`/home -> var/home`) is never its
+            // lexical prefix. A home that does not resolve is used as given.
+            let real_home = std::fs::canonicalize(home);
+            let resolved =
+                crate::paths::to_portable(resolved, real_home.as_deref().unwrap_or(home));
             return Some(format!(
                 "{shown} is a symlink to {resolved}, which is {mode}, wider than the {} this \
                  file declares; bx will not chmod a directory through a link, so chmod \
@@ -5788,5 +5798,30 @@ mod tests {
             "the note names the directory the link resolves to, portably: {note}",
         );
         assert!(note.contains("chmod"), "{note}");
+    }
+
+    #[test]
+    fn a_symlinked_parent_is_named_portably_under_a_home_reached_through_a_symlink() {
+        let guard = guarded_home();
+        // The home as `/home/u` is on a system where `/home -> var/home`: a
+        // link, so the realpath of anything under it is not under it lexically.
+        std::fs::create_dir(guard.child("real")).expect("mkdir");
+        std::os::unix::fs::symlink("real", guard.child("home")).expect("symlink");
+        let home = guard.child("home");
+        std::fs::create_dir_all(home.join("dotfiles/dot_ssh")).expect("mkdir");
+        set_mode(&home.join("dotfiles/dot_ssh"), Mode::DEFAULT_DIR).expect("chmod");
+        std::os::unix::fs::symlink("dotfiles/dot_ssh", home.join(".ssh")).expect("symlink");
+
+        let observed = observe(&home.join(".ssh/config")).expect("observe");
+        let outcome = compare(&observed, &desired(b"Host *\n", Mode::PRIVATE_FILE), &home);
+        assert_eq!(
+            outcome.parent_note.as_deref(),
+            Some(
+                "~/.ssh is a symlink to ~/dotfiles/dot_ssh, which is 0755, wider than the 0600 \
+                 this file declares; bx will not chmod a directory through a link, so chmod \
+                 ~/dotfiles/dot_ssh itself"
+            ),
+            "`bx plan` prints this note, so it names no absolute home",
+        );
     }
 }

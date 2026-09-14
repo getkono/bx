@@ -536,6 +536,7 @@ pub(crate) fn save<T: Serialize>(
     // Both are deterministic; only one is evolvable.
     let bytes =
         rmp_serde::to_vec_named(&envelope).map_err(|source| Error::Encode { kind, source })?;
+    // Every state file StateDir names is `root.join(<name>)`, so a parent always exists.
     if let Some(parent) = path.parent() {
         ensure_dir(parent, Mode::PRIVATE_DIR)?;
     }

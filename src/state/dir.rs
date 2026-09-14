@@ -179,6 +179,7 @@ pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
         path: path.to_path_buf(),
         source: source.into(),
     };
+    // No parent only for `/` or an empty path: never a resolved root, `restore/` or `shell/`.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
             path: parent.to_path_buf(),
@@ -335,6 +336,7 @@ pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, Error> {
 ///
 /// A missing directory holds none.
 fn numbered(path: &Path) -> std::io::Result<Vec<u64>> {
+    // Every state file StateDir names is `root.join(<UTF-8 name>)`, so the else arm is unreachable.
     let (Some(root), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
         return Ok(Vec::new());
     };

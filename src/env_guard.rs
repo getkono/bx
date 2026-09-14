@@ -46,9 +46,11 @@
 //! because no line the grammar accepts can leave a quote, a continuation or a
 //! heredoc open. [`scan_with`] states the grammar.
 //!
-//! This module is that rule as code. Anything bx generates for a shell is run
-//! through [`scan_with`] before it is written, and the check is covered by tests
-//! rather than left to review.
+//! This module is that rule as code. Every environment fragment bx generates is
+//! run through [`scan_with`] before it is written, and the check is covered by
+//! tests rather than left to review. The shell-init snippet is not one: it is
+//! fixed text from bx's source that sets only `BX_`-prefixed names, and sets
+//! every other variable by sourcing a guarded environment fragment.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -4466,6 +4468,21 @@ mod tests {
         assert_eq!(
             reason_of(&check("CARGO_HOME", "~/cargo", &strict)),
             Some(Reason::NoRootsDeclared)
+        );
+    }
+
+    #[test]
+    fn the_init_snippet_is_not_an_environment_fragment() {
+        // Invariant 2 sends bx's generated environment fragments through the
+        // guard. The shell-init snippet is fixed text from bx's source — a
+        // staleness test, a completion function, a `compdef` — that sets only
+        // `BX_` names and gets every other variable by sourcing a guarded
+        // fragment. The guard reads none of those statements, which is why the
+        // invariant does not send the snippet to it.
+        let snippet = include_str!("../bench/fixtures/bx/bx-init.zsh");
+        assert_eq!(
+            reasons(snippet, &RootSet::strict()),
+            [8, 12, 13, 14, 15, 16, 17].map(|line| (line, Reason::Unreadable))
         );
     }
 

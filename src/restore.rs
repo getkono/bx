@@ -1521,6 +1521,72 @@ mod tests {
     }
 
     #[test]
+    fn a_prior_snapshot_that_cannot_be_read_stops_rm_and_restores_nothing() {
+        // r3 coverage C10. A missing or corrupt snapshot is a conflict; any
+        // other failure to read one stops `rm`, as its documentation says.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+        let portable = managed(&state, home.path(), ".conf", "bx's\n", Mode::DEFAULT_FILE);
+        let blob = state.restore().join(ContentHash::of(b"theirs\n").to_hex());
+        std::fs::remove_file(&blob).expect("remove the snapshot");
+        std::fs::create_dir(&blob).expect("a directory where the snapshot was");
+
+        let err =
+            restore(&state, home.path(), std::slice::from_ref(&portable)).expect_err("rm stops");
+        assert!(
+            matches!(err, Error::State(crate::state::Error::Read { .. })),
+            "got {err}"
+        );
+        assert_eq!(peek(&dest).expect("untouched").0, b"bx's\n");
+        assert!(entry_for(&state, home.path(), &portable).is_some());
+    }
+
+    #[test]
+    fn a_write_rm_cannot_make_is_the_sessions_own_error() {
+        // r3 coverage C11. `restore_one` returns the session's failure for a
+        // removal and for a revert, not the `Poisoned` a later `finish` gives.
+        let guard = guarded_home();
+        for revert in [false, true] {
+            let case = if revert { "revert" } else { "remove" };
+            let home = guard.child(case);
+            std::fs::create_dir_all(&home).expect("the home");
+            let state = StateDir::resolve(&home);
+            let rel = "locked/app.conf";
+            if revert {
+                plant_file(&home.join(rel), "theirs\n", Mode::DEFAULT_FILE);
+            }
+            let portable = managed(&state, &home, rel, "bx\n", Mode::DEFAULT_FILE);
+            let locked = home.join("locked");
+            fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make it read-only");
+            if !crate::journal::tests::permissions_refuse(&locked) {
+                fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
+                return;
+            }
+            let result = restore(&state, &home, std::slice::from_ref(&portable));
+            // Before any assertion, so the tempdir can be removed whatever happens.
+            fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
+
+            let err = result.expect_err(case);
+            if revert {
+                assert!(
+                    matches!(err, Error::Journal(journal::Error::Write(_))),
+                    "{case}: got {err}"
+                );
+            } else {
+                assert!(
+                    matches!(err, Error::Journal(journal::Error::Io { .. })),
+                    "{case}: got {err}"
+                );
+            }
+            assert_eq!(peek(&home.join(rel)).expect("untouched").0, b"bx\n");
+            assert!(state.journal().exists(), "{case}: left for the next run");
+            assert!(entry_for(&state, &home, &portable).is_some(), "{case}");
+        }
+    }
+
+    #[test]
     fn a_user_file_inside_a_shared_created_directory_keeps_it() {
         for sharing in [Sharing::OneRm, Sharing::OneRmReversed, Sharing::SeparateRms] {
             assert_eq!(

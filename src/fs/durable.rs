@@ -242,6 +242,27 @@ mod tests {
     }
 
     #[test]
+    fn the_destination_directory_is_opened_as_a_directory_and_closed_on_exec() {
+        // Dropping `O_DIRECTORY`, or `O_DIRECTORY` and `O_CLOEXEC`, from the
+        // directory open left every other test green. A file opens without
+        // `O_DIRECTORY`, and a descriptor without `O_CLOEXEC` is inherited by a
+        // child another thread spawns while the write is under way.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handle = Dir::open(dir.path()).expect("a directory opens");
+        let flags = rustix::io::fcntl_getfd(&handle.fd).expect("F_GETFD");
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC), "{flags:?}");
+
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").expect("seed");
+        let err = Dir::open(&file).expect_err("a file is not a directory");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error()),
+            "got {err}",
+        );
+    }
+
+    #[test]
     fn a_panic_inside_a_recording_leaves_the_thread_clean() {
         let caught = std::panic::catch_unwind(|| {
             recording(|| panic!("inside"));

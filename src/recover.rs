@@ -1769,6 +1769,44 @@ mod tests {
     }
 
     #[test]
+    fn a_prior_snapshot_that_cannot_be_read_stops_recovery_as_an_error() {
+        // r3 coverage C10. A missing or corrupt snapshot is a verdict; any
+        // other failure to read one is an error, for the report and the
+        // recovery alike, and nothing is changed.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+        let blob = state.restore().join(ContentHash::of(b"old\n").to_hex());
+        std::fs::remove_file(&blob).expect("remove the snapshot");
+        std::fs::create_dir(&blob).expect("a directory where the snapshot was");
+
+        let reported = pending(&state);
+        assert!(
+            matches!(
+                reported,
+                Err(Error::State(crate::state::Error::Read { .. }))
+            ),
+            "got {reported:?}"
+        );
+        let recovered = recover(&state);
+        assert!(
+            matches!(
+                recovered,
+                Err(Error::State(crate::state::Error::Read { .. }))
+            ),
+            "got {recovered:?}"
+        );
+        assert_eq!(peek(&dest).expect("untouched").0, b"new\n");
+        assert!(state.journal().exists(), "the journal is kept");
+    }
+
+    #[test]
     fn a_journal_that_records_a_write_with_no_header_is_set_aside_not_replayed() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -1808,6 +1846,19 @@ mod tests {
             bytes,
         );
         assert!(!state.journal().exists());
+    }
+
+    #[test]
+    fn a_terminated_journal_with_no_header_has_no_home_to_rebuild_against() {
+        // r3 coverage C12. The loader refuses a journal whose first frame is
+        // not its header, so no journal on disk reaches this. Pinned on a
+        // hand-built value, so such a journal can only be refused, never rebuilt.
+        let path = Path::new("/nonexistent/journal.mpk");
+        let headless = Loaded::Terminated(vec![Record::End(End { written: 0 })]);
+        assert!(
+            matches!(rebuild_home(&headless, true, path), Err(Error::Headless { path: refused }) if refused == path),
+        );
+        assert!(matches!(rebuild_home(&headless, false, path), Ok(None)));
     }
 
     #[test]

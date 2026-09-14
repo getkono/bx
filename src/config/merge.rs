@@ -1436,6 +1436,30 @@ mod tests {
     }
 
     #[test]
+    fn two_toggles_that_each_cancel_a_placeholder_meet_for_one_answer_only() {
+        // `~/.config/{{p}}/../s` and `~/.config/{{q}}/../s` are `~/.config/s`
+        // while `p` and `q` each hold one segment, and two files once either
+        // holds a `/`. Meeting for these answers is the account's doing, so the
+        // file is recorded as a conflict rather than failing the merge.
+        let config = merge(&[
+            global(
+                "bx.toml",
+                &format!(
+                    "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                     [[value]]\nname = \"q\"\nkind = \"string\"\n{}\
+                     [[target]]\npath = \"~/.config/{{{{p}}}}/../s\"\nenabled = false\n\
+                     [[target]]\npath = \"~/.config/{{{{q}}}}/../s\"\nenabled = true\n",
+                    target_toml("~/.config/s", "S")
+                ),
+            ),
+            local("[values]\np = \"a\"\nq = \"b\"\n"),
+        ])
+        .unwrap_or_else(|e| panic!("an answer that names one file twice failed the merge: {e}"));
+        assert_eq!(config.conflicts.len(), 1);
+        assert_eq!(config.conflicts[0].file, "~/.config/s");
+    }
+
+    #[test]
     fn one_layer_may_not_name_one_file_twice_under_two_spellings() {
         // The parser's duplicate check compares spellings, so it cannot see this.
         let message = failure(&[global(

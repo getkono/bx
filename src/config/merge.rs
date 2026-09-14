@@ -29,7 +29,9 @@
 //! it by that spelling. One layer naming one file twice, under any two
 //! spellings, is an error, as it is under one — when no account answer went
 //! into either spelling, or when the two spellings are one path before any
-//! answer goes in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`).
+//! answer goes in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`). A `..` that
+//! cancels a placeholder's segment is no such proof: `~/.config/{{p}}/../s`
+//! reads as `~/.config/s` only while `p` holds no `/`.
 //!
 //! When one did, the collision is the account's. `bx.toml` declaring
 //! `~/.config/{{profile}}/s` and `~/.config/default/s` names two files as
@@ -581,7 +583,8 @@ impl Merged<Target, TargetKey> {
 /// in either spelling, or whose two spellings reduce to one text with their
 /// placeholders left in (`~/.config/{{p}}/s` and `~/.config/{{p}}/./s`), names
 /// one file for every account whatever is answered, which is the repo's defect
-/// and fails the merge. Otherwise the collision is the account's, it is
+/// and fails the merge. A reduction that cancelled a placeholder proves nothing
+/// (see [`as_written`]). Otherwise the collision is the account's, it is
 /// recorded against this layer, replacing what was recorded for the file so far
 /// with every statement this layer has made about it, and the answer is
 /// `Ok(true)`.
@@ -610,7 +613,7 @@ fn clash(
         // before any answer goes in: either way the pair names one file for
         // every account, and no answer could clear it.
         if (mine.is_empty() && theirs.is_empty())
-            || as_written(&statement.spelling, values.home()) == reduced
+            || (reduced.is_some() && as_written(&statement.spelling, values.home()) == reduced)
         {
             return Err(refuse_twice(statement, spelling, origin));
         }
@@ -640,9 +643,17 @@ fn clash(
 ///
 /// Two spellings that reduce to one text name one file whatever the answers
 /// are, so an answer in them is not what made them meet.
-fn as_written(spelling: &str, home: &Path) -> String {
-    Portable::parse_in(spelling, home)
-        .map_or_else(|_| spelling.to_string(), |path| path.as_str().to_string())
+///
+/// `None` when the reduction dropped a placeholder: a `..` cancelled the
+/// segment it sat in, and an answer holding a `/` would not have been
+/// cancelled, so the reduced text is not what every answer names. A spelling
+/// the lexical rule refuses is compared as written.
+fn as_written(spelling: &str, home: &Path) -> Option<String> {
+    match Portable::parse_in(spelling, home) {
+        Err(_) => Some(spelling.to_string()),
+        Ok(path) if path.as_str().matches("{{").count() < spelling.matches("{{").count() => None,
+        Ok(path) => Some(path.as_str().to_string()),
+    }
 }
 
 /// A second statement for one file from one layer, with no answer to blame.

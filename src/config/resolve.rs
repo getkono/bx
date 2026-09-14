@@ -1382,6 +1382,48 @@ mod tests {
     }
 
     #[test]
+    fn a_dotdot_against_a_placeholder_is_not_one_path_as_written() {
+        // Reduced with its placeholder left in, `~/.config/{{p}}/../s` folds to
+        // `~/.config/s`, which read as proof that the toggle and the first entry
+        // are one path for every answer. They are not: `p = "a/b"` makes the
+        // toggle `~/.config/a/s`. With `p = "a"` the collision is the answer's,
+        // so it blocks the file's row instead of failing the load.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                             [[target]]\npath = \"~/.config/a/s\"\ncontent = \"AS\"\n\
+                             [[target]]\npath = \"~/.config/{{p}}/../s\"\nenabled = false\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let folded = resolved(LAYER, Some("[values]\np = \"a\"\n"))
+            .expect("an answer that names one file twice blocks it, not the load");
+        assert_eq!(keys(&folded), ["~/.config/s", "~/.config/a/s", "~/.zshrc"]);
+        let entry = blocked(&folded, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["p".to_string()]
+            }
+        );
+        for part in [
+            "`~/.config/s` at bx.toml:4",
+            "`~/.config/{{p}}/../s` at bx.toml:10",
+            "the answer to `p` at local.toml:2",
+        ] {
+            assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
+        }
+        ready(&folded, 1);
+        ready(&folded, 2);
+
+        // The same toggle meeting the other entry, as before.
+        let deeper = resolved(LAYER, Some("[values]\np = \"a/b\"\n"))
+            .expect("an answer that names one file twice blocks it, not the load");
+        assert_eq!(keys(&deeper), ["~/.config/s", "~/.config/a/s", "~/.zshrc"]);
+        ready(&deeper, 0);
+        blocked(&deeper, 1);
+        ready(&deeper, 2);
+    }
+
+    #[test]
     fn a_later_layer_that_names_the_file_settles_what_an_answer_made_one_layer_name_twice() {
         // The account has the last word: a full entry for the file replaces
         // both, and a toggle switches both off.

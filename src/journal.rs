@@ -266,6 +266,23 @@ pub enum Error {
         /// The target written twice.
         target: Portable,
     },
+    /// A removal named, as a directory bx created for its target, a path that
+    /// is not a parent of the target's destination below the home.
+    ///
+    /// Refused because the journal recording it could never be believed —
+    /// [`load`] applies the same rule — and because pruning it could remove a
+    /// directory that is not bx's. Nothing is observed, stored or touched.
+    #[error(
+        "bx will not remove {} for {}: it is not a parent directory of the target below the home",
+        .dir.display(),
+        .target.as_str()
+    )]
+    StrayCreatedDir {
+        /// The target the removal named.
+        target: Portable,
+        /// The directory it named.
+        dir: PathBuf,
+    },
     /// The state directory failed.
     #[error(transparent)]
     State(#[from] crate::state::Error),
@@ -787,16 +804,23 @@ fn misplaced(intent: &Intent, home: &Path) -> Option<&'static str> {
             );
         }
     }
-    if intent
-        .created_dirs
-        .iter()
-        .any(|dir| dir == dest || !dest.starts_with(dir) || home.starts_with(dir))
-    {
+    if stray_created_dir(dest, home, &intent.created_dirs).is_some() {
         return Some(
             "an intent's created directory is not a parent of its destination below the home",
         );
     }
     None
+}
+
+/// The first of `dirs` that is not a strict parent of `dest` below `home`, if
+/// one is not.
+///
+/// The one rule for a directory bx may claim it created for a destination,
+/// shared by the loader, which refuses a journal breaking it, and by
+/// [`Session::apply`], which refuses a removal that would write such a journal.
+fn stray_created_dir<'a>(dest: &Path, home: &Path, dirs: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    dirs.iter()
+        .find(|dir| *dir == dest || !dest.starts_with(dir) || home.starts_with(dir))
 }
 
 /// Why there is no whole record at an offset.
@@ -1282,8 +1306,9 @@ impl Session {
     /// [`Error::Misplaced`] when the request's destination is not where its
     /// target renders, [`Error::State`] with
     /// [`crate::state::Error::ForeignRecord`] when the target is spelled
-    /// absolutely under the home, [`Error::Repeated`] when this session already wrote the
-    /// target, [`Error::Write`] when the destination cannot be written, is not
+    /// absolutely under the home, [`Error::StrayCreatedDir`] when a removal names a
+    /// created directory that is not a parent of its destination below the home,
+    /// [`Error::Repeated`] when this session already wrote the target, [`Error::Write`] when the destination cannot be written, is not
     /// a file bx may replace, or is no longer what the request's plan observed
     /// ([`crate::fs::Error::Changed`]), [`Error::State`] when the prior bytes
     /// cannot be stored or recorded, [`Error::Io`] when the journal cannot be
@@ -1301,7 +1326,11 @@ impl Session {
             mode,
             ownership,
         } = request;
-        if let Err(e) = self.admit(&target, &dest) {
+        let claimed: &[PathBuf] = match &content {
+            Content::Bytes { .. } => &[],
+            Content::Absent { created_dirs, .. } => created_dirs,
+        };
+        if let Err(e) = self.admit(&target, &dest, claimed) {
             self.poisoned = true;
             return Err(e);
         }
@@ -1338,7 +1367,17 @@ impl Session {
     /// it under its `~` spelling, and the same file under that spelling would
     /// pass [`Error::Repeated`]. It is refused as
     /// [`crate::state::Error::ForeignRecord`] before anything is touched.
-    fn admit(&mut self, target: &Portable, dest: &Path) -> Result<(), Error> {
+    ///
+    /// A removal's `created_dirs` are what it prunes and what its Intent
+    /// records, so each must be a strict parent of the destination below the
+    /// home — the loader's rule — or the removal is [`Error::StrayCreatedDir`],
+    /// before anything is observed, stored or touched.
+    fn admit(
+        &mut self,
+        target: &Portable,
+        dest: &Path,
+        created_dirs: &[PathBuf],
+    ) -> Result<(), Error> {
         let rendered = target.render(&self.home);
         if dest != rendered {
             return Err(Error::Misplaced {
@@ -1354,6 +1393,12 @@ impl Session {
                 stored: target.as_str().to_string(),
                 source: Box::new(source),
             })?;
+        if let Some(dir) = stray_created_dir(dest, &self.home, created_dirs) {
+            return Err(Error::StrayCreatedDir {
+                target: target.clone(),
+                dir: dir.clone(),
+            });
+        }
         if !self.touched.insert(target.clone()) {
             return Err(Error::Repeated {
                 target: target.clone(),
@@ -4361,6 +4406,89 @@ pub(crate) mod tests {
         prune_dirs(&claims).expect("prune");
         prune_claims(&LedgerView::default(), dir.path(), &claims).expect("prune the claims");
         assert_eq!(std::fs::read(&file).expect("kept"), b"the user's\n");
+    }
+
+    #[test]
+    fn a_removal_naming_a_directory_that_is_not_its_parent_is_refused_before_anything_is_touched() {
+        // r3 round 1, D2. The session checked a removal's destination but not
+        // its created directories, so it pruned an empty directory of the user's
+        // and wrote an Intent the loader refuses: the journal was then set
+        // aside, and the removed file was never put back.
+        let guard = guarded_home();
+        for case in [
+            "an unrelated directory",
+            "the home",
+            "the destination itself",
+            "a directory above the home",
+        ] {
+            let home = guard.child(case.replace(' ', "-"));
+            std::fs::create_dir_all(&home).expect("the home");
+            let state = StateDir::resolve(&home);
+            let (portable, dest) = target(&home, ".conf");
+            let mut first =
+                Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+            first
+                .apply(write_to(&home, ".conf", "bx created\n", Mode::DEFAULT_FILE))
+                .expect("apply");
+            first.finish().expect("finish");
+            let users = home.join("projects/empty");
+            std::fs::create_dir_all(&users).expect("the user's empty directory");
+            let stray = match case {
+                "an unrelated directory" => users.clone(),
+                "the home" => home.clone(),
+                "the destination itself" => dest.clone(),
+                _ => guard.path().to_path_buf(),
+            };
+
+            let mut session =
+                Session::open(&state, SessionKind::Restore, &home, Vec::new()).expect("open");
+            let err = session
+                .apply(Request {
+                    target: portable.clone(),
+                    dest: dest.clone(),
+                    content: Content::Absent {
+                        created_dirs: vec![stray.clone()],
+                        planned: fs::observe(&dest).expect("plan's observation"),
+                    },
+                    mode: Mode::DEFAULT_FILE,
+                    ownership: Ownership::Released,
+                })
+                .expect_err(case);
+            assert!(
+                matches!(&err, Error::StrayCreatedDir { target, dir } if *target == portable && *dir == stray),
+                "{case}: got {err}"
+            );
+            assert!(users.is_dir(), "{case}: the user's directory stays");
+            assert_eq!(peek(&dest).expect("untouched").0, b"bx created\n", "{case}");
+            let again = session
+                .apply(write_to(&home, ".other", "x\n", Mode::DEFAULT_FILE))
+                .expect_err("the session is poisoned");
+            assert!(
+                matches!(again, Error::Poisoned { .. }),
+                "{case}: got {again}"
+            );
+            drop(session);
+
+            let loaded = load(&state.journal()).expect("load");
+            assert!(
+                !matches!(loaded, Loaded::Unreadable { .. }),
+                "{case}: {loaded:?}"
+            );
+            assert_eq!(loaded.intents().count(), 0, "{case}: nothing was announced");
+            assert_eq!(
+                crate::recover::recover(&state).expect("recover"),
+                crate::recover::Outcome::RolledBack { undone: 0 },
+                "{case}"
+            );
+            assert!(
+                LedgerView::read(&state, &home)
+                    .expect("read the ledger")
+                    .value
+                    .get(&portable)
+                    .is_some(),
+                "{case}: bx still manages the file"
+            );
+        }
     }
 
     #[test]

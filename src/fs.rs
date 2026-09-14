@@ -358,6 +358,48 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_that_opens_but_refuses_the_temporary_file_fails_the_write_naming_it() {
+        // r3 round 2b (P7R4-COV1): every earlier failure was before the
+        // directory opened or after the temporary file existed, so the
+        // temporary file's own creation failing was never reached.
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("d");
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("f");
+        std::fs::write(&path, b"before").expect("seed");
+        // Readable and searchable, so it opens `O_RDONLY | O_DIRECTORY`; not
+        // writable, so no temporary file can be created in it.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let result = write_atomically(&path, b"after", Mode::DEFAULT_FILE);
+        let names: Vec<_> = std::fs::read_dir(&root)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restore");
+
+        let err = result.expect_err("a directory refusing the temporary file fails the write");
+        assert!(
+            matches!(&err, Error::Write { path: at, source }
+                if *at == root && source.kind() == std::io::ErrorKind::PermissionDenied),
+            "got {err}",
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            b"before",
+            "a failed write leaves the previous file exactly as it was",
+        );
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("f")],
+            "no temporary file"
+        );
+    }
+
+    #[test]
     fn the_destination_directory_is_opened_as_a_directory_and_closed_on_exec() {
         // r3 round 1, mutation run: dropping `O_DIRECTORY`, or `O_DIRECTORY`
         // and `O_CLOEXEC`, from the directory open left every test green. A

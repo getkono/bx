@@ -1503,24 +1503,54 @@ mod tests {
         // "nothing here reads the environment" — it takes both the home and the
         // `XDG_STATE_HOME` override as arguments — which is the claim this test
         // is quoted as proving.
+        //
+        // `target.rs` parses every target a layer holds, against the home it is
+        // handed. `paths.rs` holds `Portable::parse_in` and `normalize`, which
+        // every module above calls, and also the crate's two deliberate reads
+        // of the environment: `home()` and `config_root()`, the edges that hand
+        // a resolution path its arguments. Each edge line is allowed exactly
+        // once and by its whole text, so a third read anywhere in the module,
+        // or a second copy of either, still fails here.
+        const PATHS_EDGES: [&str; 2] = [
+            "home_in(std::env::var_os(\"HOME\").as_deref())",
+            "std::env::var_os(\"XDG_CONFIG_HOME\").as_deref(),",
+        ];
         for (name, source) in [
             ("layers.rs", include_str!("layers.rs")),
             ("merge.rs", include_str!("merge.rs")),
             ("values.rs", include_str!("values.rs")),
             ("resolve.rs", include_str!("resolve.rs")),
             ("values/local.rs", include_str!("values/local.rs")),
+            ("target.rs", include_str!("target.rs")),
+            ("paths.rs", include_str!("../paths.rs")),
         ] {
             // The non-test half, minus its prose. This very test names the
             // strings it forbids, and `layers.rs` documents what the *binary*
             // passes in by naming the call the library itself may not make — a
             // textual scan cannot tell a description from a call, so whole-line
             // comments are dropped and code is what is scanned.
-            let body: String = source
+            let code = source
                 .split("#[cfg(test)]")
                 .next()
-                .expect("the non-test half")
+                .expect("the non-test half");
+            let edges: &[&str] = if name == "paths.rs" {
+                &PATHS_EDGES
+            } else {
+                &[]
+            };
+            for edge in edges {
+                assert_eq!(
+                    code.lines().filter(|line| line.trim() == *edge).count(),
+                    1,
+                    "{name}: the edge `{edge}` is expected exactly once; if it moved, \
+                     re-verify this list rather than widening the scan's exceptions"
+                );
+            }
+            let body: String = code
                 .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| {
+                    !line.trim_start().starts_with("//") && !edges.contains(&line.trim())
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             // `paths::home(` is the likeliest real regression: a resolution

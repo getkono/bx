@@ -7,6 +7,15 @@
 //! the empty default, having moved the damaged bytes aside to the next
 //! `<name>.corrupt`, `<name>.corrupt.1`, … and warned about it.
 //!
+//! # Damage that cannot be moved aside is refused
+//!
+//! The empty default is safe only once the damaged bytes are kept under a
+//! quarantine name, because the next save writes the file's own name. So a
+//! holder of the lock that cannot move the file aside — a state directory it
+//! cannot write, a name with no room for the suffix — returns
+//! [`Error::CannotQuarantine`], naming the file and what is wrong with it,
+//! and renames, resets and writes nothing.
+//!
 //! # Only the holder of the exclusive lock moves a file
 //!
 //! A quarantine is a rename **by path**, and a path names whatever is there when
@@ -21,7 +30,9 @@
 //! the highest quarantine present, with `RENAME_NOREPLACE`, so a second damaged
 //! ledger cannot destroy the first — which may be the only index there is to the
 //! user's restore blobs — and a gap left by a deleted one is never refilled, so
-//! the numbers present are always in the order the quarantines were made.
+//! the numbers present are always in the order the quarantines were made. Only
+//! a number with no successor, which bx never makes, breaks that order: past it
+//! the lowest free number is taken, so a crafted name never blocks a quarantine.
 //!
 //! # A refusal is not damage
 //!
@@ -230,7 +241,8 @@ impl Health {
 /// has been reset" reads [`Loaded::health`]; a caller that only wants the value
 /// reads the `value` field and ignores it. The `Err` arm is reserved for a file
 /// that could not be read, where there is no value to return and no health to
-/// describe.
+/// describe, and for damage the lock holder could not set aside
+/// ([`Error::CannotQuarantine`]), where an empty value would be saved over it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded<T> {
     /// The loaded — or default — value.
@@ -281,6 +293,9 @@ impl<T> Loaded<T> {
 ///
 /// [`Error::WrongLock`] if `lock` is not the lock of the directory holding
 /// `path`; nothing is read.
+///
+/// [`Error::CannotQuarantine`] if, with `lock`, the file is damaged and cannot
+/// be moved aside; nothing is renamed or reset, and the file is left in place.
 pub(crate) fn load<T: DeserializeOwned + Default>(
     path: &Path,
     kind: &'static str,
@@ -348,7 +363,7 @@ fn judge<T: DeserializeOwned + Default>(
                     Loss::Permanent => Err(Error::DanglingLink {
                         path: path.to_path_buf(),
                     }),
-                    Loss::Recomputable => Ok(degrade(path, Damage::DanglingLink, lock)),
+                    Loss::Recomputable => degrade(path, Damage::DanglingLink, lock),
                 };
             }
             if source.kind() == std::io::ErrorKind::NotFound {
@@ -393,7 +408,7 @@ fn judge<T: DeserializeOwned + Default>(
         // Quarantine happens only here: after `read` succeeded and `decode` or
         // `check` found damage, so the bytes being moved aside are known to be
         // unusable — and only under the lock, so they are still the bytes read.
-        Err(Rejected::Damage(damage)) => Ok(degrade(path, damage, lock)),
+        Err(Rejected::Damage(damage)) => degrade(path, damage, lock),
         Err(Rejected::Refused(error)) => Err(error),
     }
 }
@@ -405,7 +420,7 @@ fn judge<T: DeserializeOwned + Default>(
 /// Only meaningful once the path itself is known to be a link: without one,
 /// `ENOENT` is simply no file, and `ENOTDIR` a state directory that is not a
 /// directory.
-fn leads_nowhere(error: &std::io::Error) -> bool {
+pub(super) fn leads_nowhere(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
         || error.raw_os_error().is_some_and(|code| {
             code == rustix::io::Errno::LOOP.raw_os_error()
@@ -445,7 +460,18 @@ fn decode<T: DeserializeOwned>(
 
 /// Return the empty default for a damaged file, moving it aside only under the
 /// lock.
-fn degrade<T: Default>(path: &Path, damage: Damage, lock: Option<&ExclusiveLock>) -> Loaded<T> {
+///
+/// # Errors
+///
+/// [`Error::CannotQuarantine`] if the lock is held and the file cannot be
+/// moved aside. [`Health::Reset`] promises the bytes were kept, and the next
+/// save writes the file's name, so a file left in place is refused rather than
+/// reset.
+fn degrade<T: Default>(
+    path: &Path,
+    damage: Damage,
+    lock: Option<&ExclusiveLock>,
+) -> Result<Loaded<T>, Error> {
     let Some(lock) = lock else {
         tracing::warn!(
             path = %path.display(),
@@ -453,31 +479,28 @@ fn degrade<T: Default>(path: &Path, damage: Damage, lock: Option<&ExclusiveLock>
              the state directory lock moves it aside.",
             path.display(),
         );
-        return Loaded {
+        return Ok(Loaded {
             value: T::default(),
             health: Health::Damaged(damage),
             quarantined: Vec::new(),
-        };
+        });
     };
-    match move_aside(path, lock) {
-        Ok(quarantine) => tracing::warn!(
-            path = %path.display(),
-            moved_to = %quarantine.display(),
-            "discarding {}: {damage}. The bytes were kept, not deleted.",
-            path.display(),
-        ),
-        Err(source) => tracing::warn!(
-            path = %path.display(),
-            %source,
-            "discarding {}: {damage}. It could not be moved aside.",
-            path.display(),
-        ),
-    }
-    Loaded {
+    let quarantine = move_aside(path, lock).map_err(|source| Error::CannotQuarantine {
+        path: path.to_path_buf(),
+        damage: damage.clone(),
+        source,
+    })?;
+    tracing::warn!(
+        path = %path.display(),
+        moved_to = %quarantine.display(),
+        "discarding {}: {damage}. The bytes were kept, not deleted.",
+        path.display(),
+    );
+    Ok(Loaded {
         value: T::default(),
         health: Health::Reset(damage),
         quarantined: Vec::new(),
-    }
+    })
 }
 
 /// Write a state file atomically, at `0600`, creating its directory at `0700`.
@@ -486,7 +509,9 @@ fn degrade<T: Default>(path: &Path, damage: Damage, lock: Option<&ExclusiveLock>
 ///
 /// [`Error::Encode`] if the value cannot be encoded — a bug, not a user
 /// condition — and [`Error::CreateDir`] or [`Error::Write`] for a filesystem
-/// failure. A failure leaves the previous file exactly as it was.
+/// failure. A failure leaves the previous file exactly as it was, except a
+/// failing `fsync` of the directory after the rename, which is returned with
+/// the new file already in place — see [`write_atomically`].
 pub(crate) fn save<T: Serialize>(
     path: &Path,
     kind: &'static str,
@@ -746,6 +771,47 @@ mod tests {
     }
 
     #[test]
+    fn every_damage_says_what_is_wrong_with_the_file() {
+        // r3 round 1 (C4): two of the six texts were never asserted, and
+        // the others only in part, so an empty rendering survived mutation.
+        let cases = [
+            (Damage::Malformed, "it is not valid MessagePack"),
+            (
+                Damage::TrailingBytes,
+                "it has unexpected bytes after the end",
+            ),
+            (
+                Damage::WrongKind {
+                    found: OTHER.to_string(),
+                },
+                "it is a bx.other file",
+            ),
+            (
+                Damage::FutureVersion {
+                    found: 8,
+                    supported: 3,
+                },
+                "it is version 8, and this bx understands up to 3",
+            ),
+            (
+                Damage::DanglingLink,
+                "it is a symbolic link to something that does not exist, or that cannot be \
+                 followed",
+            ),
+            (
+                Damage::KeyMismatch {
+                    key: "~/.aaaa".to_string(),
+                    path: "~/.bbbb".to_string(),
+                },
+                "its entry for ~/.aaaa names a different path, ~/.bbbb",
+            ),
+        ];
+        for (damage, text) in cases {
+            assert_eq!(damage.to_string(), text, "{damage:?}");
+        }
+    }
+
+    #[test]
     fn a_file_of_the_wrong_kind_is_not_accepted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");
@@ -901,6 +967,26 @@ mod tests {
         std::fs::write(&path, b"fifth").expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.quarantined, vec![StateDir::quarantine(&path)]);
+    }
+
+    #[test]
+    fn a_quarantine_number_with_no_successor_does_not_block_the_next_quarantine() {
+        // r3 round 1 (L1a): with `v.mpk.corrupt.18446744073709551615` present,
+        // the number after the highest overflowed, nothing was moved aside,
+        // and the load still said the file had been quarantined.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let crafted = StateDir::quarantine_nth(&path, u64::MAX);
+        std::fs::write(&crafted, b"crafted").expect("seed");
+        std::fs::write(&path, b"garbage").expect("seed");
+
+        let loaded: Loaded<Value> = locked_load(&path).expect("load");
+        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
+        let first = StateDir::quarantine(&path);
+        assert_eq!(std::fs::read(&first).expect("moved aside"), b"garbage");
+        assert_eq!(std::fs::read(&crafted).expect("left alone"), b"crafted");
+        assert_eq!(loaded.quarantined, vec![first, crafted]);
+        assert!(std::fs::symlink_metadata(&path).is_err(), "the file moved");
     }
 
     #[test]
@@ -1119,21 +1205,73 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_cannot_be_moved_aside_still_degrades() {
+    fn a_file_that_cannot_be_moved_aside_is_refused_and_left_in_place() {
+        // r3 round 1 (L1b): a failed move aside was logged and reported as
+        // `Health::Reset` — "has been quarantined" — with the damaged file
+        // still at its name, so the next save overwrote the bytes that
+        // `Reset` and the module both promise are kept.
         let dir = tempfile::tempdir().expect("tempdir");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
         // A name at the 255-byte limit: every quarantine name is longer, so
         // each rename fails with ENAMETOOLONG rather than finding a free name.
         let path = dir.path().join("v".repeat(255));
-        std::fs::write(&path, b"garbage").expect("seed");
+        for loss in [Loss::Recomputable, Loss::Permanent] {
+            std::fs::write(&path, b"garbage").expect("seed");
+            let result = load::<Value>(&path, KIND, VERSION, loss, Some(&lock));
+            assert_eq!(
+                std::fs::read(&path).expect("in place"),
+                b"garbage",
+                "{loss:?}: the damaged bytes are where they were",
+            );
+            assert_eq!(names_but_the_lock(dir.path()), vec!["v".repeat(255)]);
+            let err = result.expect_err("a file that cannot be moved aside is refused");
+            assert!(
+                matches!(
+                    &err,
+                    Error::CannotQuarantine { path: at, damage: Damage::Malformed, source }
+                        if *at == path
+                            && source.raw_os_error()
+                                == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+                ),
+                "{loss:?}: got {err}",
+            );
+            let message = err.to_string();
+            for needle in [
+                path.to_string_lossy().as_ref(),
+                "not valid MessagePack",
+                "by hand",
+            ] {
+                assert!(
+                    message.contains(needle),
+                    "{loss:?}: missing {needle:?}: {message}"
+                );
+            }
+        }
 
-        let loaded: Loaded<Value> = locked_load(&path).expect("load");
-        assert!(loaded.health.is_reset());
-        assert!(loaded.value.is_empty());
-        assert_eq!(
-            std::fs::read(&path).expect("in place"),
-            b"garbage",
-            "the damaged bytes survive a failed rename",
+        // A cache link that leads nowhere is the other damage moved aside.
+        std::fs::remove_file(&path).expect("remove");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &path).expect("symlink");
+        let err = load::<Value>(&path, KIND, VERSION, Loss::Recomputable, Some(&lock))
+            .expect_err("a link that cannot be moved aside is refused");
+        assert!(
+            matches!(
+                &err,
+                Error::CannotQuarantine { path: at, damage: Damage::DanglingLink, .. }
+                    if *at == path
+            ),
+            "got {err}",
         );
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "the link is in place"
+        );
+
+        // A lockless reader still reports the damage and moves nothing.
+        std::fs::remove_file(&path).expect("remove");
+        std::fs::write(&path, b"garbage").expect("seed");
+        let loaded = load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None).expect("load");
+        assert_eq!(loaded.health, Health::Damaged(Damage::Malformed));
     }
 
     #[test]

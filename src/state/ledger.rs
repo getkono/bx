@@ -533,6 +533,10 @@ impl Ledger {
     /// [`Error::WrongLock`] if `lock` is not `dir`'s own lock. It is checked
     /// before the ledger is read, so another directory's lock never
     /// quarantines this one.
+    ///
+    /// [`Error::CannotQuarantine`] if `ledger.mpk` is damaged and cannot be
+    /// moved aside. It is left exactly where it is and nothing is reset, so no
+    /// later [`Ledger::save`] can write over the only record of the priors.
     pub fn open(dir: &StateDir, lock: &ExclusiveLock, home: &Path) -> Result<Loaded<Self>, Error> {
         let dir = dir.clone();
         Ok(LedgerView::load(&dir, home, Some(lock))?.map(|view| Self {
@@ -856,7 +860,9 @@ impl Ledger {
     /// # Errors
     ///
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
-    /// leaves the previous ledger exactly as it was.
+    /// leaves the previous ledger exactly as it was, except a failing `fsync`
+    /// of the state directory after the rename, which is returned with the new
+    /// ledger already in place — see [`write_atomically`].
     ///
     /// [`Error::WrongLock`] if the lock file this ledger was opened under has
     /// been replaced or removed since; nothing is written.
@@ -1681,6 +1687,62 @@ mod tests {
             second.ino(),
             "a blob of the right name and length already holds these bytes",
         );
+    }
+
+    #[test]
+    fn a_prior_that_cannot_be_stored_leaves_every_entry_and_the_saved_ledger_unchanged() {
+        // r3 round 1 (C7): a failing blob write inside `record` and
+        // `adopt_current_as_prior` was never reached, so the promise that
+        // the entry is left unchanged was untested.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .record(entry("~/.own", b"bx wrote this"))
+            .expect("own");
+        ledger
+            .record(NewEntry::new(
+                target("~/.region"),
+                ContentHash::of(b"a file with bx's region"),
+                Mode::DEFAULT_FILE,
+                Mechanism::Region { comment: '#' },
+            ))
+            .expect("region");
+        ledger.save().expect("save");
+        let saved = std::fs::read(dir.ledger()).expect("read");
+        let own = ledger.get(&target("~/.own")).expect("own").clone();
+        let region = ledger.get(&target("~/.region")).expect("region").clone();
+
+        // A non-empty directory at the blob's name: no rename of a file
+        // replaces it, so the write of these bytes fails.
+        let user = b"the user changed this";
+        let occupied = dir.restore().join(ContentHash::of(user).to_hex());
+        std::fs::create_dir_all(occupied.join("keep")).expect("occupy");
+        let prior = || PriorBytes::Bytes {
+            bytes: user.to_vec(),
+            mode: Mode::DEFAULT_FILE,
+        };
+
+        let err = ledger
+            .record(entry("~/.own", b"bx wrote this").with_prior(prior()))
+            .expect_err("a re-record whose prior cannot be stored");
+        assert!(matches!(err, Error::Write(_)), "got {err}");
+        let err = ledger
+            .record(entry("~/.new", b"bx wrote this").with_prior(prior()))
+            .expect_err("a first record whose prior cannot be stored");
+        assert!(matches!(err, Error::Write(_)), "got {err}");
+        let err = ledger
+            .adopt_current_as_prior(&target("~/.region"), user, Mode::DEFAULT_FILE)
+            .expect_err("an adoption whose bytes cannot be stored");
+        assert!(matches!(err, Error::Write(_)), "got {err}");
+
+        assert_eq!(ledger.get(&target("~/.own")), Some(&own));
+        assert_eq!(ledger.get(&target("~/.region")), Some(&region));
+        assert_eq!(ledger.get(&target("~/.new")), None);
+        assert_eq!(ledger.len(), 2);
+        ledger.save().expect("save");
+        assert_eq!(std::fs::read(dir.ledger()).expect("read"), saved);
+        assert!(occupied.join("keep").is_dir(), "what held the name is kept");
     }
 
     #[test]
@@ -2823,6 +2885,51 @@ mod tests {
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
         assert!(loaded.value.is_empty());
         assert!(dir.root().join("ledger.mpk.corrupt").exists());
+    }
+
+    #[test]
+    fn a_damaged_ledger_that_cannot_be_moved_aside_stops_bx_and_is_never_saved_over() {
+        // r3 round 1 (L1b): `Ledger::open` reported `Health::Reset` when the
+        // rename failed, a caller that kept only the value saved, and the save
+        // replaced the damaged ledger — possibly the only index to the user's
+        // restore blobs — that `Reset` said had been kept.
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            // `state::store`'s 255-byte-name test pins the same rule for root.
+            return;
+        }
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
+        // Readable and searchable, so the ledger is read and judged; not
+        // writable, so it cannot be renamed.
+        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        let result = Ledger::open(&dir, &lock, home.path());
+        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore");
+        if let Ok(loaded) = &result {
+            // What a caller that keeps only the value does next.
+            loaded.value.save().expect("save");
+        }
+
+        assert_eq!(
+            std::fs::read(dir.ledger()).expect("in place"),
+            b"not messagepack",
+            "the damaged ledger is never replaced",
+        );
+        let err = result.expect_err("a ledger that cannot be moved aside stops bx");
+        assert!(
+            matches!(
+                &err,
+                Error::CannotQuarantine { path, damage: Damage::Malformed, source }
+                    if *path == dir.ledger()
+                        && source.kind() == std::io::ErrorKind::PermissionDenied
+            ),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("by hand"), "{err}");
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
     }
 
     #[test]

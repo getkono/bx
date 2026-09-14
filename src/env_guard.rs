@@ -814,9 +814,15 @@ pub enum Reason {
     /// `RANDOM`, zsh's tied `path` — or acts on when it is assigned.
     #[error("assigns or refers to a name the shell manages itself")]
     ReservedName,
-    /// It assigns a name bx does not generate, whatever the value: the guard
-    /// cannot tell what a name it does not know holds.
-    #[error("assigns a variable bx does not generate, so it cannot judge the value")]
+    /// It assigns a variable no bx generator declares, whatever the value: the
+    /// guard cannot tell what a name it does not know holds. bx generates every
+    /// fragment the guard judges, so this is a defect in bx — a generator that
+    /// did not add its name to the emit table — and not in the user's
+    /// configuration.
+    #[error(
+        "assigns a variable no bx generator declares, so bx cannot judge the \
+         value — a defect in bx, not in your configuration"
+    )]
     NotEmittable,
     /// It points at a directory bx owns, whatever the roots say.
     #[error("points inside a directory bx owns")]
@@ -2119,7 +2125,8 @@ mod tests {
         );
         assert_eq!(
             Reason::NotEmittable.to_string(),
-            "assigns a variable bx does not generate, so it cannot judge the value"
+            "assigns a variable no bx generator declares, so bx cannot judge the \
+             value — a defect in bx, not in your configuration"
         );
         assert_eq!(
             Reason::NotAProgram.to_string(),

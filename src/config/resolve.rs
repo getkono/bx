@@ -529,7 +529,11 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
         requires: target
             .requires
             .iter()
-            .map(|tool| sub(tool))
+            .map(|tool| {
+                let text = sub(tool)?;
+                check_requirement(&text).map_err(|problem| field(tool, problem))?;
+                Ok(text)
+            })
             .collect::<Result<Vec<_>, Broken>>()?,
         references: target
             .references
@@ -539,6 +543,22 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
         enabled: target.enabled,
         origin: target.origin.clone(),
     })
+}
+
+/// Refuse a `requires` entry detection could never find.
+///
+/// Detection looks a bare name up on `PATH` and opens an absolute path as it
+/// is; a relative name holding a `/` is never found, and an empty one would be
+/// joined onto every `PATH` directory. Checked once substituted, because an
+/// answer is where either most plausibly comes from.
+fn check_requirement(text: &str) -> Result<(), String> {
+    if text.is_empty() || (text.contains('/') && !text.starts_with('/')) {
+        return Err(format!(
+            "`requires` names a tool by a bare name to look up on `PATH`, or by an \
+             absolute path; got {text:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Order `names` the way the values were declared, deduplicated.
@@ -1021,6 +1041,57 @@ mod tests {
                 owns: vec![KeyPath::parse("editor.tab_size").unwrap()]
             }
         );
+    }
+
+    #[test]
+    fn a_requires_that_detect_could_never_find_blocks_or_fails() {
+        // Detection looks a tool up by a bare name on `PATH`, or opens an
+        // absolute path. An empty name, or a relative one holding a `/`, is
+        // never found, so the target would be reported as waiting on a tool no
+        // install could supply. Substituted text is checked like any field.
+        const LAYER: &str = "[[value]]\nname = \"tool\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\ncontent = \"x\"\n\
+                             requires = [\"{{tool}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for answer in ["", "bin/sccache"] {
+            let answered = resolved(LAYER, Some(&format!("[values]\ntool = \"{answer}\"\n")))
+                .unwrap_or_else(|e| panic!("{answer:?} failed the whole load: {e}"));
+            let entry = blocked(&answered, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["tool".to_string()]
+                },
+                "{answer:?}"
+            );
+            for part in [
+                "`requires` names a tool by a bare name to look up on `PATH`, or by an \
+                 absolute path",
+                "local.toml:2",
+            ] {
+                assert!(
+                    entry.hint.contains(part),
+                    "{answer:?} {part}: {}",
+                    entry.hint
+                );
+            }
+            ready(&answered, 1);
+        }
+
+        let message = resolved(
+            &LAYER.replace("kind = \"string\"\n", "kind = \"string\"\ndefault = \"\"\n"),
+            None,
+        )
+        .expect_err("a committed default detection could never find is a repo defect");
+        assert!(message.contains("`requires`"), "{message}");
+        assert!(message.contains("~/.config/env"), "{message}");
+
+        for answer in ["/usr/bin/sccache", "sccache"] {
+            let found = resolved(LAYER, Some(&format!("[values]\ntool = \"{answer}\"\n")))
+                .unwrap_or_else(|e| panic!("{answer:?}: {e}"));
+            assert_eq!(ready(&found, 0).requires, [answer]);
+        }
     }
 
     #[test]

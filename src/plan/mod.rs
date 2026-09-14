@@ -239,6 +239,17 @@ pub enum Error {
     /// The state directory failed, including another bx holding it.
     #[error(transparent)]
     State(state::Error),
+    /// A state file bx reads is something other than a regular file — a FIFO,
+    /// a device, a link — which a read could wait on forever or never finish.
+    #[error(
+        "{} is not a regular file, so bx will not read it; move it out of the way and run bx \
+         again",
+        .path.display()
+    )]
+    NotARegularFile {
+        /// The state file.
+        path: PathBuf,
+    },
     /// An interrupted session could not be inspected or resolved, including a
     /// recovery that is blocked on files it cannot account for.
     #[error(transparent)]
@@ -315,6 +326,7 @@ pub fn run(
     mode: Mode,
     approve: &mut dyn FnMut(&Report) -> Result<bool, Error>,
 ) -> Result<Report, Error> {
+    refuse_irregular_state_files(&inputs.state)?;
     let mut report = Report::default();
     match mode {
         Mode::Plan => look_at_state(inputs, &mut report)?,
@@ -377,6 +389,21 @@ pub fn exit(report: &Report, mode: Mode) -> Exit {
         }
         Mode::Plan | Mode::Apply => Exit::from_actions(&actions),
     }
+}
+
+/// Refuse a state file `run` reads that is there and is not a regular file.
+///
+/// Checked with `lstat` before any reader opens one. bx only ever leaves these
+/// files by rename, and a FIFO, a device or a link at one of them could make a
+/// read wait forever or never end. An absent file is fine — there is nothing to
+/// read — and so is one `lstat` cannot see, which the read then reports itself.
+fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
+    for path in [state.ledger(), state.fingerprints(), state.journal()] {
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.file_type().is_file()) {
+            return Err(Error::NotARegularFile { path });
+        }
+    }
+    Ok(())
 }
 
 /// What a read-only run learns from the state directory before deciding.
@@ -1437,6 +1464,132 @@ pub(crate) mod tests {
             );
             assert_eq!(std::fs::read(&dest).expect("untouched"), b"new\n");
         }
+    }
+
+    /// Make `path` a FIFO. Opening it to read waits for a writer that never
+    /// comes, which is what any read of it that is not refused first does.
+    fn fifo_at(path: &Path) {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("the FIFO's directory");
+        }
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("mkfifo");
+    }
+
+    /// The text of the error `run` in `mode` stops with, run on a thread so a
+    /// read that waits fails the test instead of hanging it.
+    fn refusal(inputs: &Inputs, mode: Mode) -> String {
+        let (sent, received) = std::sync::mpsc::channel();
+        let inputs = inputs.clone();
+        std::thread::spawn(move || {
+            let outcome = run(&inputs, mode, &mut |_| Ok(true))
+                .map(|report| report.actions())
+                .map_err(|error| error.to_string());
+            let _ = sent.send(outcome);
+        });
+        match received.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(Err(message)) => message,
+            Ok(Ok(actions)) => panic!("{mode:?} ran to completion: {actions:?}"),
+            Err(_) => panic!("{mode:?} had not returned after 20 s: a read is waiting"),
+        }
+    }
+
+    /// A FIFO where `file` names a state file: both modes stop at once with an
+    /// error naming it, and nothing is written.
+    fn a_fifo_state_file_is_refused(file: fn(&StateDir) -> PathBuf) {
+        let home = guarded_home();
+        let inputs = inputs(&home, &inline("~/.a", "a\\n"));
+        let path = file(inputs.state());
+        fifo_at(&path);
+
+        for mode in [Mode::Plan, Mode::Apply] {
+            let message = refusal(&inputs, mode);
+            assert!(
+                message.contains(&path.display().to_string()),
+                "{mode:?}: {message}"
+            );
+            assert!(
+                message.contains("not a regular file"),
+                "{mode:?}: {message}"
+            );
+        }
+        assert!(
+            !home.child(".a").exists(),
+            "written past a refused state file"
+        );
+    }
+
+    #[test]
+    fn decision_20_a_fifo_at_the_ledger_is_refused_without_waiting() {
+        a_fifo_state_file_is_refused(StateDir::ledger);
+    }
+
+    #[test]
+    fn decision_20_a_fifo_at_the_fingerprints_is_refused_without_waiting() {
+        a_fifo_state_file_is_refused(StateDir::fingerprints);
+    }
+
+    #[test]
+    fn decision_20_a_fifo_at_the_journal_is_refused_without_waiting() {
+        a_fifo_state_file_is_refused(StateDir::journal);
+    }
+
+    #[test]
+    fn decision_20_a_link_to_a_device_at_the_ledger_is_refused_before_any_read() {
+        // Asked of the guard itself, not of `run`: were the guard ever to let
+        // it through, the ledger's reader would read `/dev/zero` into memory
+        // until the host ran out. The FIFO tests show `run` asks the guard
+        // before anything is read.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir_all(state.root()).expect("the state directory");
+        std::os::unix::fs::symlink("/dev/zero", state.ledger()).expect("the link");
+
+        let error = refuse_irregular_state_files(&state).expect_err("a link is refused");
+
+        assert!(
+            matches!(&error, Error::NotARegularFile { path } if *path == state.ledger()),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+
+        // Absent state files, and regular ones, are read as before.
+        let other = guarded_home();
+        let fresh = StateDir::resolve(other.path());
+        assert!(refuse_irregular_state_files(&fresh).is_ok());
+        std::fs::create_dir_all(fresh.root()).expect("the state directory");
+        std::fs::write(fresh.ledger(), b"a ledger's bytes").expect("a regular ledger");
+        assert!(refuse_irregular_state_files(&fresh).is_ok());
+    }
+
+    #[test]
+    fn decision_20_a_fifo_as_a_file_body_is_refused_without_waiting() {
+        let home = guarded_home();
+        let inputs = inputs(
+            &home,
+            "[[target]]\npath = \"~/.b\"\nfile = \"files/body\"\n",
+        );
+        let body = home.child(".config/bx/files/body");
+        fifo_at(&body);
+
+        for mode in [Mode::Plan, Mode::Apply] {
+            let message = refusal(&inputs, mode);
+            assert!(
+                message.contains(&body.display().to_string()),
+                "{mode:?}: {message}"
+            );
+            assert!(
+                message.contains("not a regular file"),
+                "{mode:?}: {message}"
+            );
+        }
+        assert!(!home.child(".b").exists(), "written from a refused body");
     }
 
     #[test]

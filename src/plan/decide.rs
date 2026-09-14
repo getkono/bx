@@ -224,11 +224,18 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
         Body::Inline(content) => content.clone().into_bytes(),
         Body::File(rel) => {
             let path = ctx.repo.join(rel);
-            std::fs::read(&path).map_err(|source| Error::Body {
+            let body = |source| Error::Body {
                 origin: target.origin.clone(),
-                path,
+                path: path.clone(),
                 source,
-            })?
+            };
+            // Followed through a link, since a body the repo links to is the
+            // user's layout. Anything but a regular file at the end of it — a
+            // FIFO, a device — would block the read or never end it.
+            if std::fs::metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+                return Err(body(std::io::Error::other("not a regular file")));
+            }
+            std::fs::read(&path).map_err(body)?
         }
         Body::Generated(generator) => {
             let content = generate(generator);

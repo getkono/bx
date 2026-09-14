@@ -3247,6 +3247,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_journal_with_a_second_session_header_is_unreadable() {
+        // r3 coverage C5.
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let path = dir.path().join("journal.mpk");
+        let begin = Record::Begin(some_begin());
+        raw_journal(&path, &[begin.clone(), begin]);
+        assert_eq!(
+            load(&path).expect("load"),
+            Loaded::Unreadable { moved_to: None }
+        );
+    }
+
+    #[test]
     fn an_unreadable_journal_is_never_set_aside_over_an_earlier_one() {
         // Review round 3, item 5. The set-aside name was fixed, and opening a
         // session renamed the unreadable journal over the earlier one. Round 3
@@ -3472,6 +3485,58 @@ pub(crate) mod tests {
             load(&state.journal()).expect("load"),
             Loaded::Unterminated(_)
         ));
+    }
+
+    #[test]
+    fn a_failed_removal_intent_append_poisons_the_session_and_unlinks_nothing() {
+        // r3 coverage C7. The write path's failed append is pinned above; the
+        // removal's was not.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".conf");
+        let mut first =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        first
+            .apply(write_to(
+                home.path(),
+                ".conf",
+                "bx created\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        first.finish().expect("finish");
+
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+        session.journal.file = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let err = session
+            .apply(Request {
+                target: portable.clone(),
+                dest: dest.clone(),
+                content: Content::Absent {
+                    created_dirs: Vec::new(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Released,
+            })
+            .expect_err("a full disk fails the removal's Intent append");
+        assert!(
+            matches!(&err, Error::Io { path, .. } if *path == state.journal()),
+            "got {err}"
+        );
+        assert_eq!(peek(&dest).expect("not unlinked").0, b"bx created\n");
+        assert!(
+            session.ledger().get(&portable).is_some(),
+            "nothing was removed, so nothing is forgotten"
+        );
+        let finished = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
     }
 
     #[test]

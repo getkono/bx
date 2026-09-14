@@ -1813,6 +1813,13 @@ fn parent_state(dir: &Path) -> Result<ParentState, Error> {
     for ancestor in dir.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
             Err(e) if unresolvable_path(&e) => {}
+            // Reachable only through a race, so no test constructs it. Every
+            // ancestor is a prefix that resolving `dir` above already walked,
+            // and `lstat` does not follow its last component: a refusal here —
+            // a permission denied, most often — means the permissions changed
+            // between that resolution and this call. It stays a read error
+            // rather than joining the arm above, which would report a directory
+            // bx cannot see as absent and announce a `Create` it cannot make.
             Err(source) => {
                 return Err(Error::Read {
                     path: ancestor.to_path_buf(),

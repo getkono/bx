@@ -209,6 +209,24 @@ pub enum Error {
         /// The newest format this build understands.
         supported: u8,
     },
+    /// A journal bx cannot believe could not be moved aside.
+    ///
+    /// Refused rather than read as absent: a session opened over it creates
+    /// its own journal by renaming over these bytes, and a recovery that went
+    /// on would clear the way for one. The bytes are left exactly where they
+    /// are, and every writing command refuses until they can be moved.
+    #[error(
+        "the write-ahead journal {} cannot be read and could not be set aside ({source}); \
+         it was left in place, and bx will not write until it can be moved",
+        .path.display()
+    )]
+    CannotSetAside {
+        /// The journal.
+        path: PathBuf,
+        /// Why it could not be moved.
+        #[source]
+        source: std::io::Error,
+    },
     /// A session was asked to start while an unresolved interruption stands.
     ///
     /// The escape is [`crate::recover::recover`], which every writing command
@@ -471,10 +489,11 @@ pub enum Loaded {
     /// aside earlier — and [`load`], which runs without the lock, leaves them
     /// where they are. What the write may have completed is then recomputed by
     /// `plan`, which reports a file bx wrote but never recorded as a conflict:
-    /// skipped, never overwritten.
+    /// skipped, never overwritten. A journal [`load_exclusive`] cannot move
+    /// aside is never this value, but [`Error::CannotSetAside`].
     Unreadable {
-        /// Where the bytes were kept, or `None` if they were not moved: the read
-        /// held no lock, or the rename failed.
+        /// Where the bytes were kept, or `None` if they were not moved because
+        /// the read held no lock.
         moved_to: Option<PathBuf>,
     },
 }
@@ -606,13 +625,15 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
 ///
 /// # Errors
 ///
-/// As [`load`]. A journal that cannot be moved aside is still reported as
-/// [`Loaded::Unreadable`], with `moved_to: None`, and left in place.
+/// As [`load`], and [`Error::CannotSetAside`] for an unreadable journal that
+/// cannot be moved aside, which is left in place. It is not reported as
+/// [`Loaded::Unreadable`]: every caller treats that as nothing standing, and
+/// [`Session::open`] would create its own journal over the bytes.
 pub fn load_exclusive(path: &Path, lock: &ExclusiveLock) -> Result<Loaded, Error> {
-    Ok(match inspect(path)? {
-        Ok(loaded) => loaded,
+    match inspect(path)? {
+        Ok(loaded) => Ok(loaded),
         Err(why) => quarantine(path, why, lock),
-    })
+    }
 }
 
 /// Classify the bytes at `path`: what a session, or a crash of one, left there,
@@ -896,7 +917,14 @@ fn checksum(nonce: &[u8; NONCE], prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
 /// The name is the first free one, taken with `RENAME_NOREPLACE` by
 /// [`crate::state::move_aside`], so an earlier set-aside journal is never
 /// replaced.
-fn quarantine(path: &Path, why: &str, lock: &ExclusiveLock) -> Loaded {
+///
+/// # Errors
+///
+/// [`Error::CannotSetAside`] when the move fails. The journal is left where it
+/// is, and it is an error rather than a value its caller could read as
+/// "nothing stands": [`Session::open`] would then create its own journal over
+/// the bytes by rename.
+fn quarantine(path: &Path, why: &str, lock: &ExclusiveLock) -> Result<Loaded, Error> {
     match crate::state::move_aside(path, lock) {
         Ok(aside) => {
             tracing::error!(
@@ -908,19 +936,23 @@ fn quarantine(path: &Path, why: &str, lock: &ExclusiveLock) -> Loaded {
                  overwritten.",
                 path.display(),
             );
-            Loaded::Unreadable {
+            Ok(Loaded::Unreadable {
                 moved_to: Some(aside),
-            }
+            })
         }
         Err(source) => {
             tracing::error!(
                 path = %path.display(),
                 %source,
-                "discarding the write-ahead journal {}: {why}. \
-                 It could not be moved aside.",
+                "the write-ahead journal {} cannot be believed: {why}. \
+                 It could not be moved aside, so it is left in place and \
+                 nothing is written over it.",
                 path.display(),
             );
-            Loaded::Unreadable { moved_to: None }
+            Err(Error::CannotSetAside {
+                path: path.to_path_buf(),
+                source,
+            })
         }
     }
 }
@@ -1189,7 +1221,9 @@ impl Session {
     ///
     /// [`Error::InProgress`] when a journal already stands — recover first.
     /// [`Error::FutureVersion`] when the journal that stands was written by a
-    /// newer bx: nothing is set aside. [`Error::State`] when the directory
+    /// newer bx: nothing is set aside. [`Error::CannotSetAside`] when the
+    /// journal that stands cannot be believed and cannot be moved aside: it is
+    /// left in place, never replaced. [`Error::State`] when the directory
     /// cannot be made or locked, and [`Error::Io`] when the journal cannot be
     /// written.
     pub fn open(
@@ -3914,7 +3948,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_journal_that_cannot_be_moved_aside_is_still_read_as_absent() {
+    fn a_journal_that_cannot_be_moved_aside_is_an_error_and_stays_in_place() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         state.ensure().expect("ensure");
@@ -3931,12 +3965,60 @@ pub(crate) mod tests {
         let loaded = load_exclusive(&state.journal(), &lock);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
 
-        assert_eq!(loaded.expect("load"), Loaded::Unreadable { moved_to: None });
+        let err = loaded.expect_err("a journal that cannot be moved aside is refused");
+        assert!(
+            matches!(&err, Error::CannotSetAside { path, .. } if *path == state.journal()),
+            "got {err}"
+        );
         assert_eq!(
             std::fs::read(state.journal()).expect("still in place"),
             b"GARBAGE!",
         );
         assert!(!StateDir::quarantine(&state.journal()).exists());
+    }
+
+    #[test]
+    fn an_unreadable_journal_that_cannot_be_set_aside_is_refused_and_never_replaced() {
+        // r3, routed from #7's repair planning. `load_exclusive` reported a
+        // journal it could not move aside as `Unreadable { moved_to: None }`,
+        // which is not an interruption, so `Session::open` created its own
+        // journal over it by rename and the bytes were gone.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        std::fs::write(state.journal(), b"GARBAGE!").expect("an unreadable journal");
+        // No set-aside name follows the highest one there can be, so the move
+        // fails with no permission bit involved, and a session could write.
+        let last = StateDir::quarantine_nth(&state.journal(), u64::MAX);
+        std::fs::write(&last, b"the last name").expect("the highest set-aside name");
+
+        let opened = Session::open(&state, SessionKind::Apply, home.path(), Vec::new());
+        assert_eq!(
+            std::fs::read(state.journal()).expect("kept"),
+            b"GARBAGE!",
+            "the unreadable journal's bytes are still at its path"
+        );
+        assert!(
+            matches!(opened, Err(Error::CannotSetAside { .. })),
+            "got {opened:?}"
+        );
+
+        let recovered = crate::recover::before_writing(&state);
+        assert!(
+            matches!(
+                recovered,
+                Err(crate::recover::Error::Journal(Error::CannotSetAside { .. }))
+            ),
+            "got {recovered:?}"
+        );
+        assert_eq!(std::fs::read(state.journal()).expect("kept"), b"GARBAGE!");
+        assert!(
+            crate::recover::pending(&state)
+                .expect("pending")
+                .expect("still reported")
+                .unreadable
+        );
+        assert_eq!(std::fs::read(&last).expect("kept"), b"the last name");
     }
 
     /// Whether a directory without write permission refuses this process.

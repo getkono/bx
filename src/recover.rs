@@ -854,8 +854,8 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        crash_phases, finish_crash_phases, frame_starts, peek, permissions_refuse, plant_file,
-        raw_journal, seal, target, write_to,
+        crash_phases, finish_crash_phases, frame_starts, names_in, peek, permissions_refuse,
+        plant_file, raw_journal, seal, state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
@@ -2585,6 +2585,64 @@ mod tests {
                 .expect("the entry")
                 .written,
             ContentHash::of(b"new\n"),
+        );
+    }
+
+    #[test]
+    fn a_damaged_ledger_that_cannot_be_moved_aside_stops_recovery_and_keeps_the_journal() {
+        // Stack integration of #8 @62de0aa, which carries #7's r3 round 1:
+        // `Ledger::open` refuses a damaged ledger it cannot move aside with
+        // `state::Error::CannotQuarantine`. A terminated journal's bookkeeping
+        // opens the ledger, so recovery must stop there: the ledger keeps its
+        // bytes, and the journal stays for the run after the ledger is moved.
+        let home = guarded_home();
+        let made = StateDir::resolve(home.path());
+        plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &made,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+        seal(&made.journal(), 1);
+        std::fs::write(made.ledger(), b"not a ledger").expect("damage the ledger");
+        let journal = std::fs::read(made.journal()).expect("the journal");
+        // Written where a session's names fit, then moved to where no
+        // set-aside name does.
+        let state = state_beyond_set_aside_names(&home);
+        std::fs::create_dir_all(state.root().parent().expect("a parent")).expect("its parents");
+        std::fs::rename(made.root(), state.root()).expect("move the state directory");
+
+        let recovered = recover(&state);
+        assert!(
+            matches!(
+                &recovered,
+                Err(Error::State(crate::state::Error::CannotQuarantine {
+                    path,
+                    damage: crate::state::Damage::Malformed,
+                    ..
+                })) if *path == state.ledger()
+            ),
+            "got {recovered:?}"
+        );
+        assert_eq!(
+            std::fs::read(state.ledger()).expect("kept"),
+            b"not a ledger",
+            "the damaged ledger's bytes are unchanged"
+        );
+        assert_eq!(
+            std::fs::read(state.journal()).expect("kept"),
+            journal,
+            "the journal stays for the next run"
+        );
+        assert_eq!(
+            names_in(state.root()),
+            ["journal.mpk", "ledger.mpk", "lock", "restore", "shell"],
+            "nothing was set aside or saved"
+        );
+        assert_eq!(
+            peek(&home.child(".conf")).map(|(bytes, _)| bytes),
+            Some(b"new\n".to_vec()),
+            "a terminated session's write is not rolled back"
         );
     }
 

@@ -10,12 +10,15 @@
 //!   carries the observation and the bytes it was made from. Nothing else can
 //!   construct one, so the bytes `plan` diffed are the bytes `apply` writes.
 //! * `plan` writes nothing, and does not even create the state directory.
+//!   `apply` recovers an interrupted session before it decides anything, and
+//!   makes every write through one journalled session.
 //!
 //! The one environment read in the whole path is [`Env::from_process`]; every
 //! other function takes what it needs as an argument.
 
 mod decide;
 mod diff;
+mod execute;
 
 use std::ffi::OsString;
 use std::io::IsTerminal as _;
@@ -26,9 +29,10 @@ pub use diff::{Diff, DiffKind, TEXT_LIMIT, Why};
 use crate::config::resolve::{self, Resolved};
 use crate::config::{self, Origin, layers, merge};
 use crate::env_guard::RootSet;
+use crate::journal::{self, Session, SessionKind};
 use crate::paths;
 use crate::recover::{self, Interrupted};
-use crate::report::Action;
+use crate::report::{Action, Exit};
 use crate::state::{self, LedgerView, SharedLock, StateDir};
 
 /// Which half of the traversal is running.
@@ -39,6 +43,8 @@ use crate::state::{self, LedgerView, SharedLock, StateDir};
 pub enum Mode {
     /// Decide and report. Writes nothing.
     Plan,
+    /// Recover, decide, report, and — once approved — write.
+    Apply,
 }
 
 /// Everything bx takes from the process it runs in.
@@ -88,6 +94,7 @@ pub struct Inputs {
     state: StateDir,
     resolved: Resolved,
     roots: RootSet,
+    progress: bool,
 }
 
 impl Inputs {
@@ -114,6 +121,7 @@ impl Inputs {
             state,
             resolved,
             roots,
+            progress: env.stderr_tty,
         })
     }
 
@@ -199,9 +207,13 @@ pub enum Error {
     /// The state directory failed, including another bx holding it.
     #[error(transparent)]
     State(state::Error),
-    /// An interrupted session could not be inspected or resolved.
+    /// An interrupted session could not be inspected or resolved, including a
+    /// recovery that is blocked on files it cannot account for.
     #[error(transparent)]
     Recover(recover::Error),
+    /// The session refused or failed a write.
+    #[error(transparent)]
+    Journal(journal::Error),
     /// A destination could not be observed.
     #[error(transparent)]
     Fs(#[from] crate::fs::Error),
@@ -222,25 +234,48 @@ impl From<state::Error> for Error {
     }
 }
 
+impl From<journal::Error> for Error {
+    fn from(error: journal::Error) -> Self {
+        match error {
+            journal::Error::State(error) => Self::State(error),
+            other => Self::Journal(other),
+        }
+    }
+}
+
 impl From<recover::Error> for Error {
     fn from(error: recover::Error) -> Self {
         match error {
             recover::Error::State(error) => Self::State(error),
+            recover::Error::Journal(error) => error.into(),
             other => Self::Recover(other),
         }
     }
 }
 
-/// Decide every target, and report.
+/// Decide every target, report, and — in [`Mode::Apply`], once `approve` says
+/// so — write.
+///
+/// `approve` is shown the report and asked only when there is a write to make,
+/// and never in [`Mode::Plan`]. Declining leaves the report unexecuted and
+/// nothing written: no session is opened and no journal is created.
 ///
 /// # Errors
 ///
-/// Whatever loading the ledger, inspecting an interrupted session, reading a
-/// body or observing a destination returns.
-pub fn run(inputs: &Inputs, mode: Mode) -> Result<Report, Error> {
+/// Whatever recovery, loading the ledger, reading a body, observing a
+/// destination, `approve`, or the session returns. A failed write leaves its
+/// journal for the next writing run to roll back.
+pub fn run(
+    inputs: &Inputs,
+    mode: Mode,
+    approve: &mut dyn FnMut(&Report) -> Result<bool, Error>,
+) -> Result<Report, Error> {
     let mut report = Report::default();
     match mode {
         Mode::Plan => look_at_state(inputs, &mut report)?,
+        Mode::Apply => {
+            recover::before_writing(&inputs.state)?;
+        }
     }
 
     let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
@@ -250,8 +285,11 @@ pub fn run(inputs: &Inputs, mode: Mode) -> Result<Report, Error> {
         repo: &inputs.repo,
         roots: &inputs.roots,
     };
+    let mut ops = Vec::new();
     for resolution in &inputs.resolved.targets {
-        report.changes.push(decide::decide(resolution, &ctx)?);
+        let (change, op) = decide::decide(resolution, &ctx)?;
+        report.changes.push(change);
+        ops.extend(op);
     }
 
     match mode {
@@ -259,6 +297,40 @@ pub fn run(inputs: &Inputs, mode: Mode) -> Result<Report, Error> {
             mark_interrupted(&mut report);
             Ok(report)
         }
+        Mode::Apply => {
+            if ops.is_empty() || !approve(&report)? {
+                return Ok(report);
+            }
+            let scope = ops.iter().map(|op| op.target().clone()).collect();
+            let session = Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;
+            let progress = execute::progress(ops.len(), inputs.progress);
+            execute::execute(ops, session, &progress)?;
+            report.executed = true;
+            Ok(report)
+        }
+    }
+}
+
+/// The process status a report implies.
+///
+/// A read-only run exits [`Exit::Pending`] while an interruption stands, and by
+/// its actions otherwise. An executed `apply` has done its pending work, so
+/// only a row still needing attention keeps it pending. An `apply` that wrote
+/// nothing — declined, or with nothing to do — exits by its actions, so a
+/// declined prompt over pending work exits 2.
+#[must_use]
+pub fn exit(report: &Report, mode: Mode) -> Exit {
+    let actions = report.actions();
+    match mode {
+        Mode::Plan if report.interrupted.is_some() => Exit::Pending,
+        Mode::Apply if report.executed => {
+            if actions.iter().any(|action| action.needs_attention()) {
+                Exit::Pending
+            } else {
+                Exit::Converged
+            }
+        }
+        Mode::Plan | Mode::Apply => Exit::from_actions(&actions),
     }
 }
 
@@ -306,12 +378,16 @@ fn mark_interrupted(report: &mut Report) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Output};
+
     use super::*;
     use crate::fs::{self, Mode as FileMode};
-    use crate::journal::{Content, Ownership, Request, Session, SessionKind};
+    use crate::journal::tests::{crash_phases, finish_crash_phases};
+    use crate::journal::{Content, Ownership, Request};
     use crate::paths::Portable;
-    use crate::state::Mechanism;
+    use crate::state::{ExclusiveLock, Mechanism};
     use crate::testing::{GuardedHome, guarded_home};
 
     /// An environment with nothing overridden and no terminal.
@@ -327,10 +403,22 @@ mod tests {
         }
     }
 
+    /// Write `layer` as the repo's `bx.toml` under `home`.
+    pub(crate) fn seed(home: &Path, layer: &str) {
+        let repo = home.join(".config/bx");
+        std::fs::create_dir_all(&repo).expect("the config repo");
+        std::fs::write(repo.join("bx.toml"), layer).expect("bx.toml");
+    }
+
+    /// Load the inputs for `home`.
+    fn load(home: &Path) -> Inputs {
+        Inputs::load(&env(home)).expect("the inputs load")
+    }
+
     /// Write `layer` as the repo's `bx.toml` and load it.
     pub(crate) fn inputs(home: &GuardedHome, layer: &str) -> Inputs {
-        home.write(".config/bx/bx.toml", layer);
-        Inputs::load(&env(home.path())).expect("the inputs load")
+        seed(home.path(), layer);
+        load(home.path())
     }
 
     /// One inline target, as TOML. `content` is spelled as a TOML basic string.
@@ -339,7 +427,11 @@ mod tests {
     }
 
     fn plan(inputs: &Inputs) -> Report {
-        run(inputs, Mode::Plan).expect("plan runs")
+        run(inputs, Mode::Plan, &mut |_| panic!("plan never asks")).expect("plan runs")
+    }
+
+    fn apply(inputs: &Inputs) -> Report {
+        run(inputs, Mode::Apply, &mut |_| Ok(true)).expect("apply runs")
     }
 
     /// Write `bytes` at `~/rel` through a journalled session, so bx owns it
@@ -373,6 +465,39 @@ mod tests {
         }
     }
 
+    /// One path under a snapshot root: its bytes when it is a file, and its mode.
+    type Entry = (PathBuf, Option<Vec<u8>>, u32);
+
+    /// Every path under `root` except those beneath a `skip` prefix, with the
+    /// bytes of each regular file and every mode.
+    fn snapshot(root: &Path, skip: &[&str]) -> Vec<Entry> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read a directory") {
+                let path = entry.expect("an entry").path();
+                let rel = path.strip_prefix(root).expect("under root").to_path_buf();
+                if skip.iter().any(|prefix| rel.starts_with(prefix)) {
+                    continue;
+                }
+                let meta = std::fs::symlink_metadata(&path).expect("lstat");
+                let bytes = meta
+                    .is_file()
+                    .then(|| std::fs::read(&path).expect("read a file"));
+                if meta.is_dir() {
+                    stack.push(path);
+                }
+                found.push((rel, bytes, meta.permissions().mode()));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// What neither a rollback nor a restore puts back: bx's own records, and
+    /// the repo.
+    const OUTSIDE: [&str; 2] = [".local", ".config/bx"];
+
     #[test]
     fn t1_an_absent_target_is_a_create_with_the_whole_body_added() {
         let home = guarded_home();
@@ -391,6 +516,7 @@ mod tests {
             !StateDir::resolve(home.path()).root().exists(),
             "plan created the state directory"
         );
+        assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
     }
 
     #[test]
@@ -407,17 +533,25 @@ mod tests {
             text(&report.changes[0]),
             "--- ~/.a (on disk)\n+++ ~/.a (bx)\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
         );
+
+        apply(&inputs);
+        assert_eq!(
+            std::fs::read(home.child(".a")).expect("the file"),
+            b"one\nTWO\nthree\n"
+        );
     }
 
     #[test]
-    fn t3_a_present_file_bx_does_not_own_is_a_conflict() {
+    fn t3_a_present_file_bx_does_not_own_is_a_conflict_apply_does_not_overwrite() {
         let home = guarded_home();
         home.write(".a", "mine\n");
-        let inputs = inputs(&home, &inline("~/.a", "bx\\n"));
+        let inputs = inputs(
+            &home,
+            &[inline("~/.a", "bx\\n"), inline("~/.b", "b\\n")].concat(),
+        );
 
         let report = plan(&inputs);
-
-        assert_eq!(report.actions(), vec![Action::Conflict]);
+        assert_eq!(report.actions(), vec![Action::Conflict, Action::Create]);
         assert_eq!(
             report.changes[0].note.as_deref(),
             Some("exists and bx does not own it")
@@ -426,22 +560,31 @@ mod tests {
             text(&report.changes[0]),
             "--- ~/.a (on disk)\n+++ ~/.a (bx)\n@@ -1 +1 @@\n-mine\n+bx\n"
         );
+
+        let applied = apply(&inputs);
+        assert!(applied.executed);
+        assert_eq!(exit(&applied, Mode::Apply), Exit::Pending);
+        assert_eq!(std::fs::read(home.child(".a")).expect("mine"), b"mine\n");
+        assert_eq!(std::fs::read(home.child(".b")).expect("created"), b"b\n");
     }
 
     #[test]
-    fn t4_an_owned_file_edited_since_bx_wrote_it_is_a_conflict() {
+    fn t4_an_owned_file_edited_since_bx_wrote_it_is_a_conflict_not_overwritten() {
         let home = guarded_home();
         own(home.path(), ".a", b"bx\n", Mechanism::Own);
         std::fs::write(home.child(".a"), "edited\n").expect("the edit");
         let inputs = inputs(&home, &inline("~/.a", "new\\n"));
 
         let report = plan(&inputs);
-
         assert_eq!(report.actions(), vec![Action::Conflict]);
         assert_eq!(
             report.changes[0].note.as_deref(),
             Some("edited since bx last wrote it")
         );
+
+        let applied = apply(&inputs);
+        assert!(!applied.executed, "nothing to write, so no session");
+        assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
     }
 
     #[test]
@@ -454,6 +597,7 @@ mod tests {
 
         assert_eq!(report.actions(), vec![Action::Unchanged]);
         assert_eq!(report.changes[0].diff, None);
+        assert_eq!(exit(&report, Mode::Plan), Exit::Converged);
     }
 
     #[test]
@@ -513,6 +657,9 @@ mod tests {
                 .as_deref()
                 .is_some_and(|note| note.contains("directory"))
         );
+
+        assert!(!apply(&inputs).executed);
+        assert!(home.child(".dir").is_dir());
     }
 
     #[test]
@@ -533,6 +680,8 @@ mod tests {
             Some(config::values::init_hint(&["scratch_root"]).as_str())
         );
         assert_eq!(report.changes[0].diff, None);
+
+        assert!(!apply(&inputs).executed);
         assert!(!home.child(".env").exists());
     }
 
@@ -563,9 +712,14 @@ mod tests {
         );
 
         let report = plan(&inputs);
-
         assert_eq!(report.actions(), vec![Action::Create]);
         assert!(text(&report.changes[0]).ends_with("+[user]\n+\tname = ~/x\n"));
+
+        apply(&inputs);
+        assert_eq!(
+            std::fs::read(home.child(".gitconfig")).expect("written"),
+            b"[user]\n\tname = ~/x\n"
+        );
     }
 
     #[test]
@@ -576,7 +730,7 @@ mod tests {
             "[[target]]\npath = \"~/.gitconfig\"\nfile = \"files/absent\"\n",
         );
 
-        let error = run(&inputs, Mode::Plan).expect_err("a missing body");
+        let error = run(&inputs, Mode::Plan, &mut |_| Ok(false)).expect_err("a missing body");
 
         assert!(matches!(error, Error::Body { .. }), "{error:?}");
         assert!(error.to_string().contains("bx.toml:1"), "{error}");
@@ -600,6 +754,7 @@ mod tests {
         assert_eq!(inputs.home(), home.path());
         assert_eq!(inputs.repo(), home.child(".config/bx"));
         assert_eq!(inputs.state(), &StateDir::resolve(home.path()));
+        assert!(!inputs.progress);
     }
 
     #[test]
@@ -621,18 +776,481 @@ mod tests {
     }
 
     #[test]
-    fn a_state_error_and_a_recovery_state_error_are_one_variant() {
-        let lock = || state::Error::NotADirectory {
+    fn state_errors_are_one_variant_wherever_they_come_from() {
+        let failure = || state::Error::NotADirectory {
             path: PathBuf::from("/x"),
         };
-        assert!(matches!(Error::from(lock()), Error::State(_)));
+        assert!(matches!(Error::from(failure()), Error::State(_)));
         assert!(matches!(
-            Error::from(recover::Error::State(lock())),
+            Error::from(recover::Error::State(failure())),
             Error::State(_)
+        ));
+        assert!(matches!(
+            Error::from(journal::Error::State(failure())),
+            Error::State(_)
+        ));
+        assert!(matches!(
+            Error::from(recover::Error::Journal(journal::Error::State(failure()))),
+            Error::State(_)
+        ));
+        assert!(matches!(
+            Error::from(recover::Error::Journal(journal::Error::InProgress {
+                path: PathBuf::from("/j")
+            })),
+            Error::Journal(_)
         ));
         assert!(matches!(
             Error::from(recover::Error::Blocked { conflicts: vec![] }),
             Error::Recover(_)
         ));
+    }
+
+    #[test]
+    fn t9_apply_twice_converges_and_changes_nothing_the_second_time() {
+        let home = guarded_home();
+        own(home.path(), ".owned", b"v1\n", Mechanism::Own);
+        let layer = [
+            inline("~/.config/new/deep.conf", "deep\\n"),
+            inline("~/.owned", "v2\\n"),
+            "[[target]]\npath = \"~/.private\"\ncontent = \"secret\\n\"\nmode = \"0600\"\n"
+                .to_string(),
+        ]
+        .concat();
+        let inputs = inputs(&home, &layer);
+
+        let first = apply(&inputs);
+        assert!(first.executed);
+        assert_eq!(
+            first.actions(),
+            vec![Action::Create, Action::Modify, Action::Create]
+        );
+        assert_eq!(exit(&first, Mode::Apply), Exit::Converged);
+
+        let after = plan(&inputs);
+        assert_eq!(after.actions(), vec![Action::Unchanged; 3]);
+        assert_eq!(exit(&after, Mode::Plan), Exit::Converged);
+
+        let written = snapshot(home.path(), &[]);
+        let second = run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve"))
+            .expect("the second apply");
+        assert!(!second.executed);
+        assert_eq!(exit(&second, Mode::Apply), Exit::Converged);
+        assert_eq!(
+            snapshot(home.path(), &[".local/state/bx/lock"]),
+            written
+                .into_iter()
+                .filter(|(path, _, _)| !path.starts_with(".local/state/bx/lock"))
+                .collect::<Vec<_>>()
+        );
+        assert!(!StateDir::resolve(home.path()).journal().exists());
+        assert_eq!(
+            std::fs::metadata(home.child(".private"))
+                .expect("private")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn t10_apply_announces_exactly_what_plan_announced_and_plan_changes_nothing() {
+        let guard = guarded_home();
+        let layer = [
+            inline("~/.owned", "v2\\n"),
+            inline("~/.new", "new\\n"),
+            inline("~/.mine", "bx\\n"),
+        ]
+        .concat();
+        let seeded = |name: &str| {
+            let home = guard.child(name);
+            std::fs::create_dir_all(&home).expect("a home");
+            own(&home, ".owned", b"v1\n", Mechanism::Own);
+            std::fs::write(home.join(".mine"), "mine\n").expect("mine");
+            seed(&home, &layer);
+            home
+        };
+        let planned_home = seeded("plan");
+        let applied_home = seeded("apply");
+
+        let before = snapshot(&planned_home, &[]);
+        let planned = plan(&load(&planned_home));
+        assert_eq!(
+            snapshot(&planned_home, &[]),
+            before,
+            "plan changed the tree"
+        );
+
+        let mut shown = None;
+        let applied = run(&load(&applied_home), Mode::Apply, &mut |report| {
+            shown = Some(report.clone());
+            Ok(true)
+        })
+        .expect("apply");
+        let rows = |report: &Report| {
+            report
+                .changes
+                .iter()
+                .map(|c| (c.target.clone(), c.action, c.diff.clone(), c.note.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&applied), rows(&planned));
+        assert_eq!(rows(&shown.expect("apply asked")), rows(&planned));
+    }
+
+    #[test]
+    fn t11_a_mode_only_drift_is_a_journalled_modify_that_converges() {
+        let home = guarded_home();
+        own(home.path(), ".a", b"same\n", Mechanism::Own);
+        let inputs = inputs(
+            &home,
+            "[[target]]\npath = \"~/.a\"\ncontent = \"same\\n\"\nmode = \"0600\"\n",
+        );
+
+        let report = plan(&inputs);
+        assert_eq!(report.actions(), vec![Action::Modify]);
+        // The comparison's own note leads; a parent wider than 0600 — the
+        // tempdir home — adds its own after it.
+        assert!(
+            report.changes[0]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("mode 0644 -> 0600")),
+            "{:?}",
+            report.changes[0].note
+        );
+        assert_eq!(
+            report.changes[0].diff,
+            Some(Diff {
+                kind: DiffKind::Mode {
+                    from: FileMode::DEFAULT_FILE,
+                    to: FileMode::PRIVATE_FILE
+                }
+            })
+        );
+
+        assert!(apply(&inputs).executed);
+        let meta = std::fs::metadata(home.child(".a")).expect("the file");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::read(home.child(".a")).expect("bytes"), b"same\n");
+        assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+    }
+
+    #[test]
+    fn t12_everything_apply_writes_is_reversed_exactly_by_restore() {
+        let home = guarded_home();
+        home.write("mine.txt", "user\n");
+        let layer = [
+            inline("~/.config/deep/er/new.conf", "new\\n"),
+            inline("~/.b", "b\\n"),
+            inline("~/.owned", "v2\\n"),
+        ]
+        .concat();
+        seed(home.path(), &layer);
+        let before = snapshot(home.path(), &OUTSIDE);
+        own(home.path(), ".owned", b"v1\n", Mechanism::Own);
+        let inputs = load(home.path());
+
+        let applied = apply(&inputs);
+        assert_eq!(
+            applied.actions(),
+            vec![Action::Create, Action::Create, Action::Modify]
+        );
+        assert_ne!(snapshot(home.path(), &OUTSIDE), before);
+
+        let state = StateDir::resolve(home.path());
+        let targets: Vec<Portable> = LedgerView::read(&state, home.path())
+            .expect("the ledger")
+            .value
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect();
+        assert_eq!(targets.len(), 3);
+        crate::restore::restore(&state, home.path(), &targets).expect("restore");
+
+        assert_eq!(snapshot(home.path(), &OUTSIDE), before);
+    }
+
+    /// The home the crash child applies in. Passed per command.
+    const CRASH_HOME: &str = "BX_PLAN_CRASH_HOME";
+
+    /// Two writes: a create under a directory bx must invent, then a modify of
+    /// a file bx owns.
+    fn seed_crash(home: &Path) {
+        std::fs::create_dir_all(home).expect("the crash home");
+        own(home, ".owned", b"before\n", Mechanism::Own);
+        seed(
+            home,
+            &[
+                inline("~/.config/made/new.conf", "made\\n"),
+                inline("~/.owned", "after\\n"),
+            ]
+            .concat(),
+        );
+    }
+
+    /// How many writes [`seed_crash`]'s apply makes.
+    const CRASH_WRITES: usize = 2;
+
+    /// Re-run this test binary as an apply that aborts at `phase` of write
+    /// `index`.
+    fn spawn_crash_child(home: &Path, index: usize, phase: &str) -> Output {
+        Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "plan::tests::apply_crash_child",
+            ])
+            .env("BX_CRASH_AT", format!("{index}:{phase}"))
+            .env(CRASH_HOME, home)
+            // The child aborts, so it writes no profile; removing the pattern
+            // keeps that independent of how coverage is configured.
+            .env_remove("LLVM_PROFILE_FILE")
+            .output()
+            .expect("spawn the crash child")
+    }
+
+    #[test]
+    #[ignore = "spawned by the crash harness; it aborts on purpose"]
+    fn apply_crash_child() {
+        let Some(home) = std::env::var_os(CRASH_HOME) else {
+            return;
+        };
+        let inputs = load(Path::new(&home));
+        run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("the apply");
+    }
+
+    #[test]
+    fn t13_an_apply_killed_at_any_journal_phase_recovers_to_the_clean_apply() {
+        let guard = guarded_home();
+        let clean = guard.child("clean");
+        seed_crash(&clean);
+        assert!(apply(&load(&clean)).executed);
+        let want = snapshot(&clean, &OUTSIDE);
+
+        let boundaries = (0..CRASH_WRITES)
+            .flat_map(|index| crash_phases().map(move |phase| (index, phase)))
+            .chain(finish_crash_phases().map(|phase| (CRASH_WRITES, phase)));
+        let mut crossed = 0;
+        for (index, phase) in boundaries {
+            let at = format!("{index}:{phase}");
+            let home = guard.child(format!("crash-{index}-{phase}"));
+            seed_crash(&home);
+            let output = spawn_crash_child(&home, index, phase);
+            assert!(
+                !output.status.success(),
+                "{at}: the child did not stop: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let inputs = load(&home);
+            let found = plan(&inputs);
+            assert!(
+                found.interrupted.is_some(),
+                "{at}: no interruption reported"
+            );
+            assert_eq!(exit(&found, Mode::Plan), Exit::Pending, "{at}");
+
+            run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("the recovering apply");
+            // The journal's one recorded exception, which its own crash harness
+            // pins: a crash between `stage` and the Intent naming the staged
+            // file orphans that one `.bx-` temporary, and recovery removes only
+            // what the journal names. Nothing else may differ.
+            let (orphans, rest): (Vec<Entry>, Vec<Entry>) = snapshot(&home, &OUTSIDE)
+                .into_iter()
+                .partition(|(path, _, _)| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(fs::TEMP_PREFIX))
+                });
+            let orphan_possible = matches!(phase, "after-stage" | "after-fill");
+            assert!(
+                orphans.len() <= usize::from(orphan_possible),
+                "{at}: {orphans:?}"
+            );
+            assert_eq!(rest, want, "{at}");
+
+            let after = plan(&inputs);
+            assert_eq!(after.interrupted, None, "{at}");
+            assert_eq!(after.actions(), vec![Action::Unchanged; 2], "{at}");
+            assert!(!StateDir::resolve(&home).journal().exists(), "{at}");
+            crossed += 1;
+        }
+        assert_eq!(crossed, CRASH_WRITES * 6 + 2);
+    }
+
+    #[test]
+    fn t14_a_standing_interruption_is_reported_as_conflicts_and_plan_writes_nothing() {
+        let guard = guarded_home();
+        let home = guard.child("home");
+        seed_crash(&home);
+        assert!(
+            !spawn_crash_child(&home, 1, "after-publish")
+                .status
+                .success()
+        );
+        let before = snapshot(&home, &[]);
+
+        let report = plan(&load(&home));
+
+        let interrupted = report.interrupted.as_ref().expect("an interruption");
+        assert_eq!(interrupted.unfinished.len(), CRASH_WRITES);
+        for unfinished in &interrupted.unfinished {
+            let change = report
+                .changes
+                .iter()
+                .find(|change| change.target == unfinished.target.as_str())
+                .expect("a row for every unfinished write");
+            assert_eq!(change.action, Action::Conflict);
+            assert_eq!(change.note.as_deref(), Some(unfinished.note.as_str()));
+        }
+        assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
+        assert_eq!(snapshot(&home, &[]), before, "plan changed the tree");
+
+        // A target the configuration no longer names is still reported.
+        seed(&home, "");
+        let report = plan(&load(&home));
+        assert_eq!(report.actions(), vec![Action::Conflict; CRASH_WRITES]);
+        assert_eq!(report.changes[0].origin.line, 0);
+    }
+
+    #[test]
+    fn t15_apply_refuses_a_held_state_directory_and_plan_reports_it_running() {
+        let home = guarded_home();
+        let inputs = inputs(&home, &inline("~/.a", "x\\n"));
+        let held = ExclusiveLock::acquire(inputs.state()).expect("the lock");
+
+        let error = run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect_err("locked");
+        assert!(
+            matches!(error, Error::State(state::Error::Locked { .. })),
+            "{error:?}"
+        );
+
+        let report = plan(&inputs);
+        assert!(report.apply_running);
+        assert_eq!(report.interrupted, None);
+        assert_eq!(report.actions(), vec![Action::Create]);
+        assert!(!home.child(".a").exists());
+
+        drop(held);
+        let report = plan(&inputs);
+        assert!(
+            !report.apply_running,
+            "a released lock is not a running apply"
+        );
+    }
+
+    #[test]
+    fn a_declined_apply_writes_nothing_and_opens_no_session() {
+        let home = guarded_home();
+        let inputs = inputs(&home, &inline("~/.a", "x\\n"));
+        let mut asked = 0;
+
+        let report = run(&inputs, Mode::Apply, &mut |report| {
+            asked += 1;
+            assert_eq!(report.actions(), vec![Action::Create]);
+            Ok(false)
+        })
+        .expect("a declined apply");
+
+        assert_eq!(asked, 1);
+        assert!(!report.executed);
+        assert_eq!(exit(&report, Mode::Apply), Exit::Pending);
+        assert!(!home.child(".a").exists());
+        assert!(!StateDir::resolve(home.path()).journal().exists());
+    }
+
+    #[test]
+    fn an_approval_that_fails_stops_the_run() {
+        let home = guarded_home();
+        let inputs = inputs(&home, &inline("~/.a", "x\\n"));
+
+        let error = run(&inputs, Mode::Apply, &mut |_| {
+            Err(Error::RepoMissing(PathBuf::from("/refused")))
+        })
+        .expect_err("the approval's error");
+
+        assert!(matches!(error, Error::RepoMissing(_)), "{error:?}");
+        assert!(!home.child(".a").exists());
+    }
+
+    #[test]
+    fn a_destination_changed_after_it_was_decided_is_not_replaced_and_is_rolled_back() {
+        let home = guarded_home();
+        let inputs = inputs(
+            &home,
+            &[inline("~/.b", "b\\n"), inline("~/.a", "bx\\n")].concat(),
+        );
+        let target = home.child(".a");
+
+        let error = run(&inputs, Mode::Apply, &mut |_| {
+            std::fs::write(&target, "raced\n").expect("the race");
+            Ok(true)
+        })
+        .expect_err("the changed destination");
+
+        assert!(
+            matches!(
+                error,
+                Error::Journal(journal::Error::Write(crate::fs::Error::Changed { .. }))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read(&target).expect("kept"), b"raced\n");
+        assert!(StateDir::resolve(home.path()).journal().exists());
+
+        // The next writing run rolls the first write back before deciding.
+        let next = apply(&inputs);
+        assert_eq!(next.actions(), vec![Action::Create, Action::Conflict]);
+        assert!(!StateDir::resolve(home.path()).journal().exists());
+    }
+
+    fn report_of(actions: &[Action]) -> Report {
+        Report {
+            changes: actions
+                .iter()
+                .map(|&action| Change {
+                    target: "~/.a".to_string(),
+                    origin: Origin::unknown(Path::new("/repo/bx.toml")),
+                    action,
+                    diff: None,
+                    note: None,
+                })
+                .collect(),
+            ..Report::default()
+        }
+    }
+
+    #[test]
+    fn t20_exit_follows_the_mode_and_whether_apply_wrote() {
+        use Action::{Blocked, Conflict, Create, Unchanged};
+
+        assert_eq!(exit(&report_of(&[]), Mode::Plan), Exit::Converged);
+        assert_eq!(exit(&report_of(&[Unchanged]), Mode::Plan), Exit::Converged);
+        assert_eq!(exit(&report_of(&[Create]), Mode::Plan), Exit::Pending);
+
+        let mut interrupted = report_of(&[Unchanged]);
+        interrupted.interrupted = Some(Interrupted {
+            kind: SessionKind::Apply,
+            journal: PathBuf::from("/state/journal"),
+            complete: false,
+            unreadable: true,
+            unfinished: Vec::new(),
+        });
+        assert_eq!(exit(&interrupted, Mode::Plan), Exit::Pending);
+
+        let mut executed = report_of(&[Create, Unchanged]);
+        executed.executed = true;
+        assert_eq!(exit(&executed, Mode::Apply), Exit::Converged);
+        let mut attention = report_of(&[Create, Blocked]);
+        attention.executed = true;
+        assert_eq!(exit(&attention, Mode::Apply), Exit::Pending);
+        let mut conflict = report_of(&[Conflict]);
+        conflict.executed = true;
+        assert_eq!(exit(&conflict, Mode::Apply), Exit::Pending);
+
+        assert_eq!(exit(&report_of(&[Create]), Mode::Apply), Exit::Pending);
+        assert_eq!(exit(&report_of(&[Unchanged]), Mode::Apply), Exit::Converged);
     }
 }

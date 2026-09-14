@@ -4,14 +4,21 @@
 //! two with [`crate::fs::compare`], and consults the ledger for ownership. It
 //! is handed shared references only and knows nothing of the mode it runs in,
 //! so `plan` and `apply` cannot reach different verdicts from one input.
+//!
+//! An [`Op`] is the write a decision produced. Its fields are private to this
+//! module, so no other code can make one, and it carries the observation and
+//! the bytes the decision was made on: what `apply` writes is what `plan`
+//! diffed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{Change, Diff, Error};
 use crate::config::resolve::Resolution;
 use crate::config::target::{Attach, Body, Direction, Format, Gen, Target};
 use crate::env_guard::{self, RootSet};
 use crate::fs::{self, Desired, Kind, Mode, Observed};
+use crate::journal::{Content, Ownership, Request};
+use crate::paths::Portable;
 use crate::report::Action;
 use crate::state::{LedgerEntry, LedgerView, Mechanism};
 
@@ -28,23 +35,62 @@ pub(super) struct Ctx<'a> {
     pub roots: &'a RootSet,
 }
 
-/// Decide what to do about one resolved target.
+/// One write a decision produced.
+///
+/// A mode-only change is an `Op` too: the same bytes rewritten at the new
+/// mode, journalled like any other write, so `rm` can put the old mode back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Op {
+    target: Portable,
+    dest: PathBuf,
+    bytes: Vec<u8>,
+    planned: Observed,
+    mode: Mode,
+}
+
+impl Op {
+    /// The target the write is for.
+    pub(super) const fn target(&self) -> &Portable {
+        &self.target
+    }
+
+    /// The journal request that makes this write, bx owning the whole file.
+    pub(super) fn into_request(self) -> Request {
+        Request {
+            target: self.target,
+            dest: self.dest,
+            content: Content::Bytes {
+                bytes: self.bytes,
+                planned: self.planned,
+            },
+            mode: self.mode,
+            ownership: Ownership::Owned(Mechanism::Own),
+        }
+    }
+}
+
+/// Decide what to do about one resolved target: its row, and the write it
+/// needs when it needs one.
 ///
 /// # Errors
 ///
 /// [`Error::Body`] when a `file` body cannot be read from the config repo, and
 /// [`Error::Fs`] when the destination cannot be observed.
-pub(super) fn decide(resolution: &Resolution<Target>, ctx: &Ctx<'_>) -> Result<Change, Error> {
+pub(super) fn decide(
+    resolution: &Resolution<Target>,
+    ctx: &Ctx<'_>,
+) -> Result<(Change, Option<Op>), Error> {
     let target = match resolution {
         Resolution::Ready(target) => target,
         Resolution::Blocked(entry) => {
-            return Ok(Change {
+            let change = Change {
                 target: entry.key.clone(),
                 origin: entry.origin.clone(),
                 action: Action::Blocked,
                 diff: None,
                 note: Some(entry.hint.clone()),
-            });
+            };
+            return Ok((change, None));
         }
     };
     let row = |action, diff, note| Change {
@@ -57,7 +103,7 @@ pub(super) fn decide(resolution: &Resolution<Target>, ctx: &Ctx<'_>) -> Result<C
 
     let bytes = match wanted(target, ctx)? {
         Wanted::Bytes(bytes) => bytes,
-        Wanted::Blocked(note) => return Ok(row(Action::Blocked, None, Some(note))),
+        Wanted::Blocked(note) => return Ok((row(Action::Blocked, None, Some(note)), None)),
     };
 
     let dest = target.path.render(ctx.home);
@@ -94,7 +140,15 @@ pub(super) fn decide(resolution: &Resolution<Target>, ctx: &Ctx<'_>) -> Result<C
             )
         })
         .flatten();
-    Ok(row(action, diff, note))
+    let change = row(action, diff, note);
+    let op = action.is_pending().then(|| Op {
+        target: target.path.clone(),
+        dest,
+        bytes,
+        planned: observed,
+        mode,
+    });
+    Ok((change, op))
 }
 
 /// The bytes a target wants, or why it cannot have any yet.
@@ -220,12 +274,9 @@ fn join(parts: impl IntoIterator<Item = Option<String>>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::config::Origin;
     use crate::config::target::KeyPath;
-    use crate::paths::Portable;
     use crate::testing::guarded_home;
 
     fn a_target(home: &Path, path: &str) -> Target {
@@ -267,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_3_an_unsupported_shape_is_blocked_before_anything_is_read() {
+    fn decision_3_an_unsupported_shape_is_blocked_with_no_write() {
         let home = guarded_home();
         let ledger = LedgerView::default();
         let roots = RootSet::strict();
@@ -311,8 +362,9 @@ mod tests {
         ];
 
         for (target, entry) in cases {
-            let change = decide(&Resolution::Ready(target.clone()), &ctx).expect("no read");
+            let (change, op) = decide(&Resolution::Ready(target.clone()), &ctx).expect("no read");
             assert_eq!(change.action, Action::Blocked, "{target:?}");
+            assert_eq!(op, None, "{target:?}");
             assert_eq!(change.diff, None);
             let note = change.note.expect("a note");
             assert!(
@@ -323,6 +375,42 @@ mod tests {
             assert_eq!(change.origin.line, 3);
         }
         assert!(!home.child(".a").exists());
+    }
+
+    #[test]
+    fn only_a_create_or_a_modify_produces_a_write_and_it_is_the_decided_one() {
+        let home = guarded_home();
+        home.write(".mine", "user\n");
+        let ledger = LedgerView::default();
+        let roots = RootSet::strict();
+        let ctx = Ctx {
+            ledger: &ledger,
+            home: home.path(),
+            repo: &home.child(".config/bx"),
+            roots: &roots,
+        };
+
+        let (change, op) =
+            decide(&Resolution::Ready(a_target(home.path(), "~/.new")), &ctx).expect("decide");
+        assert_eq!(change.action, Action::Create);
+        let op = op.expect("a create writes");
+        assert_eq!(op.target().as_str(), "~/.new");
+        let request = op.into_request();
+        assert_eq!(request.dest, home.child(".new"));
+        assert_eq!(request.mode, Mode::DEFAULT_FILE);
+        assert_eq!(request.ownership, Ownership::Owned(Mechanism::Own));
+        match request.content {
+            Content::Bytes { bytes, planned } => {
+                assert_eq!(bytes, b"x\n");
+                assert_eq!(planned.kind, Kind::Absent);
+            }
+            Content::Absent { .. } => panic!("a create is bytes"),
+        }
+
+        let (change, op) =
+            decide(&Resolution::Ready(a_target(home.path(), "~/.mine")), &ctx).expect("decide");
+        assert_eq!(change.action, Action::Conflict);
+        assert_eq!(op, None);
     }
 
     #[test]

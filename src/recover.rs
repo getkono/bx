@@ -498,14 +498,17 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     };
     let mut conflicts = Vec::new();
     let mut resolved = 0_usize;
-    // The directories the terminated session's removals claimed. The session
-    // prunes them after its `End` frame, so a crash between the two leaves
-    // them standing. Handing on what still stands is bookkeeping its save may
-    // not have reached; recovery removes none of them, because a terminated
-    // session is never rolled back or finished on its behalf, and one no
-    // entry is beneath is left for `bx doctor`, as decision 11 keeps an
-    // orphaned temporary file.
-    let mut released = Vec::new();
+    // Every directory a target the terminated session dropped from the ledger
+    // claimed. The session prunes a removal's after its `End` frame, so a crash
+    // between the two leaves them standing. Handing on what still stands is
+    // bookkeeping its save may not have reached; recovery removes none of them,
+    // because a terminated session is never rolled back or finished on its
+    // behalf, and one no entry is beneath is left for `bx doctor`, as
+    // decision 11 keeps an orphaned temporary file.
+    //
+    // Owned rather than borrowed from the intents, because a dropped entry's
+    // own claims are rendered here and belong to nobody else.
+    let mut released: Vec<PathBuf> = Vec::new();
 
     let mut intents = loaded.landed();
     if !complete {
@@ -566,11 +569,21 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 }
             }
             Step::Forget => {
-                if let Some(ledger) = ledger.as_mut() {
-                    ledger.forget(&intent.target);
-                }
+                let dropped = ledger
+                    .as_mut()
+                    .and_then(|ledger| ledger.forget(&intent.target));
                 if intent.after == Written::Absent {
-                    released.extend(&intent.created_dirs);
+                    released.extend(intent.created_dirs.iter().cloned());
+                }
+                // The entry's *own* claims, which are not always the Intent's.
+                // A removal's Intent carries them, because `plan_restore` takes
+                // them from the entry; a released write's does not — it records
+                // only the directories that write invented, which is none. The
+                // replay path drops the same entry `Session::write` drops, so
+                // it has to carry the same claim on, or a crash turns a
+                // hand-off into a loss. See `r3 round 4` decision R3R4-1.
+                if let (Some(dropped), Some(home)) = (dropped, home) {
+                    released.extend(dropped.created_dirs.iter().map(|dir| dir.render(home)));
                 }
             }
         }
@@ -594,7 +607,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     }
 
     if let (Some(ledger), Some(home)) = (ledger.as_mut(), home) {
-        journal::hand_off_claims(ledger, home, released)?;
+        journal::hand_off_claims(ledger, home, &released)?;
     }
 
     if let Some(ledger) = &ledger {
@@ -2164,6 +2177,98 @@ mod tests {
             ExclusiveLock::try_acquire(&state).expect("try").is_some(),
             "the refused session released the lock",
         );
+    }
+
+    #[test]
+    fn replaying_a_released_write_hands_on_the_directories_its_entry_claimed() {
+        // r3 round 4, D1 and COV2. `Session::write` was repaired in round 3 to
+        // stop discarding the entry `ledger.forget` returns; `resolve`'s
+        // `Step::Forget` still discarded it, so the same `rm`, crashed between
+        // its `End` frame and its save, lost the claims the live path keeps.
+        // `hand_off_claims` documents the replay as running "the same hand-off
+        // … so a crash between the `End` frame and the save loses no claim",
+        // and nothing reached `Step::Forget` for a released write at all.
+        //
+        // A released write's Intent cannot stand in for the entry: it records
+        // the directories *that write* invented, which for a write over a file
+        // that is already there is none.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dir = home.child(".config/app");
+        let claims = vec![home.child(".config"), home.child(".config/app")];
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        for rel in [".config/app/a.conf", ".config/app/heir.conf"] {
+            session
+                .apply(write_to(home.path(), rel, "bx\n", Mode::DEFAULT_FILE))
+                .expect("apply");
+        }
+        session.finish().expect("finish");
+        let (a, a_dest) = target(home.path(), ".config/app/a.conf");
+        let (heir, _) = target(home.path(), ".config/app/heir.conf");
+        let saved_claims = |what: &Portable| -> Vec<PathBuf> {
+            let mut dirs = LedgerView::read(&state, home.path())
+                .expect("read the ledger")
+                .value
+                .get(what)
+                .map(|entry| {
+                    entry
+                        .created_dirs
+                        .iter()
+                        .map(|d| d.render(home.path()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            dirs.sort();
+            dirs
+        };
+        assert_eq!(saved_claims(&a), claims, "a.conf claims both directories");
+        assert!(saved_claims(&heir).is_empty());
+
+        // `rm a.conf` hands the file back and then dies between its `End`
+        // frame and its ledger save: a terminated journal over a ledger that
+        // still holds the entry.
+        interrupted(
+            &state,
+            home.path(),
+            vec![Request {
+                target: a.clone(),
+                dest: a_dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"theirs\n".to_vec(),
+                    planned: fs::observe(&a_dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Released,
+            }],
+        );
+        seal(&state.journal(), 1);
+        let intent = journal::load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .cloned()
+            .expect("the released write's Intent");
+        assert!(
+            intent.created_dirs.is_empty(),
+            "the Intent carries no claim of its own: {:?}",
+            intent.created_dirs,
+        );
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 },
+        );
+        assert!(saved_claims(&a).is_empty(), "the entry was handed back");
+        assert_eq!(
+            saved_claims(&heir),
+            claims,
+            "and its claims reached the entry still beneath them, as the live \
+             path's do",
+        );
+        assert_eq!(peek(&a_dest).expect("handed back").0, b"theirs\n");
+        assert!(dir.is_dir(), "nothing was pruned: no removal was announced");
     }
 
     #[test]

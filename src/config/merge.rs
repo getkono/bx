@@ -2408,6 +2408,61 @@ mod tests {
         );
     }
 
+    /// The values one layer set resolves to, for a predicate taken on its own.
+    fn resolved(layers: &[Layer]) -> ResolvedValues {
+        let decls: Vec<ValueDecl> = layers
+            .iter()
+            .flat_map(|layer| layer.config.values.clone())
+            .collect();
+        let given: Vec<ValueAssignment> = layers
+            .iter()
+            .flat_map(|layer| layer.config.value_assignments.clone())
+            .collect();
+        ResolvedValues::resolve(decls, &given, &home()).expect("the fixture's values resolve")
+    }
+
+    #[test]
+    fn a_toggle_is_anchored_by_a_full_entry_in_any_layer_folded_so_far() {
+        // `anchored` taken on its own, because neither source it adds to the
+        // first can be told apart through a hint: a same-layer entry one path
+        // as written with the toggle is refused before a hint is chosen (see
+        // `toggles_one_path_past_a_placeholder_are_the_layer_s_defect_whatever_climbs`),
+        // and an entry a later layer declares settles the clash instead of
+        // rewording it (see resolve.rs's
+        // `one_file_clashing_in_two_layers_is_recorded_for_each_and_settled_only_by_name`).
+        // What the predicate answers is still what the hints rest on, so each
+        // source it consults is pinned here.
+        let declaring = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "[[value]]\nname = \"p\"\nkind = \"string\"\n{}",
+                    target_toml("~/.config/{{p}}/s", "P")
+                ),
+            )
+        };
+        let answering = || local("[values]\np = \"default\"\n");
+        let values = resolved(&[declaring(), answering()]);
+        let folded = declaring();
+
+        assert!(
+            anchored("~/.config/{{p}}/./s", &[&folded], &answering(), &values),
+            "an earlier layer's entry anchors it"
+        );
+        assert!(
+            anchored("~/.config/{{p}}/./s", &[], &declaring(), &values),
+            "its own layer's entry anchors it"
+        );
+        assert!(
+            !anchored("~/.config/default/s", &[&folded], &answering(), &values),
+            "a spelling only this account's answer pairs with the entry does not"
+        );
+        assert!(
+            !anchored("~/.config/{{p}}/./s", &[], &answering(), &values),
+            "a layer set that declares nothing anchors nothing"
+        );
+    }
+
     #[test]
     fn a_removal_that_leaves_two_statements_naming_one_file_names_the_answer_too() {
         // Three statements, one flagged: two full entries and a toggle bx

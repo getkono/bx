@@ -844,14 +844,17 @@ fn check_requirement(text: &str) -> Result<(), String> {
 ///
 /// So two reports of one problem read the same way regardless of which field
 /// happened to be probed first.
+///
+/// Indexed against [`ResolvedValues::index_of`], which counts every
+/// declaration, rather than [`ResolvedValues::decls`], which lists only the
+/// enabled ones. The difference shows in exactly one caller:
+/// [`BlockReason::DisabledValue`], whose names are switched off by definition.
+/// Against the filtered list every one of them would come back `usize::MAX`,
+/// leaving the sort to report them in whichever order the fields happened to be
+/// probed — the one thing this function exists to prevent, in the one block
+/// that cannot avoid it.
 fn in_declaration_order(values: &ResolvedValues, mut names: Vec<String>) -> Vec<String> {
-    let index = |name: &String| {
-        values
-            .decls()
-            .iter()
-            .position(|decl| &decl.name == name)
-            .unwrap_or(usize::MAX)
-    };
+    let index = |name: &String| values.index_of(name).unwrap_or(usize::MAX);
     names.sort_by_key(index);
     names.dedup();
     names
@@ -3487,6 +3490,37 @@ mod tests {
             BlockReason::InvalidValue {
                 names: vec!["s".to_string()]
             }
+        );
+    }
+
+    #[test]
+    fn switched_off_names_are_ordered_by_declaration_like_every_other_block() {
+        // `a` is declared before `b`, and the target names `b` in its path and
+        // `a` in its body, so the probe meets them the other way round —
+        // `for_each_string` visits the path first. `BlockReason::DisabledValue`
+        // documents its names as being in declaration order, like every other
+        // block reason, and a switch does not move a declaration.
+        let resolved = resolved(
+            "[[value]]\nname = \"a\"\nkind = \"string\"\n\
+             [[value]]\nname = \"b\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{b}}\"\ncontent = \"{{a}}\"\n",
+            Some(
+                "[[value]]\nname = \"a\"\nenabled = false\n\
+                 [[value]]\nname = \"b\"\nenabled = false\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&resolved, 0).reason,
+            BlockReason::DisabledValue {
+                names: vec!["a".to_string(), "b".to_string()]
+            }
+        );
+        assert!(
+            blocked(&resolved, 0).hint.starts_with("re-enable a, b"),
+            "{}",
+            blocked(&resolved, 0).hint
         );
     }
 

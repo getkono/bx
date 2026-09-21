@@ -1416,8 +1416,13 @@ impl ResolvedValues {
             .join("; ")
     }
 
-    /// The declaration index of `name`.
-    fn index_of(&self, name: &str) -> Option<usize> {
+    /// The declaration index of `name`, switched off or not.
+    ///
+    /// Unfiltered, unlike [`ResolvedValues::decls`]: a declaration's position is
+    /// where it was written, and `enabled` does not move it. That is what lets
+    /// `resolve`'s `in_declaration_order` order the names of a block that is
+    /// *about* switched-off declarations.
+    pub(crate) fn index_of(&self, name: &str) -> Option<usize> {
         self.decls.iter().position(|decl| decl.name == name)
     }
 

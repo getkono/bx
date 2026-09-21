@@ -1617,6 +1617,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn decision_33_a_finished_sessions_rows_are_shown_in_the_plan_view() {
+        // P42R2-CL3. `command::apply_with` renders its approval prompt with
+        // View::Plan, which hides Unchanged rows — and over a finished session
+        // every row IS Unchanged, so the user was asked to confirm a recovery
+        // that named none of the files it was about to record.
+        let guard = guarded_home();
+        let home = guard.child("home");
+        seed_crash(&home);
+        assert!(
+            !spawn_crash_child(&home, CRASH_WRITES, finish_crash_phases()[0])
+                .status
+                .success()
+        );
+        let loaded = load(&home);
+        let report = plan(&loaded);
+        assert_eq!(report.actions(), vec![Action::Unchanged; CRASH_WRITES]);
+
+        let shown = render(&report, View::Plan, Palette::PLAIN, &home);
+
+        for change in &report.changes {
+            assert!(
+                shown.contains(&change.target),
+                "the approval prompt does not name {}: {shown}",
+                change.target
+            );
+        }
+
+        // The rule the exception is carved out of still holds: with no
+        // interruption standing, an unchanged configured target stays hidden.
+        let settled_home = guarded_home();
+        let settled = inputs(&settled_home, &inline("~/.settled", "x\\n"));
+        assert!(apply(&settled).executed);
+        let converged = plan(&settled);
+        assert_eq!(converged.interrupted, None);
+        assert_eq!(converged.actions(), vec![Action::Unchanged]);
+        assert!(
+            !render(&converged, View::Plan, Palette::PLAIN, settled_home.path())
+                .contains("~/.settled"),
+            "an unchanged target is shown with no interruption standing"
+        );
+    }
+
+    #[test]
     fn t14_a_standing_interruption_is_reported_as_its_roll_back_and_plan_writes_nothing() {
         // Decision 18 reverses this test's earlier expectation, that every
         // interrupted write is a conflict. A write recovery resolves on its own

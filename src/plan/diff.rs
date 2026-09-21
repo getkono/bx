@@ -241,7 +241,7 @@ pub fn render(report: &Report, view: View, palette: Palette, home: &Path) -> Str
         out.push('\n');
     }
     for change in &report.changes {
-        if view == View::Plan && change.action == Action::Unchanged {
+        if view == View::Plan && change.action == Action::Unchanged && !interrupted(report) {
             continue;
         }
         row(&mut out, change, palette, home);
@@ -249,6 +249,28 @@ pub fn render(report: &Report, view: View, palette: Palette, home: &Path) -> Str
     out.push_str(&report::summary(&report.actions()));
     out.push('\n');
     out
+}
+
+/// Whether every row in this report is about an interrupted session rather
+/// than about a configured target.
+///
+/// # Decision 33: an interrupted session's rows are never hidden
+///
+/// [`View::Plan`] hides an [`Action::Unchanged`] row, because a target already
+/// in its declared state is noise in a list of work. Over an interrupted
+/// session that rule hid the work itself: `run` decides no configured target
+/// while a journal stands, so every row is about the session, and a session
+/// that wrote everything but did not record it makes every one of them
+/// `Unchanged` — recording a write touches no file. `View::Plan` therefore
+/// printed a banner, a summary line, and not one target.
+///
+/// `command::apply_with` renders its approval prompt with [`View::Plan`] too,
+/// so the user was asked to confirm a recovery that named none of the files it
+/// was about to record. A confirmation prompt that cannot show what it is
+/// confirming is not one a user can answer, and the rows already exist — only
+/// the filter stood between them and the screen.
+fn interrupted(report: &Report) -> bool {
+    report.interrupted.is_some()
 }
 
 /// The line above the rows, when the state directory has something to say.

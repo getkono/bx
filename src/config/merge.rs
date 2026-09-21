@@ -700,11 +700,15 @@ fn clash(
 ///
 /// Which source decides a hint, and which cannot: only an earlier layer's
 /// entry can. An entry in `layer` itself is one path as written with the
-/// toggle, so [`clash`] refuses the pair as that layer naming one file twice
-/// before any hint is chosen. And an entry a later layer declares would settle
-/// the clash rather than change its hint, since a full entry drops every clash
-/// held for its file. Both arms are kept all the same: this answers what bx
-/// can show about one toggle, and neither of those rules is its to assume.
+/// toggle, so the pair is refused before a hint is chosen — by [`clash`], as
+/// that layer naming one file twice, while the file is known; and by
+/// [`unknown_toggle`] when it is not, since a spelling waiting on a value is
+/// keyed by its own text, so two spellings of one form are two keys and the
+/// toggle reaches no entry at all. And an entry a later layer declares would
+/// settle the clash rather than change its hint, since a full entry drops
+/// every clash held for its file. Both arms are kept all the same: this
+/// answers what bx can show about one toggle, and none of those rules is its
+/// to assume.
 fn anchored(toggle: &str, earlier: &[&Layer], layer: &Layer, values: &ResolvedValues) -> bool {
     earlier
         .iter()
@@ -2425,8 +2429,12 @@ mod tests {
     fn a_toggle_is_anchored_by_a_full_entry_in_any_layer_folded_so_far() {
         // `anchored` taken on its own, because neither source it adds to the
         // first can be told apart through a hint: a same-layer entry one path
-        // as written with the toggle is refused before a hint is chosen (see
-        // `toggles_one_path_past_a_placeholder_are_the_layer_s_defect_whatever_climbs`),
+        // as written with the toggle is refused before a hint is chosen, by
+        // `clash` while the file is known (see
+        // `toggles_one_path_past_a_placeholder_are_the_layer_s_defect_whatever_climbs`)
+        // and by `unknown_toggle` when it is not, each spelling being keyed by
+        // its own text then (see
+        // `a_toggle_for_a_target_waiting_on_a_value_names_the_declared_spelling`);
         // and an entry a later layer declares settles the clash instead of
         // rewording it (see resolve.rs's
         // `one_file_clashing_in_two_layers_is_recorded_for_each_and_settled_only_by_name`).

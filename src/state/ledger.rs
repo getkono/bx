@@ -360,15 +360,34 @@ impl LedgerView {
     /// aside under the lock, so nothing is lost and a human can see what
     /// happened to it.
     ///
-    /// A row listing a `created_dirs` entry that is not an ancestor of its own
-    /// target is removed the same way, as
-    /// [`super::Damage::UnrelatedCreatedDirs`]. [`check_created_dirs`] refuses
-    /// one on the way in, so a stored one is not something bx wrote; left in
-    /// place it would be sorted among real ancestors by a depth that says
-    /// nothing about it, and `bx rm` would remove a directory it never created
-    /// for that target. The rule was enforced on the write path and nowhere on
-    /// the load path, which is the half that faces untrusted bytes
-    /// (r4 round 2, D9).
+    /// A `created_dirs` entry that is not an ancestor of its own target costs
+    /// **that directory** and nothing else: it is dropped from the entry's
+    /// list, the entry, its prior and its history are kept, and the loss is
+    /// named in a [`super::Damage::UnrelatedCreatedDirs`].
+    /// [`check_created_dirs`] refuses one on the way in, so a stored one is
+    /// not something bx wrote; left in place it would be sorted among real
+    /// ancestors by a depth that says nothing about it, and `bx rm` would
+    /// remove a directory it never created for that target. The rule was
+    /// enforced on the write path and nowhere on the load path, which is the
+    /// half that faces untrusted bytes (r4 round 2, D9).
+    ///
+    /// Dropping the whole entry for it would take the user's displaced bytes
+    /// out of the index — the one thing recomputation cannot rebuild — to be
+    /// rid of a bad directory name, which is a larger degradation than the
+    /// damage and is what decision 52 forbids (r4 round 3, D2 and CL4).
+    ///
+    /// # One damage is reported, and it is the whole of what was lost
+    ///
+    /// The health carries one [`super::Damage`], and
+    /// [`super::Damage::is_partial`] promises that what its rows name is the
+    /// whole of what the load dropped. So when a file carries both kinds, the
+    /// key mismatch is reported **and is the only thing acted on**: the stray
+    /// directories are left exactly as they are, the file is quarantined whole
+    /// so a human has them, and the next load — of the clean file this one's
+    /// caller saves — strips them and says so. Two loads to converge on a
+    /// tampered file, and each one's report is true. Acting on both while
+    /// naming one was the round-2 shape, and it made `is_partial`'s promise
+    /// false (r4 round 3, D1).
     ///
     /// All-or-nothing was the wrong degradation for this file. `CLAUDE.md`
     /// requires a corrupt machine-owned file to degrade to recomputation, and
@@ -407,32 +426,40 @@ impl LedgerView {
         // not above its target and quietly dropped. A salvaged ledger must
         // also be one the next open would accept.
         self.check_against_home(file, home)?;
-        let unrelated: Vec<_> = self
-            .entries
-            .iter()
-            .filter_map(|(key, entry)| {
-                unrelated_created_dir(&entry.path, &entry.created_dirs)
-                    .map(|dir| (entry.path.as_str().to_string(), dir, key.clone()))
-            })
-            .collect();
-        for (.., key) in &unrelated {
-            self.entries.remove(key);
-        }
-        // Both kinds of row are removed; the graver of the two is what the
-        // damage names, and the quarantined file holds both for a human. A key
-        // that is not its entry's path is graver, because it makes `get`
-        // answer with another target's record, where an unrelated
-        // `created_dirs` entry costs only that target's directory list.
+        // A key mismatch is the graver of the two and is reported alone: the
+        // health carries one damage, and `Damage::is_partial` promises that
+        // what the rows name is the whole of what was lost. Stripping stray
+        // directories here as well would break that promise, because the
+        // reported rows would then not be the whole of it. The stray
+        // directories keep — the file is quarantined whole, so a human has
+        // them — and the next load of the file this one saves strips them and
+        // says so. Two loads to converge, and each one's report is true.
         if !mismatched.is_empty() {
             return Err(Rejected::PartialDamage(super::Damage::KeyMismatch {
                 rows: strip(mismatched),
             }));
         }
-        if !unrelated.is_empty() {
+        // A directory that is not above its target costs **that directory**,
+        // not the entry. The entry's prior is the user's displaced bytes and
+        // the one thing recomputation cannot rebuild; dropping it to be rid of
+        // a bad directory name would be a larger degradation than the damage,
+        // which is exactly what decision 52 forbids (r4 round 3, D2/CL4).
+        let mut stray = Vec::new();
+        for entry in self.entries.values_mut() {
+            let LedgerEntry {
+                path, created_dirs, ..
+            } = entry;
+            created_dirs.retain(|dir| {
+                if is_ancestor(dir, path) {
+                    return true;
+                }
+                stray.push((path.as_str().to_string(), dir.as_str().to_string()));
+                false
+            });
+        }
+        if !stray.is_empty() {
             return Err(Rejected::PartialDamage(
-                super::Damage::UnrelatedCreatedDirs {
-                    rows: strip(unrelated),
-                },
+                super::Damage::UnrelatedCreatedDirs { rows: stray },
             ));
         }
         Ok(())
@@ -654,7 +681,7 @@ fn check_created_dirs(entry: &NewEntry) -> Result<(), Error> {
     }
 }
 
-/// The first of `dirs` that is not a lexical ancestor of `target`, if any.
+/// Whether `dir` is a lexical ancestor of `target`.
 ///
 /// The one statement of the rule, so the refusal `record` gives on the way in
 /// and the damage a load finds on the way out cannot disagree. Lexical, and it
@@ -662,15 +689,19 @@ fn check_created_dirs(entry: &NewEntry) -> Result<(), Error> {
 /// deserialisation, so no `..`, `.`, `//` or trailing slash reaches here. The
 /// `'/'` test is what keeps `~/.config` from being read as an ancestor of
 /// `~/.config.bak`, and a path is not its own ancestor.
+fn is_ancestor(dir: &crate::paths::Portable, target: &crate::paths::Portable) -> bool {
+    let (dir, target) = (dir.as_str(), target.as_str());
+    target.starts_with(dir) && target[dir.len()..].starts_with('/')
+}
+
+/// The first of `dirs` that is not an ancestor of `target`, if any.
 fn unrelated_created_dir(
     target: &crate::paths::Portable,
     dirs: &[crate::paths::Portable],
 ) -> Option<String> {
-    let target = target.as_str();
     dirs.iter()
-        .map(crate::paths::Portable::as_str)
-        .find(|dir| !target.starts_with(*dir) || !target[dir.len()..].starts_with('/'))
-        .map(str::to_string)
+        .find(|dir| !is_ancestor(dir, target))
+        .map(|dir| dir.as_str().to_string())
 }
 
 /// [`Error::PriorConflict`] when re-recording `existing` with `incoming` would
@@ -3933,11 +3964,33 @@ mod tests {
         let view = LedgerView::read(&dir, home.path()).expect("read");
         assert_eq!(view.health, Health::Damaged(damage.clone()));
         assert!(damage.is_partial(), "the rows named are the whole loss");
+        // r4 round 3 (D2, CL4): the entry is **kept** and only the directory is
+        // dropped. Losing the entry would take the user's displaced bytes out
+        // of the index to be rid of a bad directory name.
         let kept: Vec<_> = view.value.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(
             kept,
-            vec!["~/.config/tool/x.conf"],
-            "the row that checks out"
+            vec![
+                "~/.cache/z",
+                "~/.config/other/y.conf",
+                "~/.config/tool/x.conf"
+            ],
+            "every entry survives; only the stray directories go",
+        );
+        let dirs = |view: &LedgerView, name: &str| {
+            view.get(&target(name))
+                .expect("entry")
+                .created_dirs
+                .iter()
+                .map(|d| d.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(dirs(&view.value, "~/.config/other/y.conf").is_empty());
+        assert!(dirs(&view.value, "~/.cache/z").is_empty());
+        assert_eq!(
+            dirs(&view.value, "~/.config/tool/x.conf"),
+            vec!["~/.config".to_string()],
+            "a real ancestor is untouched",
         );
         assert!(
             damage.to_string().contains("which is not above it"),
@@ -3949,6 +4002,99 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
             seeded,
+        );
+    }
+
+    #[test]
+    fn a_ledger_damaged_both_ways_reports_and_acts_on_the_graver_only() {
+        // r4 round 3 (D1, COV1): with both kinds of row damage present the
+        // round-2 code dropped both row sets and named only the key mismatch,
+        // which makes `Damage::is_partial`'s promise — that what the rows name
+        // is the whole of what was lost — false. And no test staged both, so
+        // the "graver of the two" selection was reached by nothing.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut entries = BTreeMap::new();
+        for (key, path, dirs) in [
+            // A key that is not its entry's path: the graver damage.
+            (target("~/.aaaa"), target("~/.zzzz"), Vec::<Portable>::new()),
+            // A stray `created_dirs` entry, in a row whose key is its path.
+            (
+                target("~/.config/tool/x.conf"),
+                target("~/.config/tool/x.conf"),
+                vec![target("~/.config/tool"), target("~/.cache")],
+            ),
+        ] {
+            entries.insert(
+                key,
+                LedgerEntry {
+                    path,
+                    written: ContentHash::of(b"x"),
+                    mode: Mode::DEFAULT_FILE,
+                    mechanism: Mechanism::Own,
+                    prior: Prior::Absent,
+                    created_dirs: dirs,
+                    superseded: Vec::new(),
+                    superseded_absent: false,
+                },
+            );
+        }
+        store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
+
+        // The first load names the key mismatch, and *only* the key mismatch
+        // is acted on: the stray directory is still there.
+        let first = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(
+            first.health,
+            Health::Damaged(Damage::KeyMismatch {
+                rows: vec![("~/.aaaa".to_string(), "~/.zzzz".to_string())],
+            }),
+            "the graver of the two",
+        );
+        let survivor = first
+            .value
+            .get(&target("~/.config/tool/x.conf"))
+            .expect("kept");
+        assert_eq!(
+            survivor
+                .created_dirs
+                .iter()
+                .map(|d| d.as_str())
+                .collect::<Vec<_>>(),
+            vec!["~/.config/tool", "~/.cache"],
+            "untouched, because the reported rows do not name it",
+        );
+
+        // Under the lock the same verdict, the file is quarantined, and the
+        // save the caller makes leaves a clean file still holding the stray.
+        let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert!(matches!(
+            opened.health,
+            Health::Reset(Damage::KeyMismatch { .. })
+        ));
+        opened.value.save().expect("save the survivors");
+
+        // The second load strips the stray directory and says so, keeping the
+        // entry. Two loads to converge, and each report was true.
+        let second = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(
+            second.health,
+            Health::Damaged(Damage::UnrelatedCreatedDirs {
+                rows: vec![("~/.config/tool/x.conf".to_string(), "~/.cache".to_string())],
+            }),
+        );
+        let entry = second
+            .value
+            .get(&target("~/.config/tool/x.conf"))
+            .expect("the entry survives");
+        assert_eq!(
+            entry
+                .created_dirs
+                .iter()
+                .map(|d| d.as_str())
+                .collect::<Vec<_>>(),
+            vec!["~/.config/tool"],
+            "the real ancestor stays, the stray goes",
         );
     }
 

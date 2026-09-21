@@ -1504,10 +1504,16 @@ mod tests {
         assert!(err.to_string().contains("Move it aside"), "{err}");
 
         // r4 round 2 (COV6): the call site used to be reached only when this
-        // process was unprivileged, so on a root CI runner nothing exercised
+        // process was unprivileged, so on a root runner nothing exercised
         // `tighten`'s `check_owner` at all and a mutant deleting the call
         // survived there. Root is the case that can *stage* a foreign owner
         // rather than the case that cannot, so it gets its own staging.
+        //
+        // **CI does not take that arm.** `.github/workflows/ci.yml` runs on
+        // `ubuntu-latest`, unprivileged, so CI runs the `else` below; the root
+        // arm is for a root container or a CI image that ever changes. It is
+        // recorded as such in the pull request body rather than left to imply
+        // coverage CI does not have (r4 round 3, D4 and COV3).
         let home = guarded_home();
         let (foreign, owner) = if rustix::process::geteuid().is_root() {
             // `/` is this process's own directory now, so one is made and
@@ -1515,7 +1521,13 @@ mod tests {
             let made = home.child("theirs");
             std::fs::create_dir(&made).expect("mkdir");
             let nobody = rustix::fs::Uid::from_raw(65_534);
-            rustix::fs::chown(&made, Some(nobody), None).expect("chown");
+            // A rootless user namespace maps one uid and leaves 65534
+            // unmapped, so `chown` fails `EINVAL` there. Nothing can be
+            // staged then, and a panic would report an environment as a
+            // defect — so the test steps aside instead (r4 round 3, D4).
+            if rustix::fs::chown(&made, Some(nobody), None).is_err() {
+                return;
+            }
             (made, 65_534)
         } else {
             // `/` is a real directory this account does not own, and `tighten`

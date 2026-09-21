@@ -751,13 +751,14 @@ fn degrade<T>(
 /// `HashMap`, `HashSet` and anything iterating over them are the shapes that
 /// break it.
 ///
-/// So the constraint is carried by a check **inside this function**, on every
-/// save a test makes: the bytes are decoded back into `T` and re-encoded, and
-/// the two encodings must be identical. Decoding builds every `HashMap` in the
-/// payload afresh, with its own `RandomState`, so a map that iterates in hash
-/// order encodes differently the second time and the save fails where it is
-/// made. That is why `T` is bound by [`DeserializeOwned`] as well as
-/// [`Serialize`] — every state payload is loadable anyway.
+/// So part of the constraint is carried by a check **inside this function**,
+/// by [`assert_reencodes_identically`]: the bytes are decoded back into `T`
+/// and re-encoded, [`REENCODES`] times, and every encoding must equal the
+/// first. Each decode builds every `HashMap` in the payload afresh, with its
+/// own `RandomState`, so a map that iterates in hash order comes back in a
+/// different order and the save fails where it is made. That is why `T` is
+/// bound by [`DeserializeOwned`] as well as [`Serialize`] — every state payload
+/// is loadable anyway.
 ///
 /// **It is here rather than at a call site because three call-site shapes in a
 /// row satisfied the obligation while proving nothing** (r4 rounds 1, 2 and 3):
@@ -765,21 +766,35 @@ fn degrade<T>(
 /// constructor that built the old fields and left a new one empty. Each fix
 /// closed the hole it was shown. A check a caller can write in a way that
 /// passes vacuously is not a constraint, and the call site is where the
-/// vacuity lives — so the constraint moved to the one place every payload
-/// type, present and future, has to go through, and which no test module can
-/// decline to call.
+/// vacuity lives — so this half of the constraint moved to the one place every
+/// payload type has to go through to write a file.
 ///
-/// What it catches: any map in any payload, at any depth, that holds two or
-/// more keys and iterates in hash order — on the first save any test makes of
-/// such a value. What it does not catch: a collection field **no test and no
-/// production path ever populates with two entries**. That residual is not a
-/// gap in Invariant 3: an empty or one-entry map encodes identically however it
-/// iterates, so a field nothing fills cannot make a generated file differ
-/// between runs. It becomes catchable the moment anything fills it.
+/// # Exactly what this catches, and what it does not
 ///
-/// [`assert_saves_identically`] remains, beside this, as the payload-type-level
-/// statement that *two independently built values* agree — the in-process
-/// stand-in for "between runs" that a single value cannot make.
+/// The check is `#[cfg(test)]` **at its call site**, so what it binds is
+/// *every save a test makes* — not every payload type. A payload type whose
+/// tests read and check but never save is not reached by it at all
+/// (r4 round 4, CL3, correcting a stronger claim this paragraph used to make).
+/// [`assert_saves_identically`] is what such a type's test module still has to
+/// call, and the two together are the obligation.
+///
+/// **Catches:** a map at any depth holding two or more keys and iterating in
+/// hash order — *with high probability, not with certainty*, and the
+/// probability is what [`REENCODES`] is for. **Does not catch, at all:**
+///
+/// * A collection no test and no production path ever fills with two entries.
+///   Not a gap in Invariant 3 — an empty or one-entry map encodes identically
+///   however it iterates, so a field nothing fills cannot make a generated file
+///   differ between runs. It becomes catchable the moment anything fills it.
+/// * **An order-dependent *sequence*.** A `Vec<String>` built by draining a
+///   `HashSet` is in hash order, and two independent builds of it differ — a
+///   real Invariant 3 breach — but a `Vec` decodes in its stored order and
+///   re-encodes identically, so no number of re-encodings here can see it. A
+///   64-element case was accepted 20 saves out of 20 (r4 round 4, D1).
+///   [`assert_saves_identically`] catches it, because it builds twice, and
+///   `the_two_construction_assertion_refuses_an_order_dependent_sequence`
+///   pins that it does. This is the class that makes the second mechanism
+///   necessary rather than redundant.
 ///
 /// # Errors
 ///
@@ -816,35 +831,63 @@ pub(crate) fn save<T: Serialize + DeserializeOwned>(
     Ok(())
 }
 
-/// Assert that `bytes`, decoded into `T` and encoded again, is `bytes`.
+/// How many times [`assert_reencodes_identically`] decodes and re-encodes.
 ///
-/// [`save`]'s determinism obligation, made where it cannot be opted out of.
-/// The decode is what gives it teeth: it builds every `HashMap` in the payload
-/// afresh, with its own `RandomState`, so a map that iterates in hash order
-/// comes back in a different order and the re-encoding differs. A `BTreeMap`
-/// comes back in key order both times, as do struct fields, which are emitted
-/// in declaration order by `to_vec_named`.
+/// One decode is not enough, and saying it was is what made [`save`]'s
+/// documented catch boundary false (r4 round 4, D1). A `HashMap` of *n* keys
+/// built twice iterates the same way often enough to matter at small *n*:
+/// measured over 3000 independent constructions per size, two builds are
+/// **detected as differing** 0/3000 times at one key, 1321/3000 at two,
+/// 2263/3000 at three, 2746/3000 at four, and 3000/3000 at eight and sixteen.
+/// So one comparison of a two-key map misses 56% of the time — and a red run
+/// would turn green on a re-run, which is worse than no check.
+///
+/// Each decode draws a fresh `RandomState`, so *k* comparisons miss
+/// `0.56^k`. At 32 that is about `1.2e-8` for the worst case, two keys, and
+/// smaller for every other size; a one-key map is undetectable at any *k* and
+/// is also harmless, since one entry encodes identically in any order.
+///
+/// The cost is *k* decodes and encodes of a small in-memory payload on every
+/// save a test makes, and only in a test build.
+#[cfg(test)]
+const REENCODES: usize = 32;
+
+/// Assert that `bytes`, decoded into `T` and encoded again, is `bytes` —
+/// [`REENCODES`] times over.
+///
+/// Half of [`save`]'s determinism obligation, made where a call site cannot
+/// write it vacuously. The decode is what gives it teeth: it builds every
+/// `HashMap` in the payload afresh, with its own `RandomState`, so a map that
+/// iterates in hash order comes back in a different order and the re-encoding
+/// differs. A `BTreeMap` comes back in key order every time, as do struct
+/// fields, which `to_vec_named` emits in declaration order.
 ///
 /// A decode failure is a failure too, and a real one: [`load`] would refuse
 /// the file this `save` is about to write, which is a payload type whose
 /// `Serialize` and `Deserialize` disagree.
 ///
+/// What it cannot see at all is an order-dependent *sequence* — see [`save`].
+///
 /// Test-only. The property is about the *type*, so one process establishing it
-/// for every payload the suite saves establishes it for every run; paying two
-/// encodings and a decode on every production save would buy nothing.
+/// for every payload the suite saves establishes it for every run; paying this
+/// on every production save would buy nothing.
 #[cfg(test)]
 fn assert_reencodes_identically<T: Serialize + DeserializeOwned>(bytes: &[u8], kind: &'static str) {
-    let decoded: Envelope<T> = match rmp_serde::from_slice(bytes) {
-        Ok(decoded) => decoded,
-        Err(why) => panic!("{kind} does not decode the bytes it just encoded: {why}"),
-    };
-    let again = rmp_serde::to_vec_named(&decoded).expect("re-encoding a decoded envelope");
-    assert!(
-        again == bytes,
-        "{kind} does not encode the same value to the same bytes: decoding it and encoding it \
-         again gives different bytes, which means something in the payload iterates in hash \
-         order. Invariant 3 forbids it — use a BTreeMap, not a HashMap",
-    );
+    for _ in 0..REENCODES {
+        // Decoded from the original bytes each time, so each round draws a new
+        // `RandomState` and the rounds are independent.
+        let decoded: Envelope<T> = match rmp_serde::from_slice(bytes) {
+            Ok(decoded) => decoded,
+            Err(why) => panic!("{kind} does not decode the bytes it just encoded: {why}"),
+        };
+        let again = rmp_serde::to_vec_named(&decoded).expect("re-encoding a decoded envelope");
+        assert!(
+            again == bytes,
+            "{kind} does not encode the same value to the same bytes: decoding it and encoding \
+             it again gives different bytes, which means something in the payload iterates in \
+             hash order. Invariant 3 forbids it — use a BTreeMap, not a HashMap",
+        );
+    }
 }
 
 /// Assert that a value built twice saves to the same bytes — [`save`]'s
@@ -868,9 +911,10 @@ fn assert_reencodes_identically<T: Serialize + DeserializeOwned>(bytes: &[u8], k
 /// bucket layout along with the contents, so two clones of one value iterate
 /// identically and a hash-ordered payload passes — which is exactly how both
 /// real call sites defeated this assertion when they read `|| value.clone()`
-/// (r4 round 2, D1). Build enough keys, too: measured over 3000 trials, two
-/// independently built hash maps agree 1456 times at two keys, 140 at four,
-/// and never at eight, sixteen or sixty-four (r4 round 3).
+/// (r4 round 2, D1). Build enough keys, too: two independently built maps are
+/// detected as differing 1321 times in 3000 at two keys, 2746 at four, and
+/// 3000 at eight and sixteen (r4 round 4), so a fixture below eight keys is
+/// a flaky assertion rather than a strong one.
 ///
 /// # What this does *not* establish, and what does
 ///
@@ -879,14 +923,19 @@ fn assert_reencodes_identically<T: Serialize + DeserializeOwned>(bytes: &[u8], k
 /// default satisfies this assertion while saying nothing about it — the third
 /// way a call site has satisfied the obligation vacuously (r4 round 3, D3).
 /// **That hole is closed in [`save`] itself, not here**: every save a test
-/// makes decodes its own bytes and re-encodes them, and no payload type or
-/// test module can decline to go through it. Read [`save`]'s own section for
-/// what that catches and what it leaves.
+/// makes decodes its own bytes and re-encodes them. Read [`save`]'s own
+/// section for what that catches and what it leaves.
 ///
-/// What this adds over that check, and the reason it stays: `save`'s check
-/// works on one value, and this one works on **two independently built**
-/// values. That is the in-process stand-in for "between runs", and one value
-/// cannot make it however often it is encoded.
+/// What this adds, and the reason it stays rather than being subsumed: `save`'s
+/// check works on **one** value, and this works on **two independently built**
+/// ones. That is the in-process stand-in for "between runs", and one value
+/// cannot make it however often it is re-encoded. The class that separates
+/// them is an order-dependent sequence — a `Vec` drained from a `HashSet` —
+/// which `save` cannot see at any number of re-encodings and this catches.
+/// Each mechanism has a test that fails when **only that one** is removed:
+/// `a_hash_ordered_payload_is_refused_by_saves_own_check` for `save`'s, and
+/// `the_two_construction_assertion_refuses_an_order_dependent_sequence` for
+/// this one (r4 round 4, COV1).
 ///
 /// [`save`] itself is called, rather than the encoder, so the property pinned
 /// is the one the file on disk has.
@@ -904,8 +953,10 @@ pub(crate) fn assert_saves_identically<T: Serialize + DeserializeOwned>(
     assert_eq!(
         std::fs::read(&path).expect("read"),
         first,
-        "{kind} does not encode the same value to the same bytes; Invariant 3 requires it, and \
-         a HashMap anywhere in the payload breaks it",
+        "{kind} encodes two independently built values with the same contents to different \
+         bytes; Invariant 3 requires a generated file to be byte-identical between runs, and \
+         anything that iterates in hash order breaks it — a HashMap or HashSet, or a sequence \
+         built by draining one",
     );
 }
 
@@ -1071,21 +1122,69 @@ mod tests {
         assert_saves_identically(KIND, VERSION, sample);
     }
 
+    // The determinism obligation is carried by two mechanisms, and each of the
+    // three tests below fails when *only its own* mechanism is removed. Until
+    // r4 round 4 one test stood for both: its 128-key `HashMap` payload tripped
+    // inside `save` before the helper's comparison ran, so neutering either
+    // mechanism alone left the suite green and only their disjunction was
+    // tested (r4 round 4, COV1).
+
     #[test]
-    fn the_shared_determinism_assertion_refuses_a_hash_ordered_payload() {
-        // The obligation is only worth stating if it can fail. A `HashMap`
-        // payload is the shape it exists to catch: two of them with the same
-        // contents iterate differently, because `RandomState` gives each its
-        // own keys, so the encoded bytes differ between one construction and
-        // the next — which is what Invariant 3 forbids.
-        let checked = std::panic::catch_unwind(|| {
-            assert_saves_identically(KIND, VERSION, || {
-                (0..128_u32)
-                    .map(|n| (format!("k{n}"), n))
-                    .collect::<std::collections::HashMap<String, u32>>()
-            });
+    #[should_panic(expected = "decoding it and encoding it again gives different bytes")]
+    fn a_hash_ordered_payload_is_refused_by_saves_own_check() {
+        // `save` alone, with no helper in the picture: one value, saved once.
+        // The helper cannot make this pass or fail.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hashed: std::collections::HashMap<String, u32> =
+            (0..128_u32).map(|n| (format!("k{n}"), n)).collect();
+        let _ = save(&dir.path().join("v.mpk"), KIND, VERSION, &hashed);
+    }
+
+    #[test]
+    #[should_panic(expected = "two independently built values")]
+    fn the_two_construction_assertion_refuses_an_order_dependent_sequence() {
+        // The helper alone: a payload `save`'s check *accepts* and two
+        // independent builds differ on. A `Vec` drained from a `HashSet` is in
+        // hash order, but it decodes in its stored order and re-encodes
+        // identically, so no number of re-encodings inside `save` can see it —
+        // while two builds of it are two different orders, which is the
+        // Invariant 3 breach. This is the class that makes the second
+        // mechanism necessary rather than redundant (r4 round 4, D1).
+        #[derive(Serialize, Deserialize)]
+        struct Ordered {
+            order: Vec<String>,
+        }
+        assert_saves_identically(KIND, VERSION, || Ordered {
+            order: (0..64_u32)
+                .map(|n| format!("k{n}"))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect(),
         });
-        assert!(checked.is_err(), "a HashMap payload must not pass");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not decode the bytes it just encoded")]
+    fn a_payload_whose_encoding_it_cannot_read_back_is_refused() {
+        // r4 round 4 (COV3): the decode arm of `save`'s own check was reached
+        // by nothing, so a mutant turning the panic into a silent `return`
+        // survived. A type whose `Serialize` and `Deserialize` disagree is what
+        // reaches it, and it is a real condition: `load` would refuse the file
+        // the save is about to write.
+        struct Mismatched;
+        impl Serialize for Mismatched {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str("not a number")
+            }
+        }
+        impl<'de> Deserialize<'de> for Mismatched {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                u32::deserialize(d).map(|_| Self)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _ = save(&dir.path().join("v.mpk"), KIND, VERSION, &Mismatched);
     }
 
     #[test]

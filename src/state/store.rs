@@ -266,6 +266,28 @@ pub struct Loaded<T> {
     /// only index there is to the user's restore blobs, so `plan` and `doctor`
     /// should name every one until a human moves it; bx never deletes them.
     pub quarantined: Vec<PathBuf>,
+    /// The state directory, when it could not be listed, so
+    /// [`Loaded::quarantined`] is what is *known* rather than what is there.
+    ///
+    /// `None` whenever the listing succeeded, a listing that found none
+    /// included. `Some` says the load itself finished — the value and the
+    /// health are what they say, and a quarantine this load made was
+    /// completed and its bytes are safe — and only the listing failed. An
+    /// empty `quarantined` alongside a `Some` therefore means nothing is
+    /// known, never that nothing is there.
+    ///
+    /// A directory bx cannot list is reported this way rather than as
+    /// [`Error::Read`] because the two are different facts. `Error::Read` from
+    /// a load means *the file's bytes were never seen*, and a caller matching
+    /// on it expects the state file's own path; a listing failure would have
+    /// named the directory, and would have discarded a rename that had already
+    /// happened. A state directory left at `0300` — searchable and writable,
+    /// not readable — used to fail every `LedgerView::read` and
+    /// `Fingerprints::read` with no remedy named, though each file in it read
+    /// perfectly well.
+    ///
+    /// The cause is logged with the failure through `tracing::warn!`.
+    pub unlisted: Option<PathBuf>,
 }
 
 impl<T> Loaded<T> {
@@ -275,6 +297,7 @@ impl<T> Loaded<T> {
             value: f(self.value),
             health: self.health,
             quarantined: self.quarantined,
+            unlisted: self.unlisted,
         }
     }
 }
@@ -334,7 +357,26 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
     let mut loaded = judge(path, kind, version, loss, lock, check)?;
     // Listed after any quarantine this load made, and whatever the health: an
     // earlier run's quarantine must not hide behind `Fresh`.
-    loaded.quarantined = quarantines(path)?;
+    //
+    // A listing that fails does not fail the load. `judge` may already have
+    // renamed the damaged file, and returning `Error::Read` here would report
+    // a completed quarantine as a read that never happened — and would brick
+    // every read of a state directory that is persistently unlistable, though
+    // the file itself read perfectly. The load stands, and the unknown is
+    // reported in `Loaded::unlisted`.
+    match quarantines(path) {
+        Ok(found) => loaded.quarantined = found,
+        Err(why) => {
+            let dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+            tracing::warn!(
+                path = %path.display(),
+                directory = %dir.display(),
+                "{why}. {} was read; the quarantines of it that are present are not known.",
+                path.display(),
+            );
+            loaded.unlisted = Some(dir);
+        }
+    }
     Ok(loaded)
 }
 
@@ -377,6 +419,7 @@ fn judge<T: DeserializeOwned + Default>(
                     value: T::default(),
                     health: Health::Fresh,
                     quarantined: Vec::new(),
+                    unlisted: None,
                 });
             }
             return Err(Error::Read {
@@ -394,6 +437,7 @@ fn judge<T: DeserializeOwned + Default>(
             value,
             health: Health::Loaded,
             quarantined: Vec::new(),
+            unlisted: None,
         }),
         // A newer format of a file nothing can rebuild is not believed and not
         // discarded: it is intact as far as anyone knows.
@@ -489,6 +533,7 @@ fn degrade<T: Default>(
             value: T::default(),
             health: Health::Damaged(damage),
             quarantined: Vec::new(),
+            unlisted: None,
         });
     };
     let quarantine = move_aside(path, lock).map_err(|source| Error::CannotQuarantine {
@@ -506,6 +551,7 @@ fn degrade<T: Default>(
         value: T::default(),
         health: Health::Reset(damage),
         quarantined: Vec::new(),
+        unlisted: None,
     })
 }
 
@@ -565,6 +611,82 @@ mod tests {
         let dir = StateDir::new(path.parent().expect("a parent").to_path_buf());
         let lock = ExclusiveLock::acquire(&dir).expect("lock");
         load(path, KIND, VERSION, Loss::Recomputable, Some(&lock))
+    }
+
+    /// A `tracing` sink that keeps what was written to it.
+    ///
+    /// No test in the repository installed a subscriber, so every
+    /// `tracing::warn!` in this module had its *argument expressions* executed
+    /// zero times: the enabled-check ran, found no subscriber, and the body
+    /// never did. Deleting a warning whose text the module documentation and
+    /// `state/mod.rs` both state as part of the contract left the whole suite
+    /// green (r4 round 1, COV2).
+    struct Sink;
+
+    thread_local! {
+        /// Where this thread's diagnostics go, when it is capturing.
+        static CAPTURED: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED.with(|slot| {
+                if let Some(into) = slot.borrow().as_ref() {
+                    into.lock().expect("the sink").extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            Self
+        }
+    }
+
+    /// Run `f` and return what it produced alongside the diagnostics it
+    /// emitted on this thread.
+    ///
+    /// The subscriber is installed **globally**, once, and routes to a
+    /// per-thread buffer, so a test captures only its own output however many
+    /// tests run at once. A thread-local subscriber would not do: `tracing`
+    /// caches each callsite's interest process-wide, so a thread with no
+    /// subscriber installed can cache "never" for a callsite another thread is
+    /// about to use, and the capture comes back empty at random.
+    fn capturing<T>(f: impl FnOnce() -> T) -> (T, String) {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(Sink)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish(),
+            )
+            .expect("no other global subscriber");
+        });
+
+        struct Stop;
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                CAPTURED.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let into = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        CAPTURED.with(|slot| *slot.borrow_mut() = Some(into.clone()));
+        let _stop = Stop;
+
+        let out = f();
+        let bytes = into.lock().expect("the sink").clone();
+        (out, String::from_utf8(bytes).expect("utf-8 diagnostics"))
     }
 
     /// Every name in `dir` but the lock file, sorted.
@@ -1123,7 +1245,14 @@ mod tests {
     }
 
     #[test]
-    fn a_state_directory_that_cannot_be_listed_is_an_error_not_an_empty_list() {
+    fn a_state_directory_that_cannot_be_listed_leaves_the_quarantines_unknown() {
+        // r4 round 1 (D8): the listing failure was returned as `Error::Read`,
+        // whose documented meaning is "the file's bytes were never seen" — and
+        // whose path was the directory, not the state file a caller matches
+        // on. It also discarded a quarantine `judge` had already completed,
+        // and a persistently unlistable directory (0300: searchable and
+        // writable, not readable) failed every `LedgerView::read` and
+        // `Fingerprints::read` with no remedy, though each file read perfectly.
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
             return;
@@ -1134,15 +1263,69 @@ mod tests {
         let path = root.join("v.mpk");
         save(&path, KIND, VERSION, &sample()).expect("seed");
         // Searchable, so the file itself reads; not readable, so it cannot be
-        // listed. Reporting no quarantines there would be a guess.
+        // listed. Reporting no quarantines there would be a guess, so the load
+        // says it does not know rather than saying there are none.
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).expect("chmod");
-        let result = load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None);
+        let (loaded, said) =
+            capturing(|| load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None));
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restore");
-        let err = result.expect_err("an unlistable directory is not an empty one");
-        assert!(
-            matches!(&err, Error::Read { path: at, .. } if *at == root),
-            "got {err}"
+
+        let loaded = loaded.expect("the file itself read perfectly");
+        assert_eq!(loaded.value, sample(), "the load stands");
+        assert_eq!(loaded.health, Health::Loaded);
+        assert_eq!(
+            loaded.unlisted.as_deref(),
+            Some(root.as_path()),
+            "the directory it could not list",
         );
+        assert!(
+            loaded.quarantined.is_empty(),
+            "empty because nothing is known",
+        );
+        assert!(said.contains("Permission denied"), "{said}");
+        assert!(said.contains(&root.display().to_string()), "{said}");
+
+        // A listing that succeeds says so, whatever it found.
+        let (fine, _) = capturing(|| load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None));
+        assert_eq!(fine.expect("load").unlisted, None);
+    }
+
+    #[test]
+    fn a_damaged_file_is_reported_through_tracing_whether_or_not_it_is_moved() {
+        // r4 round 1 (COV2): neither `tracing::warn!` body in this module had
+        // ever been executed, because no library test installed a subscriber.
+        // Both texts are stated as part of the contract — by this module's
+        // `load` doc and by `state/mod.rs` — and deleting either macro passed
+        // the entire suite.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        std::fs::write(&path, b"garbage").expect("seed");
+
+        // The lockless reader: told what is wrong, and told who will move it.
+        let (lockless, said) =
+            capturing(|| load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None));
+        assert_eq!(
+            lockless.expect("load").health,
+            Health::Damaged(Damage::Malformed),
+        );
+        assert!(said.contains(&path.display().to_string()), "{said}");
+        assert!(said.contains("is damaged"), "{said}");
+        assert!(
+            said.contains("the next bx that holds the state directory lock moves it aside"),
+            "{said}",
+        );
+
+        // The lock holder: told what was discarded, and *where the bytes went*
+        // — the only place the numbered quarantine name reaches the log.
+        let (writer, said) = capturing(|| locked_load::<Value>(&path));
+        assert!(writer.expect("load").health.is_reset());
+        let quarantine = StateDir::quarantine(&path);
+        assert!(said.contains("discarding"), "{said}");
+        assert!(
+            said.contains(&format!("moved_to={}", quarantine.display())),
+            "{said}",
+        );
+        assert!(said.contains("The bytes were kept, not deleted."), "{said}",);
     }
 
     #[test]
@@ -1414,11 +1597,12 @@ mod tests {
             value: 1_u32,
             health: Health::Reset(Damage::Malformed),
             quarantined: vec![PathBuf::from("/s/v.mpk.corrupt")],
+            unlisted: Some(PathBuf::from("/s")),
         };
         let mapped = loaded.map(|v| v + 1);
         assert_eq!(mapped.value, 2);
         assert_eq!(mapped.health, Health::Reset(Damage::Malformed));
         assert_eq!(mapped.quarantined, vec![PathBuf::from("/s/v.mpk.corrupt")]);
-        assert_eq!(mapped.value, 2);
+        assert_eq!(mapped.unlisted, Some(PathBuf::from("/s")));
     }
 }

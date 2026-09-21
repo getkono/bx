@@ -391,6 +391,18 @@ fn refuse_committed_requirement(target: &Target, tool: &str) -> Result<(), Error
 /// through one is judged by [`refuse_path_answer_in_file`], and blocks the
 /// target rather than failing the load.
 ///
+/// Written order rules **within this walk**. It does not rule between the two:
+/// when `file` holds a committed way to a `path` value and an answered one,
+/// this walk wins whichever is written first, because it runs first and returns
+/// `Err`. That is not an accident of the call order. A committed way is the
+/// same defect for every account and no answer clears it, so reporting it as
+/// one account's blocked target would hide a repository defect behind a hint
+/// advising that account to change something — and would report it to the
+/// account that answered and not to the one that did not. The load error
+/// outranks the block; only the field it names is decided by written order.
+/// `a_file_reached_by_a_committed_route_and_an_answered_one_fails_the_load`
+/// pins it in both written orders.
+///
 /// A malformed placeholder is left to the probe, which reports it with the
 /// rest of the target's defects.
 fn refuse_path_value_in_file(
@@ -3430,6 +3442,37 @@ mod tests {
                 names: vec!["s".to_string()]
             }
         );
+    }
+
+    #[test]
+    fn a_file_reached_by_a_committed_route_and_an_answered_one_fails_the_load() {
+        // `c`'s committed default reaches `b`; the account's answer to `s`
+        // reaches it too. The committed way is the same defect for every
+        // account and no answer clears it, so it outranks the block whichever
+        // name is written first in `file` — written order decides which
+        // reference a walk names, not which walk answers. Reporting the block
+        // instead would hide a repository defect behind advice to this one
+        // account, and would report it only to an account that had answered.
+        const LAYER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                             [[value]]\nname = \"c\"\nkind = \"string\"\n\
+                             default = \"{{b}}\"\n\
+                             [[value]]\nname = \"s\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/thing\"\nfile = \"FILE\"\n";
+
+        for file in ["cfg/{{c}}/{{s}}/x", "cfg/{{s}}/{{c}}/x"] {
+            let message = resolved(
+                &LAYER.replace("FILE", file),
+                Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),
+            )
+            .expect_err("the committed route is a load error, not one account's block");
+            assert!(
+                message.contains(
+                    "`file` references `c`, whose default at bx.toml:4 is built from `b`, \
+                     a `path` value"
+                ),
+                "{file}: {message}"
+            );
+        }
     }
 
     #[test]

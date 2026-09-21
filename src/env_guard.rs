@@ -5389,6 +5389,40 @@ mod tests {
     }
 
     #[test]
+    fn the_rule_covers_one_level_above_a_location_and_no_more() {
+        // `DeclaredRootItself` buys exactly one level: an approved value's
+        // parent is inside a declared root, so the directory uv derives at
+        // `$XDG_DATA_HOME/../bin` is too. It buys no second level, and the
+        // module's docs say so. A value one level beneath the root is allowed
+        // although its grandparent — the root's own parent — is outside every
+        // root, so a tool deriving two levels up would leave them.
+        let one_level = format!("{ROOT}/share");
+        assert_eq!(
+            check("XDG_DATA_HOME", &one_level, &rooted()),
+            Verdict::Allowed
+        );
+        let parent = Path::new(&one_level).parent().expect("a parent");
+        assert!(rooted().contains(parent), "one level up is inside a root");
+        let grandparent = parent.parent().expect("a grandparent");
+        assert_eq!(grandparent, Path::new("/var/mnt/scratch"));
+        assert!(
+            !rooted().contains(grandparent),
+            "two levels up is outside every root, and the guard does not model it"
+        );
+        // Two levels are covered only when a root happens to lie two levels
+        // above the value, which no rule requires.
+        let nested = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from("/var/mnt/scratch"), PathBuf::from(ROOT)],
+        );
+        assert_eq!(
+            check("XDG_DATA_HOME", &one_level, &nested),
+            Verdict::Allowed
+        );
+        assert!(nested.contains(grandparent));
+    }
+
+    #[test]
     fn uv_puts_executables_beside_its_data_home_and_the_guard_refuses_a_root() {
         // The mechanism behind `DeclaredRootItself`, held to a real uv when one
         // is installed. `dir --bin` only prints where executables would go, and

@@ -1717,15 +1717,22 @@ impl Session {
         // it to own.
         let (entry, mechanism) = match ownership {
             Ownership::Owned(mechanism) => (
-                Some(
+                Some({
                     // `new_entry` claims everything the write made. The entry
                     // and the Intent have to claim the same set, or a rollback
                     // and an `rm` would disagree about the home: `prune_claims`
                     // would reach a directory the Intent deliberately left out.
-                    filled
-                        .new_entry(&self.home, mechanism.clone())?
-                        .with_created_dirs(portable_dirs(&created_dirs, &self.home)?),
-                ),
+                    //
+                    // Two statements, not one expression: `portable_dirs`'
+                    // `Err` is unreachable *because* `new_entry` has already
+                    // made the same conversion and would have failed first,
+                    // and in one expression that reason would rest on the
+                    // receiver being evaluated before the argument — true of
+                    // Rust, and not something this file should need a reader
+                    // to know (`r3 round 7`, CL3).
+                    let entry = filled.new_entry(&self.home, mechanism.clone())?;
+                    entry.with_created_dirs(portable_dirs(&created_dirs, &self.home)?)
+                }),
                 Some(mechanism.clone()),
             ),
             Ownership::Released => (None, None),
@@ -2132,10 +2139,11 @@ fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
 /// # Errors
 ///
 /// [`Error::Write`] with [`crate::fs::Error::NotPortable`] for one that cannot
-/// be, which a ledger would refuse to store. Unreachable from the one caller:
-/// [`crate::fs::Filled::new_entry`] has already made the same conversion, for
-/// a superset of the same paths and against the same home, and would have
-/// failed first. Kept rather than unwrapped — a panic in a writer's durability
+/// be, which a ledger would refuse to store. Unreachable from the one caller,
+/// which calls [`crate::fs::Filled::new_entry`] in the statement before: that
+/// makes the same conversion, for a superset of the same paths and against the
+/// same home, and returns its failure first. The order is a statement
+/// boundary, not an evaluation rule (`r3 round 7`, CL3). Kept rather than unwrapped — a panic in a writer's durability
 /// path is worse than a returned error nothing produces — and named here so it
 /// reads as a gap on purpose (`r3 round 6`, COV3), like `plan_restore`'s own
 /// unreachable `Err` arm.

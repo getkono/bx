@@ -1219,15 +1219,38 @@ mod tests {
         // directory that holds it failing was never reached. A link the kernel
         // follows, to a file whose real path is longer than `PATH_MAX`, can be
         // examined but not resolved.
+        //
+        // The over-long real path is staged as a *chain* of short links: each
+        // one names a single 200-byte component under the link before it, so
+        // no symlink target grows past ~204 bytes and no path handed to a
+        // syscall is long either. A filesystem that caps one symlink target
+        // well below `PATH_MAX` — XFS caps it at 1024 bytes — stages this as
+        // readily as any other. The chain grows until `canonicalize` of the
+        // cursor itself is the failure under test, so the length that is
+        // enough is measured here rather than assumed.
         let (home, _target, dir) = linked_state(0o711);
         let part = "d".repeat(200);
-        let outer: PathBuf = std::iter::repeat_n(part.as_str(), 19).collect();
-        let inner: PathBuf = std::iter::repeat_n(part.as_str(), 12).collect();
-        std::fs::create_dir_all(home.child("deep").join(&outer)).expect("outer");
-        std::os::unix::fs::symlink(home.child("deep").join(&outer), home.child("short"))
-            .expect("short");
-        let near = home.child("short").join(&inner);
-        std::fs::create_dir_all(&near).expect("inner, through the short link");
+        std::fs::create_dir(home.child("deep")).expect("deep");
+        let mut cursor = PathBuf::from("deep");
+        let mut links = 0_u32;
+        loop {
+            match std::fs::canonicalize(home.child(&cursor)) {
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error()) => break,
+                Err(e) => panic!("staging the chain at {}: {e}", cursor.display()),
+            }
+            // The kernel refuses more than 40 nested links, and each step here
+            // costs one. A real path over `PATH_MAX` needs ~21 of them, so
+            // failing to get there is a surprise worth reporting, not a skip.
+            assert!(links < 32, "no real path over PATH_MAX after {links} links");
+            let next = cursor.join(&part);
+            std::fs::create_dir(home.child(&next)).expect("one component deeper");
+            let link = PathBuf::from(format!("s{links}"));
+            std::os::unix::fs::symlink(&next, home.child(&link)).expect("a short link to it");
+            cursor = link;
+            links += 1;
+        }
+        let near = home.child(&cursor);
         std::fs::write(near.join("local.toml"), "[values]\n").expect("local.toml");
         std::os::unix::fs::symlink(near.join("local.toml"), dir.local_toml()).expect("symlink");
         assert!(

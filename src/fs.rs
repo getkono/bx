@@ -72,9 +72,31 @@ impl Error {
 /// be written outside it — and the ledger needs both. The collapse belongs to
 /// the entry that owns `config/target.rs`, and until it happens nothing may
 /// re-export one of these as the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Mode(u32);
+
+impl<'de> Deserialize<'de> for Mode {
+    /// Decoded through [`Mode::from_bits`], so a stored mode means the same
+    /// thing as one read from a `stat`.
+    ///
+    /// Hand-written rather than derived, because a derived transparent
+    /// `Deserialize` masks nothing: one flipped byte in `ledger.mpk` yields
+    /// `Mode(0o100_644)`, which decodes cleanly — not `Damage::Malformed` —
+    /// renders as `0644` and converts to `0644`, but compares unequal to the
+    /// `Mode::from_bits(stat_bits)` a `plan` reads off the disk. A `plan`
+    /// comparing the two then reports a permanent difference between two
+    /// values it prints identically, and `apply` never converges: Invariant 3
+    /// broken with no diagnostic that could explain it. The comparison is
+    /// derived over the field, so the field is what has to be canonical.
+    ///
+    /// `paths::Portable` validates in its own `Deserialize` for the same
+    /// reason; this masks rather than refuses, because [`Mode::from_bits`] is
+    /// already the crate's answer to "what do the extra bits mean" — nothing.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        u32::deserialize(deserializer).map(Self::from_bits)
+    }
+}
 
 impl Mode {
     /// `0644` — the mode bx gives a generated file with no mode of its own.
@@ -271,6 +293,48 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&Mode::PRIVATE_FILE).expect("encode");
         let back: Mode = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(back, Mode::PRIVATE_FILE);
+    }
+
+    #[test]
+    fn a_decoded_mode_carries_only_the_permission_bits() {
+        // r4 round 1 (D4, COV4): the derived transparent `Deserialize` masked
+        // nothing, and the round-trip above was tested only with a canonical
+        // value. One flipped byte in `ledger.mpk` gave a `Mode` that renders,
+        // converts and chmods as `0644` but compares unequal to the `0644` a
+        // `plan` reads off the disk — two values printed identically that
+        // never converge.
+        let wire = rmp_serde::to_vec_named(&0o100_644_u32).expect("encode");
+        let back: Mode = rmp_serde::from_slice(&wire).expect("decode");
+        assert_eq!(back, Mode::DEFAULT_FILE, "equal to the mode a stat gives");
+        assert_eq!(back.bits(), 0o644);
+        assert_eq!(back.to_string(), "0644");
+
+        // Every bit `from_bits` keeps survives the round trip, set-id and
+        // sticky included: `0o7777`, not `0o777`.
+        for bits in [0o4755, 0o2755, 0o1777, 0o7777] {
+            let mode = Mode::from_bits(bits);
+            let wire = rmp_serde::to_vec_named(&mode).expect("encode");
+            assert_eq!(
+                rmp_serde::from_slice::<Mode>(&wire).expect("decode"),
+                mode,
+                "{bits:04o}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_set_id_and_sticky_bits_reach_the_chmod() {
+        // r4 round 1 (COV4): every test and every call site used 0644, 0755,
+        // 0600 or 0700, so `from_bits_truncate` dropping `0o7000` in the
+        // conversion `fchmod` uses would have been invisible — precisely the
+        // four bits the `0o7777` mask in `from_bits` exists to preserve.
+        for bits in [0o4755, 0o2755, 0o1777, 0o7777] {
+            assert_eq!(
+                RawMode::from(Mode::from_bits(bits)).bits(),
+                bits,
+                "{bits:04o}",
+            );
+        }
     }
 
     #[test]

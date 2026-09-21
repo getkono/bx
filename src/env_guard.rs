@@ -5074,8 +5074,12 @@ mod tests {
     /// CARGO_HOME` in the snippet went unnoticed.
     ///
     /// The second sweep is deliberately generous: it takes every `-v` operand
-    /// and every non-flag operand of a `read`, which over-reports rather than
-    /// under-reports, and over-reporting can only make the caller stricter.
+    /// and *every* name-shaped operand of a `read`, `mapfile` or `readarray`,
+    /// which over-reports rather than under-reports, and over-reporting can
+    /// only make the caller stricter. Taking only the first non-flag operand
+    /// under-reported instead, against this very sentence — `read -p "Enter: "
+    /// N`, `read -d '' N`, `read -rn 1 N` and `read -r A N` each hid `N`
+    /// behind a flag's own operand or a second target (round-3 note D2).
     /// Comments are dropped first, so prose ending in the word `for` is not an
     /// assignment.
     ///
@@ -5113,25 +5117,32 @@ mod tests {
                 .take_while(|word| !word.starts_with('#'))
                 .collect();
             for (at, word) in words.iter().enumerate() {
-                let named = match *word {
+                let named: Vec<&str> = match *word {
                     // `for N in V` and `select N in V` name their control
                     // variable immediately.
-                    "for" | "select" => words.get(at + 1).copied(),
+                    "for" | "select" => words.get(at + 1).copied().into_iter().collect(),
                     // `getopts OPTSTRING N` names it after the option string.
-                    "getopts" => words.get(at + 2).copied(),
-                    // `read [-flags] N ...` names every operand that is not a
-                    // flag; the first is enough to refuse the line.
-                    "read" => words[at + 1..]
+                    "getopts" => words.get(at + 2).copied().into_iter().collect(),
+                    // `coproc N { ... }` names its array immediately.
+                    "coproc" => words.get(at + 1).copied().into_iter().collect(),
+                    // `read [-flags] N...`, `mapfile [-flags] N`, `readarray
+                    // [-flags] N`. Every *name-shaped* word after the command
+                    // is taken, not the first non-flag one: a flag's own
+                    // operand may sit between the flags and the target —
+                    // `read -p "Enter: " N`, `read -d '' N`, `read -rn 1 N` —
+                    // and `read` may name several targets at once. Taking them
+                    // all over-reports, which is the safe direction and is
+                    // what this function's contract promises.
+                    "read" | "mapfile" | "readarray" => words[at + 1..]
                         .iter()
-                        .find(|operand| !operand.starts_with('-'))
-                        .copied(),
+                        .copied()
+                        .filter(|operand| !operand.starts_with('-'))
+                        .collect(),
                     // `printf -v N V`, and any other `-v` target.
-                    "-v" => words.get(at + 1).copied(),
-                    _ => None,
+                    "-v" => words.get(at + 1).copied().into_iter().collect(),
+                    _ => Vec::new(),
                 };
-                if let Some(named) = named.filter(|named| is_shell_name(named)) {
-                    found.push(named);
-                }
+                found.extend(named.into_iter().filter(|named| is_shell_name(named)));
             }
         }
         found
@@ -5150,6 +5161,24 @@ mod tests {
             assert!(
                 assignments_in(&content).contains(&"CARGO_HOME"),
                 "the sweep does not see {content:?} assign CARGO_HOME"
+            );
+        }
+        // The exact shapes round-3 note D2 measured returning nothing, where
+        // a flag's own operand or a second target sat between the command and
+        // the name. `read -d ''` is here and not in the table above because
+        // the table's `{V}` substitution cannot express an empty delimiter.
+        for form in [
+            "read -p \"Enter: \" CARGO_HOME",
+            "read -d '' CARGO_HOME",
+            "read -rn 1 CARGO_HOME",
+            "read -r A CARGO_HOME",
+            "mapfile -t CARGO_HOME < /x",
+            "readarray -t CARGO_HOME < /x",
+            "coproc CARGO_HOME { :; }",
+        ] {
+            assert!(
+                assignments_in(form).contains(&"CARGO_HOME"),
+                "the sweep does not see {form:?} assign CARGO_HOME"
             );
         }
         // Not vacuous: shell that assigns nothing is reported as assigning
@@ -6931,6 +6960,20 @@ mod tests {
 
     /// Shell that sets a variable in bash or zsh — `{N}` the name, `{V}` the
     /// value. The review's forms, and the neighbours of each.
+    ///
+    /// **This is the reviewed set, not an exhaustive account of every way a
+    /// shell can assign**, and it cannot be one: the set is bounded by bash's
+    /// and zsh's grammars, not by anything bx controls, and a table claiming
+    /// exhaustiveness would be wrong the next time either shell grew a
+    /// builtin. Nothing here carries the guard's safety. The guard **fails
+    /// closed by shape** — it refuses every line outside its own small
+    /// grammar, whatever that line mentions — so a form nobody has thought of
+    /// is refused by not being `NAME=VALUE`, not by appearing below. This
+    /// table is a regression net over the forms review has actually produced,
+    /// and the thing it is worth being complete about is that every form in it
+    /// stays refused. `mapfile`, `readarray` and `coproc` were added in round
+    /// 3, which is what this paragraph exists to stop being read as a gap in a
+    /// proof.
     const ASSIGNING_FORMS: &[&str] = &[
         // A keyword quoted, escaped or aliased.
         "\\export {N}={V}",
@@ -6950,6 +6993,12 @@ mod tests {
         "for {N} in {V}; do :; done",
         "select {N} in {V}; do break; done",
         "read -r {N} <<< {V}",
+        "read -p \"Enter: \" {N}",
+        "read -rn 1 {N}",
+        "read -r A {N}",
+        "mapfile -t {N} < /x",
+        "readarray -t {N} < /x",
+        "coproc {N} {{ :; }}",
         "printf -v {N} {V}",
         "getopts : {N}",
         "{N}[1,-1]={V}",

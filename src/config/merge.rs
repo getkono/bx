@@ -33,8 +33,8 @@
 //! placeholders unanswered. That is sound: a pair the reduction calls one path
 //! is one file for every answer, or none. It is complete over the shapes the
 //! fixed-seed property test generates, not over every spelling. The known
-//! shapes it does not decide are listed in the review notes of pull
-//! request #16. A `..` cancels a placeholder's segment only for a `bool`,
+//! shapes it does not decide are listed under *Shapes the written form does not
+//! decide* below. A `..` cancels a placeholder's segment only for a `bool`,
 //! which is always one segment, as a `string` need not be.
 //!
 //! When one did, the collision is the account's. `bx.toml` declaring
@@ -44,6 +44,64 @@
 //! target with it, so instead both entries are kept and recorded as a
 //! [`Conflict`], and resolution blocks each one, naming both lines and the
 //! answer's. A later layer that names the file settles it.
+//!
+//! # Shapes the written form does not decide
+//!
+//! This is the register [`written_form`], [`one_path_as_written`] and [`Root`]
+//! point at. It is here, in the tree, rather than in a review thread, so that a
+//! maintainer changing the reduction reads the limitation beside the code it
+//! limits, and so that it outlives whatever tracker entry carried it.
+//!
+//! **What holds.** The form is *sound*: two spellings with one form name one
+//! file for every answer, or no file for any. It is *complete over the shapes
+//! the fixed-seed property test generates* — there, two spellings with
+//! different forms are parted by some answer in the set, so the collision is
+//! one the account can clear.
+//!
+//! **What does not hold.** The form does not recognise every pair that names
+//! one file for every answer. When it misses one, a layer that spells the same
+//! file twice loads `Ok` and the file is blocked as a [`Conflict`], whose
+//! "change that answer" hint no answer satisfies. **No general rule is claimed
+//! for which pairs are missed.** Several rounds of review each proposed one and
+//! each was found unsound or too narrow, so the register is a list of executed
+//! examples, not a rule.
+//!
+//! **Known examples.** Each pair below was keyed under 35,756 answer sets with
+//! the home `/var/home/example`, over `string` `p` and `q`, `bool` `f`, `path`
+//! `r` and `s`, an `email` and an `ssh-key`, and **no answer parted it**, while
+//! the two written forms differ:
+//!
+//! - `~/{{p}}x/..` against `~/{{p}}y/..` — literal text glued after a
+//!   placeholder, ending the segment the following `..` cancels.
+//! - `{{r}}./..` against `{{r}}/..`, and `{{r}}x/..` against `{{r}}/..` — glue
+//!   after a `path` value where nothing but the root `/` stands above it.
+//! - `/opt/{{r}}../../conf` against `/opt/{{r}}/../conf`, and
+//!   `/opt/{{r}}x/../../conf` against `/opt/{{r}}/../../conf`, and
+//!   `/a/b/{{r}}../../..` against `/a/b/{{r}}/../..` — a `..` glued after a
+//!   `path` value that then climbs through every fixed segment above it to `/`.
+//! - `~/{{p}}{{f}}/..` against `~/{{p}}x/..` — a glued tail holding a `bool`,
+//!   whose answer is never empty, never only dots and never holds a `/`, so the
+//!   `..` cancels the segment either way.
+//! - `~{{p}}/.{{p}}` against `~{{p}}/{{p}}` — each occurrence of a placeholder
+//!   is read on its own, so an *opening* occurrence that limits which answers
+//!   name a file at all is not carried to the later one.
+//! - With the home set to `/`: `{{p}}` against `{{p}}/`.
+//!
+//! **Rules already shown to be unsound**, so that none of them is re-adopted:
+//! treating any glued placeholder tail like literal text (`{{r}}{{p}}/..`
+//! against `{{r}}/..` is parted by `p = "~/a"`, `r = "//srv/"`); and treating
+//! glue with no following `..` as one path (`{{r}}x/conf` against
+//! `{{r}}/conf` is parted by `r = "/srv"`, and `/opt/{{r}}./conf` against
+//! `/opt/{{r}}/conf` by `r = "/srv"`). Equally, a `..` glued after a `path`
+//! value is *not* always undecided: with two fixed segments above the value,
+//! `/a/b/{{r}}../..` against `/a/b/{{r}}/..` is parted by `r = "/"`, and so is
+//! `/opt/{{r}}x/../conf` against `/opt/{{r}}/../conf`, which key as
+//! `/opt/conf` and `/conf`.
+//!
+//! Any future rule must be proven sound against
+//! `one_path_as_written_agrees_with_every_answer_in_a_fuzzed_set` and a wider
+//! fuzz before it is adopted, and every example above belongs in that test as a
+//! case once it is decided.
 //!
 //! # Toggles: how an account opts out cheaply
 //!
@@ -656,7 +714,8 @@ fn clash(
 /// fixed-seed property test generates: there, forms that differ are parted by
 /// some answer, so the collision is one the account can clear. It is not
 /// complete over every spelling. The known shapes it does not decide are listed
-/// in the review notes of pull request #16.
+/// under *Shapes the written form does not decide* in the [module
+/// documentation](self).
 ///
 /// Only spellings whose keys are one [`TargetKey::File`] are compared here, so
 /// every placeholder in either is declared, enabled and answered: a
@@ -676,7 +735,8 @@ struct WrittenForm<'a> {
 ///
 /// Part of the form [`one_path_as_written`] compares, which is sound and
 /// complete over the shapes the fixed-seed property test generates; the known
-/// shapes it does not decide are listed in the review notes of pull request #16.
+/// shapes it does not decide are listed under *Shapes the written form does not
+/// decide* in the [module documentation](self).
 #[derive(Debug, PartialEq, Eq)]
 enum Root<'a> {
     /// `/`, or a `path` value opening the spelling, alone or with text glued
@@ -716,8 +776,8 @@ enum Segment<'a> {
 ///
 /// The form is sound: identical forms name one file for every answer, or none.
 /// It is complete over the shapes the fixed-seed property test generates; the
-/// known shapes it does not decide are listed in the review notes of pull
-/// request #16.
+/// known shapes it does not decide are listed under *Shapes the written form
+/// does not decide* in the [module documentation](self).
 ///
 /// A `path` value starts its own segment wherever it sits, as though a `/` were
 /// written before it. That changes no file. A `path` answer is absolute and

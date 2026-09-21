@@ -4392,7 +4392,11 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "spawned by a_directory_bx_will_not_remove_is_made_at_the_accounts_umask"]
     fn umask_child() {
-        let under = PathBuf::from(std::env::var_os(UMASK_CHILD_DIR).expect("the parent's dir"));
+        // As `skips_allowed_child`: no instructions, nothing to do.
+        let Some(under) = std::env::var_os(UMASK_CHILD_DIR) else {
+            return;
+        };
+        let under = PathBuf::from(under);
         let mode = |path: &Path| {
             Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(
                 &std::fs::symlink_metadata(path).expect("stat").permissions(),
@@ -6317,7 +6321,13 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "spawned by the_opt_out_is_read_from_the_environment_not_assumed"]
     fn skips_allowed_child() {
-        let expected = std::env::var_os(EXPECT_SKIPS).expect("the parent says what to expect");
+        // Returns rather than panics when it was not spawned by its parent, so
+        // a bare `cargo test -- --ignored` finds no instructions and does
+        // nothing — the shape the other children already had (`r3 round 7`,
+        // D3).
+        let Some(expected) = std::env::var_os(EXPECT_SKIPS) else {
+            return;
+        };
         let expected = expected == "yes";
         assert_eq!(
             skips_allowed(),

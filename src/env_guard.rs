@@ -69,24 +69,32 @@
 //! input check: it states a **theorem about this module's own code** — that
 //! once every `:`-entry of a location has been judged, the whole value the tool
 //! reads lies strictly beneath a declared root as well. No value can falsify
-//! it; only an edit to the entry rules can. It is written as an assertion
-//! rather than as a [`Reason`] precisely because a [`Reason`] there could never
-//! be returned, which is a branch no test can reach and no mutant can kill —
-//! the defect it replaced (#47 round 3). Being a `debug_assert!`, it is
-//! compiled out of a release build and costs a release binary nothing; what it
-//! buys is that every test in the suite, not only the one that targets the
-//! property, checks it on every location it judges.
+//! it. Only an edit to the code it rests on can: the entry rules in `judge`,
+//! [`RootSet::contains`], or [`crate::paths::normalize`], which decides what a
+//! path's components are. It is written as an assertion rather than as a
+//! [`Reason`] precisely because a [`Reason`] there could never be returned,
+//! which is a branch no test can reach and no mutant can kill — the defect it
+//! replaced (#47 round 3). Being a `debug_assert!` it does nothing in a release
+//! build — the compiler keeps the code and then eliminates it, so a release
+//! binary pays nothing for it; what it buys is that every test in the suite,
+//! not only the one that targets the property, checks it on every location it
+//! judges.
 //!
 //! **Before adding a second one**, ask which of the two it is. A statement
 //! about a *value* is a [`Reason`], always, even when it seems impossible —
 //! values come from a user's configuration and the guard's own reading of a
-//! shell fragment, and neither is a place to be certain. A statement about
-//! *this module's internal consistency*, which no input can reach and whose
-//! falsification would be a bug in bx, may be a `debug_assert!` — and should
-//! be, rather than an unreachable [`Reason`] that reads like a verdict. Pair it
-//! with a test that pins the same property through the public API, as
+//! shell fragment, and neither is a place to be certain. That half of the rule
+//! is load-bearing, not a matter of taste: a statement about a value written as
+//! a `debug_assert!` would **fail open in the shipped binary** on exactly the
+//! input it was meant to catch, approving a relocation instead of refusing it,
+//! and the tests would not show it because they run with assertions on. A
+//! statement about *this module's internal consistency*, which no input can
+//! reach and whose falsification would be a bug in bx, may be a
+//! `debug_assert!` — and should be, rather than an unreachable [`Reason`] that
+//! reads like a verdict. Pair it with a test that pins the same property
+//! through the public API, as
 //! `every_entry_beneath_a_root_leaves_the_whole_value_beneath_one` does, so the
-//! property is still pinned where assertions are compiled out.
+//! property is still pinned where assertions do nothing.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;

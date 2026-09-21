@@ -278,8 +278,8 @@ pub enum Error {
     /// with `quiet`, and some FUSE and network filesystems — can drop any of
     /// the three the same way. Publishing it would put a mode on disk that is
     /// not the declared one and make every later `plan` announce a `Modify` no
-    /// `apply` can close. The temporary file is removed and the destination is
-    /// untouched.
+    /// `apply` can close. The destination is untouched and the temporary file is
+    /// dropped — see [`Staged`] for what that is worth.
     ///
     /// The message names the bits that were lost, and blames group membership
     /// only when the setgid bit is among them.
@@ -1039,8 +1039,25 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
 
 /// A write that has a temporary file at its final mode and no content yet.
 ///
-/// Created by [`stage`]. Dropping it removes the temporary file and leaves the
-/// destination exactly as it was.
+/// Created by [`stage`]. Dropping it leaves the destination exactly as it was.
+///
+/// # What "the temporary file is removed" is worth
+///
+/// This is the one place that statement is qualified, and every other mention
+/// of it in this module and in [`crate::fs::durable`] points here rather than
+/// repeating it, so there is one sentence to be right rather than six.
+///
+/// Dropping a `Staged` or a [`Filled`] asks the kernel to unlink the `.bx-`
+/// file, and **that unlink can fail**: it needs write permission on the
+/// destination directory, which the directory can lose after [`stage`] made
+/// the file. A directory narrowed to `0500` between `stage` and
+/// [`Filled::publish`] fails the rename and keeps the temporary file. `tempfile`
+/// reports nothing from `Drop`, so bx does not learn of it either.
+///
+/// Nothing in the writer can close that: removal is exactly what the directory
+/// now refuses. It is why the prefix is reserved
+/// ([`TEMP_PREFIX`]) — a leftover is identifiable as bx's by name, and recovery
+/// and `doctor` find it there. Pinned by `a_failed_rename_syncs_no_directory`.
 #[derive(Debug)]
 pub struct Staged(Pending);
 
@@ -1271,9 +1288,13 @@ impl Staged {
         self.fill(bytes)?.publish().map_err(Unpublished::into_error)
     }
 
-    /// Discard the write. The temporary file is removed and the destination is
-    /// untouched. Identical to dropping it; named so a caller can say so.
+    /// Discard the write. The destination is untouched and the temporary file
+    /// is dropped — see [`Staged`] for what that is worth. Identical to
+    /// dropping it; named so a caller can say so.
     pub fn abandon(self) {
+        // A surviving mutant, and equivalent: `self` is dropped at the end of
+        // this function whether or not the body says so, so emptying the body
+        // gives the same program. The call is here to be read, not to act.
         drop(self);
     }
 }
@@ -1425,11 +1446,10 @@ impl Filled {
     ///
     /// The cause is [`Error::Changed`] when the destination is no longer what
     /// [`stage`] observed; nothing is replaced. [`Error::Write`] wrapping the
-    /// failing `open` of the directory, `rename`, or `fsync`. The temporary
-    /// file is removed either way, unless the directory no longer permits
-    /// removal, which also fails the rename; the `.bx-` file is then left for
-    /// recovery. Only a failing `fsync` of the directory is returned after the
-    /// destination was replaced.
+    /// failing `open` of the directory, `rename`, or `fsync`. The temporary file
+    /// is dropped either way — see [`Staged`] for what that is worth. Only a
+    /// failing `fsync` of the directory is returned after the destination was
+    /// replaced.
     pub fn publish(self) -> Result<(), Unpublished> {
         let Self {
             pending:
@@ -1472,9 +1492,13 @@ impl Filled {
         Ok(())
     }
 
-    /// Discard the write. The temporary file is removed and the destination is
-    /// untouched. Identical to dropping it; named so a caller can say so.
+    /// Discard the write. The destination is untouched and the temporary file
+    /// is dropped — see [`Staged`] for what that is worth. Identical to
+    /// dropping it; named so a caller can say so.
     pub fn abandon(self) {
+        // A surviving mutant, and equivalent: `self` is dropped at the end of
+        // this function whether or not the body says so, so emptying the body
+        // gives the same program. The call is here to be read, not to act.
         drop(self);
     }
 }
@@ -1535,9 +1559,8 @@ impl std::error::Error for Unpublished {
 /// [`Error::Changed`], whatever changed it after bx looked — with one
 /// exception. A failing `fsync` of the destination directory is reported after
 /// the rename, so that [`Error::Write`] comes back with `path` already holding
-/// all of `bytes`, in a rename a power loss may still undo. No temporary file
-/// is left behind in any case, unless the directory no longer permits its
-/// removal — see [`Filled::publish`].
+/// all of `bytes`, in a rename a power loss may still undo. The temporary file
+/// is dropped in any case — see [`Staged`] for what that is worth.
 ///
 /// The shorthand for [`observe`] + [`stage`] + [`Staged::commit`], for a caller
 /// whose `plan` and `apply` are this one call. A caller that printed a plan

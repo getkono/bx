@@ -94,8 +94,10 @@ impl Dir {
 ///
 /// # Errors
 ///
-/// The failed `rename`. The temporary file is removed when the error is
-/// dropped.
+/// The failed `rename`. The temporary file is dropped with the error — see
+/// [`crate::fs::atomic::Staged`] for what that is worth, because the unlink
+/// needs a permission on the destination directory that a failing rename may
+/// mean it no longer grants.
 pub(crate) fn rename(temp: NamedTempFile, dest: &Path) -> Result<(), tempfile::PersistError> {
     #[cfg(test)]
     let from = temp.path().to_path_buf();

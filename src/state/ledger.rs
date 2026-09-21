@@ -389,6 +389,17 @@ impl LedgerView {
     /// naming one was the round-2 shape, and it made `is_partial`'s promise
     /// false (r4 round 3, D1).
     ///
+    /// **What that costs, and where it is paid.** Between the two loads the
+    /// returned value holds a row bx has not yet reported anything about, and
+    /// a caller may write through it before the second load ever happens. So
+    /// the write path refuses to carry it: [`merge_created_dirs`] drops a
+    /// stored directory that is not above its target, and bx therefore never
+    /// writes a file it would go on to call damaged. That is the whole of the
+    /// exposure, and it is a degradation-policy consequence rather than an
+    /// accident (r4 round 4, D2 and CL2). `bx rm` — the one command that acts
+    /// on `created_dirs` — does not exist on this branch; when it does, it
+    /// reads a ledger this rule has already been through.
+    ///
     /// All-or-nothing was the wrong degradation for this file. `CLAUDE.md`
     /// requires a corrupt machine-owned file to degrade to recomputation, and
     /// the ledger is the one state file recomputation cannot rebuild: it holds
@@ -929,14 +940,14 @@ impl Ledger {
                 // had the fault silently corrected from the second apply on
                 // and not the first — and `bx rm` left a directory behind for
                 // targets applied exactly once.
-                merge_created_dirs(&[], entry.created_dirs),
+                merge_created_dirs(&key, &[], entry.created_dirs),
             ),
             Some(existing) => {
                 let (prior, history) = self.carry_prior(existing, &entry.mechanism, entry.prior)?;
                 (
                     prior,
                     history,
-                    merge_created_dirs(&existing.created_dirs, entry.created_dirs),
+                    merge_created_dirs(&key, &existing.created_dirs, entry.created_dirs),
                 )
             }
         };
@@ -1202,11 +1213,41 @@ fn supersede(existing: &LedgerEntry, adopted: &RestoreRef) -> History {
 /// Every entry is an ancestor of the same target, so depth alone orders them:
 /// the result is deduplicated and sorted deepest first, with ties — which two
 /// distinct ancestors of one path cannot produce — kept in first-seen order.
+///
+/// # The stored side is checked too, not only the incoming one
+///
+/// [`check_created_dirs`] refuses a stray in the entry the caller hands over,
+/// before anything is stored. It says nothing about the list already in the
+/// ledger — and since r4 round 3 that list can hold a stray: a load that found
+/// a key mismatch reports and acts on that alone, and leaves a stray
+/// `created_dirs` entry in a surviving row for the next load to strip. Merging
+/// it through would write it back, and the next read would report
+/// `UnrelatedCreatedDirs` **on a file bx had just written** — bx producing a
+/// file it refuses (r4 round 4, D2).
+///
+/// So a stored directory that is not above `target` is dropped here, with a
+/// warning: the load that let it through already quarantined the file it came
+/// from, so the bytes are kept and there is nothing to lose by not carrying it
+/// forward. `record` still *refuses* an incoming stray rather than dropping it
+/// — a caller handing one over has a bug, where a stored one is damage bx has
+/// already reported.
 fn merge_created_dirs(
+    target: &crate::paths::Portable,
     existing: &[crate::paths::Portable],
     incoming: Vec<crate::paths::Portable>,
 ) -> Vec<crate::paths::Portable> {
-    let mut merged = existing.to_vec();
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    for dir in existing {
+        if is_ancestor(dir, target) {
+            merged.push(dir.clone());
+        } else {
+            tracing::warn!(
+                target = %target,
+                dir = %dir,
+                "{dir} is not above {target}; dropping it rather than recording it again",
+            );
+        }
+    }
     for dir in incoming {
         if !merged.contains(&dir) {
             merged.push(dir);
@@ -3934,7 +3975,18 @@ mod tests {
             // Not above it, and not caught by a prefix test alone: `~/.conf`
             // is a string prefix of `~/.config/…` without being a component.
             (target("~/.config/other/y.conf"), vec![target("~/.conf")]),
-            (target("~/.cache/z"), vec![target("~/.local/share")]),
+            // Two strays around a real ancestor, seeded out of sorted order:
+            // the rows for one target come back in the entry's own list order,
+            // which round 2's COV5 pinned for `KeyMismatch.rows` and the
+            // per-directory retain reopened here (r4 round 4, COV4).
+            (
+                target("~/.cache/z"),
+                vec![
+                    target("~/.local/share"),
+                    target("~/.cache"),
+                    target("~/.aaaa"),
+                ],
+            ),
         ] {
             entries.insert(
                 key.clone(),
@@ -3957,7 +4009,11 @@ mod tests {
 
         let damage = Damage::UnrelatedCreatedDirs {
             rows: vec![
+                // Ascending by target; within a target, the entry's own list
+                // order — `~/.local/share` before `~/.aaaa`, which is neither
+                // sorted nor reverse-sorted.
                 ("~/.cache/z".to_string(), "~/.local/share".to_string()),
+                ("~/.cache/z".to_string(), "~/.aaaa".to_string()),
                 ("~/.config/other/y.conf".to_string(), "~/.conf".to_string()),
             ],
         };
@@ -3986,7 +4042,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(dirs(&view.value, "~/.config/other/y.conf").is_empty());
-        assert!(dirs(&view.value, "~/.cache/z").is_empty());
+        assert_eq!(
+            dirs(&view.value, "~/.cache/z"),
+            vec!["~/.cache".to_string()],
+            "the real ancestor between the two strays survives",
+        );
         assert_eq!(
             dirs(&view.value, "~/.config/tool/x.conf"),
             vec!["~/.config".to_string()],
@@ -4002,6 +4062,97 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
             seeded,
+        );
+    }
+
+    #[test]
+    fn recording_through_a_partially_damaged_survivor_never_writes_the_stray_back() {
+        // r4 round 4 (D2, COV2): round 3 made a key-mismatch load leave a
+        // stray `created_dirs` entry in a surviving row, for the next load to
+        // strip. Nothing recorded through such a survivor, and `record` merged
+        // the stored list **past** `check_created_dirs` — which validates the
+        // incoming entry only — so bx wrote the stray back and the next read
+        // reported `UnrelatedCreatedDirs` on a file bx had just written. A
+        // file bx produces and then refuses.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut entries = BTreeMap::new();
+        // The key mismatch, which is what makes the load leave the stray.
+        entries.insert(
+            target("~/.aaaa"),
+            LedgerEntry {
+                path: target("~/.zzzz"),
+                written: ContentHash::of(b"x"),
+                mode: Mode::DEFAULT_FILE,
+                mechanism: Mechanism::Own,
+                prior: Prior::Absent,
+                created_dirs: Vec::new(),
+                superseded: Vec::new(),
+                superseded_absent: false,
+            },
+        );
+        // The survivor, carrying one real ancestor and one stray.
+        entries.insert(
+            target("~/.config/tool/x.conf"),
+            LedgerEntry {
+                path: target("~/.config/tool/x.conf"),
+                written: ContentHash::of(b"x"),
+                mode: Mode::DEFAULT_FILE,
+                mechanism: Mechanism::Own,
+                prior: Prior::Absent,
+                created_dirs: vec![target("~/.config/tool"), target("~/.cache")],
+                superseded: Vec::new(),
+                superseded_absent: false,
+            },
+        );
+        store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
+
+        let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
+        assert!(matches!(
+            opened.health,
+            Health::Reset(Damage::KeyMismatch { .. })
+        ));
+        let mut ledger = opened.value;
+        assert_eq!(
+            ledger
+                .get(&target("~/.config/tool/x.conf"))
+                .expect("survivor")
+                .created_dirs
+                .len(),
+            2,
+            "the stray is still there, because the load reported only the key mismatch",
+        );
+
+        // A re-record of the survivor. The merge drops the stray and says so.
+        let (_, said) = crate::state::store::capture::capturing(|| {
+            ledger
+                .record(
+                    entry("~/.config/tool/x.conf", b"again")
+                        .with_created_dirs(vec![target("~/.config/tool")]),
+                )
+                .expect("record");
+        });
+        assert!(said.contains("is not above"), "{said}");
+        assert!(said.contains("~/.cache"), "{said}");
+        ledger.save().expect("save");
+
+        // And the file bx just wrote loads clean.
+        let reread = LedgerView::read(&dir, home.path()).expect("read");
+        assert_eq!(
+            reread.health,
+            Health::Loaded,
+            "bx must not write a file it would then report as damaged",
+        );
+        assert_eq!(
+            reread
+                .value
+                .get(&target("~/.config/tool/x.conf"))
+                .expect("entry")
+                .created_dirs
+                .iter()
+                .map(|d| d.as_str())
+                .collect::<Vec<_>>(),
+            vec!["~/.config/tool"],
         );
     }
 

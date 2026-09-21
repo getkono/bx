@@ -5985,19 +5985,80 @@ pub(crate) mod tests {
         }
         assert!(!allows_skips(None), "unset is not an opt-out");
 
-        // And the live read agrees with the pure rule for this run. A run that
-        // did opt out says so on the real stderr rather than through
-        // `eprintln!`, which libtest captures and discards for a passing test.
-        assert_eq!(
-            skips_allowed(),
-            allows_skips(std::env::var_os(ALLOW_SKIPS).as_deref()),
-        );
-        if skips_allowed() {
+        // The environment is in one of the two states the policy recognises.
+        // r3 round 5, COV2: the assertion that stood here was `f(x) == f(x)` —
+        // it re-spelled `skips_allowed`'s own body and constrained nothing.
+        // This one can fail: a `0` or a `false` set in the belief that it
+        // turns the opt-out *off* leaves every unbuildable scenario failing
+        // while the person who set it thinks otherwise, and that is worth a
+        // red suite.
+        if let Some(value) = std::env::var_os(ALLOW_SKIPS) {
+            assert!(
+                value == "1",
+                "{ALLOW_SKIPS} is set to {value:?}, which is not a spelling of the \
+                 opt-out. Unset it, or set it to exactly 1.",
+            );
             say_out_loud(&format!(
                 "INCOMPLETE RUN: {ALLOW_SKIPS}=1 is set, so every scenario this \
                  machine cannot build was skipped rather than failed",
             ));
         }
+
+        // And `cannot_build`, which reads the environment, follows the policy
+        // for this run: it is the wiring between the two that a mutant hard-
+        // coding `true` would break.
+        let opted_out = skips_allowed();
+        let live = std::panic::catch_unwind(|| cannot_build("live_probe", "a probe"));
+        assert_eq!(
+            live.is_ok(),
+            opted_out,
+            "cannot_build must fail exactly when the run did not opt out",
+        );
+    }
+
+    /// What the say-out-loud child writes through the handle.
+    const LOUD_MARKER: &str = "bx-say-out-loud-reaches-the-report";
+
+    /// What it writes with `eprintln!`, which libtest captures.
+    const CAPTURED_MARKER: &str = "bx-eprintln-is-swallowed";
+
+    #[test]
+    #[ignore = "spawned by an_opted_in_skip_reaches_the_report_and_eprintln_does_not"]
+    fn say_out_loud_child() {
+        say_out_loud(LOUD_MARKER);
+        eprintln!("{CAPTURED_MARKER}");
+    }
+
+    #[test]
+    fn an_opted_in_skip_reaches_the_report_and_eprintln_does_not() {
+        // r3 round 5, COV1. The round-4 repair swapped `eprintln!` for a
+        // `Stderr` handle so that an opted-in skip is visible, and nothing
+        // pinned it: reverting the one line left the suite green, which is how
+        // a repair gets undone by the next edit.
+        //
+        // The difference is only observable in a process libtest is capturing,
+        // and a test cannot turn its own capture on. So the binary is
+        // re-invoked for one `#[ignore]`d test, *without* `--nocapture`: the
+        // handle write reaches the child's stderr, and the `eprintln!` from
+        // the same passing test reaches nowhere.
+        let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", "--ignored", "journal::tests::say_out_loud_child"])
+            .output()
+            .expect("spawn the say-out-loud child");
+        let (out, err) = (
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        assert!(child.status.success(), "the child failed:\n{out}\n{err}");
+        assert!(
+            err.contains(LOUD_MARKER),
+            "`say_out_loud` did not reach the report:\nstdout:\n{out}\nstderr:\n{err}",
+        );
+        assert!(
+            !out.contains(CAPTURED_MARKER) && !err.contains(CAPTURED_MARKER),
+            "`eprintln!` from a passing test was expected to be swallowed, and was \
+             not — the premise of the repair is wrong:\nstdout:\n{out}\nstderr:\n{err}",
+        );
     }
 
     #[test]

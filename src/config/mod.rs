@@ -115,7 +115,9 @@ pub enum LayerKind {
 /// decides the result.
 ///
 /// A missing `bx.toml` and a missing `modules/` are both empty results, not
-/// errors — a repo may hold either, both, or neither.
+/// errors — a repo may hold either, both, or neither. A repo root that does not
+/// exist, lies beneath a non-directory, or is not a directory is
+/// [`Error::RepoMissing`].
 ///
 /// # Only a clean answer skips a file
 ///
@@ -130,10 +132,11 @@ pub enum LayerKind {
 ///
 /// # Errors
 ///
-/// [`Error::RepoMissing`] if `repo` does not exist or is not a directory, and
-/// [`Error::Io`] naming the path for any candidate that cannot be examined.
+/// [`Error::RepoMissing`] if `repo` does not exist, lies beneath a
+/// non-directory, or is not a directory, and [`Error::Io`] naming the path for
+/// any candidate that cannot be examined.
 pub fn layer_files(repo: &Path) -> Result<Vec<PathBuf>, Error> {
-    if !examine(repo)?.is_some_and(|meta| meta.is_dir()) {
+    if !examine_root(repo)?.is_some_and(|meta| meta.is_dir()) {
         return Err(Error::RepoMissing(repo.to_path_buf()));
     }
 
@@ -184,19 +187,59 @@ fn is_module_name(path: &Path) -> bool {
 /// then followed with `stat`, and `ENOENT` there is a **dangling** link, which
 /// is an error rather than an absence, because a layer someone linked in and
 /// broke is not a layer nobody wrote. Every other failure of either call —
-/// `EACCES`, `ELOOP` — is an error carrying the call's own `errno`.
+/// `EACCES`, `ELOOP` — is an error carrying the call's own `errno`. The repo
+/// root alone is examined with [`examine_root`], which also reads `ENOTDIR`
+/// from `lstat` as nothing there.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] naming `path` for anything but a clean answer.
 fn examine(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
+    examine_as(path, &[std::io::ErrorKind::NotFound])
+}
+
+/// [`examine`] for a repo root: `None` also when `lstat` says `ENOTDIR`.
+///
+/// A root beneath a regular file (`~/.config` is a file) is as missing as one
+/// that does not exist, and as one that is itself a file. Only the root reads
+/// it so: a state directory that is a file is where the account's layer has to
+/// be, so there `ENOTDIR` stays an error. Following a root symlink is unchanged,
+/// so a root linked to such a place is still an error: the follow with `stat`
+/// fails with `ENOTDIR` too, never `ENOENT`, so it is an io error naming the
+/// link and not the dangling one.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming `path` for anything but a clean answer.
+fn examine_root(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
+    examine_as(
+        path,
+        &[
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ],
+    )
+}
+
+/// [`examine`], with `absent` the `lstat` error kinds that mean nothing is there.
+///
+/// The list applies to `lstat` alone; following a symlink is the same for
+/// every caller.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming `path` for anything but a clean answer.
+fn examine_as(
+    path: &Path,
+    absent: &[std::io::ErrorKind],
+) -> Result<Option<std::fs::Metadata>, Error> {
     let io = |source| Error::Io {
         path: path.to_path_buf(),
         source,
     };
     let link = match std::fs::symlink_metadata(path) {
         Ok(link) => link,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if absent.contains(&source.kind()) => return Ok(None),
         Err(source) => return Err(io(source)),
     };
     if !link.file_type().is_symlink() {
@@ -776,15 +819,47 @@ mod tests {
         // A process that can read a 0000 directory -- root, or one holding
         // CAP_DAC_READ_SEARCH -- cannot construct this case at all. Say so
         // rather than assert something else and call it covered.
-        let reachable = std::fs::read_dir(&modules).is_err();
+        //
+        // The skip below is reached by no gate this repository runs, and that is
+        // recorded rather than fixed here. Every job in `.github/workflows/ci.yml`
+        // is a plain `runs-on: ubuntu-latest` with no `container:` and no `user:`,
+        // and `mise run test` runs as the invoking user, so `constructible` is
+        // true under all of them and the assertions below always run. The branch
+        // exists so the test does not *fail* for the privileged reader, which is
+        // what issue #13 item 3 asked for; covering it would need a test that
+        // re-execs under `unshare`, which this repository does not do for the
+        // two sibling skips it already carries on `master` -- the one below in
+        // `a_modules_directory_that_cannot_be_searched_names_the_entry`, and the
+        // one in `layers.rs`. Both are cited from `master` on purpose: a
+        // precedent a reader cannot open from the default branch is not one, and
+        // grounding this argument off the default branch is the fault issue #56
+        // was corrected in place for.
+        let constructible = std::fs::read_dir(&modules).is_err();
         let result = layer_files(dir.path());
         std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
             .expect("restore, so the tempdir can be removed");
 
-        assert!(
-            reachable,
-            "this process can read a 0000 directory, so the io error cannot be reached"
-        );
+        if !constructible {
+            // Through the stderr handle, not `eprintln!`: libtest captures the
+            // print macros and discards the capture for a test that passes, so
+            // an `eprintln!` here would reach nobody on the one kind of machine
+            // that takes this branch -- the suite would go green with the
+            // assertions below never run and nothing said. A direct write
+            // survives that capture. The two sibling skip sites carry the same
+            // defect and this pull request deliberately does not modify them:
+            // they are `master` code tracked by issue #56, whose acceptance asks
+            // for a broader remedy -- make the branch reachable, or make an
+            // ordinary run fail loudly and a skip be opted into by name -- and
+            // changing only their print channel here would pre-empt that with a
+            // half-measure.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "skipped: this process can read a 0000 directory, so the io error cannot be \
+                 constructed here"
+            );
+            return;
+        }
         match result {
             Err(Error::Io { path, .. }) => assert_eq!(path, modules),
             other => panic!(
@@ -875,6 +950,44 @@ mod tests {
         let error = layer_files(&missing).expect_err("should be an error");
         assert!(matches!(error, Error::RepoMissing(ref p) if *p == missing));
         assert!(error.to_string().contains("no bx config repo at"));
+    }
+
+    /// A repo root beneath a regular file is missing, exactly as one at a file is.
+    ///
+    /// `lstat` on `dotconfig/bx` with `dotconfig` a regular file says `ENOTDIR`,
+    /// not `ENOENT`, and that came back as an io error while a regular file at
+    /// the root itself was `RepoMissing`: one fault, two answers.
+    ///
+    /// Guards the other side of R4-6: a root that is a symlink to such a place
+    /// is still an error. The follow with `stat` fails with `ENOTDIR` as well,
+    /// never `ENOENT`, so what comes back is a plain io error naming the link,
+    /// and not the dangling one. The kind is asserted so this doc cannot drift
+    /// from it.
+    #[test]
+    fn a_repo_beneath_a_regular_file_is_missing() {
+        let dir = repo(&[("dotconfig", "")]);
+        let beneath = dir.path().join("dotconfig/bx");
+
+        let error = layer_files(&beneath).expect_err("should be an error");
+        assert!(
+            matches!(error, Error::RepoMissing(ref p) if *p == beneath),
+            "{error:?}"
+        );
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path().join("dotconfig/x"), &link).expect("symlink");
+        match layer_files(&link) {
+            Err(Error::Io { path, source }) => {
+                assert_eq!(path, link);
+                assert_eq!(
+                    source.kind(),
+                    std::io::ErrorKind::NotADirectory,
+                    "the follow fails at `dotconfig`, not at a missing target: {source}"
+                );
+                assert!(!source.to_string().contains("dangling"), "{source}");
+            }
+            other => panic!("expected an io error naming the link, got {other:?}"),
+        }
     }
 
     #[test]

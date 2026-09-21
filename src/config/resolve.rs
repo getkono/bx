@@ -30,8 +30,9 @@
 //!
 //! So does a legal answer that makes a **target's own field** invalid once
 //! substituted: `acct = "../../.."` into `~/.config/{{acct}}/settings.json`
-//! climbs out of the home, and `seg = ""` into `owns = ["a.{{seg}}"]` leaves an
-//! empty key segment. The target is blocked naming the answer's line, and
+//! climbs out of the home, `seg = ""` into `owns = ["a.{{seg}}"]` leaves an
+//! empty key segment, and `leaf = "."` into a file target's `~/{{leaf}}` makes it
+//! the home directory itself. The target is blocked naming the answer's line, and
 //! nothing is written for it. The same field broken with no account answer in
 //! it — a committed `default` alone — is the repo's defect and fails the load.
 //!
@@ -386,7 +387,8 @@ fn for_each_string(target: &Target, visit: &mut impl FnMut(&str)) {
 /// Only called once every reference is known to be answered, so a substitution
 /// here cannot fail for want of an answer; it can still fail because a
 /// substituted string is no longer a valid portable path, repo file or key
-/// path. That is [`Broken::Field`], carrying the text as written, and
+/// path, or because a file target's path became the home or a directory above
+/// it. That is [`Broken::Field`], carrying the text as written, and
 /// [`resolve_target`] decides whose it is from the answers that went in.
 fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broken> {
     let origin = &target.origin;
@@ -445,8 +447,14 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
         other => other.clone(),
     };
 
+    // The parser's own refusal again, on the path as substituted: it saw
+    // `~/{{leaf}}`, and a `string` answer of `.` makes that the home itself.
+    let path = portable(target.path.as_str())?;
+    super::target::refuse_file_at_home_or_above(path.as_str(), &path, &body, values.home())
+        .map_err(|message| field(target.path.as_str(), message))?;
+
     Ok(Target {
-        path: portable(target.path.as_str())?,
+        path,
         body,
         mode: target.mode,
         attach,
@@ -752,6 +760,77 @@ mod tests {
                 "{what}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn a_target_path_substituted_onto_the_home_or_above_is_refused() {
+        // The parser refuses a file target at the home or above it, but it sees
+        // `~/{{leaf}}`. A `string` answer is used verbatim, so `leaf = "."`
+        // resolved a ready file target at `~` itself. An account's answer costs
+        // the account's target; a committed default is a repo defect.
+        const HOME: &str = "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
+                            [[target]]\npath = \"~/{{leaf}}\"\ncontent = \"x\"\n\
+                            [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(HOME, Some("[values]\nleaf = \".\"\n"))
+            .unwrap_or_else(|e| panic!("an answer failed the whole load: {e}"));
+        let entry = blocked(&answered, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["leaf".to_string()]
+            }
+        );
+        assert!(
+            entry
+                .hint
+                .contains("the home directory or a directory above it"),
+            "{}",
+            entry.hint
+        );
+        assert!(
+            entry.hint.contains("the answer to `leaf` at local.toml:2"),
+            "{}",
+            entry.hint
+        );
+        assert_eq!(ready(&answered, 1).path.as_str(), "~/.zshrc");
+
+        let message = resolved(
+            &HOME.replace(
+                "kind = \"string\"\n",
+                "kind = \"string\"\ndefault = \".\"\n",
+            ),
+            None,
+        )
+        .expect_err("a committed default with no answer in it is a repo defect");
+        assert!(
+            message.contains("the home directory or a directory above it"),
+            "{message}"
+        );
+
+        let above = resolved(
+            "[[value]]\nname = \"seg\"\nkind = \"string\"\n\
+             [[target]]\npath = \"/var/{{seg}}\"\ncontent = \"x\"\n",
+            Some("[values]\nseg = \"home\"\n"),
+        )
+        .unwrap_or_else(|e| panic!("an answer failed the whole load: {e}"));
+        let entry = blocked(&above, 0);
+        assert!(
+            entry
+                .hint
+                .contains("the home directory or a directory above it"),
+            "{}",
+            entry.hint
+        );
+
+        // A directory target may still land there.
+        let dir = resolved(
+            "[[value]]\nname = \"leaf\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/{{leaf}}\"\ndir = true\n",
+            Some("[values]\nleaf = \".\"\n"),
+        )
+        .unwrap();
+        assert_eq!(ready(&dir, 0).path.as_str(), "~");
     }
 
     #[test]

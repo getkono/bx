@@ -4699,15 +4699,78 @@ mod tests {
     #[test]
     fn the_init_snippet_is_not_an_environment_fragment() {
         // Invariant 2 sends bx's generated environment fragments through the
-        // guard. The shell-init snippet is fixed text from bx's source — a
-        // staleness test, a completion function, a `compdef` — that sets only
-        // `BX_` names and gets every other variable by sourcing a guarded
-        // fragment. The guard reads none of those statements, which is why the
-        // invariant does not send the snippet to it.
+        // guard, and requires of generated shell content that is *not* one of
+        // them that it carry no environment assignment at all. The shell-init
+        // snippet is the repository's one such file — a staleness test, a
+        // completion function, a `compdef` — so that property has to be
+        // established of it rather than assumed.
+        //
+        // It is established positively, and not out of the guard's inability
+        // to parse the snippet: `Reason::Unreadable` says only that a line is
+        // outside the grammar, which is no evidence at all that the line sets
+        // nothing. Every `=` in the snippet is found instead, and the name in
+        // front of it must be one of bx's own `BX_` names — which no tool
+        // reads — or an array the completion function declares `local`, which
+        // never leaves that function. Nothing else is given a value anywhere
+        // in the file, so the snippet sets no environment variable and there
+        // is nothing in it for the guard to judge.
+        //
+        // Written this way the test survives the snippet being reformatted,
+        // and fails the moment a generator puts a real assignment in it.
         let snippet = include_str!("../bench/fixtures/bx/bx-init.zsh");
-        assert_eq!(
-            reasons(snippet, &RootSet::strict()),
-            [8, 12, 13, 14, 15, 16, 17].map(|line| (line, Reason::Unreadable))
+        let locals: Vec<&str> = snippet
+            .lines()
+            .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
+            .filter_map(|rest| rest.split_whitespace().next_back())
+            .map(|declared| declared.split('=').next().unwrap_or(declared))
+            .collect();
+        let mut assigned = Vec::new();
+        for (at, _) in snippet.match_indices('=') {
+            let (before, from) = snippet.split_at(at);
+            // `==`, `!=`, `<=` and `>=` compare; they assign nothing.
+            if before.ends_with(['=', '!', '<', '>']) || from[1..].starts_with('=') {
+                continue;
+            }
+            // `:=`, `+=` and the rest of the assigning operators keep the name
+            // in front of them.
+            let before = before.trim_end_matches([':', '+', '-', '?']);
+            let head = before.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+            let name = &before[head.len()..];
+            assert!(
+                !name.is_empty(),
+                "the snippet assigns through {before:?}, which names nothing"
+            );
+            assigned.push(name);
+        }
+        for name in &assigned {
+            assert!(
+                name.starts_with("BX_") || locals.contains(name),
+                "the snippet gives {name} a value, which is neither one of \
+                 bx's own names nor local to a function"
+            );
+        }
+        // Not vacuous: the staleness test is what the snippet is for, and it
+        // is the two names found above.
+        assert!(assigned.contains(&"BX_BIN") && assigned.contains(&"BX_STALE"));
+        // So the guard reads no environment assignment out of it either. Every
+        // line is a comment, a blank, or shell outside the grammar, but for the
+        // one local array — whose value the grammar cannot read, so nothing is
+        // learned from it and nothing is approved.
+        for (idx, line) in snippet.split('\n').enumerate() {
+            if let Statement::Assign { name, .. } = statement(line) {
+                assert!(
+                    locals.contains(&name),
+                    "line {} assigns {name}, which the guard would have to judge",
+                    idx + 1
+                );
+            }
+        }
+        assert!(
+            pass(snippet, &RootSet::strict())
+                .1
+                .learned
+                .values()
+                .all(Result::is_err)
         );
     }
 

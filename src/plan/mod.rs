@@ -416,19 +416,70 @@ pub fn exit(report: &Report, mode: Mode) -> Exit {
     }
 }
 
-/// Refuse a state file `run` reads that is there and is not a regular file.
+/// Refuse anything in the state directory that is neither a regular file nor a
+/// directory, before any reader opens it.
 ///
-/// Checked with `lstat` before any reader opens one. bx only ever leaves these
-/// files by rename, and a FIFO, a device or a link at one of them could make a
-/// read wait forever or never end. An absent file is fine — there is nothing to
-/// read — and so is one `lstat` cannot see, which the read then reports itself.
+/// bx only ever leaves a state file by rename, and a FIFO, a device or a link
+/// at one could make a read wait forever or never end: a FIFO blocks the open
+/// until a writer that never comes, and a link to `/dev/zero` fills memory
+/// without bound. Everything under the state root is bx's own, so nothing there
+/// is legitimately either.
+///
+/// # Decision 32: the scope is the tree, not a list of names
+///
+/// The check used to name three files — the ledger, the fingerprints and the
+/// journal — and its doc claimed that was every state file a run opens. It was
+/// not. `bx plan` also reads `<state>/restore/<digest>` through
+/// [`interrupted_rows`], with no file-type check anywhere on that path, and a
+/// FIFO there hung `bx plan` — the read-only command — forever. The blob was
+/// outside the guard by omission and not by judgement: decision 20's rationale
+/// covers it word for word, and it is left by rename like the other three.
+///
+/// A fourth name would have been the same artefact with the same defect
+/// waiting. A list of the state files a run reads has to be re-derived by hand
+/// every time a reader is added, and nothing fails when it is not: the three
+/// tests that exercised it mirrored the same three names, so the suite could
+/// not find what the list had missed. So the list is gone. The scope is now
+/// **everything under the state root**, walked from the filesystem, which is an
+/// over-approximation of what any reader could open and therefore cannot be
+/// short of it. A state file added tomorrow is covered on the day it is
+/// written, by nobody having done anything.
+///
+/// Directories are descended into and are not themselves refused; the root is
+/// not refused either, so an account that symlinks its whole state directory
+/// elsewhere still works. An absent state directory is fine — there is nothing
+/// to read — and so is an entry `lstat` cannot see, which the read then reports
+/// itself.
 fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
-    for path in [state.ledger(), state.fingerprints(), state.journal()] {
-        if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.file_type().is_file()) {
-            return Err(Error::NotARegularFile { path });
+    fn walk(dir: &Path) -> Result<(), Error> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            // Unreadable or absent: there is nothing bx can enumerate here, and
+            // whichever reader wants a file beneath it reports its own failure.
+            return Ok(());
+        };
+        // Sorted, so a directory holding two irregular entries is always
+        // refused naming the same one: `read_dir` yields in whatever order the
+        // filesystem happens to hold, and an error message that varies between
+        // identical runs is not one a test or a user can rely on.
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
+            // `symlink_metadata`, so a symlink is judged as a symlink rather
+            // than as whatever it points at. `entry.file_type()` would do on
+            // Linux, but it is documented as possibly needing a stat, and this
+            // one must not follow.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&path)?;
+            } else if !meta.file_type().is_file() {
+                return Err(Error::NotARegularFile { path });
+            }
         }
+        Ok(())
     }
-    Ok(())
+    walk(state.root())
 }
 
 /// What a read-only run learns from the state directory before deciding.
@@ -1689,6 +1740,153 @@ pub(crate) mod tests {
     #[test]
     fn decision_20_a_fifo_at_the_journal_is_refused_without_waiting() {
         a_fifo_state_file_is_refused(StateDir::journal);
+    }
+
+    /// Stage an apply that died once its write was published: the journal
+    /// stands over `new\n`, and rolling it back needs the restore snapshot of
+    /// `old\n`. This is the state in which `bx plan` reads a fourth state file.
+    fn a_standing_write_over(home: &GuardedHome) -> Inputs {
+        home.write(".conf", "old\n");
+        let inputs = inputs(home, &inline("~/.conf", "new\\n"));
+        let target = Portable::parse_in("~/.conf", home.path()).expect("a portable target");
+        let dest = home.child(".conf");
+        let mut session = Session::open(
+            inputs.state(),
+            SessionKind::Apply,
+            home.path(),
+            vec![target.clone()],
+        )
+        .expect("a session");
+        session
+            .apply(Request {
+                target,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"new\n".to_vec(),
+                    planned: fs::observe(&dest).expect("observe"),
+                },
+                mode: FileMode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("the write");
+        drop(session);
+        inputs
+    }
+
+    #[test]
+    fn decision_32_a_fifo_at_the_restore_snapshot_is_refused_without_waiting() {
+        // P42R2-D3 and P42R2-COV3, the named case. `bx plan` reads
+        // <state>/restore/<digest> through `interrupted_rows` ->
+        // LedgerView::restore_bytes, which is a bare std::fs::read. The guard
+        // named three state files and not this one, so at 5d1bba7 this test
+        // does not merely fail: `run` never returns, and `refusal`'s deadline
+        // is what turns the hang into a failure.
+        let home = guarded_home();
+        let inputs = a_standing_write_over(&home);
+        let blob = inputs
+            .state()
+            .restore()
+            .join(crate::state::ContentHash::of(b"old\n").to_hex());
+        std::fs::remove_file(&blob).expect("the snapshot goes");
+        fifo_at(&blob);
+
+        for mode in [Mode::Plan, Mode::Apply] {
+            let message = refusal(&inputs, mode);
+            assert!(
+                message.contains(&blob.display().to_string()),
+                "{mode:?}: {message}"
+            );
+            assert!(
+                message.contains("not a regular file"),
+                "{mode:?}: {message}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(home.child(".conf")).expect("untouched"),
+            b"new\n",
+            "a refused state file was written past"
+        );
+    }
+
+    /// Every path under `state`, deepest first, as the filesystem holds them.
+    ///
+    /// Re-derived from disk on every run rather than written down: the point of
+    /// [`refuse_irregular_state_files`] after decision 32 is that its scope is
+    /// whatever is there, so a test that named the files would be the very
+    /// artefact the decision removed.
+    fn every_state_path(state: &StateDir) -> Vec<PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+            paths.sort();
+            for path in paths {
+                if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                    walk(&path, found);
+                } else {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(state.root(), &mut found);
+        found
+    }
+
+    #[test]
+    fn decision_32_a_fifo_at_any_file_under_the_state_directory_is_refused_without_waiting() {
+        // P42R2-D3 and P42R2-COV3. The guard used to name three files — the
+        // ledger, the fingerprints and the journal — and the three tests that
+        // exercised it mirrored that same list, so neither could find what the
+        // list had missed: `bx plan` also reads <state>/restore/<digest>
+        // through `interrupted_rows`, with no file-type check on that path, and
+        // a FIFO there made `bx plan` — the read-only command — wait forever.
+        //
+        // This asks it of every file the state directory actually holds,
+        // enumerated from disk at the head it runs against. A reader added
+        // later brings its file with it and is covered the day it is written;
+        // nobody has to remember to extend a list.
+        let home = guarded_home();
+        let inputs = a_standing_write_over(&home);
+
+        let paths = every_state_path(inputs.state());
+        let blob_dir = inputs.state().restore();
+        assert!(
+            paths.iter().any(|path| path.parent() == Some(&*blob_dir)),
+            "the fixture holds no restore snapshot, so the case that hung is untested: {paths:?}"
+        );
+        assert!(
+            paths.contains(&inputs.state().journal()),
+            "the fixture holds no journal: {paths:?}"
+        );
+
+        for path in paths {
+            let kept = std::fs::read(&path).expect("the file's bytes");
+            std::fs::remove_file(&path).expect("make way for the FIFO");
+            fifo_at(&path);
+
+            // `refusal` runs on a thread with a deadline, so a read that waits
+            // fails the test instead of hanging it.
+            let message = refusal(&inputs, Mode::Plan);
+            assert!(
+                message.contains(&path.display().to_string()),
+                "{}: {message}",
+                path.display()
+            );
+            assert!(
+                message.contains("not a regular file"),
+                "{}: {message}",
+                path.display()
+            );
+
+            std::fs::remove_file(&path).expect("the FIFO goes");
+            std::fs::write(&path, kept).expect("the file comes back");
+        }
+
+        // With every file back as it was, the same run reports the
+        // interruption rather than a refusal: the sweep left nothing behind.
+        assert!(plan(&inputs).interrupted.is_some());
     }
 
     #[test]

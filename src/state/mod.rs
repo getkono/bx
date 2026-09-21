@@ -300,6 +300,28 @@ pub enum Error {
         /// The state file.
         path: PathBuf,
     },
+    /// The state directory, or its lock file, is owned by another account.
+    ///
+    /// The module validates file type, link-ness, `nlink` and mode precisely
+    /// to establish "this is ours"; owner is the component of that judgement
+    /// that can be established rather than guessed. A `~/.local/state/bx`
+    /// owned by another uid at `0700` would otherwise be accepted as bx's own,
+    /// and bx would write the user's displaced private bytes into a directory
+    /// that account controls — and lock against a file it can replace.
+    #[error(
+        "{} is owned by uid {owner}, and bx is running as uid {ours}; bx will not keep your \
+         files in a directory another account owns, nor lock against a file it owns. Move it \
+         aside, or run bx as the account that owns it",
+        .path.display()
+    )]
+    ForeignOwner {
+        /// The directory or lock file.
+        path: PathBuf,
+        /// The uid that owns it.
+        owner: u32,
+        /// This process's effective uid.
+        ours: u32,
+    },
     /// A directory the state directory needs is a symbolic link that leads
     /// nowhere: to nothing, round a loop of links (`ELOOP`), or through a file
     /// (`ENOTDIR`).

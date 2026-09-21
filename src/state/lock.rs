@@ -15,6 +15,24 @@
 //! Acquisition never blocks. A CLI that hangs with no output is worse than one
 //! that says who holds the lock, so a refused exclusive acquisition reports the
 //! holder's pid and program, read from the lock file's body.
+//!
+//! # A reader creates the state directory too
+//!
+//! [`SharedLock::acquire`] — the lock a read-only `plan` or `doctor` takes —
+//! goes through [`open_lock_file`], which calls
+//! [`ensure_dir`][super::dir::ensure_dir]. So `bx plan` on a machine that has
+//! never applied anything creates `~/.local/state/bx`, `restore/`, `shell/`
+//! and `lock`, narrows the directory to `0700` and the lock file to `0600`.
+//! That is deliberate.
+//!
+//! Invariant 1 forbids rewriting a byte **the user wrote**; `~/.local/state/bx`
+//! is a directory bx owns, and creating it writes none of them. And the shared
+//! lock is what stops a `plan` reading a half-written ledger while an `apply`
+//! writes one: a lock needs a file, so tolerating an absent state directory
+//! would mean a second, lock-free read path through the module that carries
+//! Invariant 4, whose correctness would have to be argued on its own. That is
+//! new risk on the safety-critical module, to avoid a `mkdir` of bx's own
+//! directory.
 
 use std::cell::Cell;
 use std::fmt;
@@ -307,6 +325,12 @@ fn open_lock_file(dir: &StateDir, path: &Path) -> Result<(OwnedFd, rustix::fs::S
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1 {
         return Err(not_a_file());
     }
+    // Owner is the last component of "is this ours", and the one this call
+    // used to omit. Inside a `0700` state directory this account owns, only
+    // root could have put another account's file here — so it is defence in
+    // depth rather than a condition an unprivileged test can stage; see
+    // `check_owner`'s own tests for the judgement it makes.
+    super::dir::check_owner(path, stat.st_uid)?;
     let found = Mode::from_bits(stat.st_mode);
     if found != Mode::PRIVATE_FILE {
         tracing::warn!(

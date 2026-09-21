@@ -150,8 +150,16 @@ impl StateDir {
     /// and are not bx's to tighten. The directories bx invents — `bx/`,
     /// `bx/restore/`, `bx/shell/` — are created at `0700` and tightened back to
     /// `0700` if they are found wider, because they hold `local.toml`, the age
-    /// identity, and prior copies of the user's private files. Changing the mode
-    /// of a directory bx created is not rewriting a byte the user wrote.
+    /// identity, and prior copies of the user's private files. See [`tighten`]
+    /// for why a directory already there is narrowed whoever made it, why a
+    /// linked one is refused rather than narrowed, and what ownership is
+    /// checked.
+    ///
+    /// **A read-only command calls this.** `bx plan` and `bx doctor` take the
+    /// shared lock, and a lock needs a file, so they create the state
+    /// directory on a machine that has never applied anything. Invariant 1
+    /// forbids rewriting a byte the *user* wrote, and none of these paths is
+    /// one; see the [`super::lock`] module documentation for the argument.
     ///
     /// # Errors
     ///
@@ -484,11 +492,54 @@ fn check_local_layer(dir: &Path, mode: Mode) -> Result<(), Error> {
     Ok(())
 }
 
-/// Check that an existing `path` is a directory, and narrow it to `mode` if it
-/// is reachable by anyone but its owner.
+/// Refuse `path` unless `uid` is this process's effective uid.
+///
+/// The one component of "is this ours" the module used to omit. It validates
+/// file type, link-ness, `nlink` and mode precisely to establish that a state
+/// directory or a lock file is bx's own; a directory owned by another account
+/// at `0700` was accepted as bx's regardless, and bx would then write the
+/// user's displaced private bytes into a directory that account controls.
+///
+/// Reachable rather than theoretical: `state/mod.rs` contemplates the
+/// `EACCES` a `sudo bx` leaves behind, which is the same mixed-uid situation
+/// arriving one run later.
+///
+/// # Errors
+///
+/// [`Error::ForeignOwner`], naming both uids.
+pub(crate) fn check_owner(path: &Path, uid: u32) -> Result<(), Error> {
+    let ours = rustix::process::geteuid().as_raw();
+    if uid == ours {
+        return Ok(());
+    }
+    Err(Error::ForeignOwner {
+        path: path.to_path_buf(),
+        owner: uid,
+        ours,
+    })
+}
+
+/// Check that an existing `path` is a directory owned by this account, and
+/// narrow it to `mode` if it is reachable by anyone but its owner.
+///
+/// # Why a pre-existing directory is narrowed at all
+///
+/// bx narrows a directory found at its own state path, whoever made it,
+/// because that directory holds `restore/` — verbatim copies of the user's
+/// private files — and a `0755` state directory exposes every one of them.
+/// Provenance cannot gate it: nothing records which process created the
+/// directory, and inferring it from mode or mtime is a guess. Reporting and
+/// refusing instead would leave those copies world-readable while bx talks
+/// about it, which is the worse failure for the concern Invariant 5 names.
+/// Ownership is checked, which is the part that can be established.
+///
+/// # Why a linked directory is refused rather than narrowed
 ///
 /// A directory reached through a symlink is never narrowed: it is refused if
-/// [`open_beyond_owner`], and otherwise left exactly as it is.
+/// [`open_beyond_owner`], and otherwise left exactly as it is. What is at the
+/// other end of a link the user made is not bx's to re-permission — it is a
+/// directory bx did not create and may be shared with other users — so the
+/// only answers left are to accept it as it is or to refuse and say why.
 fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
     let read_failed = |source| Error::Read {
         path: path.to_path_buf(),
@@ -523,6 +574,8 @@ fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
             path: path.to_path_buf(),
         });
     }
+
+    check_owner(path, std::os::unix::fs::MetadataExt::uid(&meta))?;
     let found = Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
     if linked {
         // Never `chmod` through a link: the directory it names is not one bx
@@ -1297,6 +1350,42 @@ mod tests {
         dir.ensure().expect("ensure");
         assert!(real.join("restore").is_dir());
         assert_eq!(mode_of(&real.join("restore")), Mode::PRIVATE_DIR);
+    }
+
+    #[test]
+    fn a_state_directory_owned_by_another_account_is_refused_naming_both_uids() {
+        // r4 round 1 (CL5): the module established "this is ours" from file
+        // type, link-ness, nlink and mode, and never from the owner, so a
+        // `~/.local/state/bx` owned by another uid at 0700 was accepted as
+        // bx's own — and bx would write the user's displaced private bytes
+        // into a directory that account controls.
+        let ours = rustix::process::geteuid().as_raw();
+        assert!(check_owner(Path::new("/s/bx"), ours).is_ok(), "our own");
+
+        let err = check_owner(Path::new("/s/bx"), ours.wrapping_add(1)).expect_err("another uid");
+        assert!(
+            matches!(&err, Error::ForeignOwner { path, owner, ours: mine }
+                if path == Path::new("/s/bx")
+                    && *owner == ours.wrapping_add(1)
+                    && *mine == ours),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("Move it aside"), "{err}");
+
+        if rustix::process::geteuid().is_root() {
+            // `/` is this process's own directory then, so the refusal below
+            // cannot be staged without making a second account.
+            return;
+        }
+        // `/` is a real directory this account does not own, and `tighten`
+        // used to judge it by its mode alone: 0755 is shared, so it would
+        // reach for the `chmod` and report whatever that failed with.
+        let err = tighten(Path::new("/"), Mode::PRIVATE_DIR).expect_err("not ours");
+        assert!(
+            matches!(&err, Error::ForeignOwner { path, .. } if path == Path::new("/")),
+            "got {err}",
+        );
+        assert_eq!(mode_of(Path::new("/")).bits() & 0o7777, 0o755, "untouched");
     }
 
     #[test]

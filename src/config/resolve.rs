@@ -46,6 +46,10 @@
 //! load. When the way there runs through this account's answer — `s =
 //! "{{b}}"` into `file = "cfg/{{s}}/x"`, with `b` a `path` value — the target
 //! is blocked, naming that answer's line, whether or not `b` is answered.
+//!
+//! What is refused is reaching a **`path` value**, not every absolute text: an
+//! account answering a plain `string` value `/home/example/…` still resolves,
+//! because nothing separates that from a string the account meant.
 
 use std::path::Path;
 
@@ -479,6 +483,13 @@ fn path_value_behind<'a>(
 /// blocked on that, and the load error the committed walk owes is left to it.
 /// `a_committed_chain_alone_is_not_an_answer_block` calls this with exactly
 /// that chain, so the coupling is pinned rather than asserted.
+///
+/// Only a declaration of kind `path` ends the walk, so this closes the route an
+/// account's answer opens *into a `path` value*, not every way an absolute
+/// literal reaches `file`. An account answering a plain `string` value
+/// `/home/example/…` still resolves Ready: that text is what a `string` value
+/// is for, and nothing separates a machine location from a string an account
+/// meant.
 fn refuse_path_answer_in_file(
     target: &Target,
     file: &str,
@@ -3304,7 +3315,12 @@ mod tests {
             );
         }
 
-        // Two answers on the way: both are named, in declaration order.
+        // Two answers on the way: both are named, in declaration order — `t`
+        // before `s`, though the walk met `s` first. `BlockReason::
+        // InvalidValue`'s "in declaration order" and `in_declaration_order`
+        // both predate this change, and every other block reason uses them;
+        // walk order here would be the one exception. An answer may name only
+        // an earlier value, so the two orders differ for every chain of two.
         let resolved = resolved(
             &layer,
             Some("[values]\ns = \"{{t}}\"\nt = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),

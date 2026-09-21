@@ -44,6 +44,12 @@ pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
 }
 
 /// Ask on the terminal whether to write.
+///
+/// The default is **no**: a prompt answered with a bare newline, or one whose
+/// terminal goes away mid-question, must not be read as approval. Everything
+/// around this — `yes`, no terminal, declined, accepted, a failing prompt — is
+/// decided in [`apply_with`] and tested through its `ask` seam; this wrapper
+/// exists only to put the question.
 fn confirm() -> Result<bool, Error> {
     inquire::Confirm::new("Apply these changes?")
         .with_default(false)
@@ -144,6 +150,70 @@ mod tests {
 
     fn never() -> Result<bool, Error> {
         panic!("nothing should have been asked")
+    }
+
+    /// Set on the child that actually calls [`confirm`].
+    const CONFIRM_CHILD: &str = "BX_TEST_CONFIRM_CHILD";
+
+    #[test]
+    #[ignore = "spawned by the test below; it must run with a stdin that is not a terminal"]
+    fn confirm_child() {
+        // Without the variable this is someone running `--ignored` by hand,
+        // possibly from a terminal, where `prompt` would block on a question
+        // nobody is there to answer. Do nothing rather than hang.
+        if std::env::var_os(CONFIRM_CHILD).is_none() {
+            return;
+        }
+        let answer = confirm();
+        // `Ok(_)` is what both surviving mutants return, so this is the
+        // assertion that kills them: with no terminal there is no answer, and
+        // a wrapper that invents one would approve a write nobody confirmed.
+        assert!(
+            matches!(answer, Err(Error::Prompt(inquire::InquireError::NotTTY))),
+            "{answer:?}"
+        );
+    }
+
+    #[test]
+    fn confirm_without_a_terminal_is_a_prompt_error_and_never_an_answer() {
+        // P42R1 "Untested line: the `inquire` confirmation call". `cargo
+        // mutants` reported `confirm -> Ok(true)` and `-> Ok(false)` as missed.
+        // The earlier round recorded it as needing a pseudo-terminal and a
+        // dependency this pull request does not add, and left it. It does not:
+        // the question is what `confirm` does when there is NO terminal, and
+        // that is reachable by giving it one that certainly is not.
+        //
+        // Run in a child rather than here, because `inquire` reads the
+        // process's stdin and a test must not depend on how `cargo test` was
+        // invoked. In CI stdin is already not a terminal; on a developer's
+        // machine it is, and this test would hang waiting for an answer. The
+        // child's stdin is `/dev/null` either way, which is the same seam
+        // `plan::tests`'s crash harness uses to fix a child's environment.
+        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "command::tests::confirm_child",
+            ])
+            .env(CONFIRM_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn the confirmation child");
+
+        assert!(
+            output.status.success(),
+            "the child's assertion failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // The child really ran the case, rather than being filtered out and
+        // reporting success over an empty run.
+        let ran = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            ran.contains("1 passed") && ran.contains("0 failed"),
+            "the child ran no test: {ran}"
+        );
     }
 
     #[test]

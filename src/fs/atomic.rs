@@ -1574,6 +1574,36 @@ impl Filled {
 /// `publish` consumes the [`Filled`], so nothing the caller still holds names
 /// the write afterwards. This does: [`Unpublished::dest`] is the path
 /// [`Filled::new_entry`] keyed the entry on.
+///
+/// # It is deliberately not an error type
+///
+/// No [`Display`](std::fmt::Display) and no
+/// [`std::error::Error`], so `?` converts it into nothing: not into
+/// [`Error`], and not into an aggregating type like `eyre::Report`, whose
+/// blanket `From` needs exactly those impls. The ledger-holding caller lives in
+/// that second layer, so an error impl here would have made the guard look
+/// present and not be.
+///
+/// ```compile_fail
+/// fn publish(filled: bx::fs::Filled) -> Result<(), bx::fs::Error> {
+///     filled.publish()?; // no `From<Unpublished> for fs::Error`
+///     Ok(())
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn publish(filled: bx::fs::Filled) -> eyre::Result<()> {
+///     filled.publish()?; // and none for `eyre::Report` either
+///     Ok(())
+/// }
+/// ```
+///
+/// ```
+/// fn publish(filled: bx::fs::Filled) -> Result<(), bx::fs::Error> {
+///     // Written out, because it says "this write had no ledger entry".
+///     filled.publish().map_err(bx::fs::Unpublished::into_error)
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Unpublished {
     /// Why the write was refused.
@@ -1591,21 +1621,12 @@ impl Unpublished {
     /// that *had* recorded an entry would lose the only thing that still names
     /// it. Writing this out says "there is no entry", which is true of
     /// [`Staged::commit`] and [`write_atomically`] and of nothing else here.
+    ///
+    /// The [`Error`] it returns does not name [`Unpublished::dest`], because by
+    /// then the caller has said there is nothing keyed on it.
     #[must_use]
     pub fn into_error(self) -> Error {
         self.error
-    }
-}
-
-impl std::fmt::Display for Unpublished {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
-    }
-}
-
-impl std::error::Error for Unpublished {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
     }
 }
 
@@ -1627,16 +1648,20 @@ impl std::error::Error for Unpublished {
 ///
 /// # The parent directory must already exist
 ///
-/// This function creates no directories. [`stage`] does — at the mode a
-/// directory target declares, or at [`Mode::DEFAULT_DIR`] — and it is the only
-/// entry point that does, because creating one is a decision that needs three
-/// things this shorthand has none of: a [`CreatedDirs`] to record the directory
-/// in so a reversal can remove it, a [`compare`] to announce it in a plan
-/// before `apply` makes it, and a caller who knows what the directory is for
-/// and therefore what mode it should get. Inventing a `0755` directory here to
-/// hold a `0600` decrypted secret would answer that last question by default,
-/// silently, in the one function billed as the single place a secret is
-/// written.
+/// This function creates no directories, and that is the whole of the claim.
+/// Two entry points in this module do: [`stage`], for the parents a write
+/// needs, and [`ensure_dir`], which is a directory target's own apply. Both
+/// take a [`CreatedDirs`] to record what they made so a reversal can remove it,
+/// both are announced by a [`compare`] or [`compare_dir`] first, and both get
+/// their mode from a declaration. (Outside `fs` entirely,
+/// `state::dir::ensure_dir` creates the state directory; it is bx's own and
+/// does not pass through here.)
+///
+/// This shorthand has none of the three: no set to record in, no plan to
+/// announce in, and no caller to say what mode a new directory should get.
+/// Inventing a `0755` directory here to hold a `0600` decrypted secret would
+/// answer that last question by default, silently, in the one function billed
+/// as the single place a secret is written.
 ///
 /// So a missing parent is [`Error::MissingParent`]: the caller creates the
 /// directory it means, at the mode it means, and both state-directory callers

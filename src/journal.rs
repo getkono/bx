@@ -392,9 +392,9 @@ pub struct Begin {
     /// What it is *not* is free-form. [`refusal`] puts every entry through
     /// [`Portable::check_against`] with the header's home, and one entry that
     /// fails makes the whole journal unreadable — so a session that wrote an
-    /// unportable scope entry could never be rolled back. [`Session::open`]
-    /// therefore refuses the same entries the loader refuses, before the
-    /// journal exists: see `r3 round 3` decision 1.
+    /// unportable scope entry could never be rolled back.
+    /// [`Session::open_locked`] therefore refuses the same entries the loader
+    /// refuses, before the journal exists: see `r3 round 3` decision R3R3-1.
     pub scope: Vec<Portable>,
 }
 

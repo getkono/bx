@@ -19,6 +19,9 @@
 //!   removed deepest-first while they are empty; one another managed file
 //!   still holds is handed to that file's entry, so its own `rm` removes it,
 //!   and one the user replaced with something that is not a directory is left.
+//!   A claim is never simply dropped: a target handed back to the user, whose
+//!   file stays where it is, gives its claims to a surviving entry beneath them
+//!   the same way a removal does.
 //!   The file is unlinked only while it is still the one the plan observed.
 //! * **Never overwrite a later edit.** The destination's current digest is
 //!   compared with the digest bx recorded when it last wrote the file. If they

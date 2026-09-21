@@ -26,7 +26,10 @@
 //! # Who recovers, and who only reports
 //!
 //! A **writing** command — `apply`, `sync`, `init`, `add`, `rm` — calls
-//! [`before_writing`] first, which recovers and refuses to go on if it cannot. A
+//! [`lock_for_writing`] first, which recovers under the state directory's lock,
+//! refuses to go on if it cannot, and hands the same lock to the session it is
+//! about to open, so no second bx can win the directory in between.
+//! [`before_writing`] is the same recovery for a caller that opens no session. A
 //! **read-only** command — `plan`, `status`, `doctor` — calls [`pending`],
 //! reports every named target as [`Action::Conflict`], exits
 //! [`Exit::Pending`](crate::report::Exit::Pending), and writes nothing. That is

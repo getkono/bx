@@ -827,8 +827,13 @@ mod tests {
         // true under all of them and the assertions below always run. The branch
         // exists so the test does not *fail* for the privileged reader, which is
         // what issue #13 item 3 asked for; covering it would need a test that
-        // re-execs under `unshare`, which this repository does not do for the two
-        // sibling skips it already carries on `master`.
+        // re-execs under `unshare`, which this repository does not do for the
+        // two sibling skips it already carries on `master` -- the one below in
+        // `a_modules_directory_that_cannot_be_searched_names_the_entry`, and the
+        // one in `layers.rs`. Both are cited from `master` on purpose: a
+        // precedent a reader cannot open from the default branch is not one, and
+        // grounding this argument off the default branch is the fault issue #56
+        // was corrected in place for.
         let constructible = std::fs::read_dir(&modules).is_err();
         let result = layer_files(dir.path());
         std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
@@ -840,8 +845,13 @@ mod tests {
             // an `eprintln!` here would reach nobody on the one kind of machine
             // that takes this branch -- the suite would go green with the
             // assertions below never run and nothing said. A direct write
-            // survives that capture. Issue #56 records the same defect at the
-            // two sibling skip sites, which this pull request does not modify.
+            // survives that capture. The two sibling skip sites carry the same
+            // defect and this pull request deliberately does not modify them:
+            // they are `master` code tracked by issue #56, whose acceptance asks
+            // for a broader remedy -- make the branch reachable, or make an
+            // ordinary run fail loudly and a skip be opted into by name -- and
+            // changing only their print channel here would pre-empt that with a
+            // half-measure.
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),

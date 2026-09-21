@@ -29,13 +29,14 @@
 //! note names the `local.toml` line that caused it.
 //!
 //! So does a legal answer that makes a **target's own field** invalid once
-//! substituted: `acct = "../../.."` into `~/.config/{{acct}}/settings.json`
-//! climbs out of the home, `seg = ""` into `owns = ["a.{{seg}}"]` leaves an
-//! empty key segment, `seg = "b.c"` adds a segment, naming a deeper key than
-//! the one written, and `leaf = "."` into a file target's `~/{{leaf}}` makes it
-//! the home directory itself. The target is blocked naming the answer's line, and
-//! nothing is written for it. The same field broken with no account answer in
-//! it — a committed `default` alone — is the repo's defect and fails the load.
+//! substituted, among them: `acct = "../../.."` into
+//! `~/.config/{{acct}}/settings.json` climbs out of the home, `seg = ""` into
+//! `owns = ["a.{{seg}}"]` leaves an empty key segment, `seg = "b.c"` adds a
+//! segment, naming a deeper key than the one written, and `leaf = "."` into a
+//! file target's `~/{{leaf}}` makes it the home directory itself. The target is
+//! blocked naming the answer's line, and nothing is written for it. The same
+//! field broken with no account answer in it — a committed `default` alone — is
+//! the repo's defect and fails the load.
 //!
 //! A defect in the **committed** repo is not blocked but fatal — a malformed
 //! placeholder, or a reference to a value no layer declares, cannot be fixed by

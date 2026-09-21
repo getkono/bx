@@ -2472,6 +2472,72 @@ mod tests {
     }
 
     #[test]
+    fn a_toggle_the_hint_leaves_standing_is_one_no_answer_can_strand() {
+        // The premise the closing clause rests on: what outlives the removals
+        // is not a toggle an answer could strand. Here one survivor is a
+        // toggle — `~/.config/{{p}}/./s`, anchored by `bx.toml`'s own spelling
+        // of it, which `local.toml`'s entry replaced in the merge but not in
+        // the layer — so following the whole hint has to leave it naming a
+        // declared target. It does: the answer change moves it onto `bx.toml`'s
+        // entry under the new answer, and the configuration loads.
+        const DECLS: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"r\"\nkind = \"string\"\n";
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "{DECLS}{}{}",
+                    target_toml("~/.config/{{p}}/s", "P"),
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let answered = |p: &str, toggles: &str| {
+            [
+                base(),
+                local(&format!(
+                    "[values]\np = \"{p}\"\nq = \"default\"\nr = \"default\"\n{}{}{toggles}",
+                    target_toml("~/.config/{{q}}/s", "L"),
+                    "[[target]]\npath = \"~/.config/{{p}}/./s\"\nenabled = false\n"
+                )),
+            ]
+        };
+
+        let config = merge(&answered("default", &toggle_toml("~/.config/{{r}}/s"))).unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(
+            hint.ends_with(
+                "; remove the toggle `~/.config/{{r}}/s` at local.toml:11: bx cannot show \
+                 that it names a declared target for every answer, so another answer may \
+                 leave it toggling a file no earlier layer declares; `~/.config/{{q}}/s` at \
+                 local.toml:5 and `~/.config/{{p}}/./s` at local.toml:8 still name one file \
+                 once it is gone, because of the answer to `p` at local.toml:2 and the \
+                 answer to `q` at local.toml:3; change that answer too"
+            ),
+            "{hint}"
+        );
+
+        // The whole hint followed: the flagged toggle gone, `p` changed. The
+        // surviving toggle now names `bx.toml`'s entry under the new answer and
+        // switches it off; nothing is stranded and nothing clashes.
+        assert_eq!(
+            loads(&answered("other", "")),
+            [
+                (
+                    "~/.zshrc".to_string(),
+                    crate::config::target::Body::Inline("setopt".to_string())
+                ),
+                (
+                    "~/.config/default/s".to_string(),
+                    crate::config::target::Body::Inline("L".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn a_removal_that_leaves_two_statements_naming_one_file_names_the_answer_too() {
         // Three statements, one flagged: two full entries and a toggle bx
         // cannot show names a declared target for every answer. Removing the

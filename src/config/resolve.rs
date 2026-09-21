@@ -1712,6 +1712,114 @@ mod tests {
     }
 
     #[test]
+    fn a_derived_value_one_spelling_carries_twice_is_offered_as_the_way_out() {
+        // The exclusion above is by *count*, not by membership. `q` is carried
+        // by both spellings, but once by the first and twice by the second, so
+        // answering it does part them and the hint has to say so: with
+        // `p = ""` both key `~/x`, and `q = "a"` makes them `~/a/x` and
+        // `~/aa/x`. Before the count comparison, `q` was excluded and the hint
+        // named only `p`, whose every answer keeps them one file or parts the
+        // pair the same way.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[target]]\npath = \"~/{{q}}/x\"\ncontent = \"ONE\"\n\
+                             [[target]]\npath = \"~/{{q}}{{q}}/x\"\ncontent = \"TWO\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let blocking = resolved(LAYER, Some("[values]\np = \"\"\n"))
+            .expect("an account's answer blocks the file, not the load");
+        // A blocked entry is keyed by its spelling; both name `~/x` once `q` is
+        // empty, which is why they collide at all.
+        assert_eq!(keys(&blocking), ["~/{{q}}/x", "~/{{q}}{{q}}/x", "~/.zshrc"]);
+        for index in [0, 1] {
+            let entry = blocked(&blocking, index);
+            assert!(
+                entry.hint.ends_with(
+                    "because of the answer to `p` at local.toml:2, carried in by the default of \
+                     `q` at bx.toml:4; change that answer, or answer `q` directly"
+                ),
+                "{index}: {}",
+                entry.hint
+            );
+        }
+
+        // The act the hint names is one that clears the block.
+        let cleared = resolved(LAYER, Some("[values]\np = \"\"\nq = \"a\"\n"))
+            .expect("answering `q` directly parts the two spellings");
+        assert_eq!(keys(&cleared), ["~/a/x", "~/aa/x", "~/.zshrc"]);
+        for index in [0, 1, 2] {
+            ready(&cleared, index);
+        }
+    }
+
+    #[test]
+    fn a_derived_value_two_of_three_colliding_spellings_carry_is_offered_as_the_way_out() {
+        // Three spellings for one file. `q` is carried by two of them and not
+        // by the third, so it is in a separating position and the hint names
+        // it. The third spelling is what makes the deduplication guard matter:
+        // `q` is reached once per spelling that carries it and named once.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[target]]\npath = \"~/{{q}}/x\"\ncontent = \"ONE\"\n\
+                             [[target]]\npath = \"~/{{q}}{{q}}/x\"\ncontent = \"TWO\"\n\
+                             [[target]]\npath = \"~/{{p}}/x\"\ncontent = \"THREE\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let blocking = resolved(LAYER, Some("[values]\np = \"\"\n"))
+            .expect("an account's answer blocks the file, not the load");
+        assert_eq!(
+            keys(&blocking),
+            ["~/{{q}}/x", "~/{{q}}{{q}}/x", "~/{{p}}/x", "~/.zshrc"]
+        );
+        for index in [0, 1, 2] {
+            let hint = &blocked(&blocking, index).hint;
+            assert!(hint.ends_with("or answer `q` directly"), "{index}: {hint}");
+            assert_eq!(
+                hint.matches("`q`").count(),
+                2,
+                "named once in the defaults and once in the direct list: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_derived_value_reached_down_two_defaults_is_named_once() {
+        // `left` and `right` both default to `{{shared}}`, so one text reaches
+        // `shared` twice, by two different routes, and every value on the way
+        // is an act that clears the entry. `shared` is offered once and in
+        // declaration order. `derived_between`'s own guard is what keeps it to
+        // one entry with one count, which
+        // `derived_between_names_a_value_reached_down_two_defaults_once` pins
+        // directly; here the interest is that the whole chain reaches the
+        // account.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"shared\"\nkind = \"string\"\n\
+                             default = \"{{p}}\"\n\
+                             [[value]]\nname = \"left\"\nkind = \"string\"\n\
+                             default = \"{{shared}}\"\n\
+                             [[value]]\nname = \"right\"\nkind = \"string\"\n\
+                             default = \"{{shared}}\"\n\
+                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
+                             content = \"{{{{}}\"\n\
+                             format = \"jsonc\"\nowns = [\"a.{{left}}{{right}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\np = \"b.c\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let hint = &blocked(&answered, 0).hint;
+        assert_eq!(
+            hint.matches("`shared`").count(),
+            2,
+            "one default entry and one direct entry, not two of each: {hint}"
+        );
+        assert!(
+            hint.ends_with("change that answer, or answer `shared` or `left` or `right` directly"),
+            "{hint}"
+        );
+        ready(&answered, 1);
+    }
+
+    #[test]
     fn a_committed_requires_defect_fails_the_load_whether_or_not_the_target_is_blocked() {
         // The defect is written entirely in committed text, so it is the
         // layer's for every account. It is checked before the probe, so an

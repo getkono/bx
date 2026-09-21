@@ -301,7 +301,7 @@ pub fn restore(
 ) -> Result<Vec<Restored>, Error> {
     // One lock across the recovery and the session: see
     // `recover::lock_for_writing`.
-    let (_recovered, lock) = recover::lock_for_writing(state)?;
+    let lock = recover::lock_for_writing(state)?;
     let mut session =
         Session::open_locked(state, SessionKind::Restore, home, targets.to_vec(), lock)?;
     let mut done = Vec::with_capacity(targets.len());

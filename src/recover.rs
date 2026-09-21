@@ -27,9 +27,14 @@
 //!
 //! A **writing** command — `apply`, `sync`, `init`, `add`, `rm` — calls
 //! [`lock_for_writing`] first, which recovers under the state directory's lock,
-//! refuses to go on if it cannot, and hands the same lock to the session it is
-//! about to open, so no second bx can win the directory in between.
-//! [`before_writing`] is the same recovery for a caller that opens no session. A
+//! refuses to go on if it cannot, and hands that same lock to the session it is
+//! about to open, so no second bx can win the directory in between. Nothing in
+//! the type system makes a writing command use it rather than
+//! [`before_writing`] and a fresh [`journal::Session::open`]; what makes it
+//! safe is that `lock_for_writing` is the only call that produces the guard
+//! [`journal::Session::open_locked`] consumes, and that `before_writing`'s own
+//! documentation says it is not this call. [`before_writing`] is the same
+//! recovery for a caller that opens no session. A
 //! **read-only** command — `plan`, `status`, `doctor` — calls [`pending`],
 //! reports every named target as [`Action::Conflict`], exits
 //! [`Exit::Pending`](crate::report::Exit::Pending), and writes nothing. That is
@@ -385,9 +390,17 @@ pub fn recover(state: &StateDir) -> Result<Outcome, Error> {
     resolve(state, &lock)
 }
 
-/// Recover, and refuse to continue if recovery is blocked.
+/// Recover, refuse to continue if recovery is blocked, and release the lock.
 ///
-/// The call every writing command makes before it writes anything.
+/// **Not** the call a writing command makes. It gives the state directory back
+/// before it returns, so a command that then opens a session leaves a window in
+/// which a second bx can win the directory — and that session's
+/// [`journal::Error::InProgress`] would then name a live run rather than an
+/// interruption. [`lock_for_writing`] is the call a writing command makes.
+///
+/// This is for a caller that resolves an interruption and opens no session: a
+/// `doctor` that recovers and reports, where the next command takes the lock
+/// again on its own terms.
 ///
 /// # Errors
 ///
@@ -417,19 +430,24 @@ fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome
 /// was an interruption this run could not resolve. See `r3 round 3`
 /// decision 3.
 ///
-/// The recovery's [`Outcome`] comes back with the lock, because a caller that
-/// rolled writes back has something to tell the user before it makes its own.
+/// Only the guard comes back. The recovery's [`Outcome`] is logged by
+/// [`resolve`] and not returned: no writing command has a channel to report it
+/// on yet, and a value every caller binds to `_` is a value the next reader has
+/// to work out the point of. A command layer that grows such a channel adds it
+/// back with a caller that reads it. Until then [`before_writing`] is the form
+/// that answers "what did recovery do", for a caller that opens no session.
+///
 /// The caller opens the session itself, so a session's failure stays a
 /// session's failure rather than becoming a recovery's.
 ///
 /// # Errors
 ///
 /// As [`before_writing`].
-pub fn lock_for_writing(state: &StateDir) -> Result<(Outcome, ExclusiveLock), Error> {
+pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
     state.ensure()?;
     let lock = ExclusiveLock::acquire(state)?;
-    let outcome = resolved_or_blocked(state, &lock)?;
-    Ok((outcome, lock))
+    resolved_or_blocked(state, &lock)?;
+    Ok(lock)
 }
 
 /// Move an unresolvable journal aside without touching any destination.
@@ -2122,6 +2140,11 @@ mod tests {
         // back, and a session refused for its scope gives it back too. It is
         // the last that would otherwise be unreached: `open_locked` owns the
         // guard, so an early return has to drop it.
+        //
+        // What it does *not* establish is that a writing command uses the
+        // pair: nothing in the type system says so, and `restore` being the
+        // only writing command at this revision is what makes it true today.
+        // See `r3 round 4`, CL1.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let dest = home.child(".conf");
@@ -2132,9 +2155,12 @@ mod tests {
             vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
         );
 
-        let (recovered, lock) = lock_for_writing(&state).expect("recover and keep the lock");
-        assert_eq!(recovered, Outcome::RolledBack { undone: 1 });
-        assert_eq!(peek(&dest).expect("rolled back").0, b"old\n");
+        let lock = lock_for_writing(&state).expect("recover and keep the lock");
+        assert_eq!(
+            peek(&dest).expect("rolled back").0,
+            b"old\n",
+            "the recovery ran under the guard that came back",
+        );
         assert!(
             ExclusiveLock::try_acquire(&state).expect("try").is_none(),
             "the recovery did not release the lock",
@@ -2155,7 +2181,7 @@ mod tests {
 
         // A scope the loader would refuse is refused under the caller's lock
         // too, and releases it: `open_locked` owns the guard either way.
-        let (_, lock) = lock_for_writing(&state).expect("nothing to recover");
+        let lock = lock_for_writing(&state).expect("nothing to recover");
         let absolute = Portable::try_from(dest.to_str().expect("utf-8").to_string())
             .expect("a well-formed absolute path");
         let err = Session::open_locked(

@@ -34,6 +34,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v2
+      # env_guard's strongest evidence is differential: it holds its grammar
+      # against what real bash, zsh and bun actually do with a value. A missing
+      # interpreter fails those tests rather than skipping them, so the runner
+      # has to supply every one of them or the property never runs. bash is on
+      # the image already.
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - uses: oven-sh/setup-bun@v2
       - name: Check formatting
         run: mise run format-check
       - name: Clippy
@@ -62,6 +70,11 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v2
+      # Coverage runs the same suite as `check`, so it needs the same
+      # interpreters; without them the differential tests fail here too.
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - uses: oven-sh/setup-bun@v2
       - name: Collect coverage data
         run: cargo llvm-cov --no-report
       - name: Generate lcov report and enforce threshold

@@ -494,6 +494,16 @@ enum Kind {
 /// The values a [`Kind::Setting`] accepts, each the shape its tool reads. None
 /// of them can hold a `/`, a `~`, a `:`, a blank, a URL, or `.` or `..`, so no
 /// setting names a path.
+///
+/// **The numeric bounds are chosen here, not read from each tool's parser.**
+/// [`Setting::Count`]'s 1024 and [`Setting::Size`]'s six digits are what bx is
+/// willing to generate; mise and sccache may well accept more. That is safe in
+/// one direction only: a bound too tight refuses a value bx might have wanted
+/// to write, and is widened by the change that first wants it, which refuses
+/// nothing approved before. A bound too loose would approve a value its tool
+/// mis-parses, and nothing downstream would catch it. No generator emits
+/// `MISE_JOBS` or `SCCACHE_CACHE_SIZE` today, so no bound here has yet had to
+/// be right about a real tool — only about what bx will write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Setting {
     /// `0`, `1`, `true` or `false`, and no other word.

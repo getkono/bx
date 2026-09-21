@@ -886,14 +886,15 @@ pub enum Reason {
     /// beside its own: uv puts executables in `$XDG_DATA_HOME/../bin`, and so
     /// does every tool built on dirs-next, which lands outside every root when
     /// the value is one. A tool given a whole root also clears everything else
-    /// the root holds. Point the value beneath the root. Every other reason
-    /// outranks it, at any entry and in a location's whole value, but one:
-    /// every entry, and then the whole value, is judged for bx's directories,
-    /// and every entry for lying inside a root, before any entry is judged for
-    /// being a root. A location's whole value is judged for lying inside a root
-    /// only after that, and that reason never shows on its own: once no entry
-    /// is a root itself, the whole value lies inside the root its first entry
-    /// lies beneath.
+    /// the root holds. Point the value beneath the root.
+    ///
+    /// Every other reason outranks it, at any entry and in a location's whole
+    /// value: every entry, and then the whole value, is judged for bx's
+    /// directories, and every entry for lying inside a root, before any entry
+    /// is judged for being a root. Nothing is asked of a location's whole value
+    /// after that, because nothing asked there could refuse: once no entry is a
+    /// root itself, the whole value and its parent lie inside the root the
+    /// first entry lies beneath (#47 round 3).
     #[error("is a declared root itself, and its tool may write beside it, outside every root")]
     DeclaredRootItself,
     /// Empty, a bare word, a URL, or a relative path, where a path that can be
@@ -1045,10 +1046,12 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// one it lists, the value as a shell gives it is judged for the [`Kind`] the
 /// table records:
 ///
-/// * a **location** needs a declared root, and every `:`-entry, and then the
-///   whole value read as one path, must be absolute, outside bx's own
-///   directories and strictly beneath a root, never a root itself
-///   ([`Reason::DeclaredRootItself`]);
+/// * a **location** needs a declared root, and every `:`-entry must be
+///   absolute, outside bx's own directories and strictly beneath a root, never
+///   a root itself ([`Reason::DeclaredRootItself`]). The whole value, read as
+///   one path, is judged for bx's own directories too; being strictly beneath
+///   a root then follows from the entries and is not asked again
+///   ([`Reason::DeclaredRootItself`] says why);
 /// * a **list of locations** is judged the same way entry by entry, and not
 ///   as a whole;
 /// * an **anchor** is judged as a location's one path, except that it may
@@ -1217,7 +1220,7 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
                 // Every entry is judged for every other reason before any is
                 // judged for being a root itself, so a root earlier in the
                 // list does not hide a later entry's reason (#47 round 1).
-                value
+                let reason = value
                     .split(':')
                     .find_map(|entry| refuses_entry_placement(entry, None, roots))
                     // Once every entry has passed, the whole value begins with
@@ -1236,19 +1239,28 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
                         value
                             .split(':')
                             .find_map(|entry| refuses_entry_at_root(entry, roots))
-                    })
-                    // The first entry lies strictly beneath a root by now, so
-                    // the whole value and its parent begin with that entry's
-                    // parent, which is inside the root: this never newly
-                    // refuses the value as outside every root or as a root
-                    // itself. It stays, because it judges the path the tool
-                    // reads.
-                    .or_else(|| {
-                        whole.and_then(|value| {
-                            refuses_entry_outside(value, roots)
-                                .or_else(|| refuses_entry_at_root(value, roots))
-                        })
-                    })
+                    });
+                // There is no whole-value placement check after this, because
+                // one could not refuse anything (#47 round 3). Every entry now
+                // lies strictly beneath a root, so the first entry's parent is
+                // inside one; the whole value extends that parent's components,
+                // so the whole value and its own parent are inside that root
+                // too, and neither `refuses_entry_outside` nor
+                // `refuses_entry_at_root` can fire on it. A check that can
+                // never refuse is an equivalent mutant no test can catch, so
+                // the property is asserted where a future change to the entry
+                // rules would trip it, and pinned by
+                // `every_entry_beneath_a_root_leaves_the_whole_value_beneath_one`.
+                debug_assert!(
+                    reason.is_some()
+                        || whole.is_none_or(|value| {
+                            refuses_entry_outside(value, roots).is_none()
+                                && refuses_entry_at_root(value, roots).is_none()
+                        }),
+                    "a location whose entries all lie strictly beneath a declared root \
+                     has a whole value that lies strictly beneath one too"
+                );
+                reason
             })
         }),
         // An anchor is one directory bx has found no tool to read, so none is
@@ -5297,6 +5309,59 @@ mod tests {
             reason_of(&check("GOPATH", "/r1/c:/r2", &repo)),
             Some(Reason::DeclaredRootItself)
         );
+    }
+
+    #[test]
+    fn every_entry_beneath_a_root_leaves_the_whole_value_beneath_one() {
+        // The property that lets `judge` stop after the at-root pass over
+        // entries, and so the one a whole-value placement check would have been
+        // the net for. Once every `:`-entry lies strictly beneath a declared
+        // root, the whole value extends the first entry's parent, which is
+        // inside a root, so the whole value and its own parent are inside that
+        // root too. A whole-value `OutsideDeclaredRoots` or `DeclaredRootItself`
+        // check would therefore be an equivalent mutant no test could catch
+        // (#47 round 3), and this pins what it would have caught instead: break
+        // an entry rule and this fails, where a dead branch would not have.
+        let layouts = [
+            (vec!["/r"], "/h"),
+            (vec!["/r"], "/r"),
+            (vec!["/r"], "/r/x"),
+            (vec!["/r"], "/r/a:/r/b"),
+            (vec!["/r", "/r/a"], "/h"),
+            (vec!["/r/a", "/s"], "/h:/r"),
+            (vec!["~"], HOME),
+        ];
+        let tails = ["", "/a", "/a/b", "/b", "/a:x", "/x", "/"];
+        let heads = ["/r", "/r/a", "/r/a/b", "/s", "/h", "/", HOME];
+        let seconds = ["", ":/r/q", ":/r/a/q", ":/s/q", ":/r", ":/"];
+        let mut allowed = 0_usize;
+        let mut loose = Vec::new();
+        for (declared, home) in layouts {
+            let declared: Vec<PathBuf> = declared.iter().map(PathBuf::from).collect();
+            let roots = RootSet::new(Path::new(home), &declared);
+            for head in heads {
+                for tail in tails {
+                    for second in seconds {
+                        let value = format!("{head}{tail}{second}");
+                        // The whole public verdict, not a replay of `judge`'s
+                        // internals, so a later reordering inside `judge`
+                        // cannot move the test in lockstep with the code.
+                        if check("CARGO_HOME", &value, &roots) != Verdict::Allowed {
+                            continue;
+                        }
+                        allowed += 1;
+                        let whole = refuses_entry_outside(&value, &roots)
+                            .or_else(|| refuses_entry_at_root(&value, &roots));
+                        if let Some(reason) = whole {
+                            loose.push((value, home, reason));
+                        }
+                    }
+                }
+            }
+        }
+        // Not vacuous: the values above really are allowed as locations.
+        assert!(allowed > 200, "{allowed} of the values were allowed");
+        assert_eq!(loose, Vec::new());
     }
 
     #[test]

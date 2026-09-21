@@ -4989,6 +4989,114 @@ mod tests {
         );
     }
 
+    /// Whether `word` is a shell variable name.
+    fn is_shell_name(word: &str) -> bool {
+        word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// Every name `text` gives a value to, by any form this module knows a
+    /// shell assigns through.
+    ///
+    /// Two sweeps, because the forms divide in two. Most of them put the name
+    /// in front of an `=` — `export N=V`, `N+=V`, `N[1]=V`, `: ${N:=V}` — and
+    /// are found by walking the `=`s. The rest hold no `=` at all and name
+    /// their target as a word after a keyword: the control variable of a `for`
+    /// or a `select`, an operand of `read` or `getopts`, the target of
+    /// `printf -v`. The `=` sweep alone is what round-2 note COV1 was about —
+    /// it cannot see a single one of the second group, so a `read -r
+    /// CARGO_HOME` in the snippet went unnoticed.
+    ///
+    /// The second sweep is deliberately generous: it takes every `-v` operand
+    /// and every non-flag operand of a `read`, which over-reports rather than
+    /// under-reports, and over-reporting can only make the caller stricter.
+    /// Comments are dropped first, so prose ending in the word `for` is not an
+    /// assignment.
+    ///
+    /// This is not held to a list of forms of its own.
+    /// `the_assignment_sweep_sees_every_form_the_module_knows_assigns` holds
+    /// it to [`ASSIGNING_FORMS`], the table the module already maintains, so a
+    /// form added there that this cannot see fails rather than quietly
+    /// narrowing what the snippet is held to.
+    fn assignments_in(text: &str) -> Vec<&str> {
+        let mut found = Vec::new();
+        for (at, _) in text.match_indices('=') {
+            let (before, from) = text.split_at(at);
+            // `==`, `!=`, `<=` and `>=` compare; they assign nothing.
+            if before.ends_with(['=', '!', '<', '>']) || from[1..].starts_with('=') {
+                continue;
+            }
+            // `:=`, `+=` and the rest of the assigning operators keep the name
+            // in front of them.
+            let before = before.trim_end_matches([':', '+', '-', '?']);
+            // `N[1]=V`, and zsh's `N[1,-1]=V`, assign to `N`.
+            let before = match before
+                .strip_suffix(']')
+                .and_then(|head| head.rfind('[').map(|open| &head[..open]))
+            {
+                Some(name) => name,
+                None => before,
+            };
+            let head = before.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+            found.push(&before[head.len()..]);
+        }
+        for line in text.lines() {
+            let words: Vec<&str> = line
+                .split(|c: char| c.is_whitespace() || c == ';')
+                .filter(|word| !word.is_empty())
+                .take_while(|word| !word.starts_with('#'))
+                .collect();
+            for (at, word) in words.iter().enumerate() {
+                let named = match *word {
+                    // `for N in V` and `select N in V` name their control
+                    // variable immediately.
+                    "for" | "select" => words.get(at + 1).copied(),
+                    // `getopts OPTSTRING N` names it after the option string.
+                    "getopts" => words.get(at + 2).copied(),
+                    // `read [-flags] N ...` names every operand that is not a
+                    // flag; the first is enough to refuse the line.
+                    "read" => words[at + 1..]
+                        .iter()
+                        .find(|operand| !operand.starts_with('-'))
+                        .copied(),
+                    // `printf -v N V`, and any other `-v` target.
+                    "-v" => words.get(at + 1).copied(),
+                    _ => None,
+                };
+                if let Some(named) = named.filter(|named| is_shell_name(named)) {
+                    found.push(named);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_assignment_sweep_sees_every_form_the_module_knows_assigns() {
+        // What makes `assignments_in` a mechanism rather than another list.
+        // Every form the module knows a shell assigns through is re-derived
+        // here, at this head, from the table the module already keeps — so the
+        // sweep cannot fall behind the forms without this failing, and a form
+        // added to `ASSIGNING_FORMS` is held by the snippet check the same day
+        // it is written.
+        for form in ASSIGNING_FORMS {
+            let content = form.replace("{N}", "CARGO_HOME").replace("{V}", "/x");
+            assert!(
+                assignments_in(&content).contains(&"CARGO_HOME"),
+                "the sweep does not see {content:?} assign CARGO_HOME"
+            );
+        }
+        // Not vacuous: shell that assigns nothing is reported as assigning
+        // nothing, including prose that merely ends in a keyword.
+        for quiet in [
+            "compdef _bx bx 2>/dev/null",
+            "# the user was already paying for",
+            "[[ -n $X ]] && print -- $X",
+        ] {
+            assert_eq!(assignments_in(quiet), Vec::<&str>::new(), "{quiet:?}");
+        }
+    }
+
     #[test]
     fn the_init_snippet_is_not_an_environment_fragment() {
         // Invariant 2 sends bx's generated environment fragments through the
@@ -4998,15 +5106,21 @@ mod tests {
         // completion function, a `compdef` — so that property has to be
         // established of it rather than assumed.
         //
+        // The bytes below are the benchmark's copy, and at this head they are
+        // the *only* copy: no bx code generates shell content yet, because the
+        // guard has no non-test caller. So this holds the snippet bx will
+        // emit, in the one place the repository keeps it, and the first
+        // generator must emit these bytes for it to keep meaning that.
+        //
         // It is established positively, and not out of the guard's inability
         // to parse the snippet: `Reason::Unreadable` says only that a line is
         // outside the grammar, which is no evidence at all that the line sets
-        // nothing. Every `=` in the snippet is found instead, and the name in
-        // front of it must be one of bx's own `BX_` names — which no tool
-        // reads — or an array the completion function declares `local`, which
-        // never leaves that function. Nothing else is given a value anywhere
-        // in the file, so the snippet sets no environment variable and there
-        // is nothing in it for the guard to judge.
+        // nothing. Every name the snippet gives a value to is found instead —
+        // through an `=` or through any of the assigning forms that hold no
+        // `=`, which is what round-2 note COV1 found this missing — and each
+        // must be one of bx's own `BX_` names, which no tool reads, or an
+        // array the completion function declares `local`, which never leaves
+        // that function.
         //
         // Written this way the test survives the snippet being reformatted,
         // and fails the moment a generator puts a real assignment in it.
@@ -5017,25 +5131,12 @@ mod tests {
             .filter_map(|rest| rest.split_whitespace().next_back())
             .map(|declared| declared.split('=').next().unwrap_or(declared))
             .collect();
-        let mut assigned = Vec::new();
-        for (at, _) in snippet.match_indices('=') {
-            let (before, from) = snippet.split_at(at);
-            // `==`, `!=`, `<=` and `>=` compare; they assign nothing.
-            if before.ends_with(['=', '!', '<', '>']) || from[1..].starts_with('=') {
-                continue;
-            }
-            // `:=`, `+=` and the rest of the assigning operators keep the name
-            // in front of them.
-            let before = before.trim_end_matches([':', '+', '-', '?']);
-            let head = before.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
-            let name = &before[head.len()..];
+        let assigned = assignments_in(snippet);
+        for name in &assigned {
             assert!(
                 !name.is_empty(),
-                "the snippet assigns through {before:?}, which names nothing"
+                "the snippet assigns through something that names nothing"
             );
-            assigned.push(name);
-        }
-        for name in &assigned {
             assert!(
                 name.starts_with("BX_") || locals.contains(name),
                 "the snippet gives {name} a value, which is neither one of \

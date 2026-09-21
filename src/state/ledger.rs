@@ -2873,6 +2873,60 @@ mod tests {
     }
 
     #[test]
+    fn re_adopting_the_stored_prior_leaves_it_the_prior_and_not_history() {
+        // r4 round 1 (COV7): the one path where `supersede`'s push-then-retain
+        // has to cancel out — the bytes being adopted are the exact bytes
+        // already stored as the prior — was reached by no test. Without the
+        // `retain`, the blob would be both the prior and a superseded entry,
+        // and `bx rm` would index one snapshot twice.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .record(entry("~/.bashrc", b"bx wrote this").with_prior(prior(b"the original", 0o644)))
+            .expect("record");
+
+        // The user puts the original back, and it is accepted as it is now.
+        let stored = ledger
+            .adopt_current_as_prior(&target("~/.bashrc"), b"the original", Mode::DEFAULT_FILE)
+            .expect("adopt")
+            .expect("an entry")
+            .clone();
+
+        let Prior::Existed(reference) = &stored.prior else {
+            panic!("expected a snapshot, got {:?}", stored.prior)
+        };
+        assert_eq!(reference.digest, ContentHash::of(b"the original"));
+        assert!(
+            stored.superseded.is_empty(),
+            "the prior is the prior, not also history: {:?}",
+            stored.superseded,
+        );
+        assert!(!stored.superseded_absent);
+        assert_eq!(stored.written, ContentHash::of(b"the original"));
+    }
+
+    #[test]
+    fn a_restore_directory_that_cannot_be_created_is_reported() {
+        // r4 round 1 (COV7): `store_blob`'s `Error::CreateDir` arm — the
+        // `ensure_dir` of `restore/` failing — was reached by no test.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        std::fs::remove_dir(dir.restore()).expect("clear the name");
+        std::fs::write(dir.restore(), b"not a directory").expect("occupy it");
+
+        let err = ledger
+            .record(entry("~/a", b"x").with_prior(prior(b"the user wrote this", 0o644)))
+            .expect_err("must fail");
+        assert!(
+            matches!(&err, Error::NotADirectory { path } if *path == dir.restore()),
+            "got {err}",
+        );
+        assert!(ledger.is_empty(), "nothing was recorded");
+    }
+
+    #[test]
     fn forgetting_a_target_leaves_its_restore_blob_in_place() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);

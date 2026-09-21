@@ -1438,6 +1438,36 @@ mod tests {
     }
 
     #[test]
+    fn a_save_that_cannot_be_written_is_reported_naming_the_directory() {
+        // r4 round 1 (COV7): `save`'s `Error::Write` propagation from
+        // `write_atomically` was reached by no test at all — region count
+        // zero — so the whole arm could be replaced by `Ok(())` undetected.
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("state");
+        std::fs::create_dir(&root).expect("root");
+        // `0500` shares nothing, so `ensure_dir` leaves it exactly as it is —
+        // and the atomic write's temporary file cannot be created in it.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let result = save(&root.join("v.mpk"), KIND, VERSION, &sample());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restore");
+
+        let err = result.expect_err("must fail");
+        assert!(
+            matches!(&err, Error::Write(inner) if inner.path() == root),
+            "got {err}",
+        );
+        assert_eq!(
+            names_but_the_lock(&root),
+            Vec::<String>::new(),
+            "nothing left"
+        );
+    }
+
+    #[test]
     fn a_lockless_reader_reports_damage_and_moves_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v.mpk");

@@ -108,15 +108,29 @@ impl ContentHash {
 }
 
 /// The lowercase hex character for the low four bits of `value`.
+///
+/// A table lookup rather than `char::from_digit(..).unwrap_or('0')`: the
+/// callers only ever pass four bits, so the fallback was unreachable by
+/// construction — which is another way of saying no test could reach it and a
+/// mutant changing the character it produced survived the whole suite
+/// (r4 round 1, COV7). Indexing a 16-entry table with four bits has no arm to
+/// leave unreached.
 fn nibble(value: u8) -> char {
-    char::from_digit(u32::from(value), 16).unwrap_or('0')
+    char::from(b"0123456789abcdef"[usize::from(value & 0x0f)])
 }
 
 /// The value of one lowercase-or-uppercase hex character.
+///
+/// Spelled out rather than `to_digit(16).and_then(|d| u8::try_from(d).ok())`,
+/// whose `try_from` could not fail — `to_digit(16)` returns less than 16 — so
+/// the `None` it would have produced was unreachable and unpinnable.
 fn unnibble(c: u8) -> Option<u8> {
-    char::from(c)
-        .to_digit(16)
-        .and_then(|d| u8::try_from(d).ok())
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl fmt::Display for ContentHash {
@@ -143,7 +157,14 @@ impl<'de> Deserialize<'de> for ContentHash {
     }
 }
 
-/// Accepts exactly 32 bytes, borrowed or owned, and nothing else.
+/// Accepts exactly 32 bytes and nothing else.
+///
+/// No `visit_byte_buf` override. `deserialize_bytes` never dispatches to it —
+/// serde's default forwards to [`Visitor::visit_bytes`], which is where the
+/// length check lives — so an override was a second copy of nothing, reachable
+/// through no decode path in the crate and pinnable by no test: a mutant
+/// returning a zero digest from it survived the whole suite (r4 round 1,
+/// COV7).
 struct ContentHashVisitor;
 
 impl Visitor<'_> for ContentHashVisitor {
@@ -158,10 +179,6 @@ impl Visitor<'_> for ContentHashVisitor {
             .try_into()
             .map_err(|_| E::invalid_length(value.len(), &self))?;
         Ok(ContentHash(bytes))
-    }
-
-    fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
-        self.visit_bytes(&value)
     }
 }
 
@@ -215,6 +232,55 @@ mod tests {
         assert_eq!(ContentHash::from_hex(&hash.to_hex()), Some(hash));
         assert_eq!(hash.to_string(), hash.to_hex());
         assert_eq!(hash.as_bytes().len(), LEN);
+    }
+
+    #[test]
+    fn every_hex_character_is_the_one_chmod_and_ls_would_show() {
+        // r4 round 1 (COV7): `nibble`'s fallback was unreachable by
+        // construction, so a mutant changing the character it produced
+        // survived the whole suite — and the digests the tests compare against
+        // exercise only the sixteen characters between them by luck. Pin all
+        // sixteen, in both directions.
+        let bytes: [u8; LEN] = std::array::from_fn(|i| u8::try_from(i * 8 % 256).expect("a byte"));
+        let hash = ContentHash::from_hex(&ContentHash(bytes).to_hex()).expect("round trip");
+        assert_eq!(hash.as_bytes(), &bytes);
+        assert_eq!(
+            ContentHash(std::array::from_fn(
+                |i| u8::try_from(i % 256).expect("a byte")
+            ))
+            .to_hex(),
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+        // And uppercase parses to the same value, as `from_hex`'s doc says.
+        let upper = ContentHash::of(b"case").to_hex().to_uppercase();
+        assert_eq!(
+            ContentHash::from_hex(&upper),
+            Some(ContentHash::of(b"case"))
+        );
+    }
+
+    #[test]
+    fn a_digest_decodes_from_a_stream_as_well_as_a_slice() {
+        // r4 round 1 (COV7): the crate decodes only from slices, so nothing
+        // pinned what a stream does — including that the length check still
+        // applies there. It reaches `visit_bytes` too, which is why the
+        // `visit_byte_buf` override this visitor used to carry was unreachable
+        // and has gone.
+        let hash = ContentHash::of(b"owned");
+        let encoded = rmp_serde::to_vec_named(&hash).expect("encode");
+        assert_eq!(
+            rmp_serde::from_read::<_, ContentHash>(encoded.as_slice()).expect("decode"),
+            hash,
+        );
+        // And the length check holds on that path too.
+        struct ShortBytes;
+        impl Serialize for ShortBytes {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(b"too short")
+            }
+        }
+        let short = rmp_serde::to_vec_named(&ShortBytes).expect("encode");
+        assert!(rmp_serde::from_read::<_, ContentHash>(short.as_slice()).is_err());
     }
 
     #[test]

@@ -687,6 +687,45 @@ mod tests {
     }
 
     #[test]
+    fn a_holder_line_longer_than_the_read_bound_is_read_up_to_it() {
+        // r4 round 1 (COV8): no test wrote a body longer than about 20 bytes,
+        // so `BODY` could be mutated to anything above ~12 undetected, and
+        // what happens to a long `argv[0]` was unspecified. `read_holder` reads
+        // the first `BODY` bytes and parses what it finds: the pid, and the
+        // program name truncated at the bound — never a mangled name pieced
+        // together from a later read.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let held = ExclusiveLock::acquire(&dir).expect("acquire");
+
+        // The lengths below are literal rather than derived from `BODY`, so
+        // that a change to the bound changes what this test observes.
+        assert_eq!(BODY, 256);
+
+        // Exactly at the bound: `"4242 "` and a 250-character name and the
+        // newline are 256 bytes, so the whole line is inside it.
+        let name = "n".repeat(250);
+        std::fs::write(held.path(), format!("4242 {name}\n")).expect("clobber");
+        assert_eq!(
+            read_holder(held.path()),
+            Holder {
+                pid: 4242,
+                program: name,
+            },
+        );
+
+        // Past it: the name is cut at the bound, and nothing beyond is
+        // reported — never a name spliced from a second read.
+        let longer = "n".repeat(1000);
+        std::fs::write(held.path(), format!("4242 {longer}\n")).expect("clobber");
+        let read = read_holder(held.path());
+        assert_eq!(read.pid, 4242);
+        assert_eq!(read.program.len(), 251, "256 bytes, less `4242 `");
+        assert!(longer.starts_with(&read.program), "a prefix, not a splice");
+        assert!(read.to_string().starts_with("pid 4242 (nnn"), "{read}");
+    }
+
+    #[test]
     fn an_empty_lock_body_still_yields_a_usable_message() {
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());

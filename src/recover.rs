@@ -2192,6 +2192,156 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_over_a_ledger_at_the_same_digest_and_another_mode_records_the_mode() {
+        // r3 coverage COV6. `decide`'s already-saved skip is "the stored entry
+        // is at the intent's `after` digest *and mode*". No fixture differed
+        // in mode alone, so deleting the mode conjunct passed: a terminated
+        // journal whose write changed only the mode, over a ledger at that
+        // digest at the old mode, would be skipped and the mode change lost.
+        //
+        // A ledger and a journal can disagree this way whenever the ledger is
+        // not the one the session opened — an older ledger put back beside a
+        // newer journal, or one rebuilt after a quarantine — so the journal is
+        // built here rather than crashed out of a session.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let bytes = "bx\n";
+        let digest = ContentHash::of(bytes.as_bytes());
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(write_to(home.path(), ".conf", bytes, Mode::DEFAULT_FILE))
+            .expect("apply");
+        session.finish().expect("finish");
+        let (portable, dest) = target(home.path(), ".conf");
+        let stored = |state: &StateDir| {
+            LedgerView::read(state, home.path())
+                .expect("read the ledger")
+                .value
+                .get(&portable)
+                .cloned()
+                .expect("the entry")
+        };
+        assert_eq!(
+            (stored(&state).written, stored(&state).mode),
+            (digest, Mode::DEFAULT_FILE),
+        );
+
+        // The same bytes at a narrower mode, landed, with the ledger the
+        // session opened holding nothing for the target.
+        raw_journal(
+            &state.journal(),
+            &[
+                Record::Begin(Begin {
+                    kind: SessionKind::Apply,
+                    home: home.path().to_path_buf(),
+                    scope: Vec::new(),
+                }),
+                Record::Intent(Intent {
+                    target: portable.clone(),
+                    dest: dest.clone(),
+                    temp: None,
+                    before: Prior::Absent,
+                    after: Written::Present {
+                        digest,
+                        mode: Mode::PRIVATE_FILE,
+                    },
+                    created_dirs: Vec::new(),
+                    mechanism: Some(Mechanism::Own),
+                    ledger_written: None,
+                }),
+                Record::Done(Done {
+                    target: portable.clone(),
+                }),
+                Record::End(End { written: 1 }),
+            ],
+        );
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 },
+        );
+        assert_eq!(
+            (stored(&state).written, stored(&state).mode),
+            (digest, Mode::PRIVATE_FILE),
+            "the mode the journal records is the mode the ledger ends at",
+        );
+    }
+
+    #[test]
+    fn a_blocked_targets_note_names_both_states_it_could_legitimately_hold() {
+        // r3 coverage COV7. `note`'s "held {digest}" and "was to be removed"
+        // arms were never asserted, and they are the whole operator-facing
+        // surface of a blocked recovery: the file, both legitimate digests,
+        // and `abandon` as the way out.
+        let home = guarded_home();
+        let (portable, dest) = target(home.path(), ".conf");
+        let old = ContentHash::of(b"old\n");
+        let new = ContentHash::of(b"new\n");
+        let base = Intent {
+            target: portable,
+            dest,
+            temp: None,
+            before: Prior::Absent,
+            after: Written::Absent,
+            created_dirs: Vec::new(),
+            mechanism: Some(Mechanism::Own),
+            ledger_written: None,
+        };
+        let tail = "bx will not overwrite it. Put back either of those two states, \
+                    or abandon the interrupted session to have bx report it as a \
+                    conflict instead.";
+
+        let created = Intent {
+            after: Written::Present {
+                digest: new,
+                mode: Mode::DEFAULT_FILE,
+            },
+            ..base.clone()
+        };
+        assert_eq!(
+            note(&created, Standing::Diverged),
+            format!(
+                "was edited after the interruption; before the interruption it \
+                 did not exist, and it was being given {new}. {tail}"
+            ),
+        );
+
+        let modified = Intent {
+            before: Prior::Existed(RestoreRef {
+                digest: old,
+                mode: Mode::DEFAULT_FILE,
+                len: 4,
+            }),
+            ..created
+        };
+        assert_eq!(
+            note(&modified, Standing::Diverged),
+            format!(
+                "was edited after the interruption; before the interruption it \
+                 held {old}, and it was being given {new}. {tail}"
+            ),
+        );
+
+        let removal = Intent {
+            before: Prior::Existed(RestoreRef {
+                digest: old,
+                mode: Mode::DEFAULT_FILE,
+                len: 4,
+            }),
+            mechanism: None,
+            ..base
+        };
+        assert_eq!(
+            note(&removal, Standing::Foreign),
+            format!(
+                "is not a regular file; before the interruption it held {old}, \
+                 and it was to be removed. {tail}"
+            ),
+        );
+    }
+
+    #[test]
     fn a_terminated_journal_with_a_missing_blob_is_blocked() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -2635,15 +2785,22 @@ mod tests {
 
     #[test]
     fn every_standing_renders_a_sentence() {
-        for standing in [
-            Standing::Prior,
-            Standing::Written,
-            Standing::Vanished,
-            Standing::Diverged,
-            Standing::Foreign,
-            Standing::Unreachable,
+        // r3 coverage COV7. Non-empty was all this asserted, so any of the six
+        // could have been swapped for another and the suite stayed green.
+        // Each reads as the predicate of a sentence whose subject is the path,
+        // which is how `note` and `unreachable` both use it.
+        for (standing, sentence) in [
+            (Standing::Prior, "holds the bytes that were there before"),
+            (
+                Standing::Written,
+                "holds the bytes the interrupted session wrote",
+            ),
+            (Standing::Vanished, "is gone"),
+            (Standing::Diverged, "was edited after the interruption"),
+            (Standing::Foreign, "is not a regular file"),
+            (Standing::Unreachable, "cannot be reached"),
         ] {
-            assert!(!standing.to_string().is_empty());
+            assert_eq!(standing.to_string(), sentence);
         }
         assert_eq!(SessionKind::Apply.to_string(), "apply");
         assert_eq!(SessionKind::Restore.to_string(), "restore");

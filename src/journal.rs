@@ -4817,7 +4817,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_removal_names_how_its_destination_moved_since_plan() {
-        // r3 coverage C2. Only "modified or replaced" was ever produced.
+        // r3 coverage C2, extended for r3 coverage COV5: the third detail and
+        // the `planned.path != now.path` branch had no case. That branch is
+        // the one that stops a removal running against an observation of a
+        // different file.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let (gone, gone_dest) = target(home.path(), ".gone");
@@ -4827,6 +4830,19 @@ pub(crate) mod tests {
         let (appeared, appeared_dest) = target(home.path(), ".appeared");
         let nothing = fs::observe(&appeared_dest).expect("plan's observation");
         plant_file(&appeared_dest, "the user's\n", Mode::DEFAULT_FILE);
+        let (edited, edited_dest) = target(home.path(), ".edited");
+        plant_file(&edited_dest, "bx created\n", Mode::DEFAULT_FILE);
+        let as_written = fs::observe(&edited_dest).expect("plan's observation");
+        plant_file(&edited_dest, "the user's edit\n", Mode::DEFAULT_FILE);
+        // An observation of another file entirely, handed to a removal of
+        // this one: the same shape a caller pairing the wrong plan with the
+        // wrong target would produce.
+        let (_elsewhere, elsewhere_dest) = target(home.path(), ".elsewhere");
+        plant_file(&elsewhere_dest, "somebody else's\n", Mode::DEFAULT_FILE);
+        let (mixed_up, mixed_up_dest) = target(home.path(), ".mixed-up");
+        plant_file(&mixed_up_dest, "bx created\n", Mode::DEFAULT_FILE);
+        let another_file = fs::observe(&elsewhere_dest).expect("plan's observation");
+        let wrong_path = format!("plan observed {}, not this path", elsewhere_dest.display());
 
         for (portable, dest, planned, detail) in [
             (gone, gone_dest, was_there, "it has been removed"),
@@ -4835,6 +4851,18 @@ pub(crate) mod tests {
                 appeared_dest.clone(),
                 nothing,
                 "nothing was there, and something is now",
+            ),
+            (
+                edited,
+                edited_dest.clone(),
+                as_written,
+                "it has been modified or replaced",
+            ),
+            (
+                mixed_up,
+                mixed_up_dest.clone(),
+                another_file,
+                wrong_path.as_str(),
             ),
         ] {
             let mut session =
@@ -4864,6 +4892,13 @@ pub(crate) mod tests {
             crate::recover::recover(&state).expect("clear the refused session");
         }
         assert_eq!(peek(&appeared_dest).expect("kept").0, b"the user's\n");
+        assert_eq!(peek(&edited_dest).expect("kept").0, b"the user's edit\n");
+        assert_eq!(peek(&mixed_up_dest).expect("kept").0, b"bx created\n");
+        assert_eq!(
+            peek(&elsewhere_dest).expect("kept").0,
+            b"somebody else's\n",
+            "and the file the wrong observation named is untouched",
+        );
     }
 
     /// An Intent that says bx created `dest` holding `bytes`.
@@ -5564,6 +5599,112 @@ pub(crate) mod tests {
         drop(ledger);
         assert_eq!(peek(&a_dest).expect("handed back").0, b"theirs\n");
         assert!(dir.is_dir(), "nothing was pruned: no removal was announced");
+    }
+
+    #[test]
+    fn a_prior_already_in_the_restore_store_is_not_written_again() {
+        // r3 coverage COV2. The skip arm keeps a repeat write from replacing a
+        // blob another entry's prior or superseded snapshot already points at,
+        // and keeps every `apply` from churning `restore/`. Only the rewrite
+        // side was pinned; a mutant that always wrote passed the suite.
+        use std::os::unix::fs::MetadataExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let dest = home.child(".conf");
+        plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+        let observed = fs::observe(&dest).expect("observe");
+
+        let Prior::Existed(reference) = store_prior(&state, &observed).expect("store") else {
+            panic!("a file that is there has an `Existed` prior");
+        };
+        let blob = state.restore().join(reference.blob_name());
+        let first = std::fs::symlink_metadata(&blob).expect("the blob");
+
+        assert_eq!(
+            store_prior(&state, &observed).expect("store again"),
+            Prior::Existed(reference),
+        );
+        let second = std::fs::symlink_metadata(&blob).expect("the blob");
+        assert_eq!(
+            (first.dev(), first.ino()),
+            (second.dev(), second.ino()),
+            "the second store wrote nothing: `write_atomically` renames a new \
+             inode into place, so a rewrite cannot keep this one",
+        );
+        assert_eq!(std::fs::read(&blob).expect("read"), b"theirs\n");
+
+        // And the arm is a length test, not a presence test: a blob of the
+        // wrong length is replaced.
+        std::fs::write(&blob, b"short\n").expect("truncate the blob");
+        store_prior(&state, &observed).expect("store over a wrong-length blob");
+        assert_eq!(std::fs::read(&blob).expect("read"), b"theirs\n");
+    }
+
+    #[test]
+    fn a_ledger_that_refuses_after_a_publish_poisons_the_session_and_is_rolled_back() {
+        // r3 coverage COV8. The sharpest of `Session::write`'s error paths past
+        // the point of no return: the destination is published, the Intent is
+        // durable, no `Done` follows, and the ledger refuses. Recovery must
+        // roll a landed write back from a journal with no `Done`, and the
+        // ledger must hold nothing for the target.
+        // `Ledger::record` checks the lock file it was opened under and
+        // `check_record` does not, so replacing the lock file mid-session fails
+        // exactly the call after the publish.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".conf");
+        plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        std::fs::rename(state.lock(), home.child("moved-lock")).expect("an outside mv of the lock");
+        let second = ExclusiveLock::acquire(&state).expect("a second writer takes the new lock");
+
+        let err = session
+            .apply(write_to(home.path(), ".conf", "bx\n", Mode::DEFAULT_FILE))
+            .expect_err("the ledger refuses after the publish");
+        assert!(
+            matches!(err, Error::State(crate::state::Error::WrongLock { .. })),
+            "got {err}"
+        );
+        assert_eq!(
+            peek(&dest).expect("published").0,
+            b"bx\n",
+            "the write landed before the ledger refused",
+        );
+        let finished = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
+        drop(second);
+
+        let loaded = load(&state.journal()).expect("load");
+        assert_eq!(loaded.intents().count(), 1, "the Intent is durable");
+        assert!(
+            !matches!(loaded, Loaded::Terminated(_)),
+            "and no End followed it",
+        );
+        assert!(
+            !frame_starts(&std::fs::read(state.journal()).expect("read")).is_empty(),
+            "the journal holds whole frames",
+        );
+
+        let outcome = crate::recover::before_writing(&state).expect("the next writing run");
+        assert!(
+            matches!(outcome, crate::recover::Outcome::RolledBack { undone: 1 }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            peek(&dest).expect("rolled back").0,
+            b"theirs\n",
+            "the landed write was undone",
+        );
+        assert!(
+            saved_ledger(&state, home.path()).get(&portable).is_none(),
+            "and the ledger holds nothing for the target",
+        );
     }
 
     #[test]

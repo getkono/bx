@@ -1615,9 +1615,40 @@ mod tests {
         // r3 round 1, D1. The file went through the link, pruning the claimed
         // directory failed with ENOTDIR, and the session was left for a rollback
         // that put the file back: every `rm` after that did the same.
+        //
+        // Extended for r3 coverage COV3: `hand_off_claims`' guard for a claim
+        // that is no longer a directory was reached with no entry beneath the
+        // path, so deleting it changed no assertion. `heir.conf` is that
+        // entry. Without the guard the claim on `~/d` lands on it, and the
+        // `rm` that removes it calls `remove_if_empty` on a symlink — the
+        // breakage this test's own repair exists to stop.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let portable = managed(&state, home.path(), "d/a.conf", "bx\n", Mode::DEFAULT_FILE);
+        let heir = managed(
+            &state,
+            home.path(),
+            "d/heir.conf",
+            "bx\n",
+            Mode::DEFAULT_FILE,
+        );
+        assert_eq!(
+            entry_for(&state, home.path(), &portable)
+                .expect("a.conf")
+                .created_dirs
+                .iter()
+                .map(|dir| dir.render(home.path()))
+                .collect::<Vec<_>>(),
+            vec![home.child("d")],
+            "a.conf claims the directory bx made",
+        );
+        assert!(
+            entry_for(&state, home.path(), &heir)
+                .expect("heir.conf")
+                .created_dirs
+                .is_empty(),
+            "and heir.conf claims nothing yet",
+        );
         std::fs::rename(home.child("d"), home.child("real")).expect("move the directory");
         std::os::unix::fs::symlink(home.child("real"), home.child("d")).expect("link it back");
 
@@ -1639,12 +1670,28 @@ mod tests {
         assert!(home.child("real").is_dir(), "and so does what it names");
         assert!(!state.journal().exists(), "the session finished");
         assert!(entry_for(&state, home.path(), &portable).is_none());
+        assert!(
+            entry_for(&state, home.path(), &heir)
+                .expect("heir.conf survives")
+                .created_dirs
+                .is_empty(),
+            "a claim the user replaced with a symlink is not handed to the \
+             entry beneath it",
+        );
 
         let again = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
         assert!(
             matches!(again.as_slice(), [Restored::Unmanaged { .. }]),
             "{again:?}"
         );
+        // And the heir's own `rm` finishes: it inherited no claim to prune.
+        let heir_done = restore(&state, home.path(), std::slice::from_ref(&heir)).expect("rm");
+        assert!(
+            matches!(heir_done.as_slice(), [Restored::Removed { .. }]),
+            "{heir_done:?}"
+        );
+        assert!(peek(&home.child("real/heir.conf")).is_none());
+        assert!(home.child("real").is_dir(), "the user's directory stays");
     }
 
     #[test]

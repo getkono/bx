@@ -20,7 +20,9 @@
 //!
 //! A machine-owned file that becomes an error the user cannot clear is a defect,
 //! so damaged *contents* are never fatal. A truncated, garbled or wrong-kind
-//! file is reported through `tracing::warn!` and replaced by the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
+//! file is reported through `tracing::warn!` and replaced by what survived it —
+//! the empty default, or the rows that check out when the damage is confined to
+//! rows and [`Damage::is_partial`] says so. A holder of the [`ExclusiveLock`] also moves it aside, to
 //! the quarantine number after the highest present — `<name>.corrupt`, then
 //! `<name>.corrupt.1`, … — never over an earlier quarantine, and not into a
 //! gap one left until the top number, `<name>.corrupt.<u64::MAX>`, is present,

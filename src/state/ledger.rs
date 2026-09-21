@@ -273,11 +273,17 @@ pub struct LedgerView {
 impl LedgerView {
     /// Read the ledger without taking a lock.
     ///
-    /// A damaged `ledger.mpk` yields an empty ledger with
-    /// [`super::Health::Damaged`] saying so, and is **left where it is**: a
-    /// reader holding no lock cannot know that the path still names the bytes
-    /// it read, so it renames nothing. [`Ledger::open`], under the lock, is what
-    /// quarantines.
+    /// A damaged `ledger.mpk` yields [`super::Health::Damaged`] saying so, and
+    /// is **left where it is**: a reader holding no lock cannot know that the
+    /// path still names the bytes it read, so it renames nothing.
+    /// [`Ledger::open`], under the lock, is what quarantines.
+    ///
+    /// The ledger returned is **what survived**, not always an empty one.
+    /// Damage the decoder finds costs the whole file; damage confined to rows
+    /// — a key that is not its entry's path, a `created_dirs` entry that is not
+    /// above its target — costs those rows and keeps the rest.
+    /// [`super::Damage::is_partial`] is what tells the two apart, and a caller
+    /// that means *nothing bx wrote is left* has to ask it.
     ///
     /// # Every stored path is checked against `home`
     ///
@@ -699,9 +705,11 @@ impl Ledger {
     /// that one was taken.
     ///
     /// A damaged `ledger.mpk` is moved aside to the next quarantine name and
-    /// this returns an empty ledger, with [`super::Health::Reset`] saying
-    /// so. The lock is what makes that rename safe: no writer can have saved
-    /// since the bytes were read.
+    /// this returns what survived it, with [`super::Health::Reset`] saying so —
+    /// the empty ledger for damage the decoder found, and the rows that check
+    /// out for damage confined to rows; see [`LedgerView::read`]. The lock is
+    /// what makes that rename safe: no writer can have saved since the bytes
+    /// were read.
     ///
     /// # Errors
     ///

@@ -4,8 +4,11 @@
 //! corrupt one degrades to recomputation rather than to an error the user cannot
 //! clear. That requirement is met here, once, for every file in the state
 //! directory: [`load`] returns the stored value, or — for damaged *contents* —
-//! the empty default, having moved the damaged bytes aside to the next
-//! `<name>.corrupt`, `<name>.corrupt.1`, … and warned about it.
+//! what survived the damage, having moved the damaged bytes aside to the next
+//! `<name>.corrupt`, `<name>.corrupt.1`, … and warned about it. That is the
+//! empty default for damage the decoder finds, and the rows that check out for
+//! damage a loader's `check` can confine to rows; [`Damage::is_partial`] tells
+//! a caller which it is holding.
 //!
 //! # Damage that cannot be moved aside is refused
 //!
@@ -659,8 +662,11 @@ fn decode<T: DeserializeOwned>(
     Ok(envelope.payload)
 }
 
-/// Return the empty default for a damaged file, moving it aside only under the
-/// lock.
+/// Return `value` — what survived a damaged file — moving the file aside only
+/// under the lock.
+///
+/// `value` is `T::default()` for damage the decoder found, and the rows a
+/// `check` left behind for damage it could confine to rows.
 ///
 /// # Errors
 ///

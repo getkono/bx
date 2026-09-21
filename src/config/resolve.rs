@@ -253,10 +253,18 @@ fn resolve_target(
         }))
     };
 
-    // Ahead of every other block: each of them names an act — answering a
-    // value, re-enabling one, changing an answer — that would leave this
-    // target blocked here. Behind the repo defects above, which no answer
-    // could clear.
+    // Ahead of the blocks the probe found: each of them names an act —
+    // answering a value, changing an answer — that would leave this target
+    // blocked here. Behind the repo defects above, which no answer could
+    // clear.
+    //
+    // Not ahead of a switched-off declaration, though the disabled block sits
+    // below: while the switch is off, the answer under it is not this
+    // account's value, so this walk does not see it and the switch is reported
+    // first. Re-enabling then lands here. That is two true statements in the
+    // order they become true, each one progress, and not the loop this
+    // placement exists to avoid — which is a hint whose act returns the target
+    // to the *same* block.
     if let Body::File(file) = &target.body
         && let Some((names, hint)) =
             refuse_path_answer_in_file(target, &file.to_string_lossy(), values, assignments)
@@ -577,13 +585,26 @@ enum Step<'a> {
 /// reads them.
 ///
 /// So `enabled` gates the **answer edge alone**, and the walk ends at a `path`
-/// declaration whether or not it is switched on. Ending only at an enabled one
-/// would block `s = "{{b}}"` with a switched-off `b` on `b` instead, advising
-/// the account to re-enable it — an act that lands straight back here, which is
-/// the one thing a hint may not name. It would also judge that same `b`
-/// differently from [`refuse_path_value_in_file`], which fails the load for a
-/// committed `file` whose chain reaches a switched-off `path` value.
-/// `a_switched_off_path_declaration_still_ends_the_walk` pins it.
+/// declaration whether or not it is switched on. The two are not in tension:
+/// they ask different questions. `enabled` says whether an answer is *this
+/// account's value* — which is the answer edge's question, and the reason this
+/// uses the same lookup [`ResolvedValues::resolve`] does. It does not say what
+/// a declaration *is*: a switched-off `path` declaration is still declared
+/// `path`, and the terminal asks only its kind. That is also why
+/// [`refuse_path_value_in_file`], which reads kinds and defaults and nothing
+/// else, never consults `enabled` at all. Gating the terminal would make the
+/// two walks judge one `b` differently, and it would leave a `file` reaching a
+/// switched-off `path` value refused for an account with no answer and allowed
+/// for one with an answer that reaches it.
+///
+/// What does **not** settle this is which hint the account sees first.
+/// Switching `s` off gives `DisabledValue{["s"]}` and "re-enable s", and
+/// re-enabling lands in this block; dropping the answer edge's gate gives this
+/// block first, and changing the answer lands in `DisabledValue`. Either way
+/// two statements are true and are reported in the order they become true, so
+/// that reading decides nothing.
+/// `a_switched_off_path_declaration_still_ends_the_walk` and
+/// `a_disabled_value_s_answer_is_not_walked` pin both halves.
 ///
 /// `seen` stops the walk at a name it has already walked, and it is
 /// load-bearing here for the reason [`path_value_behind`] gives: an overridden
@@ -3426,8 +3447,9 @@ mod tests {
     #[test]
     fn a_disabled_value_s_answer_is_not_walked() {
         // A switched-off declaration's answer is not this account's value, so
-        // the target is blocked by the switch, as it was before.
-        let resolved = resolved(
+        // the walk does not see it and the target is blocked by the switch, as
+        // it was before.
+        let switched_off = resolved(
             &ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"),
             Some(
                 "[[value]]\nname = \"s\"\nenabled = false\n\
@@ -3437,8 +3459,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            blocked(&resolved, 0).reason,
+            blocked(&switched_off, 0).reason,
             BlockReason::DisabledValue {
+                names: vec!["s".to_string()]
+            }
+        );
+        assert!(
+            blocked(&switched_off, 0).hint.starts_with("re-enable s"),
+            "{}",
+            blocked(&switched_off, 0).hint
+        );
+
+        // Where that act leads, pinned beside it so the sequence is legible
+        // rather than left to a reader to assemble: the same layers with the
+        // switch on block on the answer, which changing clears outright. Two
+        // statements, each true when it is made, each one progress. The order
+        // they are reported in is a consequence of what `enabled` means, not a
+        // rule this module keeps for its own sake.
+        let switched_on = resolved(
+            &ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"),
+            Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&switched_on, 0).reason,
+            BlockReason::InvalidValue {
                 names: vec!["s".to_string()]
             }
         );

@@ -829,6 +829,28 @@ pub fn disabled_hint(names: &[&str]) -> String {
     )
 }
 
+/// The statements of one clash, named as every hint about it spells them.
+///
+/// Each spelling quoted with the line it was written on, joined with "and" in
+/// the order read. One spelling of the phrase, so the problem a conflict states
+/// and the hint that follows it cannot render one clash two ways; the reason
+/// [`ResolvedValues::answers_hint`] and [`ResolvedValues::removal_hint`] share
+/// `answers_named`.
+///
+/// Takes the triples a clash holds its statements in. The flag saying whether
+/// bx can show a statement names a declared target decides which statements a
+/// caller passes, never how one of them is spelled.
+#[must_use]
+pub(crate) fn statements_named<'a>(
+    statements: impl IntoIterator<Item = &'a (String, Origin, bool)>,
+) -> String {
+    statements
+        .into_iter()
+        .map(|(spelling, origin, _)| format!("`{spelling}` at {origin}"))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// Why an answer the account wrote has no usable text.
 ///
 /// Names the line, which is in the file the account can edit. Blocking rather
@@ -1291,10 +1313,9 @@ impl ResolvedValues {
         statements: &[(String, Origin, bool)],
     ) -> String {
         let answers = self.answers_named(names);
-        let unshown: Vec<String> = statements
+        let unshown: Vec<&(String, Origin, bool)> = statements
             .iter()
             .filter(|(_, _, unshown)| *unshown)
-            .map(|(spelling, origin, _)| format!("`{spelling}` at {origin}"))
             .collect();
         if unshown.len() == statements.len() {
             return format!(
@@ -1304,18 +1325,18 @@ impl ResolvedValues {
                  declares"
             );
         }
-        if let [toggle] = unshown.as_slice() {
+        let named = statements_named(unshown.iter().copied());
+        if unshown.len() == 1 {
             return format!(
-                "{problem}, because of {answers}; remove the toggle {toggle}: bx cannot show \
+                "{problem}, because of {answers}; remove the toggle {named}: bx cannot show \
                  that it names a declared target for every answer, so another answer may \
                  leave it toggling a file no earlier layer declares"
             );
         }
         format!(
-            "{problem}, because of {answers}; remove the toggles {}: bx cannot show that they \
-             name declared targets for every answer, so another answer may leave them \
-             toggling files no earlier layer declares",
-            unshown.join(" and ")
+            "{problem}, because of {answers}; remove the toggles {named}: bx cannot show that \
+             they name declared targets for every answer, so another answer may leave them \
+             toggling files no earlier layer declares"
         )
     }
 

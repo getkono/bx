@@ -83,7 +83,9 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::target::Target;
-use super::values::{Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan};
+use super::values::{
+    Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan, statements_named,
+};
 use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
 
@@ -443,12 +445,7 @@ impl Clash {
     /// toggles to remove instead.
     fn into_conflict(self, values: &ResolvedValues) -> Conflict {
         let (TargetKey::File(file) | TargetKey::AsWritten(file)) = self.key;
-        let spellings = self
-            .statements
-            .iter()
-            .map(|(spelling, origin, _)| format!("`{spelling}` at {origin}"))
-            .collect::<Vec<_>>()
-            .join(" and ");
+        let spellings = statements_named(&self.statements);
         let names = values.in_declaration_order(self.names);
         let problem = format!(
             "`[[target]]` {spellings} name one file, `{file}`, and one layer may name a \

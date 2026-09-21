@@ -110,21 +110,61 @@ jobs:
       # Tags, branches and commit SHAs are all accepted, so pinning a ref
       # harder never fails this.
       #
-      # The match is anchored at both ends so that a whole line must *be* a
-      # `uses:` entry. An unanchored pattern matches this step's own source —
-      # the extraction below contains the string it greps for — and then tries
-      # to resolve fragments of its own sed script.
+      # The match is anchored at the *start* only. `^` is what stops it reading
+      # this step's own source, since the extraction contains the string it
+      # greps for and no line of it begins with `uses:`. Anchoring the end too
+      # was an over-correction: it required a line to be bare to its end, which
+      # silently skipped `uses: owner/repo@<sha> # v4.2.2` — the conventional
+      # harder pin, and the very form the note above recommends. A step called
+      # "every" that quietly checks fewer is the failure it exists to prevent,
+      # so the trailing comment is now part of the grammar and stripped.
+      #
+      # A local action (`./.github/actions/x`) and a container action
+      # (`docker://…`) are named by neither a tag nor a SHA, so no registry can
+      # answer for them. They are skipped *by name* rather than reported
+      # unresolved. None is present today; this is here so adding one does not
+      # turn the step red for the wrong reason.
+      #
+      # This job's own `actions/checkout@v4`, above, is the one ref whose
+      # breakage this step cannot report: the job would die at `Set up job`
+      # before the step ran. It is the same hole the step exists to close, one
+      # level up, and nothing inside a workflow can close it for itself.
       - name: Resolve every action ref
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           status=0
-          refs=$(grep -hE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]]+[[:space:]]*$' \
-            .github/workflows/*.yml | sed -E 's/^.*uses:[[:space:]]*//' | sort -u)
+          refs=$(grep -hE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]]' \
+            .github/workflows/*.yml \
+            | sed -E -e 's/^.*uses:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' \
+                     -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' \
+            | sort -u)
           test -n "$refs" || { echo 'no action refs found, which cannot be right'; exit 1; }
           for ref in $refs; do
-            repo=${ref%@*}
-            rev=${ref#*@}
+            case $ref in
+              ./*|docker://*)
+                echo "skipped     $ref (local or container action; no registry names it)"
+                continue
+                ;;
+            esac
+            case $ref in
+              */*@*) repo=${ref%@*}; rev=${ref#*@} ;;
+              */*)   repo=$ref;      rev= ;;
+              *)
+                echo "UNRESOLVED  $ref (not owner/repo[@ref])"
+                status=1
+                continue
+                ;;
+            esac
+            if [ -z "$rev" ]; then
+              if gh api "repos/$repo" >/dev/null 2>&1; then
+                echo "resolves    $ref (unpinned, default branch)"
+              else
+                echo "UNRESOLVED  $ref"
+                status=1
+              fi
+              continue
+            fi
             if gh api "repos/$repo/git/ref/tags/$rev" >/dev/null 2>&1 \
               || gh api "repos/$repo/git/ref/heads/$rev" >/dev/null 2>&1 \
               || gh api "repos/$repo/commits/$rev" >/dev/null 2>&1; then

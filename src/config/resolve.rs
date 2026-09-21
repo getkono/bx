@@ -608,7 +608,7 @@ enum Step<'a> {
 /// `a_disabled_value_s_answer_is_not_walked` pin both halves.
 ///
 /// The rule is stated with its sites so a reader can check it rather than
-/// take it. Six places read a `ValueDecl`'s `enabled`, and every one asks the
+/// take it. **Seven** places read a `ValueDecl`'s `enabled`. Six ask the
 /// account-value question:
 ///
 /// - [`ResolvedValues::resolve`], which gives a switched-off declaration no
@@ -619,15 +619,22 @@ enum Step<'a> {
 ///   each listing what this account may answer;
 /// - the answer edge here.
 ///
+/// The seventh is `merge`'s `<ValueDecl as Keyed>::enabled`, and it asks
+/// nothing, because it is never called. `Keyed::enabled` is read in one place,
+/// `Merged::into_enabled`, which is instantiated once — for `Target`.
+/// Declarations leave the merge through `into_entries`, which keeps the
+/// switched-off ones so that a reference to one stays distinguishable from a
+/// reference to a name no layer declares. The accessor exists because `Keyed`
+/// requires it of a public list type, and says so at its definition. Its
+/// sibling `set_enabled` **writes** the field and is live: it is how a later
+/// layer's toggle switches a declaration off in the first place.
+///
 /// Nothing else reads it. `roots`, [`ResolvedValues::substitute`] and
 /// [`ResolvedValues::get`] all behave correctly for a switched-off declaration
 /// **without** consulting `enabled`, because they read the answer `resolve`
 /// already derived; they are consequences of the first site, not further
-/// sites. `Target::enabled` and `merge`'s `into_enabled` are a different field
-/// on a different type — a target's own switch, which drops it from the merged
-/// configuration, where a switched-off *value* is deliberately kept so that a
-/// reference to it stays distinguishable from a reference to a name no layer
-/// declares.
+/// sites. `Target::enabled` is a different field on a different type — a
+/// target's own switch, and the one `into_enabled` acts on.
 ///
 /// Everything that asks what a declaration *is* reads it through
 /// [`ResolvedValues::decl`] or [`ResolvedValues::index_of`], both unfiltered,
@@ -637,9 +644,13 @@ enum Step<'a> {
 /// filtered `decls`, so a switch moved a declaration's position — and it now
 /// indexes against [`ResolvedValues::index_of`] like its twin.
 ///
-/// This list was derived by grepping `enabled` across `src/config` and
-/// classifying every hit, not by reading from memory; the version before it
-/// named two sites that do not read `enabled` and missed one that does.
+/// This list was derived by grepping `enabled` across `src` and classifying
+/// every hit, reads and writes alike. Two earlier versions were not: the first
+/// named two sites that do not read `enabled` and missed one that does, and
+/// the second disposed of its neighbours with "a different field on a
+/// different type", a clause that silently excluded the one site which is the
+/// same field on the same type. A site is named and dispositioned here, or it
+/// is not covered.
 ///
 /// `seen` stops the walk at a name it has already walked, and it is
 /// load-bearing here for the reason [`path_value_behind`] gives: an overridden
@@ -898,9 +909,12 @@ fn check_requirement(text: &str) -> Result<(), String> {
 ///   `enabled` filter in [`path_value_through_answer`], so they are enabled
 ///   too.
 ///
-/// [`ResolvedValues::in_declaration_order`] is this function's twin for the
-/// names inside an [`Unresolved`](super::values::Unresolved); it indexed
-/// against every declaration already, and the two now agree.
+/// [`ResolvedValues::in_declaration_order`] is this function's twin on the
+/// `values` side, for the names inside an
+/// [`Unresolved`](super::values::Unresolved), those in `answers_hint`, and a
+/// clash's; it indexed against every declaration already, and the two now
+/// agree. The count of six above is this function's own callers, not the
+/// twin's.
 fn in_declaration_order(values: &ResolvedValues, mut names: Vec<String>) -> Vec<String> {
     let index = |name: &String| values.index_of(name).unwrap_or(usize::MAX);
     names.sort_by_key(index);

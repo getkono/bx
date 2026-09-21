@@ -1231,6 +1231,12 @@ pub struct Session {
     /// would.
     #[cfg(test)]
     before_unlink: Option<fn(&Path)>,
+    /// Called with the directory [`Session::write`] just made for the home,
+    /// before [`crate::fs::stage`] looks, so a test can produce the one
+    /// trigger the claim filter has left: that directory going away in
+    /// between. See `r3 round 7` decision R3R7-2.
+    #[cfg(test)]
+    before_stage: Option<fn(&Path)>,
     /// Held, never read: dropping it releases the state directory.
     _lock: ExclusiveLock,
 }
@@ -1403,6 +1409,8 @@ impl Session {
             before_publish: None,
             #[cfg(test)]
             before_unlink: None,
+            #[cfg(test)]
+            before_stage: None,
             _lock: lock,
         })
     }
@@ -1666,6 +1674,10 @@ impl Session {
                 dir = %shared.display(),
                 "made a directory bx shares with every other tool, at the process umask",
             );
+            #[cfg(test)]
+            if let Some(meddle) = self.before_stage {
+                meddle(&shared);
+            }
         }
         let staged = fs::stage(&dest, mode, planned, &mut self.created)?;
         let temp = staged.temp_path().to_path_buf();
@@ -1694,11 +1706,18 @@ impl Session {
         //
         // Since `r3 round 6` the `create_dir_all` above makes those same
         // directories before `stage` runs, so `stage` no longer finds them
-        // missing and this loop drops nothing in any sequence this tree can
-        // produce. It is kept because it is the only place the property "an
-        // Intent never records a claim the loader refuses" is *checked* rather
-        // than argued: the round-4 defect was exactly an argument of that
-        // shape. A directory removed between the two calls reaches it.
+        // missing and this loop drops nothing in the ordinary sequence. Its one
+        // live trigger is the race that fix created: the directory going away
+        // between the two calls, which `before_stage` produces on purpose and
+        // `a_claim_that_appears_after_the_directory_is_lost_is_still_dropped`
+        // pins.
+        //
+        // It is kept because that trigger is a branch that can be taken, not a
+        // branch that cannot. `r3 round 6` claimed instead that this is "the
+        // only place the property is checked rather than argued"; that was a
+        // true statement about the code and a false one about the tests, which
+        // constrained it nowhere until the seam above existed (`r3 round 7`,
+        // CL1).
         let mut created_dirs = Vec::with_capacity(filled.created_dirs().len());
         for dir in filled.created_dirs() {
             if stray_created_dir(&dest, &self.home, std::slice::from_ref(dir)).is_some() {
@@ -4495,6 +4514,69 @@ pub(crate) mod tests {
             "the umask child failed:\n{}\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn a_claim_that_appears_after_the_directory_is_lost_is_still_dropped() {
+        // r3 round 7, CL1/COV1. The `r3 round 6` fix makes the home before
+        // `fs::stage` looks, so `stage` stops inventing it and the claim
+        // filter stops firing — and nothing constrained the filter at all:
+        // mutating it left the suite green at 1064 passed, and the "pair"
+        // witness only showed that deleting the fix *and* the filter together
+        // fails, which deleting the fix alone already does.
+        //
+        // The filter's one live trigger is the race the fix created: the
+        // directory going away between the two calls. `before_stage` produces
+        // it, so the branch a race would take is taken here on purpose.
+        let guard = guarded_home();
+        let home = guard.child("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        let (portable, dest) = target(&home, ".bashrc");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        session.before_stage = Some(|dir| {
+            std::fs::remove_dir(dir).expect("lose the directory before stage looks");
+        });
+        session
+            .apply(Request {
+                target: portable.clone(),
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"bx\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("stage makes the directory again");
+        assert!(home.is_dir(), "`stage` made it the second time");
+
+        // `stage` invented the home this time, so the filter is the only thing
+        // between that and an Intent the loader refuses.
+        let intent = load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .cloned()
+            .expect("the Intent");
+        assert!(
+            intent.created_dirs.is_empty(),
+            "the claim on the home was dropped, not recorded: {:?}",
+            intent.created_dirs,
+        );
+        assert!(
+            !matches!(
+                load(&state.journal()).expect("load"),
+                Loaded::Unreadable { .. }
+            ),
+            "so the journal is still one the loader believes",
+        );
+        session.finish().expect("finish");
+        assert!(
+            entry_created_dirs(&state, &home, &portable).is_empty(),
+            "and the entry claims none of it either",
         );
     }
 

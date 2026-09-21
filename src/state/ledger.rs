@@ -383,20 +383,25 @@ impl LedgerView {
     /// whole of what the load dropped. So when a file carries both kinds, the
     /// key mismatch is reported **and is the only thing acted on**: the stray
     /// directories are left exactly as they are, the file is quarantined whole
-    /// so a human has them, and the next load — of the clean file this one's
-    /// caller saves — strips them and says so. Two loads to converge on a
-    /// tampered file, and each one's report is true. Acting on both while
+    /// so a human has them, and they are dropped by whichever comes first:
+    /// a [`Ledger::save`], which warns, or the next load, which reports
+    /// [`super::Damage::UnrelatedCreatedDirs`]. Two passes to converge on a
+    /// tampered file, and every report along the way is true. Acting on both while
     /// naming one was the round-2 shape, and it made `is_partial`'s promise
     /// false (r4 round 3, D1).
     ///
     /// **What that costs, and where it is paid.** Between the two loads the
     /// returned value holds a row bx has not yet reported anything about, and
-    /// a caller may write through it before the second load ever happens. So
-    /// the write path refuses to carry it: [`merge_created_dirs`] drops a
-    /// stored directory that is not above its target, and bx therefore never
-    /// writes a file it would go on to call damaged. That is the whole of the
-    /// exposure, and it is a degradation-policy consequence rather than an
-    /// accident (r4 round 4, D2 and CL2). `bx rm` — the one command that acts
+    /// a caller may act on it or write through it before the second load ever
+    /// happens. So **every** write refuses to carry it: [`Ledger::record`]
+    /// through [`merge_created_dirs`], before the entry is handed back, and
+    /// [`Ledger::save`] before the bytes reach the file. bx therefore never
+    /// writes a file it would go on to call damaged. Round 4 put the rule on
+    /// `record` alone and said that was the whole exposure; it was not —
+    /// opening a ledger and saving it without re-recording that row wrote the
+    /// stray out, and the reread reported it (r4 round 5, D1 and CL1). The
+    /// exposure that remains is the returned value itself, in memory, for the
+    /// life of one run. `bx rm` — the one command that acts
     /// on `created_dirs` — does not exist on this branch; when it does, it
     /// reads a ledger this rule has already been through.
     ///
@@ -455,6 +460,24 @@ impl LedgerView {
         // the one thing recomputation cannot rebuild; dropping it to be rid of
         // a bad directory name would be a larger degradation than the damage,
         // which is exactly what decision 52 forbids (r4 round 3, D2/CL4).
+        let stray = self.strip_unrelated_created_dirs();
+        if !stray.is_empty() {
+            return Err(Rejected::PartialDamage(
+                super::Damage::UnrelatedCreatedDirs { rows: stray },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drop every `created_dirs` entry that is not above its own target,
+    /// returning `(target, directory)` for each — ascending by target, and
+    /// within a target in the entry's own list order.
+    ///
+    /// The one statement of the rule on the value, so that the load path,
+    /// which reports it as [`super::Damage::UnrelatedCreatedDirs`], and the
+    /// write path, which refuses to put it on disk, cannot disagree about what
+    /// a stray is (r4 round 5, D1).
+    fn strip_unrelated_created_dirs(&mut self) -> Vec<(String, String)> {
         let mut stray = Vec::new();
         for entry in self.entries.values_mut() {
             let LedgerEntry {
@@ -468,12 +491,7 @@ impl LedgerView {
                 false
             });
         }
-        if !stray.is_empty() {
-            return Err(Rejected::PartialDamage(
-                super::Damage::UnrelatedCreatedDirs { rows: stray },
-            ));
-        }
-        Ok(())
+        stray
     }
 
     /// Refuse the ledger if any path it stores cannot be used with `home`.
@@ -1134,8 +1152,31 @@ impl Ledger {
     ///
     /// [`Error::WrongLock`] if the lock file this ledger was opened under has
     /// been replaced or removed since; nothing is written.
-    pub fn save(&self) -> Result<(), Error> {
+    ///
+    /// # No stray `created_dirs` reaches the file
+    ///
+    /// A load that found a key mismatch reports and acts on that alone, and
+    /// leaves a stray `created_dirs` entry in a surviving row for the next
+    /// load to strip — see [`LedgerView::check_paths`]. Saving the view
+    /// verbatim would put it on disk, and the next read would report
+    /// `UnrelatedCreatedDirs` on a file bx had just written. So this strips
+    /// them here too, and warns.
+    ///
+    /// [`merge_created_dirs`] does the same on the `record` path, and both are
+    /// needed rather than one: `record` hands the entry back to its caller
+    /// before any save, so a caller acting on what it returns must not see a
+    /// stray either. "The write path" means **every** write, which is what
+    /// this round settled (r4 round 5, D1 and CL1) — the previous round put
+    /// the rule on `record` alone and claimed it covered the whole exposure.
+    pub fn save(&mut self) -> Result<(), Error> {
         self.check_lock()?;
+        for (target, dir) in self.view.strip_unrelated_created_dirs() {
+            tracing::warn!(
+                target = %target,
+                dir = %dir,
+                "{dir} is not above {target}; dropping it rather than writing it out",
+            );
+        }
         store::save(&self.dir.ledger(), KIND, VERSION, &self.view)
     }
 
@@ -2787,7 +2828,7 @@ mod tests {
         let old_shape = dir.root().join("before.mpk");
         store::save(&old_shape, KIND, VERSION, &before(&ledger)).expect("save the old shape");
         assert_eq!(std::fs::read(&old_shape).expect("read"), now);
-        let reopened = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        let mut reopened = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         reopened.save().expect("save again");
         assert_eq!(std::fs::read(dir.ledger()).expect("read"), now);
 
@@ -3485,17 +3526,23 @@ mod tests {
         let result = Ledger::open(&dir, &lock, home.path());
         std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o700))
             .expect("restore");
-        if let Ok(loaded) = &result {
-            // What a caller that keeps only the value does next.
-            loaded.value.save().expect("save");
-        }
+        // What a caller that keeps only the value does next. `save` takes
+        // `&mut self` since r4 round 5, so the value is moved out of the
+        // result and the error is kept beside it.
+        let err = match result {
+            Ok(loaded) => {
+                let mut ledger = loaded.value;
+                ledger.save().expect("save");
+                panic!("a ledger that cannot be moved aside stops bx");
+            }
+            Err(err) => err,
+        };
 
         assert_eq!(
             std::fs::read(dir.ledger()).expect("in place"),
             b"not messagepack",
             "the damaged ledger is never replaced",
         );
-        let err = result.expect_err("a ledger that cannot be moved aside stops bx");
         assert!(
             matches!(
                 &err,
@@ -4216,23 +4263,30 @@ mod tests {
             "untouched, because the reported rows do not name it",
         );
 
-        // Under the lock the same verdict, the file is quarantined, and the
-        // save the caller makes leaves a clean file still holding the stray.
+        // Under the lock the same verdict, and the file is quarantined.
         let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
         assert!(matches!(
             opened.health,
             Health::Reset(Damage::KeyMismatch { .. })
         ));
-        opened.value.save().expect("save the survivors");
+        let mut ledger = opened.value;
 
-        // The second load strips the stray directory and says so, keeping the
-        // entry. Two loads to converge, and each report was true.
+        // r4 round 5 (D1): the save the caller makes **strips the stray** and
+        // warns, rather than writing it out for a second load to find. Round 4
+        // put that rule on `record` only, so a save without a re-record of
+        // that row put the stray on disk and the reread reported it — bx
+        // writing a file it then called damaged.
+        let (saved, said) = crate::state::store::capture::capturing(|| ledger.save());
+        saved.expect("save the survivors");
+        assert!(said.contains("is not above"), "{said}");
+        assert!(said.contains("~/.cache"), "{said}");
+
+        // So the file bx just wrote loads clean, with the entry intact.
         let second = LedgerView::read(&dir, home.path()).expect("read");
         assert_eq!(
             second.health,
-            Health::Damaged(Damage::UnrelatedCreatedDirs {
-                rows: vec![("~/.config/tool/x.conf".to_string(), "~/.cache".to_string())],
-            }),
+            Health::Loaded,
+            "bx must not write a file it would then report as damaged",
         );
         let entry = second
             .value

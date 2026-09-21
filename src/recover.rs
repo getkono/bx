@@ -2091,6 +2091,79 @@ mod tests {
     }
 
     #[test]
+    fn a_writing_command_holds_one_lock_across_its_recovery_and_its_session() {
+        // r3 round 3, CL3. `before_writing` followed by `Session::open` drops
+        // the state directory between the two, so a second bx could win it and
+        // this one's session would refuse with `InProgress` naming a journal
+        // that belongs to a live run rather than to an interruption.
+        //
+        // The one-lock property itself is the type's: `lock_for_writing`
+        // returns the guard by value and `Session::open_locked` consumes it,
+        // so there is no point at which a caller of the pair can be without
+        // it. What this pins is the contract around that — the recovery runs
+        // and reports, the returned guard is held, the session takes it over
+        // rather than acquiring a second one, a finished session gives it
+        // back, and a session refused for its scope gives it back too. It is
+        // the last that would otherwise be unreached: `open_locked` owns the
+        // guard, so an early return has to drop it.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+
+        let (recovered, lock) = lock_for_writing(&state).expect("recover and keep the lock");
+        assert_eq!(recovered, Outcome::RolledBack { undone: 1 });
+        assert_eq!(peek(&dest).expect("rolled back").0, b"old\n");
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_none(),
+            "the recovery did not release the lock",
+        );
+
+        let session =
+            Session::open_locked(&state, SessionKind::Restore, home.path(), Vec::new(), lock)
+                .expect("the session takes the guard");
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_none(),
+            "and the session holds the same one",
+        );
+        assert_eq!(session.finish().expect("finish"), 0);
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_some(),
+            "only the finished session releases it",
+        );
+
+        // A scope the loader would refuse is refused under the caller's lock
+        // too, and releases it: `open_locked` owns the guard either way.
+        let (_, lock) = lock_for_writing(&state).expect("nothing to recover");
+        let absolute = Portable::try_from(dest.to_str().expect("utf-8").to_string())
+            .expect("a well-formed absolute path");
+        let err = Session::open_locked(
+            &state,
+            SessionKind::Restore,
+            home.path(),
+            vec![absolute],
+            lock,
+        )
+        .expect_err("a scope entry the loader refuses");
+        assert!(
+            matches!(
+                err,
+                journal::Error::State(crate::state::Error::ForeignRecord { .. })
+            ),
+            "got {err}"
+        );
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_some(),
+            "the refused session released the lock",
+        );
+    }
+
+    #[test]
     fn a_blocked_recovery_hands_no_claim_on_and_leaves_the_saved_ledger_alone() {
         // r3 coverage COV4. One terminated journal holding both a blocked
         // intent and a released removal: the removal's claims must not reach

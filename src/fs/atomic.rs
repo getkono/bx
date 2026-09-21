@@ -282,10 +282,13 @@ pub enum Error {
     ///
     /// The kernel's own cause is refused before any `chmod`: [`ensure_dir`]
     /// does not `chmod` an existing directory that has `S_ISGID`, or is
-    /// declared with it, when the process is neither root nor in the
-    /// directory's group. That `chmod` would strip the bit, and a set-back by
-    /// the same process would strip it again, so a bit the user had would be
-    /// lost for good. Then `chmod_left` is `None` and nothing was changed.
+    /// declared with it, unless a `chmod` by this process is **confirmed** to
+    /// keep the bit — by `CAP_FSETID` in the effective set, or by the
+    /// directory's group being one the kernel resolved and this process is in
+    /// (see [`keeps_setgid`]). Anything it cannot confirm is refused. That
+    /// `chmod` would strip the bit, and a set-back by the same process would
+    /// strip it again, so a bit the user had would be lost for good. Then
+    /// `chmod_left` is `None` and nothing was changed.
     ///
     /// The message is worded from `landed`, the mode on the directory when bx
     /// returned, and says whether a set-back restored the mode `plan` saw.
@@ -446,9 +449,9 @@ fn directory_set_id_not_kept(
         };
         return format!(
             "{} declares {declared} and is {landed}: the kernel drops a directory's setgid bit \
-             on a chmod by a process that is neither root nor in the directory's group, and this \
-             one is neither, so the directory would {lost}. bx did not chmod it, and nothing was \
-             changed",
+             on a chmod unless the process holds CAP_FSETID or is in the directory's group, and \
+             bx could confirm neither for this process, so the directory would {lost}. bx did \
+             not chmod it, and nothing was changed",
             path.display()
         );
     };
@@ -1536,8 +1539,8 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// setuid, setgid or sticky bit is not on the directory after its `chmod` — a
 /// refused `Modify` sets the directory back to the mode `plan` saw first, and
 /// reads it back — and, before any `chmod`, when the directory has `S_ISGID`
-/// or `mode` adds it and the process is neither root nor in the directory's
-/// group, so the kernel would strip the bit;
+/// or `mode` adds it and nothing confirms that a `chmod` by this process keeps
+/// the bit, so the kernel may strip it;
 /// [`Error::ParentComponent`] when it has a `..`
 /// component; [`Error::Read`]
 /// when the path or its parent cannot be stat'd; and [`Error::Write`] when a
@@ -2180,29 +2183,50 @@ fn set_dir_mode(path: &Path, mode: Mode) -> Result<std::fs::Metadata, Error> {
         path: path.to_path_buf(),
         source,
     })?;
-    let landed = mode_of(&meta);
-    let declared = mode.bits() & SPECIAL;
-    if landed.bits() & declared != declared {
-        return Err(Error::DirectorySetIdNotKept {
-            path: path.to_path_buf(),
-            declared: mode,
-            landed,
-            chmod_left: Some(landed),
-            set_back: None,
-        });
-    }
+    refuse_dir_set_id_dropped(path, mode, &meta)?;
     Ok(meta)
 }
 
-/// Refuse to `chmod` the existing directory at `path`, which `plan` found at
-/// `found`, to `declared` when the kernel would strip its setgid bit: the
-/// directory has `S_ISGID` or `declared` adds it, and this process is neither
-/// root nor in the directory's group — see [`keeps_setgid`].
+/// Refuse when a declared setuid, setgid or sticky bit is missing from the
+/// directory `meta` describes, after a `chmod` to `mode` that reported success.
 ///
-/// A `chmod` by such a process clears `S_ISGID` whatever mode it asks for, so
-/// a bit declared would not stick, and a bit the directory had would be lost
-/// for good: setting it back is another `chmod` by the same process. Refused
-/// before any `chmod`, nothing changes.
+/// Apart from [`set_dir_mode`] so that the refusal is constructible from a
+/// metadata alone. Making the kernel actually drop a bit needs a directory in a
+/// group the process is not in, which only a user namespace arranges; what
+/// every caller depends on is this answer, and it does not need the kernel to
+/// produce it.
+///
+/// # Errors
+///
+/// [`Error::DirectorySetIdNotKept`], naming what the `chmod` left.
+fn refuse_dir_set_id_dropped(
+    path: &Path,
+    mode: Mode,
+    meta: &std::fs::Metadata,
+) -> Result<(), Error> {
+    let landed = mode_of(meta);
+    let declared = mode.bits() & SPECIAL;
+    if landed.bits() & declared == declared {
+        return Ok(());
+    }
+    Err(Error::DirectorySetIdNotKept {
+        path: path.to_path_buf(),
+        declared: mode,
+        landed,
+        chmod_left: Some(landed),
+        set_back: None,
+    })
+}
+
+/// Refuse to `chmod` the existing directory at `path`, which `plan` found at
+/// `found`, to `declared` unless the setgid bit is confirmed to survive it: the
+/// directory has `S_ISGID` or `declared` adds it, and nothing confirms that a
+/// `chmod` by this process keeps it — see [`keeps_setgid`].
+///
+/// A `chmod` by a process the kernel does not exempt clears `S_ISGID` whatever
+/// mode it asks for, so a bit declared would not stick, and a bit the directory
+/// had would be lost for good: setting it back is another `chmod` by the same
+/// process. Refused before any `chmod`, nothing changes.
 ///
 /// # Errors
 ///
@@ -2218,22 +2242,65 @@ fn refuse_setgid_a_chmod_strips(path: &Path, found: Mode, declared: Mode) -> Res
         path: path.to_path_buf(),
         source,
     })?;
-    if process_keeps_setgid(meta.gid()) {
+    refuse_unless_setgid_survives(path, declared, &meta, process_keeps_setgid(meta.gid()))
+}
+
+/// The refusal itself: pass when `keeps` names a confirmation, refuse when it
+/// is `None`.
+///
+/// The confirmation is an argument rather than something this function reads,
+/// so that both answers are constructible on any host. The `None` answer is the
+/// one that matters and the one a real filesystem cannot produce here: it needs
+/// a directory in a group the process is not in, which only a user namespace
+/// arranges.
+///
+/// # Errors
+///
+/// [`Error::DirectorySetIdNotKept`] with no `chmod_left`: nothing was changed.
+fn refuse_unless_setgid_survives(
+    path: &Path,
+    declared: Mode,
+    meta: &std::fs::Metadata,
+    keeps: Option<KeepsSetgid>,
+) -> Result<(), Error> {
+    if keeps.is_some() {
         return Ok(());
     }
     Err(Error::DirectorySetIdNotKept {
         path: path.to_path_buf(),
         declared,
-        landed: mode_of(&meta),
+        landed: mode_of(meta),
         chmod_left: None,
         set_back: None,
     })
 }
 
-/// Whether a `chmod` by this process keeps the setgid bit of a directory
-/// whose group is `gid` — [`keeps_setgid`] for the process's effective uid,
-/// effective gid and supplementary groups.
-fn process_keeps_setgid(gid: u32) -> bool {
+/// Why a `chmod` by this process is known to keep a directory's setgid bit.
+///
+/// There is no variant for "probably" and none for a uid. The preflight passes
+/// only on a confirmation named here, so a setup nobody anticipated is refused
+/// rather than waved through: refusing costs a plan line, and guessing wrong
+/// costs a setgid bit that no second `chmod` by the same process can put back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepsSetgid {
+    /// This process holds `CAP_FSETID` in its effective set.
+    Capability,
+    /// The directory's group is this process's effective group or one of its
+    /// supplementary groups, and it is a group the kernel resolved into this
+    /// process's user namespace.
+    Group,
+}
+
+/// Whether a `chmod` by this process keeps the setgid bit of a directory whose
+/// group `stat` reports as `gid` — [`keeps_setgid`] against this process's own
+/// capabilities, effective gid, supplementary groups and overflow gid.
+fn process_keeps_setgid(gid: u32) -> Option<KeepsSetgid> {
+    // The test build can force either answer on this thread, because the
+    // `None` one needs a user namespace most hosts do not offer.
+    #[cfg(test)]
+    if let Some(forced) = forced::confirmation() {
+        return forced;
+    }
     // A process whose groups cannot be read is taken to be in none of them:
     // the refusal that follows changes nothing, where a wrong guess the
     // other way would strip a bit.
@@ -2244,20 +2311,130 @@ fn process_keeps_setgid(gid: u32) -> bool {
         .collect();
     keeps_setgid(
         gid,
-        rustix::process::geteuid().as_raw(),
+        has_cap_fsetid(),
         rustix::process::getegid().as_raw(),
         &groups,
+        overflow_gid(),
     )
 }
 
 /// Whether the kernel keeps a directory's setgid bit through a `chmod` by a
-/// process with effective uid `euid`, effective gid `egid` and supplementary
-/// groups `groups`, when the directory's group is `gid`.
+/// process holding `cap_fsetid`, with effective gid `egid` and supplementary
+/// groups `groups`, when the directory's group reads as `gid` and this user
+/// namespace's overflow gid is `overflow`.
 ///
-/// `chmod(2)` clears `S_ISGID` unless the caller is in the file's group or
-/// has `CAP_FSETID`. Root stands for the capability here.
-fn keeps_setgid(gid: u32, euid: u32, egid: u32, groups: &[u32]) -> bool {
-    euid == 0 || egid == gid || groups.contains(&gid)
+/// `chmod(2)` clears `S_ISGID` unless the caller holds `CAP_FSETID` or is in
+/// the file's group. Both halves are **confirmed**, never inferred, and
+/// anything else is refused:
+///
+/// * **The capability, not the uid.** A process can hold `CAP_FSETID` without
+///   being uid 0, and can be uid 0 without holding it — uid 0 in a user
+///   namespace whose bounding set was dropped is the case bx meets, and there
+///   the kernel strips the bit from a chmod that uid 0 made.
+/// * **A gid the kernel resolved, not the number `stat` printed.** A group with
+///   no mapping in this user namespace is reported as the overflow gid, which
+///   names no group at all. Comparing it against this process's groups answers
+///   a different question from the one `chmod(2)` will ask, so it confirms
+///   nothing — including when this process's own gids read as the overflow gid
+///   too, which is how an equality between two unmapped groups would otherwise
+///   look like membership.
+fn keeps_setgid(
+    gid: u32,
+    cap_fsetid: bool,
+    egid: u32,
+    groups: &[u32],
+    overflow: u32,
+) -> Option<KeepsSetgid> {
+    if cap_fsetid {
+        return Some(KeepsSetgid::Capability);
+    }
+    if gid == overflow {
+        return None;
+    }
+    (egid == gid || groups.contains(&gid)).then_some(KeepsSetgid::Group)
+}
+
+/// `CAP_FSETID`, capability 4 in `linux/capability.h`.
+const CAP_FSETID: u32 = 4;
+
+/// Whether this process holds `CAP_FSETID` in its effective capability set.
+///
+/// Read from `/proc/self/status`, which is the whole interface: bx forbids
+/// `unsafe`, so `capget(2)` is not reachable without a dependency that adds
+/// one, and bx is Linux-only, so `/proc` is the native answer rather than a
+/// portability compromise.
+///
+/// A set that cannot be read or parsed confirms nothing and is `false`. The
+/// caller then refuses, which changes nothing; the other guess strips a bit.
+fn has_cap_fsetid() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| cap_eff(&status))
+        .is_some_and(|effective| effective & (1 << CAP_FSETID) != 0)
+}
+
+/// The effective capability mask on a `/proc/<pid>/status` `CapEff:` line.
+///
+/// `None` when the line is absent or is not the hex mask the kernel writes.
+fn cap_eff(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+}
+
+/// The gid `stat` reports for a group with no mapping in this process's user
+/// namespace, from `/proc/sys/kernel/overflowgid`.
+///
+/// `65534` when it cannot be read: that is the kernel's own compiled-in
+/// default, and assuming anything else is what would let an unmapped group
+/// through the comparison [`keeps_setgid`] makes.
+fn overflow_gid() -> u32 {
+    /// The kernel's `DEFAULT_OVERFLOWGID`.
+    const DEFAULT: u32 = 65534;
+
+    std::fs::read_to_string("/proc/sys/kernel/overflowgid")
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(DEFAULT)
+}
+
+/// A forced answer for [`process_keeps_setgid`], per thread, in the test build
+/// only.
+///
+/// The refusal a foreign group causes is the whole point of the preflight, and
+/// a foreign group needs unprivileged user namespaces and subordinate ids to
+/// arrange. Forcing the answer constructs the refusal on every path that asks
+/// for it, on any host. `cfg(test)`, not a feature gate: no configuration of
+/// the binary differs from another, and the product build has no branch here.
+#[cfg(test)]
+mod forced {
+    use std::cell::Cell;
+
+    use super::KeepsSetgid;
+
+    thread_local! {
+        static ANSWER: Cell<Option<Option<KeepsSetgid>>> = const { Cell::new(None) };
+    }
+
+    /// The answer forced on this thread, if any.
+    pub(super) fn confirmation() -> Option<Option<KeepsSetgid>> {
+        ANSWER.get()
+    }
+
+    /// Run `f` with every [`super::process_keeps_setgid`] call on this thread
+    /// answering `answer`. Cleared on unwind too.
+    pub(super) fn answering<R>(answer: Option<KeepsSetgid>, f: impl FnOnce() -> R) -> R {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                ANSWER.set(None);
+            }
+        }
+        ANSWER.set(Some(answer));
+        let _clear = Clear;
+        f()
+    }
 }
 
 /// Set a directory whose `Modify` was `refused` back to `prior`, the mode
@@ -3212,10 +3389,10 @@ mod tests {
                     message,
                     format!(
                         "{} declares {declared} and is {inherited}: the kernel drops a \
-                         directory's setgid bit on a chmod by a process that is neither root \
-                         nor in the directory's group, and this one is neither, so the \
-                         directory would lose the setgid bit it has. bx did not chmod it, and \
-                         nothing was changed",
+                         directory's setgid bit on a chmod unless the process holds CAP_FSETID \
+                         or is in the directory's group, and bx could confirm neither for this \
+                         process, so the directory would lose the setgid bit it has. bx did not \
+                         chmod it, and nothing was changed",
                         team.display()
                     ),
                 );
@@ -3266,6 +3443,73 @@ mod tests {
         run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_PREFLIGHT_CHILD_DIR, |_| {});
     }
 
+    /// The variable the uid-0 child finds its setgid directory in.
+    const SET_ID_ROOT_CHILD_DIR: &str = "BX_TEST_SET_ID_ROOT_CHILD_DIR";
+
+    #[test]
+    fn uid_zero_without_cap_fsetid_is_refused_like_any_other_process() {
+        const NAME: &str =
+            "fs::atomic::tests::uid_zero_without_cap_fsetid_is_refused_like_any_other_process";
+
+        if let Some(dir) = std::env::var_os(SET_ID_ROOT_CHILD_DIR) {
+            // The child: uid 0 in a user namespace, with an empty capability
+            // bounding set, so `execve` left it no `CAP_FSETID`. The kernel
+            // strips `S_ISGID` from a chmod it makes of a directory in a group
+            // it is not in, exactly as it would for any other uid — and the
+            // predicate that once read `euid == 0` said otherwise, passed the
+            // preflight, and lost the bit for good.
+            println!("{SET_ID_CHILD_RAN}");
+            let dir = PathBuf::from(dir);
+            assert!(rustix::process::geteuid().is_root(), "the child is uid 0");
+            let status = std::fs::read_to_string("/proc/self/status").expect("status");
+            assert!(
+                !has_cap_fsetid(),
+                "uid 0 with no capabilities: CapEff {:?}",
+                cap_eff(&status),
+            );
+            // This child runs one test, so its umask is its own to set.
+            rustix::process::umask(Mode::from_bits(0o022).into());
+            let team = dir.join("team-root");
+            rustix::fs::mkdir(&team, Mode::DEFAULT_DIR.into()).expect("mkdir");
+            let inherited = Mode::from_bits(0o2755);
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "a setgid parent gives it the bit and its group",
+            );
+
+            let declared = Mode::from_bits(0o2775);
+            let planned = observe(&team).expect("observe");
+            let err = ensure_dir(&team, declared, &planned, &mut CreatedDirs::new())
+                .expect_err("uid 0 is not CAP_FSETID");
+            assert!(
+                matches!(
+                    &err,
+                    Error::DirectorySetIdNotKept { path, chmod_left: None, .. } if *path == team
+                ),
+                "{err:?}",
+            );
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "the setgid bit the directory had is still on it",
+            );
+            return;
+        }
+
+        run_in_a_foreign_setgid_directory(
+            NAME,
+            SET_ID_ROOT_CHILD_DIR,
+            &[
+                "--reuid=0",
+                "--regid=0",
+                "--clear-groups",
+                "--bounding-set=-all",
+            ],
+            |_| {},
+        );
+    }
+
     /// The refusal `set_dir_mode` returns for `dir`, declared `declared`, when
     /// its chmod left `left`.
     fn not_kept(dir: &Path, declared: Mode, left: Mode) -> Error {
@@ -3279,35 +3523,244 @@ mod tests {
     }
 
     #[test]
-    fn the_kernel_keeps_a_setgid_bit_for_root_and_the_directory_s_group_alone() {
+    fn the_setgid_predicate_confirms_a_capability_or_a_resolved_group_and_nothing_else() {
         const GID: u32 = 5;
-        assert!(keeps_setgid(GID, 0, 1, &[]), "root");
-        assert!(keeps_setgid(GID, 1, GID, &[]), "the effective group");
-        assert!(keeps_setgid(GID, 1, 1, &[3, GID]), "a supplementary group");
-        assert!(!keeps_setgid(GID, 1, 1, &[3, 4]), "other groups only");
-        assert!(!keeps_setgid(GID, 1, 1, &[]), "no groups");
+        const OVERFLOW: u32 = 65534;
 
-        // The same answer for this process, read through rustix.
+        // The capability is what chmod(2) tests, and it is the only thing that
+        // lets a process outside the directory's group through.
+        assert_eq!(
+            keeps_setgid(GID, true, 1, &[], OVERFLOW),
+            Some(KeepsSetgid::Capability),
+            "CAP_FSETID, held by a process in none of the groups",
+        );
+        assert_eq!(
+            keeps_setgid(GID, false, GID, &[], OVERFLOW),
+            Some(KeepsSetgid::Group),
+            "the effective group",
+        );
+        assert_eq!(
+            keeps_setgid(GID, false, 1, &[3, GID], OVERFLOW),
+            Some(KeepsSetgid::Group),
+            "a supplementary group",
+        );
+        assert_eq!(
+            keeps_setgid(GID, false, 1, &[3, 4], OVERFLOW),
+            None,
+            "other groups only",
+        );
+        assert_eq!(
+            keeps_setgid(GID, false, 1, &[], OVERFLOW),
+            None,
+            "no groups"
+        );
+
+        // uid 0 is not a parameter at all, and that is the repair: a process
+        // that is root in a user namespace without CAP_FSETID has its chmod
+        // stripped like any other, and there is no arm left for it to take.
+        //
+        // An unmapped group reads as the overflow gid, which names no group.
+        // Matching it confirms nothing, even against gids that read the same
+        // way, which is how two distinct unmapped groups would otherwise look
+        // like one membership.
+        assert_eq!(
+            keeps_setgid(OVERFLOW, false, OVERFLOW, &[OVERFLOW], OVERFLOW),
+            None,
+            "the overflow gid never confirms a membership",
+        );
+        assert_eq!(
+            keeps_setgid(OVERFLOW, true, 1, &[], OVERFLOW),
+            Some(KeepsSetgid::Capability),
+            "the capability settles it whatever the gid reads as",
+        );
+        // The overflow gid is only the overflow gid: a host whose value it is
+        // not still compares that number as an ordinary group.
+        assert_eq!(
+            keeps_setgid(OVERFLOW, false, OVERFLOW, &[], 65533),
+            Some(KeepsSetgid::Group),
+        );
+
+        // The same answers for this process, read through rustix and /proc.
         let egid = rustix::process::getegid().as_raw();
-        assert!(process_keeps_setgid(egid), "this process's own group");
+        let overflow = overflow_gid();
         let groups: Vec<u32> = rustix::process::getgroups()
             .expect("getgroups")
             .into_iter()
             .map(rustix::process::Gid::as_raw)
             .collect();
-        for member in &groups {
-            assert!(
+        if egid != overflow {
+            assert_eq!(
+                process_keeps_setgid(egid),
+                Some(KeepsSetgid::Group),
+                "this process's own group",
+            );
+        }
+        for member in groups.iter().filter(|gid| **gid != overflow) {
+            assert_eq!(
                 process_keeps_setgid(*member),
-                "supplementary group {member}"
+                Some(KeepsSetgid::Group),
+                "supplementary group {member}",
             );
         }
         let foreign = (1..)
-            .find(|gid| *gid != egid && !groups.contains(gid))
+            .find(|gid| *gid != egid && *gid != overflow && !groups.contains(gid))
             .expect("a group this process is not in");
         assert_eq!(
-            process_keeps_setgid(foreign),
-            rustix::process::geteuid().is_root(),
-            "group {foreign}, which this process is not in",
+            process_keeps_setgid(foreign).is_some(),
+            has_cap_fsetid(),
+            "group {foreign}, which this process is not in: only the capability confirms it",
+        );
+    }
+
+    #[test]
+    fn the_effective_capability_set_is_read_from_the_line_that_names_it() {
+        assert_eq!(
+            cap_eff("Name:\tbx\nCapInh:\t0000000000000000\nCapEff:\t0000000000000010\n"),
+            Some(0x10),
+        );
+        assert_eq!(cap_eff("CapEff: 1ffffffffff\n"), Some(0x1ff_ffff_ffff));
+        assert_eq!(cap_eff("CapEff:\t0\n"), Some(0));
+        assert_eq!(
+            cap_eff("CapInh:\t0000000000000010\n"),
+            None,
+            "a different capability set is not the effective one",
+        );
+        assert_eq!(cap_eff("CapEff:\tnot a mask\n"), None);
+        assert_eq!(cap_eff(""), None);
+
+        // CAP_FSETID is capability 4, so the mask above is that bit alone.
+        assert_eq!(1u64 << CAP_FSETID, 0x10);
+        assert!(
+            !cap_eff("CapEff:\t0000000000000008\n").is_some_and(|e| e & (1 << CAP_FSETID) != 0)
+        );
+        assert!(cap_eff("CapEff:\t0000000000000018\n").is_some_and(|e| e & (1 << CAP_FSETID) != 0));
+
+        // The overflow gid is the kernel's, read rather than assumed, and it
+        // is a gid either way.
+        let overflow = overflow_gid();
+        if let Ok(text) = std::fs::read_to_string("/proc/sys/kernel/overflowgid") {
+            assert_eq!(overflow.to_string(), text.trim());
+        } else {
+            assert_eq!(overflow, 65534);
+        }
+    }
+
+    #[test]
+    fn the_setgid_preflight_refuses_a_directory_whose_group_it_cannot_confirm() {
+        let home = guarded_home();
+        let dir = home.child("team");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let found = Mode::from_bits(0o2755);
+        set_mode(&dir, found).expect("chmod");
+        let declared = Mode::from_bits(0o2775);
+
+        // Forced rather than arranged: an unconfirmable group needs a user
+        // namespace, and the preflight's answer is the same either way.
+        let err = forced::answering(None, || refuse_setgid_a_chmod_strips(&dir, found, declared))
+            .expect_err("an unconfirmed process may not chmod a setgid directory");
+        assert!(
+            matches!(
+                &err,
+                Error::DirectorySetIdNotKept {
+                    path,
+                    declared: said,
+                    landed,
+                    chmod_left: None,
+                    set_back: None,
+                } if *path == dir && *said == declared && *landed == found
+            ),
+            "{err:?}",
+        );
+        assert_eq!(
+            mode_of_path(&dir),
+            found,
+            "the refusal comes before any chmod",
+        );
+        let message = err.to_string();
+        assert!(message.contains("CAP_FSETID"), "{message}");
+        assert!(
+            message.contains("bx did not chmod it, and nothing was changed"),
+            "{message}",
+        );
+
+        // Either confirmation passes it.
+        for keeps in [KeepsSetgid::Capability, KeepsSetgid::Group] {
+            assert!(
+                forced::answering(Some(keeps), || refuse_setgid_a_chmod_strips(
+                    &dir, found, declared
+                ))
+                .is_ok(),
+                "{keeps:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_this_apply_created_is_refused_when_its_group_stops_being_confirmable() {
+        // The adopt path: a directory this apply made at a declared setgid
+        // mode, met again by its own directory target. It runs the same
+        // preflight before its chmod, and nothing else constructs that call's
+        // refusal.
+        let home = guarded_home();
+        let dir = home.child("shared");
+        let declared = Mode::from_bits(0o2755);
+        let planned = observe(&dir).expect("plan sees nothing");
+        let mut created = CreatedDirs::new();
+        let made = ensure_dir(&dir, declared, &planned, &mut created).expect("create");
+        assert_eq!(made.action, Action::Create);
+        assert_eq!(
+            mode_of_path(&dir),
+            declared,
+            "the bit stuck for its creator"
+        );
+
+        let err = forced::answering(None, || ensure_dir(&dir, declared, &planned, &mut created))
+            .expect_err("the adopt path refuses a chmod it cannot confirm");
+        assert!(
+            matches!(
+                &err,
+                Error::DirectorySetIdNotKept { path, chmod_left: None, .. } if *path == dir
+            ),
+            "{err:?}",
+        );
+        assert_eq!(mode_of_path(&dir), declared, "nothing was changed");
+    }
+
+    #[test]
+    fn a_declared_directory_bit_missing_after_its_chmod_is_a_typed_error() {
+        // The read-back `set_dir_mode` makes, apart from the chmod: the kernel
+        // drops the bit only for a process outside the directory's group, and
+        // the answer every caller depends on is this one.
+        let home = guarded_home();
+        let dir = home.child("plain");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let landed = Mode::DEFAULT_DIR;
+        set_mode(&dir, landed).expect("chmod");
+        let meta = std::fs::symlink_metadata(&dir).expect("stat");
+
+        assert!(
+            refuse_dir_set_id_dropped(&dir, landed, &meta).is_ok(),
+            "no special bit declared, nothing to lose",
+        );
+        let declared = Mode::from_bits(0o2755);
+        let err = refuse_dir_set_id_dropped(&dir, declared, &meta)
+            .expect_err("a declared setgid bit that is not on the directory");
+        assert!(
+            matches!(
+                &err,
+                Error::DirectorySetIdNotKept {
+                    path,
+                    declared: said,
+                    landed: found,
+                    chmod_left: Some(left),
+                    set_back: None,
+                } if *path == dir && *said == declared && *found == landed && *left == landed
+            ),
+            "{err:?}",
+        );
+        assert!(
+            err.to_string().contains("the setgid bit did not stick"),
+            "{err}"
         );
     }
 
@@ -3551,7 +4004,35 @@ mod tests {
         child_env: &str,
         seed: impl FnOnce(&Path),
     ) {
-        let skip = |why: &str| eprintln!("skipped {name}: {why}");
+        run_in_a_foreign_setgid_directory(
+            name,
+            child_env,
+            &["--reuid=1", "--regid=1", "--clear-groups"],
+            seed,
+        );
+    }
+
+    /// Run the test `name` again under `setpriv`'s `credentials`, inside a user
+    /// namespace, with `child_env` naming a world-writable setgid directory
+    /// owned by a group those credentials are not in.
+    ///
+    /// Skips, with a message on stderr, wherever the scenario cannot be
+    /// constructed; fails only when the child ran and failed.
+    fn run_in_a_foreign_setgid_directory(
+        name: &str,
+        child_env: &str,
+        credentials: &[&str],
+        seed: impl FnOnce(&Path),
+    ) {
+        // Written to the process's own stderr, not through `eprintln!`:
+        // libtest captures the macro's output and discards it for a test that
+        // passes, so a skip announced that way is invisible and the suite still
+        // reports green. This goes to file descriptor 2, which libtest does not
+        // intercept.
+        let skip = |why: &str| {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "skipped {name}: {why}");
+        };
         let home = guarded_home();
         // Another uid has to reach the directory and run this test binary,
         // whose own directory it may not be able to read.
@@ -3604,17 +4085,16 @@ mod tests {
             return skip("the directory is not setgid to a foreign group");
         }
 
-        let child = in_namespace(&[
-            "setpriv".as_ref(),
-            "--reuid=1".as_ref(),
-            "--regid=1".as_ref(),
-            "--clear-groups".as_ref(),
+        let mut argv: Vec<&std::ffi::OsStr> = vec!["setpriv".as_ref()];
+        argv.extend(credentials.iter().map(|arg| std::ffi::OsStr::new(*arg)));
+        argv.extend([
             "--".as_ref(),
             exe.as_os_str(),
             "--exact".as_ref(),
             name.as_ref(),
             "--nocapture".as_ref(),
         ]);
+        let child = in_namespace(&argv);
         let out = match child {
             Ok(out) => out,
             Err(e) => return skip(&format!("unshare could not run: {e}")),

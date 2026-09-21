@@ -342,6 +342,20 @@ pub fn run(
     refuse_irregular_state_files(&inputs.state)?;
     let mut report = Report::default();
     look_at_state(inputs, &mut report)?;
+    // A writing run refuses a held state directory here, before it decides
+    // anything. `Session::open` refuses it too, but only after every target has
+    // been decided against a disk the running `apply` is concurrently changing,
+    // the whole plan has been rendered, and the user has answered a
+    // confirmation prompt for work this run was never going to do. The refusal
+    // is the same error `Session::open` would have raised, named by the same
+    // holder — see [`Holder::of`].
+    if mode == Mode::Apply && report.apply_running {
+        return Err(state::Error::Locked {
+            holder: state::Holder::of(&inputs.state),
+            path: inputs.state.lock(),
+        }
+        .into());
+    }
     if let Some(interrupted) = report.interrupted.clone() {
         report.changes = interrupted_rows(inputs, &interrupted)?;
         if mode == Mode::Plan {
@@ -2113,11 +2127,22 @@ pub(crate) mod tests {
         let inputs = inputs(&home, &inline("~/.a", "x\\n"));
         let held = ExclusiveLock::acquire(inputs.state()).expect("the lock");
 
-        let error = run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect_err("locked");
+        // P42R2-D5. The refusal comes before anything else the run would do.
+        // It used to come from `Session::open`, at the end: every target was
+        // decided against a state directory the running apply was concurrently
+        // changing, the whole plan was rendered, and the user was asked to
+        // confirm work this run was never going to be allowed to do.
+        let mut asked = 0;
+        let error = run(&inputs, Mode::Apply, &mut |_| {
+            asked += 1;
+            Ok(true)
+        })
+        .expect_err("locked");
         assert!(
             matches!(error, Error::State(state::Error::Locked { .. })),
             "{error:?}"
         );
+        assert_eq!(asked, 0, "apply prompted before refusing the held lock");
 
         let report = plan(&inputs);
         assert!(report.apply_running);

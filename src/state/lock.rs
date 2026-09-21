@@ -42,6 +42,24 @@ pub struct Holder {
 }
 
 impl Holder {
+    /// Whoever holds `dir`'s lock, as far as the lock file's body says.
+    ///
+    /// Read-only and best effort: an absent, unopenable or malformed lock file
+    /// is [`Holder::unknown`], exactly as it is on
+    /// [`ExclusiveLock::acquire`]'s refusal path, and nothing is created,
+    /// narrowed or written.
+    ///
+    /// The kernel remains the authority on whether the directory is held —
+    /// [`SharedLock::probe`] asks it. This answers only *who*, so a writing
+    /// command that has already been told the directory is held can refuse with
+    /// the same [`Error::Locked`] `acquire` would have raised, before it does
+    /// any other work, rather than reaching `acquire` at the end of a run it
+    /// was never going to be allowed to finish.
+    #[must_use]
+    pub fn of(dir: &StateDir) -> Self {
+        read_holder(&dir.lock())
+    }
+
     /// The holder bx reports when the lock file says nothing usable.
     ///
     /// An empty or unreadable body is not an error: the kernel is the authority

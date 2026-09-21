@@ -44,13 +44,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v2
       # env_guard's strongest evidence is differential: it holds its grammar
-      # against what real bash, zsh and bun actually do with a value. A missing
-      # interpreter fails those tests rather than skipping them, so the runner
-      # has to supply every one of them or the property never runs. bash is on
-      # the image already.
+      # against what real bash, zsh, bun and uv actually do with a value. A
+      # missing program fails those tests rather than skipping them, so the
+      # runner has to supply every one of them or the property never runs. bash
+      # is on the image already.
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
       - uses: oven-sh/setup-bun@v2
+      # uv is pinned, not floated. `Reason::DeclaredRootItself` exists because
+      # uv derives its executable directory as `$XDG_DATA_HOME/../bin`, and the
+      # test that holds the rule to a real uv was written against the version
+      # below. Floating it would let a uv release turn this red at a time
+      # nobody chose. When uv does change that layout,
+      # `uv_puts_executables_beside_its_data_home_and_the_guard_refuses_a_root`
+      # fails on its `dir --bin` assertion at the commit that raises the pin,
+      # where the rule can be re-derived deliberately — which is the point.
+      #
+      # It comes from the action rather than from mise.toml's [tools] because
+      # mise puts a *shim* on PATH, and a shim resolves the real binary out of
+      # mise's data directory, which it finds through HOME and XDG_DATA_HOME.
+      # The test spawns uv with `env_clear()` and redirects both into a scratch
+      # temporary directory, so a shim there reports "uv is not a valid shim"
+      # and the test fails on `an installed uv runs` instead.
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.11.30"
       - name: Check formatting
         run: mise run format-check
       - name: Clippy
@@ -79,11 +97,15 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v2
-      # Coverage runs the same suite as `check`, so it needs the same
-      # interpreters; without them the differential tests fail here too.
+      # Coverage runs the same suite as `check`, so it needs the same programs;
+      # without them the differential tests fail here too. The uv pin is the
+      # same one, and for the reasons written out in `check`.
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
       - uses: oven-sh/setup-bun@v2
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.11.30"
       - name: Collect coverage data
         run: cargo llvm-cov --no-report
       - name: Generate lcov report and enforce threshold

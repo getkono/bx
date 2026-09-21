@@ -710,11 +710,11 @@ impl Ledger {
     /// things, and the entry's own `written` digest — the whole file as bx last
     /// left it — tells them apart:
     ///
-    /// * [`PriorBytes::Absent`] — the stored prior is kept. It is also what
-    ///   [`NewEntry::new`] defaults to, so it cannot be trusted to mean "there
-    ///   is no file", and it carries no bytes that keeping the stored prior
-    ///   could lose. A stored snapshot is therefore never rewritten into
-    ///   "unlink it".
+    /// * [`PriorBytes::Absent`] — the stored prior is kept. A caller states it
+    ///   rather than omitting it ([`NewEntry::new`] takes it), so it does mean
+    ///   "there was no file" — but it carries no bytes that keeping the stored
+    ///   prior could lose, and the stored prior is what the user last had. A
+    ///   stored snapshot is therefore never rewritten into "unlink it".
     /// * bytes that hash to the stored `written` — bx's own previous output,
     ///   untouched. The stored prior is kept and nothing is written: snapshotting
     ///   these would make `bx rm` restore bx's generated content.

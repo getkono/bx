@@ -4634,13 +4634,38 @@ pub(crate) mod tests {
     /// unbuildable scenario **fails**, and the only way to have it skip is to
     /// say so in the environment — which is a decision a human takes, and
     /// which the gate report then has to carry.
+    ///
+    /// It is read, never written: `Cargo.toml` forbids `unsafe`, so no test in
+    /// this crate can set an environment variable. [`report_unbuildable`]
+    /// takes the answer as an argument so that both of its paths can be
+    /// tested without one.
     pub(crate) const ALLOW_SKIPS: &str = "BX_ALLOW_UNBUILDABLE_SCENARIOS";
+
+    /// Whether this run opted out of failing on a scenario it cannot build.
+    pub(crate) fn skips_allowed() -> bool {
+        allows_skips(std::env::var_os(ALLOW_SKIPS).as_deref())
+    }
+
+    /// Whether `value`, as [`ALLOW_SKIPS`] holds it, opts out.
+    ///
+    /// Exactly `1` opts out. Any other value is not a spelling of "yes" — it
+    /// is a mistake, and a mistake must not be a silent opt-out. Pure, so a
+    /// test can drive every spelling in a process that cannot set a variable.
+    pub(crate) fn allows_skips(value: Option<&std::ffi::OsStr>) -> bool {
+        value.is_some_and(|allow| allow == "1")
+    }
 
     /// Fail because `name`'s scenario cannot be built here, or skip loudly if
     /// [`ALLOW_SKIPS`] says to.
     pub(crate) fn cannot_build(name: &str, why: &str) {
+        report_unbuildable(name, why, skips_allowed());
+    }
+
+    /// [`cannot_build`] with the opt-out supplied, so a test can drive both
+    /// paths in a process that cannot change its own environment.
+    pub(crate) fn report_unbuildable(name: &str, why: &str, allowed: bool) {
         assert!(
-            std::env::var_os(ALLOW_SKIPS).is_some_and(|allow| allow == "1"),
+            allowed,
             "{name} could not be run on this machine: {why}.\n\
              That is a failure, not a skip: everything this test is the only \
              cover for is now unverified. Run the suite as an unprivileged \
@@ -4648,7 +4673,25 @@ pub(crate) mod tests {
              util-linux present; or set {ALLOW_SKIPS}=1 to accept the gap, \
              which leaves it unverified and makes the suite say so.",
         );
-        eprintln!("SKIPPED, opted out with {ALLOW_SKIPS}=1 — {name}: {why}");
+        say_out_loud(&format!(
+            "INCOMPLETE RUN, opted out with {ALLOW_SKIPS}=1 — {name} did not \
+             run: {why}",
+        ));
+    }
+
+    /// Put `line` in the test binary's output whether or not it is a failing
+    /// test's.
+    ///
+    /// r3 round 4, COV1. `eprintln!` goes through `std::io::_eprint`, which
+    /// honours libtest's per-thread output capture, so a line printed that way
+    /// by a *passing* test is printed nowhere at all — which is precisely the
+    /// case the opt-out exists for. The `Stderr` handle does not consult the
+    /// capture, so this reaches the report the gate reads.
+    pub(crate) fn say_out_loud(line: &str) {
+        use std::io::Write as _;
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "{line}");
+        let _ = err.flush();
     }
 
     /// A state directory, not yet created, whose files' paths fit Linux's
@@ -5815,6 +5858,60 @@ pub(crate) mod tests {
             saved_ledger(&state, home.path()).get(&portable).is_none(),
             "and the ledger holds nothing for the target",
         );
+    }
+
+    #[test]
+    fn a_scenario_this_machine_cannot_build_fails_unless_the_run_opted_out() {
+        // r3 round 4, COV1. Nothing pinned the policy itself: that the default
+        // is a failure naming the test and the environment, that only the
+        // exact string "1" opts out, and that the opted-in path still puts a
+        // line in the report. `Cargo.toml` forbids `unsafe`, so no test here
+        // can set an environment variable; `report_unbuildable` takes the
+        // answer as an argument so both paths are reachable.
+        let refused = std::panic::catch_unwind(|| {
+            report_unbuildable("some_test", "there is no way to make it", false);
+        })
+        .expect_err("the default is a failure, not a skip");
+        let said = refused
+            .downcast_ref::<String>()
+            .expect("a panic message")
+            .clone();
+        assert!(said.contains("some_test"), "{said}");
+        assert!(said.contains("there is no way to make it"), "{said}");
+        assert!(said.contains(ALLOW_SKIPS), "names the way out: {said}");
+        assert!(
+            said.contains("unprivileged"),
+            "names the environment: {said}"
+        );
+
+        // Opted in, it returns — and says so where the report can see it.
+        report_unbuildable("some_test", "there is no way to make it", true);
+
+        // Exactly "1" opts out. Nothing else is a spelling of "yes": an empty
+        // value, a "0" or a "true" left over from another tool's convention
+        // must not turn the suite's own failures off.
+        assert!(allows_skips(Some(std::ffi::OsStr::new("1"))));
+        for not_yes in ["", "0", "true", "yes", "1 ", " 1"] {
+            assert!(
+                !allows_skips(Some(std::ffi::OsStr::new(not_yes))),
+                "{not_yes:?} is not an opt-out",
+            );
+        }
+        assert!(!allows_skips(None), "unset is not an opt-out");
+
+        // And the live read agrees with the pure rule for this run. A run that
+        // did opt out says so on the real stderr rather than through
+        // `eprintln!`, which libtest captures and discards for a passing test.
+        assert_eq!(
+            skips_allowed(),
+            allows_skips(std::env::var_os(ALLOW_SKIPS).as_deref()),
+        );
+        if skips_allowed() {
+            say_out_loud(&format!(
+                "INCOMPLETE RUN: {ALLOW_SKIPS}=1 is set, so every scenario this \
+                 machine cannot build was skipped rather than failed",
+            ));
+        }
     }
 
     #[test]

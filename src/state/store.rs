@@ -159,18 +159,30 @@ pub enum Damage {
     /// `record` stores every entry under its own path, so a mismatch is not
     /// something bx wrote: it is damage, whatever home the ledger is read with.
     KeyMismatch {
-        /// The key the entry is stored under.
-        key: String,
-        /// The path the entry itself names.
-        path: String,
+        /// Every damaged row, as `(key, the path its entry names)`, in the
+        /// order the file stores them. Never empty.
+        rows: Vec<(String, String)>,
     },
 }
 
 /// Why a file's loader did not accept a value that decoded.
 #[derive(Debug)]
 pub(crate) enum Rejected {
-    /// The contents are damaged. Quarantined under the lock, reported without.
+    /// The contents are damaged, and nothing in them is usable. The value is
+    /// the empty default. Quarantined under the lock, reported without.
     Damage(Damage),
+    /// Part of the contents is damaged, and the check has already removed it
+    /// from the value, which holds the rest.
+    ///
+    /// The file is quarantined exactly as for [`Rejected::Damage`], so nothing
+    /// is lost, and the health says the same thing — but the caller gets the
+    /// rows that do check out rather than an empty default. For the ledger
+    /// that is the difference between losing one target's restore index and
+    /// losing every target's: `CLAUDE.md` requires a corrupt machine-owned
+    /// file to degrade to recomputation, and the ledger is the one file
+    /// recomputation cannot rebuild, so the degradation has to be as small as
+    /// the damage.
+    PartialDamage(Damage),
     /// The contents may be intact, and the context they were checked against is
     /// what is wrong. Returned to the caller; nothing is renamed.
     Refused(Error),
@@ -196,8 +208,14 @@ impl std::fmt::Display for Damage {
                 "it is a symbolic link to something that does not exist, or that cannot be \
                  followed",
             ),
-            Self::KeyMismatch { key, path } => {
-                write!(f, "its entry for {key} names a different path, {path}")
+            Self::KeyMismatch { rows } => {
+                let named = rows
+                    .iter()
+                    .map(|(key, path)| {
+                        format!("its entry for {key} names a different path, {path}")
+                    })
+                    .collect::<Vec<_>>();
+                f.write_str(&named.join("; "))
             }
         }
     }
@@ -332,16 +350,19 @@ pub(crate) fn load<T: DeserializeOwned + Default>(
     loss: Loss,
     lock: Option<&ExclusiveLock>,
 ) -> Result<Loaded<T>, Error> {
-    load_checked(path, kind, version, loss, lock, |_| Ok(()))
+    load_checked(path, kind, version, loss, lock, |_: &mut T| Ok(()))
 }
 
 /// [`load`], with a check on the decoded value that decoding alone cannot make.
 ///
-/// `check` runs only on a value that decoded whole. [`Rejected::Damage`] is
-/// handled like any other decode failure. [`Rejected::Refused`] is returned as
-/// the error and renames nothing: a value refused against context the decoder
-/// did not have — the account's home — is never believed, and never discarded
-/// either.
+/// `check` runs only on a value that decoded whole, and takes it by `&mut` so
+/// that it can *remove* what it rejects. [`Rejected::Damage`] is handled like
+/// any other decode failure and the value is discarded.
+/// [`Rejected::PartialDamage`] quarantines the file exactly the same way, and
+/// keeps whatever `check` left in the value. [`Rejected::Refused`] is returned
+/// as the error and renames nothing: a value refused against context the
+/// decoder did not have — the account's home — is never believed, and never
+/// discarded either.
 ///
 /// # Errors
 ///
@@ -352,7 +373,7 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
     version: u16,
     loss: Loss,
     lock: Option<&ExclusiveLock>,
-    check: impl FnOnce(&T) -> Result<(), Rejected>,
+    check: impl FnOnce(&mut T) -> Result<(), Rejected>,
 ) -> Result<Loaded<T>, Error> {
     let mut loaded = judge(path, kind, version, loss, lock, check)?;
     // Listed after any quarantine this load made, and whatever the health: an
@@ -387,7 +408,7 @@ fn judge<T: DeserializeOwned + Default>(
     version: u16,
     loss: Loss,
     lock: Option<&ExclusiveLock>,
-    check: impl FnOnce(&T) -> Result<(), Rejected>,
+    check: impl FnOnce(&mut T) -> Result<(), Rejected>,
 ) -> Result<Loaded<T>, Error> {
     // A lock presented for another directory guards nothing here, and is
     // refused before anything is read.
@@ -411,7 +432,7 @@ fn judge<T: DeserializeOwned + Default>(
                     Loss::Permanent => Err(Error::DanglingLink {
                         path: path.to_path_buf(),
                     }),
-                    Loss::Recomputable => degrade(path, Damage::DanglingLink, lock),
+                    Loss::Recomputable => degrade(path, Damage::DanglingLink, lock, T::default()),
                 };
             }
             if source.kind() == std::io::ErrorKind::NotFound {
@@ -429,36 +450,47 @@ fn judge<T: DeserializeOwned + Default>(
         }
     };
 
-    let checked = decode::<T>(&bytes, kind, version)
-        .map_err(Rejected::Damage)
-        .and_then(|value| check(&value).map(|()| value));
-    match checked {
-        Ok(value) => Ok(Loaded {
+    // A newer format of a file nothing can rebuild is not believed and not
+    // discarded: it is intact as far as anyone knows.
+    let future_version = |found, supported| {
+        // One flipped bit in the version number also makes an intact file
+        // "newer". Whether the rest of it reads as this build's format is what
+        // the message can honestly say about that.
+        let payload_readable = rmp_serde::from_slice::<Envelope<T>>(&bytes).is_ok();
+        Err(Error::FutureVersion {
+            path: path.to_path_buf(),
+            found,
+            supported,
+            payload_readable,
+        })
+    };
+    let mut value = match decode::<T>(&bytes, kind, version) {
+        Ok(value) => value,
+        Err(Damage::FutureVersion { found, supported }) if loss == Loss::Permanent => {
+            return future_version(found, supported);
+        }
+        // Quarantine happens only here: after `read` succeeded and `decode` or
+        // `check` found damage, so the bytes being moved aside are known to be
+        // unusable — and only under the lock, so they are still the bytes read.
+        Err(damage) => return degrade(path, damage, lock, T::default()),
+    };
+    match check(&mut value) {
+        Ok(()) => Ok(Loaded {
             value,
             health: Health::Loaded,
             quarantined: Vec::new(),
             unlisted: None,
         }),
-        // A newer format of a file nothing can rebuild is not believed and not
-        // discarded: it is intact as far as anyone knows.
         Err(Rejected::Damage(Damage::FutureVersion { found, supported }))
             if loss == Loss::Permanent =>
         {
-            // One flipped bit in the version number also makes an intact file
-            // "newer". Whether the rest of it reads as this build's format is
-            // what the message can honestly say about that.
-            let payload_readable = rmp_serde::from_slice::<Envelope<T>>(&bytes).is_ok();
-            Err(Error::FutureVersion {
-                path: path.to_path_buf(),
-                found,
-                supported,
-                payload_readable,
-            })
+            future_version(found, supported)
         }
-        // Quarantine happens only here: after `read` succeeded and `decode` or
-        // `check` found damage, so the bytes being moved aside are known to be
-        // unusable — and only under the lock, so they are still the bytes read.
-        Err(Rejected::Damage(damage)) => degrade(path, damage, lock),
+        Err(Rejected::Damage(damage)) => degrade(path, damage, lock, T::default()),
+        // The same quarantine, so nothing is lost, and the rows that did check
+        // out rather than the empty default. `check` has already removed the
+        // damaged ones from `value`.
+        Err(Rejected::PartialDamage(damage)) => degrade(path, damage, lock, value),
         Err(Rejected::Refused(error)) => Err(error),
     }
 }
@@ -517,10 +549,11 @@ fn decode<T: DeserializeOwned>(
 /// moved aside. [`Health::Reset`] promises the bytes were kept, and the next
 /// save writes the file's name, so a file left in place is refused rather than
 /// reset.
-fn degrade<T: Default>(
+fn degrade<T>(
     path: &Path,
     damage: Damage,
     lock: Option<&ExclusiveLock>,
+    value: T,
 ) -> Result<Loaded<T>, Error> {
     let Some(lock) = lock else {
         tracing::warn!(
@@ -530,7 +563,7 @@ fn degrade<T: Default>(
             path.display(),
         );
         return Ok(Loaded {
-            value: T::default(),
+            value,
             health: Health::Damaged(damage),
             quarantined: Vec::new(),
             unlisted: None,
@@ -548,7 +581,7 @@ fn degrade<T: Default>(
         path.display(),
     );
     Ok(Loaded {
-        value: T::default(),
+        value,
         health: Health::Reset(damage),
         quarantined: Vec::new(),
         unlisted: None,
@@ -929,10 +962,19 @@ mod tests {
             ),
             (
                 Damage::KeyMismatch {
-                    key: "~/.aaaa".to_string(),
-                    path: "~/.bbbb".to_string(),
+                    rows: vec![("~/.aaaa".to_string(), "~/.bbbb".to_string())],
                 },
                 "its entry for ~/.aaaa names a different path, ~/.bbbb",
+            ),
+            (
+                Damage::KeyMismatch {
+                    rows: vec![
+                        ("~/.aaaa".to_string(), "~/.bbbb".to_string()),
+                        ("~/.cccc".to_string(), "~/.dddd".to_string()),
+                    ],
+                },
+                "its entry for ~/.aaaa names a different path, ~/.bbbb; its entry for ~/.cccc \
+                 names a different path, ~/.dddd",
             ),
         ];
         for (damage, text) in cases {

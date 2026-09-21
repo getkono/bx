@@ -329,7 +329,7 @@ impl LedgerView {
             VERSION,
             Loss::Permanent,
             lock,
-            |view: &Self| view.check_paths(&path, home),
+            |view: &mut Self| view.check_paths(&path, home),
         )
     }
 
@@ -339,15 +339,58 @@ impl LedgerView {
     /// against the home, so a damaged ledger is never reported as a home
     /// problem. `home` has already been accepted, so the only home failure left
     /// is [`crate::paths::Error::AbsoluteUnderHome`].
-    fn check_paths(&self, file: &Path, home: &Path) -> Result<(), Rejected> {
-        for (key, entry) in &self.entries {
-            if *key != entry.path {
-                return Err(Rejected::Damage(super::Damage::KeyMismatch {
-                    key: key.as_str().to_string(),
-                    path: entry.path.as_str().to_string(),
-                }));
+    ///
+    /// # Damage is isolated to the rows that carry it
+    ///
+    /// A row stored under a key that is not its own `path` is removed, every
+    /// one of them is named in the [`super::Damage::KeyMismatch`], and the
+    /// rows that do check out are kept — while the whole file is still moved
+    /// aside under the lock, so nothing is lost and a human can see what
+    /// happened to it.
+    ///
+    /// All-or-nothing was the wrong degradation for this file. `CLAUDE.md`
+    /// requires a corrupt machine-owned file to degrade to recomputation, and
+    /// the ledger is the one state file recomputation cannot rebuild: it holds
+    /// the user's prior bytes. One bad row used to cost the restore index for
+    /// every target bx manages, leaving the blobs in `restore/` with nothing
+    /// naming them. So the degradation is as small as the damage.
+    ///
+    /// A path that cannot be used with `home` is *not* isolated this way. It
+    /// says nothing about the bytes — the likeliest cause is the same account
+    /// with its home spelled another way — so the whole ledger is refused and
+    /// nothing is renamed or dropped.
+    fn check_paths(&mut self, file: &Path, home: &Path) -> Result<(), Rejected> {
+        let mismatched: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(key, entry)| **key != entry.path)
+            .map(|(key, entry)| {
+                (
+                    key.as_str().to_string(),
+                    entry.path.as_str().to_string(),
+                    key.clone(),
+                )
+            })
+            .collect();
+        if !mismatched.is_empty() {
+            for (.., key) in &mismatched {
+                self.entries.remove(key);
             }
+            // The rows that are left are checked against the home too: a
+            // salvaged ledger must be one the next open would accept.
+            self.check_against_home(file, home)?;
+            return Err(Rejected::PartialDamage(super::Damage::KeyMismatch {
+                rows: mismatched
+                    .into_iter()
+                    .map(|(key, path, _)| (key, path))
+                    .collect(),
+            }));
         }
+        self.check_against_home(file, home)
+    }
+
+    /// Refuse the ledger if any path it stores cannot be used with `home`.
+    fn check_against_home(&self, file: &Path, home: &Path) -> Result<(), Rejected> {
         for (key, entry) in &self.entries {
             for stored in std::iter::once(key).chain(&entry.created_dirs) {
                 stored.check_against(home).map_err(|source| {
@@ -3337,22 +3380,73 @@ mod tests {
 
     /// A one-entry ledger whose entry names `path` but is stored under `key`.
     fn seed_mismatched(dir: &StateDir, key: Portable, path: Portable) -> Vec<u8> {
+        seed_rows(dir, vec![(key, path)])
+    }
+
+    /// A ledger of `rows`, each entry stored under the key it is paired with
+    /// whether or not that is its own path.
+    fn seed_rows(dir: &StateDir, rows: Vec<(Portable, Portable)>) -> Vec<u8> {
         let mut entries = BTreeMap::new();
-        entries.insert(
-            key,
-            LedgerEntry {
-                path,
-                written: ContentHash::of(b"x"),
-                mode: Mode::DEFAULT_FILE,
-                mechanism: Mechanism::Own,
-                prior: Prior::Absent,
-                created_dirs: Vec::new(),
-                superseded: Vec::new(),
-                superseded_absent: false,
-            },
-        );
+        for (key, path) in rows {
+            entries.insert(
+                key,
+                LedgerEntry {
+                    path,
+                    written: ContentHash::of(b"x"),
+                    mode: Mode::DEFAULT_FILE,
+                    mechanism: Mechanism::Own,
+                    prior: Prior::Absent,
+                    created_dirs: Vec::new(),
+                    superseded: Vec::new(),
+                    superseded_absent: false,
+                },
+            );
+        }
         store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
         std::fs::read(dir.ledger()).expect("read the seed")
+    }
+
+    #[test]
+    fn a_mismatched_row_costs_its_own_target_and_no_other() {
+        // r4 round 1 (CL7): one `KeyMismatch` row rejected the whole ledger, so
+        // a single corrupted key in a ledger of fifty targets cost the restore
+        // index for all fifty — and left their blobs in `restore/` with
+        // nothing naming them. The ledger is the one state file recomputation
+        // cannot rebuild, so the degradation has to be as small as the damage.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let seeded = seed_rows(
+            &dir,
+            vec![
+                (target("~/.aaaa"), target("~/.aaaa")),
+                (target("~/.bbbb"), target("~/.zzzz")),
+                (target("~/.cccc"), target("~/.cccc")),
+                (target("~/.dddd"), target("~/.yyyy")),
+            ],
+        );
+        let damage = Damage::KeyMismatch {
+            rows: vec![
+                ("~/.bbbb".to_string(), "~/.zzzz".to_string()),
+                ("~/.dddd".to_string(), "~/.yyyy".to_string()),
+            ],
+        };
+
+        for view in [
+            LedgerView::read(&dir, home.path()).expect("read"),
+            Ledger::open(&dir, &lock, home.path())
+                .expect("open")
+                .map(|ledger| (*ledger).clone()),
+        ] {
+            assert_eq!(view.health.damage(), Some(&damage), "every damaged key");
+            let kept: Vec<_> = view.value.iter().map(|(path, _)| path.as_str()).collect();
+            assert_eq!(kept, vec!["~/.aaaa", "~/.cccc"], "the rows that check out");
+        }
+
+        // And the whole file is still kept, so a human can see what happened.
+        assert_eq!(
+            std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("quarantined"),
+            seeded,
+        );
     }
 
     #[test]
@@ -3364,12 +3458,12 @@ mod tests {
         let (dir, lock) = locked(&home);
         let seeded = seed_mismatched(&dir, target("~/.aaaa"), target("~/.bbbb"));
         let damage = Damage::KeyMismatch {
-            key: "~/.aaaa".to_string(),
-            path: "~/.bbbb".to_string(),
+            rows: vec![("~/.aaaa".to_string(), "~/.bbbb".to_string())],
         };
 
         let view = LedgerView::read(&dir, home.path()).expect("read");
         assert_eq!(view.health, Health::Damaged(damage.clone()));
+        // The one row it had was the damaged one, so nothing is left.
         assert!(view.value.is_empty());
         assert!(damage.to_string().contains("~/.bbbb"), "{damage}");
 

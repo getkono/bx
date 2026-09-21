@@ -3387,12 +3387,20 @@ mod tests {
         fingerprints.set("activation:rustup", Fingerprint::hashed(b"v1"));
         fingerprints.save(&dir, &lock).expect("save");
 
+        // r4 round 1 (D3): this asserted `starts_with(home/".local")`, two
+        // components shallower than the state directory, so it admitted the
+        // whole of `~/.local` — `~/.local/share/bx-cache`, `~/.local/bin`, or
+        // another tool's `~/.local/state/<tool>` — while its name and the
+        // body's claim both say "the state directory". The two XDG ancestors
+        // `ensure_dir` creates are the sole exception, and they are named
+        // rather than admitted by prefix.
+        let ancestors = [home.child(".local"), home.child(".local/state")];
         for path in walk(home.path()) {
-            if before.contains(&path) {
+            if before.contains(&path) || ancestors.contains(&path) {
                 continue;
             }
             assert!(
-                path.starts_with(home.child(".local")),
+                path.starts_with(dir.root()),
                 "{} was created outside the state directory",
                 path.display(),
             );

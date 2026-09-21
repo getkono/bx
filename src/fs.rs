@@ -13,10 +13,16 @@
 //! and a `/tmp` on a different mount would turn the atomic rename into a
 //! copy-then-delete with a visible half-written window.
 //!
-//! [`Mode`] is the crate's single permission type. It carries the twelve
-//! meaningful bits of a POSIX mode and nothing else — no file type, no `umask`
-//! interaction — so a mode read from a ledger entry means the same thing as a
-//! mode written into one.
+//! [`Mode`] is the permission type this crate's filesystem layer uses. It
+//! carries the twelve meaningful bits of a POSIX mode and nothing else — no
+//! file type, no `umask` interaction — so a mode read from a ledger entry means
+//! the same thing as a mode written into one.
+//!
+//! It is **not** the crate's only permission type today:
+//! [`crate::config::target::Mode`] is a second one, declared where the config
+//! schema needed it first, and the two re-derive `0644` and `0755`
+//! independently. See [`Mode`]'s own documentation for what the collapse needs
+//! and who owns it.
 
 use std::io::Write as _;
 use std::os::fd::OwnedFd;
@@ -66,12 +72,17 @@ impl Error {
 ///
 /// [`crate::config::target::Mode`] is the same concept, declared where the
 /// config schema needed it first, and its own documentation names `bx::fs::Mode`
-/// as the address its body is to be relocated to. This is that address. The two
-/// cannot be collapsed from here: `config::target::Mode`'s field is private to
-/// its module, so no constructor from raw `stat` bits and no `Deserialize` can
-/// be written outside it — and the ledger needs both. The collapse belongs to
-/// the entry that owns `config/target.rs`, and until it happens nothing may
-/// re-export one of these as the other.
+/// as the address its body is to be relocated to. This is that address. Both
+/// types exist in this crate now, and both declare `0644` and `0755`
+/// independently, so the two constants can drift.
+///
+/// The collapse cannot be finished from this file: `config::target::Mode`'s
+/// field is private to its module, so the raw-`stat`-bits constructor the
+/// ledger needs — and the [`Deserialize`] that masks through it — cannot be
+/// written outside `config/target.rs`. The orphan rule is not what stops it;
+/// the private field is. One `pub const fn from_bits` there is the whole of
+/// what is missing, and the entry that owns `config/target.rs` is the one that
+/// adds it. Until it does, nothing may re-export one of these as the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Mode(u32);

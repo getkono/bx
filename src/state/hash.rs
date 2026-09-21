@@ -359,13 +359,25 @@ mod tests {
 
     #[test]
     fn digests_order_by_their_bytes() {
-        let mut all = [
-            ContentHash::of(b"c"),
+        // r4 round 2 (COV3): this sorted the array and asserted it was sorted,
+        // which holds for any total order — a reversed `Ord` included — so the
+        // impl was executed and constrained by nothing. The expected
+        // permutation is asserted instead, against the digests' own bytes.
+        let (a, b, c) = (
             ContentHash::of(b"a"),
             ContentHash::of(b"b"),
-        ];
+            ContentHash::of(b"c"),
+        );
+        // SHA-256 of "a", "b" and "c" begin 0xca, 0x3e and 0x2e: by their
+        // bytes the order is c, then b, then a — which is neither the input
+        // order nor its reverse, so a mutant flipping the comparison fails.
+        assert_eq!(a.as_bytes()[0], 0xca);
+        assert_eq!(b.as_bytes()[0], 0x3e);
+        assert_eq!(c.as_bytes()[0], 0x2e);
+
+        let mut all = [c, a, b];
         all.sort_unstable();
-        assert!(all[0] <= all[1] && all[1] <= all[2]);
+        assert_eq!(all, [c, b, a]);
         assert!(format!("{:?}", all[0]).starts_with("ContentHash("));
     }
 }

@@ -204,7 +204,9 @@ fn examine(path: &Path) -> Result<Option<std::fs::Metadata>, Error> {
 /// that does not exist, and as one that is itself a file. Only the root reads
 /// it so: a state directory that is a file is where the account's layer has to
 /// be, so there `ENOTDIR` stays an error. Following a root symlink is unchanged,
-/// so a root linked to such a place is dangling and still an error.
+/// so a root linked to such a place is still an error: the follow with `stat`
+/// fails with `ENOTDIR` too, never `ENOENT`, so it is an io error naming the
+/// link and not the dangling one.
 ///
 /// # Errors
 ///
@@ -928,7 +930,10 @@ mod tests {
     /// the root itself was `RepoMissing`: one fault, two answers.
     ///
     /// Guards the other side of R4-6: a root that is a symlink to such a place
-    /// is still dangling, and a dangling root is an io error naming the link.
+    /// is still an error. The follow with `stat` fails with `ENOTDIR` as well,
+    /// never `ENOENT`, so what comes back is a plain io error naming the link,
+    /// and not the dangling one. The kind is asserted so this doc cannot drift
+    /// from it.
     #[test]
     fn a_repo_beneath_a_regular_file_is_missing() {
         let dir = repo(&[("dotconfig", "")]);
@@ -943,7 +948,15 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(dir.path().join("dotconfig/x"), &link).expect("symlink");
         match layer_files(&link) {
-            Err(Error::Io { path, .. }) => assert_eq!(path, link),
+            Err(Error::Io { path, source }) => {
+                assert_eq!(path, link);
+                assert_eq!(
+                    source.kind(),
+                    std::io::ErrorKind::NotADirectory,
+                    "the follow fails at `dotconfig`, not at a missing target: {source}"
+                );
+                assert!(!source.to_string().contains("dangling"), "{source}");
+            }
             other => panic!("expected an io error naming the link, got {other:?}"),
         }
     }

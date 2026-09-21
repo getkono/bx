@@ -3494,6 +3494,66 @@ mod tests {
     }
 
     #[test]
+    fn a_path_answer_block_outranks_an_unrelated_disabled_or_invalid_value() {
+        // The placement this block was given is "before the disabled, invalid
+        // and unset blocks", and only the unset half was ever exercised. Each
+        // of the other two is given a value of its own, in `requires`, with
+        // nothing to do with the way `file` reaches `b`: clearing either one
+        // would leave this target blocked here, so neither may be reported
+        // first. The second half of each case drops the answer route and shows
+        // the block that would otherwise have won, so the first half is a
+        // statement about precedence rather than about the only block there is.
+        const LAYER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                             [[value]]\nname = \"other\"\nkind = \"KIND\"\n\
+                             [[value]]\nname = \"s\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/thing\"\nfile = \"FILE\"\n\
+                             requires = [\"{{other}}\"]\n";
+        let reaching = "cfg/{{s}}/x";
+
+        for (kind, local, without) in [
+            // Switched off: `other` is unrelated to the way to `b`.
+            (
+                "string",
+                "[[value]]\nname = \"other\"\nenabled = false\n\
+                 [values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n",
+                BlockReason::DisabledValue {
+                    names: vec!["other".to_string()],
+                },
+            ),
+            // Answered something its kind refuses, likewise unrelated.
+            (
+                "path",
+                "[values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n\
+                 other = \"relative/thing\"\n",
+                BlockReason::InvalidValue {
+                    names: vec!["other".to_string()],
+                },
+            ),
+        ] {
+            let layer = LAYER.replace("KIND", kind);
+
+            let blocking = resolved(&layer.replace("FILE", reaching), Some(local)).unwrap();
+            assert_eq!(
+                blocked(&blocking, 0).reason,
+                BlockReason::InvalidValue {
+                    names: vec!["s".to_string()]
+                },
+                "{kind}: the path-answer block did not outrank {without:?}"
+            );
+            assert!(
+                blocked(&blocking, 0).hint.contains("a `path` value"),
+                "{kind}: {}",
+                blocked(&blocking, 0).hint
+            );
+
+            // The same layers with `file` reaching nothing: the block that was
+            // outranked is really there, and really would have reported.
+            let alone = resolved(&layer.replace("FILE", "cfg/x"), Some(local)).unwrap();
+            assert_eq!(blocked(&alone, 0).reason, without, "{kind}");
+        }
+    }
+
+    #[test]
     fn switched_off_names_are_ordered_by_declaration_like_every_other_block() {
         // `a` is declared before `b`, and the target names `b` in its path and
         // `a` in its body, so the probe meets them the other way round —

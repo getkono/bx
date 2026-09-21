@@ -33,48 +33,113 @@ pub(super) struct Ctx<'a> {
     pub repo: &'a Path,
     /// The roots a generated environment fragment is judged against.
     pub roots: &'a RootSet,
-    /// Every directory target whose declared mode denies its owner write or
-    /// search, rendered, with that mode — see [`locked_dirs`].
-    pub locked_dirs: &'a [(PathBuf, Mode)],
 }
 
-/// The directory targets whose declared mode denies their owner write or
-/// search, each rendered against `home`, with its mode.
+/// Why a write to a destination is refused, read from the mode **on disk** of
+/// the directory `apply` would have to write into.
 ///
-/// Nothing beneath such a directory can be created or rewritten once it has
-/// that mode, so [`decide`] refuses every write beneath one at plan time rather
-/// than letting `apply` fail in `stage`. A directory target with nothing
-/// declared beneath it keeps whatever mode it declares.
-pub(super) fn locked_dirs(targets: &[Resolution<Target>], home: &Path) -> Vec<(PathBuf, Mode)> {
-    targets
-        .iter()
-        .filter_map(|resolution| match resolution {
-            Resolution::Ready(target) if target.body == Body::Dir => {
-                let mode = target.mode?;
-                (mode.bits() & 0o300 != 0o300).then(|| (target.path.render(home), mode))
-            }
-            _ => None,
-        })
-        .collect()
+/// # Decision 24, revised: the basis is the observed mode, not a declared one
+///
+/// The first form of this rule was keyed on the declared mode of `dir = true`
+/// targets: `plan` built a list of the directory targets whose declared mode
+/// denied their owner write or search, and refused every destination beneath
+/// one. That list was wrong in both directions, and each direction is a
+/// separate defect the list could not see:
+///
+/// * It **missed** the case that occurs in real homes. A directory already on
+///   disk at `0500` is declared by nothing, so it was in no list, and `plan`
+///   announced a `Create` that `apply` then failed with `EACCES` — Invariant 7
+///   broken by the very rule written to uphold it. [`crate::fs::compare`] does
+///   not catch it either: its parent note fires only when the parent is *wider*
+///   than the file's desired mode, and `0500` is not wider than `0644`.
+/// * It **fired where nothing was wrong**. A `dir = true` target declared
+///   `0555` whose directory does not exist made every file beneath it a
+///   conflict, with a note saying `apply` could not write there — untrue, since
+///   every `Body::Dir` target is blocked in [`wanted`], so no declared
+///   directory mode reaches disk at all and the parent is created at
+///   [`Mode::DEFAULT_DIR`].
+///
+/// A declaration is a statement about what the user asked for; this rule needs
+/// a fact about what `apply` will meet. So the basis is the observation the
+/// comparison already holds. Nothing can opt out of it: there is no list to be
+/// absent from, and a directory's mode is read from the filesystem whether or
+/// not any target names it.
+///
+/// The directory that governs the write is the destination's parent when it is
+/// already there, and otherwise the deepest ancestor of it that is — the
+/// directory `create_missing_dirs` makes its first `mkdir` in. Every directory
+/// between that one and the parent is one `apply` creates itself, at
+/// [`Mode::DEFAULT_DIR`], which denies its owner nothing.
+///
+/// An unusable parent is not this rule's to report: [`crate::fs::compare`] has
+/// already settled it as a conflict with its own reason.
+///
+/// Owner bits are the test, because bx writes as the account that owns its own
+/// home. A directory owned by somebody else is a different refusal, and `stage`
+/// reports it.
+///
+/// # Why **write** is the whole test, and search is not a second case
+///
+/// The rule this replaces distinguished three denials — write, search, and
+/// both — and named each in its note. Only one of the three can arrive here,
+/// and the reason is not that the others are rare:
+///
+/// A directory bx cannot **search** is one [`crate::fs::observe`] could not
+/// read through. Reaching this function at all means `observe` returned, and
+/// `observe` stats the destination with `optional_metadata`, which turns
+/// `ENOENT` into "absent" and every other failure — `EACCES` among them — into
+/// [`crate::fs::Error::Read`]. So a present parent that denies its owner search
+/// stops the run before any target is decided. A parent that is *absent* is
+/// reached the same way: `parent_state` reports `Absent` only when `metadata`
+/// on it returned `ENOENT`, which needs search on everything above it, and
+/// [`deepest_existing`] walks no further than that.
+///
+/// Every mode that denies search is therefore unreachable here, whether or not
+/// it denies write, and every mode that reaches here and denies write allows
+/// search. One bit decides it. `a_parent_bx_cannot_search_stops_the_run_before
+/// _any_decision` is the witness, and it asserts the failure rather than
+/// describing it, so the argument is recomputed on every run rather than taken
+/// on trust.
+fn locked_parent(observed: &Observed, home: &Path) -> Option<String> {
+    let parent = observed.parent.as_ref()?;
+    let (dir, mode) = match parent.state {
+        crate::fs::ParentState::Present(mode) => (parent.path.as_path(), mode),
+        crate::fs::ParentState::Absent(_) => deepest_existing(&parent.path)?,
+        crate::fs::ParentState::Unusable(_) => return None,
+    };
+    if mode.bits() & 0o200 != 0 {
+        return None;
+    }
+    let shown = paths::to_portable(dir, home);
+    Some(if dir == parent.path {
+        format!(
+            "{shown} is {mode} on disk, which denies its owner write, so apply could not write \
+             a file inside it"
+        )
+    } else {
+        format!(
+            "{shown} is {mode} on disk, which denies its owner write, so apply could not create \
+             {} inside it",
+            paths::to_portable(&parent.path, home)
+        )
+    })
 }
 
-/// Why a write to `dest` is refused, when `dest` lies beneath a directory
-/// target whose declared mode denies its owner write or search.
-fn locked_beneath(dest: &Path, ctx: &Ctx<'_>) -> Option<String> {
-    let (dir, mode) = ctx
-        .locked_dirs
-        .iter()
-        .find(|(dir, _)| dest != dir && dest.starts_with(dir))?;
-    let denied = match (mode.bits() & 0o200 == 0, mode.bits() & 0o100 == 0) {
-        (true, true) => "write and search",
-        (true, false) => "write",
-        (false, _) => "search",
-    };
-    Some(format!(
-        "{} is a directory target declared {mode}, which denies its owner {denied}, so apply \
-         could not write a file beneath it",
-        paths::to_portable(dir, ctx.home)
-    ))
+/// The deepest ancestor of `dir` that resolves to a directory, with its mode.
+///
+/// Read with `metadata`, which follows symlinks, because a symlinked parent is
+/// written *through* — decision 2 — so the directory that governs the write is
+/// the one the link resolves to, exactly as [`crate::fs::observe`] reads it.
+fn deepest_existing(dir: &Path) -> Option<(&Path, Mode)> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    dir.ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+        .find_map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            meta.is_dir()
+                .then(|| (path, Mode::from_bits(meta.permissions().mode())))
+        })
 }
 
 /// One write a decision produced.
@@ -176,10 +241,10 @@ pub(super) fn decide(
         join([note, outcome.parent_note]),
     );
 
-    // A write beneath a directory target its owner cannot write or search is
-    // refused here, so `apply` never reaches `stage` for it. A row with no
-    // write is left as it is: there is nothing to refuse.
-    let (action, note) = match (action.is_pending(), locked_beneath(&dest, ctx)) {
+    // A write into a directory its owner cannot write or search is refused
+    // here, so `apply` never reaches `stage` for it. A row with no write is
+    // left as it is: there is nothing to refuse.
+    let (action, note) = match (action.is_pending(), locked_parent(&observed, ctx.home)) {
         (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
         _ => (action, note),
     };
@@ -470,7 +535,6 @@ mod tests {
             home: home.path(),
             repo: &home.child(".config/bx"),
             roots: &roots,
-            locked_dirs: &[],
         };
         let shaped = |change: fn(&mut Target)| {
             let mut target = a_target(home.path(), "~/.a");
@@ -532,7 +596,6 @@ mod tests {
             home: home.path(),
             repo: &home.child(".config/bx"),
             roots: &roots,
-            locked_dirs: &[],
         };
 
         let (change, op) =
@@ -585,7 +648,6 @@ mod tests {
                 home: home.path(),
                 repo: &home.child(".config/bx"),
                 roots: &roots,
-                locked_dirs: &[],
             };
 
             let (change, op) =
@@ -615,53 +677,192 @@ mod tests {
             .unwrap_or_else(|| panic!("no row for {target}: {report:?}"))
     }
 
+    /// A directory at `~/rel`, made at `mode`, reopened to its owner when the
+    /// returned guard drops so the tempdir home can still be cleaned up.
+    fn locked_dir_at(home: &Path, rel: &str, mode: u32) -> impl Drop {
+        struct Unlock(PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = fs::set_mode(&self.0, Mode::from_bits(0o700));
+            }
+        }
+        let dir = home.join(rel);
+        std::fs::create_dir_all(&dir).expect("the directory");
+        fs::set_mode(&dir, Mode::from_bits(mode)).expect("chmod");
+        Unlock(dir)
+    }
+
     #[test]
-    fn decision_24_a_file_beneath_a_directory_its_owner_cannot_write_or_search_is_a_conflict() {
-        // #8's reviewer: a file beneath a declared read-only directory was
-        // printed as a create, and apply failed writing it.
-        for (mode, denied) in [
-            ("0555", "write"),
-            ("0655", "search"),
-            ("0444", "write and search"),
-        ] {
+    fn decision_24_a_file_whose_existing_parent_denies_its_owner_write_is_a_conflict() {
+        // P42R2-D1 and P42R2-COV1. The parent is on disk at a mode that denies
+        // its owner write, and NO directory target declares it — the case the
+        // declared-mode rule this replaces could not see, and the one that
+        // occurs in real homes. At 5d1bba7 `plan` printed `Create` with no note
+        // at all, `apply` failed with EACCES part-way through, the journal was
+        // left standing, and the next `plan` reported an interruption with zero
+        // rows: every configured target undecided.
+        //
+        // 0500 denies write and allows search; 0100 denies read as well. Both
+        // reach the rule. A mode denying *search* cannot — see
+        // `a_parent_bx_cannot_search_stops_the_run_before_any_decision`.
+        for mode in [0o500_u32, 0o100] {
             let home = guarded_home();
             let inputs = crate::plan::tests::inputs(
                 &home,
-                &a_directory_target(mode, &crate::plan::tests::inline("~/.d/f", "x\\n")),
+                &crate::plan::tests::inline("~/locked/conf", "x\\n"),
             );
+            let _unlock = locked_dir_at(home.path(), "locked", mode);
 
             let report = crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false))
                 .expect("plan");
 
-            let file = row_for(&report, "~/.d/f");
-            assert_eq!(file.action, Action::Conflict, "{mode}: {file:?}");
+            let file = row_for(&report, "~/locked/conf");
+            assert!(
+                !file.action.is_pending(),
+                "{mode:04o}: plan announced work apply cannot do: {file:?}"
+            );
+            assert_eq!(file.action, Action::Conflict, "{mode:04o}: {file:?}");
             let note = file.note.as_deref().expect("a note");
             assert!(
-                note.contains("~/.d")
-                    && note.contains(mode)
-                    && note.contains(&format!("owner {denied},")),
-                "{mode}: {note}"
+                note.contains("~/locked")
+                    && note.contains(&format!("{mode:04o}"))
+                    && note.contains("denies its owner write"),
+                "{mode:04o}: {note}"
             );
 
+            // Invariant 7: apply does exactly what plan announced, which here
+            // is nothing. It must not fail, and must leave no journal standing.
             let applied = crate::plan::run(&inputs, crate::plan::Mode::Apply, &mut |_| Ok(true))
-                .expect("apply");
-            assert!(!applied.executed, "{mode}: apply wrote");
+                .expect("apply must not fail on a row plan refused");
+            assert!(!applied.executed, "{mode:04o}: apply wrote");
             assert!(
-                !home.child(".d").exists(),
-                "{mode}: apply created the directory"
+                !crate::state::StateDir::resolve(home.path())
+                    .journal()
+                    .exists(),
+                "{mode:04o}: apply left a journal standing"
+            );
+            assert!(
+                !home.child("locked/conf").exists(),
+                "{mode:04o}: apply created the file"
             );
         }
     }
 
     #[test]
-    fn decision_24_a_childless_directory_target_keeps_any_declared_mode() {
+    fn decision_24_an_absent_parent_beneath_an_unwritable_one_names_what_cannot_be_created() {
+        // The parent itself is absent, so the directory that governs the write
+        // is the deepest ancestor that is there: the one `apply` would make its
+        // first `mkdir` in.
         let home = guarded_home();
-        let inputs = crate::plan::tests::inputs(&home, &a_directory_target("0555", ""));
+        let inputs = crate::plan::tests::inputs(
+            &home,
+            &crate::plan::tests::inline("~/locked/a/b/conf", "x\\n"),
+        );
+        let _unlock = locked_dir_at(home.path(), "locked", 0o500);
 
         let report =
             crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false)).expect("plan");
 
-        assert_eq!(report.actions(), vec![Action::Blocked], "{report:?}");
+        let file = row_for(&report, "~/locked/a/b/conf");
+        assert_eq!(file.action, Action::Conflict, "{file:?}");
+        let note = file.note.as_deref().expect("a note");
+        assert!(
+            note.contains("~/locked is 0500 on disk")
+                && note.contains("could not create ~/locked/a/b inside it"),
+            "{note}"
+        );
+        assert!(!home.child("locked/a").exists(), "a directory was made");
+    }
+
+    #[test]
+    fn a_parent_bx_cannot_search_stops_the_run_before_any_decision() {
+        // The witness for `locked_parent`'s argument that search denial cannot
+        // reach it. Asserted rather than described, so it is recomputed every
+        // run: were `observe` ever to tolerate EACCES, this fails and the
+        // argument in that doc comment has to be reopened.
+        //
+        // 0600 denies search and ALLOWS write — the one combination that would
+        // need a note `locked_parent` does not write.
+        let home = guarded_home();
+        let inputs =
+            crate::plan::tests::inputs(&home, &crate::plan::tests::inline("~/locked/conf", "x\\n"));
+        let _unlock = locked_dir_at(home.path(), "locked", 0o600);
+
+        let error = crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false))
+            .expect_err("a parent bx cannot search stops the run");
+
+        assert!(
+            matches!(&error, crate::plan::Error::Fs(fs::Error::Read { .. })),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn decision_24_a_declared_directory_mode_decides_nothing_beneath_it() {
+        // P42R2-D2. A `dir = true` target declared 0555 whose directory is
+        // absent used to turn every file beneath it into a Conflict whose note
+        // said apply could not write there. That was untrue: every directory
+        // target is Blocked in `wanted`, so the declared mode never reaches
+        // disk and `create_missing_dirs` makes the parent at DEFAULT_DIR. The
+        // control arm is the identical layer with the directory target removed
+        // — it always applied cleanly, and the two now agree.
+        for layer in [
+            a_directory_target("0555", &crate::plan::tests::inline("~/.d/f", "x\\n")),
+            crate::plan::tests::inline("~/.d/f", "x\\n"),
+        ] {
+            let home = guarded_home();
+            let inputs = crate::plan::tests::inputs(&home, &layer);
+
+            let report = crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false))
+                .expect("plan");
+            assert_eq!(
+                row_for(&report, "~/.d/f").action,
+                Action::Create,
+                "{report:?}"
+            );
+
+            let applied = crate::plan::run(&inputs, crate::plan::Mode::Apply, &mut |_| Ok(true))
+                .expect("apply");
+            assert!(applied.executed, "{report:?}");
+            assert_eq!(std::fs::read(home.child(".d/f")).expect("written"), b"x\n");
+            assert_eq!(
+                fs::observe(&home.child(".d")).expect("observe").mode,
+                Some(Mode::DEFAULT_DIR),
+                "the declared 0555 reached disk"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_3_a_directory_target_is_blocked_at_every_mode_it_can_declare() {
+        // P42R2-COV5 replaces a test whose name claimed a childless locked
+        // directory target "keeps any declared mode" while its only assertion
+        // was that one such target is Blocked — true of every directory target
+        // at every mode, so the name was evidence of a distinction the code
+        // never drew. Mode-independence is the property that does hold, so the
+        // mode is what varies, and declaring none is one of the cases.
+        for layer in [
+            a_directory_target("0755", ""),
+            a_directory_target("0555", ""),
+            a_directory_target("0444", ""),
+            "[[target]]\npath = \"~/.d\"\ndir = true\n".to_string(),
+        ] {
+            let home = guarded_home();
+            let inputs = crate::plan::tests::inputs(&home, &layer);
+
+            let report = crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false))
+                .expect("plan");
+
+            assert_eq!(
+                report.actions(),
+                vec![Action::Blocked],
+                "{layer}: {report:?}"
+            );
+            assert!(
+                !home.child(".d").exists(),
+                "{layer}: the directory was made"
+            );
+        }
     }
 
     #[test]
@@ -683,32 +884,44 @@ mod tests {
     }
 
     #[test]
-    fn decision_24_only_what_lies_beneath_a_locked_directory_target_is_refused() {
-        // The mutation run found unpinned that a file beside the directory,
-        // and a path beneath a file target, are not refused.
+    fn decision_24_only_what_the_unwritable_directory_actually_holds_is_refused() {
+        // The mutation run found unpinned that a file BESIDE the unwritable
+        // directory, and a file whose own declared mode is narrow, are not
+        // refused. Both still hold with the observed-mode rule, and the
+        // directory is now one on disk rather than one a target declares.
         let home = guarded_home();
         let layer = [
-            a_directory_target("0555", ""),
-            crate::plan::tests::inline("~/.e", "x\\n"),
-            "[[target]]\npath = \"~/.f\"\ncontent = \"x\\n\"\nmode = \"0444\"\n".to_string(),
-            crate::plan::tests::inline("~/.f/g", "x\\n"),
+            crate::plan::tests::inline("~/locked/conf", "x\\n"),
+            crate::plan::tests::inline("~/beside", "x\\n"),
+            "[[target]]\npath = \"~/narrow\"\ncontent = \"x\\n\"\nmode = \"0444\"\n".to_string(),
         ]
         .concat();
         let inputs = crate::plan::tests::inputs(&home, &layer);
+        let _unlock = locked_dir_at(home.path(), "locked", 0o500);
 
         let report =
             crate::plan::run(&inputs, crate::plan::Mode::Plan, &mut |_| Ok(false)).expect("plan");
 
         assert_eq!(
-            row_for(&report, "~/.e").action,
+            row_for(&report, "~/locked/conf").action,
+            Action::Conflict,
+            "{report:?}"
+        );
+        // Beside it, not beneath it: the home is writable and the row stands.
+        assert_eq!(
+            row_for(&report, "~/beside").action,
             Action::Create,
             "{report:?}"
         );
+        // A file's own narrow mode is not its parent's: `locked_parent` reads
+        // the directory, never the file the target declares.
+        let narrow = row_for(&report, "~/narrow");
+        assert_eq!(narrow.action, Action::Create, "{report:?}");
         assert!(
-            row_for(&report, "~/.f/g")
+            narrow
                 .note
                 .as_deref()
-                .is_none_or(|note| !note.contains("directory target")),
+                .is_none_or(|note| !note.contains("denies its owner write")),
             "{report:?}"
         );
     }

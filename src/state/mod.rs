@@ -405,6 +405,27 @@ pub enum Error {
         /// Where the snapshot should have been.
         path: PathBuf,
     },
+    /// Something other than the plain file bx wrote occupies a restore
+    /// snapshot's name.
+    ///
+    /// A symlink, a second hard link, a directory, a FIFO or a device. The
+    /// write side establishes a snapshot's length through `O_PATH | O_NOFOLLOW` and
+    /// refuses anything but a single-linked regular file; the read side asks
+    /// the same question, so that what `bx rm` restores is the file bx wrote
+    /// and not whatever was put at its name. Reading one of these would block
+    /// forever on a FIFO, or allocate without bound through a link to
+    /// `/dev/zero`.
+    #[error(
+        "the restore snapshot {digest} is not the plain file bx wrote: {} is a symbolic link, a \
+         hard link, a directory or a special file. Move it aside and run bx again",
+        .path.display()
+    )]
+    RestoreNotAFile {
+        /// The digest the ledger recorded.
+        digest: ContentHash,
+        /// The name it should have been at.
+        path: PathBuf,
+    },
     /// A restore snapshot's bytes do not hash to the digest that named them.
     #[error("the restore snapshot {} does not match its digest {digest}", .path.display())]
     RestoreCorrupt {

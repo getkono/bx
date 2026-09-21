@@ -392,23 +392,61 @@ impl LedgerView {
     /// content over a file the user wrote would be worse than refusing, so this
     /// refuses.
     ///
+    /// What is read must be bx's own entry in `restore/`, checked the way
+    /// [`blob_len`] checks it on the write side: opened `O_NOFOLLOW`, and a
+    /// regular file with exactly one link. Reading it with plain
+    /// `std::fs::read` accepted precisely the entries the write side refuses
+    /// to trust — a FIFO there blocks `bx rm` forever with no diagnostic, and
+    /// a link to an unbounded source such as `/dev/zero` allocates until the
+    /// process is killed. Content integrity is not the reason: the digest
+    /// below covers that. Availability is.
+    ///
     /// # Errors
     ///
-    /// [`Error::RestoreMissing`] if the blob is gone, [`Error::RestoreCorrupt`]
-    /// if its bytes do not hash to `reference.digest`, and [`Error::Read`] for
-    /// any other read failure.
+    /// [`Error::RestoreMissing`] if the blob is gone,
+    /// [`Error::RestoreNotAFile`] if what is at the name is not bx's own
+    /// snapshot, [`Error::RestoreCorrupt`] if its bytes do not hash to
+    /// `reference.digest`, and [`Error::Read`] for any other read failure.
     pub fn restore_bytes(&self, dir: &StateDir, reference: &RestoreRef) -> Result<Vec<u8>, Error> {
         let path = blob_path(dir, &reference.digest);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::RestoreMissing {
-                    digest: reference.digest,
+        let missing = || Error::RestoreMissing {
+            digest: reference.digest,
+            path: path.clone(),
+        };
+        let not_a_file = || Error::RestoreNotAFile {
+            digest: reference.digest,
+            path: path.clone(),
+        };
+        // `O_NONBLOCK` as well as `O_NOFOLLOW`: `O_NOFOLLOW` refuses a symlink,
+        // but a FIFO is opened by name and `open` itself blocks on one until a
+        // writer appears, before there is any descriptor to `fstat`.
+        let fd = match rustix::fs::open(
+            &path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            RawMode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => return Err(missing()),
+            // `ELOOP`: a symlink, refused by `O_NOFOLLOW`.
+            Err(rustix::io::Errno::LOOP) => return Err(not_a_file()),
+            Err(source) => {
+                return Err(Error::Read {
                     path,
+                    source: source.into(),
                 });
             }
-            Err(source) => return Err(Error::Read { path, source }),
         };
+        let stat = rustix::fs::fstat(&fd).map_err(|source| Error::Read {
+            path: path.clone(),
+            source: source.into(),
+        })?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1 {
+            return Err(not_a_file());
+        }
+        let mut bytes = Vec::new();
+        if let Err(source) = std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes) {
+            return Err(Error::Read { path, source });
+        }
         if ContentHash::of(&bytes) == reference.digest {
             Ok(bytes)
         } else {
@@ -1843,6 +1881,74 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_blob_that_is_not_bxs_own_file_is_refused_rather_than_read() {
+        // r4 round 1 (D5): the read side used plain `std::fs::read`, which
+        // follows links and accepts any file type — precisely the entries the
+        // write side's `blob_len` refuses to trust. A FIFO there blocked
+        // `bx rm` forever inside the read, with no timeout and no diagnostic;
+        // a link to an unbounded source allocated until the process died.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .record(entry("~/a", b"x").with_prior(prior(b"original", 0o644)))
+            .expect("record");
+        let Prior::Existed(reference) = &ledger.get(&target("~/a")).expect("entry").prior else {
+            panic!("expected a snapshot")
+        };
+        let reference = reference.clone();
+        let blob = dir.restore().join(reference.digest.to_hex());
+
+        home.write("elsewhere", "original");
+        for stage in ["symlink", "hard link", "directory", "fifo"] {
+            if blob.is_dir() {
+                std::fs::remove_dir(&blob).expect("clear the name");
+            } else {
+                std::fs::remove_file(&blob).expect("clear the name");
+            }
+            match stage {
+                "symlink" => {
+                    std::os::unix::fs::symlink(home.child("elsewhere"), &blob).expect("symlink");
+                }
+                "hard link" => {
+                    std::fs::hard_link(home.child("elsewhere"), &blob).expect("hard link");
+                }
+                "directory" => std::fs::create_dir(&blob).expect("directory"),
+                _ => rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &blob,
+                    FileType::Fifo,
+                    RawMode::from_bits_truncate(0o600),
+                    0,
+                )
+                .expect("fifo"),
+            }
+
+            // In a thread with a deadline: without the fix the FIFO case does
+            // not fail, it never returns, and a test that hangs reports
+            // nothing. The thread is abandoned if it does hang.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let view: LedgerView = (*ledger).clone();
+            let (dir_for, reference_for) = (dir.clone(), reference.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(format!(
+                    "{:?}",
+                    view.restore_bytes(&dir_for, &reference_for)
+                ));
+            });
+            let said = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("restore_bytes blocked on a {stage}"));
+            assert!(said.starts_with("Err(RestoreNotAFile"), "{stage}: {said}");
+            // And what the entry named was never read through.
+            assert_eq!(
+                std::fs::read(home.child("elsewhere")).expect("read"),
+                b"original",
+            );
+        }
+    }
+
+    #[test]
     fn a_tampered_restore_blob_is_refused_rather_than_returned() {
         let home = guarded_home();
         let (dir, lock) = locked(&home);
@@ -1891,6 +1997,10 @@ mod tests {
 
     #[test]
     fn an_unreadable_restore_blob_is_reported() {
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            return;
+        }
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
@@ -1902,8 +2012,10 @@ mod tests {
             .expect("record");
         let digest = ContentHash::of(b"body");
         let blob = dir.restore().join(digest.to_hex());
-        std::fs::remove_file(&blob).expect("remove");
-        std::fs::create_dir(&blob).expect("occupy");
+        // A regular file nobody may open: unreadable, as against a name
+        // occupied by something that is not a snapshot at all, which is
+        // `Error::RestoreNotAFile`.
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).expect("seal");
 
         let Prior::Existed(reference) = &ledger.get(&target("~/a")).expect("entry").prior else {
             panic!("expected a snapshot")

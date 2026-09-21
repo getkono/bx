@@ -44,7 +44,10 @@
 //! a path, approved a tool it had not heard of. The guard judges only what bx
 //! generates, so the table grows with the generators and with nothing else.
 //! [`check`] is the verdict. Declare no root — [`RootSet::strict`], which is
-//! what [`scan`] uses — and no location may be set at all.
+//! what [`scan`] uses — and no location, no list of locations and no anchor
+//! may be set at all. A program, a search list, a socket and a setting move
+//! nothing, so none of them needs a root; each is still held to every other
+//! check, bx's own directories included.
 //!
 //! The guard **fails closed by shape** as well. It does not model shell syntax
 //! and approve whatever it does not recognise: it reads a fragment against a
@@ -57,9 +60,14 @@
 //!
 //! This module is that rule as code. Every environment fragment bx generates is
 //! run through [`scan_with`] before it is written, and the check is covered by
-//! tests rather than left to review. The shell-init snippet is not one: it is
-//! fixed text from bx's source that sets only `BX_`-prefixed names, and sets
-//! every other variable by sourcing a guarded environment fragment.
+//! tests rather than left to review. Generated shell content that is **not** an
+//! environment fragment carries no environment assignment at all, which is what
+//! leaves nothing outside the guard's reach. The shell-init snippet is the one
+//! file bx generates under that rule: fixed text from bx's source that sets no
+//! environment variable outside bx's own `BX_` namespace, and gets every other
+//! variable by sourcing a guarded environment fragment.
+//! `tests::the_init_snippet_is_not_an_environment_fragment` proves it of the
+//! snippet rather than assuming it.
 //!
 //! **Reasons, and the one assertion.** Everything this module can be given —
 //! any name, any value, any fragment, well formed or not — comes back as a
@@ -104,8 +112,9 @@ use crate::config::layers;
 use crate::config::values::ResolvedValues;
 use crate::paths;
 
-/// Names a shell defines and manages itself. A fragment may neither assign one
-/// nor refer to one.
+/// Names a shell defines and manages itself. A fragment may not assign one,
+/// and may not refer to one either — except `HOME`, which [`Scope::lookup`]
+/// answers from the root set, and which is how `$HOME` and `~` resolve at all.
 ///
 /// A value assigned to one of these does not read back as it was written:
 /// `RANDOM`, `SECONDS` and `LINENO` are computed, `HISTSIZE` is an integer the
@@ -121,6 +130,27 @@ use crate::paths;
 /// value did not read back in one of them although neither defines it at
 /// startup. A test re-derives the first part from whichever shells the machine
 /// running it has.
+///
+/// Which modules are *bundled* is a property of the build, not of zsh, and that
+/// is how a name came to be missing here. `zgdbm_tied` is defined by
+/// `zsh/db/gdbm`; Ubuntu's zsh ships that module and this repository's
+/// development host does not, so the probe run by hand never loaded it and
+/// never saw the name. CI, on a runner that has the module, is what found it —
+/// the same test, the same sweep, a larger `$module_path`.
+///
+/// The rest of the list was re-checked against `zshmodules(1)` rather than
+/// against what is installed. `zsh/db/gdbm` is the only module that page
+/// documents which this host lacks, and `zgdbm_tied` is the only parameter it
+/// documents for it — `zgdbmpath` is a builtin, and it writes `REPLY` when it
+/// is called. Every other name that page attaches to a module is either already
+/// here or is created by an event rather than by the module loading: the
+/// connection-scoped `ZFTP_*` names appear on `open` and are unset on `close`,
+/// the completion specials exist only while a completion widget runs, and
+/// `MATCH`, `match` and `reply` are written by `pcre_match`, `zregexparse` and
+/// `zselect` when those builtins run. No build defines any of them at startup,
+/// so no build can widen this list through them. What could still widen it is a
+/// module no upstream manual page describes — a distribution-local one — and
+/// nothing establishes that none exists; the test is what would catch it.
 ///
 /// That probe finds names a shell *defines*. It cannot find a name the shell
 /// *acts on* when it is assigned and that reads back exactly as written —
@@ -305,6 +335,7 @@ const SHELL_NAMES: &[&str] = &[
     "zcurses_colors",
     "zcurses_keycodes",
     "zcurses_windows",
+    "zgdbm_tied",
     "zle_bracketed_paste",
     "zsh_eval_context",
     "zsh_scheduled_events",
@@ -738,6 +769,25 @@ impl RootSet {
     }
 
     /// Whether `path` contains, or is, a directory bx owns or a config repo.
+    ///
+    /// [`RootSet::owns`] and [`RootSet::in_config_repo`] both fall back to a
+    /// pattern for a set with no home, and this one deliberately does not.
+    /// The asymmetry is in the question, not in the care taken: those two ask
+    /// whether bx's directory is *in* the path, and `.local/state/bx` spells
+    /// itself out there whoever's home it is; this asks whether one lies
+    /// *under* the path, and under a path belonging to an unknown home one
+    /// always might. A fallback would therefore have to answer `true` for
+    /// every path a homeless set is shown, refusing all of them.
+    ///
+    /// Answering `false` instead is sound only because this is consulted from
+    /// [`refuses_entry`] alone, which [`judge`] reaches only for a location or
+    /// a list of them, after [`RootSet::refuses_everything`] has already
+    /// refused a set with no admissible root — and the only set without a home
+    /// is [`RootSet::strict`], which declares none. A later kind given a
+    /// containing check must not simply call this: under `scan` it would get
+    /// no protection at all, and it needs its own answer to the question
+    /// above. `a_set_with_no_home_is_never_asked_what_holds_bxs_directories`
+    /// pins both halves.
     fn holds_bx_directory(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);
         self.owned
@@ -900,8 +950,10 @@ pub enum Reason {
     /// parameter, an operator, an unclosed quote, a control character.
     #[error("is shell the guard cannot read, so it is not approved")]
     Unreadable,
-    /// It assigns, or refers to, a name the shell manages itself — `HOME`,
-    /// `RANDOM`, zsh's tied `path` — or acts on when it is assigned.
+    /// It assigns a name the shell manages itself — `HOME`, `RANDOM`, zsh's
+    /// tied `path` — or acts on when it is assigned; or it *refers* to one of
+    /// them other than `HOME`, which resolves against the root set's home
+    /// instead ([`Scope::lookup`]).
     #[error("assigns or refers to a name the shell manages itself")]
     ReservedName,
     /// It assigns a variable no bx generator declares, whatever the value: the
@@ -1095,8 +1147,14 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///
 /// A name the shell manages itself — `HOME`, `RANDOM`, `LINENO`, zsh's `path`
 /// and the rest of `SHELL_NAMES` — or acts on when it is assigned —
-/// `HISTFILESIZE` and the rest of [`ACTS_ON_ASSIGNMENT`] — may be neither
-/// assigned nor referred to, and is refused as [`Reason::ReservedName`].
+/// `HISTFILESIZE` and the rest of [`ACTS_ON_ASSIGNMENT`] — may not be
+/// assigned, and is refused as [`Reason::ReservedName`]. Nor may it be
+/// referred to, with one exception: `$HOME`, and the `~` that stands for it,
+/// resolve against the root set's home ([`Scope::lookup`]). That exception is
+/// the mechanism every value written against the home is judged through, and
+/// it is exactly why `HOME` may not be *assigned*: a fragment that moved it
+/// would move `~` with it, and the guard would judge against a home no shell
+/// will have.
 ///
 /// **What is judged.** Every accepted assignment, exported or not, since
 /// assigning a name the environment already exports changes what every child
@@ -2514,6 +2572,88 @@ mod tests {
                 "{content}"
             );
         }
+    }
+
+    #[test]
+    fn the_kinds_that_move_nothing_need_no_root() {
+        // "Declare no root and nothing moves" is true of the three kinds that
+        // say where a tool keeps its files — a location, a list of them and an
+        // anchor — and of nothing else. A program is one the tool runs, a
+        // search list is where it looks, a socket is what it connects to, and
+        // a setting is not a path at all: none of them moves a tool's config,
+        // data or cache, which is what invariant 2 is about, so none needs a
+        // root. `CLAUDE.md`, `AGENTS.md` and `README.md` are written to say
+        // exactly that, and this is what holds them to it.
+        for (name, value) in [
+            ("PATH", "/etc/evil:/usr/bin"),
+            ("INFOPATH", "/etc/evil"),
+            ("SSH_AUTH_SOCK", "/tmp/agent/s"),
+            ("EDITOR", "/usr/bin/vim"),
+            ("RUSTC_WRAPPER", "sccache"),
+            ("MISE_JOBS", "8"),
+        ] {
+            assert_eq!(
+                scan(&format!("export {name}={value}\n")),
+                vec![],
+                "{name}={value}"
+            );
+        }
+        // And false of the three that do move something: with nothing
+        // declared each is refused for having no root, whatever its value.
+        for (name, value) in [
+            ("CARGO_HOME", "/etc/evil"),
+            ("GOPATH", "/etc/evil:/usr/lib/go"),
+            ("SCRATCH_HOME", "/etc/evil"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &RootSet::strict())),
+                Some(Reason::NoRootsDeclared),
+                "{name}={value}"
+            );
+        }
+        // Needing no root is not a licence: bx's own directories are still
+        // refused to every one of them.
+        let owned = "/var/home/example/.local/state/bx/x";
+        for name in ["PATH", "INFOPATH", "SSH_AUTH_SOCK", "EDITOR"] {
+            assert_eq!(
+                reason_of(&check(name, owned, &RootSet::new(Path::new(HOME), &[]))),
+                Some(Reason::BxOwnedDirectory),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_set_with_no_home_is_never_asked_what_holds_bxs_directories() {
+        // `owns` and `in_config_repo` recognise bx's directories under any
+        // home, so a set with none still refuses a path into them. The
+        // containing check has no such fallback and cannot have one: a
+        // `.local/state/bx` may lie under any path at all, so a fallback would
+        // have to refuse every path a homeless set is shown. Answering `false`
+        // is sound only while the check is reached from `refuses_entry` alone,
+        // behind `refuses_everything`. Both halves are pinned here, so a later
+        // kind given a containing check cannot inherit the hole unnoticed.
+        let strict = RootSet::strict();
+        assert!(strict.owns(Path::new("/x/.local/state/bx/ledger")));
+        assert!(strict.in_config_repo(Path::new("/x/.config/bx/bx.toml")));
+        assert!(!strict.holds_bx_directory(Path::new("/x")));
+        // The only set without a home declares no root, so every kind that
+        // consults the containing check is refused before it is reached.
+        assert!(strict.refuses_everything().is_some());
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "/x", &strict)),
+            Some(Reason::NoRootsDeclared)
+        );
+        // A set that does have a home answers the containing question, which
+        // is the only configuration that asks it.
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/home/example/.local",
+                &RootSet::new(Path::new(HOME), &[PathBuf::from("~")])
+            )),
+            Some(Reason::ContainsBxDirectory)
+        );
     }
 
     #[test]
@@ -4828,15 +4968,78 @@ mod tests {
     #[test]
     fn the_init_snippet_is_not_an_environment_fragment() {
         // Invariant 2 sends bx's generated environment fragments through the
-        // guard. The shell-init snippet is fixed text from bx's source — a
-        // staleness test, a completion function, a `compdef` — that sets only
-        // `BX_` names and gets every other variable by sourcing a guarded
-        // fragment. The guard reads none of those statements, which is why the
-        // invariant does not send the snippet to it.
+        // guard, and requires of generated shell content that is *not* one of
+        // them that it carry no environment assignment at all. The shell-init
+        // snippet is the repository's one such file — a staleness test, a
+        // completion function, a `compdef` — so that property has to be
+        // established of it rather than assumed.
+        //
+        // It is established positively, and not out of the guard's inability
+        // to parse the snippet: `Reason::Unreadable` says only that a line is
+        // outside the grammar, which is no evidence at all that the line sets
+        // nothing. Every `=` in the snippet is found instead, and the name in
+        // front of it must be one of bx's own `BX_` names — which no tool
+        // reads — or an array the completion function declares `local`, which
+        // never leaves that function. Nothing else is given a value anywhere
+        // in the file, so the snippet sets no environment variable and there
+        // is nothing in it for the guard to judge.
+        //
+        // Written this way the test survives the snippet being reformatted,
+        // and fails the moment a generator puts a real assignment in it.
         let snippet = include_str!("../bench/fixtures/bx/bx-init.zsh");
-        assert_eq!(
-            reasons(snippet, &RootSet::strict()),
-            [8, 12, 13, 14, 15, 16, 17].map(|line| (line, Reason::Unreadable))
+        let locals: Vec<&str> = snippet
+            .lines()
+            .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
+            .filter_map(|rest| rest.split_whitespace().next_back())
+            .map(|declared| declared.split('=').next().unwrap_or(declared))
+            .collect();
+        let mut assigned = Vec::new();
+        for (at, _) in snippet.match_indices('=') {
+            let (before, from) = snippet.split_at(at);
+            // `==`, `!=`, `<=` and `>=` compare; they assign nothing.
+            if before.ends_with(['=', '!', '<', '>']) || from[1..].starts_with('=') {
+                continue;
+            }
+            // `:=`, `+=` and the rest of the assigning operators keep the name
+            // in front of them.
+            let before = before.trim_end_matches([':', '+', '-', '?']);
+            let head = before.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+            let name = &before[head.len()..];
+            assert!(
+                !name.is_empty(),
+                "the snippet assigns through {before:?}, which names nothing"
+            );
+            assigned.push(name);
+        }
+        for name in &assigned {
+            assert!(
+                name.starts_with("BX_") || locals.contains(name),
+                "the snippet gives {name} a value, which is neither one of \
+                 bx's own names nor local to a function"
+            );
+        }
+        // Not vacuous: the staleness test is what the snippet is for, and it
+        // is the two names found above.
+        assert!(assigned.contains(&"BX_BIN") && assigned.contains(&"BX_STALE"));
+        // So the guard reads no environment assignment out of it either. Every
+        // line is a comment, a blank, or shell outside the grammar, but for the
+        // one local array — whose value the grammar cannot read, so nothing is
+        // learned from it and nothing is approved.
+        for (idx, line) in snippet.split('\n').enumerate() {
+            if let Statement::Assign { name, .. } = statement(line) {
+                assert!(
+                    locals.contains(&name),
+                    "line {} assigns {name}, which the guard would have to judge",
+                    idx + 1
+                );
+            }
+        }
+        assert!(
+            pass(snippet, &RootSet::strict())
+                .1
+                .learned
+                .values()
+                .all(Result::is_err)
         );
     }
 
@@ -6285,7 +6488,11 @@ mod tests {
     }
 
     #[test]
-    fn a_name_the_shell_manages_may_be_neither_assigned_nor_referred_to() {
+    fn a_name_the_shell_manages_may_not_be_assigned_and_only_home_may_be_referred_to() {
+        // `HOME` is the one reserved name a value may refer to: `Scope::lookup`
+        // answers it from the root set before it reaches the reserved branch,
+        // which is what makes `$HOME` and `~` resolvable at all. Assigning it
+        // is still refused, and so is a reference to every other reserved name.
         for name in [
             "HOME", "RANDOM", "SECONDS", "LINENO", "path", "fpath", "USERNAME", "UID", "_",
             "FUNCNAME", "ERRNO",
@@ -6322,6 +6529,33 @@ mod tests {
             reasons("HOME=/etc/evil\nCARGO_HOME=~/cargo\n", &home_rooted),
             vec![(1, Reason::ReservedName), (2, Reason::UnreadableReference)]
         );
+        // The exception the grammar names, and the whole reason it exists: a
+        // *reference* to `HOME` resolves against the root set, and so does the
+        // `~` that stands for it, while a reference to any other reserved name
+        // is refused. Without it no value could be written against the home.
+        assert_eq!(
+            check("CARGO_HOME", "$HOME/.cargo", &home_rooted),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            check("CARGO_HOME", "${HOME}/.cargo", &home_rooted),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            check("CARGO_HOME", "~/.cargo", &home_rooted),
+            Verdict::Allowed
+        );
+        for name in ["RANDOM", "SECONDS", "UID", "FUNCNAME"] {
+            assert_eq!(
+                reason_of(&check(
+                    "CARGO_HOME",
+                    &format!("${name}/.cargo"),
+                    &home_rooted
+                )),
+                Some(Reason::ReservedName),
+                "{name}"
+            );
+        }
         // `PATH` reads back as written, so it may be assigned and extended.
         assert!(!SHELL_NAMES.contains(&"PATH"));
         assert_eq!(
@@ -6570,27 +6804,52 @@ mod tests {
         },
     ];
 
-    /// The installed shell `program` resolves to, or `None` with a message.
+    /// The variable that excuses a machine from supplying the shells.
+    ///
+    /// Differential agreement with real bash and zsh is this module's
+    /// strongest evidence, and a check that quietly asserts nothing is worse
+    /// than no check at all: `cargo test` hides `eprintln!`, so a skip
+    /// announced that way is invisible and the suite still reports green.
+    /// Skipping therefore has to be asked for by name, from outside the suite,
+    /// and every other run fails instead.
+    const WITHOUT_SHELLS: &str = "BX_TEST_WITHOUT_SHELLS";
+
+    /// Whether this machine has been excused from supplying the shells.
+    fn shells_are_excused() -> bool {
+        std::env::var_os(WITHOUT_SHELLS).is_some()
+    }
+
+    /// The installed shell `program` resolves to.
+    ///
+    /// A shell that is not installed fails the check it would have run, unless
+    /// [`WITHOUT_SHELLS`] is set.
     fn installed(program: &str) -> Option<PathBuf> {
         match crate::detect::locate_in_env(program) {
             crate::detect::Presence::Present { path } => Some(path),
             _ => {
-                eprintln!("skipping the {program} check: {program} is not installed");
+                assert!(
+                    shells_are_excused(),
+                    "{program} is not installed, so every check held against it \
+                     would assert nothing — install it, or set {WITHOUT_SHELLS} \
+                     to skip those checks on purpose"
+                );
+                eprintln!("skipping the {program} checks: {WITHOUT_SHELLS} is set");
                 None
             }
         }
     }
 
-    /// Run `script` in `shell` with an empty environment and the test home,
-    /// and return what it printed. Nothing in this process's environment is
+    /// Run `script` in `shell` with an empty environment and `home`, and
+    /// return what it printed. Nothing in this process's environment is
     /// touched: the child's is built per command.
     ///
     /// Some of the fragments these tests run are deliberately broken shell,
     /// and a stray `>` in one is a redirection. So the child runs in a fresh
     /// temporary directory, where a relative redirection lands, and with a
     /// `PATH` that finds no program, so a word that becomes a command runs
-    /// nothing.
-    fn run_script(shell: &Path, flags: &[&str], script: &str) -> Vec<u8> {
+    /// nothing. An *absolute* redirection is kept inside a temporary directory
+    /// too, by [`Shells`] rewriting every fixed path a fragment names.
+    fn run_script(shell: &Path, flags: &[&str], home: &Path, script: &str) -> Vec<u8> {
         let scratch = tempfile::tempdir().expect("a scratch directory");
         std::process::Command::new(shell)
             .args(flags)
@@ -6598,7 +6857,7 @@ mod tests {
             .arg(script)
             .current_dir(scratch.path())
             .env_clear()
-            .env("HOME", HOME)
+            .env("HOME", home)
             .env("PATH", "/nonexistent")
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -6607,10 +6866,15 @@ mod tests {
             .stdout
     }
 
-    /// Every scalar variable `shell` holds after running `content`.
-    fn variables_after(shell: &Shell, path: &Path, content: &str) -> HashMap<String, String> {
+    /// Every scalar variable `shell` holds after running `content` with `home`.
+    fn variables_after(
+        shell: &Shell,
+        path: &Path,
+        home: &Path,
+        content: &str,
+    ) -> HashMap<String, String> {
         let script = format!("{}\n{content}", shell.report);
-        run_script(path, shell.flags, &script)
+        run_script(path, shell.flags, home, &script)
             .split(|&byte| byte == 0)
             .filter_map(|entry| {
                 let entry = String::from_utf8_lossy(entry);
@@ -6620,24 +6884,75 @@ mod tests {
             .collect()
     }
 
-    /// Each installed shell, with the variables it holds running nothing.
+    /// The installed shells, the variables each holds running nothing, and the
+    /// temporary directory their fragments are rewritten into.
     ///
-    /// None at all if the neutral root exists on this machine: a broken
-    /// fragment could then redirect into it, and a test may not write outside
-    /// a temporary directory.
-    fn installed_shells() -> Vec<(&'static Shell, PathBuf, HashMap<String, String>)> {
-        if Path::new(ROOT).exists() {
-            eprintln!("skipping the shell checks: {ROOT} exists on this machine");
-            return Vec::new();
+    /// The fragments below name [`HOME`] and [`ROOT`] literally, and some of
+    /// them are deliberately broken shell in which a stray `>` is a redirection
+    /// into the value. A test may write nowhere but a temporary directory, so
+    /// both names are rewritten to a directory under one before a shell — or
+    /// the guard the shell is compared against — sees the fragment. That is
+    /// why these checks no longer skip themselves when `ROOT` happens to exist
+    /// on the machine: the earlier form gated on that fixed absolute path, and
+    /// a scratch mount under `/var/mnt/scratch` is the very layout this change
+    /// is motivated by, so the strongest checks in the module switched
+    /// themselves off exactly where they mattered most.
+    struct Shells {
+        dir: tempfile::TempDir,
+        found: Vec<(&'static Shell, PathBuf, HashMap<String, String>)>,
+    }
+
+    impl Shells {
+        /// Every shell in [`SHELLS`] — or none, when [`WITHOUT_SHELLS`]
+        /// excuses the machine from having them.
+        fn found() -> Self {
+            let dir = tempfile::tempdir().expect("a sandbox directory");
+            let home = dir.path().join("home");
+            let root = dir.path().join("scratch/example");
+            std::fs::create_dir_all(&home).expect("a sandbox home");
+            std::fs::create_dir_all(&root).expect("a sandbox root");
+            let found: Vec<_> = SHELLS
+                .iter()
+                .filter_map(|shell| {
+                    let path = installed(shell.program)?;
+                    let baseline = variables_after(shell, &path, &home, "");
+                    Some((shell, path, baseline))
+                })
+                .collect();
+            assert!(
+                !found.is_empty() || shells_are_excused(),
+                "no shell ran, so every check held against one asserted nothing"
+            );
+            Self { dir, found }
         }
-        SHELLS
-            .iter()
-            .filter_map(|shell| {
-                let path = installed(shell.program)?;
-                let baseline = variables_after(shell, &path, "");
-                Some((shell, path, baseline))
-            })
-            .collect()
+
+        /// The home the shells run with, standing in for [`HOME`].
+        fn home(&self) -> PathBuf {
+            self.dir.path().join("home")
+        }
+
+        /// The scratch root the fragments are written against, standing in for
+        /// [`ROOT`].
+        fn root(&self) -> PathBuf {
+            self.dir.path().join("scratch/example")
+        }
+
+        /// `content` with both fixed paths rewritten into the sandbox.
+        fn rewrite(&self, content: &str) -> String {
+            content
+                .replace(ROOT, &self.root().to_string_lossy())
+                .replace(HOME, &self.home().to_string_lossy())
+        }
+
+        /// [`rooted`] in the sandbox: the scratch root declared, the home not.
+        fn rooted(&self) -> RootSet {
+            RootSet::new(&self.home(), &[self.root()])
+        }
+
+        /// The sandbox's home declared as the one root.
+        fn home_rooted(&self) -> RootSet {
+            RootSet::new(&self.home(), &[PathBuf::from("~")])
+        }
     }
 
     /// Whether a shell that ended holding `name=value` — and the variables
@@ -6648,25 +6963,30 @@ mod tests {
     /// containing `/`, beginning `~` or `=`, or `.` or `..` — makes the whole
     /// value one the roots must admit, for any name; so does any value of a
     /// name the round-5 review saw a tool read as a location. bx's state
-    /// directory is worked out here from the test home and the shell's own
-    /// `XDG_STATE_HOME`, and an `XDG_CONFIG_HOME` whose `/bx` lands in it
-    /// escapes. The names the shell manages are its own business. The
-    /// commands, search lists and socket written out below need no root: a
+    /// directory is worked out here from `home` — the sandbox home the shell
+    /// actually ran with, which is not always the root set's, since some of
+    /// these fragments are judged against [`RootSet::strict`] — and the
+    /// shell's own `XDG_STATE_HOME`, and an `XDG_CONFIG_HOME` whose `/bx`
+    /// lands in it escapes. The names the shell manages are its own business.
+    /// The commands, search lists and socket written out below need no root: a
     /// command escapes with a second word or a relative or owned path, and a
     /// list or socket with any relative or owned entry.
-    fn escapes(name: &str, value: &str, roots: &RootSet, after: &HashMap<String, String>) -> bool {
+    fn escapes(
+        name: &str,
+        value: &str,
+        roots: &RootSet,
+        after: &HashMap<String, String>,
+        home: &Path,
+    ) -> bool {
         if SHELL_NAMES.contains(&name) {
             return false;
         }
         // bx's state directory, worked out here rather than asked of the
-        // guard: under the test home, or wherever the shell's own absolute
-        // `XDG_STATE_HOME` moved it.
+        // guard: under the home the shell ran with, or wherever the shell's own
+        // absolute `XDG_STATE_HOME` moved it.
         // bx's config repo counts as well: a tool pointed into it writes into a
         // committed tree, or runs what was committed there.
-        let mut owned = vec![
-            Path::new(HOME).join(".local/state/bx"),
-            Path::new(HOME).join(".config/bx"),
-        ];
+        let mut owned = vec![home.join(".local/state/bx"), home.join(".config/bx")];
         if let Some(state) = after
             .get("XDG_STATE_HOME")
             .filter(|state| Path::new(state).is_absolute())
@@ -6735,67 +7055,71 @@ mod tests {
     /// of the guard's table. Every other value is also read as one whole path.
     const TEST_COLON_LISTS: &[&str] = &["GOPATH"];
 
-    /// Run `content` in every installed shell and hold the guard to what each
-    /// shell did. The guard must never approve a fragment after which any
-    /// variable [`escapes`] — holds a path outside `roots` or inside bx's own
-    /// directory, for any name; and where the guard read every line, what it
-    /// learned must be exactly what the shell set. Returns, per shell, whether
-    /// the shell relocated anything outside the roots.
-    fn assert_the_shells_agree(
-        shells: &[(&'static Shell, PathBuf, HashMap<String, String>)],
-        content: &str,
-        roots: &RootSet,
-    ) -> Vec<bool> {
-        let (found, scope) = pass(content, roots);
-        let mut escaped_in = Vec::new();
-        for (shell, path, baseline) in shells {
-            let after = variables_after(shell, path, content);
-            let changed: Vec<(&String, &String)> = after
-                .iter()
-                .filter(|(name, value)| baseline.get(*name) != Some(*value))
-                .collect();
-            let escaped: Vec<_> = changed
-                .iter()
-                .filter(|(name, value)| escapes(name, value, roots, &after))
-                .collect();
-            assert!(
-                escaped.is_empty() || !found.is_empty(),
-                "{}: the guard approved {content:?}, after which {escaped:?}",
-                shell.program
-            );
-            escaped_in.push(!escaped.is_empty());
-            if scope.lost {
-                continue;
-            }
-            for (name, value) in &changed {
-                if is_reserved(name) {
+    impl Shells {
+        /// Run `content` in every installed shell and hold the guard to what each
+        /// shell did. The guard must never approve a fragment after which any
+        /// variable [`escapes`] — holds a path outside `roots` or inside bx's own
+        /// directory, for any name; and where the guard read every line, what it
+        /// learned must be exactly what the shell set. Returns, per shell, whether
+        /// the shell relocated anything outside the roots.
+        ///
+        /// `content` is rewritten into the sandbox first, and so must `roots` have
+        /// been — [`Shells::rooted`] and [`Shells::home_rooted`] are the two sets
+        /// these checks pass.
+        fn agree(&self, content: &str, roots: &RootSet) -> Vec<bool> {
+            let content = &self.rewrite(content);
+            let home = self.home();
+            let (found, scope) = pass(content, roots);
+            let mut escaped_in = Vec::new();
+            for (shell, path, baseline) in &self.found {
+                let after = variables_after(shell, path, &home, content);
+                let changed: Vec<(&String, &String)> = after
+                    .iter()
+                    .filter(|(name, value)| baseline.get(*name) != Some(*value))
+                    .collect();
+                let escaped: Vec<_> = changed
+                    .iter()
+                    .filter(|(name, value)| escapes(name, value, roots, &after, &home))
+                    .collect();
+                assert!(
+                    escaped.is_empty() || !found.is_empty(),
+                    "{}: the guard approved {content:?}, after which {escaped:?}",
+                    shell.program
+                );
+                escaped_in.push(!escaped.is_empty());
+                if scope.lost {
                     continue;
                 }
-                match scope.learned.get(*name) {
-                    Some(Ok(learned)) => assert_eq!(
-                        learned, *value,
-                        "{}: {content:?} gives {name} a different value",
-                        shell.program
-                    ),
-                    Some(Err(_)) => {}
-                    None => panic!(
-                        "{}: {content:?} sets {name}={value:?}, which the guard did not learn",
-                        shell.program
-                    ),
+                for (name, value) in &changed {
+                    if is_reserved(name) {
+                        continue;
+                    }
+                    match scope.learned.get(*name) {
+                        Some(Ok(learned)) => assert_eq!(
+                            learned, *value,
+                            "{}: {content:?} gives {name} a different value",
+                            shell.program
+                        ),
+                        Some(Err(_)) => {}
+                        None => panic!(
+                            "{}: {content:?} sets {name}={value:?}, which the guard did not learn",
+                            shell.program
+                        ),
+                    }
+                }
+                for (name, learned) in &scope.learned {
+                    if let Ok(learned) = learned {
+                        assert_eq!(
+                            after.get(name),
+                            Some(learned),
+                            "{}: {content:?} does not give {name} what the guard learned",
+                            shell.program
+                        );
+                    }
                 }
             }
-            for (name, learned) in &scope.learned {
-                if let Ok(learned) = learned {
-                    assert_eq!(
-                        after.get(name),
-                        Some(learned),
-                        "{}: {content:?} does not give {name} what the guard learned",
-                        shell.program
-                    );
-                }
-            }
+            escaped_in
         }
-        escaped_in
     }
 
     /// Fragments the grammar reads line for line, some approved and some
@@ -6820,90 +7144,134 @@ mod tests {
 
     #[test]
     fn the_shells_read_every_readable_fragment_as_the_guard_does() {
-        let shells = installed_shells();
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let shells = Shells::found();
         for content in READABLE_FRAGMENTS {
-            for roots in [rooted(), home_rooted.clone()] {
-                assert!(!pass(content, &roots).1.lost, "{content:?}");
-                assert_the_shells_agree(&shells, content, &roots);
+            for roots in [shells.rooted(), shells.home_rooted()] {
+                assert!(
+                    !pass(&shells.rewrite(content), &roots).1.lost,
+                    "{content:?}"
+                );
+                shells.agree(content, &roots);
             }
         }
     }
 
     #[test]
+    fn nothing_a_shell_runs_names_a_path_outside_the_sandbox() {
+        // What replaced the old skip. The fragments these checks run are
+        // deliberately broken shell, and a stray `>` in one is a redirection
+        // into the path the fragment names, while a test may write nowhere but
+        // a temporary directory. The old form bought that by refusing to run
+        // at all when `ROOT` existed on the machine — which silently switched
+        // the module's strongest checks off on exactly the machines this
+        // change is written for, and said so only through an `eprintln!` that
+        // `cargo test` hides. The rewrite buys it instead, and this holds the
+        // rewrite to it.
+        let shells = Shells::found();
+        assert!(shells.root().starts_with(shells.dir.path()));
+        assert!(shells.home().starts_with(shells.dir.path()));
+        let forms = ASSIGNING_FORMS.iter().map(|form| {
+            form.replace("{N}", "CARGO_HOME")
+                .replace("{V}", "/var/mnt/scratch/example/x")
+        });
+        for content in READABLE_FRAGMENTS
+            .iter()
+            .map(|content| (*content).to_string())
+            .chain(forms)
+        {
+            let rewritten = shells.rewrite(&content);
+            assert!(!rewritten.contains(ROOT), "{content:?}");
+            assert!(!rewritten.contains(HOME), "{content:?}");
+        }
+        // And the rewrite is a rename, not a redaction: the operator's own
+        // fragment names the root on every line, and is approved after it.
+        let rewritten = shells.rewrite(OPERATOR_FRAGMENT);
+        assert!(rewritten.contains(&*shells.root().to_string_lossy()));
+        assert_eq!(scan_with(&rewritten, &shells.rooted()), vec![]);
+    }
+
+    #[test]
     fn every_review_falsifier_relocates_in_a_real_shell_and_is_refused() {
-        let shells = installed_shells();
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let shells = Shells::found();
+        let rooted = shells.rooted();
+        let home_rooted = shells.home_rooted();
         for form in ASSIGNING_FORMS {
             let content = form
                 .replace("{N}", "CARGO_HOME")
                 .replace("{V}", "/etc/evil");
-            assert_ne!(scan_with(&content, &rooted()), vec![], "{content:?}");
-            assert_the_shells_agree(&shells, &content, &rooted());
+            assert_ne!(
+                scan_with(&shells.rewrite(&content), &rooted),
+                vec![],
+                "{content:?}"
+            );
+            shells.agree(&content, &rooted);
         }
         // The review's own list, each run for real: every one but the alias
         // (neither shell expands an alias defined in the same `-c` string)
         // relocates outside the roots in at least one installed shell.
         let falsifiers = [
-            ("\\export CARGO_HOME=/etc/evil", rooted()),
-            ("\"export\" CARGO_HOME=/etc/evil", rooted()),
-            ("e''xport CARGO_HOME=/etc/evil", rooted()),
-            (": '\n'; export CARGO_HOME=/etc/evil #'", rooted()),
-            ("ex\\\nport CARGO_HOME=/etc/evil", rooted()),
+            ("\\export CARGO_HOME=/etc/evil", rooted.clone()),
+            ("\"export\" CARGO_HOME=/etc/evil", rooted.clone()),
+            ("e''xport CARGO_HOME=/etc/evil", rooted.clone()),
+            (": '\n'; export CARGO_HOME=/etc/evil #'", rooted.clone()),
+            ("ex\\\nport CARGO_HOME=/etc/evil", rooted.clone()),
             (
                 "export CARGO_HOME=/var/mnt/scratch/example/cargo\nCARGO_\\\nHOME=/etc/evil",
-                rooted(),
+                rooted.clone(),
             ),
-            ("for CARGO_HOME in /etc/evil; do :; done", rooted()),
-            ("read -r CARGO_HOME <<< /etc/evil", rooted()),
-            ("printf -v CARGO_HOME /etc/evil", rooted()),
-            ("CARGO_HOME[1,-1]=/etc/evil", rooted()),
-            (": ${CARGO_HOME::=/etc/evil}", rooted()),
-            ("set -a\n: ${CARGO_HOME:=/etc/evil}", rooted()),
+            ("for CARGO_HOME in /etc/evil; do :; done", rooted.clone()),
+            ("read -r CARGO_HOME <<< /etc/evil", rooted.clone()),
+            ("printf -v CARGO_HOME /etc/evil", rooted.clone()),
+            ("CARGO_HOME[1,-1]=/etc/evil", rooted.clone()),
+            (": ${CARGO_HOME::=/etc/evil}", rooted.clone()),
+            ("set -a\n: ${CARGO_HOME:=/etc/evil}", rooted.clone()),
             (
                 "R=/var/mnt/scratch/example\nunset R\nexport CARGO_HOME=$R/etc/evil",
-                rooted(),
+                rooted.clone(),
             ),
             (
                 "CARGO_HOME=/var/mnt/scratch/example/$@/$@/$@/$@/../../../../etc/evil",
-                rooted(),
+                rooted.clone(),
             ),
             ("HOME=/etc/evil\nCARGO_HOME=~/cargo", home_rooted.clone()),
-            ("eval \"export CARGO_HOME=/etc/evil\"", rooted()),
+            ("eval \"export CARGO_HOME=/etc/evil\"", rooted.clone()),
             (
                 "source /dev/stdin <<< 'export CARGO_HOME=/etc/evil'",
-                rooted(),
+                rooted.clone(),
             ),
-            ("UV_PROJECT==ls", rooted()),
+            ("UV_PROJECT==ls", rooted.clone()),
             (
                 "KUBECONFIG=/var/mnt/scratch/example/k:/etc/evil/config",
-                rooted(),
+                rooted.clone(),
             ),
-            ("GOPATH=/var/mnt/scratch/example/go:/etc/evil", rooted()),
-            ("npm_config_cache=/etc/evil", rooted()),
-            ("ZDOTDIR=/etc/evil", rooted()),
+            (
+                "GOPATH=/var/mnt/scratch/example/go:/etc/evil",
+                rooted.clone(),
+            ),
+            ("npm_config_cache=/etc/evil", rooted.clone()),
+            ("ZDOTDIR=/etc/evil", rooted.clone()),
             // Round 4: names no list held, a state directory the fragment
             // moved, a history file, and a search list with a relative entry.
-            ("export RIPGREP_CONFIG_PATH=/etc/evil", rooted()),
-            ("export GIT_CONFIG_SYSTEM=/etc/evil", rooted()),
-            ("export CARGO_TARGET_DIR=/etc/evil", rooted()),
-            ("export XDG_CONFIG_DIRS=/etc/evil", rooted()),
-            ("SOMETHING=build/cache", rooted()),
+            ("export RIPGREP_CONFIG_PATH=/etc/evil", rooted.clone()),
+            ("export GIT_CONFIG_SYSTEM=/etc/evil", rooted.clone()),
+            ("export CARGO_TARGET_DIR=/etc/evil", rooted.clone()),
+            ("export XDG_CONFIG_DIRS=/etc/evil", rooted.clone()),
+            ("SOMETHING=build/cache", rooted.clone()),
             (
                 "export XDG_STATE_HOME=/var/mnt/scratch/example/state\n\
                  export CARGO_HOME=/var/mnt/scratch/example/state/bx",
-                rooted(),
+                rooted.clone(),
             ),
-            ("export HISTFILE=/etc/evil", rooted()),
-            ("export PATH=.:/usr/bin", rooted()),
-            ("export EDITOR=./nvim", rooted()),
+            ("export HISTFILE=/etc/evil", rooted.clone()),
+            ("export PATH=.:/usr/bin", rooted.clone()),
+            ("export EDITOR=./nvim", rooted.clone()),
             // Round 5: a bare word a tool reads as a path, a program given
             // arguments, a state directory a later line moves, a URL-shaped
             // relative path, bx's default state directory with no home, and a
             // config repo landing on the state directory.
             (
                 "export EDITOR=\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
-                rooted(),
+                rooted.clone(),
             ),
             (
                 "export EDITOR=\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
@@ -6911,16 +7279,19 @@ mod tests {
             ),
             (
                 "export PAGER=\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
-                rooted(),
+                rooted.clone(),
             ),
             (
                 "export CARGO_HOME=/var/mnt/scratch/example/state/bx\n\
                  export XDG_STATE_HOME=/var/mnt/scratch/example/state",
-                rooted(),
+                rooted.clone(),
             ),
-            ("export EDITOR=x://ed", rooted()),
-            ("export RIPGREP_CONFIG_PATH=cfg://rc", rooted()),
-            ("export GIT_CONFIG_SYSTEM=https://x:/etc/evil", rooted()),
+            ("export EDITOR=x://ed", rooted.clone()),
+            ("export RIPGREP_CONFIG_PATH=cfg://rc", rooted.clone()),
+            (
+                "export GIT_CONFIG_SYSTEM=https://x:/etc/evil",
+                rooted.clone(),
+            ),
             (
                 "export PATH=/var/home/example/.local/state/bx/bin:/usr/bin",
                 RootSet::strict(),
@@ -6942,7 +7313,7 @@ mod tests {
             // whole value, which cargo reads, is not.
             (
                 "export CARGO_HOME=/var/mnt/scratch/example/x:/../../../var/mnt/scratch/example/y",
-                rooted(),
+                rooted.clone(),
             ),
         ];
         let bare_words: Vec<String> = R5_READ_AS_LOCATIONS
@@ -6955,18 +7326,22 @@ mod tests {
             .chain(
                 bare_words
                     .iter()
-                    .map(|content| (content.as_str(), rooted())),
+                    .map(|content| (content.as_str(), rooted.clone())),
             )
             .collect();
         for (content, roots) in &falsifiers {
-            let escaped = assert_the_shells_agree(&shells, content, roots);
-            assert_ne!(scan_with(content, roots), vec![], "{content:?}");
-            if shells.len() == SHELLS.len() {
-                assert!(
-                    escaped.contains(&true),
-                    "{content:?} relocated nothing in any shell"
-                );
-            }
+            let escaped = shells.agree(content, roots);
+            assert_ne!(
+                scan_with(&shells.rewrite(content), roots),
+                vec![],
+                "{content:?}"
+            );
+            // Only a machine `WITHOUT_SHELLS` excuses runs on fewer than all
+            // of them, and some of these relocate in one shell alone.
+            assert!(
+                escaped.contains(&true) || shells.found.len() < SHELLS.len(),
+                "{content:?} relocated nothing in any shell"
+            );
         }
     }
 
@@ -7037,21 +7412,28 @@ mod tests {
 
     #[test]
     fn no_single_special_character_makes_the_guard_approve_what_a_shell_reads_otherwise() {
-        let shells = installed_shells();
+        let shells = Shells::found();
+        let rooted = shells.rooted();
         for base in [
             "export CARGO_HOME=/var/mnt/scratch/example/cargo",
             "SCRATCH_HOME=/var/mnt/scratch/example\nexport CARGO_HOME=\"$SCRATCH_HOME/cargo\"",
             "SCRATCH_HOME=/var/mnt/scratch/example\nGOPATH=${SCRATCH_HOME}/go:$SCRATCH_HOME/b",
         ] {
-            assert_eq!(scan_with(base, &rooted()), vec![], "{base:?}");
+            assert_eq!(
+                scan_with(&shells.rewrite(base), &rooted),
+                vec![],
+                "{base:?}"
+            );
             for content in variants(base) {
-                assert_the_shells_agree(&shells, &content, &rooted());
+                shells.agree(&content, &rooted);
             }
         }
     }
 
     #[test]
     fn the_shells_define_no_name_a_fragment_may_assign_except_path() {
+        let home = tempfile::tempdir().expect("a sandbox home");
+        let mut ran = 0;
         for (program, flags, list) in [
             ("bash", &["--norc", "--noprofile"][..], "compgen -v"),
             (
@@ -7065,7 +7447,8 @@ mod tests {
             let Some(path) = installed(program) else {
                 continue;
             };
-            let listed = run_script(&path, flags, list);
+            ran += 1;
+            let listed = run_script(&path, flags, home.path(), list);
             let unreserved: Vec<String> = String::from_utf8_lossy(&listed)
                 .lines()
                 .filter(|name| is_variable_name(name) && !name.starts_with("__bx_"))
@@ -7074,5 +7457,9 @@ mod tests {
                 .collect();
             assert_eq!(unreserved, Vec::<String>::new(), "{program}");
         }
+        assert!(
+            ran > 0 || shells_are_excused(),
+            "no shell ran, so this check asserted nothing"
+        );
     }
 }

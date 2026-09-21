@@ -383,11 +383,18 @@ pub struct Begin {
     pub home: PathBuf,
     /// What the session may touch.
     ///
-    /// **Advisory and reporting-only.** Recovery never consults it: the
-    /// [`Intent`] records alone decide what is undone. A caller may pass the
-    /// announced pending set or the whole resolved target list as a superset,
-    /// and recovery behaves identically either way — an under-set is a reporting
-    /// inaccuracy, not a safety defect.
+    /// **Reporting-only, but load-bearing.** Recovery never consults it to
+    /// decide what is undone — the [`Intent`] records alone do that — so a
+    /// caller may pass the announced pending set or the whole resolved target
+    /// list as a superset and recovery behaves identically either way. An
+    /// under-set is a reporting inaccuracy, not a safety defect.
+    ///
+    /// What it is *not* is free-form. [`refusal`] puts every entry through
+    /// [`Portable::check_against`] with the header's home, and one entry that
+    /// fails makes the whole journal unreadable — so a session that wrote an
+    /// unportable scope entry could never be rolled back. [`Session::open`]
+    /// therefore refuses the same entries the loader refuses, before the
+    /// journal exists: see `r3 round 3` decision 1.
     pub scope: Vec<Portable>,
 }
 
@@ -1301,7 +1308,9 @@ impl Session {
     /// at the journal's path is not a regular file: it is never opened.
     /// [`Error::CannotSetAside`] when the
     /// journal that stands cannot be believed and cannot be moved aside: it is
-    /// left in place, never replaced. [`Error::State`] when the directory
+    /// left in place, never replaced. [`Error::State`] with
+    /// [`crate::state::Error::ForeignRecord`] when a scope entry is one the
+    /// loader would refuse. [`Error::State`] when the directory
     /// cannot be made or locked, and [`Error::Io`] when the journal cannot be
     /// written.
     pub fn open(
@@ -1313,6 +1322,19 @@ impl Session {
         state.ensure()?;
         // The lock first, so the check below cannot race a second bx.
         let lock = ExclusiveLock::acquire(state)?;
+        // Before the journal exists, because the loader refuses the *whole*
+        // journal over one unportable scope entry: a session that wrote one
+        // could never be rolled back. The same rule `admit` applies to a
+        // request's target, at the one other place a path enters the journal.
+        for entry in &scope {
+            entry
+                .check_against(home)
+                .map_err(|source| crate::state::Error::ForeignRecord {
+                    home: home.to_path_buf(),
+                    stored: entry.as_str().to_string(),
+                    source: Box::new(source),
+                })?;
+        }
         let path = state.journal();
         if load_exclusive(&path, &lock)?.is_interrupted() {
             return Err(Error::InProgress { path });
@@ -4036,6 +4058,90 @@ pub(crate) mod tests {
             );
         }
         session.finish().expect("finish");
+    }
+
+    #[test]
+    fn a_scope_entry_the_loader_would_refuse_is_refused_before_the_journal_exists() {
+        // r3 round 3, D1. `refusal` puts every `Begin.scope` entry through
+        // `check_against(home)` and refuses the *whole* journal when one
+        // fails, so a session that wrote one could never be rolled back: the
+        // next load reads `Unreadable`, `recover::resolve` returns `Nothing`,
+        // and half-applied writes survive with nothing undone. `restore`
+        // forwards its caller's target list verbatim as the scope, and
+        // `Portable::try_from` accepts `/<home>/.gitconfig`, so the caller
+        // needed no mistake beyond spelling a target absolutely.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let absolute = Portable::try_from(
+            home.child(".gitconfig")
+                .to_str()
+                .expect("utf-8")
+                .to_string(),
+        )
+        .expect("a well-formed absolute path");
+        assert!(
+            absolute.check_against(home.path()).is_err(),
+            "the fixture is a scope entry the loader refuses",
+        );
+
+        let err = Session::open(
+            &state,
+            SessionKind::Apply,
+            home.path(),
+            vec![target(home.path(), ".vimrc").0, absolute.clone()],
+        )
+        .expect_err("a scope entry the loader refuses");
+        assert!(
+            matches!(err, Error::State(crate::state::Error::ForeignRecord { .. })),
+            "got {err}"
+        );
+        assert!(
+            !state.journal().exists(),
+            "and no journal was written for it to refuse",
+        );
+
+        // The same scope, written past the refusal, is what the refusal buys:
+        // the loader disbelieves the whole file, so nothing in it is undone.
+        let mut session = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
+            .expect("a well-formed scope opens");
+        session
+            .apply(write_to(home.path(), ".vimrc", "bx\n", Mode::DEFAULT_FILE))
+            .expect("apply");
+        let path = state.journal();
+        let believed = std::fs::read(&path).expect("read");
+        drop(session);
+        assert!(
+            matches!(
+                load(&path).expect("load"),
+                Loaded::Unterminated(_) | Loaded::Torn { .. }
+            ),
+            "the well-formed session's journal is believed",
+        );
+        raw_journal(
+            &path,
+            &[
+                Record::Begin(Begin {
+                    kind: SessionKind::Apply,
+                    home: home.path().to_path_buf(),
+                    scope: vec![absolute],
+                }),
+                Record::Intent(Intent {
+                    target: target(home.path(), ".vimrc").0,
+                    dest: home.child(".vimrc"),
+                    temp: None,
+                    before: Prior::Absent,
+                    after: Written::Absent,
+                    created_dirs: Vec::new(),
+                    mechanism: None,
+                    ledger_written: None,
+                }),
+            ],
+        );
+        assert!(
+            matches!(load(&path).expect("load"), Loaded::Unreadable { .. }),
+            "one unportable scope entry makes the whole journal unreadable",
+        );
+        assert_ne!(believed, std::fs::read(&path).expect("read"));
     }
 
     #[test]

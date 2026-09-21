@@ -1313,9 +1313,11 @@ impl ResolvedValues {
     /// whole load, so the answer that made the clash can be the only one that
     /// loads. Removing it can always be followed: a toggle creates no entry, so
     /// removing one leaves nothing unknown, and every statement that stays
-    /// already names the file. Nor is a value carried in by a `default` named,
-    /// as [`ResolvedValues::answers_hint`] names one: answering it directly is
-    /// changing an answer too.
+    /// already names the file. Nor, for that act, is a value carried in by a
+    /// `default` named, as [`ResolvedValues::answers_hint`] names one:
+    /// answering it directly is changing an answer too. The clause that closes
+    /// the hint does name one — see `still_one_file`, which says why the same
+    /// reason does not reach it.
     ///
     /// The removals alone clear the clash only while one statement stays. Two
     /// or more still name one file once the flagged toggles are gone, and none
@@ -1382,6 +1384,17 @@ impl ResolvedValues {
     /// that is left. Any two statements have an answer between them — a pair
     /// with none in either spelling is refused as the repo's own defect — so
     /// the phrase is never empty.
+    ///
+    /// This clause takes the whole [`ResolvedValues::answer_route`], the offer
+    /// to answer a value a committed `default` carries an answer in included,
+    /// where the removal advice above it withholds that offer. The two are not
+    /// the same act on the same statements: the removal is withheld an answer
+    /// because a flagged toggle may name nothing under another one, and no
+    /// statement here is flagged. Withholding it anyway would leave a clash
+    /// that only answering the derived value parts — two spellings that differ
+    /// only in reaching one value through another's `default` — with a closing
+    /// act that does not clear it, which is the defect this clause exists to
+    /// close, one level down.
     fn still_one_file(&self, statements: &[(String, Origin, bool)], one_gone: bool) -> String {
         let kept: Vec<&(String, Origin, bool)> = statements
             .iter()
@@ -1390,16 +1403,24 @@ impl ResolvedValues {
         if kept.len() < 2 {
             return String::new();
         }
+        let texts: Vec<&str> = kept.iter().map(|statement| statement.0.as_str()).collect();
         let names = self.in_declaration_order(
-            kept.iter()
-                .flat_map(|statement| self.account_inputs(&statement.0))
+            texts
+                .iter()
+                .flat_map(|text| self.account_inputs(text))
                 .collect(),
         );
+        let (cause, direct) = self.answer_route(&texts, &names);
+        let directly = if direct.is_empty() {
+            String::new()
+        } else {
+            format!(", or answer {direct} directly")
+        };
         format!(
-            "; {} still name one file once {} gone, so change {} too",
+            "; {} still name one file once {} gone, because of {cause}; change that answer \
+             too{directly}",
             statements_named(kept.iter().copied()),
-            if one_gone { "it is" } else { "they are" },
-            self.answers_named(&names)
+            if one_gone { "it is" } else { "they are" }
         )
     }
 

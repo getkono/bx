@@ -2514,8 +2514,8 @@ mod tests {
                  answer to `profile` at local.toml:2 and the answer to `q` at local.toml:3; \
                  remove the toggle `~/.config/{{{{q}}}}/s` at local.toml:10{CANNOT_SHOW_ONE}; \
                  `~/.config/default/s` at local.toml:4 and `~/.config/{{{{profile}}}}/s` at \
-                 local.toml:7 still name one file once it is gone, so change the answer to \
-                 `profile` at local.toml:2 too"
+                 local.toml:7 still name one file once it is gone, because of the answer to \
+                 `profile` at local.toml:2; change that answer too"
             )
         );
 
@@ -2564,7 +2564,8 @@ mod tests {
             hint.ends_with(&format!(
                 "{CANNOT_SHOW_SEVERAL}; `~/.config/default/s` at local.toml:5 and \
                  `~/.config/{{{{profile}}}}/s` at local.toml:8 still name one file once they \
-                 are gone, so change the answer to `profile` at local.toml:2 too"
+                 are gone, because of the answer to `profile` at local.toml:2; change that \
+                 answer too"
             )),
             "{hint}"
         );
@@ -2586,6 +2587,64 @@ mod tests {
                     crate::config::target::Body::Inline("B".to_string())
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn what_a_removal_leaves_is_offered_the_answer_a_default_carries_it_into() {
+        // The two entries differ only in that one reaches `p` through `q`'s
+        // committed `default`, so no answer to `p` parts them and answering `q`
+        // directly does. The removal advice withholds that offer (decision 6);
+        // the clause that closes the hint makes it, because the statements it
+        // is about are not the flagged toggle and the reason for withholding it
+        // does not reach them. Withheld, the clause would be an act that does
+        // not clear the clash.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                     [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{{{p}}}}\"\n\
+                     [[value]]\nname = \"r\"\nkind = \"string\"\n{}",
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let entries = format!(
+            "{}{}",
+            target_toml("~/.config/{{p}}/s", "A"),
+            target_toml("~/.config/{{q}}/s", "B")
+        );
+        let answered =
+            |values: &str, toggles: &str| [base(), local(&format!("{values}{entries}{toggles}"))];
+        let both = "[values]\np = \"a\"\nr = \"a\"\n";
+
+        let config = merge(&answered(both, &toggle_toml("~/.config/{{r}}/s"))).unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(
+            hint.ends_with(
+                "; `~/.config/{{p}}/s` at local.toml:4 and `~/.config/{{q}}/s` at \
+                 local.toml:7 still name one file once it is gone, because of the answer to \
+                 `p` at local.toml:2, carried in by the default of `q` at bx.toml:4; change \
+                 that answer too, or answer `q` directly"
+            ),
+            "{hint}"
+        );
+
+        // The act the clause names first does not part them: `q` follows `p`.
+        assert!(
+            !merge(&answered("[values]\np = \"b\"\nr = \"a\"\n", ""))
+                .unwrap()
+                .conflicts
+                .is_empty(),
+            "changing the answer to `p` moves both spellings together"
+        );
+        // The offer it would have withheld does.
+        assert_eq!(
+            loads(&answered("[values]\np = \"a\"\nq = \"b\"\nr = \"a\"\n", "")).len(),
+            3,
+            "`~/.zshrc` and the two entries, now two files"
         );
     }
 

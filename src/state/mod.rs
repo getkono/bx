@@ -300,6 +300,26 @@ pub enum Error {
         /// The state file.
         path: PathBuf,
     },
+    /// A directory the state directory needs is a symbolic link that leads
+    /// nowhere: to nothing, round a loop of links (`ELOOP`), or through a file
+    /// (`ENOTDIR`).
+    ///
+    /// The state directory itself, `restore/` or `shell/`. `mkdir` returns
+    /// `EEXIST` for such a link, because the link occupies the name, so
+    /// without this the user was told the directory they can see cannot be
+    /// read. [`Error::DanglingLink`] is the same condition for a state *file*.
+    #[error(
+        "{} is a symbolic link to {}, which does not exist or cannot be followed (the links \
+         loop, or the path runs through a file). Restore what it points at, or remove the link",
+        .path.display(),
+        .target.display()
+    )]
+    DanglingStateDir {
+        /// The link.
+        path: PathBuf,
+        /// What it names, as the link spells it.
+        target: PathBuf,
+    },
     /// The state directory is a symbolic link to a directory that users other
     /// than its owner can read or write.
     ///

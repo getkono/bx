@@ -501,7 +501,23 @@ fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
     // `metadata` follows symlinks on purpose: a state directory the user has
     // symlinked onto other storage is theirs to arrange, and refusing it would
     // be bx dictating a layout.
-    let meta = std::fs::metadata(path).map_err(read_failed)?;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // A link that leads nowhere is not a directory that cannot be read.
+        // `mkdir` returned `EEXIST` because the link occupies the name, and
+        // "reading ~/.local/state/bx: No such file or directory" would then
+        // be untrue on its face — the user can see the thing it names — and
+        // would name no remedy. `store::leads_nowhere` and
+        // `Damage::DanglingLink` already draw this distinction for state
+        // *files*; this is the same distinction for the directories.
+        Err(e) if linked && leads_nowhere(&e) => {
+            return Err(Error::DanglingStateDir {
+                path: path.to_path_buf(),
+                target: std::fs::read_link(path).unwrap_or_else(|_| PathBuf::from("?")),
+            });
+        }
+        Err(source) => return Err(read_failed(source)),
+    };
     if !meta.is_dir() {
         return Err(Error::NotADirectory {
             path: path.to_path_buf(),
@@ -1281,6 +1297,43 @@ mod tests {
         dir.ensure().expect("ensure");
         assert!(real.join("restore").is_dir());
         assert_eq!(mode_of(&real.join("restore")), Mode::PRIVATE_DIR);
+    }
+
+    #[test]
+    fn a_state_directory_that_is_a_link_to_nowhere_names_the_link_and_its_target() {
+        // r4 round 1 (D6): `tighten`'s `metadata` follows the link, so a
+        // dangling one was reported as `Error::Read{ENOENT}` — "reading
+        // ~/.local/state/bx: No such file or directory" — which is untrue of a
+        // path the user can see, and names no remedy. Reachable whenever the
+        // state directory is a link to storage that is not mounted.
+        let home = guarded_home();
+        let gone = home.child("unmounted");
+        std::fs::create_dir_all(home.child(".local/state")).expect("ancestors");
+        std::os::unix::fs::symlink(&gone, home.child(".local/state/bx")).expect("symlink");
+        let dir = StateDir::resolve(home.path());
+
+        let err = dir.ensure().expect_err("must refuse");
+        assert!(
+            matches!(&err, Error::DanglingStateDir { path, target }
+                if path == dir.root() && *target == gone),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("remove the link"), "{err}");
+
+        // A loop, and a link whose path runs through a file, are the same
+        // condition and must read the same way — and `restore/` inside a real
+        // state directory is judged by the same code.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        std::fs::create_dir_all(dir.root()).expect("root");
+        home.write("a-file", "not a directory");
+        std::os::unix::fs::symlink(home.child("a-file/under-it"), dir.restore())
+            .expect("through a file");
+        let err = dir.ensure().expect_err("must refuse");
+        assert!(
+            matches!(&err, Error::DanglingStateDir { path, .. } if *path == dir.restore()),
+            "got {err}",
+        );
     }
 
     #[test]

@@ -880,6 +880,38 @@ pub struct Outcome {
 ///   [`stage`] does not refuse such a mode: a reversal restores a recorded
 ///   prior mode through it as recorded.
 ///
+/// # The parent note is about the immediate parent, and only about it
+///
+/// A directory anywhere above the immediate parent can be group- or
+/// world-writable and no note says so — `~/.config` at `0777` holding
+/// `~/.config/foo` at `0700` holding a `0600` file produces nothing. That is
+/// the scope this function has, deliberately, and the reason is what the note
+/// is *for* rather than what the danger is.
+///
+/// The immediate parent is the one directory this write interacts with: bx puts
+/// its temporary file there, renames within it, and may create it — at a mode
+/// this target's own declaration fixes ([`stage`]). Its mode is therefore
+/// comparable with the mode this target declares, which is exactly what the
+/// note compares, and the remedy is this target's author's: declare the
+/// directory, or narrow it.
+///
+/// A writable ancestor is a different fact with a different remedy. It is one
+/// fact about the home, not one per target: repeating it on every plan line
+/// beneath it would say the same thing as many times as there are targets, and
+/// the one action that fixes it is not this target's. It is also not the same
+/// danger — an ancestor's *write* bit lets somebody rename a subtree, which no
+/// mode on this file or its parent prevents — so reporting it through a
+/// predicate built to compare a directory against a file inside it
+/// ([`Mode::is_wider_than`], which excludes execute for that reason) would
+/// answer the wrong question. A whole-home audit is where it belongs.
+///
+/// What this scope does **not** leave open: a wide ancestor bx made itself.
+/// [`stage`] creates a missing ancestor at [`Mode::DEFAULT_DIR`] or at the mode
+/// a directory target declares, never wider, and refuses to write beneath a
+/// declared directory that is still wider than declared
+/// ([`Error::DirectoryTargetPending`]). Every unreported ancestor was already
+/// there and is the user's.
+///
 /// `home` only names things: a directory the parent note mentions is written
 /// `~/…` when it is under `home`, through [`crate::paths::to_portable`],
 /// because `plan` prints the note and plan output names no absolute home. The

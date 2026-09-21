@@ -258,14 +258,12 @@ fn resolve_target(
     // blocked here. Behind the repo defects above, which no answer could
     // clear.
     //
-    // A switched-off declaration *on the walk* is no exception to that. The
-    // walk does not follow the answer under it, because while the switch is
-    // off that answer is not this account's value, so there is nothing here to
-    // outrank anything with and whatever the probe found reports instead.
-    // `a_disabled_value_s_answer_is_not_walked` is that case; an unrelated
-    // switched-off value is not, and
-    // `a_path_answer_block_outranks_an_unrelated_disabled_or_invalid_value`
-    // is that one.
+    // What this ordering does for a switched-off declaration is left to the
+    // tests, which hold three different answers to it — the paragraph that
+    // tried to summarise them was wrong three times.
+    // `a_path_answer_block_outranks_an_unrelated_disabled_or_invalid_value`,
+    // `a_switched_off_declaration_is_walked_through_by_its_default` and
+    // `a_disabled_value_s_answer_is_not_walked`.
     if let Body::File(file) = &target.body
         && let Some((names, hint)) =
             refuse_path_answer_in_file(target, &file.to_string_lossy(), values, assignments)
@@ -583,7 +581,9 @@ enum Step<'a> {
 /// alike whether `t` is answered or left to a default built from a `path`
 /// value. A switched-off declaration's answer is not this account's value and
 /// is not followed; its kind and default are still read, as the committed walk
-/// reads them.
+/// reads them — so such a declaration is not a wall, and the walk goes through
+/// it by its default. `a_switched_off_declaration_is_walked_through_by_its_default`
+/// pins both halves of that: the default followed, the answer over it not.
 ///
 /// So `enabled` gates the **answer edge alone**, and the walk ends at a `path`
 /// declaration whether or not it is switched on. The two are not in tension:
@@ -607,18 +607,39 @@ enum Step<'a> {
 /// `a_switched_off_path_declaration_still_ends_the_walk` and
 /// `a_disabled_value_s_answer_is_not_walked` pin both halves.
 ///
-/// The rule is stated with its sites, so a reader can check it rather than
-/// take it. Every consultation of `enabled` in the configuration asks the
-/// account-value question: [`ResolvedValues::decls`] and
-/// [`ResolvedValues::unset`] list what this account may answer, `roots`, the
-/// substitution and the per-kind checks in `values` ask the same of one
-/// declaration, and `merge`'s toggle checks ask it of one layer's entry.
+/// The rule is stated with its sites so a reader can check it rather than
+/// take it. Six places read a `ValueDecl`'s `enabled`, and every one asks the
+/// account-value question:
+///
+/// - [`ResolvedValues::resolve`], which gives a switched-off declaration no
+///   answer of this account's — the site the other five and everything below
+///   follow from;
+/// - `check_answer`, which refuses an answer to one;
+/// - [`ResolvedValues::decls`], [`ResolvedValues::unset`] and `unset_required`,
+///   each listing what this account may answer;
+/// - the answer edge here.
+///
+/// Nothing else reads it. `roots`, [`ResolvedValues::substitute`] and
+/// [`ResolvedValues::get`] all behave correctly for a switched-off declaration
+/// **without** consulting `enabled`, because they read the answer `resolve`
+/// already derived; they are consequences of the first site, not further
+/// sites. `Target::enabled` and `merge`'s `into_enabled` are a different field
+/// on a different type — a target's own switch, which drops it from the merged
+/// configuration, where a switched-off *value* is deliberately kept so that a
+/// reference to it stays distinguishable from a reference to a name no layer
+/// declares.
+///
 /// Everything that asks what a declaration *is* reads it through
-/// [`ResolvedValues::decl`], which is unfiltered, and ignores `enabled`: this
-/// walk's terminal, [`path_value_behind`], and `merge`'s kind lookups.
-/// [`in_declaration_order`] was the one exception — it indexed against the
-/// filtered `decls`, so a switch moved a declaration's position — and it is
-/// now indexed against [`ResolvedValues::index_of`], which counts them all.
+/// [`ResolvedValues::decl`] or [`ResolvedValues::index_of`], both unfiltered,
+/// and ignores `enabled`: this walk's terminal, [`path_value_behind`],
+/// `merge`'s `written_form` kind lookups, and both `in_declaration_order`s.
+/// The resolve-side one was the single exception — it indexed against the
+/// filtered `decls`, so a switch moved a declaration's position — and it now
+/// indexes against [`ResolvedValues::index_of`] like its twin.
+///
+/// This list was derived by grepping `enabled` across `src/config` and
+/// classifying every hit, not by reading from memory; the version before it
+/// named two sites that do not read `enabled` and missed one that does.
 ///
 /// `seen` stops the walk at a name it has already walked, and it is
 /// load-bearing here for the reason [`path_value_behind`] gives: an overridden
@@ -861,12 +882,25 @@ fn check_requirement(text: &str) -> Result<(), String> {
 ///
 /// Indexed against [`ResolvedValues::index_of`], which counts every
 /// declaration, rather than [`ResolvedValues::decls`], which lists only the
-/// enabled ones. The difference shows in exactly one caller:
-/// [`BlockReason::DisabledValue`], whose names are switched off by definition.
-/// Against the filtered list every one of them would come back `usize::MAX`,
-/// leaving the sort to report them in whichever order the fields happened to be
-/// probed — the one thing this function exists to prevent, in the one block
-/// that cannot avoid it.
+/// enabled ones. There are six callers, and the list is exhaustive because a
+/// partial one would not be a safety case:
+///
+/// - the `disabled` names — switched off by definition, so against the
+///   filtered list every one came back `usize::MAX` and the sort left them in
+///   whichever order the fields were probed. This is the caller the index was
+///   wrong for, and the only one.
+/// - the `invalid` and `unset` names, which come from declarations this
+///   account may answer, so they are enabled;
+/// - a clash's causes and a [`Broken::Field`]'s causes, which are answers this
+///   account applied, and a switched-off declaration has none applied;
+/// - [`refuse_path_answer_in_file`]'s own names, which are the [`Step::Answer`]
+///   declarations of a chain — and `Step::Answer` is built only behind the
+///   `enabled` filter in [`path_value_through_answer`], so they are enabled
+///   too.
+///
+/// [`ResolvedValues::in_declaration_order`] is this function's twin for the
+/// names inside an [`Unresolved`](super::values::Unresolved); it indexed
+/// against every declaration already, and the two now agree.
 fn in_declaration_order(values: &ResolvedValues, mut names: Vec<String>) -> Vec<String> {
     let index = |name: &String| values.index_of(name).unwrap_or(usize::MAX);
     names.sort_by_key(index);

@@ -18,6 +18,9 @@
 //! 5. the prior state recorded — [`Filled::new_entry`] assembles it and
 //!    [`crate::state::Ledger::record`] makes it durable — **before** the
 //!    rename, so a crash after the rename still has a recoverable prior state.
+//!    Steps 6 and 7 can still refuse or fail, so this record can outlive a
+//!    write that never lands; [`Unpublished`] names the write so its entry can
+//!    be withdrawn, and [`Filled::new_entry`] says when it must be.
 //! 6. the destination `lstat`ed again and compared with what step 1 saw, and
 //!    the write refused if it changed.
 //! 7. `rename`.
@@ -217,6 +220,12 @@ pub enum Error {
     /// temporary file is removed — unless its directory no longer permits
     /// removal, when the `.bx-` file is left for recovery — and the path keeps
     /// what is there now.
+    ///
+    /// From [`Filled::publish`] it arrives inside an [`Unpublished`], because
+    /// "nothing was replaced" is not the whole obligation: a caller that
+    /// recorded a ledger entry before publishing, as [`Filled::new_entry`]
+    /// requires, is holding an entry for a write that did not happen, and must
+    /// withdraw it before it saves.
     #[error(
         "{} changed after bx looked at it ({detail}); nothing was replaced. Run plan again",
         .path.display()
@@ -1179,7 +1188,9 @@ impl Staged {
     ///
     /// Whatever [`Staged::fill`] or [`Filled::publish`] returns.
     pub fn commit(self, bytes: &[u8]) -> Result<(), Error> {
-        self.fill(bytes)?.publish()
+        // No ledger entry can exist for this write: `commit` never hands the
+        // caller a `Filled`, so `new_entry` was never reachable for it.
+        self.fill(bytes)?.publish().map_err(Unpublished::into_error)
     }
 
     /// Discard the write. The temporary file is removed and the destination is
@@ -1252,6 +1263,26 @@ impl Filled {
     /// `restore/` before it returns. A crash after the rename is then
     /// recoverable, because the bytes that were displaced are already durable.
     ///
+    /// # The entry is owed a withdrawal if the publish is refused
+    ///
+    /// That ordering is not a preference: the displaced bytes must be durable
+    /// before anything can displace them, so the record has to precede a rename
+    /// that may still fail. An entry recorded here therefore describes a write
+    /// that has not happened yet, and [`Filled::publish`] can refuse — a
+    /// destination changed after `stage` looked, a directory that cannot be
+    /// opened, a `rename` out of space.
+    ///
+    /// So a caller that records an entry **must withdraw it when the publish is
+    /// refused**, with [`crate::state::Ledger::forget`], before it saves the
+    /// ledger. [`Unpublished`] exists so that it can: `publish` consumes the
+    /// `Filled`, and the refusal hands back the destination this entry is keyed
+    /// on. A durable entry for a write that never landed makes `bx rm` restore
+    /// the recorded prior over content bx never replaced, which is Invariant 4
+    /// inverted.
+    ///
+    /// Pinned by
+    /// `a_ledger_entry_for_a_refused_publish_is_withdrawn_through_what_the_refusal_names`.
+    ///
     /// # Errors
     ///
     /// [`Error::NotPortable`] if the destination or a created directory is not
@@ -1308,14 +1339,20 @@ impl Filled {
     ///
     /// # Errors
     ///
-    /// [`Error::Changed`] when the destination is no longer what [`stage`]
-    /// observed; nothing is replaced. [`Error::Write`] wrapping the failing
-    /// `open` of the directory, `rename`, or `fsync`. The temporary file is
-    /// removed either way, unless the directory no longer permits removal,
-    /// which also fails the rename; the `.bx-` file is then left for recovery.
-    /// Only a failing `fsync` of the directory is returned after the
+    /// [`Unpublished`], which names the destination as well as the cause, so a
+    /// caller that recorded a ledger entry for this write before calling — as
+    /// [`Filled::new_entry`] requires — can withdraw it. `publish` consumes the
+    /// `Filled`, so the refusal is the only thing left that knows which write
+    /// it was.
+    ///
+    /// The cause is [`Error::Changed`] when the destination is no longer what
+    /// [`stage`] observed; nothing is replaced. [`Error::Write`] wrapping the
+    /// failing `open` of the directory, `rename`, or `fsync`. The temporary
+    /// file is removed either way, unless the directory no longer permits
+    /// removal, which also fails the rename; the `.bx-` file is then left for
+    /// recovery. Only a failing `fsync` of the directory is returned after the
     /// destination was replaced.
-    pub fn publish(self) -> Result<(), Error> {
+    pub fn publish(self) -> Result<(), Unpublished> {
         let Self {
             pending:
                 Pending {
@@ -1328,20 +1365,30 @@ impl Filled {
             ..
         } = self;
 
-        let dir = parent_of(&dest)?;
-        let dir_fail = |source| Error::Write {
-            path: dir.to_path_buf(),
-            source,
+        // Every refusal below names `dest`, because that is the key of the
+        // ledger entry a caller was obliged to record before calling. There is
+        // no early return that forgets to: the closure is the only way out.
+        let refused = |error: Error| Unpublished {
+            error,
+            dest: dest.clone(),
         };
-        let handle = durable::Dir::open(dir).map_err(dir_fail)?;
-        // The last thing before the rename, so the window it leaves open is as
-        // narrow as it can be. Refusing drops `temp`, which removes it.
-        verify_unchanged(&prior)?;
-        durable::rename(temp, &dest).map_err(|e| Error::Write {
-            path: dest.clone(),
-            source: e.error,
-        })?;
-        handle.sync().map_err(dir_fail)?;
+        let publish = || -> Result<(), Error> {
+            let dir = parent_of(&dest)?;
+            let dir_fail = |source| Error::Write {
+                path: dir.to_path_buf(),
+                source,
+            };
+            let handle = durable::Dir::open(dir).map_err(dir_fail)?;
+            // The last thing before the rename, so the window it leaves open is
+            // as narrow as it can be. Refusing drops `temp`, which removes it.
+            verify_unchanged(&prior)?;
+            durable::rename(temp, &dest).map_err(|e| Error::Write {
+                path: dest.clone(),
+                source: e.error,
+            })?;
+            handle.sync().map_err(dir_fail)
+        };
+        publish().map_err(refused)?;
 
         tracing::debug!(dest = %dest.display(), %mode, "wrote a file atomically");
         Ok(())
@@ -1351,6 +1398,54 @@ impl Filled {
     /// untouched. Identical to dropping it; named so a caller can say so.
     pub fn abandon(self) {
         drop(self);
+    }
+}
+
+/// A write [`Filled::publish`] refused: why, and which write it was.
+///
+/// The second half is the point. [`Filled::new_entry`] must be called before
+/// `publish`, because the bytes a rename displaces have to be durable before
+/// anything displaces them — so by the time a publish is refused, a caller with
+/// a ledger has already recorded an entry for a write that did not happen. That
+/// entry has to be withdrawn with [`crate::state::Ledger::forget`] before the
+/// ledger is saved, or `bx rm` will restore the recorded prior over content bx
+/// never replaced.
+///
+/// `publish` consumes the [`Filled`], so nothing the caller still holds names
+/// the write afterwards. This does: [`Unpublished::dest`] is the path
+/// [`Filled::new_entry`] keyed the entry on.
+#[derive(Debug)]
+pub struct Unpublished {
+    /// Why the write was refused.
+    pub error: Error,
+    /// The destination it would have replaced, and the path the entry to
+    /// withdraw is keyed on.
+    pub dest: PathBuf,
+}
+
+impl Unpublished {
+    /// The cause alone, for a caller that recorded nothing to withdraw.
+    ///
+    /// Deliberately a named call rather than a `From` impl: `?` would then
+    /// convert a refused publish into a plain [`Error`] silently, and a caller
+    /// that *had* recorded an entry would lose the only thing that still names
+    /// it. Writing this out says "there is no entry", which is true of
+    /// [`Staged::commit`] and [`write_atomically`] and of nothing else here.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        self.error
+    }
+}
+
+impl std::fmt::Display for Unpublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for Unpublished {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -2550,7 +2645,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Mutex;
 
-    use crate::state::{ExclusiveLock, Ledger, Prior, StateDir};
+    use crate::state::{ExclusiveLock, Ledger, LedgerView, Prior, StateDir};
     use crate::testing::{GuardedHome, guarded_home};
 
     /// Serialises the one test that mutates the process `umask`.
@@ -4395,9 +4490,11 @@ mod tests {
             save(&dest);
             let saved = std::fs::read(&dest).expect("read the save");
 
-            let err = filled
+            let refused = filled
                 .publish()
                 .expect_err("a destination that changed after it was observed is not replaced");
+            assert_eq!(refused.dest, dest, "{how}: the refusal names the write");
+            let err = refused.into_error();
             assert!(matches!(err, Error::Changed { .. }), "{how}: {err:?}");
             assert_eq!(err.path(), dest, "{how}");
             assert_eq!(
@@ -4432,9 +4529,11 @@ mod tests {
         std::fs::remove_file(&dest).expect("rm");
         std::os::unix::fs::symlink("elsewhere", &dest).expect("symlink");
 
-        let err = filled
+        let refused = filled
             .publish()
             .expect_err("the link is not bx's to replace");
+        assert_eq!(refused.dest, dest, "the refusal names the write");
+        let err = refused.into_error();
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert!(
             std::fs::symlink_metadata(&dest)
@@ -4463,9 +4562,11 @@ mod tests {
         assert_eq!(filled.prior().stamp, None, "nothing was there to stamp");
         std::fs::write(&dest, b"another tool's\n").expect("another tool creates it");
 
-        let err = filled
+        let refused = filled
             .publish()
             .expect_err("bx announced a create, and there is now a file to replace");
+        assert_eq!(refused.dest, dest, "the refusal names the write");
+        let err = refused.into_error();
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(std::fs::read(&dest).expect("read"), b"another tool's\n");
         assert_eq!(names_in(home.path()), vec![OsString::from(".conf")]);
@@ -6025,7 +6126,9 @@ mod tests {
         let (published, events) = durable::recording(|| filled.publish());
         set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for the assertions");
 
-        let err = published.expect_err("an unwritable directory refuses the rename");
+        let refused = published.expect_err("an unwritable directory refuses the rename");
+        assert_eq!(refused.dest, dest, "the refusal names the write");
+        let err = refused.into_error();
         let Error::Write { path, source } = &err else {
             panic!("expected a write error, got {err:?}");
         };
@@ -6336,6 +6439,79 @@ mod tests {
         write_atomically(&dest, &bytes, reference.mode).expect("restore");
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host old\n");
         assert_eq!(mode_of_path(&dest), Mode::from_bits(0o640));
+    }
+
+    #[test]
+    fn a_ledger_entry_for_a_refused_publish_is_withdrawn_through_what_the_refusal_names() {
+        // The one state the seam makes reachable and no other test reached:
+        // `record` has succeeded, so the prior bytes are durable in `restore/`
+        // and the in-memory ledger claims the target — and then `publish`
+        // refuses, so the destination still holds what the user has.
+        //
+        // Saving the ledger from here would make `bx rm` write the recorded
+        // prior over content bx never replaced. What stops it is that the
+        // refusal names the write, so the entry can be withdrawn.
+        let home = guarded_home();
+        let (dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host old\n", Mode::from_bits(0o640));
+
+        let filled = stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host new\n")
+            .expect("fill");
+        let recorded = ledger
+            .record(
+                filled
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry"),
+            )
+            .expect("record")
+            .clone();
+        let Prior::Existed(reference) = &recorded.prior else {
+            panic!("the prior state must be Existed, got {:?}", recorded.prior);
+        };
+
+        // The user saves over the destination between the record and the
+        // rename, which is exactly what `publish` refuses.
+        std::fs::write(&dest, b"Host theirs\n").expect("the user saves");
+        let refused = filled.publish().expect_err("the destination changed");
+        assert_eq!(refused.dest, dest, "the refusal names the write");
+        assert!(
+            matches!(refused.error, Error::Changed { .. }),
+            "{:?}",
+            refused.error,
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read"),
+            b"Host theirs\n",
+            "bx wrote nothing",
+        );
+
+        // What the ledger is left holding: the entry, and the blob its prior
+        // names. Both are real, and both describe a write that did not happen.
+        assert_eq!(ledger.len(), 1, "the entry is still in the ledger");
+        assert_eq!(
+            ledger
+                .restore_bytes(&dir, reference)
+                .expect("the blob record fsynced"),
+            b"Host old\n",
+            "the snapshot is durable, and it is not what is on disk now",
+        );
+
+        // The withdrawal, keyed on nothing but what the refusal handed back.
+        let key = Portable::from_path(&refused.dest, home.path()).expect("portable");
+        let withdrawn = ledger.forget(&key).expect("the entry is there to withdraw");
+        assert_eq!(withdrawn.written, ContentHash::of(b"Host new\n"));
+        assert!(ledger.is_empty(), "nothing claims the target now");
+        ledger.save().expect("save");
+
+        // Read back from disk: no entry, so `bx rm` has nothing to restore
+        // over the user's file. The blob is left in `restore/`, which is
+        // content-addressed and reused rather than owned by one entry.
+        let reread = LedgerView::read(&dir, home.path()).expect("read").value;
+        assert!(reread.is_empty(), "the durable ledger claims nothing");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host theirs\n");
     }
 
     #[test]

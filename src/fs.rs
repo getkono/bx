@@ -24,7 +24,7 @@ pub mod mode;
 
 pub use atomic::{
     CreatedDirs, Desired, EnsuredDir, Error, Filled, Observed, Outcome, Parent, ParentState,
-    Staged, Stamp, TEMP_PREFIX, compare, compare_dir, ensure_dir, observe, set_mode, stage,
-    write_atomically,
+    Staged, Stamp, TEMP_PREFIX, Unpublished, compare, compare_dir, ensure_dir, observe, set_mode,
+    stage, write_atomically,
 };
 pub use mode::{Kind, Mode, ModeError};

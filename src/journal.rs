@@ -1619,6 +1619,34 @@ impl Session {
         // `written` moves only once a write has succeeded, so it is this
         // write's index.
         let index = self.written;
+        // The home, and anything above it, that this destination needs and
+        // that is not there. `fs::stage` would invent them like any other
+        // ancestor: `mkdir` at [`Mode::DEFAULT_DIR`] and then a `chmod`, which
+        // is deliberately *not* masked, so the result is `0755` whatever the
+        // account's `umask` says. That is the right rule for a directory bx
+        // owns and will remove again. These are not that. bx neither claims
+        // nor ever removes them — see the loop below — so they are the shared
+        // ancestors `crate::state::dir::ensure_dir` describes: "created with
+        // the process `umask` … not bx's to tighten". Leaving one wider than
+        // the account's own `umask` would have made it is bx deciding
+        // something that is not its to decide, and nothing later narrows it,
+        // because nothing later touches it.
+        //
+        // `create_dir_all` is the same call, with the same rule, that the
+        // state directory's own ancestors get: `mkdir(0o777)` masked by the
+        // `umask`, and no `chmod`. Made before `stage`, so the directory never
+        // exists at `0755` for an instant — a window a descriptor opened
+        // inside would outlive. See `r3 round 6` decision R3R6-1.
+        if let Some(shared) = shared_ancestor(&dest, &self.home) {
+            std::fs::create_dir_all(&shared).map_err(|source| fs::Error::Write {
+                path: shared.clone(),
+                source,
+            })?;
+            tracing::debug!(
+                dir = %shared.display(),
+                "made a directory bx shares with every other tool, at the process umask",
+            );
+        }
         let staged = fs::stage(&dest, mode, planned, &mut self.created)?;
         let temp = staged.temp_path().to_path_buf();
         self.crash.reached(index, Phase::AfterStage);
@@ -1643,6 +1671,14 @@ impl Session {
         // reach of a rollback's `prune_dirs` and a later `rm`'s
         // `prune_claims`. Unclaimed, it is left standing — the orphan
         // decision 11 already keeps. See `r3 round 5` decision R3R5-1.
+        //
+        // Since `r3 round 6` the `create_dir_all` above makes those same
+        // directories before `stage` runs, so `stage` no longer finds them
+        // missing and this loop drops nothing in any sequence this tree can
+        // produce. It is kept because it is the only place the property "an
+        // Intent never records a claim the loader refuses" is *checked* rather
+        // than argued: the round-4 defect was exactly an argument of that
+        // shape. A directory removed between the two calls reaches it.
         let mut created_dirs = Vec::with_capacity(filled.created_dirs().len());
         for dir in filled.created_dirs() {
             if stray_created_dir(&dest, &self.home, std::slice::from_ref(dir)).is_some() {
@@ -2029,12 +2065,32 @@ fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
     Ok(Prior::Existed(reference))
 }
 
+/// The deepest ancestor of `dest` that is `home` or above it and is not
+/// there, or `None` when every one of them already is.
+///
+/// Creating that one creates every ancestor of it too, so it is the whole
+/// answer. It is exactly the set [`stray_created_dir`] refuses a claim for:
+/// a directory bx must make to reach the destination and must never remove,
+/// because the home lives under it.
+fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
+    dest.ancestors()
+        .skip(1)
+        .find(|dir| home.starts_with(dir) && std::fs::symlink_metadata(dir).is_err())
+        .map(Path::to_path_buf)
+}
+
 /// Every directory in `dirs`, made portable against `home`.
 ///
 /// # Errors
 ///
 /// [`Error::Write`] with [`crate::fs::Error::NotPortable`] for one that cannot
-/// be, which a ledger would refuse to store.
+/// be, which a ledger would refuse to store. Unreachable from the one caller:
+/// [`crate::fs::Filled::new_entry`] has already made the same conversion, for
+/// a superset of the same paths and against the same home, and would have
+/// failed first. Kept rather than unwrapped — a panic in a writer's durability
+/// path is worse than a returned error nothing produces — and named here so it
+/// reads as a gap on purpose (`r3 round 6`, COV3), like `plan_restore`'s own
+/// unreachable `Err` arm.
 fn portable_dirs(dirs: &[PathBuf], home: &Path) -> Result<Vec<Portable>, Error> {
     dirs.iter()
         .map(|dir| {
@@ -4272,6 +4328,114 @@ pub(crate) mod tests {
             "one unportable scope entry makes the whole journal unreadable",
         );
         assert_ne!(believed, std::fs::read(&path).expect("read"));
+    }
+
+    /// The directory the umask child does its two writes under.
+    const UMASK_CHILD_DIR: &str = "BX_TEST_UMASK_DIR";
+
+    #[test]
+    #[ignore = "spawned by a_directory_bx_will_not_remove_is_made_at_the_accounts_umask"]
+    fn umask_child() {
+        let under = PathBuf::from(std::env::var_os(UMASK_CHILD_DIR).expect("the parent's dir"));
+        let mode = |path: &Path| {
+            Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::symlink_metadata(path).expect("stat").permissions(),
+            ))
+        };
+        // `umask 077` is what the parent's shell set, so a directory made
+        // under it and never chmod'd is 0o777 & !0o077.
+        let shared = Mode::from_bits(0o700);
+
+        // In the home: `~` itself is the directory bx must make and will not
+        // remove. The two under it are bx's own, and keep bx's own mode.
+        let home = under.join("in-home/home");
+        let state = StateDir::resolve_in(&home, Some(under.join("in-home/state").as_os_str()));
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        session
+            .apply(write_to(
+                &home,
+                ".config/app/x.conf",
+                "bx\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        session.finish().expect("finish");
+        assert_eq!(mode(&home), shared, "the home was made past the umask");
+        for rel in [".config", ".config/app"] {
+            assert_eq!(
+                mode(&home.join(rel)),
+                Mode::DEFAULT_DIR,
+                "{rel} is bx's own"
+            );
+        }
+        assert_eq!(
+            entry_created_dirs(&state, &home, &target(&home, ".config/app/x.conf").0),
+            vec![home.join(".config/app"), home.join(".config")],
+            "bx claims what it made for its own target, and nothing above it",
+        );
+
+        // Beside the home: the directory bx must make is *above* the home,
+        // and the home itself is never made, because nothing needs it.
+        let beside_home = under.join("beside/home");
+        let beside_state =
+            StateDir::resolve_in(&beside_home, Some(under.join("beside-state").as_os_str()));
+        let dest = under.join("beside/x.conf");
+        let portable = Portable::try_from(dest.to_str().expect("utf-8").to_string())
+            .expect("a well-formed absolute path");
+        let mut session =
+            Session::open(&beside_state, SessionKind::Apply, &beside_home, Vec::new())
+                .expect("open");
+        session
+            .apply(Request {
+                target: portable,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"bx\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("apply");
+        session.finish().expect("finish");
+        assert_eq!(
+            mode(&under.join("beside")),
+            shared,
+            "a directory above the home was made past the umask",
+        );
+        assert!(!beside_home.exists(), "and the home itself was not made");
+    }
+
+    #[test]
+    fn a_directory_bx_will_not_remove_is_made_at_the_accounts_umask() {
+        // r3 round 6, D1/COV4/CL1/CL2. The path r3 round 5 made succeed
+        // created the user's own home through `fs::stage`, which `chmod`s past
+        // the `umask` on purpose — the right rule for a directory bx owns and
+        // will remove again, and the wrong one for a directory bx neither
+        // claims nor ever removes. `crate::state::dir::ensure_dir` already
+        // documents the opposite rule for exactly this category of directory,
+        // so bx's two ancestor-making paths disagreed.
+        //
+        // `umask(2)` is process-global and this suite runs in parallel, so the
+        // umask is set for a child rather than here: `sh -c 'umask 077; exec …'`,
+        // which needs no `unsafe` and no shared lock.
+        let guard = guarded_home();
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"umask 077; exec "$1" --exact --ignored journal::tests::umask_child"#)
+            .arg("sh")
+            .arg(&exe)
+            .env(UMASK_CHILD_DIR, guard.child("under"))
+            .output()
+            .expect("spawn the umask child");
+        assert!(
+            out.status.success(),
+            "the umask child failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
     }
 
     #[test]

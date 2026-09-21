@@ -19,8 +19,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # convco needs full history to walk the commit range
-      # mise provisions convco (see mise.toml); the install is cached across runs.
+      # convco is a `cargo:` tool, so mise builds it from source and the build
+      # needs a toolchain that is pinned here rather than whatever the runner
+      # image happens to carry.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # mise provisions convco (see mise.toml); the install is cached across
+      # runs. Only convco is installed: this job runs nothing else, and building
+      # the rest of the table from source is time spent on tools it never calls.
       - uses: jdx/mise-action@v2
+        with:
+          install_args: cargo:convco
       - name: Conventional Commits check
         run: convco check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
 
@@ -94,9 +103,23 @@ jobs:
     # requirement — and an unmeasured requirement is one that regresses. The
     # fixture is hermetic (scratch HOME, stub tools), so this is a real gate and
     # not a measurement of the runner's mood. See bench/README.md.
+    #
+    # `mise run` installs every missing tool in the table before it runs a task,
+    # so `install_args` alone would be undone by the Measure step. Turning that
+    # off is what makes the narrowed install hold; a tool this job needs and
+    # does not have fails loudly in bench/run.sh, which checks for each one.
+    env:
+      MISE_AUTO_INSTALL: "false"
     steps:
       - uses: actions/checkout@v4
+      # The measurement needs no cargo, but a pinned toolchain keeps any tool
+      # mise does build from source off the runner image's mood (issue #55).
+      - uses: dtolnay/rust-toolchain@stable
+      # hyperfine is the only tool this job calls; the rest of the table would
+      # be built from source for nothing.
       - uses: jdx/mise-action@v2
+        with:
+          install_args: aqua:sharkdp/hyperfine
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
       - name: Measure

@@ -3914,7 +3914,7 @@ pub(crate) mod tests {
             .expect("a staged temporary file");
 
         let report = crate::recover::pending(&state);
-        let recovered = crate::recover::before_writing(&state);
+        let recovered = crate::recover::recover(&state);
         let temp_left = temp.is_file();
         writable(&dir);
 
@@ -3941,7 +3941,7 @@ pub(crate) mod tests {
         assert!(!state.journal().exists(), "and the session is resolved");
         assert_eq!(peek(&dest).expect("untouched").0, b"user\n");
         assert_eq!(
-            crate::recover::before_writing(&state).expect("again"),
+            crate::recover::recover(&state).expect("again"),
             crate::recover::Outcome::Nothing,
         );
     }
@@ -4628,7 +4628,7 @@ pub(crate) mod tests {
             "got {opened:?}"
         );
 
-        let recovered = crate::recover::before_writing(&state);
+        let recovered = crate::recover::recover(&state);
         assert!(
             matches!(
                 recovered,
@@ -5441,7 +5441,7 @@ pub(crate) mod tests {
                     "{case}: moved, not replaced"
                 );
                 assert_eq!(
-                    crate::recover::before_writing(&state).expect("bx writes again"),
+                    crate::recover::recover(&state).expect("bx writes again"),
                     crate::recover::Outcome::Nothing,
                     "{case}"
                 );
@@ -5930,7 +5930,7 @@ pub(crate) mod tests {
             "the journal holds whole frames",
         );
 
-        let outcome = crate::recover::before_writing(&state).expect("the next writing run");
+        let outcome = crate::recover::recover(&state).expect("the next writing run");
         assert!(
             matches!(outcome, crate::recover::Outcome::RolledBack { undone: 1 }),
             "{outcome:?}"

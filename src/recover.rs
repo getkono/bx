@@ -29,12 +29,11 @@
 //! [`lock_for_writing`] first, which recovers under the state directory's lock,
 //! refuses to go on if it cannot, and hands that same lock to the session it is
 //! about to open, so no second bx can win the directory in between. Nothing in
-//! the type system makes a writing command use it rather than
-//! [`before_writing`] and a fresh [`journal::Session::open`]; what makes it
-//! safe is that `lock_for_writing` is the only call that produces the guard
-//! [`journal::Session::open_locked`] consumes, and that `before_writing`'s own
-//! documentation says it is not this call. [`before_writing`] is the same
-//! recovery for a caller that opens no session. A
+//! the type system makes a writing command use it rather than [`recover`]
+//! followed by a fresh [`journal::Session::open`]; what makes it the obvious
+//! one is that `lock_for_writing` is the only call that produces the guard
+//! [`journal::Session::open_locked`] consumes, and the only one that turns a
+//! blocked recovery into a refusal. A
 //! **read-only** command — `plan`, `status`, `doctor` — calls [`pending`],
 //! reports every named target as [`Action::Conflict`], exits
 //! [`Exit::Pending`](crate::report::Exit::Pending), and writes nothing. That is
@@ -390,28 +389,11 @@ pub fn recover(state: &StateDir) -> Result<Outcome, Error> {
     resolve(state, &lock)
 }
 
-/// Recover, refuse to continue if recovery is blocked, and release the lock.
+/// [`lock_for_writing`]'s verdict, with the lock already held.
 ///
-/// **Not** the call a writing command makes. It gives the state directory back
-/// before it returns, so a command that then opens a session leaves a window in
-/// which a second bx can win the directory — and that session's
-/// [`journal::Error::InProgress`] would then name a live run rather than an
-/// interruption. [`lock_for_writing`] is the call a writing command makes.
-///
-/// This is for a caller that resolves an interruption and opens no session: a
-/// `doctor` that recovers and reports, where the next command takes the lock
-/// again on its own terms.
-///
-/// # Errors
-///
-/// As [`recover`], plus [`Error::Blocked`] when a destination cannot be
-/// accounted for. The escape from that is [`abandon`].
-pub fn before_writing(state: &StateDir) -> Result<Outcome, Error> {
-    let lock = ExclusiveLock::acquire(state)?;
-    resolved_or_blocked(state, &lock)
-}
-
-/// [`before_writing`] with the lock already held.
+/// [`Outcome::Blocked`] becomes [`Error::Blocked`] here and nowhere else: a
+/// command that is about to write must stop, while [`recover`] hands the same
+/// verdict back as a value for a caller that only reports it.
 fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     match resolve(state, lock)? {
         Outcome::Blocked { conflicts } => Err(Error::Blocked { conflicts }),
@@ -421,7 +403,7 @@ fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome
 
 /// Recover, refuse if it is blocked, and **keep the lock**.
 ///
-/// The call every writing command makes. [`before_writing`] followed by
+/// The call every writing command makes. [`recover`] followed by
 /// [`journal::Session::open`] releases the state directory between the two, so
 /// a second bx can win it in between and this one's session then refuses with
 /// [`journal::Error::InProgress`] naming a journal that belongs to a live run
@@ -434,15 +416,17 @@ fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome
 /// [`resolve`] and not returned: no writing command has a channel to report it
 /// on yet, and a value every caller binds to `_` is a value the next reader has
 /// to work out the point of. A command layer that grows such a channel adds it
-/// back with a caller that reads it. Until then [`before_writing`] is the form
-/// that answers "what did recovery do", for a caller that opens no session.
+/// back with a caller that reads it. Until then [`recover`] is the form that
+/// answers "what did recovery do", for a caller that opens no session.
 ///
 /// The caller opens the session itself, so a session's failure stays a
 /// session's failure rather than becoming a recovery's.
 ///
 /// # Errors
 ///
-/// As [`before_writing`].
+/// As [`recover`], plus [`Error::Blocked`] when a destination cannot be
+/// accounted for — a command that is about to write must stop. The escape from
+/// that is [`abandon`].
 pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
     state.ensure()?;
     let lock = ExclusiveLock::acquire(state)?;
@@ -1342,7 +1326,7 @@ mod tests {
             let report = pending(&state).expect("pending").expect("a journal stands");
             assert!(report.blocked().next().is_none(), "{case}");
             let note = report.unfinished[0].note.clone();
-            let outcome = before_writing(&state).expect("the next writing run");
+            let outcome = recover(&state).expect("the next writing run");
             assert!(!state.journal().exists(), "{case}");
             let entry = LedgerView::read(&state, &home)
                 .expect("read the ledger")
@@ -1399,7 +1383,7 @@ mod tests {
                 assert!(!note.contains("bx doctor"), "{case}: {note}");
                 assert!(entry.is_none(), "{case}");
             }
-            assert_eq!(before_writing(&state).expect("again"), Outcome::Nothing);
+            assert_eq!(recover(&state).expect("again"), Outcome::Nothing);
         }
     }
 
@@ -1448,7 +1432,7 @@ mod tests {
         let state = StateDir::resolve(home.path());
         assert!(pending(&state).expect("pending").is_none());
         assert_eq!(recover(&state).expect("recover"), Outcome::Nothing);
-        assert_eq!(before_writing(&state).expect("before"), Outcome::Nothing);
+        assert_eq!(recover(&state).expect("before"), Outcome::Nothing);
         assert_eq!(abandon(&state).expect("abandon"), None);
     }
 
@@ -1904,7 +1888,7 @@ mod tests {
         ));
         assert!(state.journal().exists(), "the interruption still stands");
 
-        let err = before_writing(&state).expect_err("a writing command must refuse");
+        let err = lock_for_writing(&state).expect_err("a writing command must refuse");
         let Error::Blocked { conflicts } = &err else {
             panic!("got {err}")
         };
@@ -2126,7 +2110,7 @@ mod tests {
 
     #[test]
     fn a_writing_command_holds_one_lock_across_its_recovery_and_its_session() {
-        // r3 round 3, CL3. `before_writing` followed by `Session::open` drops
+        // r3 round 3, CL3. A recovery followed by `Session::open` drops
         // the state directory between the two, so a second bx could win it and
         // this one's session would refuse with `InProgress` naming a journal
         // that belongs to a live run rather than to an interruption.
@@ -2144,7 +2128,10 @@ mod tests {
         // What it does *not* establish is that a writing command uses the
         // pair: nothing in the type system says so, and `restore` being the
         // only writing command at this revision is what makes it true today.
-        // See `r3 round 4`, CL1.
+        // What narrows it is that `lock_for_writing` is now the only call that
+        // refuses a blocked recovery — `before_writing`, which did the same
+        // and released the lock, had no caller but a test and is gone
+        // (`r3 round 5`, CL1).
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let dest = home.child(".conf");
@@ -3225,7 +3212,7 @@ mod tests {
         assert!(foreign(&err), "got {err}");
         let err = recover(&state).expect_err("a mis-spelled home stops the run");
         assert!(foreign(&err), "got {err}");
-        let err = before_writing(&state).expect_err("and every writing command");
+        let err = lock_for_writing(&state).expect_err("and every writing command");
         assert!(foreign(&err), "got {err}");
 
         assert_eq!(std::fs::read(state.ledger()).expect("in place"), ledger);
@@ -3346,7 +3333,7 @@ mod tests {
         assert!(future(&err), "got {err}");
         let err = recover(&state).expect_err("the recovery stops");
         assert!(future(&err), "got {err}");
-        let err = before_writing(&state).expect_err("and every writing command");
+        let err = lock_for_writing(&state).expect_err("and every writing command");
         assert!(future(&err), "got {err}");
 
         assert_eq!(std::fs::read(state.ledger()).expect("in place"), newer);
@@ -4311,7 +4298,7 @@ mod tests {
         assert!(refused(pending(&state).expect_err("pending refuses")));
         assert!(refused(recover(&state).expect_err("recover refuses")));
         assert!(refused(
-            before_writing(&state).expect_err("a writing command refuses")
+            lock_for_writing(&state).expect_err("a writing command refuses")
         ));
         let opened = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
             .expect_err("a session refuses");
@@ -4382,7 +4369,7 @@ mod tests {
         std::os::unix::fs::symlink(home.child("real"), home.child("d")).expect("link it back");
 
         assert_eq!(
-            before_writing(&state).expect("recover"),
+            recover(&state).expect("recover"),
             Outcome::RolledBack { undone: 1 },
         );
         assert!(!state.journal().exists());
@@ -4393,7 +4380,7 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(before_writing(&state).expect("again"), Outcome::Nothing);
+        assert_eq!(recover(&state).expect("again"), Outcome::Nothing);
     }
 
     #[test]
@@ -4497,7 +4484,10 @@ mod tests {
         assert!(write.note.contains("~/.made"), "{}", write.note);
         assert!(write.note.contains("abandon"), "{}", write.note);
         assert!(state.journal().exists(), "the journal is kept");
-        assert!(matches!(before_writing(&state), Err(Error::Blocked { .. })));
+        assert!(matches!(
+            lock_for_writing(&state),
+            Err(Error::Blocked { .. })
+        ));
         assert!(
             std::fs::symlink_metadata(&made)
                 .expect("the link stays")
@@ -4506,10 +4496,7 @@ mod tests {
         );
 
         assert!(abandon(&state).expect("abandon").is_some());
-        assert_eq!(
-            before_writing(&state).expect("after abandon"),
-            Outcome::Nothing
-        );
+        assert_eq!(recover(&state).expect("after abandon"), Outcome::Nothing);
     }
 
     #[test]

@@ -1070,7 +1070,7 @@ mod tests {
             );
 
             assert_eq!(
-                crate::recover::before_writing(&state).expect("the next writing run"),
+                crate::recover::recover(&state).expect("the next writing run"),
                 crate::recover::Outcome::Nothing,
                 "{case}"
             );

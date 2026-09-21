@@ -5801,26 +5801,174 @@ mod tests {
             reason_of(&check("DATA_DIR", ROOT, &RootSet::strict())),
             Some(NoRootsDeclared)
         );
+    }
+
+    #[test]
+    fn the_anchor_exemption_is_open_and_this_is_what_it_allows() {
         // The three measurements `refuses_anchor`'s doc records as the open
-        // exemption. They are asserted here so that record cannot rot: the
-        // doc says these two are `Allowed` and the third is not, and when the
-        // exemption is closed these fail and send whoever closed it to the
-        // paragraph that has to change with them (round-4 note COV4).
+        // defect this pull request ships with, asserted so the record cannot
+        // rot (round-4 note COV4).
+        //
+        // It lives in its own test, and that is round-5 note COV3: inside
+        // `an_anchor_may_contain_bxs_directories_and_a_tool_read_location_may_not`
+        // an earlier assertion fired first under the very mutation these were
+        // written for, so the record-bearing lines were never reached. A pin
+        // nothing reaches pins nothing.
+        //
+        // This test **fails when the exemption is closed**, which is
+        // deliberate: the honest pin for a limit the change ships with is one
+        // that breaks when the limit lifts. The message says so, so that a
+        // failure here reads as a signpost rather than an obstacle.
+        use Reason::ContainsBxDirectory;
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let closing = "If you have just given `Kind::Anchor` the containing check, this test \
+                       failing is the expected and wanted consequence. Read the paragraph on \
+                       `refuses_anchor` headed \"The exemption is open, and this is what it \
+                       costs\", which records this measurement as the open defect, and rewrite \
+                       it with this test.";
+        // An anchor may contain bx's state directory. This is the defect.
         for name in ["DATA_DIR", "SCRATCH_HOME"] {
             assert_eq!(
                 check(name, "/var/home/example/.local/state", &home_rooted),
                 Verdict::Allowed,
-                "{name}"
+                "{name} no longer contains bx's state directory unrefused. {closing}"
             );
         }
+        // A tool-read location with the identical value is refused, which is
+        // what makes the anchor's exemption a difference of name alone.
         assert_eq!(
             reason_of(&check(
                 "UV_CACHE_DIR",
                 "/var/home/example/.local/state",
                 &home_rooted
             )),
-            Some(ContainsBxDirectory)
+            Some(ContainsBxDirectory),
+            "the contrast the exemption is measured against has moved. {closing}"
         );
+    }
+
+    /// `text` with its comments removed, line by line, carrying block state.
+    ///
+    /// Written because a `//`-prefix test is not comment handling: round 5
+    /// found that the tripwire below both **missed** a caller after a block
+    /// comment opened and **false-positived** on the module's name inside one.
+    /// That is the same blind spot the `Reason` census had, reappearing in the
+    /// round's other new mechanism — so it is fixed the same way, with a test
+    /// that fails when it is removed.
+    ///
+    /// **What it does not do:** it does not know string literals, so a `//` or
+    /// a `/*` inside one truncates the line. That direction is safe here — it
+    /// can only hide a caller that a string literal also spells, which no call
+    /// is — and stating it is the point, since the alternative is a claim
+    /// wider than the code.
+    fn code_only(text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut in_block = false;
+        for (idx, raw) in text.lines().enumerate() {
+            let mut code = String::new();
+            let mut rest = raw;
+            while !rest.is_empty() {
+                if in_block {
+                    match rest.find("*/") {
+                        Some(at) => {
+                            rest = &rest[at + 2..];
+                            in_block = false;
+                        }
+                        None => break,
+                    }
+                } else {
+                    let block = rest.find("/*");
+                    let line = rest.find("//");
+                    match (block, line) {
+                        (Some(b), Some(l)) if l < b => {
+                            code.push_str(&rest[..l]);
+                            break;
+                        }
+                        (Some(b), _) => {
+                            code.push_str(&rest[..b]);
+                            rest = &rest[b + 2..];
+                            in_block = true;
+                        }
+                        (None, Some(l)) => {
+                            code.push_str(&rest[..l]);
+                            break;
+                        }
+                        (None, None) => {
+                            code.push_str(rest);
+                            break;
+                        }
+                    }
+                }
+            }
+            out.push((idx + 1, code));
+        }
+        out
+    }
+
+    #[test]
+    fn comments_are_stripped_however_they_are_written() {
+        let stripped = |text: &str| {
+            code_only(text)
+                .into_iter()
+                .map(|(_, code)| code.trim().to_string())
+                .collect::<Vec<_>>()
+        };
+        // A line comment, a doc comment, a block comment on one line, and a
+        // block comment spanning lines — including code that resumes after it
+        // closes, which a `//`-prefix test loses entirely.
+        assert_eq!(stripped("let a = 1; // note"), vec!["let a = 1;"]);
+        assert_eq!(stripped("/// doc"), vec![""]);
+        assert_eq!(stripped("let a = /* x */ 1;"), vec!["let a =  1;"]);
+        assert_eq!(
+            stripped("/* open\nstill\n*/ let a = 1;"),
+            vec!["", "", "let a = 1;"]
+        );
+        // The name of this module inside a block comment is prose; a call
+        // after that block closes is not.
+        assert_eq!(stripped("/* env_guard */"), vec![""]);
+        assert_eq!(
+            stripped("/* env_guard\n*/ env_guard::scan(\"\");"),
+            vec!["", "env_guard::scan(\"\");"]
+        );
+    }
+
+    /// Whether `code` names this module in a position a Rust path can use.
+    ///
+    /// `env_guard::…`, `use …env_guard;`, `use …env_guard as g;` and
+    /// `use …{env_guard, …}` — every way a path reaches in, the alias round-5
+    /// note D1 found included. A bare mention in prose is not one of them, and
+    /// matching bare names reported a diagnostic string in `config::values` as
+    /// a caller.
+    fn names_the_guard(code: &str) -> bool {
+        let mut rest = code;
+        while let Some(at) = rest.find("env_guard") {
+            let after = &rest[at + "env_guard".len()..];
+            if after.starts_with([':', ';', ',', '}']) || after.trim_start().starts_with("as ") {
+                return true;
+            }
+            rest = after;
+        }
+        false
+    }
+
+    #[test]
+    fn the_guard_is_named_in_path_position_and_not_in_prose() {
+        for path in [
+            "crate::env_guard::scan(\"\")",
+            "use crate::env_guard;",
+            "use crate::env_guard as guard;",
+            "use crate::{env_guard, paths};",
+            "use crate::{paths, env_guard};",
+        ] {
+            assert!(names_the_guard(path), "{path:?}");
+        }
+        for prose in [
+            "declares a directory the env_guard root set admits",
+            "pub mod env_guard",
+            "env_guard enforces invariant 2",
+        ] {
+            assert!(!names_the_guard(prose), "{prose:?}");
+        }
     }
 
     #[test]
@@ -5831,11 +5979,24 @@ mod tests {
         // guard yet.
         //
         // Round-4 note COV3: that was prose, and prose is the same shape as
-        // the premise the exemption itself is criticised for — a safety claim
-        // nothing enforces. So it is a tripwire now. The first generator makes
-        // this fail, which is exactly when someone needs to read what it was
-        // capping. Reading the crate's own source to hold a property no type
-        // can carry is how `testing::tests::no_user_specific_literal_survives_        // under_src` already works.
+        // the premise the exemption itself is criticised for. Round-5 note D1:
+        // the first version searched for `env_guard::` after a `//` test, so
+        // `use crate::env_guard as guard;` followed by `guard::scan("")` — a
+        // real caller — passed it. It searches for the module's *name* now, in
+        // comment-free code, which catches the alias at its `use` line.
+        //
+        // **What it catches:** the module's name in *path position* in
+        // comment-free code — `env_guard::`, `use …env_guard;`,
+        // `use …env_guard as g;`, `use …{env_guard, …}`. Those are the forms
+        // by which a Rust path can reach into this module, alias included.
+        // **What it does not:** a caller that never names the module, which no
+        // Rust path can manage. `pub mod env_guard;` is the declaration rather
+        // than a way in, and is the one allowed form.
+        //
+        // Path position, not the bare name, because the bare name appears in
+        // prose this test must not fire on — `src/config/values.rs` quotes
+        // "the env_guard root set" inside a user-facing diagnostic, and a
+        // bare-name search reports it as a caller.
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let own = src.join("env_guard.rs");
         let mut callers = Vec::new();
@@ -5851,14 +6012,12 @@ mod tests {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).expect("a source file");
-                for (idx, line) in text.lines().enumerate() {
-                    // A doc comment or a comment naming the module is prose,
-                    // not a call. `pub mod env_guard;` names no path into it.
-                    if line.trim_start().starts_with("//") {
+                for (line, code) in code_only(&text) {
+                    if code.trim() == "pub mod env_guard;" {
                         continue;
                     }
-                    if line.contains("env_guard::") {
-                        callers.push(format!("{}:{}", path.display(), idx + 1));
+                    if names_the_guard(&code) {
+                        callers.push(format!("{}:{line}", path.display()));
                     }
                 }
             }

@@ -2022,8 +2022,11 @@ mod tests {
 
     #[test]
     fn a_literal_tilde_is_rooted_at_home_not_absolute() {
-        // `written_form`'s literal-`~` branch (merge.rs ~:796) is what parts a
-        // pair that climbs above the home and what keeps `~` from meeting `/`.
+        // `written_form`'s `Root::Home` arm — the one that reads a first
+        // segment of exactly `[Piece::Literal("~")]` — is what parts a pair
+        // that climbs above the home and what keeps `~` from meeting `/`.
+        // Cited by name rather than by line, which is the convention the rest
+        // of this file follows and the only citation a refactor cannot rot.
         // At `/` nothing is above the root, so a bare `..` clamps away (see
         // `a_dotdot_past_the_root_is_the_layer_s_defect_whatever_is_answered`
         // above); under `~` the home's own parent is unknown, so it does not.

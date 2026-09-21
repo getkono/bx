@@ -359,9 +359,17 @@ fn identify(fd: &OwnedFd) {
 fn read_holder(path: &Path) -> Holder {
     // Opened separately rather than through the refused descriptor: this runs
     // on the error path, where clarity beats saving one `open`.
+    //
+    // `O_NONBLOCK` because opening by path reaches whatever is at the path
+    // *now*, which need not be the regular file `open_lock_file` validated —
+    // `sudo bx` against a user-owned `$HOME` lets the unprivileged owner win
+    // that race. Opening a FIFO for reading blocks until a writer appears, and
+    // the module's headline promise is that acquisition never blocks. The flag
+    // changes nothing for a regular file, and turns a FIFO into
+    // [`Holder::unknown`] at once.
     let Ok(fd) = rustix::fs::open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         RawMode::empty(),
     ) else {
         return Holder::unknown();
@@ -1015,6 +1023,38 @@ mod tests {
             dir.ensure().expect("a second run");
             drop(ExclusiveLock::acquire(&dir).expect("a second run takes the lock"));
         }
+    }
+
+    #[test]
+    fn a_fifo_at_the_lock_path_does_not_block_the_holder_report() {
+        // r4 round 1 (D7): `read_holder` re-opens the lock path rather than
+        // reading through the descriptor `open_lock_file` validated, so what
+        // it opens need not be the regular file that was checked — `sudo bx`
+        // against a user-owned $HOME lets the owner win that race. Opening a
+        // FIFO for reading blocks until a writer appears, and the module's
+        // headline promise is that acquisition never blocks.
+        let home = guarded_home();
+        let path = home.child("lock");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            FileType::Fifo,
+            RawMode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("fifo");
+
+        // In a thread with a deadline: the failure is a hang, and a test that
+        // hangs reports nothing. The thread is abandoned if it does.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let for_thread = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_holder(&for_thread));
+        });
+        let holder = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("read_holder blocked on a FIFO");
+        assert_eq!(holder, Holder::unknown());
     }
 
     #[test]

@@ -300,16 +300,31 @@ fn resolve_target(
     }
 }
 
-/// Refuse a `requires` entry **no answer** could make findable.
+/// Refuse a `requires` entry **no text at all** could make findable.
 ///
-/// The boundary is the rule this module opens with, applied to the committed
-/// skeleton rather than to one account's answers: an entry that no substitution
-/// of its placeholders satisfies is broken by the text a layer committed, so it
-/// is the layer's defect whatever anyone answered. An entry holding no
-/// placeholder is the degenerate case of that, not a separate rule — its one
-/// producible text is the text as written. Holding a placeholder is therefore
-/// no exemption: `requires = ["bin/{{tool}}"]` is a relative name with a `/` in
-/// it for every answer to `tool`, and is refused here.
+/// The boundary is the **committed skeleton**: an entry that no string, put in
+/// place of its placeholders, could make findable is broken by the bytes a
+/// layer wrote, so it is that layer's defect whatever anyone answered. An entry
+/// holding no placeholder is the degenerate case of that, not a separate rule —
+/// its one producible text is the text as written. Holding a placeholder is
+/// therefore no exemption: `requires = ["bin/{{tool}}"]` is a relative name
+/// with a `/` in it whatever text fills `{{tool}}`, and is refused here.
+///
+/// The boundary is deliberately **not** "no answer could satisfy it", which is
+/// the wider set: a declared kind narrows which strings are answers, so
+/// `requires = ["bx{{sfx}}"]` with `sfx` of kind `path` is unsatisfiable by
+/// every answer — a `path` is always absolute, so the result always holds a `/`
+/// and never opens with one — and is still not refused here. That is by design,
+/// and the reason is which file the verdict would then depend on. A `[[value]]`
+/// declaration is **not** restricted to committed layers; only a `[values]`
+/// table is. An account may redeclare `sfx` in `local.toml` and change its
+/// kind, so a kind-aware refusal would let an account's own edit fail the whole
+/// load — or repair a load its layers broke — which is exactly the
+/// account-caused whole-load failure this module exists to prevent. A kind
+/// narrowing an entry into unusability therefore stays a **blocked target**: it
+/// names the value and costs that one entry, which is what an account can act
+/// on. `a_kind_that_narrows_a_requires_skeleton_blocks_the_target_not_the_load`
+/// pins that, and pins that the load survives it.
 ///
 /// Checked **before** the probe, beside [`refuse_path_value_in_file`], because
 /// [`substituted`] is reached only once every value the target references has a
@@ -342,32 +357,42 @@ fn refuse_committed_requirement(target: &Target, tool: &str) -> Result<(), Error
     })
 }
 
-/// The two answers [`refuse_committed_requirement`] asks its question with.
+/// The two texts [`refuse_committed_requirement`] asks its question with.
 ///
 /// [`check_requirement`] reads a substituted text three ways: whether it opens
 /// with `/`, whether it holds a `/` anywhere, and whether every `/`-separated
-/// segment is empty, `.` or `..`. An answer moves all three only through the
-/// text it contributes, so two stand-ins settle the whole question rather than
-/// a list of shapes that would keep growing. Suppose some answer set passes.
-/// The text it makes either opens with `/` or holds no `/`:
+/// segment is empty, `.` or `..`. A filled placeholder moves all three only
+/// through the text it contributes, so two stand-ins settle the whole question
+/// rather than a list of shapes that would keep growing.
 ///
-/// - It opens with `/`. That `/` is committed text before the first
-///   placeholder, or else there is no committed text before it and the `/` came
-///   from that answer. `/q` supplies the second case and leaves the first
-///   alone, and puts a `q` in the text, so the result is not all dots.
-/// - It holds no `/`. Then no committed chunk holds one and no answer does, so
-///   `q`, which holds none either, leaves the text `/`-free — and again not all
-///   dots.
+/// Suppose some assignment of strings passes. Then the text it makes opens with
+/// `/`, or holds no `/`; take each in turn.
 ///
-/// One of the two therefore passes whenever any answer does, so refusing when
-/// both fail refuses only an entry no answer rescues. They stand in for an
-/// arbitrary string rather than for an answer of a declared kind, which is the
-/// conservative direction: a kind only narrows which answers exist, so a
-/// skeleton no string satisfies is one no answer satisfies.
+/// - **It opens with `/`.** Split on the **first piece**, not on where the `/`
+///   came from. If that piece is a literal it is non-empty — `scan` emits no
+///   empty literal — so the result begins with its first byte under every
+///   assignment, this one included, and both stand-ins leave it alone. If that
+///   piece is a name, `/q` begins with `/`, so the result does too whatever
+///   follows. Either way `/q` opens with `/`. (Splitting instead on the origin
+///   of the `/` misses `{{a}}/usr/bin` with `a` empty, where the `/` is
+///   committed text that is not before the first placeholder.)
+/// - **It holds no `/`.** Then no committed chunk holds one and no substituted
+///   text does, so `q`, which holds none either, leaves the result `/`-free.
+///
+/// Neither stand-in is empty or a dot, and a text reaching this question holds
+/// at least one placeholder — with none, both stand-ins reproduce the text
+/// unchanged and the question is just [`check_requirement`] — so neither
+/// stand-in can make an all-dots result that the committed text did not force.
+///
+/// One of the two therefore passes whenever any assignment does, so refusing
+/// when both fail refuses only an entry no string rescues. They stand in for an
+/// arbitrary string, which is the whole boundary and not an approximation of a
+/// kind-aware one; [`refuse_committed_requirement`] says why the kind is
+/// deliberately not consulted.
 ///
 /// `a_requires_skeleton_only_one_stand_in_satisfies_is_not_a_committed_defect`
 /// pins that both are needed, and
-/// `a_requires_skeleton_no_answer_could_complete_fails_the_load` pins the
+/// `a_requires_skeleton_no_text_could_complete_fails_the_load` pins the
 /// refusal itself.
 const REQUIREMENT_STAND_INS: [&str; 2] = ["/q", "q"];
 
@@ -643,7 +668,7 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
 /// segments (`/` among them) names a directory, which detection never counts
 /// as a tool. Checked once substituted, because an answer is where any of these
 /// most plausibly comes from — and, through [`refuse_committed_requirement`],
-/// against stand-in answers before the probe, so a skeleton no answer satisfies
+/// against stand-in texts before the probe, so a skeleton no string satisfies
 /// is the layer's defect rather than one account's.
 fn check_requirement(text: &str) -> Result<(), String> {
     let only_dots = text
@@ -1906,10 +1931,10 @@ mod tests {
     }
 
     #[test]
-    fn a_requires_skeleton_no_answer_could_complete_fails_the_load() {
-        // `bin/{{tool}}` is a relative name holding a `/` whatever `tool` is,
-        // so the committed text alone makes it unfindable and holding a
-        // placeholder is no exemption. The three account states below are the
+    fn a_requires_skeleton_no_text_could_complete_fails_the_load() {
+        // `bin/{{tool}}` is a relative name holding a `/` whatever text fills
+        // `{{tool}}`, so the committed skeleton alone makes it unfindable and
+        // holding a placeholder is no exemption. The three account states below are the
         // ones that used to disagree: unanswered the target was blocked on
         // `tool` with a hint no answer cleared, answered it was blocked naming
         // the answer's line, and with a committed `default` the load failed.
@@ -1927,7 +1952,7 @@ mod tests {
             (WITH_DEFAULT, None),
         ] {
             let message = resolved(&format!("{global}{TARGETS}"), local)
-                .expect_err("a skeleton no answer completes fails the load for every account");
+                .expect_err("a skeleton no string completes fails the load for every account");
             assert!(
                 message.contains("`requires` names a tool by a bare name"),
                 "{local:?}: {message}"
@@ -1975,6 +2000,60 @@ mod tests {
         .expect("the answers complete both skeletons");
         assert_eq!(ready(&answered, 0).requires, ["/usr/bin/foo"]);
         assert_eq!(ready(&answered, 1).requires, ["bx-nightly"]);
+    }
+
+    #[test]
+    fn a_requires_skeleton_an_empty_answer_completes_is_not_a_committed_defect() {
+        // The shape the soundness argument splits on the first *piece* to
+        // cover. `{{a}}/usr/bin` opens with a name, and the answer that makes
+        // it findable contributes no text at all: `a = ""` gives `/usr/bin`,
+        // whose leading `/` is committed text that is not before the first
+        // placeholder. The `/q` stand-in still settles it, because a spelling
+        // opening with a name opens with the stand-in, but an argument split on
+        // where the `/` came from would have missed this entry and refused a
+        // load that has a perfectly good answer.
+        const LAYER: &str = "[[value]]\nname = \"a\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"{{a}}/usr/bin\"]\n";
+
+        let resolved = resolved(LAYER, Some("[values]\na = \"\"\n"))
+            .expect("an empty answer completes the skeleton, so it is no load error");
+        assert_eq!(ready(&resolved, 0).requires, ["/usr/bin"]);
+    }
+
+    #[test]
+    fn a_kind_that_narrows_a_requires_skeleton_blocks_the_target_not_the_load() {
+        // The boundary the pre-probe refusal deliberately does **not** take.
+        // `bx{{sfx}}` is satisfiable by some string — `sfx = "-nightly"` — so it
+        // is not the committed skeleton's defect; but with `sfx` declared
+        // `path`, every *answer* is absolute, so every answer leaves a relative
+        // name holding a `/`, and none is findable. The load still succeeds and
+        // the cost is the one target, because a `[[value]]` declaration is not
+        // restricted to committed layers: an account may redeclare `sfx` in
+        // `local.toml`, and a kind-aware refusal would make that edit fail or
+        // repair the whole load.
+        const LAYER: &str = "[[value]]\nname = \"sfx\"\nkind = \"path\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"bx{{sfx}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        // Unanswered, and answered with the only shape the kind allows: the
+        // load survives both, and every other target is unaffected.
+        for local in [None, Some("[values]\nsfx = \"/opt/x\"\n")] {
+            let resolved = resolved(LAYER, local)
+                .expect("a kind that narrows a skeleton is not the layer's defect");
+            blocked(&resolved, 0);
+            ready(&resolved, 1);
+        }
+
+        // The account's redeclaration is what clears it, and it clears it
+        // without the load having failed in the meantime.
+        let widened = resolved(
+            LAYER,
+            Some("[[value]]\nname = \"sfx\"\nkind = \"string\"\n[values]\nsfx = \"-nightly\"\n"),
+        )
+        .expect("the redeclaration resolves");
+        assert_eq!(ready(&widened, 0).requires, ["bx-nightly"]);
     }
 
     #[test]

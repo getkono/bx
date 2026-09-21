@@ -300,18 +300,26 @@ fn resolve_target(
     }
 }
 
-/// Refuse a `requires` entry written entirely in committed text.
+/// Refuse a `requires` entry **no answer** could make findable.
 ///
-/// An entry holding no placeholder is the same text for every account, so a
-/// defect in it is the layer's whatever anyone answered — the rule this module
-/// opens with. Checked **before** the probe, beside
-/// [`refuse_path_value_in_file`], because [`substituted`] is reached only once
-/// every value the target references has a usable answer: left there alone, the
-/// very same committed line would fail the load for an account that has
-/// answered and be invisible to one that has not.
+/// The boundary is the rule this module opens with, applied to the committed
+/// skeleton rather than to one account's answers: an entry that no substitution
+/// of its placeholders satisfies is broken by the text a layer committed, so it
+/// is the layer's defect whatever anyone answered. An entry holding no
+/// placeholder is the degenerate case of that, not a separate rule — its one
+/// producible text is the text as written. Holding a placeholder is therefore
+/// no exemption: `requires = ["bin/{{tool}}"]` is a relative name with a `/` in
+/// it for every answer to `tool`, and is refused here.
 ///
-/// [`check_requirement`] still runs inside [`substituted`], for text an answer
-/// filled. That is the account's to change, and it costs that target alone.
+/// Checked **before** the probe, beside [`refuse_path_value_in_file`], because
+/// [`substituted`] is reached only once every value the target references has a
+/// usable answer: left there alone, the very same committed line would fail the
+/// load for an account that has answered and be invisible to one that has not.
+///
+/// [`check_requirement`] still runs inside [`substituted`], for an entry some
+/// answer could have satisfied and this account's did not — `["{{tool}}"]` with
+/// `tool = "./bin/foo"`. That is the account's to change, and it costs that
+/// target alone.
 ///
 /// A malformed placeholder is left to the probe, which reports it with the rest
 /// of the target's defects, so text `scan` refuses is passed over here.
@@ -319,16 +327,59 @@ fn resolve_target(
 /// The `owns` arity check needs no twin: with no placeholder in the key, the
 /// substituted text is the text as written, so its segment count cannot move.
 fn refuse_committed_requirement(target: &Target, tool: &str) -> Result<(), Error> {
-    let Ok(names) = super::values::placeholders(tool) else {
+    let Ok(pieces) = super::values::scan(tool) else {
         return Ok(());
     };
-    if !names.is_empty() {
+    let satisfiable = REQUIREMENT_STAND_INS
+        .iter()
+        .any(|stand_in| check_requirement(&stood_in(&pieces, stand_in)).is_ok());
+    if satisfiable {
         return Ok(());
     }
-    check_requirement(tool).map_err(|problem| Error::BadValue {
+    Err(Error::BadValue {
         origin: target.origin.clone(),
-        message: format!("target `{}`: {problem}", target.path),
+        message: format!("target `{}`: {}", target.path, unfindable_requirement(tool)),
     })
+}
+
+/// The two answers [`refuse_committed_requirement`] asks its question with.
+///
+/// [`check_requirement`] reads a substituted text three ways: whether it opens
+/// with `/`, whether it holds a `/` anywhere, and whether every `/`-separated
+/// segment is empty, `.` or `..`. An answer moves all three only through the
+/// text it contributes, so two stand-ins settle the whole question rather than
+/// a list of shapes that would keep growing. Suppose some answer set passes.
+/// The text it makes either opens with `/` or holds no `/`:
+///
+/// - It opens with `/`. That `/` is committed text before the first
+///   placeholder, or else there is no committed text before it and the `/` came
+///   from that answer. `/q` supplies the second case and leaves the first
+///   alone, and puts a `q` in the text, so the result is not all dots.
+/// - It holds no `/`. Then no committed chunk holds one and no answer does, so
+///   `q`, which holds none either, leaves the text `/`-free — and again not all
+///   dots.
+///
+/// One of the two therefore passes whenever any answer does, so refusing when
+/// both fail refuses only an entry no answer rescues. They stand in for an
+/// arbitrary string rather than for an answer of a declared kind, which is the
+/// conservative direction: a kind only narrows which answers exist, so a
+/// skeleton no string satisfies is one no answer satisfies.
+///
+/// `a_requires_skeleton_only_one_stand_in_satisfies_is_not_a_committed_defect`
+/// pins that both are needed, and
+/// `a_requires_skeleton_no_answer_could_complete_fails_the_load` pins the
+/// refusal itself.
+const REQUIREMENT_STAND_INS: [&str; 2] = ["/q", "q"];
+
+/// `pieces` with every `{{name}}` replaced by `stand_in`.
+fn stood_in(pieces: &[super::values::Piece<'_>], stand_in: &str) -> String {
+    pieces
+        .iter()
+        .map(|piece| match piece {
+            super::values::Piece::Literal(literal) => *literal,
+            super::values::Piece::Name(_) => stand_in,
+        })
+        .collect()
 }
 
 /// Refuse a `file` that references a `path` value.
@@ -591,18 +642,28 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
 /// joined onto every `PATH` directory. A name made only of `.` and `..`
 /// segments (`/` among them) names a directory, which detection never counts
 /// as a tool. Checked once substituted, because an answer is where any of these
-/// most plausibly comes from.
+/// most plausibly comes from — and, through [`refuse_committed_requirement`],
+/// against stand-in answers before the probe, so a skeleton no answer satisfies
+/// is the layer's defect rather than one account's.
 fn check_requirement(text: &str) -> Result<(), String> {
     let only_dots = text
         .split('/')
         .all(|segment| matches!(segment, "" | "." | ".."));
     if only_dots || (text.contains('/') && !text.starts_with('/')) {
-        return Err(format!(
-            "`requires` names a tool by a bare name to look up on `PATH`, or by an \
-             absolute path; got {text:?}"
-        ));
+        return Err(unfindable_requirement(text));
     }
     Ok(())
+}
+
+/// How [`check_requirement`] says it refused `text`.
+///
+/// One spelling, so the pre-probe refusal reports a skeleton the way the
+/// post-substitution one reports a filled text.
+fn unfindable_requirement(text: &str) -> String {
+    format!(
+        "`requires` names a tool by a bare name to look up on `PATH`, or by an \
+         absolute path; got {text:?}"
+    )
 }
 
 /// Order `names` the way the values were declared, deduplicated.
@@ -1842,6 +1903,78 @@ mod tests {
             );
             assert!(message.contains("./bin/foo"), "{local:?}: {message}");
         }
+    }
+
+    #[test]
+    fn a_requires_skeleton_no_answer_could_complete_fails_the_load() {
+        // `bin/{{tool}}` is a relative name holding a `/` whatever `tool` is,
+        // so the committed text alone makes it unfindable and holding a
+        // placeholder is no exemption. The three account states below are the
+        // ones that used to disagree: unanswered the target was blocked on
+        // `tool` with a hint no answer cleared, answered it was blocked naming
+        // the answer's line, and with a committed `default` the load failed.
+        // One committed line, one verdict.
+        const DECL: &str = "[[value]]\nname = \"tool\"\nkind = \"string\"\n";
+        const WITH_DEFAULT: &str =
+            "[[value]]\nname = \"tool\"\nkind = \"string\"\ndefault = \"foo\"\n";
+        const TARGETS: &str = "[[target]]\npath = \"~/.config/env\"\n\
+                               content = \"x\"\nrequires = [\"bin/{{tool}}\"]\n\
+                               [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for (global, local) in [
+            (DECL, None),
+            (DECL, Some("[values]\ntool = \"foo\"\n")),
+            (WITH_DEFAULT, None),
+        ] {
+            let message = resolved(&format!("{global}{TARGETS}"), local)
+                .expect_err("a skeleton no answer completes fails the load for every account");
+            assert!(
+                message.contains("`requires` names a tool by a bare name"),
+                "{local:?}: {message}"
+            );
+            // The skeleton is reported as committed, which is the text a
+            // maintainer has to edit — not one account's filled-in version.
+            assert!(message.contains("bin/{{tool}}"), "{local:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_requires_skeleton_only_one_stand_in_satisfies_is_not_a_committed_defect() {
+        // Both halves of the pre-probe question, each satisfied by one stand-in
+        // and not the other. `{{dir}}/foo` opens with the placeholder, so an
+        // absolute answer makes it an absolute path — the `/q` stand-in — while
+        // a bare one does not. `bx{{sfx}}` holds no `/` in its committed text,
+        // so a `/`-free answer makes it a bare name — the `q` stand-in — while
+        // an absolute one does not. Asking with either stand-in alone would
+        // refuse one of these two at load, for an account that has answered
+        // nothing.
+        const LAYER: &str = "[[value]]\nname = \"dir\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"sfx\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"{{dir}}/foo\"]\n\
+                             [[target]]\npath = \"~/.config/other\"\n\
+                             content = \"y\"\nrequires = [\"bx{{sfx}}\"]\n";
+
+        // Unanswered: the load succeeds and each target waits on its value.
+        let waiting =
+            resolved(LAYER, None).expect("a skeleton some answer completes is not a load error");
+        for index in [0, 1] {
+            let entry = blocked(&waiting, index);
+            assert!(
+                matches!(entry.reason, BlockReason::UnsetValue { .. }),
+                "{index}: {:?}",
+                entry.reason
+            );
+        }
+
+        // Answered the way the stand-ins stand in for: both resolve.
+        let answered = resolved(
+            LAYER,
+            Some("[values]\ndir = \"/usr/bin\"\nsfx = \"-nightly\"\n"),
+        )
+        .expect("the answers complete both skeletons");
+        assert_eq!(ready(&answered, 0).requires, ["/usr/bin/foo"]);
+        assert_eq!(ready(&answered, 1).requires, ["bx-nightly"]);
     }
 
     #[test]

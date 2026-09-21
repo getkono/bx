@@ -496,9 +496,13 @@ impl Merged<Target, TargetKey> {
     /// `earlier` are the layers folded before this one: a toggle is compared
     /// against their full entries' spellings, and this layer's, to decide which
     /// hint a clash it is in gets. It is a slice of borrows rather than of
-    /// layers so that the whole set cannot be passed in its place: the caller
-    /// has to have collected the layers it folded, and a layer it has not
-    /// folded yet is not in the collection to pass.
+    /// layers so that the set the caller is iterating cannot be passed in its
+    /// place: `&layers` does not type-check here, and the list the caller does
+    /// pass is one a layer enters only once it has been folded. A barrier, not
+    /// a proof — `layers.iter().collect()` would still pass every layer — and
+    /// nothing stronger is available, since no test can tell the bound apart:
+    /// a toggle judged against a later layer's entry gets no hint at all, for
+    /// the reason [`anchored`] gives.
     fn absorb_layer(
         &mut self,
         layer: &Layer,

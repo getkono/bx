@@ -657,6 +657,14 @@ pub(crate) fn save<T: Serialize>(
 /// twice is therefore the in-process stand-in for "between runs", which is
 /// what Invariant 3 actually says.
 ///
+/// This is an obligation on the **caller**, not only on this function: `make`
+/// must construct, never clone. `HashMap::clone` copies the hasher and the
+/// bucket layout along with the contents, so two clones of one value iterate
+/// identically and a hash-ordered payload passes — which is exactly how both
+/// real call sites defeated this assertion when they read `|| value.clone()`
+/// (r4 round 2, D1). Build enough keys, too: two independently built hash maps
+/// of two keys agree half the time.
+///
 /// [`save`] itself is called, rather than the encoder, so the property pinned
 /// is the one the file on disk has.
 #[cfg(test)]

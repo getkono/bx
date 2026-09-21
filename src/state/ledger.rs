@@ -2854,7 +2854,33 @@ mod tests {
 
         // And the obligation `store::save` states on every payload type, so a
         // later field that iterates in hash order fails here.
-        store::assert_saves_identically(KIND, VERSION, || (*ledger).clone());
+        //
+        // The closure *builds* a view rather than cloning one. A clone carries
+        // the original's hasher and its table layout, so two clones of one
+        // `HashMap` iterate identically and a hash-ordered payload passed the
+        // assertion this call exists to fail (r4 round 2, D1/COV2). Sixty-four
+        // keys, not two, because two independently built hash maps of two keys
+        // agree half the time.
+        store::assert_saves_identically(KIND, VERSION, || {
+            let mut built = LedgerView::default();
+            for n in 0..64_u8 {
+                let path = target(&format!("~/k{n}"));
+                built.entries.insert(
+                    path.clone(),
+                    LedgerEntry {
+                        path,
+                        written: ContentHash::of(&[n]),
+                        mode: Mode::DEFAULT_FILE,
+                        mechanism: Mechanism::Own,
+                        prior: Prior::Absent,
+                        created_dirs: Vec::new(),
+                        superseded: Vec::new(),
+                        superseded_absent: false,
+                    },
+                );
+            }
+            built
+        });
     }
 
     #[test]

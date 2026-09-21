@@ -358,7 +358,20 @@ mod tests {
 
         // And the obligation `store::save` states on every payload type, so a
         // later field that iterates in hash order fails here.
-        store::assert_saves_identically(KIND, VERSION, || fingerprints.clone());
+        //
+        // The closure *builds* a cache rather than cloning one. A clone carries
+        // the original's hasher and its table layout, so two clones of one
+        // `HashMap` iterate identically and a hash-ordered payload passed the
+        // assertion this call exists to fail (r4 round 2, D1/COV2). Sixty-four
+        // keys, not two, because two independently built hash maps of two keys
+        // agree half the time.
+        store::assert_saves_identically(KIND, VERSION, || {
+            let mut built = Fingerprints::default();
+            for n in 0..64_u8 {
+                built.set(format!("k{n}"), Fingerprint::raw(vec![n]));
+            }
+            built
+        });
     }
 
     #[test]

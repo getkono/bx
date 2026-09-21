@@ -2642,7 +2642,26 @@ mod tests {
     /// Returns names rather than a count, so the walk can say *which* variant
     /// it never reached.
     fn declared_reasons() -> Vec<&'static str> {
-        let body = include_str!("env_guard.rs")
+        reasons_declared_in(include_str!("env_guard.rs"))
+    }
+
+    /// The same census, over any source text.
+    ///
+    /// Split out from [`declared_reasons`] for one reason: **the census had no
+    /// defender**. Round 5 measured that deleting both the comment strip and
+    /// the whole cross-check below left the suite at 567 passed, 0 failed —
+    /// and that is the structural reason this one defect has now recurred
+    /// three times. Every generation was a better mechanism than the last, and
+    /// not one of them was observable from inside the suite; each was caught
+    /// by a reviewer's out-of-tree probe. A mechanism the suite cannot watch
+    /// fail is a mechanism that regresses silently.
+    ///
+    /// Taking `source` as an argument is what lets the probes live in the
+    /// repository. `the_census_*` below feed it synthetic declarations holding
+    /// the shapes the real enum does not contain, so the strip and the
+    /// cross-check each have a test that fails when it is removed.
+    fn reasons_declared_in(source: &str) -> Vec<&str> {
+        let body = source
             .split_once("pub enum Reason {")
             .expect("the Reason enum is declared in this file")
             .1
@@ -2670,24 +2689,39 @@ mod tests {
             })
             .collect();
         // **The census is checked against a second count read out of the same
-        // block**, and this is the part that makes it a property rather than
-        // another pattern that holds until it does not.
+        // block**, and that is what makes it a property rather than another
+        // pattern that holds until it does not.
         //
         // `thiserror` requires an `#[error(...)]` on every variant of this
         // enum — the crate will not derive `Display` without one — so the
-        // number of `#[error(` lines in the block *is* the number of variants,
-        // arrived at by a different route than reading the variant lines. Two
-        // counts from one source: a variant that hides from the name scrape
-        // has to hide from the message count as well, and nothing that hides a
-        // `#[error(` line still compiles.
+        // number of message attributes in the block *is* the number of
+        // variants, arrived at by a different route than reading the variant
+        // lines. Two counts from one source: a variant that hides from the
+        // name scrape has to hide from the message count as well.
         //
-        // The canary this replaces asserted that two names were *present*. It
-        // could not see a census that had shrunk, which is exactly how the
-        // trailing-comment variant survived — the third generation of the same
-        // defect on this module, found inside the fix for the second.
+        // **What that does and does not buy, stated exactly.** Round 5 found
+        // generation five: `#[error ("probe")]` — a space before the paren —
+        // with `ProbeVariant /* note */,` moved *both* counts together, and
+        // the claim written here, that nothing hiding a message attribute
+        // still compiles, was false. It compiles. The whitespace is tolerated
+        // below, which closes that shape; but this is a text reader, and no
+        // text reader is complete against every spelling Rust accepts.
+        //
+        // What closes the rest is **`cargo fmt --check`**, an enforced gate —
+        // a CI row and an `hk` pre-commit hook — which normalises attribute
+        // spelling before any of this is read. So the invariant is not "no
+        // hidden variant compiles"; it is **"no hidden variant survives a
+        // formatted tree"**, and the formatter is the co-gate that makes the
+        // two counts trustworthy. `the_census_refuses_a_declaration_it_cannot_account_for`
+        // pins the cross-check; `the_formatter_normalises_what_the_census_reads`
+        // pins the part `cargo fmt` is relied on for.
         let messages = body
             .lines()
-            .filter(|line| line.trim_start().starts_with("#[error("))
+            .map(|line| line.trim_start())
+            .filter(|line| {
+                line.strip_prefix("#[error")
+                    .is_some_and(|rest| rest.trim_start().starts_with('('))
+            })
             .count();
         assert_eq!(
             names.len(),
@@ -2697,9 +2731,76 @@ mod tests {
         );
         assert!(
             messages > 0,
-            "no `#[error(` in the Reason enum, so the scrape is lost"
+            "no message attribute in the Reason enum, so the scrape is lost"
         );
         names
+    }
+
+    /// A synthetic `Reason` declaration holding `variant`, so the census can be
+    /// held to shapes the real enum does not contain.
+    fn probe_declaration(variant: &str) -> String {
+        format!(
+            "pub enum Reason {{\n    \
+             /// The first.\n    #[error(\"first\")]\n    First,\n{variant}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn the_census_reads_past_a_trailing_comment() {
+        // Round 4's probe, now inside the suite. Deleting the `//` strip in
+        // `reasons_declared_in` makes this fail: the variant stops being
+        // counted as a name while its message is still counted, so the
+        // cross-check fires.
+        let source = probe_declaration("    #[error(\"probe\")]\n    ProbeVariant, // note");
+        assert_eq!(reasons_declared_in(&source), vec!["First", "ProbeVariant"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a variant the scrape cannot see")]
+    fn the_census_refuses_a_declaration_it_cannot_account_for() {
+        // Round 4's probe C: a block comment, which the `//` strip does not
+        // touch, so the name scrape cannot see the variant at all. Only the
+        // cross-count catches it — deleting the cross-check makes this fail,
+        // which is what the census lacked for three generations.
+        let source = probe_declaration("    #[error(\"probe\")]\n    ProbeVariant /* note */,");
+        let _ = reasons_declared_in(&source);
+    }
+
+    #[test]
+    #[should_panic(expected = "a variant the scrape cannot see")]
+    fn the_census_sees_a_message_attribute_however_it_is_spaced() {
+        // Round 5's generation five: `#[error (` moved both counts together,
+        // so the cross-check agreed with itself and the variant hid. The
+        // message count tolerates the space now, so the counts disagree and
+        // the hidden variant is named.
+        let source = probe_declaration("    #[error (\"probe\")]\n    ProbeVariant /* note */,");
+        let _ = reasons_declared_in(&source);
+    }
+
+    #[test]
+    fn the_formatter_normalises_what_the_census_reads() {
+        // The census is a text reader, so it is only as good as the text. This
+        // names the co-gate the paragraph in `reasons_declared_in` relies on:
+        // `cargo fmt` is not optional here, it is a CI row and a pre-commit
+        // hook, and it rewrites the attribute spellings a reader cannot chase.
+        // If this repository ever stops enforcing formatting, the census's
+        // guarantee weakens to exactly this test's absence.
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("hk.pkl")
+                .exists(),
+            "hk.pkl is what runs `cargo fmt` before a commit; without it the census \
+             below is reading text nothing normalises"
+        );
+        let ci = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"),
+        )
+        .expect("the CI workflow");
+        assert!(
+            ci.contains("format-check"),
+            "no formatting gate in CI, so `reasons_declared_in` may be reading unformatted \
+             source and its two counts can be made to agree by spacing alone"
+        );
     }
 
     #[test]

@@ -14,6 +14,15 @@
 //! is why a machine that puts its toolchain caches on a scratch mount is a
 //! configuration bx serves rather than one it refuses.
 //!
+//! A tool-read location must lie **strictly beneath** a declared root, never at
+//! one, because a tool may derive a directory beside its own — uv puts
+//! executables in `$XDG_DATA_HOME/../bin`. That bound is **one level**, and the
+//! guard claims no more: an approved value's parent is inside a declared root,
+//! its grandparent need not be, and a tool deriving a path two or more levels
+//! above its value is not modelled. bx knows of none.
+//! [`Reason::DeclaredRootItself`] is where the bound and its consequences are
+//! written out.
+//!
 //! bx *may never* point a tool at a directory **bx itself owns**, and that one
 //! is unconditional: it holds inside a declared root too, because bx's state
 //! directory holds the record that makes an uninstall exact, and a tool writing
@@ -36,9 +45,30 @@
 //! generates, so the table grows with the generators and with nothing else.
 //! [`check`] is the verdict. Declare no root — [`RootSet::strict`], which is
 //! what [`scan`] uses — and no location, no list of locations and no anchor
-//! may be set at all. A program, a search list, a socket and a setting move
-//! nothing, so none of them needs a root; each is still held to every other
-//! check, bx's own directories included.
+//! may be set at all. A program, a search list and a socket say what a tool
+//! runs, where it looks and what it connects to rather than where its files
+//! live, so they move nothing and need no root — but no more than any other
+//! kind may they **point inside** a directory bx owns
+//! ([`Reason::BxOwnedDirectory`], [`Reason::InsideConfigRepo`]), which
+//! [`refuses_unanchored`] asks of every path-shaped value whatever its kind. A
+//! setting names no path at all, and is held to no path check.
+//!
+//! The **containing** check is the one that does not generalise, and
+//! deliberately. The criterion is **whether the tool clears what it is given**:
+//! a tool empties its own cache or data directory, and everything beneath it
+//! goes too, so a kind naming a directory the tool *owns* can take bx's state
+//! down with it. A kind the tool only reads from cannot. That is the test to
+//! apply to a new kind — not whether its value happens to name a directory,
+//! which a search list's entries do: `PATH=/usr/bin:/opt/x/bin` is a list of
+//! directories and is approved, because nothing empties a `PATH` entry.
+//!
+//! So the check is asked of a location and of a list of locations, and of
+//! nothing else — not of a program, a search list or a socket, none of which
+//! its tool clears, and not of an anchor, which [`Kind::Anchor`] exempts
+//! because bx has found no tool that reads one at all.
+//! `a_location_may_not_contain_bxs_own_directories` asserts both halves,
+//! allowing an `EDITOR`, a `PATH` and an `SSH_AUTH_SOCK` that contain bx's
+//! directories on the same lines as it refuses a `CARGO_HOME` that does.
 //!
 //! The guard **fails closed by shape** as well. It does not model shell syntax
 //! and approve whatever it does not recognise: it reads a fragment against a
@@ -59,6 +89,41 @@
 //! variable by sourcing a guarded environment fragment.
 //! `tests::the_init_snippet_is_not_an_environment_fragment` proves it of the
 //! snippet rather than assuming it.
+//!
+//! **Reasons, and the one assertion.** Everything this module can be given —
+//! any name, any value, any fragment, well formed or not — comes back as a
+//! [`Verdict`], and every rejection as a [`Reason`]. The guard never panics on
+//! input, because its whole job is to have an answer for input it does not
+//! like. There is exactly one `debug_assert!`, in `judge`, and it is not an
+//! input check: it states a **theorem about this module's own code** — that
+//! once every `:`-entry of a location has been judged, the whole value the tool
+//! reads lies strictly beneath a declared root as well. No value can falsify
+//! it. Only an edit to the code it rests on can: the entry rules in `judge`,
+//! [`RootSet::contains`], or [`crate::paths::normalize`], which decides what a
+//! path's components are. It is written as an assertion rather than as a
+//! [`Reason`] precisely because a [`Reason`] there could never be returned,
+//! which is a branch no test can reach and no mutant can kill — the defect it
+//! replaced (#47 round 3). Being a `debug_assert!` it does nothing in a release
+//! build — the compiler keeps the code and then eliminates it, so a release
+//! binary pays nothing for it; what it buys is that every test in the suite,
+//! not only the one that targets the property, checks it on every location it
+//! judges.
+//!
+//! **Before adding a second one**, ask which of the two it is. A statement
+//! about a *value* is a [`Reason`], always, even when it seems impossible —
+//! values come from a user's configuration and the guard's own reading of a
+//! shell fragment, and neither is a place to be certain. That half of the rule
+//! is load-bearing, not a matter of taste: a statement about a value written as
+//! a `debug_assert!` would **fail open in the shipped binary** on exactly the
+//! input it was meant to catch, approving a relocation instead of refusing it,
+//! and the tests would not show it because they run with assertions on. A
+//! statement about *this module's internal consistency*, which no input can
+//! reach and whose falsification would be a bug in bx, may be a
+//! `debug_assert!` — and should be, rather than an unreachable [`Reason`] that
+//! reads like a verdict. Pair it with a test that pins the same property
+//! through the public API, as
+//! `every_entry_beneath_a_root_leaves_the_whole_value_beneath_one` does, so the
+//! property is still pinned where assertions do nothing.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -364,8 +429,15 @@ fn is_reserved(name: &str) -> bool {
 enum Kind {
     /// Where a tool keeps its config, data or cache: one path. The tool reads the whole
     /// value, `:` and all, so the whole value must be an absolute path — `~`
-    /// and `$HOME` expand to one — inside a declared root and outside bx's own
-    /// directories. A bare word, a relative path and a URL are all relative to
+    /// and `$HOME` expand to one — strictly beneath a declared root, never a
+    /// root itself, and outside bx's own directories. A tool may derive a
+    /// directory beside its own, as uv puts executables in
+    /// `$XDG_DATA_HOME/../bin`, so at a root that directory is outside every
+    /// root. *Strictly beneath* buys exactly one level: an approved value's
+    /// parent is inside a declared root, and its grandparent need not be, so a
+    /// tool deriving a path two or more levels above its value is not modelled
+    /// — bx knows of none. [`Reason::DeclaredRootItself`] states the bound in
+    /// full. A bare word, a relative path and a URL are all relative to
     /// wherever the shell happens to be, and are refused. Every `:`-separated
     /// entry is held to the same checks first, which costs only a path with a
     /// `:` in it. Every character is an ASCII letter or digit, `.`, `_`, `-`,
@@ -375,13 +447,20 @@ enum Kind {
     /// `GOPATH`. Every entry is judged as a [`Kind::Location`] is, and the
     /// whole string, which no tool reads as one path, is not.
     LocationList,
-    /// A directory other assignments are written in terms of, and that no tool
-    /// reads — the operator fragment's `SCRATCH_HOME`, `CACHE_DIR` and
-    /// `DATA_DIR`. It is one path held to every check a [`Kind::Location`]'s
-    /// path is, but one: it may contain bx's own directories. No tool clears
-    /// an anchor, and every tool-read location written in terms of one is
-    /// judged at its own line, containment included. So a home that is the
-    /// scratch root, or lies under it, is still an anchor's to name.
+    /// A directory other assignments are written in terms of, and that bx has
+    /// found no tool to read: the operator fragment's `SCRATCH_HOME` and
+    /// `DATA_DIR`. A name found to be read by a tool is not an anchor.
+    /// `CACHE_DIR` is read by npm's find-cache-dir (babel-loader, nyc, ava),
+    /// which writes, and may clear, `$CACHE_DIR/<name>` for a name its
+    /// consumer picks, so it is a [`Kind::Location`] and may not contain bx's
+    /// directories. An anchor is one path held to every check a
+    /// [`Kind::Location`]'s path is, but two: it may contain bx's own
+    /// directories, and it may be a root. An approved anchor still lies inside
+    /// a root and outside bx's directories, and every tool-read location
+    /// written in terms of one is judged at its own line: containing bx's
+    /// directories, lying strictly beneath a root, and the roots. So a home
+    /// that is the scratch root, or lies under it, is still an anchor's to
+    /// name.
     Anchor,
     /// A program a tool runs, found by name or by path: exactly one word,
     /// either an absolute path outside bx's own directories or a bare command
@@ -464,9 +543,10 @@ fn is_decimal(text: &str, digits: usize) -> bool {
 ///   the operator fragment the module's tests hold the guard to:
 ///   `SCRATCH_HOME`, the anchor the fragment is written in terms of, and 22
 ///   toolchain caches and homes, of which `GOPATH` is a list of locations.
-///   `CACHE_DIR` and `DATA_DIR` are that fragment's two unexported helpers,
-///   also anchors, and `SCCACHE_DIR` is sccache's cache, the module's
-///   motivating case.
+///   `CACHE_DIR` and `DATA_DIR` are that fragment's two unexported helpers.
+///   `DATA_DIR` is an anchor too. `CACHE_DIR` is a location, because npm's
+///   find-cache-dir reads it and writes beneath it. `SCCACHE_DIR` is
+///   sccache's cache, the module's motivating case.
 /// * `EDITOR`, `VISUAL`, `PAGER`, `BROWSER`, `TERMINAL` — the program a tool
 ///   runs to edit, page, browse or open a terminal — and `RUSTC_WRAPPER`, the
 ///   program cargo runs `rustc` through.
@@ -489,7 +569,7 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("BROWSER", Kind::Program),
     ("BUN_INSTALL", Kind::Location),
     ("BUN_INSTALL_CACHE_DIR", Kind::Location),
-    ("CACHE_DIR", Kind::Anchor),
+    ("CACHE_DIR", Kind::Location),
     ("CARGO_HOME", Kind::Location),
     (
         "CARGO_TERM_COLOR",
@@ -581,7 +661,9 @@ const INHERITED: &str = "\0";
 /// case is left to the declared roots themselves.
 ///
 /// Containment in a root is **one-directional**: a value inside a root is
-/// admitted, whatever lies beneath it. bx's own directories are the exception,
+/// admitted, whatever lies beneath it. A root contains itself, but a location
+/// may not be a root itself ([`Reason::DeclaredRootItself`]), because its tool
+/// may write beside it. bx's own directories are the exception,
 /// and are judged **both ways**: a location may neither lie inside one nor
 /// contain one ([`Reason::ContainsBxDirectory`]), because a tool clears its
 /// own directory — `uv cache clean` on `UV_CACHE_DIR=~/.local/state` deletes
@@ -719,10 +801,12 @@ impl RootSet {
     /// every path a homeless set is shown, refusing all of them.
     ///
     /// Answering `false` instead is sound only because this is consulted from
-    /// [`refuses_entry`] alone, which [`judge`] reaches only for a location or
-    /// a list of them, after [`RootSet::refuses_everything`] has already
-    /// refused a set with no admissible root — and the only set without a home
-    /// is [`RootSet::strict`], which declares none. A later kind given a
+    /// [`refuses_entry_bx`] alone, which [`judge`] reaches only for a location
+    /// or a list of them — once per `:`-entry through
+    /// [`refuses_entry_placement`] and once for a location's whole value — and
+    /// only after [`RootSet::refuses_everything`] has refused a set with no
+    /// admissible root, and the only set without a home is
+    /// [`RootSet::strict`], which declares none. A later kind given a
     /// containing check must not simply call this: under `scan` it would get
     /// no protection at all, and it needs its own answer to the question
     /// above. `a_set_with_no_home_is_never_asked_what_holds_bxs_directories`
@@ -862,7 +946,8 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// the shell does not manage, use a name bx may generate, move the value out of
 /// bx's own directory, move it out of bx's config repo, point it beside bx's
 /// directories rather than around them, write a path of plain characters with
-/// no `..`, move it inside a declared root, write an absolute path,
+/// no `..`, move it inside a declared root, point it beneath a declared root
+/// rather than at one, write an absolute path,
 /// give a program no arguments, give a setting a value it accepts, define the
 /// referenced variable earlier, give the guard a home, fix the line
 /// that assigned it, shorten it — so a caller that only knew *which* variable
@@ -919,6 +1004,32 @@ pub enum Reason {
     /// It resolves to a path, but not one inside any declared root.
     #[error("resolves outside every declared root")]
     OutsideDeclaredRoots,
+    /// A location, or an entry of a list of locations, that is a declared root
+    /// itself rather than a path beneath one. A tool may derive a directory
+    /// beside its own: uv puts executables in `$XDG_DATA_HOME/../bin`, and so
+    /// does every tool built on dirs-next, which lands outside every root when
+    /// the value is one. A tool given a whole root also clears everything else
+    /// the root holds. Point the value beneath the root.
+    ///
+    /// **The rule covers one level above the value, and no more.** Refusing a
+    /// value that is a root leaves every approved value with a parent inside a
+    /// declared root, so the directory a tool derives one level up is inside
+    /// one too. It says nothing about the grandparent: a value one level
+    /// beneath a root is approved, and `<value>/../..` is the root's own
+    /// parent, outside every root. A tool that derives a path **two or more
+    /// levels above its value is not modelled**, and bx knows of none.
+    /// [`Kind::Location`] states the same bound, and
+    /// `the_rule_covers_one_level_above_a_location_and_no_more` pins it.
+    ///
+    /// Every other reason outranks it, at any entry and in a location's whole
+    /// value: every entry, and then the whole value, is judged for bx's
+    /// directories, and every entry for lying inside a root, before any entry
+    /// is judged for being a root. Nothing is asked of a location's whole value
+    /// after that, because nothing asked there could refuse: once no entry is a
+    /// root itself, the whole value and its parent lie inside the root the
+    /// first entry lies beneath (#47 round 3).
+    #[error("is a declared root itself, and its tool may write beside it, outside every root")]
+    DeclaredRootItself,
     /// Empty, a bare word, a URL, or a relative path, where a path that can be
     /// shown to be somewhere is needed. For a list, one of its entries is.
     #[error("is not an absolute path")]
@@ -1074,13 +1185,17 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// one it lists, the value as a shell gives it is judged for the [`Kind`] the
 /// table records:
 ///
-/// * a **location** needs a declared root, and every `:`-entry, and then the
-///   whole value read as one path, must be absolute, outside bx's own
-///   directories and inside a root;
+/// * a **location** needs a declared root, and every `:`-entry must be
+///   absolute, outside bx's own directories and strictly beneath a root, never
+///   a root itself ([`Reason::DeclaredRootItself`]). The whole value, read as
+///   one path, is judged for bx's own directories too; being strictly beneath
+///   a root then follows from the entries and is not asked again
+///   ([`Reason::DeclaredRootItself`] says why). Strictly beneath covers the one
+///   level a tool may derive above its value, and no more;
 /// * a **list of locations** is judged the same way entry by entry, and not
 ///   as a whole;
 /// * an **anchor** is judged as a location's one path, except that it may
-///   contain bx's own directories;
+///   contain bx's own directories and may be a root;
 /// * a **program** is one absolute path outside bx's own directories, or one
 ///   bare command name;
 /// * a **search list** has every entry absolute and outside bx's own
@@ -1095,7 +1210,8 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// ([`Reason::BxOwnedDirectory`]) or its config repo
 /// ([`Reason::InsideConfigRepo`]), checked in that order and before any root.
 /// No location or list of locations may contain either of bx's directories
-/// ([`Reason::ContainsBxDirectory`]); an anchor may. The characters are an allowlist because
+/// ([`Reason::ContainsBxDirectory`]), or be a root itself
+/// ([`Reason::DeclaredRootItself`]); an anchor may. The characters are an allowlist because
 /// the guard cannot know which tool reads which other character its own way.
 /// A value that does not resolve cannot be shown to be any of those, and is
 /// refused for why it does not.
@@ -1237,25 +1353,64 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
         // A set with no admissible root permits no location, whatever it is.
         Kind::Location | Kind::LocationList => roots.refuses_everything().or_else(|| {
             within(resolved, |value| {
-                let entries = value
-                    .split(':')
-                    .find_map(|entry| refuses_entry(entry, None, roots));
                 // A location's tool reads the whole value as one path, whose
-                // `:` its entries were judged apart at. Every entry has passed
-                // by now, so this can newly refuse only as
-                // `OutsideDeclaredRoots`: the whole value begins with its first
-                // absolute entry, holds only allowed characters and `:`, and
-                // merging entries at a `:` makes a component holding `:`, which
-                // no directory bx owns or roots names, so it cannot complete a
-                // match with one that no entry already made.
-                entries.or_else(|| {
-                    (kind == Kind::Location)
-                        .then(|| refuses_entry(value, Some(':'), roots))
-                        .flatten()
-                })
+                // `:` its entries are judged apart at. A list's tool reads
+                // only the entries.
+                let whole = (kind == Kind::Location).then_some(value);
+                // Every entry is judged for every other reason before any is
+                // judged for being a root itself, so a root earlier in the
+                // list does not hide a later entry's reason (#47 round 1).
+                let reason = value
+                    .split(':')
+                    .find_map(|entry| refuses_entry_placement(entry, None, roots))
+                    // Once every entry has passed, the whole value begins with
+                    // its first absolute entry and holds only allowed
+                    // characters and `:`. Merging entries at a `:` makes a
+                    // component holding `:`, which completes a match no entry
+                    // made only with a directory whose own path holds a `:`.
+                    // The home, and so bx's directories under it, may: with
+                    // `HOME=<root>/x:<root>/y`, each entry of
+                    // `CARGO_HOME=<root>/x:<root>/y/.local/state` passes, and
+                    // the whole value, the path cargo reads, contains bx's
+                    // state directory. That reason outranks an entry that is a
+                    // root itself, as it does on one path (#47 round 2).
+                    .or_else(|| whole.and_then(|value| refuses_entry_bx(value, Some(':'), roots)))
+                    .or_else(|| {
+                        value
+                            .split(':')
+                            .find_map(|entry| refuses_entry_at_root(entry, roots))
+                    });
+                // There is no whole-value placement check after this, because
+                // one could not refuse anything (#47 round 3). Every entry now
+                // lies strictly beneath a root, so the first entry's parent is
+                // inside one; the whole value extends that parent's components,
+                // so the whole value and its own parent are inside that root
+                // too, and neither `refuses_entry_outside` nor
+                // `refuses_entry_at_root` can fire on it. A check that can
+                // never refuse is an equivalent mutant no test can catch, so
+                // the property is asserted where a future change to the entry
+                // rules would trip it, and pinned by
+                // `every_entry_beneath_a_root_leaves_the_whole_value_beneath_one`.
+                //
+                // This is the module's only assertion, and the only place it
+                // may be one: it says nothing about the value, which is a
+                // `Reason`'s job, and everything about this module's own
+                // consistency, which no input can reach. The module docs state
+                // the policy, and what to do before adding a second.
+                debug_assert!(
+                    reason.is_some()
+                        || whole.is_none_or(|value| {
+                            refuses_entry_outside(value, roots).is_none()
+                                && refuses_entry_at_root(value, roots).is_none()
+                        }),
+                    "a location whose entries all lie strictly beneath a declared root \
+                     has a whole value that lies strictly beneath one too"
+                );
+                reason
             })
         }),
-        // An anchor is one directory that no tool reads, so none clears it.
+        // An anchor is one directory bx has found no tool to read, so none is
+        // known to clear it or to write beside it.
         Kind::Anchor => roots
             .refuses_everything()
             .or_else(|| within(resolved, |value| refuses_anchor(value, roots))),
@@ -1304,16 +1459,26 @@ fn is_bare_word(value: &str) -> bool {
     value.starts_with(|c: char| c.is_ascii_alphanumeric()) && value.chars().all(is_word_char)
 }
 
-/// Why one resolved path — a value, or one entry of a list — may not be a
-/// relocation target, or `None` if it may. `separator` is the list separator
-/// it may still hold, as [`refuses_unanchored`] reads it.
+/// Why one resolved entry of a location value may not be a relocation target,
+/// for any reason but being a root itself ([`refuses_entry_at_root`]), or
+/// `None` if it may. `separator` is the list separator it may still hold, as
+/// [`refuses_unanchored`] reads it.
 ///
 /// The order is part of the verdict. [`refuses_unanchored`] runs first, so a
 /// path that is relative, climbs, or holds a character outside the allowlist
 /// is refused for that before any reasoning about where it is: bx cannot read
 /// such a value as a path at all. Inside bx's own directories comes next, then
-/// containing them, then the roots.
-fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
+/// containing them, then inside a root. Beneath one comes last, and `judge`
+/// asks it of an entry only once every entry, and a location's whole value,
+/// has been judged for bx's directories, so a root earlier in a list does not
+/// hide a harder reason later in it or in the whole value.
+fn refuses_entry_placement(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
+    refuses_entry_bx(path, separator, roots).or_else(|| refuses_entry_outside(path, roots))
+}
+
+/// Every reason [`refuses_entry_placement`] gives before it reasons about the
+/// roots: [`refuses_unanchored`], then containing bx's own directories.
+fn refuses_entry_bx(path: &str, separator: Option<char>, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, separator, roots)
         // bx's directories outrank the roots in this direction too.
         .or_else(|| {
@@ -1321,13 +1486,26 @@ fn refuses_entry(path: &str, separator: Option<char>, roots: &RootSet) -> Option
                 .holds_bx_directory(Path::new(path))
                 .then_some(Reason::ContainsBxDirectory)
         })
-        .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
+}
+
+/// [`Reason::OutsideDeclaredRoots`] if `path` lies inside no declared root.
+fn refuses_entry_outside(path: &str, roots: &RootSet) -> Option<Reason> {
+    (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots)
+}
+
+/// [`Reason::DeclaredRootItself`] if `path`, already inside a root, has a
+/// parent in none: the path is a root itself.
+fn refuses_entry_at_root(path: &str, roots: &RootSet) -> Option<Reason> {
+    (!paths::normalize(Path::new(path))
+        .parent()
+        .is_some_and(|parent| roots.contains(parent)))
+    .then_some(Reason::DeclaredRootItself)
 }
 
 /// Why a resolved [`Kind::Anchor`] may not be written, or `None` if it may:
-/// every check [`refuses_entry`] makes of one path, but containing bx's own
-/// directories. A tool-read location written in terms of the anchor is judged
-/// for that at its own line.
+/// every check [`refuses_entry_placement`] makes of one path, but containing
+/// bx's own directories. A tool-read location written in terms of the anchor
+/// is judged for that at its own line.
 fn refuses_anchor(path: &str, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, None, roots)
         .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
@@ -1738,8 +1916,23 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_root_contains_itself() {
+    fn a_declared_root_contains_itself_and_a_location_may_still_not_be_one() {
+        // The reflexivity issue #45 turns on, and the choice made about it.
+        // `contains` stays reflexive: it answers "is this path inside a root",
+        // and a root is. What changed is that the `Kind::Location` arm no
+        // longer reads reflexive containment as approval — `refuses_entry_at_root`
+        // asks separately whether the path's *parent* is inside a root, and a
+        // root's parent is not. The alternative, making `contains` irreflexive,
+        // would also move `refuses_anchor`, `refuses_program`, the search list
+        // and the socket, none of which issue #45 is about.
+        //
+        // Both halves are asserted here, so this cannot be read as sanctioning
+        // a location at a root.
         assert!(rooted().contains(Path::new(ROOT)));
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", ROOT, &rooted())),
+            Some(Reason::DeclaredRootItself)
+        );
     }
 
     #[test]
@@ -2288,6 +2481,10 @@ mod tests {
             "resolves outside every declared root"
         );
         assert_eq!(
+            Reason::DeclaredRootItself.to_string(),
+            "is a declared root itself, and its tool may write beside it, outside every root"
+        );
+        assert_eq!(
             Reason::BxOwnedDirectory.to_string(),
             "points inside a directory bx owns"
         );
@@ -2456,9 +2653,10 @@ mod tests {
         // containing check has no such fallback and cannot have one: a
         // `.local/state/bx` may lie under any path at all, so a fallback would
         // have to refuse every path a homeless set is shown. Answering `false`
-        // is sound only while the check is reached from `refuses_entry` alone,
-        // behind `refuses_everything`. Both halves are pinned here, so a later
-        // kind given a containing check cannot inherit the hole unnoticed.
+        // is sound only while the check is reached from `refuses_entry_bx`
+        // alone, behind `refuses_everything`. Both halves are pinned here, so
+        // a later kind given a containing check cannot inherit the hole
+        // unnoticed.
         let strict = RootSet::strict();
         assert!(strict.owns(Path::new("/x/.local/state/bx/ledger")));
         assert!(strict.in_config_repo(Path::new("/x/.config/bx/bx.toml")));
@@ -2686,8 +2884,9 @@ mod tests {
     fn substituted_text_is_not_expanded_again() {
         // `DATA_DIR='$CACHE_DIR'` holds the characters `$CACHE_DIR`, and a
         // shell that later expands `$DATA_DIR` yields them and stops. Expanding
-        // them again would judge a path no shell produces. Both helpers are
-        // locations, so each is judged as one. The line that uses the literal
+        // them again would judge a path no shell produces. `CACHE_DIR` is a
+        // location and `DATA_DIR` an anchor, and each is judged as one, where
+        // a single-quoted `$` is relative either way. The line that uses the literal
         // inside the root holds a `$` a tool could expand itself, so since r3
         // round 2 it is refused for that, and not for where a second
         // expansion would point.
@@ -2702,12 +2901,17 @@ mod tests {
             ]
         );
         // Expanded once, `$DATA_DIR/cargo` is `$CACHE_DIR/cargo`: relative.
-        // Expanded twice it would be inside the root and approved.
+        // Expanded twice it would be inside the root and approved. Since #45,
+        // `CACHE_DIR` is a location, and at the root itself it is refused too.
         let content =
             format!("CACHE_DIR={ROOT}\nDATA_DIR='$CACHE_DIR'\nexport CARGO_HOME=$DATA_DIR/cargo\n");
         assert_eq!(
             reasons(&content, &rooted()),
-            vec![(2, Reason::NotAbsolute), (3, Reason::NotAbsolute)]
+            vec![
+                (1, Reason::DeclaredRootItself),
+                (2, Reason::NotAbsolute),
+                (3, Reason::NotAbsolute)
+            ]
         );
     }
 
@@ -3070,7 +3274,7 @@ mod tests {
     /// The operator's own relocating exports, with the scratch mount replaced
     /// by a neutral root so nothing user-specific enters the repository
     /// (invariant 5). Every one of these was denied or leaked by the
-    /// name-based guard. All 23 exports and both helpers are locations in the
+    /// name-based guard. All 23 exports and both helpers are in the
     /// emit table.
     const OPERATOR_FRAGMENT: &str = concat!(
         "export SCRATCH_HOME=\"/var/mnt/scratch/example\"\n",
@@ -3184,9 +3388,10 @@ mod tests {
     fn the_same_fragment_is_all_violations_with_no_root_declared() {
         // A user who declares no root gets the strict guard, and the strict
         // guard refuses every location. Round 5 keeps the count at 25: the 23
-        // exports and the two helpers `CACHE_DIR` and `DATA_DIR` are all
-        // locations in the emit table, so every one is `NoRootsDeclared` and
-        // none is `NotEmittable`.
+        // exports and the two helpers `CACHE_DIR` and `DATA_DIR` are all in
+        // the emit table, as locations, a list of them, or anchors, each of
+        // which needs a root. So every one is `NoRootsDeclared` and none is
+        // `NotEmittable`.
         let found = scan(OPERATOR_FRAGMENT);
         assert_eq!(found.len(), 25);
         assert!(found.iter().all(|v| v.reason == Reason::NoRootsDeclared));
@@ -4644,14 +4849,23 @@ mod tests {
     fn a_location_is_the_one_path_its_tool_reads() {
         // cargo reads `CARGO_HOME` as one path, `:` and all. Each entry of this
         // value is inside the root, and the whole string is not: `example:` is
-        // one component, a sibling of the root.
+        // one component, a sibling of the root. Since #45 its first entry is
+        // the root itself, which is refused first, for either kind. With every
+        // entry strictly beneath a root, the whole string begins with its first
+        // entry's parent, so it lies inside that root too.
         let joined = "/var/mnt/scratch/example:/var/mnt/scratch/example/y";
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", joined, &rooted())),
-            Some(Reason::OutsideDeclaredRoots)
-        );
+        for name in ["CARGO_HOME", "GOPATH"] {
+            assert_eq!(
+                reason_of(&check(name, joined, &rooted())),
+                Some(Reason::DeclaredRootItself),
+                "{name}"
+            );
+        }
+        let beneath = "/var/mnt/scratch/example/x:/var/mnt/scratch/example/y";
+        for name in ["CARGO_HOME", "GOPATH"] {
+            assert_eq!(check(name, beneath, &rooted()), Verdict::Allowed, "{name}");
+        }
         // `GOPATH` is a list go splits at `:`, so each entry is the path.
-        assert_eq!(check("GOPATH", joined, &rooted()), Verdict::Allowed);
         assert_eq!(
             reason_of(&check(
                 "GOPATH",
@@ -4998,10 +5212,12 @@ mod tests {
         let moved = rooted()
             .owning(&[PathBuf::from("/var/mnt/scratch/example/state/bx")])
             .with_config_repos(&[PathBuf::from("/var/mnt/scratch/example/cfg/bx")]);
-        for value in [
-            "/var/mnt/scratch/example/state",
-            "/var/mnt/scratch/example/cfg",
-            "/var/mnt/scratch/example",
+        // Without them, the root itself is still refused for being one (#45),
+        // which containing bx's directories outranks above.
+        for (value, unmoved) in [
+            ("/var/mnt/scratch/example/state", None),
+            ("/var/mnt/scratch/example/cfg", None),
+            ("/var/mnt/scratch/example", Some(Reason::DeclaredRootItself)),
         ] {
             assert_eq!(
                 reason_of(&check("CARGO_HOME", value, &moved)),
@@ -5009,8 +5225,8 @@ mod tests {
                 "{value}"
             );
             assert_eq!(
-                check("CARGO_HOME", value, &rooted()),
-                Verdict::Allowed,
+                reason_of(&check("CARGO_HOME", value, &rooted())),
+                unmoved,
                 "{value}"
             );
         }
@@ -5174,7 +5390,7 @@ mod tests {
             OutsideDeclaredRoots, ParentComponent, UnlistedCharacter,
         };
         let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
-        for name in ["SCRATCH_HOME", "CACHE_DIR", "DATA_DIR"] {
+        for name in ["SCRATCH_HOME", "DATA_DIR"] {
             assert_eq!(emittable(name), Some(Kind::Anchor), "{name}");
         }
         // The operator's fragment written in terms of the home, under a `~`
@@ -5239,6 +5455,469 @@ mod tests {
         assert_eq!(
             reason_of(&check("DATA_DIR", ROOT, &RootSet::strict())),
             Some(NoRootsDeclared)
+        );
+    }
+
+    #[test]
+    fn a_location_at_a_declared_root_is_refused_because_its_tool_may_write_beside_it() {
+        use Reason::DeclaredRootItself;
+        // uv puts executables in `$XDG_DATA_HOME/../bin`. With the value at the
+        // root, that directory is beside the root and outside every one.
+        for value in [ROOT.to_string(), format!("{ROOT}/")] {
+            assert_eq!(
+                reason_of(&check("XDG_DATA_HOME", &value, &rooted())),
+                Some(DeclaredRootItself),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            reasons(
+                &format!("export SCRATCH_HOME={ROOT}\nexport XDG_DATA_HOME=$SCRATCH_HOME\n"),
+                &rooted()
+            ),
+            vec![(2, DeclaredRootItself)]
+        );
+        for value in [format!("{ROOT}/.local/share"), format!("{ROOT}/data")] {
+            assert_eq!(
+                check("XDG_DATA_HOME", &value, &rooted()),
+                Verdict::Allowed,
+                "{value}"
+            );
+        }
+        // The rule is by shape, not by name: no tool-read location may be a
+        // root, and no entry of a list of them may be either.
+        for (name, kind) in EMITTABLE {
+            if matches!(kind, Kind::Location | Kind::LocationList) {
+                assert_eq!(
+                    reason_of(&check(name, ROOT, &rooted())),
+                    Some(DeclaredRootItself),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(
+            reason_of(&check("GOPATH", &format!("{ROOT}/go:{ROOT}"), &rooted())),
+            Some(DeclaredRootItself)
+        );
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", &format!("{ROOT}:{ROOT}/x"), &rooted())),
+            Some(DeclaredRootItself)
+        );
+        // One level: a root nested in another lies beneath the outer one, and
+        // the outer one is still a root itself.
+        let nested = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from("/var/mnt/scratch"), PathBuf::from(ROOT)],
+        );
+        assert_eq!(check("XDG_DATA_HOME", ROOT, &nested), Verdict::Allowed);
+        assert_eq!(
+            reason_of(&check("XDG_DATA_HOME", "/var/mnt/scratch", &nested)),
+            Some(DeclaredRootItself)
+        );
+        // An anchor may be a root: no tool is known to read one.
+        for name in ["SCRATCH_HOME", "DATA_DIR"] {
+            assert_eq!(check(name, ROOT, &rooted()), Verdict::Allowed, "{name}");
+        }
+        // A search list and a socket need no root, so being one is no matter.
+        assert_eq!(
+            check("PATH", &format!("\"{ROOT}:$PATH\""), &rooted()),
+            Verdict::Allowed
+        );
+        assert_eq!(check("SSH_AUTH_SOCK", ROOT, &rooted()), Verdict::Allowed);
+    }
+
+    #[test]
+    fn an_existing_reason_on_any_entry_outranks_a_root_itself_on_an_earlier_one() {
+        use Reason::{BxOwnedDirectory, InsideConfigRepo, OutsideDeclaredRoots};
+        // With the home beside the root, each value's first entry is the root
+        // itself and a later entry has a reason that predates #45. Every entry
+        // is judged for those first, so the later entry's reason names the fix,
+        // as it did before the root-itself rule existed.
+        let mut judged = Vec::new();
+        let mut expected = Vec::new();
+        for name in ["GOPATH", "CARGO_HOME"] {
+            for (later, reason) in [
+                ("/var/home/example/.local/state/bx", BxOwnedDirectory),
+                ("/var/home/example/.config/bx", InsideConfigRepo),
+                ("/etc", OutsideDeclaredRoots),
+            ] {
+                let value = format!("{ROOT}:{later}");
+                judged.push((name, reason_of(&check(name, &value, &rooted()))));
+                expected.push((name, Some(reason)));
+            }
+        }
+        assert_eq!(judged, expected);
+    }
+
+    #[test]
+    fn a_location_whose_entries_pass_is_refused_when_its_whole_path_holds_a_home_with_a_colon() {
+        // A home may hold `:`, and so may bx's directories under it. Neither
+        // entry of this value contains bx's state directory, and the one path
+        // cargo reads does: the whole-value check is its only refusal. `GOPATH`
+        // is read entry by entry, so its whole string is not judged.
+        let home = format!("{ROOT}/x:{ROOT}/y");
+        let roots = RootSet::new(Path::new(&home), &[PathBuf::from(ROOT)]);
+        let value = format!("{ROOT}/x:{ROOT}/y/.local/state");
+        for entry in value.split(':') {
+            assert_eq!(
+                check("CARGO_HOME", entry, &roots),
+                Verdict::Allowed,
+                "{entry}"
+            );
+        }
+        assert_eq!(check("GOPATH", &value, &roots), Verdict::Allowed);
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", &value, &roots)),
+            Some(Reason::ContainsBxDirectory)
+        );
+    }
+
+    #[test]
+    fn a_whole_value_holding_a_bx_directory_outranks_an_entry_that_is_a_root_itself() {
+        use Reason::{BxOwnedDirectory, ContainsBxDirectory, InsideConfigRepo};
+        let roots = [
+            PathBuf::from("/r1"),
+            PathBuf::from("/r2"),
+            PathBuf::from("/r3"),
+        ];
+        // A home that holds `:`. The middle entry of this value is the root
+        // `/r2`, and no entry lies in bx's state directory, but the one path
+        // cargo reads is that directory.
+        let colon_home = RootSet::new(Path::new("/r1/a:/r2:/r3/h"), &roots);
+        // A state directory and a config repo that hold `:`, as a caller that
+        // read the environment may pass them.
+        let owning_the_value =
+            RootSet::new(Path::new(HOME), &roots).owning(&[PathBuf::from("/r1/s:/r2")]);
+        let owning_beneath_it =
+            RootSet::new(Path::new(HOME), &roots).owning(&[PathBuf::from("/r1/s:/r2/st")]);
+        let repo =
+            RootSet::new(Path::new(HOME), &roots).with_config_repos(&[PathBuf::from("/r1/c:/r2")]);
+        let judged: Vec<_> = [
+            (&colon_home, "~/.local/state/bx"),
+            (&owning_the_value, "/r1/s:/r2"),
+            (&owning_beneath_it, "/r1/s:/r2"),
+            (&repo, "/r1/c:/r2"),
+        ]
+        .into_iter()
+        .map(|(set, value)| (value, reason_of(&check("CARGO_HOME", value, set))))
+        .collect();
+        assert_eq!(
+            judged,
+            vec![
+                ("~/.local/state/bx", Some(BxOwnedDirectory)),
+                ("/r1/s:/r2", Some(BxOwnedDirectory)),
+                ("/r1/s:/r2", Some(ContainsBxDirectory)),
+                ("/r1/c:/r2", Some(InsideConfigRepo)),
+            ]
+        );
+        // `GOPATH` is read entry by entry, so its whole string is not judged
+        // and the root entry still names the fix.
+        assert_eq!(
+            reason_of(&check("GOPATH", "/r1/c:/r2", &repo)),
+            Some(Reason::DeclaredRootItself)
+        );
+    }
+
+    #[test]
+    fn every_entry_beneath_a_root_leaves_the_whole_value_beneath_one() {
+        // The property that lets `judge` stop after the at-root pass over
+        // entries, and so the one a whole-value placement check would have been
+        // the net for. Once every `:`-entry lies strictly beneath a declared
+        // root, the whole value extends the first entry's parent, which is
+        // inside a root, so the whole value and its own parent are inside that
+        // root too. A whole-value `OutsideDeclaredRoots` or `DeclaredRootItself`
+        // check would therefore be an equivalent mutant no test could catch
+        // (#47 round 3), and this pins what it would have caught instead: break
+        // an entry rule and this fails, where a dead branch would not have.
+        let layouts = [
+            (vec!["/r"], "/h"),
+            (vec!["/r"], "/r"),
+            (vec!["/r"], "/r/x"),
+            (vec!["/r"], "/r/a:/r/b"),
+            (vec!["/r", "/r/a"], "/h"),
+            (vec!["/r/a", "/s"], "/h:/r"),
+            (vec!["~"], HOME),
+        ];
+        let tails = ["", "/a", "/a/b", "/b", "/a:x", "/x", "/"];
+        let heads = ["/r", "/r/a", "/r/a/b", "/s", "/h", "/", HOME];
+        let seconds = ["", ":/r/q", ":/r/a/q", ":/s/q", ":/r", ":/"];
+        let mut allowed = 0_usize;
+        let mut loose = Vec::new();
+        for (declared, home) in layouts {
+            let declared: Vec<PathBuf> = declared.iter().map(PathBuf::from).collect();
+            let roots = RootSet::new(Path::new(home), &declared);
+            for head in heads {
+                for tail in tails {
+                    for second in seconds {
+                        let value = format!("{head}{tail}{second}");
+                        // The whole public verdict, not a replay of `judge`'s
+                        // internals, so a later reordering inside `judge`
+                        // cannot move the test in lockstep with the code.
+                        if check("CARGO_HOME", &value, &roots) != Verdict::Allowed {
+                            continue;
+                        }
+                        allowed += 1;
+                        let whole = refuses_entry_outside(&value, &roots)
+                            .or_else(|| refuses_entry_at_root(&value, &roots));
+                        if let Some(reason) = whole {
+                            loose.push((value, home, reason));
+                        }
+                    }
+                }
+            }
+        }
+        // Not vacuous: the values above really are allowed as locations.
+        assert!(allowed > 200, "{allowed} of the values were allowed");
+        assert_eq!(loose, Vec::new());
+    }
+
+    #[test]
+    fn the_rule_covers_one_level_above_a_location_and_no_more() {
+        // `DeclaredRootItself` buys exactly one level: an approved value's
+        // parent is inside a declared root, so the directory uv derives at
+        // `$XDG_DATA_HOME/../bin` is too. It buys no second level, and the
+        // module's docs say so. A value one level beneath the root is allowed
+        // although its grandparent — the root's own parent — is outside every
+        // root, so a tool deriving two levels up would leave them.
+        let one_level = format!("{ROOT}/share");
+        assert_eq!(
+            check("XDG_DATA_HOME", &one_level, &rooted()),
+            Verdict::Allowed
+        );
+        let parent = Path::new(&one_level).parent().expect("a parent");
+        assert!(rooted().contains(parent), "one level up is inside a root");
+        let grandparent = parent.parent().expect("a grandparent");
+        assert_eq!(grandparent, Path::new("/var/mnt/scratch"));
+        assert!(
+            !rooted().contains(grandparent),
+            "two levels up is outside every root, and the guard does not model it"
+        );
+        // Two levels are covered only when a root happens to lie two levels
+        // above the value, which no rule requires.
+        let nested = RootSet::new(
+            Path::new(HOME),
+            &[PathBuf::from("/var/mnt/scratch"), PathBuf::from(ROOT)],
+        );
+        assert_eq!(
+            check("XDG_DATA_HOME", &one_level, &nested),
+            Verdict::Allowed
+        );
+        assert!(nested.contains(grandparent));
+    }
+
+    #[test]
+    fn uv_puts_executables_beside_its_data_home_and_the_guard_refuses_a_root() {
+        // The mechanism behind `DeclaredRootItself`, held to a real uv when one
+        // is installed. `dir --bin` only prints where executables would go, and
+        // the home, the root and anything uv writes are in a temporary
+        // directory.
+        let Some(uv) = installed("uv") else {
+            return;
+        };
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let root = scratch.path().join("r");
+        let home = scratch.path().join("h");
+        std::fs::create_dir_all(&root).expect("the root");
+        std::fs::create_dir_all(&home).expect("the home");
+        let roots = RootSet::new(&home, std::slice::from_ref(&root));
+        let bin_dir = |data_home: &Path, args: &[&str]| {
+            let output = std::process::Command::new(&uv)
+                .args(args)
+                .current_dir(scratch.path())
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", "/nonexistent")
+                .env("UV_NO_CONFIG", "1")
+                .env("XDG_DATA_HOME", data_home)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("an installed uv runs");
+            let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            assert!(
+                output.status.success() && !printed.is_empty(),
+                "uv {args:?} printed {printed:?} ({}; stderr {:?})",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            paths::normalize(Path::new(&printed))
+        };
+        for args in [["tool", "dir", "--bin"], ["python", "dir", "--bin"]] {
+            let beside = bin_dir(&root, &args);
+            assert_eq!(
+                beside,
+                paths::normalize(&scratch.path().join("bin")),
+                "{args:?}"
+            );
+            assert!(!roots.contains(&beside), "{args:?}");
+            let beneath = bin_dir(&root.join("share"), &args);
+            assert_eq!(beneath, paths::normalize(&root.join("bin")), "{args:?}");
+            assert!(roots.contains(&beneath), "{args:?}");
+        }
+        assert_eq!(
+            reason_of(&check("XDG_DATA_HOME", &root.display().to_string(), &roots)),
+            Some(Reason::DeclaredRootItself)
+        );
+        assert_eq!(
+            check(
+                "XDG_DATA_HOME",
+                &root.join("share").display().to_string(),
+                &roots
+            ),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn the_operator_fragment_and_a_data_home_beneath_its_root_scan_clean_in_all_three_layouts() {
+        use Reason::{ContainsBxDirectory, DeclaredRootItself};
+        // The home beside the scratch root, equal to it, and under it. A data
+        // home at the root is refused in each: beside, because uv would write
+        // beside the root; equal and under, because the root holds bx's
+        // directories, which outranks it.
+        for (roots, at_root) in [
+            (rooted(), DeclaredRootItself),
+            (
+                RootSet::new(Path::new(ROOT), &[PathBuf::from(ROOT)]),
+                ContainsBxDirectory,
+            ),
+            (
+                RootSet::new(
+                    Path::new("/var/mnt/scratch/example/home"),
+                    &[PathBuf::from(ROOT)],
+                ),
+                ContainsBxDirectory,
+            ),
+        ] {
+            assert_eq!(scan_with(OPERATOR_FRAGMENT, &roots), vec![], "{roots:?}");
+            let beneath = format!("{OPERATOR_FRAGMENT}export XDG_DATA_HOME=\"$DATA_DIR\"\n");
+            assert_eq!(scan_with(&beneath, &roots), vec![], "{roots:?}");
+            let at = format!("{OPERATOR_FRAGMENT}export XDG_DATA_HOME=\"$SCRATCH_HOME\"\n");
+            assert_eq!(reasons(&at, &roots), vec![(26, at_root)], "{roots:?}");
+        }
+        // Written in terms of the home, under a `~` root.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let at_home = OPERATOR_FRAGMENT.replacen(
+            "export SCRATCH_HOME=\"/var/mnt/scratch/example\"",
+            "export SCRATCH_HOME=\"$HOME\"",
+            1,
+        );
+        assert_ne!(at_home, OPERATOR_FRAGMENT);
+        assert_eq!(scan_with(&at_home, &home_rooted), vec![]);
+        assert_eq!(
+            reasons(
+                &format!("{at_home}export XDG_DATA_HOME=\"$SCRATCH_HOME\"\n"),
+                &home_rooted
+            ),
+            vec![(26, ContainsBxDirectory)]
+        );
+        let found = scan(OPERATOR_FRAGMENT);
+        assert_eq!(found.len(), 25);
+        assert!(found.iter().all(|v| v.reason == Reason::NoRootsDeclared));
+    }
+
+    #[test]
+    fn cache_dir_is_read_by_find_cache_dir_and_judged_as_a_location() {
+        // npm's find-cache-dir writes, and may clear, `$CACHE_DIR/<name>` for a
+        // name its consumer picks. A consumer named `bx` under
+        // `CACHE_DIR=~/.local/state` or `~/.config`, or one named `state` under
+        // `CACHE_DIR=~/.local`, reaches bx's directories. So `CACHE_DIR` may not
+        // contain them, while the two anchors no tool is known to read still may.
+        assert_eq!(emittable("CACHE_DIR"), Some(Kind::Location));
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for value in ["~/.local/state", "~/.config", "~/.local"] {
+            assert_eq!(
+                reason_of(&check("CACHE_DIR", value, &home_rooted)),
+                Some(Reason::ContainsBxDirectory),
+                "{value}"
+            );
+            for anchor in ["DATA_DIR", "SCRATCH_HOME"] {
+                assert_eq!(
+                    check(anchor, value, &home_rooted),
+                    Verdict::Allowed,
+                    "{anchor}={value}"
+                );
+            }
+        }
+        assert_eq!(
+            scan_with(
+                "export SCRATCH_HOME=~\nCACHE_DIR=$SCRATCH_HOME/cache\n",
+                &home_rooted
+            ),
+            vec![]
+        );
+        // The one refusal this change turns into an approval. As an anchor,
+        // `CACHE_DIR` was one path with no `:` at all, so any `:` value was
+        // `UnlistedCharacter(':')`. As a location it is judged per `:`-entry
+        // and then as the whole path find-cache-dir joins its consumer's name
+        // onto, exactly as a tool reads `CARGO_HOME` — so a value whose
+        // entries and whole path all lie strictly beneath a root is allowed,
+        // and its verdict is `CARGO_HOME`'s. Revert the table line to
+        // `Kind::Anchor` and this fails.
+        // `Verdict` carries the name, so the two are compared by reason.
+        let colon_home = RootSet::new(
+            Path::new(&format!("{ROOT}/x:{ROOT}/y")),
+            &[PathBuf::from(ROOT)],
+        );
+        for (value, roots, reason) in [
+            (format!("{ROOT}/x:{ROOT}/y"), &rooted(), None),
+            (
+                format!("{ROOT}/x:{ROOT}/y/.local/state"),
+                &colon_home,
+                Some(Reason::ContainsBxDirectory),
+            ),
+            (
+                format!("{ROOT}/x:/etc"),
+                &rooted(),
+                Some(Reason::OutsideDeclaredRoots),
+            ),
+            (
+                format!("{ROOT}/x:{ROOT}"),
+                &rooted(),
+                Some(Reason::DeclaredRootItself),
+            ),
+        ] {
+            assert_eq!(
+                reason_of(&check("CACHE_DIR", &value, roots)),
+                reason,
+                "{value}"
+            );
+            assert_eq!(
+                reason_of(&check("CACHE_DIR", &value, roots)),
+                reason_of(&check("CARGO_HOME", &value, roots)),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            check("CACHE_DIR", &format!("{ROOT}/x:{ROOT}/y"), &rooted()),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn ordinary_settings_programs_and_lists_stay_allowed_beside_a_root() {
+        for roots in [rooted(), RootSet::strict()] {
+            for (name, value) in [
+                ("SCCACHE_CACHE_SIZE", "10G"),
+                ("MISE_JOBS", "8"),
+                ("UV_NO_CACHE", "1"),
+                ("MISE_VERBOSE", "0"),
+                ("CARGO_TERM_COLOR", "always"),
+                ("LANG", "C.UTF-8"),
+                ("EDITOR", "nvim"),
+                ("EDITOR", "/usr/bin/nvim"),
+                ("SSH_AUTH_SOCK", "/run/user/1000/ssh-agent"),
+            ] {
+                assert_eq!(
+                    check(name, value, &roots),
+                    Verdict::Allowed,
+                    "{name}={value} {roots:?}"
+                );
+            }
+        }
+        // A home is needed to expand `$HOME`, and the strict set has none.
+        assert_eq!(
+            check("PATH", "\"$HOME/.local/bin:$PATH\"", &rooted()),
+            Verdict::Allowed
         );
     }
 
@@ -5438,11 +6117,11 @@ mod tests {
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (
-                "export CACHE_DIR=~/.local\nexport GOPATH=~/go:$CACHE_DIR\n",
+                "export DATA_DIR=~/.local\nexport GOPATH=~/go:$DATA_DIR\n",
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (
-                "export CACHE_DIR=~/.local\nexport GOPATH=\"${CACHE_DIR}\"\n",
+                "export DATA_DIR=~/.local\nexport GOPATH=\"${DATA_DIR}\"\n",
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (
@@ -5512,7 +6191,11 @@ mod tests {
             // The home contains bx's directories (r3 round 2).
             ("~", Reason::ContainsBxDirectory),
             ("\"~x\"", NotAbsolute),
+            // Its first entry is the root itself, refused before `a` (#45).
+            // Since #47 round 1, `a` is judged for every other reason before
+            // any entry is judged for being a root, so `a` names the fix.
             ("/var/mnt/scratch/example:a", NotAbsolute),
+            ("/var/mnt/scratch/example/x:a", NotAbsolute),
             ("file:///var/mnt/scratch/example", NotAbsolute),
             ("1+x://y", NotAbsolute),
             ("", NotAbsolute),

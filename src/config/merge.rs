@@ -495,11 +495,14 @@ impl Merged<Target, TargetKey> {
     ///
     /// `earlier` are the layers folded before this one: a toggle is compared
     /// against their full entries' spellings, and this layer's, to decide which
-    /// hint a clash it is in gets.
+    /// hint a clash it is in gets. It is a slice of borrows rather than of
+    /// layers so that the whole set cannot be passed in its place: the caller
+    /// has to have collected the layers it folded, and a layer it has not
+    /// folded yet is not in the collection to pass.
     fn absorb_layer(
         &mut self,
         layer: &Layer,
-        earlier: &[Layer],
+        earlier: &[&Layer],
         values: &ResolvedValues,
         clashes: &mut Vec<Clash>,
     ) -> Result<(), Error> {
@@ -694,9 +697,18 @@ fn clash(
 /// spelling through this account's answer alone is not anchored, and neither
 /// is one whose pair with a declared spelling the written form does not
 /// decide.
-fn anchored(toggle: &str, earlier: &[Layer], layer: &Layer, values: &ResolvedValues) -> bool {
+///
+/// Which source decides a hint, and which cannot: only an earlier layer's
+/// entry can. An entry in `layer` itself is one path as written with the
+/// toggle, so [`clash`] refuses the pair as that layer naming one file twice
+/// before any hint is chosen. And an entry a later layer declares would settle
+/// the clash rather than change its hint, since a full entry drops every clash
+/// held for its file. Both arms are kept all the same: this answers what bx
+/// can show about one toggle, and neither of those rules is its to assume.
+fn anchored(toggle: &str, earlier: &[&Layer], layer: &Layer, values: &ResolvedValues) -> bool {
     earlier
         .iter()
+        .copied()
         .chain([layer])
         .flat_map(|layer| &layer.config.targets)
         .any(|target| one_path_as_written(toggle, target.path.as_str(), values))
@@ -958,8 +970,13 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
 
     let mut targets: Merged<Target, TargetKey> = Merged::default();
     let mut clashes: Vec<Clash> = Vec::new();
-    for (index, layer) in layers.iter().enumerate() {
-        targets.absorb_layer(layer, &layers[..index], &resolved, &mut clashes)?;
+    // Built as the fold goes rather than sliced by index: what a toggle may be
+    // judged against is the layers already folded, and a layer only enters this
+    // list once it has been.
+    let mut folded: Vec<&Layer> = Vec::with_capacity(layers.len());
+    for layer in layers {
+        targets.absorb_layer(layer, &folded, &resolved, &mut clashes)?;
+        folded.push(layer);
     }
 
     Ok(Config {

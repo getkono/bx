@@ -2168,7 +2168,8 @@ mod tests {
     const CANNOT_SHOW_ANY: &str = "; keep one of these toggles and remove the rest: bx cannot \
                                    show that any of them names a declared target for every \
                                    answer, so another answer may leave one toggling a file no \
-                                   earlier layer declares";
+                                   earlier layer declares; the one kept decides whether that \
+                                   file's target is enabled";
 
     /// The layers merged and resolved with no conflict, no block and no error:
     /// a configuration that loads. The ready targets, as path and body.
@@ -2513,7 +2514,9 @@ mod tests {
         // `two_toggles_that_each_cancel_a_placeholder_meet_for_one_answer_only`'s
         // toggles. Neither is the declared spelling, so neither is the one to
         // keep: either is. With the target declared in an earlier layer the
-        // two toggles are the whole clash, so keeping one clears it.
+        // two toggles are the whole clash, so keeping one clears it — and the
+        // two disagree on `enabled`, so which one is kept decides whether the
+        // target ships, which is what the hint says it does.
         const DECLS: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
                              [[value]]\nname = \"q\"\nkind = \"string\"\n";
         let first = "[[target]]\npath = \"~/.config/{{p}}/../s\"\nenabled = false\n";
@@ -2541,7 +2544,18 @@ mod tests {
             ),
             "{hint}"
         );
-        assert!(loads(&earlier(first)).is_empty(), "the one target is off");
+        assert!(
+            loads(&earlier(first)).is_empty(),
+            "the kept toggle switched the one target off"
+        );
+        assert_eq!(
+            loads(&earlier(second)),
+            [(
+                "~/.config/s".to_string(),
+                crate::config::target::Body::Inline("S".to_string())
+            )],
+            "the other kept toggle leaves it on"
+        );
 
         // In that test's own layout the target is declared beside the toggles,
         // so the full entry is in the clash too: keeping one toggle would leave

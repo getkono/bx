@@ -1314,7 +1314,10 @@ impl ResolvedValues {
     /// the spellings in the order read, each with its line, and flagged when it
     /// is such a toggle. Each flagged one is named; when every statement is
     /// flagged, none is the one to keep, so the hint says to keep any one, and
-    /// nothing stays to answer for.
+    /// nothing stays to answer for. Which one is kept is not indifferent — the
+    /// toggles in a clash need not agree on `enabled`, and the one kept is the
+    /// one that decides — so the keep-one wording says so rather than leaving
+    /// an account to find the target off when it read "keep any".
     #[must_use]
     pub(crate) fn removal_hint(
         &self,
@@ -1332,7 +1335,7 @@ impl ResolvedValues {
                 "{problem}, because of {answers}; keep one of these toggles and remove the \
                  rest: bx cannot show that any of them names a declared target for every \
                  answer, so another answer may leave one toggling a file no earlier layer \
-                 declares"
+                 declares; the one kept decides whether that file's target is enabled"
             );
         }
         let named = statements_named(unshown.iter().copied());

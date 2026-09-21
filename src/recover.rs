@@ -573,12 +573,14 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         }
         resolved += 1;
     }
-    if conflicts.is_empty()
-        && let (Some(ledger), Some(home)) = (ledger.as_mut(), home)
-    {
-        journal::hand_off_claims(ledger, home, released)?;
-    }
-
+    // Blocked first, and *before* the hand-off. r3 coverage COV4: the
+    // hand-off used to stand ahead of this return behind a
+    // `conflicts.is_empty()` guard, and deleting that guard changed no
+    // assertion — a blocked run saves no ledger, so the mutation it protected
+    // against was invisible and the arm's correctness rested on the drop.
+    // Returning first is the same behaviour with the ordering as the
+    // guarantee: past this point there are no conflicts, so nothing has to say
+    // so a second time.
     if !conflicts.is_empty() {
         tracing::error!(
             blocked = conflicts.len(),
@@ -586,6 +588,10 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             "recovery is blocked; the journal is kept and bx will not write until it is resolved",
         );
         return Ok(Outcome::Blocked { conflicts });
+    }
+
+    if let (Some(ledger), Some(home)) = (ledger.as_mut(), home) {
+        journal::hand_off_claims(ledger, home, released)?;
     }
 
     if let Some(ledger) = &ledger {
@@ -2080,6 +2086,107 @@ mod tests {
                 .value
                 .get(&portable)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_blocked_recovery_hands_no_claim_on_and_leaves_the_saved_ledger_alone() {
+        // r3 coverage COV4. One terminated journal holding both a blocked
+        // intent and a released removal: the removal's claims must not reach
+        // the entry beneath them while the run returns `Blocked`, and the
+        // saved ledger must be exactly what it was. Once the conflict is
+        // cleared, the same journal hands them on, which is what says the
+        // first half is "not yet" rather than "never".
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let theirs = "theirs\n";
+        plant_file(&home.child(".blocked"), theirs, Mode::DEFAULT_FILE);
+
+        // bx makes ~/.config/app for gone.conf, which claims it and ~/.config;
+        // heir.conf goes in beside it and claims nothing.
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        for rel in [".config/app/gone.conf", ".config/app/heir.conf"] {
+            session
+                .apply(write_to(home.path(), rel, "bx\n", Mode::DEFAULT_FILE))
+                .expect("apply");
+        }
+        session.finish().expect("finish");
+        let (gone, gone_dest) = target(home.path(), ".config/app/gone.conf");
+        let (heir, _) = target(home.path(), ".config/app/heir.conf");
+        let claims = vec![home.child(".config"), home.child(".config/app")];
+        let saved_claims = |what: &Portable| -> Vec<PathBuf> {
+            let mut dirs = LedgerView::read(&state, home.path())
+                .expect("read the ledger")
+                .value
+                .get(what)
+                .map(|entry| {
+                    entry
+                        .created_dirs
+                        .iter()
+                        .map(|dir| dir.render(home.path()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            dirs.sort();
+            dirs
+        };
+        assert_eq!(saved_claims(&gone), claims, "gone.conf claims both");
+        assert!(saved_claims(&heir).is_empty(), "heir.conf claims neither");
+
+        // The interrupted session removes gone.conf, releasing both claims,
+        // and rewrites ~/.blocked, whose prior snapshot then goes missing.
+        interrupted(
+            &state,
+            home.path(),
+            vec![
+                Request {
+                    target: gone.clone(),
+                    dest: gone_dest.clone(),
+                    content: Content::Absent {
+                        created_dirs: claims.iter().rev().cloned().collect(),
+                        planned: fs::observe(&gone_dest).expect("plan's observation"),
+                    },
+                    mode: Mode::DEFAULT_FILE,
+                    ownership: Ownership::Released,
+                },
+                write_to(home.path(), ".blocked", "bx\n", Mode::DEFAULT_FILE),
+            ],
+        );
+        seal(&state.journal(), 2);
+        let blob = state
+            .restore()
+            .join(ContentHash::of(theirs.as_bytes()).to_hex());
+        std::fs::remove_file(&blob).expect("delete the snapshot");
+
+        let outcome = recover(&state).expect("recover");
+        assert!(
+            matches!(&outcome, Outcome::Blocked { conflicts } if conflicts.len() == 1),
+            "{outcome:?}"
+        );
+        assert!(state.journal().exists(), "the journal is kept");
+        assert_eq!(
+            saved_claims(&gone),
+            claims,
+            "a blocked run saves no ledger, so the removal's entry stands",
+        );
+        assert!(
+            saved_claims(&heir).is_empty(),
+            "and no claim was handed to the entry beneath them",
+        );
+
+        // Clear the conflict and run again: now the hand-off happens.
+        std::fs::write(&blob, theirs).expect("put the snapshot back");
+        let outcome = recover(&state).expect("recover again");
+        assert!(
+            matches!(outcome, Outcome::Recorded { entries: 2 }),
+            "{outcome:?}"
+        );
+        assert!(saved_claims(&gone).is_empty(), "the removal is recorded");
+        assert_eq!(
+            saved_claims(&heir),
+            claims,
+            "and both claims reached the entry still beneath them",
         );
     }
 

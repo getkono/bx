@@ -6828,25 +6828,82 @@ mod tests {
         },
     ];
 
-    /// The variable that excuses a machine from supplying the shells.
+    /// The variable that excuses a machine from supplying the programs these
+    /// checks are held against.
     ///
-    /// Differential agreement with real bash and zsh is this module's
+    /// Differential agreement with real bash, zsh, bun and uv is this module's
     /// strongest evidence, and a check that quietly asserts nothing is worse
-    /// than no check at all: `cargo test` hides `eprintln!`, so a skip
-    /// announced that way is invisible and the suite still reports green.
-    /// Skipping therefore has to be asked for by name, from outside the suite,
-    /// and every other run fails instead.
+    /// than no check at all. Skipping therefore has to be asked for by name,
+    /// from outside the suite, and every other run fails instead.
     const WITHOUT_SHELLS: &str = "BX_TEST_WITHOUT_SHELLS";
 
-    /// Whether this machine has been excused from supplying the shells.
-    fn shells_are_excused() -> bool {
-        std::env::var_os(WITHOUT_SHELLS).is_some()
+    /// The variable every continuous-integration runner sets.
+    const ON_A_RUNNER: &str = "CI";
+
+    /// Announce a skip where a passing test's output is still read.
+    ///
+    /// `cargo test` captures what a test prints and shows it only for a test
+    /// that *fails*, so an `eprintln!` from a skip — which passes — is
+    /// announced to nobody. That is the silent skip [`WITHOUT_SHELLS`] exists
+    /// to prevent, reintroduced by the notice meant to make it visible.
+    /// Writing to the process's own stderr goes around the capture, so an
+    /// opted-in skip is seen.
+    fn announce(message: &str) {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{message}");
     }
 
-    /// The installed shell `program` resolves to.
+    /// Whether an excuse that was `asked` for is honoured on a machine that
+    /// `is_ci` says is a continuous-integration runner.
     ///
-    /// A shell that is not installed fails the check it would have run, unless
-    /// [`WITHOUT_SHELLS`] is set.
+    /// **A runner may not excuse itself**, and that is decided here rather
+    /// than in a workflow file. A CI step asserting the variable were unset
+    /// would bind this repository's own workflow and nothing else, and the
+    /// edit that set the variable could drop the step in the same breath.
+    /// Here, a runner that asks fails the suite it is running — whatever the
+    /// workflow says, and on any runner, not only this repository's.
+    ///
+    /// This is not hypothetical: the uv check landed with no job installing
+    /// uv, and both test jobs failed. Had either carried [`WITHOUT_SHELLS`],
+    /// they would have passed with the differential sweeps never run.
+    fn excuse_honoured(asked: bool, is_ci: bool) -> bool {
+        assert!(
+            !(asked && is_ci),
+            "{WITHOUT_SHELLS} is set and so is {ON_A_RUNNER}: a runner may not \
+             excuse itself from the differential checks, which are this \
+             module's strongest evidence. Install the missing program on the \
+             runner instead."
+        );
+        asked
+    }
+
+    /// Whether this machine has been excused from supplying the programs.
+    fn shells_are_excused() -> bool {
+        excuse_honoured(
+            std::env::var_os(WITHOUT_SHELLS).is_some(),
+            std::env::var_os(ON_A_RUNNER).is_some(),
+        )
+    }
+
+    #[test]
+    fn a_runner_may_not_excuse_itself_from_the_differential_checks() {
+        // Off a runner the excuse is honoured, and it is never invented.
+        assert!(excuse_honoured(true, false));
+        assert!(!excuse_honoured(false, false));
+        assert!(!excuse_honoured(false, true));
+    }
+
+    #[test]
+    #[should_panic(expected = "a runner may not excuse itself")]
+    fn a_runner_that_asks_to_be_excused_fails_instead() {
+        excuse_honoured(true, true);
+    }
+
+    /// The installed program `program` resolves to.
+    ///
+    /// A program that is not installed fails the check it would have run,
+    /// unless [`WITHOUT_SHELLS`] excuses this machine — which, per
+    /// [`excuse_honoured`], no runner may be.
     fn installed(program: &str) -> Option<PathBuf> {
         match crate::detect::locate_in_env(program) {
             crate::detect::Presence::Present { path } => Some(path),
@@ -6857,7 +6914,9 @@ mod tests {
                      would assert nothing — install it, or set {WITHOUT_SHELLS} \
                      to skip those checks on purpose"
                 );
-                eprintln!("skipping the {program} checks: {WITHOUT_SHELLS} is set");
+                announce(&format!(
+                    "skipping the {program} checks: {WITHOUT_SHELLS} is set"
+                ));
                 None
             }
         }

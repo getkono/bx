@@ -68,13 +68,18 @@
 //! **A miss is reached as a toggle, not as a full entry.** A `[[target]]`'s
 //! `path` is a [`Portable`](crate::paths::Portable) parsed by
 //! `Portable::parse_in`, which normalises the spelling with its placeholders
-//! still in it and refuses one that opens with a placeholder or reduces to a
-//! root; and two full entries whose normalised spellings coincide are refused
-//! as a duplicate target before `merge` runs. A toggle names a key by the
-//! spelling it reaches and is held to neither rule, so that is the route by
-//! which one of these pairs becomes a [`Conflict`].
+//! still in it; a spelling it rejects, and a pair whose normalised spellings
+//! coincide, are both refused before `merge` runs. Which rule catches a given
+//! registered spelling differs between them, and nothing here depends on
+//! which. A toggle names a key by the spelling it reaches and is held to none
+//! of those rules, so that is the route by which one of these pairs becomes a
+//! [`Conflict`]. The two halves are executed at different widths, deliberately:
+//! `no_registered_pair_reaches_the_comparison_as_full_entries` asserts the
+//! full-entry refusal for **every** entry in `UNDECIDED`, since that half
+//! generalises and a new entry must satisfy it too, while
 //! `a_registered_pair_reaches_the_comparison_as_a_toggle_and_not_as_a_full_entry`
-//! executes both halves.
+//! carries **one** worked pair all the way to a blocked file, since that half
+//! needs an anchor target chosen for the pair.
 //!
 //! **The two registers are tests, not prose**, so that each entry is measured
 //! at the head it is published against rather than carried forward:
@@ -1707,9 +1712,13 @@ mod tests {
     /// How `first` and `second` key across `answers`: whether some answer gives
     /// them one file, and the first answer that gives them different keys.
     ///
-    /// A pair is **undecided** when some answer met, none parted, and
-    /// [`one_path_as_written`] says false — one file for every answer in the
-    /// set, which the written form does not see.
+    /// This decides nothing on its own: it reports over whatever `answers` it
+    /// is handed. A pair is **undecided** when some answer met, none parted,
+    /// and [`one_path_as_written`] says false — for `answers` **drawn against
+    /// one home**, which is the only set over which that conjunction is the
+    /// account's experience. `UNDECIDED`'s test is what applies it that way;
+    /// handing this the union of every home asks a different and stricter
+    /// question, and one registered pair does not survive it.
     fn keying(
         first: &str,
         second: &str,
@@ -1893,8 +1902,18 @@ mod tests {
 
     /// The pairs the written form is known **not** to decide.
     ///
-    /// Each names one file under every answer [`answer_sets`] draws, and the
-    /// two written forms differ anyway. This is the register the module
+    /// For each, there is **some home** under which every answer
+    /// [`answer_sets_at`] draws keys the two spellings as one file, and the two
+    /// written forms differ anyway. Per home, and not over the union of them:
+    /// one entry below is one file for every answer only under a home of `/`,
+    /// and an account under that home has the unclearable block just the same.
+    /// That is the criterion
+    /// `every_pair_the_written_form_is_known_to_miss_is_still_missed`
+    /// executes — stated here in the words it executes, because a header
+    /// asserting the broader "under every answer" is the exact failure this
+    /// register replaced prose to end.
+    ///
+    /// This is the register the module
     /// documentation points at, kept here rather than in prose so that it is
     /// re-derived on every run: a pair that stops being undecided fails
     /// `every_pair_the_written_form_is_known_to_miss_is_still_missed`, and a
@@ -2115,6 +2134,41 @@ mod tests {
                 "{rule}: {first:?} and {second:?} with p={p:?} r={r:?}"
             );
         }
+    }
+
+    #[test]
+    fn no_registered_pair_reaches_the_comparison_as_full_entries() {
+        // The half of the reachability argument that generalises, executed over
+        // **every** entry rather than one worked example. Written as a pair of
+        // `[[target]]`s, each registered spelling is refused before `merge`
+        // runs at all — by whichever rule catches it, which differs between
+        // them: a spelling that opens with a placeholder, one that opens with a
+        // `~` glued to one, one that reduces to a root, and two whose
+        // normalised spellings coincide are four different refusals. The point
+        // is not which one fires but that none of these pairs ever reaches the
+        // comparison this way, so the register's consequence is a toggle's.
+        const VALUES: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                              [[value]]\nname = \"f\"\nkind = \"bool\"\n\
+                              [[value]]\nname = \"r\"\nkind = \"path\"\n";
+
+        let mut loaded: Vec<String> = Vec::new();
+        for (first, second, why) in UNDECIDED {
+            let text = format!(
+                "{VALUES}{}{}",
+                target_toml(first, "ONE"),
+                target_toml(second, "TWO")
+            );
+            if parse_str(&text, Path::new("bx.toml"), &home()).is_ok() {
+                loaded.push(format!("{first:?} and {second:?} ({why})"));
+            }
+        }
+        assert!(
+            loaded.is_empty(),
+            "{} registered pairs parse as full entries, so the register's \
+             toggle-only reachability no longer holds for them:\n{}",
+            loaded.len(),
+            loaded.join("\n")
+        );
     }
 
     #[test]

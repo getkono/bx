@@ -730,7 +730,7 @@ fn anchored(toggle: &str, earlier: &[&Layer], layer: &Layer, values: &ResolvedVa
 /// [`anchored`] also compares a toggle with every declared spelling, whatever
 /// its key. Soundness does not rest on the keys, so the verdict holds there
 /// too, and a spelling with no form counts as not one path, which errs toward
-/// the removal hint, whose advice can always be followed.
+/// the removal hint, every act of which can be followed.
 fn one_path_as_written(first: &str, second: &str, values: &ResolvedValues) -> bool {
     written_form(first, values).is_some_and(|form| Some(form) == written_form(second, values))
 }

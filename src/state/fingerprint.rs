@@ -248,7 +248,9 @@ mod tests {
         // `Health::Loaded` into `Health::Reset(Malformed)` with the suite
         // still green, defeating the forward-compatibility argument that
         // justifies the named encoding in `store::save`.
-        #[derive(Serialize)]
+        // `Deserialize` too, because `store::save` decodes its own bytes and
+        // re-encodes them to establish the payload iterates deterministically.
+        #[derive(Serialize, Deserialize)]
         struct NoEntries {}
 
         let home = guarded_home();

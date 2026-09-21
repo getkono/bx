@@ -174,9 +174,14 @@ pub enum Damage {
     /// wrote. Left in place it would be sorted among real ancestors by a depth
     /// that says nothing about it, and `bx rm` would remove a directory it
     /// never created for that target.
+    ///
+    /// The **directory** is what is dropped, not the entry: the entry, its
+    /// prior and its history are loaded, less the directories named here.
     UnrelatedCreatedDirs {
-        /// Every damaged row, as `(target, the directory that is not its
-        /// ancestor)`, in the order the file stores them. Never empty.
+        /// Every directory dropped, as `(target, the directory that is not its
+        /// ancestor)`, in the order the file stores them — ascending by
+        /// target, and within a target in the entry's own list order. Never
+        /// empty.
         rows: Vec<(String, String)>,
     },
 }
@@ -207,7 +212,19 @@ pub(crate) enum Rejected {
     ///
     /// The [`Damage`] carried must be one [`Damage::is_partial`] accepts, so
     /// that a caller reading the health can tell partial survival from a total
-    /// reset.
+    /// reset. A `debug_assert` in [`judge`] holds a `check` to it.
+    ///
+    /// **A `check` therefore cannot report whole-file damage** — the variant
+    /// that could was deleted in r4 round 2 (D8) because nothing constructed
+    /// it, and this is the consequence, recorded rather than left to be
+    /// discovered (r4 round 3, CL1). Clearing the value and returning a
+    /// non-row `Damage` here is not a way round it: the `debug_assert` refuses
+    /// exactly that, because `is_partial` would then say the rows named are
+    /// the whole loss when nothing was named and everything was lost. A check
+    /// that genuinely needs it — one that can tell the whole file is
+    /// unusable from something `decode` cannot see — should restore the
+    /// `Rejected::Damage` variant and the two `judge` arms it needs. Nothing
+    /// in the crate has that shape today: every check here looks at rows.
     PartialDamage(Damage),
     /// The contents may be intact, and the context they were checked against is
     /// what is wrong. Returned to the caller; nothing is renamed.
@@ -215,19 +232,27 @@ pub(crate) enum Rejected {
 }
 
 impl Damage {
-    /// Whether this damage is confined to rows a loader can remove, leaving
-    /// the rest of the file's contents loaded.
+    /// Whether this damage is confined to what its rows name, leaving the rest
+    /// of the file's contents loaded.
     ///
     /// This is what tells a caller holding a [`Health::Reset`] or a
     /// [`Health::Damaged`] whether the value beside it is the empty default or
     /// what survived. Row-shaped damage is found by a loader's `check`, which
-    /// removes the rows it names and keeps the others; every other variant is
-    /// found by `decode`, before there is a value at all, and costs the whole
-    /// file.
+    /// drops what the rows name and keeps everything else; every other variant
+    /// is found by `decode`, before there is a value at all, and costs the
+    /// whole file.
     ///
     /// A `true` here does **not** promise the value is non-empty: a file whose
-    /// every row was damaged keeps none. It promises that the rows named are
-    /// the whole of what was lost (r4 round 2, D2 and CL4).
+    /// every row was damaged keeps none. It promises that what the rows name
+    /// is the whole of what was lost (r4 round 2, D2 and CL4) — which is why a
+    /// `check` that finds two kinds of row damage at once reports one and acts
+    /// on only that one, leaving the other for the next load
+    /// (r4 round 3, D1).
+    ///
+    /// What a row costs is the variant's own business: a
+    /// [`Damage::KeyMismatch`] row costs its whole entry, and a
+    /// [`Damage::UnrelatedCreatedDirs`] row costs one directory out of an
+    /// entry that is otherwise loaded.
     #[must_use]
     pub fn is_partial(&self) -> bool {
         match self {
@@ -726,12 +751,35 @@ fn degrade<T>(
 /// `HashMap`, `HashSet` and anything iterating over them are the shapes that
 /// break it.
 ///
-/// So the constraint is carried as a shared *obligation* rather than a bound:
-/// every payload type's test module calls
-/// [`assert_saves_identically`][self::tests::assert_saves_identically], which
-/// saves twice and compares the bytes. A new payload type that adds a
-/// `HashMap` field fails that test rather than passing a suite nobody thought
-/// to extend.
+/// So the constraint is carried by a check **inside this function**, on every
+/// save a test makes: the bytes are decoded back into `T` and re-encoded, and
+/// the two encodings must be identical. Decoding builds every `HashMap` in the
+/// payload afresh, with its own `RandomState`, so a map that iterates in hash
+/// order encodes differently the second time and the save fails where it is
+/// made. That is why `T` is bound by [`DeserializeOwned`] as well as
+/// [`Serialize`] — every state payload is loadable anyway.
+///
+/// **It is here rather than at a call site because three call-site shapes in a
+/// row satisfied the obligation while proving nothing** (r4 rounds 1, 2 and 3):
+/// a value saved twice instead of built twice; a constructor that cloned; and a
+/// constructor that built the old fields and left a new one empty. Each fix
+/// closed the hole it was shown. A check a caller can write in a way that
+/// passes vacuously is not a constraint, and the call site is where the
+/// vacuity lives — so the constraint moved to the one place every payload
+/// type, present and future, has to go through, and which no test module can
+/// decline to call.
+///
+/// What it catches: any map in any payload, at any depth, that holds two or
+/// more keys and iterates in hash order — on the first save any test makes of
+/// such a value. What it does not catch: a collection field **no test and no
+/// production path ever populates with two entries**. That residual is not a
+/// gap in Invariant 3: an empty or one-entry map encodes identically however it
+/// iterates, so a field nothing fills cannot make a generated file differ
+/// between runs. It becomes catchable the moment anything fills it.
+///
+/// [`assert_saves_identically`] remains, beside this, as the payload-type-level
+/// statement that *two independently built values* agree — the in-process
+/// stand-in for "between runs" that a single value cannot make.
 ///
 /// # Errors
 ///
@@ -740,7 +788,7 @@ fn degrade<T>(
 /// failure. A failure leaves the previous file exactly as it was, except a
 /// failing `fsync` of the directory after the rename, which is returned with
 /// the new file already in place — see [`write_atomically`].
-pub(crate) fn save<T: Serialize>(
+pub(crate) fn save<T: Serialize + DeserializeOwned>(
     path: &Path,
     kind: &'static str,
     version: u16,
@@ -758,12 +806,45 @@ pub(crate) fn save<T: Serialize>(
     // Both are deterministic; only one is evolvable.
     let bytes =
         rmp_serde::to_vec_named(&envelope).map_err(|source| Error::Encode { kind, source })?;
+    #[cfg(test)]
+    assert_reencodes_identically::<T>(&bytes, kind);
     // Every state file StateDir names is `root.join(<name>)`, so a parent always exists.
     if let Some(parent) = path.parent() {
         ensure_dir(parent, Mode::PRIVATE_DIR)?;
     }
     write_atomically(path, &bytes, Mode::PRIVATE_FILE)?;
     Ok(())
+}
+
+/// Assert that `bytes`, decoded into `T` and encoded again, is `bytes`.
+///
+/// [`save`]'s determinism obligation, made where it cannot be opted out of.
+/// The decode is what gives it teeth: it builds every `HashMap` in the payload
+/// afresh, with its own `RandomState`, so a map that iterates in hash order
+/// comes back in a different order and the re-encoding differs. A `BTreeMap`
+/// comes back in key order both times, as do struct fields, which are emitted
+/// in declaration order by `to_vec_named`.
+///
+/// A decode failure is a failure too, and a real one: [`load`] would refuse
+/// the file this `save` is about to write, which is a payload type whose
+/// `Serialize` and `Deserialize` disagree.
+///
+/// Test-only. The property is about the *type*, so one process establishing it
+/// for every payload the suite saves establishes it for every run; paying two
+/// encodings and a decode on every production save would buy nothing.
+#[cfg(test)]
+fn assert_reencodes_identically<T: Serialize + DeserializeOwned>(bytes: &[u8], kind: &'static str) {
+    let decoded: Envelope<T> = match rmp_serde::from_slice(bytes) {
+        Ok(decoded) => decoded,
+        Err(why) => panic!("{kind} does not decode the bytes it just encoded: {why}"),
+    };
+    let again = rmp_serde::to_vec_named(&decoded).expect("re-encoding a decoded envelope");
+    assert!(
+        again == bytes,
+        "{kind} does not encode the same value to the same bytes: decoding it and encoding it \
+         again gives different bytes, which means something in the payload iterates in hash \
+         order. Invariant 3 forbids it — use a BTreeMap, not a HashMap",
+    );
 }
 
 /// Assert that a value built twice saves to the same bytes — [`save`]'s
@@ -787,13 +868,30 @@ pub(crate) fn save<T: Serialize>(
 /// bucket layout along with the contents, so two clones of one value iterate
 /// identically and a hash-ordered payload passes — which is exactly how both
 /// real call sites defeated this assertion when they read `|| value.clone()`
-/// (r4 round 2, D1). Build enough keys, too: two independently built hash maps
-/// of two keys agree half the time.
+/// (r4 round 2, D1). Build enough keys, too: measured over 3000 trials, two
+/// independently built hash maps agree 1456 times at two keys, 140 at four,
+/// and never at eight, sixteen or sixty-four (r4 round 3).
+///
+/// # What this does *not* establish, and what does
+///
+/// It proves nothing about a field `make` leaves empty. A constructor that
+/// builds the fields it knew about and leaves a newly added `HashMap` at its
+/// default satisfies this assertion while saying nothing about it — the third
+/// way a call site has satisfied the obligation vacuously (r4 round 3, D3).
+/// **That hole is closed in [`save`] itself, not here**: every save a test
+/// makes decodes its own bytes and re-encodes them, and no payload type or
+/// test module can decline to go through it. Read [`save`]'s own section for
+/// what that catches and what it leaves.
+///
+/// What this adds over that check, and the reason it stays: `save`'s check
+/// works on one value, and this one works on **two independently built**
+/// values. That is the in-process stand-in for "between runs", and one value
+/// cannot make it however often it is encoded.
 ///
 /// [`save`] itself is called, rather than the encoder, so the property pinned
 /// is the one the file on disk has.
 #[cfg(test)]
-pub(crate) fn assert_saves_identically<T: Serialize>(
+pub(crate) fn assert_saves_identically<T: Serialize + DeserializeOwned>(
     kind: &'static str,
     version: u16,
     make: impl Fn() -> T,
@@ -1712,6 +1810,25 @@ mod tests {
             "the writer's file is where it saved it"
         );
         assert_eq!(names_but_the_lock(dir.path()), vec!["v.mpk"]);
+    }
+
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "the guard is a debug_assert")]
+    #[should_panic(expected = "`Damage::is_partial` accepts")]
+    fn a_check_reporting_whole_file_damage_as_partial_is_refused() {
+        // r4 round 3 (COV2): the guard that holds `Rejected::PartialDamage` to
+        // row-shaped damage was reached by no test, so the body's claim that
+        // the two "cannot drift" rested on an assertion nothing exercised.
+        // `Damage::Malformed` is what `decode` produces for a whole file, and
+        // a check answering with it would make `is_partial` say the rows named
+        // are the whole loss when nothing was named.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        save(&path, KIND, VERSION, &sample()).expect("seed");
+        let _ = load_checked::<Value>(&path, KIND, VERSION, Loss::Recomputable, None, |value| {
+            value.clear();
+            Err(Rejected::PartialDamage(Damage::Malformed))
+        });
     }
 
     #[test]

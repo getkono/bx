@@ -3313,7 +3313,7 @@ mod tests {
     fn an_entry_without_created_dirs_still_loads() {
         // The `serde(default)` guarantee that justifies named encoding: a
         // ledger written before the field existed still loads.
-        #[derive(Serialize)]
+        #[derive(Serialize, Deserialize)]
         struct Old {
             path: Portable,
             written: ContentHash,
@@ -3321,7 +3321,9 @@ mod tests {
             mechanism: Mechanism,
             prior: Prior,
         }
-        #[derive(Serialize)]
+        // `Deserialize` too, because `store::save` decodes its own bytes and
+        // re-encodes them to establish the payload iterates deterministically.
+        #[derive(Serialize, Deserialize)]
         struct OldView {
             entries: BTreeMap<Portable, Old>,
         }

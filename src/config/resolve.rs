@@ -258,13 +258,14 @@ fn resolve_target(
     // blocked here. Behind the repo defects above, which no answer could
     // clear.
     //
-    // Not ahead of a switched-off declaration, though the disabled block sits
-    // below: while the switch is off, the answer under it is not this
-    // account's value, so this walk does not see it and the switch is reported
-    // first. Re-enabling then lands here. That is two true statements in the
-    // order they become true, each one progress, and not the loop this
-    // placement exists to avoid — which is a hint whose act returns the target
-    // to the *same* block.
+    // A switched-off declaration *on the walk* is no exception to that. The
+    // walk does not follow the answer under it, because while the switch is
+    // off that answer is not this account's value, so there is nothing here to
+    // outrank anything with and whatever the probe found reports instead.
+    // `a_disabled_value_s_answer_is_not_walked` is that case; an unrelated
+    // switched-off value is not, and
+    // `a_path_answer_block_outranks_an_unrelated_disabled_or_invalid_value`
+    // is that one.
     if let Body::File(file) = &target.body
         && let Some((names, hint)) =
             refuse_path_answer_in_file(target, &file.to_string_lossy(), values, assignments)
@@ -605,6 +606,19 @@ enum Step<'a> {
 /// that reading decides nothing.
 /// `a_switched_off_path_declaration_still_ends_the_walk` and
 /// `a_disabled_value_s_answer_is_not_walked` pin both halves.
+///
+/// The rule is stated with its sites, so a reader can check it rather than
+/// take it. Every consultation of `enabled` in the configuration asks the
+/// account-value question: [`ResolvedValues::decls`] and
+/// [`ResolvedValues::unset`] list what this account may answer, `roots`, the
+/// substitution and the per-kind checks in `values` ask the same of one
+/// declaration, and `merge`'s toggle checks ask it of one layer's entry.
+/// Everything that asks what a declaration *is* reads it through
+/// [`ResolvedValues::decl`], which is unfiltered, and ignores `enabled`: this
+/// walk's terminal, [`path_value_behind`], and `merge`'s kind lookups.
+/// [`in_declaration_order`] was the one exception — it indexed against the
+/// filtered `decls`, so a switch moved a declaration's position — and it is
+/// now indexed against [`ResolvedValues::index_of`], which counts them all.
 ///
 /// `seen` stops the walk at a name it has already walked, and it is
 /// load-bearing here for the reason [`path_value_behind`] gives: an overridden

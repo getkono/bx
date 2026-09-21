@@ -2652,6 +2652,10 @@ mod tests {
         let names: Vec<&str> = body
             .lines()
             .map(|line| line.trim())
+            // A trailing `// note` is legal, `cargo fmt` keeps it, and reading
+            // the line without dropping it hid `ProbeVariant, // note` from
+            // round 4's probe entirely.
+            .map(|line| line.split("//").next().unwrap_or(line).trim())
             .filter_map(|line| line.strip_suffix(','))
             // A variant is `Name,` or `Name(Type),`. Doc comments, `#[error]`
             // attributes and their wrapped strings are none of those shapes.
@@ -2665,13 +2669,35 @@ mod tests {
                 shaped.then_some(head)
             })
             .collect();
-        // If the scrape ever stops matching the declaration it must fail
-        // loudly rather than return a short list the walk would then agree
-        // with. Two variants that have been there since the enum was written
-        // are the canary.
+        // **The census is checked against a second count read out of the same
+        // block**, and this is the part that makes it a property rather than
+        // another pattern that holds until it does not.
+        //
+        // `thiserror` requires an `#[error(...)]` on every variant of this
+        // enum — the crate will not derive `Display` without one — so the
+        // number of `#[error(` lines in the block *is* the number of variants,
+        // arrived at by a different route than reading the variant lines. Two
+        // counts from one source: a variant that hides from the name scrape
+        // has to hide from the message count as well, and nothing that hides a
+        // `#[error(` line still compiles.
+        //
+        // The canary this replaces asserted that two names were *present*. It
+        // could not see a census that had shrunk, which is exactly how the
+        // trailing-comment variant survived — the third generation of the same
+        // defect on this module, found inside the fix for the second.
+        let messages = body
+            .lines()
+            .filter(|line| line.trim_start().starts_with("#[error("))
+            .count();
+        assert_eq!(
+            names.len(),
+            messages,
+            "the Reason census read {names:?} out of the source, but the enum declares \
+             {messages} messages — a variant the scrape cannot see, or one it invented"
+        );
         assert!(
-            names.contains(&"NoRootsDeclared") && names.contains(&"ExpansionTooLong"),
-            "the Reason census read {names:?} out of the source, which is not the enum"
+            messages > 0,
+            "no `#[error(` in the Reason enum, so the scrape is lost"
         );
         names
     }

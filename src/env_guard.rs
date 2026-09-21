@@ -54,14 +54,21 @@
 //! setting names no path at all, and is held to no path check.
 //!
 //! The **containing** check is the one that does not generalise, and
-//! deliberately: a tool clears the directory it is given, so only a kind that
-//! *is* given a directory can take bx's state down with it. It is asked of a
-//! location and of a list of locations, and of nothing else — not of a program,
-//! a search list or a socket, which are given no directory, and not of an
-//! anchor, which [`Kind::Anchor`] exempts because bx has found no tool that
-//! reads one. `a_location_may_not_contain_bxs_own_directories` asserts both
-//! halves, allowing an `EDITOR`, a `PATH` and an `SSH_AUTH_SOCK` that contain
-//! bx's directories on the same line as it refuses a `CARGO_HOME` that does.
+//! deliberately. The criterion is **whether the tool clears what it is given**:
+//! a tool empties its own cache or data directory, and everything beneath it
+//! goes too, so a kind naming a directory the tool *owns* can take bx's state
+//! down with it. A kind the tool only reads from cannot. That is the test to
+//! apply to a new kind — not whether its value happens to name a directory,
+//! which a search list's entries do: `PATH=/usr/bin:/opt/x/bin` is a list of
+//! directories and is approved, because nothing empties a `PATH` entry.
+//!
+//! So the check is asked of a location and of a list of locations, and of
+//! nothing else — not of a program, a search list or a socket, none of which
+//! its tool clears, and not of an anchor, which [`Kind::Anchor`] exempts
+//! because bx has found no tool that reads one at all.
+//! `a_location_may_not_contain_bxs_own_directories` asserts both halves,
+//! allowing an `EDITOR`, a `PATH` and an `SSH_AUTH_SOCK` that contain bx's
+//! directories on the same lines as it refuses a `CARGO_HOME` that does.
 //!
 //! The guard **fails closed by shape** as well. It does not model shell syntax
 //! and approve whatever it does not recognise: it reads a fragment against a
@@ -796,10 +803,10 @@ impl RootSet {
     /// Answering `false` instead is sound only because this is consulted from
     /// [`refuses_entry_bx`] alone, which [`judge`] reaches only for a location
     /// or a list of them — once per `:`-entry through
-    /// [`refuses_entry_placement`], and once for a location's whole value —
-    /// after [`RootSet::refuses_everything`] has already
-    /// refused a set with no admissible root — and the only set without a home
-    /// is [`RootSet::strict`], which declares none. A later kind given a
+    /// [`refuses_entry_placement`] and once for a location's whole value — and
+    /// only after [`RootSet::refuses_everything`] has refused a set with no
+    /// admissible root, and the only set without a home is
+    /// [`RootSet::strict`], which declares none. A later kind given a
     /// containing check must not simply call this: under `scan` it would get
     /// no protection at all, and it needs its own answer to the question
     /// above. `a_set_with_no_home_is_never_asked_what_holds_bxs_directories`
@@ -2647,8 +2654,9 @@ mod tests {
         // `.local/state/bx` may lie under any path at all, so a fallback would
         // have to refuse every path a homeless set is shown. Answering `false`
         // is sound only while the check is reached from `refuses_entry_bx`
-        // alone, behind `refuses_everything`. Both halves are pinned here, so a later
-        // kind given a containing check cannot inherit the hole unnoticed.
+        // alone, behind `refuses_everything`. Both halves are pinned here, so
+        // a later kind given a containing check cannot inherit the hole
+        // unnoticed.
         let strict = RootSet::strict();
         assert!(strict.owns(Path::new("/x/.local/state/bx/ledger")));
         assert!(strict.in_config_repo(Path::new("/x/.config/bx/bx.toml")));

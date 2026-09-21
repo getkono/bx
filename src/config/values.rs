@@ -1292,19 +1292,29 @@ impl ResolvedValues {
     /// account's answers, when a toggle among the statements cannot be shown to
     /// name a declared target whatever is answered.
     ///
-    /// Changing the answer is not offered. Under another answer such a toggle
-    /// may name a file no earlier layer declares, which fails the whole load,
-    /// so the answer that made the clash can be the only one that loads.
-    /// Removing the toggle can always be followed: a toggle creates no entry,
-    /// so removing one leaves nothing unknown, and every statement that stays
+    /// Changing the answer is not offered *for such a toggle*. Under another
+    /// answer it may name a file no earlier layer declares, which fails the
+    /// whole load, so the answer that made the clash can be the only one that
+    /// loads. Removing it can always be followed: a toggle creates no entry, so
+    /// removing one leaves nothing unknown, and every statement that stays
     /// already names the file. Nor is a value carried in by a `default` named,
     /// as [`ResolvedValues::answers_hint`] names one: answering it directly is
     /// changing an answer too.
     ///
+    /// The removals alone clear the clash only while one statement stays. Two
+    /// or more still name one file once the flagged toggles are gone, and none
+    /// of those is a toggle an answer could strand — that is what being
+    /// unflagged says — so the hint ends by naming the answers that went into
+    /// them, the act that parts them. The whole hint is then what the layer
+    /// needs, rather than a first step leaving a second block for the account
+    /// to find by re-running. That closing answer change is followable exactly
+    /// as far as `answers_hint`'s is, and no further.
+    ///
     /// `problem` and `names` are as `answers_hint` takes them. `statements` are
     /// the spellings in the order read, each with its line, and flagged when it
     /// is such a toggle. Each flagged one is named; when every statement is
-    /// flagged, none is the one to keep, so the hint says to keep any one.
+    /// flagged, none is the one to keep, so the hint says to keep any one, and
+    /// nothing stays to answer for.
     #[must_use]
     pub(crate) fn removal_hint(
         &self,
@@ -1326,17 +1336,51 @@ impl ResolvedValues {
             );
         }
         let named = statements_named(unshown.iter().copied());
+        let still = self.still_one_file(statements, unshown.len() == 1);
         if unshown.len() == 1 {
             return format!(
                 "{problem}, because of {answers}; remove the toggle {named}: bx cannot show \
                  that it names a declared target for every answer, so another answer may \
-                 leave it toggling a file no earlier layer declares"
+                 leave it toggling a file no earlier layer declares{still}"
             );
         }
         format!(
             "{problem}, because of {answers}; remove the toggles {named}: bx cannot show that \
              they name declared targets for every answer, so another answer may leave them \
-             toggling files no earlier layer declares"
+             toggling files no earlier layer declares{still}"
+        )
+    }
+
+    /// What is left to do once the flagged toggles are gone, or nothing.
+    ///
+    /// Empty while fewer than two statements stay: one statement names the file
+    /// once, which is what a layer is allowed. Two or more still name it twice,
+    /// so the clause names them and the answers that went into them. `one_gone`
+    /// is whether one toggle was named for removal rather than several.
+    ///
+    /// Only the answers those statements carry are named, not every answer the
+    /// clash was made of: one that only a removed toggle carried parts nothing
+    /// that is left. Any two statements have an answer between them — a pair
+    /// with none in either spelling is refused as the repo's own defect — so
+    /// the phrase is never empty.
+    fn still_one_file(&self, statements: &[(String, Origin, bool)], one_gone: bool) -> String {
+        let kept: Vec<&(String, Origin, bool)> = statements
+            .iter()
+            .filter(|(_, _, unshown)| !*unshown)
+            .collect();
+        if kept.len() < 2 {
+            return String::new();
+        }
+        let names = self.in_declaration_order(
+            kept.iter()
+                .flat_map(|statement| self.account_inputs(&statement.0))
+                .collect(),
+        );
+        format!(
+            "; {} still name one file once {} gone, so change {} too",
+            statements_named(kept.iter().copied()),
+            if one_gone { "it is" } else { "they are" },
+            self.answers_named(&names)
         )
     }
 

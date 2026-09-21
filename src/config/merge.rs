@@ -48,7 +48,8 @@
 //! its spelling is not one path as written with a full entry's in its own layer
 //! or an earlier one — another answer may leave it naming a file nothing
 //! declares, which fails the load, so the hint names that toggle to remove
-//! rather than the answer to change.
+//! rather than the answer to change — and then the answer to change anyway,
+//! when removing it leaves two or more statements still naming the one file.
 //!
 //! # Toggles: how an account opts out cheaply
 //!
@@ -442,7 +443,8 @@ impl Clash {
     /// Changing an answer is advice only while every toggle in the clash names a
     /// declared target whatever is answered. Otherwise another answer may leave
     /// a toggle naming nothing, which fails the load, so the hint names the
-    /// toggles to remove instead.
+    /// toggles to remove instead, and closes with the answer to change when
+    /// two or more statements outlive them and still name one file.
     fn into_conflict(self, values: &ResolvedValues) -> Conflict {
         let (TargetKey::File(file) | TargetKey::AsWritten(file)) = self.key;
         let spellings = statements_named(&self.statements);
@@ -2385,6 +2387,124 @@ mod tests {
             loads(&[base(), local(&format!("{answers}{entry}"))]).len(),
             2,
             "`~/.zshrc` and the full entry"
+        );
+    }
+
+    #[test]
+    fn a_removal_that_leaves_two_statements_naming_one_file_names_the_answer_too() {
+        // Three statements, one flagged: two full entries and a toggle bx
+        // cannot show names a declared target for every answer. Removing the
+        // named toggle is necessary and not enough — the two entries still name
+        // one file — so the hint closes with the answer that parts them, and
+        // names only the answer those two carry, not the one only the toggle
+        // brought in.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "{PROFILE}[[value]]\nname = \"q\"\nkind = \"string\"\n{}",
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let entries = format!(
+            "{}{}",
+            target_toml("~/.config/default/s", "A"),
+            target_toml("~/.config/{{profile}}/s", "B")
+        );
+        let answered = |profile: &str, toggles: &str| {
+            [
+                base(),
+                local(&format!(
+                    "[values]\nprofile = \"{profile}\"\nq = \"default\"\n{entries}{toggles}"
+                )),
+            ]
+        };
+
+        let config = merge(&answered("default", &toggle_toml("~/.config/{{q}}/s"))).unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        assert_eq!(
+            config.conflicts[0].hint,
+            format!(
+                "`[[target]]` `~/.config/default/s` at local.toml:4 and \
+                 `~/.config/{{{{profile}}}}/s` at local.toml:7 and \
+                 `~/.config/{{{{q}}}}/s` at local.toml:10 name one file, \
+                 `~/.config/default/s`, and one layer may name a file once, because of the \
+                 answer to `profile` at local.toml:2 and the answer to `q` at local.toml:3; \
+                 remove the toggle `~/.config/{{{{q}}}}/s` at local.toml:10{CANNOT_SHOW_ONE}; \
+                 `~/.config/default/s` at local.toml:4 and `~/.config/{{{{profile}}}}/s` at \
+                 local.toml:7 still name one file once it is gone, so change the answer to \
+                 `profile` at local.toml:2 too"
+            )
+        );
+
+        // The named removal is necessary: changing the answer alone leaves the
+        // toggle on a file it is only shown to name through this account's
+        // answer, so the layer still names one file twice.
+        assert!(
+            !merge(&answered("other", &toggle_toml("~/.config/{{q}}/s")))
+                .unwrap()
+                .conflicts
+                .is_empty(),
+            "the toggle still meets one of the entries"
+        );
+        // And not sufficient, which is why the hint does not stop there.
+        assert!(
+            !merge(&answered("default", ""))
+                .unwrap()
+                .conflicts
+                .is_empty(),
+            "the two entries still name one file"
+        );
+        // Two flagged toggles read the same way, in the plural.
+        let both = format!(
+            "{}{}",
+            toggle_toml("~/.config/{{q}}/s"),
+            toggle_toml("~/.config/{{r}}/s")
+        );
+        let config = merge(&[
+            global(
+                "bx.toml",
+                &format!(
+                    "{PROFILE}[[value]]\nname = \"q\"\nkind = \"string\"\n\
+                     [[value]]\nname = \"r\"\nkind = \"string\"\n{}",
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            ),
+            local(&format!(
+                "[values]\nprofile = \"default\"\nq = \"default\"\nr = \"default\"\n\
+                 {entries}{both}"
+            )),
+        ])
+        .unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(
+            hint.ends_with(&format!(
+                "{CANNOT_SHOW_SEVERAL}; `~/.config/default/s` at local.toml:5 and \
+                 `~/.config/{{{{profile}}}}/s` at local.toml:8 still name one file once they \
+                 are gone, so change the answer to `profile` at local.toml:2 too"
+            )),
+            "{hint}"
+        );
+
+        // The whole hint followed — the toggle gone, the answer changed — loads.
+        assert_eq!(
+            loads(&answered("other", "")),
+            [
+                (
+                    "~/.zshrc".to_string(),
+                    crate::config::target::Body::Inline("setopt".to_string())
+                ),
+                (
+                    "~/.config/default/s".to_string(),
+                    crate::config::target::Body::Inline("A".to_string())
+                ),
+                (
+                    "~/.config/other/s".to_string(),
+                    crate::config::target::Body::Inline("B".to_string())
+                ),
+            ]
         );
     }
 

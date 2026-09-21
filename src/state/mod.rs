@@ -300,6 +300,24 @@ pub enum Error {
         /// The state file.
         path: PathBuf,
     },
+    /// An entry handed to [`Ledger::record`] names a directory bx created that
+    /// is not an ancestor of the target.
+    ///
+    /// The stored list is ordered by depth, and depth alone orders it only
+    /// because every entry is an ancestor of one path. A directory that is not
+    /// would be sorted among them by a number that says nothing about it, and
+    /// `bx rm` would then try to remove, in that order, a directory it never
+    /// created for this target. Nothing is recorded and nothing is stored.
+    #[error(
+        "bx will not record {dir} as a directory it created for {target}: it is not an ancestor \
+         of it. Nothing was recorded"
+    )]
+    UnrelatedCreatedDir {
+        /// The target, as the entry names it.
+        target: String,
+        /// The directory that is not an ancestor of it.
+        dir: String,
+    },
     /// The state directory, or its lock file, is owned by another account.
     ///
     /// The module validates file type, link-ness, `nlink` and mode precisely

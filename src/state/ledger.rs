@@ -209,41 +209,47 @@ pub struct NewEntry {
 }
 
 impl NewEntry {
-    /// A new entry for a target bx created where nothing existed.
+    /// A new entry for a target, stating what was there before it.
     ///
-    /// The prior defaults to [`PriorBytes::Absent`] — *there was no file* —
-    /// which is only true for a target bx created. Use
-    /// [`NewEntry::with_prior`] whenever there were bytes to displace.
-    ///
-    /// Defaulting is safe on a re-record: [`Ledger::record`] never lets an
-    /// incoming [`PriorBytes::Absent`] replace the prior already stored for a
-    /// path, so an omitted prior can never overwrite the user's snapshot with
-    /// "unlink it".
+    /// `prior` is not defaulted, and that is the point. Invariant 4 makes the
+    /// prior the reversibility record, and [`PriorBytes::Absent`] is its
+    /// destructive reading — *there was no file*, so `bx rm` unlinks. A
+    /// default would make the dangerous value the one a caller reaches by
+    /// saying nothing, on the one record where nothing stored can correct it:
+    /// [`Ledger::record`] protects a *re*-record, by never letting an incoming
+    /// `Absent` replace a stored prior, and a first record has nothing to fall
+    /// back on. So a caller states it. Pass [`PriorBytes::Absent`] for a target
+    /// bx created where nothing existed.
     #[must_use]
     pub fn new(
         path: crate::paths::Portable,
         written: ContentHash,
         mode: Mode,
         mechanism: Mechanism,
+        prior: PriorBytes,
     ) -> Self {
         Self {
             path,
             written,
             mode,
             mechanism,
-            prior: PriorBytes::Absent,
+            prior,
             created_dirs: Vec::new(),
         }
     }
 
-    /// Record what the target held before.
+    /// Replace what this entry says the target held before.
     #[must_use]
     pub fn with_prior(mut self, prior: PriorBytes) -> Self {
         self.prior = prior;
         self
     }
 
-    /// Record the directories bx created on the way, deepest first.
+    /// Record the directories bx created on the way.
+    ///
+    /// Any order: [`Ledger::record`] deduplicates them and sorts them deepest
+    /// first, on a first record exactly as on a re-record, and refuses one
+    /// that is not an ancestor of the target.
     #[must_use]
     pub fn with_created_dirs(mut self, dirs: Vec<crate::paths::Portable>) -> Self {
         self.created_dirs = dirs;
@@ -549,12 +555,37 @@ impl LedgerView {
     ///
     /// # Errors
     ///
-    /// [`Error::PriorConflict`] for a changed file bx shares with the user.
+    /// [`Error::UnrelatedCreatedDir`] for a `created_dirs` entry that is not
+    /// an ancestor of the target, and [`Error::PriorConflict`] for a changed
+    /// file bx shares with the user.
     pub fn check_record(&self, entry: &NewEntry) -> Result<(), Error> {
+        check_created_dirs(entry)?;
         self.entries.get(&entry.path).map_or(Ok(()), |existing| {
             prior_conflict(existing, &entry.mechanism, &entry.prior)
         })
     }
+}
+
+/// Refuse a `created_dirs` entry that is not an ancestor of the target.
+///
+/// The ordering [`merge_created_dirs`] gives is by *depth*, and depth alone
+/// orders the list only because every entry is an ancestor of one path. A
+/// directory that is not would be sorted among them by a number that means
+/// nothing about it, and `bx rm` would then try to remove, in that order, a
+/// directory it never created for this target. The contract was documented
+/// and checked nowhere.
+fn check_created_dirs(entry: &NewEntry) -> Result<(), Error> {
+    let target = entry.path.as_str();
+    for dir in &entry.created_dirs {
+        let dir = dir.as_str();
+        if !target.starts_with(dir) || !target[dir.len()..].starts_with('/') {
+            return Err(Error::UnrelatedCreatedDir {
+                target: target.to_string(),
+                dir: dir.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// [`Error::PriorConflict`] when re-recording `existing` with `incoming` would
@@ -759,17 +790,28 @@ impl Ledger {
     /// checked before anything is stored: once saved, such a path would make
     /// every later open under the same home refuse the ledger, with no way back.
     ///
+    /// [`Error::UnrelatedCreatedDir`] if a `created_dirs` entry is not an
+    /// ancestor of the target; nothing is stored.
+    ///
     /// [`Error::WrongLock`] if the lock file this ledger was opened under has
     /// been replaced or removed since; nothing is stored.
     pub fn record(&mut self, entry: NewEntry) -> Result<&LedgerEntry, Error> {
         self.check_lock()?;
         self.check_new_paths(&entry)?;
+        check_created_dirs(&entry)?;
         let key = entry.path.clone();
         let (prior, history, created_dirs) = match self.view.entries.get(&key) {
             None => (
                 self.store_prior(entry.prior)?,
                 History::default(),
-                entry.created_dirs,
+                // Normalised on a first record exactly as `merge_created_dirs`
+                // normalises on a re-record. Storing the list verbatim here
+                // trusted `with_created_dirs`'s documented order and validated
+                // it nowhere, so a caller handing them over shallowest-first
+                // had the fault silently corrected from the second apply on
+                // and not the first — and `bx rm` left a directory behind for
+                // targets applied exactly once.
+                merge_created_dirs(&[], entry.created_dirs),
             ),
             Some(existing) => {
                 let (prior, history) = self.carry_prior(existing, &entry.mechanism, entry.prior)?;
@@ -839,6 +881,7 @@ impl Ledger {
     /// The restore blob is deliberately left in place: it may be shared with
     /// another entry, and content-addressed bytes cost far less than a wrong
     /// deletion. Reclaiming unreferenced blobs is not implemented.
+    #[must_use = "the entry removed is the only record of what was there; drop it deliberately"]
     pub fn forget(&mut self, path: &crate::paths::Portable) -> Option<LedgerEntry> {
         self.view.entries.remove(path)
     }
@@ -1092,6 +1135,7 @@ mod tests {
             ContentHash::of(body),
             Mode::DEFAULT_FILE,
             Mechanism::Own,
+            PriorBytes::Absent,
         )
     }
 
@@ -1111,7 +1155,7 @@ mod tests {
                         bytes: b"old".to_vec(),
                         mode: Mode::from_bits(0o640),
                     })
-                    .with_created_dirs(vec![target("~/.config/tool")]),
+                    .with_created_dirs(vec![target("~/.config")]),
             )
             .expect("record")
             .clone();
@@ -1120,7 +1164,7 @@ mod tests {
         assert_eq!(stored.written, ContentHash::of(b"new"));
         assert_eq!(stored.mode, Mode::DEFAULT_FILE);
         assert_eq!(stored.mechanism, Mechanism::Own);
-        assert_eq!(stored.created_dirs, vec![target("~/.config/tool")]);
+        assert_eq!(stored.created_dirs, vec![target("~/.config")]);
         let Prior::Existed(reference) = &stored.prior else {
             panic!("expected a prior snapshot, got {:?}", stored.prior)
         };
@@ -1783,6 +1827,7 @@ mod tests {
                 ContentHash::of(b"a file with bx's region"),
                 Mode::DEFAULT_FILE,
                 Mechanism::Region { comment: '#' },
+                PriorBytes::Absent,
             ))
             .expect("region");
         ledger.save().expect("save");
@@ -2137,6 +2182,7 @@ mod tests {
                 ContentHash::of(contents.as_bytes()),
                 Mode::DEFAULT_FILE,
                 mechanism,
+                PriorBytes::Absent,
             );
             new = new.with_prior(PriorBytes::Bytes {
                 bytes: users_line.as_bytes().to_vec(),
@@ -2189,8 +2235,8 @@ mod tests {
                     ContentHash::of(b"bx"),
                     Mode::DEFAULT_FILE,
                     Mechanism::Own,
-                )
-                .with_prior(prior(b"the user's gitconfig", 0o644)),
+                    prior(b"the user's gitconfig", 0o644),
+                ),
                 foreign_key,
             ),
             (
@@ -2238,8 +2284,8 @@ mod tests {
                 ContentHash::of(written),
                 Mode::DEFAULT_FILE,
                 region.clone(),
+                prior(before, 0o644),
             )
-            .with_prior(prior(before, 0o644))
         };
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger
@@ -2285,8 +2331,8 @@ mod tests {
                 ContentHash::of(written),
                 Mode::DEFAULT_FILE,
                 region.clone(),
+                prior(before, 0o644),
             )
-            .with_prior(prior(before, 0o644))
         };
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         ledger.record(apply(bx1, original)).expect("first apply");
@@ -2367,6 +2413,7 @@ mod tests {
                 ContentHash::of(written),
                 Mode::DEFAULT_FILE,
                 include.clone(),
+                PriorBytes::Absent,
             )
         };
 
@@ -2512,8 +2559,8 @@ mod tests {
                 ContentHash::of(bx1),
                 Mode::DEFAULT_FILE,
                 region.clone(),
+                prior(before, 0o644),
             )
-            .with_prior(prior(before, 0o644))
         };
         ledger.record(apply(b"user line 1\n")).expect("first apply");
         let message = ledger
@@ -2697,30 +2744,26 @@ mod tests {
         for (index, (first, second)) in cases.into_iter().enumerate() {
             let name = format!("~/.rc{index}");
             ledger
-                .record(
-                    NewEntry::new(
-                        target(&name),
-                        ContentHash::of(bx1),
-                        Mode::DEFAULT_FILE,
-                        first,
-                    )
-                    .with_prior(prior(original, 0o644)),
-                )
+                .record(NewEntry::new(
+                    target(&name),
+                    ContentHash::of(bx1),
+                    Mode::DEFAULT_FILE,
+                    first,
+                    prior(original, 0o644),
+                ))
                 .expect("first apply");
             ledger.save().expect("save");
             let saved = std::fs::read(dir.ledger()).expect("read");
             let blobs = blob_names(&dir);
 
             let err = ledger
-                .record(
-                    NewEntry::new(
-                        target(&name),
-                        ContentHash::of(b"BX2"),
-                        Mode::DEFAULT_FILE,
-                        second,
-                    )
-                    .with_prior(prior(&edited, 0o644)),
-                )
+                .record(NewEntry::new(
+                    target(&name),
+                    ContentHash::of(b"BX2"),
+                    Mode::DEFAULT_FILE,
+                    second,
+                    prior(&edited, 0o644),
+                ))
                 .expect_err("a changed shared file is a conflict");
             assert!(
                 matches!(
@@ -2758,26 +2801,22 @@ mod tests {
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         let region = Mechanism::Region { comment: '#' };
         ledger
-            .record(
-                NewEntry::new(
-                    target("~/.bashrc"),
-                    ContentHash::of(bx1),
-                    Mode::DEFAULT_FILE,
-                    region.clone(),
-                )
-                .with_prior(prior(b"user line 1\n", 0o644)),
-            )
+            .record(NewEntry::new(
+                target("~/.bashrc"),
+                ContentHash::of(bx1),
+                Mode::DEFAULT_FILE,
+                region.clone(),
+                prior(b"user line 1\n", 0o644),
+            ))
             .expect("first");
         let stored = ledger
-            .record(
-                NewEntry::new(
-                    target("~/.bashrc"),
-                    ContentHash::of(b"BX2"),
-                    Mode::DEFAULT_FILE,
-                    region,
-                )
-                .with_prior(prior(bx1, 0o644)),
-            )
+            .record(NewEntry::new(
+                target("~/.bashrc"),
+                ContentHash::of(b"BX2"),
+                Mode::DEFAULT_FILE,
+                region,
+                prior(bx1, 0o644),
+            ))
             .expect("bx's own output is not a conflict")
             .clone();
         assert_eq!(stored.written, ContentHash::of(b"BX2"));
@@ -2870,6 +2909,75 @@ mod tests {
                 .created_dirs,
             dirs,
         );
+    }
+
+    #[test]
+    fn a_first_record_normalises_the_directories_it_is_handed() {
+        // r4 round 1 (COV3, CL8): a FIRST record stored `created_dirs`
+        // verbatim, trusting `with_created_dirs`'s documented "deepest first"
+        // and validating it nowhere, while every re-record sorted and
+        // deduplicated. A caller handing them over shallowest-first had the
+        // fault silently corrected from the second apply on and not the first,
+        // so `bx rm` left a directory behind for a target applied exactly
+        // once. The test that was here handed in an already-sorted list and
+        // asserted round-trip equality, so it passed identically either way.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        let stored = ledger
+            .record(entry("~/.config/tool/sub/f", b"x").with_created_dirs(vec![
+                target("~/.config"),
+                target("~/.config/tool/sub"),
+                target("~/.config"),
+                target("~/.config/tool"),
+            ]))
+            .expect("record")
+            .clone();
+        assert_eq!(
+            stored.created_dirs,
+            vec![
+                target("~/.config/tool/sub"),
+                target("~/.config/tool"),
+                target("~/.config"),
+            ],
+            "deepest first, deduplicated, on the first record too",
+        );
+    }
+
+    #[test]
+    fn a_created_directory_that_is_not_an_ancestor_of_the_target_is_refused() {
+        // r4 round 1 (CL8): the stored list is ordered by depth, and depth
+        // alone orders it only because every entry is an ancestor of one path.
+        // A directory that is not would be sorted among them by a number that
+        // says nothing about it, and `bx rm` would try to remove it in that
+        // order. The contract was documented and checked nowhere.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        for stray in [
+            // A sibling, and the prefix trap: `~/.config/tool` is a textual
+            // prefix of `~/.config/tool.toml` and an ancestor of nothing.
+            "~/.local/share",
+            "~/.config/tool",
+            // The target itself is not an ancestor of itself.
+            "~/.config/tool.toml",
+        ] {
+            let new = entry("~/.config/tool.toml", b"x")
+                .with_created_dirs(vec![target("~/.config"), target(stray)]);
+            // The pre-check a journalled session makes and the refusal
+            // `record` gives must agree.
+            let checked = ledger.check_record(&new).expect_err("check refuses");
+            let recorded = ledger.record(new).expect_err("record refuses");
+            for err in [checked, recorded] {
+                assert!(
+                    matches!(&err, Error::UnrelatedCreatedDir { target: t, dir: d }
+                        if t == "~/.config/tool.toml" && d == stray),
+                    "got {err}",
+                );
+                assert!(err.to_string().contains("Nothing was recorded"), "{err}");
+            }
+            assert!(ledger.is_empty(), "nothing was recorded for {stray}");
+        }
     }
 
     #[test]
@@ -3318,15 +3426,13 @@ mod tests {
         let key = Portable::from_path(&home.child(".foo"), &alias).expect("portable");
         assert!(key.as_str().starts_with('/'), "{key}");
         ledger
-            .record(
-                NewEntry::new(
-                    key,
-                    ContentHash::of(b"bx"),
-                    Mode::DEFAULT_FILE,
-                    Mechanism::Own,
-                )
-                .with_prior(prior(b"the user wrote this", 0o644)),
-            )
+            .record(NewEntry::new(
+                key,
+                ContentHash::of(b"bx"),
+                Mode::DEFAULT_FILE,
+                Mechanism::Own,
+                prior(b"the user wrote this", 0o644),
+            ))
             .expect("record");
         ledger.save().expect("save");
         let seeded = std::fs::read(dir.ledger()).expect("read");

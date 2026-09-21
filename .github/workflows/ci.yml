@@ -66,7 +66,15 @@ jobs:
       # The test spawns uv with `env_clear()` and redirects both into a scratch
       # temporary directory, so a shim there reports "uv is not a valid shim"
       # and the test fails on `an installed uv runs` instead.
-      - uses: astral-sh/setup-uv@v10
+      #
+      # The ref is an exact release tag, and that is a deliberate departure from
+      # the floating major every other action here uses. setup-uv publishes no
+      # floating major past v7 — v8, v9 and v10 exist only as release series —
+      # so `@v10` does not resolve and `@v7` would mean choosing a three-major-
+      # old action to match a tag shape. An exact tag is already stricter than
+      # this file's convention; the cost is that a human bumps it, which is the
+      # same deliberate bump the uv pin above already asks for.
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.11.30"
       - name: Check formatting
@@ -99,11 +107,12 @@ jobs:
       - uses: jdx/mise-action@v2
       # Coverage runs the same suite as `check`, so it needs the same programs;
       # without them the differential tests fail here too. The uv pin is the
-      # same one, and for the reasons written out in `check`.
+      # same one, and so is the exact-release-tag ref, for the reasons written
+      # out in `check`.
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
       - uses: oven-sh/setup-bun@v2
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.11.30"
       - name: Collect coverage data

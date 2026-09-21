@@ -854,6 +854,30 @@ fn broken_answer_why(decl: &ValueDecl, assignment: &ValueAssignment, error: &Val
     )
 }
 
+/// What to do about a target whose `file` reaches a `path` value through
+/// this account's answers.
+///
+/// `problem` names the target and the way to the `path` value; each of
+/// `answers` is named with its line, which is in the file the account can
+/// edit. Unlike [`ResolvedValues::answers_hint`] it reads the answers as
+/// written, so it can name one whose value is unset or invalid: with the
+/// `path` value unanswered the answer referencing it resolves to nothing, and
+/// it is still the answer to change.
+///
+/// `answers` is never empty: an empty one would read "…, because of ; change
+/// that answer", naming nothing to change. The one caller holds a way to the
+/// `path` value that runs through at least one answer, and enforces it rather
+/// than assuming it, so this takes the slice as it finds it.
+#[must_use]
+pub(crate) fn path_answer_hint(problem: &str, answers: &[&ValueAssignment]) -> String {
+    let answers = answers
+        .iter()
+        .map(|answer| format!("the answer to `{}` at {}", answer.name, answer.origin))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!("{problem}, because of {answers}; change that answer")
+}
+
 /// Why a committed `default` has no usable text for this account.
 ///
 /// Names each answer that went into it with the line it was written on, which
@@ -1483,8 +1507,13 @@ impl ResolvedValues {
             .join("; ")
     }
 
-    /// The declaration index of `name`.
-    fn index_of(&self, name: &str) -> Option<usize> {
+    /// The declaration index of `name`, switched off or not.
+    ///
+    /// Unfiltered, unlike [`ResolvedValues::decls`]: a declaration's position is
+    /// where it was written, and `enabled` does not move it. That is what lets
+    /// `resolve`'s `in_declaration_order` order the names of a block that is
+    /// *about* switched-off declarations.
+    pub(crate) fn index_of(&self, name: &str) -> Option<usize> {
         self.decls.iter().position(|decl| decl.name == name)
     }
 

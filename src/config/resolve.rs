@@ -41,12 +41,23 @@
 //! A defect in the **committed** repo is not blocked but fatal — a malformed
 //! placeholder, or a reference to a value no layer declares, cannot be fixed by
 //! answering a prompt.
+//!
+//! A `file` that reaches a `path` value is refused either way, since a `path`
+//! value is absolute and `file` is relative to the repo root. When only
+//! committed declarations lead there, it is the repo's defect and fails the
+//! load. When the way there runs through this account's answer — `s =
+//! "{{b}}"` into `file = "cfg/{{s}}/x"`, with `b` a `path` value — the target
+//! is blocked, naming that answer's line, whether or not `b` is answered.
+//!
+//! What is refused is reaching a **`path` value**, not every absolute text: an
+//! account answering a plain `string` value `/home/example/…` still resolves,
+//! because nothing separates that from a string the account meant.
 
 use std::path::Path;
 
 use super::merge::Conflict;
 use super::target::{Attach, Body, Format, KeyPath, Target};
-use super::values::{ResolvedValues, Unresolved};
+use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
 
@@ -86,7 +97,7 @@ pub enum BlockReason {
     /// or one that, substituted into this entry, makes a field invalid — a path
     /// that climbs out of the home, a `file` that climbs out of the repo, an
     /// owned key with an empty segment or with more or fewer segments than
-    /// written.
+    /// written — or a `file` that reaches a `path` value through an answer.
     ///
     /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
     /// unanswered: the answer that needs changing is already written, and the
@@ -109,7 +120,7 @@ pub struct BlockedEntry {
     /// Why it is blocked.
     pub reason: BlockReason,
     /// What the user should do. Spelled in `values` — `init_hint`,
-    /// `disabled_hint`, `ResolvedValues::invalid_hint` or
+    /// `disabled_hint`, `path_answer_hint`, `ResolvedValues::invalid_hint` or
     /// `ResolvedValues::answers_hint` — never at a call site.
     pub hint: String,
 }
@@ -145,7 +156,14 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let targets = merged
         .targets
         .iter()
-        .map(|target| resolve_target(target, &values, &merged.conflicts))
+        .map(|target| {
+            resolve_target(
+                target,
+                &values,
+                &merged.value_assignments,
+                &merged.conflicts,
+            )
+        })
         .collect::<Result<Vec<_>, Error>>()?;
 
     refuse_shared_files(&targets)?;
@@ -188,11 +206,14 @@ fn refuse_shared_files(targets: &[Resolution<Target>]) -> Result<(), Error> {
 
 /// Substitute one target, or explain why it cannot be.
 ///
-/// `conflicts` are the files a layer named twice because of this account's
-/// answers; a target that resolves to one of them is blocked rather than ready.
+/// `assignments` are this account's answers as written, which `values` no
+/// longer holds once substituted. `conflicts` are the files a layer named twice
+/// because of this account's answers; a target that resolves to one of them is
+/// blocked rather than ready.
 fn resolve_target(
     target: &Target,
     values: &ResolvedValues,
+    assignments: &[ValueAssignment],
     conflicts: &[Conflict],
 ) -> Result<Resolution<Target>, Error> {
     if let Body::File(file) = &target.body {
@@ -233,6 +254,24 @@ fn resolve_target(
             hint,
         }))
     };
+
+    // Ahead of the blocks the probe found: each of them names an act —
+    // answering a value, changing an answer — that would leave this target
+    // blocked here. Behind the repo defects above, which no answer could
+    // clear.
+    //
+    // What this ordering does for a switched-off declaration is left to the
+    // tests, which hold three different answers to it — the paragraph that
+    // tried to summarise them was wrong three times.
+    // `a_path_answer_block_outranks_an_unrelated_disabled_or_invalid_value`,
+    // `a_switched_off_declaration_is_walked_through_by_its_default` and
+    // `a_disabled_value_s_answer_is_not_walked`.
+    if let Body::File(file) = &target.body
+        && let Some((names, hint)) =
+            refuse_path_answer_in_file(target, &file.to_string_lossy(), values, assignments)
+    {
+        return block(BlockReason::InvalidValue { names }, hint);
+    }
 
     // A switched-off declaration is reported ahead of an unanswered one: it is
     // the more specific statement about what this target is waiting for.
@@ -433,6 +472,22 @@ fn stood_in(pieces: &[super::values::Piece<'_>], stand_in: &str) -> String {
 /// fatal, unmentioned. Written order is also the deterministic choice, which is
 /// the direction Invariant 3 points.
 ///
+/// An account's answer is not read here. A way to a `path` value that runs
+/// through one is judged by [`refuse_path_answer_in_file`], and blocks the
+/// target rather than failing the load.
+///
+/// Written order rules **within this walk**. It does not rule between the two:
+/// when `file` holds a committed way to a `path` value and an answered one,
+/// this walk wins whichever is written first, because it runs first and returns
+/// `Err`. That is not an accident of the call order. A committed way is the
+/// same defect for every account and no answer clears it, so reporting it as
+/// one account's blocked target would hide a repository defect behind a hint
+/// advising that account to change something — and would report it to the
+/// account that answered and not to the one that did not. The load error
+/// outranks the block; only the field it names is decided by written order.
+/// `a_file_reached_by_a_committed_route_and_an_answered_one_fails_the_load`
+/// pins it in both written orders.
+///
 /// A malformed placeholder is left to the probe, which reports it with the
 /// rest of the target's defects.
 fn refuse_path_value_in_file(
@@ -504,6 +559,232 @@ fn path_value_behind<'a>(
         .find_map(|next| path_value_behind(values, next, seen))
         .map(|mut chain| {
             chain.insert(0, decl);
+            chain
+        })
+}
+
+/// Block a target whose `file` reaches a `path` value through this account's
+/// answer, returning the answers' names and the hint.
+///
+/// Called once [`refuse_path_value_in_file`] has found no way there through
+/// committed defaults alone from the same names, so a way found here is
+/// expected to run through at least one answer. That answer is the account's to
+/// change, which is why this blocks rather than fails; the hint names each one
+/// on the way, with its line.
+///
+/// That expectation is a claim about a **different** function — that
+/// [`path_value_behind`] is a complete walk of the committed graph this one
+/// also walks — so it is enforced here rather than left to prose. A chain of
+/// [`Step::Default`] and [`Step::Terminal`] alone names no answer, and the hint
+/// would read "…repo root, because of ; change that answer": no target is
+/// blocked on that, and the load error the committed walk owes is left to it.
+/// `a_committed_chain_alone_is_not_an_answer_block` calls this with exactly
+/// that chain, so the coupling is pinned rather than asserted.
+///
+/// Only a declaration of kind `path` ends the walk, so this closes the route an
+/// account's answer opens *into a `path` value*, not every way an absolute
+/// literal reaches `file`. An account answering a plain `string` value
+/// `/home/example/…` still resolves Ready: that text is what a `string` value
+/// is for, and nothing separates a machine location from a string an account
+/// meant.
+fn refuse_path_answer_in_file(
+    target: &Target,
+    file: &str,
+    values: &ResolvedValues,
+    assignments: &[ValueAssignment],
+) -> Option<(Vec<String>, String)> {
+    let mut seen: Vec<String> = Vec::new();
+    let chain = super::values::placeholders(file)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|name| path_value_through_answer(values, assignments, name, &mut seen))?;
+    if !chain.iter().any(|step| matches!(step, Step::Answer(..))) {
+        return None;
+    }
+
+    let steps: String = chain
+        .iter()
+        .map(|step| match step {
+            Step::Default(decl) => format!(
+                "`{}`, whose default at {} is built from ",
+                decl.name, decl.origin
+            ),
+            Step::Answer(decl, answer) => format!(
+                "`{}`, whose answer at {} is built from ",
+                decl.name, answer.origin
+            ),
+            Step::Terminal(decl) => format!("`{}`", decl.name),
+        })
+        .collect();
+    let problem = format!(
+        "target `{}`: `file` references {steps}, a `path` value; a `path` value is always \
+         absolute and `file` is relative to the config repo root",
+        target.path
+    );
+
+    let names = in_declaration_order(
+        values,
+        chain
+            .iter()
+            .filter_map(|step| match step {
+                Step::Answer(decl, _) => Some(decl.name.clone()),
+                Step::Default(_) | Step::Terminal(_) => None,
+            })
+            .collect(),
+    );
+    let answers: Vec<&ValueAssignment> = names
+        .iter()
+        .filter_map(|name| assignments.iter().find(|answer| &answer.name == name))
+        .collect();
+    let hint = super::values::path_answer_hint(&problem, &answers);
+    Some((names, hint))
+}
+
+/// One declaration on the way from a name in `file` to a `path` value.
+enum Step<'a> {
+    /// Left through its committed `default`.
+    Default(&'a ValueDecl),
+    /// Left through this account's answer to it.
+    Answer(&'a ValueDecl, &'a ValueAssignment),
+    /// The `path` value the way ends at.
+    Terminal(&'a ValueDecl),
+}
+
+/// The way from `name` to a `path` value, through answers and defaults.
+///
+/// Depth first. At each declaration, this account's answer is followed before
+/// the committed `default`, each one's references in the order written. The
+/// default is followed whether or not the answer overrides it, as
+/// [`path_value_behind`] follows it, so an answer `s = "{{t}}"` is refused
+/// alike whether `t` is answered or left to a default built from a `path`
+/// value. A switched-off declaration's answer is not this account's value and
+/// is not followed; its kind and default are still read, as the committed walk
+/// reads them — so such a declaration is not a wall, and the walk goes through
+/// it by its default. `a_switched_off_declaration_is_walked_through_by_its_default`
+/// pins both halves of that: the default followed, the answer over it not.
+///
+/// So `enabled` gates the **answer edge alone**, and the walk ends at a `path`
+/// declaration whether or not it is switched on. The two are not in tension:
+/// they ask different questions. `enabled` says whether an answer is *this
+/// account's value* — which is the answer edge's question, and the reason this
+/// uses the same lookup [`ResolvedValues::resolve`] does. It does not say what
+/// a declaration *is*: a switched-off `path` declaration is still declared
+/// `path`, and the terminal asks only its kind. That is also why
+/// [`refuse_path_value_in_file`], which reads kinds and defaults and nothing
+/// else, never consults `enabled` at all. Gating the terminal would make the
+/// two walks judge one `b` differently, and it would leave a `file` reaching a
+/// switched-off `path` value refused for an account with no answer and allowed
+/// for one with an answer that reaches it.
+///
+/// What does **not** settle this is which hint the account sees first.
+/// Switching `s` off gives `DisabledValue{["s"]}` and "re-enable s", and
+/// re-enabling lands in this block; dropping the answer edge's gate gives this
+/// block first, and changing the answer lands in `DisabledValue`. Either way
+/// two statements are true and are reported in the order they become true, so
+/// that reading decides nothing.
+/// `a_switched_off_path_declaration_still_ends_the_walk` and
+/// `a_disabled_value_s_answer_is_not_walked` pin both halves.
+///
+/// The rule is stated with its sites so a reader can check it rather than
+/// take it. **Seven** places read a `ValueDecl`'s `enabled`. Six ask the
+/// account-value question:
+///
+/// - [`ResolvedValues::resolve`], which gives a switched-off declaration no
+///   answer of this account's — the site the other five and everything below
+///   follow from;
+/// - `check_answer`, which refuses an answer to one;
+/// - [`ResolvedValues::decls`], [`ResolvedValues::unset`] and `unset_required`,
+///   each listing what this account may answer;
+/// - the answer edge here.
+///
+/// The seventh is `merge`'s `<ValueDecl as Keyed>::enabled`, and it asks
+/// nothing, because it is never called. `Keyed::enabled` is read in one place,
+/// `Merged::into_enabled`, which is instantiated once — for `Target`.
+/// Declarations leave the merge through `into_entries`, which keeps the
+/// switched-off ones so that a reference to one stays distinguishable from a
+/// reference to a name no layer declares. The accessor exists because `Keyed`
+/// requires it of a public list type, and says so at its definition. Its
+/// sibling `set_enabled` **writes** the field and is live: it is how a later
+/// layer's toggle switches a declaration off in the first place.
+///
+/// Nothing else reads it. `roots`, [`ResolvedValues::substitute`] and
+/// [`ResolvedValues::get`] all behave correctly for a switched-off declaration
+/// **without** consulting `enabled`, because they read the answer `resolve`
+/// already derived; they are consequences of the first site, not further
+/// sites. `Target::enabled` is a different field on a different type — a
+/// target's own switch, and the one `into_enabled` acts on.
+///
+/// Everything that asks what a declaration *is* reads it through
+/// [`ResolvedValues::decl`] or [`ResolvedValues::index_of`], both unfiltered,
+/// and ignores `enabled`: this walk's terminal, [`path_value_behind`],
+/// `merge`'s `written_form` kind lookups, and both `in_declaration_order`s.
+/// The resolve-side one was the single exception — it indexed against the
+/// filtered `decls`, so a switch moved a declaration's position — and it now
+/// indexes against [`ResolvedValues::index_of`] like its twin.
+///
+/// This list was derived by grepping `enabled` across `src` and classifying
+/// every hit, reads and writes alike. Two earlier versions were not: the first
+/// named two sites that do not read `enabled` and missed one that does, and
+/// the second disposed of its neighbours with "a different field on a
+/// different type", a clause that silently excluded the one site which is the
+/// same field on the same type. A site is named and dispositioned here, or it
+/// is not covered.
+///
+/// `seen` stops the walk at a name it has already walked, and it is
+/// load-bearing here for the reason [`path_value_behind`] gives: an overridden
+/// default is never expanded, so
+/// [`Unresolved::Forward`](super::values::Unresolved::Forward) never refuses a
+/// cycle that one closes, and the walk reads it anyway. Following answers opens
+/// a second shape of that cycle — `q` answered `{{r}}` with `r`'s overridden
+/// default naming `q` back — because an answer may name only an earlier value,
+/// but the default it overrides may name a later one.
+/// `an_answer_re_entering_a_walked_name_still_resolves` pins that shape;
+/// `a_file_body_through_an_answered_value_whose_default_names_itself_resolves`
+/// pins the one-declaration one.
+///
+/// `seen` is also shared across the names in `file`, so a subtree walked for
+/// one of them is not walked again for the next. The walk is a function of the
+/// declarations and this account's answers alone, so the second visit would
+/// have returned what the first did.
+fn path_value_through_answer<'a>(
+    values: &'a ResolvedValues,
+    assignments: &'a [ValueAssignment],
+    name: &str,
+    seen: &mut Vec<String>,
+) -> Option<Vec<Step<'a>>> {
+    if seen.iter().any(|walked| walked == name) {
+        return None;
+    }
+    seen.push(name.to_string());
+    let decl = values.decl(name)?;
+    if decl.kind == super::values::ValueKind::Path {
+        return Some(vec![Step::Terminal(decl)]);
+    }
+
+    // The same lookup `ResolvedValues::resolve` answers a declaration with.
+    let answer = assignments
+        .iter()
+        .find(|answer| answer.name == decl.name)
+        .filter(|_| decl.enabled);
+    if let Some(answer) = answer {
+        let text = answer.value.to_string();
+        let through = super::values::placeholders(&text)
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|next| path_value_through_answer(values, assignments, next, seen));
+        if let Some(mut chain) = through {
+            chain.insert(0, Step::Answer(decl, answer));
+            return Some(chain);
+        }
+    }
+
+    let default = decl.default.as_ref()?.to_string();
+    super::values::placeholders(&default)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|next| path_value_through_answer(values, assignments, next, seen))
+        .map(|mut chain| {
+            chain.insert(0, Step::Default(decl));
             chain
         })
 }
@@ -704,14 +985,33 @@ fn unfindable_requirement(text: &str) -> String {
 ///
 /// So two reports of one problem read the same way regardless of which field
 /// happened to be probed first.
+///
+/// Indexed against [`ResolvedValues::index_of`], which counts every
+/// declaration, rather than [`ResolvedValues::decls`], which lists only the
+/// enabled ones. There are six callers, and the list is exhaustive because a
+/// partial one would not be a safety case:
+///
+/// - the `disabled` names — switched off by definition, so against the
+///   filtered list every one came back `usize::MAX` and the sort left them in
+///   whichever order the fields were probed. This is the caller the index was
+///   wrong for, and the only one.
+/// - the `invalid` and `unset` names, which come from declarations this
+///   account may answer, so they are enabled;
+/// - a clash's causes and a [`Broken::Field`]'s causes, which are answers this
+///   account applied, and a switched-off declaration has none applied;
+/// - [`refuse_path_answer_in_file`]'s own names, which are the [`Step::Answer`]
+///   declarations of a chain — and `Step::Answer` is built only behind the
+///   `enabled` filter in [`path_value_through_answer`], so they are enabled
+///   too.
+///
+/// [`ResolvedValues::in_declaration_order`] is this function's twin on the
+/// `values` side, for the names inside an
+/// [`Unresolved`](super::values::Unresolved), those in `answers_hint`, and a
+/// clash's; it indexed against every declaration already, and the two now
+/// agree. The count of six above is this function's own callers, not the
+/// twin's.
 fn in_declaration_order(values: &ResolvedValues, mut names: Vec<String>) -> Vec<String> {
-    let index = |name: &String| {
-        values
-            .decls()
-            .iter()
-            .position(|decl| &decl.name == name)
-            .unwrap_or(usize::MAX)
-    };
+    let index = |name: &String| values.index_of(name).unwrap_or(usize::MAX);
     names.sort_by_key(index);
     names.dedup();
     names
@@ -3287,6 +3587,569 @@ mod tests {
                 PathBuf::from("/var/mnt/fast/sccache"),
             ],
             "two roots, because sccache is outside this account's scratch root"
+        );
+    }
+
+    /// `b`, a `path` value, then `s`, a `string`, then a target whose `file`
+    /// is `FILE`, and a second target that references neither.
+    const ANSWERED_PATH: &str = "[[value]]\n\
+                                 name = \"b\"\n\
+                                 kind = \"path\"\n\
+                                 [[value]]\n\
+                                 name = \"s\"\n\
+                                 kind = \"string\"\n\
+                                 [[target]]\n\
+                                 path = \"~/.config/thing\"\n\
+                                 file = \"FILE\"\n\
+                                 [[target]]\n\
+                                 path = \"~/.zshrc\"\n\
+                                 content = \"setopt\"\n";
+
+    #[test]
+    fn a_file_body_may_not_reach_a_path_value_through_an_answer() {
+        // `s` is a `string` with no default, so nothing committed reaches `b`.
+        // The account's answer `s = "{{b}}"` does, and `cfg/{{s}}/x` resolved
+        // to a repo file carrying the account's absolute location. No committed
+        // layer is at fault, so it blocks this target and names the answer.
+        for file in ["cfg/{{s}}/x", "{{s}}/x"] {
+            let layer = ANSWERED_PATH.replace("FILE", file);
+            for local in [
+                "[values]\ns = \"{{b}}\"\nb = \"/home/example/secret-machine-name\"\n",
+                // Unanswered, `b` would otherwise block the target with advice
+                // to answer it, which leads straight into this block.
+                "[values]\ns = \"{{b}}\"\n",
+            ] {
+                let resolved = resolved(&layer, Some(local))
+                    .expect("an account's answer blocks its target, not the load");
+                let entry = blocked(&resolved, 0);
+                assert_eq!(
+                    entry.reason,
+                    BlockReason::InvalidValue {
+                        names: vec!["s".to_string()]
+                    },
+                    "{file} {local}"
+                );
+                assert_eq!(
+                    entry.hint,
+                    "target `~/.config/thing`: `file` references `s`, whose answer at \
+                     local.toml:2 is built from `b`, a `path` value; a `path` value is always \
+                     absolute and `file` is relative to the config repo root, because of the \
+                     answer to `s` at local.toml:2; change that answer",
+                    "{file} {local}"
+                );
+                assert_eq!(entry.origin.to_string(), "bx.toml:7", "{file} {local}");
+                assert_eq!(
+                    ready(&resolved, 1).path.as_str(),
+                    "~/.zshrc",
+                    "{file} {local}"
+                );
+            }
+        }
+
+        // An answer built from no `path` value is the case `file` substitution
+        // exists for.
+        let ordinary = resolved(
+            &ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"),
+            Some("[values]\ns = \"work\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/x"))
+        );
+    }
+
+    #[test]
+    fn a_file_body_through_an_answer_and_a_default_names_every_step() {
+        // `t`, declared between, defaults to `{{b}}`. The walk follows an
+        // answer first, then the committed default whether or not it applies.
+        let layer = ANSWERED_PATH
+            .replace(
+                "[[value]]\nname = \"s\"",
+                "[[value]]\nname = \"t\"\nkind = \"string\"\ndefault = \"{{b}}\"\n\
+                 [[value]]\nname = \"s\"",
+            )
+            .replace("FILE", "cfg/{{s}}/x");
+
+        for local in [
+            // `t` unanswered: its default applies and carries `b` in.
+            "[values]\ns = \"{{t}}\"\nb = \"/var/mnt/cfg\"\n",
+            // `t` answered: its default does not apply, and is followed anyway,
+            // as the committed walk follows it.
+            "[values]\ns = \"{{t}}\"\nt = \"work\"\n",
+        ] {
+            let resolved = resolved(&layer, Some(local)).expect("blocked, not a load error");
+            let entry = blocked(&resolved, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["s".to_string()]
+                },
+                "{local}"
+            );
+            assert!(
+                entry.hint.starts_with(
+                    "target `~/.config/thing`: `file` references `s`, whose answer at \
+                     local.toml:2 is built from `t`, whose default at bx.toml:4 is built \
+                     from `b`, a `path` value; "
+                ),
+                "{local}: {}",
+                entry.hint
+            );
+            assert!(
+                entry.hint.ends_with(
+                    ", because of the answer to `s` at local.toml:2; change that answer"
+                ),
+                "{local}: {}",
+                entry.hint
+            );
+        }
+
+        // Two answers on the way: both are named, in declaration order — `t`
+        // before `s`, though the walk met `s` first. `BlockReason::
+        // InvalidValue`'s "in declaration order" and `in_declaration_order`
+        // both predate this change, and every other block reason uses them;
+        // walk order here would be the one exception. An answer may name only
+        // an earlier value, so the two orders differ for every chain of two.
+        let resolved = resolved(
+            &layer,
+            Some("[values]\ns = \"{{t}}\"\nt = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),
+        )
+        .expect("blocked, not a load error");
+        let entry = blocked(&resolved, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["t".to_string(), "s".to_string()]
+            }
+        );
+        assert!(
+            entry.hint.contains(
+                "`file` references `s`, whose answer at local.toml:2 is built from `t`, whose \
+                 answer at local.toml:3 is built from `b`, a `path` value"
+            ),
+            "{}",
+            entry.hint
+        );
+        assert!(
+            entry.hint.ends_with(
+                ", because of the answer to `t` at local.toml:3 and the answer to `s` at \
+                 local.toml:2; change that answer"
+            ),
+            "{}",
+            entry.hint
+        );
+    }
+
+    #[test]
+    fn a_path_answer_outside_file_still_resolves() {
+        // Only `file` is relative to the repo root. Every other field this
+        // walk could have been widened to is what a `path` value is for: two
+        // more fields of the very target whose `file` is walked (`requires`,
+        // an owned key), the target path, and inline content. `owns` matters
+        // most of the four, being the other field that looks repo-shaped.
+        let resolved = resolved(
+            "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+             [[value]]\nname = \"s\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/thing\"\nfile = \"cfg/x\"\n\
+             format = \"jsonc\"\nowns = [\"tool.{{s}}\"]\n\
+             requires = [\"{{s}}/bin/tool\"]\n\
+             [[target]]\npath = \"~/.config/env\"\ncontent = \"DIR={{s}}\"\n\
+             [[target]]\npath = \"~/.config/{{s}}/x\"\ncontent = \"x\"\n",
+            Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/work\"\n"),
+        )
+        .unwrap();
+
+        assert_eq!(ready(&resolved, 0).requires, ["/var/mnt/work/bin/tool"]);
+        assert_eq!(ready(&resolved, 0).body, Body::File(PathBuf::from("cfg/x")));
+        assert_eq!(
+            ready(&resolved, 0).format,
+            Format::Jsonc {
+                owns: vec![KeyPath::parse("tool./var/mnt/work").unwrap()]
+            }
+        );
+        assert_eq!(
+            ready(&resolved, 1).body,
+            Body::Inline("DIR=/var/mnt/work".to_string())
+        );
+        // A target path may not *open* with a placeholder — the parser refuses
+        // that, which is why the plan's own spelling was unusable — but one
+        // further along is legal, and the answer reaches it unrefused.
+        assert_eq!(
+            ready(&resolved, 2).path.as_str(),
+            "~/.config/var/mnt/work/x"
+        );
+    }
+
+    #[test]
+    fn a_repo_defect_in_a_target_outranks_a_path_answer_block() {
+        // The same target also names a value no layer declares. That is the
+        // committed repo's defect and fails the load; blocking the target on
+        // the account's answer instead would hide it.
+        let message = resolved(
+            &ANSWERED_PATH.replace(
+                "file = \"FILE\"\n",
+                "file = \"cfg/{{s}}/x\"\nrequires = [\"{{nowhere}}\"]\n",
+            ),
+            Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),
+        )
+        .expect_err("a repo defect fails the load");
+
+        assert!(
+            message.contains("no layer declares the value `nowhere`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_value_s_answer_is_not_walked() {
+        // A switched-off declaration's answer is not this account's value, so
+        // the walk does not see it and the target is blocked by the switch, as
+        // it was before.
+        let switched_off = resolved(
+            &ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"),
+            Some(
+                "[[value]]\nname = \"s\"\nenabled = false\n\
+                 [values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&switched_off, 0).reason,
+            BlockReason::DisabledValue {
+                names: vec!["s".to_string()]
+            }
+        );
+        assert!(
+            blocked(&switched_off, 0).hint.starts_with("re-enable s"),
+            "{}",
+            blocked(&switched_off, 0).hint
+        );
+
+        // Where that act leads, pinned beside it so the sequence is legible
+        // rather than left to a reader to assemble: the same layers with the
+        // switch on block on the answer, which changing clears outright. Two
+        // statements, each true when it is made, each one progress. The order
+        // they are reported in is a consequence of what `enabled` means, not a
+        // rule this module keeps for its own sake.
+        let switched_on = resolved(
+            &ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"),
+            Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&switched_on, 0).reason,
+            BlockReason::InvalidValue {
+                names: vec!["s".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_switched_off_declaration_is_walked_through_by_its_default() {
+        // `enabled` gates the answer edge and nothing else, so a switched-off
+        // declaration is not a wall. `d` is off, but its committed default
+        // reaches `b`, and the walk follows that default straight through it:
+        // the target blocks on the answer that led there, naming `d`'s
+        // default as the step, rather than on `d`'s switch.
+        const THROUGH: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                               [[value]]\nname = \"d\"\nkind = \"string\"\n\
+                               default = \"{{b}}\"\n\
+                               [[value]]\nname = \"s\"\nkind = \"string\"\n\
+                               [[target]]\npath = \"~/.config/thing\"\n\
+                               file = \"cfg/{{s}}/x\"\n";
+
+        let walked = resolved(
+            THROUGH,
+            Some(
+                "[[value]]\nname = \"d\"\nenabled = false\n\
+                 [values]\ns = \"{{d}}\"\n",
+            ),
+        )
+        .expect("blocked, not a load error");
+        assert_eq!(
+            blocked(&walked, 0).reason,
+            BlockReason::InvalidValue {
+                names: vec!["s".to_string()]
+            }
+        );
+        assert!(
+            blocked(&walked, 0).hint.contains(
+                "`file` references `s`, whose answer at local.toml:5 is built from `d`, \
+                 whose default at bx.toml:4 is built from `b`, a `path` value"
+            ),
+            "{}",
+            blocked(&walked, 0).hint
+        );
+
+        // The other half of "the answer edge alone": `d`'s default is now a
+        // plain string and its ANSWER is what reaches `b`. While the switch is
+        // off that answer is not this account's value, so the walk does not
+        // follow it and finds nothing; the switch is what reports.
+        const BY_ANSWER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                                 [[value]]\nname = \"d\"\nkind = \"string\"\n\
+                                 default = \"work\"\n\
+                                 [[value]]\nname = \"s\"\nkind = \"string\"\n\
+                                 [[target]]\npath = \"~/.config/thing\"\n\
+                                 file = \"cfg/{{s}}/x\"\n";
+        const ANSWERS: &str = "[values]\ns = \"{{d}}\"\nd = \"{{b}}\"\n\
+                               b = \"/var/mnt/cfg\"\n";
+
+        let gated = resolved(
+            BY_ANSWER,
+            Some(&format!(
+                "[[value]]\nname = \"d\"\nenabled = false\n{ANSWERS}"
+            )),
+        )
+        .expect("blocked, not a load error");
+        assert_eq!(
+            blocked(&gated, 0).reason,
+            BlockReason::DisabledValue {
+                names: vec!["d".to_string()]
+            }
+        );
+
+        // The same answers with the switch on: the answer really does reach
+        // `b`, so the case above is the gate working and not an answer that
+        // was never going to get there.
+        let ungated = resolved(BY_ANSWER, Some(ANSWERS)).expect("blocked, not a load error");
+        assert_eq!(
+            blocked(&ungated, 0).reason,
+            BlockReason::InvalidValue {
+                names: vec!["d".to_string(), "s".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_path_answer_block_outranks_an_unrelated_disabled_or_invalid_value() {
+        // The placement this block was given is "before the disabled, invalid
+        // and unset blocks", and only the unset half was ever exercised. Each
+        // of the other two is given a value of its own, in `requires`, with
+        // nothing to do with the way `file` reaches `b`: clearing either one
+        // would leave this target blocked here, so neither may be reported
+        // first. The second half of each case drops the answer route and shows
+        // the block that would otherwise have won, so the first half is a
+        // statement about precedence rather than about the only block there is.
+        const LAYER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                             [[value]]\nname = \"other\"\nkind = \"KIND\"\n\
+                             [[value]]\nname = \"s\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/thing\"\nfile = \"FILE\"\n\
+                             requires = [\"{{other}}\"]\n";
+        let reaching = "cfg/{{s}}/x";
+
+        for (kind, local, without) in [
+            // Switched off: `other` is unrelated to the way to `b`.
+            (
+                "string",
+                "[[value]]\nname = \"other\"\nenabled = false\n\
+                 [values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n",
+                BlockReason::DisabledValue {
+                    names: vec!["other".to_string()],
+                },
+            ),
+            // Answered something its kind refuses, likewise unrelated.
+            (
+                "path",
+                "[values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n\
+                 other = \"relative/thing\"\n",
+                BlockReason::InvalidValue {
+                    names: vec!["other".to_string()],
+                },
+            ),
+        ] {
+            let layer = LAYER.replace("KIND", kind);
+
+            let blocking = resolved(&layer.replace("FILE", reaching), Some(local)).unwrap();
+            assert_eq!(
+                blocked(&blocking, 0).reason,
+                BlockReason::InvalidValue {
+                    names: vec!["s".to_string()]
+                },
+                "{kind}: the path-answer block did not outrank {without:?}"
+            );
+            assert!(
+                blocked(&blocking, 0).hint.contains("a `path` value"),
+                "{kind}: {}",
+                blocked(&blocking, 0).hint
+            );
+
+            // The same layers with `file` reaching nothing: the block that was
+            // outranked is really there, and really would have reported.
+            let alone = resolved(&layer.replace("FILE", "cfg/x"), Some(local)).unwrap();
+            assert_eq!(blocked(&alone, 0).reason, without, "{kind}");
+        }
+    }
+
+    #[test]
+    fn switched_off_names_are_ordered_by_declaration_like_every_other_block() {
+        // `a` is declared before `b`, and the target names `b` in its path and
+        // `a` in its body, so the probe meets them the other way round —
+        // `for_each_string` visits the path first. `BlockReason::DisabledValue`
+        // documents its names as being in declaration order, like every other
+        // block reason, and a switch does not move a declaration.
+        let resolved = resolved(
+            "[[value]]\nname = \"a\"\nkind = \"string\"\n\
+             [[value]]\nname = \"b\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/{{b}}\"\ncontent = \"{{a}}\"\n",
+            Some(
+                "[[value]]\nname = \"a\"\nenabled = false\n\
+                 [[value]]\nname = \"b\"\nenabled = false\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blocked(&resolved, 0).reason,
+            BlockReason::DisabledValue {
+                names: vec!["a".to_string(), "b".to_string()]
+            }
+        );
+        assert!(
+            blocked(&resolved, 0).hint.starts_with("re-enable a, b"),
+            "{}",
+            blocked(&resolved, 0).hint
+        );
+    }
+
+    #[test]
+    fn a_file_reached_by_a_committed_route_and_an_answered_one_fails_the_load() {
+        // `c`'s committed default reaches `b`; the account's answer to `s`
+        // reaches it too. The committed way is the same defect for every
+        // account and no answer clears it, so it outranks the block whichever
+        // name is written first in `file` — written order decides which
+        // reference a walk names, not which walk answers. Reporting the block
+        // instead would hide a repository defect behind advice to this one
+        // account, and would report it only to an account that had answered.
+        const LAYER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                             [[value]]\nname = \"c\"\nkind = \"string\"\n\
+                             default = \"{{b}}\"\n\
+                             [[value]]\nname = \"s\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/thing\"\nfile = \"FILE\"\n";
+
+        for file in ["cfg/{{c}}/{{s}}/x", "cfg/{{s}}/{{c}}/x"] {
+            let message = resolved(
+                &LAYER.replace("FILE", file),
+                Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n"),
+            )
+            .expect_err("the committed route is a load error, not one account's block");
+            assert!(
+                message.contains(
+                    "`file` references `c`, whose default at bx.toml:4 is built from `b`, \
+                     a `path` value"
+                ),
+                "{file}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_switched_off_path_declaration_still_ends_the_walk() {
+        // The twin of the test above, for the *terminal* declaration rather
+        // than one in the middle. `enabled` gates the answer edge alone: a
+        // switched-off `b` is still a `path` declaration, and `s = "{{b}}"`
+        // still carries its absolute text into `file`. Blocking on `b` with
+        // "re-enable it" would name an act that lands straight back here, and
+        // would judge that `b` differently from the committed walk, which
+        // fails the load for a `file` whose default chain reaches a
+        // switched-off `path` value.
+        for local in [
+            "[[value]]\nname = \"b\"\nenabled = false\n\
+             [values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n",
+            // Switched off and unanswered: still this block, not `bx init`.
+            "[[value]]\nname = \"b\"\nenabled = false\n\
+             [values]\ns = \"{{b}}\"\n",
+        ] {
+            let resolved = resolved(&ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"), Some(local))
+                .expect("blocked, not a load error");
+            let entry = blocked(&resolved, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["s".to_string()]
+                },
+                "{local}"
+            );
+            assert_eq!(
+                entry.hint,
+                "target `~/.config/thing`: `file` references `s`, whose answer at \
+                 local.toml:5 is built from `b`, a `path` value; a `path` value is always \
+                 absolute and `file` is relative to the config repo root, because of the \
+                 answer to `s` at local.toml:5; change that answer",
+                "{local}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_re_entering_a_walked_name_still_resolves() {
+        // The `seen` guard along the answer edge. `q`'s answer names `r`,
+        // whose committed default names `q` back. That default is never
+        // expanded, because `r` is answered, so value resolution never refuses
+        // the forward reference and the walk is the one thing that meets the
+        // cycle — at `q`, a second time. Without `seen` it recurses until the
+        // stack runs out. Nothing on the way is a `path` value, so the target
+        // resolves.
+        let resolved = resolved(
+            "[[value]]\nname = \"r\"\nkind = \"string\"\ndefault = \"{{q}}\"\n\
+             [[value]]\nname = \"q\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/thing\"\nfile = \"cfg/{{q}}/x\"\n",
+            Some("[values]\nr = \"work\"\nq = \"{{r}}\"\n"),
+        )
+        .expect("an overridden default may name a later value");
+
+        assert_eq!(
+            ready(&resolved, 0).body,
+            Body::File(PathBuf::from("cfg/work/x"))
+        );
+        // `q` has no committed default, so the committed walk returns at once
+        // and never reaches its own guard: this cycle is the answer walk's.
+        assert_eq!(
+            path_value_behind(&resolved.values, "q", &mut Vec::new()).map(|chain| chain.len()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_committed_chain_alone_is_not_an_answer_block() {
+        // `refuse_path_answer_in_file` may name only answers, and it may say
+        // so only because `refuse_path_value_in_file` has already failed the
+        // load for every committed way to a `path` value from the same names.
+        // That is a claim about a different function, so the guard is called
+        // with the chain the claim forbids: `s`'s committed default reaches
+        // `b` and the account answered nothing. Were the two walks ever to
+        // disagree, this must stay `None` rather than block a target on an
+        // empty list of answers to change.
+        let layers = vec![
+            layer(
+                "bx.toml",
+                LayerKind::Global,
+                "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                 [[value]]\nname = \"s\"\nkind = \"string\"\ndefault = \"{{b}}\"\n\
+                 [[target]]\npath = \"~/.config/thing\"\ncontent = \"x\"\n",
+            )
+            .unwrap(),
+        ];
+        let merged = merge(&layers, &home()).unwrap();
+        let values =
+            ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, &home())
+                .unwrap();
+
+        // The chain is there for the committed walk, which owes the load error.
+        assert!(
+            refuse_path_value_in_file(&merged.targets[0], "cfg/{{s}}/x", &values).is_err(),
+            "the committed walk is the one that reaches this chain"
+        );
+        assert_eq!(
+            refuse_path_answer_in_file(
+                &merged.targets[0],
+                "cfg/{{s}}/x",
+                &values,
+                &merged.value_assignments,
+            ),
+            None
         );
     }
 }

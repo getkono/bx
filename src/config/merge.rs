@@ -704,15 +704,28 @@ fn clash(
 ///
 /// Which source decides a hint, and which cannot: only an earlier layer's
 /// entry can. An entry in `layer` itself is one path as written with the
-/// toggle, so the pair is refused before a hint is chosen — by [`clash`], as
-/// that layer naming one file twice, while the file is known; and by
-/// [`unknown_toggle`] when it is not, since a spelling waiting on a value is
-/// keyed by its own text, so two spellings of one form are two keys and the
-/// toggle reaches no entry at all. And an entry a later layer declares would
-/// settle the clash rather than change its hint, since a full entry drops
-/// every clash held for its file. Both arms are kept all the same: this
-/// answers what bx can show about one toggle, and none of those rules is its
-/// to assume.
+/// toggle, and such a pair is refused before a hint is chosen, by one of three
+/// routes. Which one is decided textually, on the strings the layer stores —
+/// an entry's `path` folded when it was parsed, a toggle's key raw:
+///
+/// - the strings coincide: the parser's own duplicate check refuses the layer,
+///   before `merge` runs at all;
+/// - they differ and the file is known: [`clash`] refuses it, as one layer
+///   naming one file twice;
+/// - they differ and the file is not known: each spelling is keyed as written,
+///   by its own text, so the toggle matches no entry and [`unknown_toggle`]
+///   refuses it.
+///
+/// The three rows of
+/// `one_layer_that_declares_a_file_and_toggles_it_is_refused_by_one_of_three_routes`
+/// are those three, and
+/// `one_layer_naming_one_file_twice_by_spelling_alone_is_refused_whatever_the_answer`
+/// covers the middle one over every folding.
+///
+/// An entry a later layer declares would settle the clash rather than change
+/// its hint, since a full entry drops every clash held for its file. Both arms
+/// are kept all the same: this answers what bx can show about one toggle, and
+/// none of those rules is its to assume.
 fn anchored(toggle: &str, earlier: &[&Layer], layer: &Layer, values: &ResolvedValues) -> bool {
     earlier
         .iter()
@@ -2146,6 +2159,64 @@ mod tests {
     }
 
     #[test]
+    fn one_layer_that_declares_a_file_and_toggles_it_is_refused_by_one_of_three_routes() {
+        // Which route refuses an own-layer `[[target]]` entry and toggle for
+        // one file is decided textually, on the strings the layer stores — an
+        // entry's `path` folded when it was parsed, a toggle's key raw. The
+        // three rows are the three answers, and together they are why no toggle
+        // anchored by its own layer's entry ever reaches a hint.
+        let text = |entry: &str, toggle: &str| {
+            format!(
+                "[[value]]\nname = \"p\"\nkind = \"string\"\n{}\
+                 [[target]]\npath = \"{toggle}\"\nenabled = false\n",
+                target_toml(entry, "x")
+            )
+        };
+
+        // (i) The strings coincide: the parser's own duplicate check refuses
+        // the layer, before any merge. The second row's entry folds to the
+        // toggle's spelling when it is parsed.
+        for (entry, toggle) in [
+            ("~/.config/s", "~/.config/s"),
+            ("~/.config/{{p}}/../s", "~/.config/s"),
+        ] {
+            let message = parse_str(&text(entry, toggle), Path::new("bx.toml"), &home())
+                .expect_err("a layer that names one file twice is refused")
+                .to_string();
+            assert!(message.contains("duplicate target"), "{entry}: {message}");
+            assert!(message.contains("first declared at"), "{entry}: {message}");
+        }
+
+        // (ii) The strings differ and the file is known: `clash` refuses it as
+        // one layer naming one file twice. Covered in full, over every folding,
+        // by `one_layer_naming_one_file_twice_by_spelling_alone_is_refused_whatever_the_answer`.
+        let message = failure(&[
+            global("bx.toml", &text("~/.config/{{p}}/s", "~/.config/{{p}}/./s")),
+            local("[values]\np = \"work\"\n"),
+        ]);
+        assert!(message.contains("in this same layer"), "{message}");
+
+        // (iii) The strings differ and the file is not known: each spelling is
+        // keyed by its own text, so the toggle matches no entry at all and
+        // `unknown_toggle` refuses it. `p` is declared and unanswered here.
+        let message = failure(&[
+            global("bx.toml", &text("~/.config/{{p}}/s", "~/.config/{{p}}/./s")),
+            local(""),
+        ]);
+        assert!(
+            message.contains("which no earlier layer declares"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "matched by the spelling it was declared with, such as `~/.config/{{p}}/s` \
+                 at bx.toml:4"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn a_toggle_for_a_target_waiting_on_a_value_names_the_declared_spelling() {
         // With `acct` unanswered the file is not known, so the spelling `plan`
         // would show once it is answered cannot reach it. The message says which
@@ -2434,11 +2505,9 @@ mod tests {
         // `anchored` taken on its own, because neither source it adds to the
         // first can be told apart through a hint: a same-layer entry one path
         // as written with the toggle is refused before a hint is chosen, by
-        // `clash` while the file is known (see
-        // `toggles_one_path_past_a_placeholder_are_the_layer_s_defect_whatever_climbs`)
-        // and by `unknown_toggle` when it is not, each spelling being keyed by
-        // its own text then (see
-        // `a_toggle_for_a_target_waiting_on_a_value_names_the_declared_spelling`);
+        // the duplicate check, by `clash` or by `unknown_toggle` according to
+        // the strings the layer stores (see
+        // `one_layer_that_declares_a_file_and_toggles_it_is_refused_by_one_of_three_routes`),
         // and an entry a later layer declares settles the clash instead of
         // rewording it (see resolve.rs's
         // `one_file_clashing_in_two_layers_is_recorded_for_each_and_settled_only_by_name`).

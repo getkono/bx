@@ -26,6 +26,29 @@
 //! `enabled = false`. Making the last layer a full layer is what covers them,
 //! and it is why this file exists rather than a `values.toml` reader.
 //!
+//! # Inside the repo is decided lexically, not on disk
+//!
+//! Whether a path is inside the config repo is decided by comparing spellings
+//! after [`paths::normalize`], which reads no filesystem. That is the same rule
+//! every other path comparison in the crate uses, and it is what lets the whole
+//! of layer resolution stay a pure function of its arguments: Invariant 3 asks
+//! for two `plan` runs a week apart to be byte-identical, which a check that
+//! resolved symlinks could not promise, and Invariant 6 keeps I/O off paths
+//! that do not need it.
+//!
+//! **Its limit, stated rather than discovered.** A symlinked alias of the repo
+//! is a different spelling, so a state directory reached through one is *not*
+//! refused, and `bx` will write a `local.toml` that is inside the repo on disk
+//! — the hole the check exists to close.
+//! `a_state_directory_reached_through_a_symlinked_alias_of_the_repo_is_not_refused`
+//! pins that, so changing it is a deliberate edit to a named test rather than a
+//! quiet change of behaviour. Closing it needs a decision this module does not
+//! take on its own: layer resolution would have to read the filesystem, by
+//! `canonicalize` or by comparing device and inode, and every caller would
+//! inherit the I/O and the failure modes of a path that may not exist yet. The
+//! `local.toml` writer entry A8 adds inherits the same limit, and must not take
+//! this check as proof that the file it writes is outside the repo.
+//!
 //! # Nothing here reads the environment
 //!
 //! [`state_dir`] takes both the home and the `XDG_STATE_HOME` override as
@@ -78,7 +101,10 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 /// [`Error::LocalInRepo`], whether or not a `local.toml` is there yet: loading
 /// it would be the hole above, and skipping it would silently drop the
 /// account's layer. Compared lexically after [`paths::normalize`], like every
-/// other path rule in the crate, so a symlinked alias of the repo is not caught.
+/// other path rule in the crate, so a symlinked alias of the repo is not caught;
+/// see *Inside the repo is decided lexically, not on disk* in the [module
+/// documentation](self) for that rule, its limit, and what closing the limit
+/// would cost.
 ///
 /// # Only a clean answer skips the local layer
 ///
@@ -332,6 +358,32 @@ mod tests {
             layer_paths(&repo, &home.child(".config/bx-state")).unwrap(),
             [repo.join("bx.toml"), local]
         );
+    }
+
+    /// The limit of the lexical check, pinned. `alias` is the repo under
+    /// another spelling, so `alias/state` is inside it on disk but not as
+    /// written, and it is accepted. Resolving symlinks here is a deliberate
+    /// change to this test, not a quiet change of behaviour; the module
+    /// documentation states the rule and this limit under *Inside the repo is
+    /// decided lexically, not on disk*.
+    #[test]
+    fn a_state_directory_reached_through_a_symlinked_alias_of_the_repo_is_not_refused() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        let alias = home.child("alias");
+        std::os::unix::fs::symlink(&repo, &alias).expect("symlink");
+        assert_eq!(
+            alias.canonicalize().expect("the alias resolves"),
+            repo.canonicalize().expect("the repo resolves"),
+            "the fixture must really be one directory under two spellings"
+        );
+        home.write(".config/bx/state/local.toml", "");
+
+        let paths = layer_paths(&repo, &alias.join("state"))
+            .expect("not refused: the check compares spellings");
+
+        assert_eq!(paths.last(), Some(&alias.join("state").join(LOCAL_FILE)));
     }
 
     #[test]

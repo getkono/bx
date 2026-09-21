@@ -29,12 +29,14 @@
 //! note names the `local.toml` line that caused it.
 //!
 //! So does a legal answer that makes a **target's own field** invalid once
-//! substituted: `acct = "../../.."` into `~/.config/{{acct}}/settings.json`
-//! climbs out of the home, `seg = ""` into `owns = ["a.{{seg}}"]` leaves an
-//! empty key segment, and `leaf = "."` into a file target's `~/{{leaf}}` makes it
-//! the home directory itself. The target is blocked naming the answer's line, and
-//! nothing is written for it. The same field broken with no account answer in
-//! it — a committed `default` alone — is the repo's defect and fails the load.
+//! substituted, among them: `acct = "../../.."` into
+//! `~/.config/{{acct}}/settings.json` climbs out of the home, `seg = ""` into
+//! `owns = ["a.{{seg}}"]` leaves an empty key segment, `seg = "b.c"` adds a
+//! segment, naming a deeper key than the one written, and `leaf = "."` into a
+//! file target's `~/{{leaf}}` makes it the home directory itself. The target is
+//! blocked naming the answer's line, and nothing is written for it. The same
+//! field broken with no account answer in it — a committed `default` alone — is
+//! the repo's defect and fails the load.
 //!
 //! A defect in the **committed** repo is not blocked but fatal — a malformed
 //! placeholder, or a reference to a value no layer declares, cannot be fixed by
@@ -83,7 +85,8 @@ pub enum BlockReason {
     /// an answer its kind refuses, one that made a committed `default` invalid,
     /// or one that, substituted into this entry, makes a field invalid — a path
     /// that climbs out of the home, a `file` that climbs out of the repo, an
-    /// owned key with an empty segment.
+    /// owned key with an empty segment or with more or fewer segments than
+    /// written.
     ///
     /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
     /// unanswered: the answer that needs changing is already written, and the
@@ -195,6 +198,9 @@ fn resolve_target(
     if let Body::File(file) = &target.body {
         refuse_path_value_in_file(target, &file.to_string_lossy(), values)?;
     }
+    for tool in &target.requires {
+        refuse_committed_requirement(target, tool)?;
+    }
 
     let mut unset: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
@@ -290,10 +296,117 @@ fn resolve_target(
                 });
             }
             let names = in_declaration_order(values, causes);
-            let hint = values.answers_hint(&problem, &names);
+            let hint = values.answers_hint(&problem, &[raw.as_str()], &names);
             block(BlockReason::InvalidValue { names }, hint)
         }
     }
+}
+
+/// Refuse a `requires` entry **no text at all** could make findable.
+///
+/// The boundary is the **committed skeleton**: an entry that no string, put in
+/// place of its placeholders, could make findable is broken by the bytes a
+/// layer wrote, so it is that layer's defect whatever anyone answered. An entry
+/// holding no placeholder is the degenerate case of that, not a separate rule —
+/// its one producible text is the text as written. Holding a placeholder is
+/// therefore no exemption: `requires = ["bin/{{tool}}"]` is a relative name
+/// with a `/` in it whatever text fills `{{tool}}`, and is refused here.
+///
+/// The boundary is deliberately **not** "no answer could satisfy it", which is
+/// the wider set: a declared kind narrows which strings are answers, so
+/// `requires = ["bx{{sfx}}"]` with `sfx` of kind `path` is unsatisfiable by
+/// every answer — a `path` is always absolute, so the result always holds a `/`
+/// and never opens with one — and is still not refused here. That is by design,
+/// and the reason is which file the verdict would then depend on. A `[[value]]`
+/// declaration is **not** restricted to committed layers; only a `[values]`
+/// table is. An account may redeclare `sfx` in `local.toml` and change its
+/// kind, so a kind-aware refusal would let an account's own edit fail the whole
+/// load — or repair a load its layers broke — which is exactly the
+/// account-caused whole-load failure this module exists to prevent. A kind
+/// narrowing an entry into unusability therefore stays a **blocked target**: it
+/// names the value and costs that one entry, which is what an account can act
+/// on. `a_kind_that_narrows_a_requires_skeleton_blocks_the_target_not_the_load`
+/// pins that, and pins that the load survives it.
+///
+/// Checked **before** the probe, beside [`refuse_path_value_in_file`], because
+/// [`substituted`] is reached only once every value the target references has a
+/// usable answer: left there alone, the very same committed line would fail the
+/// load for an account that has answered and be invisible to one that has not.
+///
+/// [`check_requirement`] still runs inside [`substituted`], for an entry some
+/// answer could have satisfied and this account's did not — `["{{tool}}"]` with
+/// `tool = "./bin/foo"`. That is the account's to change, and it costs that
+/// target alone.
+///
+/// A malformed placeholder is left to the probe, which reports it with the rest
+/// of the target's defects, so text `scan` refuses is passed over here.
+///
+/// The `owns` arity check needs no twin: with no placeholder in the key, the
+/// substituted text is the text as written, so its segment count cannot move.
+fn refuse_committed_requirement(target: &Target, tool: &str) -> Result<(), Error> {
+    let Ok(pieces) = super::values::scan(tool) else {
+        return Ok(());
+    };
+    let satisfiable = REQUIREMENT_STAND_INS
+        .iter()
+        .any(|stand_in| check_requirement(&stood_in(&pieces, stand_in)).is_ok());
+    if satisfiable {
+        return Ok(());
+    }
+    Err(Error::BadValue {
+        origin: target.origin.clone(),
+        message: format!("target `{}`: {}", target.path, unfindable_requirement(tool)),
+    })
+}
+
+/// The two texts [`refuse_committed_requirement`] asks its question with.
+///
+/// [`check_requirement`] reads a substituted text three ways: whether it opens
+/// with `/`, whether it holds a `/` anywhere, and whether every `/`-separated
+/// segment is empty, `.` or `..`. A filled placeholder moves all three only
+/// through the text it contributes, so two stand-ins settle the whole question
+/// rather than a list of shapes that would keep growing.
+///
+/// Suppose some assignment of strings passes. Then the text it makes opens with
+/// `/`, or holds no `/`; take each in turn.
+///
+/// - **It opens with `/`.** Split on the **first piece**, not on where the `/`
+///   came from. If that piece is a literal it is non-empty — `scan` emits no
+///   empty literal — so the result begins with its first byte under every
+///   assignment, this one included, and both stand-ins leave it alone. If that
+///   piece is a name, `/q` begins with `/`, so the result does too whatever
+///   follows. Either way `/q` opens with `/`. (Splitting instead on the origin
+///   of the `/` misses `{{a}}/usr/bin` with `a` empty, where the `/` is
+///   committed text that is not before the first placeholder.)
+/// - **It holds no `/`.** Then no committed chunk holds one and no substituted
+///   text does, so `q`, which holds none either, leaves the result `/`-free.
+///
+/// Neither stand-in is empty or a dot, and a text reaching this question holds
+/// at least one placeholder — with none, both stand-ins reproduce the text
+/// unchanged and the question is just [`check_requirement`] — so neither
+/// stand-in can make an all-dots result that the committed text did not force.
+///
+/// One of the two therefore passes whenever any assignment does, so refusing
+/// when both fail refuses only an entry no string rescues. They stand in for an
+/// arbitrary string, which is the whole boundary and not an approximation of a
+/// kind-aware one; [`refuse_committed_requirement`] says why the kind is
+/// deliberately not consulted.
+///
+/// `a_requires_skeleton_only_one_stand_in_satisfies_is_not_a_committed_defect`
+/// pins that both are needed, and
+/// `a_requires_skeleton_no_text_could_complete_fails_the_load` pins the
+/// refusal itself.
+const REQUIREMENT_STAND_INS: [&str; 2] = ["/q", "q"];
+
+/// `pieces` with every `{{name}}` replaced by `stand_in`.
+fn stood_in(pieces: &[super::values::Piece<'_>], stand_in: &str) -> String {
+    pieces
+        .iter()
+        .map(|piece| match piece {
+            super::values::Piece::Literal(literal) => *literal,
+            super::values::Piece::Name(_) => stand_in,
+        })
+        .collect()
 }
 
 /// Refuse a `file` that references a `path` value.
@@ -305,6 +418,21 @@ fn resolve_target(
 /// defect and a load error naming the target, whether or not the value has an
 /// answer yet — not a blocked target whose hint advises changing one.
 ///
+/// The same holds for a value whose committed `default` is built from a `path`
+/// value, however many defaults lie between: `s` defaulting to `{{b}}` carries
+/// `b`'s absolute text into `file`. Each default is followed as written,
+/// whether or not it applies for this account, so the refusal is the same for
+/// every account; the message names each declaration on the way.
+///
+/// `file` may hold both kinds of reference. The one refused is whichever comes
+/// **first in written order**, with the chain behind it, and there is no
+/// preference for the more direct one. A value directly of kind `path` is a
+/// one-step chain, so the two cases are one walk and one message shape; a rule
+/// that reported the direct reference first would tell the reader about the
+/// second `{{name}}` in the field and leave the first, whose chain is just as
+/// fatal, unmentioned. Written order is also the deterministic choice, which is
+/// the direction Invariant 3 points.
+///
 /// A malformed placeholder is left to the probe, which reports it with the
 /// rest of the target's defects.
 fn refuse_path_value_in_file(
@@ -312,26 +440,72 @@ fn refuse_path_value_in_file(
     file: &str,
     values: &ResolvedValues,
 ) -> Result<(), Error> {
-    let path_value = super::values::placeholders(file)
+    let names = super::values::placeholders(file).unwrap_or_default();
+    let mut seen: Vec<String> = Vec::new();
+    let chain = names
+        .iter()
+        .find_map(|name| path_value_behind(values, name, &mut seen));
+    let Some(chain) = chain else {
+        return Ok(());
+    };
+
+    let steps: String = chain
+        .windows(2)
+        .map(|pair| {
+            format!(
+                ", whose default at {} is built from `{}`",
+                pair[0].origin, pair[1].name
+            )
+        })
+        .collect();
+    let not_built = if chain.len() > 1 {
+        " that is not built from one"
+    } else {
+        ""
+    };
+    Err(Error::BadValue {
+        origin: target.origin.clone(),
+        message: format!(
+            "target `{}`: `file` references `{}`{steps}, a `path` value; a `path` value \
+             is always absolute and `file` is relative to the config repo root, so no \
+             answer could make it name a file in the repo; reference a `string` value\
+             {not_built}",
+            target.path, chain[0].name
+        ),
+    })
+}
+
+/// The declarations from `name` down its committed defaults to a `path` value.
+///
+/// Depth first, each default's references in the order written. `seen` stops
+/// the walk at a name it has already walked, and it is reachable.
+/// [`Unresolved::Forward`](super::values::Unresolved::Forward) keeps every
+/// *expanded* default acyclic, since a default may reference only an earlier
+/// declaration. But a default an answer overrides is never expanded, so
+/// `default = "{{q}}"` on an answered `q` reaches this walk unrefused, and
+/// without `seen` the walk would recurse until the stack ran out.
+fn path_value_behind<'a>(
+    values: &'a ResolvedValues,
+    name: &str,
+    seen: &mut Vec<String>,
+) -> Option<Vec<&'a super::values::ValueDecl>> {
+    if seen.iter().any(|walked| walked == name) {
+        return None;
+    }
+    seen.push(name.to_string());
+    let decl = values.decl(name)?;
+    if decl.kind == super::values::ValueKind::Path {
+        return Some(vec![decl]);
+    }
+    let default = decl.default.as_ref()?.to_string();
+    super::values::placeholders(&default)
         .unwrap_or_default()
         .into_iter()
-        .find(|name| {
-            values
-                .decl(name)
-                .is_some_and(|decl| decl.kind == super::values::ValueKind::Path)
-        });
-    match path_value {
-        None => Ok(()),
-        Some(name) => Err(Error::BadValue {
-            origin: target.origin.clone(),
-            message: format!(
-                "target `{}`: `file` references `{name}`, a `path` value; a `path` value \
-                 is always absolute and `file` is relative to the config repo root, so no \
-                 answer could make it name a file in the repo; reference a `string` value",
-                target.path
-            ),
-        }),
-    }
+        .find_map(|next| path_value_behind(values, next, seen))
+        .map(|mut chain| {
+            chain.insert(0, decl);
+            chain
+        })
 }
 
 /// Why [`substituted`] could not rebuild a target.
@@ -440,7 +614,23 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
                 .iter()
                 .map(|key| {
                     let raw = key.to_string();
-                    KeyPath::parse(&sub(&raw)?).map_err(|source| field(&raw, source.to_string()))
+                    let text = sub(&raw)?;
+                    let parsed =
+                        KeyPath::parse(&text).map_err(|source| field(&raw, source.to_string()))?;
+                    // `KeyPath` splits on `.`, so an answer holding one would
+                    // name a different, deeper key than the one written.
+                    let (written, now) = (key.segments().len(), parsed.segments().len());
+                    if now != written {
+                        return Err(field(
+                            &raw,
+                            format!(
+                                "`owns` key `{raw}` has {written} segments as written and {now} \
+                                 once substituted, as `{text}`; an answer may fill a segment but \
+                                 not add or remove one"
+                            ),
+                        ));
+                    }
+                    Ok(parsed)
                 })
                 .collect::<Result<Vec<_>, Broken>>()?,
         },
@@ -463,7 +653,11 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
         requires: target
             .requires
             .iter()
-            .map(|tool| sub(tool))
+            .map(|tool| {
+                let text = sub(tool)?;
+                check_requirement(&text).map_err(|problem| field(tool, problem))?;
+                Ok(text)
+            })
             .collect::<Result<Vec<_>, Broken>>()?,
         references: target
             .references
@@ -473,6 +667,37 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
         enabled: target.enabled,
         origin: target.origin.clone(),
     })
+}
+
+/// Refuse a `requires` entry detection could never find.
+///
+/// Detection looks a bare name up on `PATH` and opens an absolute path as it
+/// is; a relative name holding a `/` is never found, and an empty one would be
+/// joined onto every `PATH` directory. A name made only of `.` and `..`
+/// segments (`/` among them) names a directory, which detection never counts
+/// as a tool. Checked once substituted, because an answer is where any of these
+/// most plausibly comes from — and, through [`refuse_committed_requirement`],
+/// against stand-in texts before the probe, so a skeleton no string satisfies
+/// is the layer's defect rather than one account's.
+fn check_requirement(text: &str) -> Result<(), String> {
+    let only_dots = text
+        .split('/')
+        .all(|segment| matches!(segment, "" | "." | ".."));
+    if only_dots || (text.contains('/') && !text.starts_with('/')) {
+        return Err(unfindable_requirement(text));
+    }
+    Ok(())
+}
+
+/// How [`check_requirement`] says it refused `text`.
+///
+/// One spelling, so the pre-probe refusal reports a skeleton the way the
+/// post-substitution one reports a filled text.
+fn unfindable_requirement(text: &str) -> String {
+    format!(
+        "`requires` names a tool by a bare name to look up on `PATH`, or by an \
+         absolute path; got {text:?}"
+    )
 }
 
 /// Order `names` the way the values were declared, deduplicated.
@@ -665,6 +890,23 @@ mod tests {
     }
 
     #[test]
+    fn a_file_body_through_an_answered_value_whose_default_names_itself_resolves() {
+        // An answer overrides its declaration's default, so that default is never
+        // expanded and `Unresolved::Forward` never refuses it. The walk for a
+        // `path` value behind `file` reads committed defaults, answered or not,
+        // so it has to stop at a name it has already walked.
+        const LAYER: &str = "[[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{q}}\"\n\
+                             [[target]]\npath = \"~/.gitconfig\"\nfile = \"cfg/{{q}}/gitconfig\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\nq = \"work\"\n"))
+            .expect("an answered value's unexpanded default does not fail the load");
+        assert_eq!(
+            ready(&answered, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig"))
+        );
+    }
+
+    #[test]
     fn a_file_body_may_not_reference_a_path_value() {
         // A `path` value is absolute by construction and `file` is relative to
         // the repo root. Opening `file`, it can never name a repo file whatever
@@ -693,6 +935,15 @@ mod tests {
                 ] {
                     assert!(message.contains(part), "{file} {local:?} {part}: {message}");
                 }
+                // One step: nothing lies between, so the advice stops at the kind.
+                assert!(
+                    message.ends_with(
+                        "`file` references `cfg_dir`, a `path` value; a `path` value is always \
+                         absolute and `file` is relative to the config repo root, so no answer \
+                         could make it name a file in the repo; reference a `string` value"
+                    ),
+                    "{file} {local:?}: {message}"
+                );
             }
         }
 
@@ -702,6 +953,79 @@ mod tests {
             .replace("kind = \"path\"", "kind = \"string\"")
             .replace("FILE", "cfg/{{cfg_dir}}/gitconfig");
         let ordinary = resolved(&string, Some("[values]\ncfg_dir = \"work\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig"))
+        );
+    }
+
+    #[test]
+    fn a_file_body_may_not_reach_a_path_value_through_a_default() {
+        // `s` is a `string`, but its committed default is `{{b}}`, a `path`
+        // value. Checking only the kind of the name written in `file` let
+        // `cfg/{{s}}/gitconfig` resolve to a repo file carrying the account's
+        // absolute location, and blocked `{{s}}/gitconfig` with a hint naming
+        // only `b`. The declaration is the layer's defect whatever is answered,
+        // `s` included, so it is refused at load and the chain is named.
+        const LAYER: &str = "[[value]]\n\
+                             name = \"b\"\n\
+                             kind = \"path\"\n\
+                             [[value]]\n\
+                             name = \"s\"\n\
+                             kind = \"string\"\n\
+                             default = \"{{b}}\"\n\
+                             [[target]]\n\
+                             path = \"~/.gitconfig\"\n\
+                             file = \"FILE\"\n\
+                             [[target]]\n\
+                             path = \"~/.zshrc\"\n\
+                             content = \"setopt\"\n";
+
+        for file in ["{{s}}/gitconfig", "cfg/{{s}}/gitconfig"] {
+            for local in [
+                None,
+                Some("[values]\nb = \"/var/mnt/cfg\"\n"),
+                Some("[values]\ns = \"work\"\n"),
+            ] {
+                let message = resolved(&LAYER.replace("FILE", file), local)
+                    .expect_err("a `path` value reached through a default is the layer's defect");
+                for part in [
+                    "bx.toml:8",
+                    "`file` references `s`, whose default at bx.toml:4 is built from `b`, \
+                     a `path` value",
+                    "relative to the config repo",
+                    "reference a `string` value that is not built from one",
+                ] {
+                    assert!(message.contains(part), "{file} {local:?} {part}: {message}");
+                }
+            }
+        }
+
+        // Three steps: `t` defaults to `{{s}}`, which defaults to `{{b}}`.
+        let chained = LAYER
+            .replace(
+                "[[target]]\npath = \"~/.gitconfig\"",
+                "[[value]]\nname = \"t\"\nkind = \"string\"\ndefault = \"{{s}}\"\n\
+                 [[target]]\npath = \"~/.gitconfig\"",
+            )
+            .replace("FILE", "cfg/{{t}}/gitconfig");
+        let message = resolved(&chained, Some("[values]\nb = \"/var/mnt/cfg\"\n"))
+            .expect_err("however many defaults lie between");
+        assert!(
+            message.contains(
+                "bx.toml:12: target `~/.gitconfig`: `file` references `t`, whose default at \
+                 bx.toml:8 is built from `s`, whose default at bx.toml:4 is built from `b`, \
+                 a `path` value"
+            ),
+            "{message}"
+        );
+
+        // A `string` default built from no `path` value is still the case
+        // `file` substitution exists for.
+        let plain = LAYER
+            .replace("default = \"{{b}}\"", "default = \"work\"")
+            .replace("FILE", "cfg/{{s}}/gitconfig");
+        let ordinary = resolved(&plain, None).unwrap();
         assert_eq!(
             ready(&ordinary, 0).body,
             Body::File(PathBuf::from("cfg/work/gitconfig"))
@@ -904,6 +1228,134 @@ mod tests {
         )
         .expect_err("`editor.` from a committed default is a repo defect");
         assert!(message.contains("empty segment"), "{message}");
+    }
+
+    #[test]
+    fn a_substitution_that_changes_a_key_path_s_segment_count_blocks_or_fails() {
+        // `KeyPath` splits on `.`, so `setting = "b.c"` turned the one key
+        // `editor.{{setting}}` into `editor.b.c`: a different key, one level
+        // deeper, owned without anyone having written it. An answer may fill a
+        // segment; it may not add or remove one.
+        const LAYER: &str = "[[value]]\nname = \"setting\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
+                             content = \"{{{{}}\"\n\
+                             format = \"jsonc\"\nowns = [\"editor.{{setting}}\"]\n";
+
+        let answered = resolved(LAYER, Some("[values]\nsetting = \"b.c\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&answered, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["setting".to_string()]
+            }
+        );
+        for part in [
+            "local.toml:2",
+            "`owns` key `editor.{{setting}}` has 2 segments as written and 3 once \
+             substituted, as `editor.b.c`",
+        ] {
+            assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
+        }
+
+        let message = resolved(
+            &LAYER.replace(
+                "kind = \"string\"\n",
+                "kind = \"string\"\ndefault = \"b.c\"\n",
+            ),
+            None,
+        )
+        .expect_err("a committed default that adds a segment is a repo defect");
+        assert!(message.contains("segments"), "{message}");
+        assert!(message.contains("~/.config/zed/settings.json"), "{message}");
+
+        // Filling the segment is the case the placeholder is for.
+        let filled = resolved(LAYER, Some("[values]\nsetting = \"tab_size\"\n")).unwrap();
+        assert_eq!(
+            ready(&filled, 0).format,
+            Format::Jsonc {
+                owns: vec![KeyPath::parse("editor.tab_size").unwrap()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_field_broken_through_a_derived_value_names_the_declaration_between() {
+        // `derived` is not answered; its default carries the answer to `base`
+        // in. The broken field is one text, so answering `derived` directly
+        // changes it and clears the entry: the hint names that declaration.
+        const LAYER: &str = "[[value]]\nname = \"base\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"derived\"\nkind = \"string\"\n\
+                             default = \"{{base}}\"\n\
+                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
+                             content = \"{{{{}}\"\n\
+                             format = \"jsonc\"\nowns = [\"a.{{derived}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\nbase = \"b.c\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&answered, 0);
+        assert!(
+            entry.hint.ends_with(
+                "because of the answer to `base` at local.toml:2, carried in by the default of \
+                 `derived` at bx.toml:4; change that answer, or answer `derived` directly"
+            ),
+            "{}",
+            entry.hint
+        );
+        ready(&answered, 1);
+    }
+
+    #[test]
+    fn a_requires_that_detect_could_never_find_blocks_or_fails() {
+        // Detection looks a tool up by a bare name on `PATH`, or opens an
+        // absolute path. An empty name, a relative one holding a `/`, or one made
+        // only of `.` and `..` (a directory, never a tool) is never found, so the
+        // target would be reported as waiting on a tool no install could supply.
+        // Substituted text is checked like any field.
+        const LAYER: &str = "[[value]]\nname = \"tool\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\ncontent = \"x\"\n\
+                             requires = [\"{{tool}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for answer in ["", "bin/sccache", ".", "..", "/"] {
+            let answered = resolved(LAYER, Some(&format!("[values]\ntool = \"{answer}\"\n")))
+                .unwrap_or_else(|e| panic!("{answer:?} failed the whole load: {e}"));
+            let entry = blocked(&answered, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["tool".to_string()]
+                },
+                "{answer:?}"
+            );
+            for part in [
+                "`requires` names a tool by a bare name to look up on `PATH`, or by an \
+                 absolute path",
+                "local.toml:2",
+            ] {
+                assert!(
+                    entry.hint.contains(part),
+                    "{answer:?} {part}: {}",
+                    entry.hint
+                );
+            }
+            ready(&answered, 1);
+        }
+
+        let message = resolved(
+            &LAYER.replace("kind = \"string\"\n", "kind = \"string\"\ndefault = \"\"\n"),
+            None,
+        )
+        .expect_err("a committed default detection could never find is a repo defect");
+        assert!(message.contains("`requires`"), "{message}");
+        assert!(message.contains("~/.config/env"), "{message}");
+
+        for answer in ["/usr/bin/sccache", "sccache"] {
+            let found = resolved(LAYER, Some(&format!("[values]\ntool = \"{answer}\"\n")))
+                .unwrap_or_else(|e| panic!("{answer:?}: {e}"));
+            assert_eq!(ready(&found, 0).requires, [answer]);
+        }
     }
 
     #[test]
@@ -1282,6 +1734,910 @@ mod tests {
     }
 
     #[test]
+    fn a_clash_through_a_derived_value_names_the_declaration_between() {
+        // `q` defaults to `{{p}}`, so `~/{{p}}/s` and `~/{{q}}/s` are one file for
+        // every answer to `p`. Naming only `p` left out the act that clears it:
+        // answering `q`. `r` is built from a committed default alone, so no
+        // answer is carried through it and it is not named.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[value]]\nname = \"r\"\nkind = \"string\"\ndefault = \"s\"\n\
+                             [[target]]\npath = \"~/{{p}}/s\"\ncontent = \"P\"\n\
+                             [[target]]\npath = \"~/{{q}}/{{r}}\"\ncontent = \"Q\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let derived = resolved(LAYER, Some("[values]\np = \"work\"\n"))
+            .expect("an account's answer does not fail the load");
+        for index in [0, 1] {
+            let entry = blocked(&derived, index);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["p".to_string()]
+                }
+            );
+            for part in [
+                "`~/{{p}}/s` at bx.toml:12",
+                "`~/{{q}}/{{r}}` at bx.toml:15",
+                "because of the answer to `p` at local.toml:2, carried in by the default of \
+                 `q` at bx.toml:4; change that answer, or answer `q` directly",
+            ] {
+                assert!(entry.hint.contains(part), "{index} {part}: {}", entry.hint);
+            }
+            assert!(!entry.hint.contains("`r`"), "{index}: {}", entry.hint);
+        }
+        ready(&derived, 2);
+
+        // With `q` answered too, nothing is carried in: the hint names both
+        // answers and says nothing more.
+        let answered = resolved(LAYER, Some("[values]\np = \"work\"\nq = \"work\"\n"))
+            .expect("an account's answers do not fail the load");
+        let entry = blocked(&answered, 0);
+        assert!(
+            entry.hint.ends_with(
+                "because of the answer to `p` at local.toml:2 and the answer to `q` at \
+                 local.toml:3; change that answer"
+            ),
+            "{}",
+            entry.hint
+        );
+    }
+
+    #[test]
+    fn a_clash_through_two_derived_values_names_both_declarations() {
+        // `q` and `r` both default to `{{p}}`, so `~/{{q}}/s` and `~/{{r}}/s` are
+        // one file for every answer to `p`. Either declaration answered directly
+        // clears it, so the hint names both, each once, in declaration order.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[value]]\nname = \"r\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[target]]\npath = \"~/{{q}}/s\"\ncontent = \"Q\"\n\
+                             [[target]]\npath = \"~/{{r}}/s\"\ncontent = \"R\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let resolved = resolved(LAYER, Some("[values]\np = \"work\"\n"))
+            .expect("an account's answer does not fail the load");
+        for index in [0, 1] {
+            let entry = blocked(&resolved, index);
+            assert!(
+                entry.hint.ends_with(
+                    "because of the answer to `p` at local.toml:2, carried in by the default \
+                     of `q` at bx.toml:4 and the default of `r` at bx.toml:8; change that \
+                     answer, or answer `q` or `r` directly"
+                ),
+                "{index}: {}",
+                entry.hint
+            );
+        }
+        ready(&resolved, 2);
+    }
+
+    #[test]
+    fn a_clash_through_a_chain_of_defaults_names_every_declaration_between() {
+        // `t` defaults to `{{q}}`, which defaults to `{{p}}`, which is answered.
+        // Answering `t` or `q` directly both separate `~/{{t}}/s` from
+        // `~/work/s`, so the hint follows the chain down and names each.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[value]]\nname = \"t\"\nkind = \"string\"\ndefault = \"{{q}}\"\n\
+                             [[target]]\npath = \"~/{{t}}/s\"\ncontent = \"T\"\n\
+                             [[target]]\npath = \"~/work/s\"\ncontent = \"W\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let resolved = resolved(LAYER, Some("[values]\np = \"work\"\n"))
+            .expect("an account's answer does not fail the load");
+        for index in [0, 1] {
+            let entry = blocked(&resolved, index);
+            assert!(
+                entry.hint.ends_with(
+                    "because of the answer to `p` at local.toml:2, carried in by the default \
+                     of `q` at bx.toml:4 and the default of `t` at bx.toml:8; change that \
+                     answer, or answer `q` or `t` directly"
+                ),
+                "{index}: {}",
+                entry.hint
+            );
+        }
+        ready(&resolved, 2);
+    }
+
+    #[test]
+    fn a_derived_value_every_colliding_spelling_carries_is_not_offered_as_the_way_out() {
+        // `q` carries the answer to `o` into both spellings, so answering `q`
+        // directly moves both files together and they stay one file. Naming it
+        // would be advice that clears nothing, so the hint does not.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"o\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{o}}\"\n\
+                             [[target]]\npath = \"~/{{p}}/{{q}}\"\ncontent = \"P\"\n\
+                             [[target]]\npath = \"~/work/{{q}}\"\ncontent = \"W\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for local in [
+            "[values]\np = \"work\"\no = \"x\"\n",
+            "[values]\np = \"work\"\no = \"x\"\nq = \"y\"\n",
+        ] {
+            let resolved =
+                resolved(LAYER, Some(local)).expect("an account's answers do not fail the load");
+            for index in [0, 1] {
+                let entry = blocked(&resolved, index);
+                assert!(
+                    entry.hint.ends_with("; change that answer"),
+                    "{local:?} {index}: {}",
+                    entry.hint
+                );
+                for part in ["the default of `q`", "directly"] {
+                    assert!(
+                        !entry.hint.contains(part),
+                        "{local:?} {index} {part}: {}",
+                        entry.hint
+                    );
+                }
+            }
+            ready(&resolved, 2);
+        }
+    }
+
+    #[test]
+    fn a_derived_value_one_spelling_carries_twice_is_offered_as_the_way_out() {
+        // The exclusion above is by *count*, not by membership. `q` is carried
+        // by both spellings, but once by the first and twice by the second, so
+        // answering it does part them and the hint has to say so: with
+        // `p = ""` both key `~/x`, and `q = "a"` makes them `~/a/x` and
+        // `~/aa/x`. Before the count comparison, `q` was excluded and the hint
+        // named only `p`, whose every answer keeps them one file or parts the
+        // pair the same way.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[target]]\npath = \"~/{{q}}/x\"\ncontent = \"ONE\"\n\
+                             [[target]]\npath = \"~/{{q}}{{q}}/x\"\ncontent = \"TWO\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let blocking = resolved(LAYER, Some("[values]\np = \"\"\n"))
+            .expect("an account's answer blocks the file, not the load");
+        // A blocked entry is keyed by its spelling; both name `~/x` once `q` is
+        // empty, which is why they collide at all.
+        assert_eq!(keys(&blocking), ["~/{{q}}/x", "~/{{q}}{{q}}/x", "~/.zshrc"]);
+        for index in [0, 1] {
+            let entry = blocked(&blocking, index);
+            assert!(
+                entry.hint.ends_with(
+                    "because of the answer to `p` at local.toml:2, carried in by the default of \
+                     `q` at bx.toml:4; change that answer, or answer `q` directly"
+                ),
+                "{index}: {}",
+                entry.hint
+            );
+        }
+
+        // The act the hint names is one that clears the block.
+        let cleared = resolved(LAYER, Some("[values]\np = \"\"\nq = \"a\"\n"))
+            .expect("answering `q` directly parts the two spellings");
+        assert_eq!(keys(&cleared), ["~/a/x", "~/aa/x", "~/.zshrc"]);
+        for index in [0, 1, 2] {
+            ready(&cleared, index);
+        }
+    }
+
+    #[test]
+    fn a_derived_value_two_of_three_colliding_spellings_carry_is_offered_as_the_way_out() {
+        // Three spellings for one file. `q` is carried by two of them and not
+        // by the third, so it is in a separating position and the hint names
+        // it. The third spelling is what makes the deduplication guard matter:
+        // `q` is reached once per spelling that carries it and named once.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[target]]\npath = \"~/{{q}}/x\"\ncontent = \"ONE\"\n\
+                             [[target]]\npath = \"~/{{q}}{{q}}/x\"\ncontent = \"TWO\"\n\
+                             [[target]]\npath = \"~/{{p}}/x\"\ncontent = \"THREE\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let blocking = resolved(LAYER, Some("[values]\np = \"\"\n"))
+            .expect("an account's answer blocks the file, not the load");
+        assert_eq!(
+            keys(&blocking),
+            ["~/{{q}}/x", "~/{{q}}{{q}}/x", "~/{{p}}/x", "~/.zshrc"]
+        );
+        for index in [0, 1, 2] {
+            let hint = &blocked(&blocking, index).hint;
+            assert!(hint.ends_with("or answer `q` directly"), "{index}: {hint}");
+            assert_eq!(
+                hint.matches("`q`").count(),
+                2,
+                "named once in the defaults and once in the direct list: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_derived_value_reached_down_two_defaults_is_named_once() {
+        // `left` and `right` both default to `{{shared}}`, so one text reaches
+        // `shared` twice, by two different routes, and every value on the way
+        // is an act that clears the entry. `shared` is offered once and in
+        // declaration order. `add_reach` is what keeps it to one entry with one
+        // total, which
+        // `derived_between_names_a_value_reached_down_two_defaults_once` pins
+        // directly; here the interest is that the whole chain reaches the
+        // account.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"shared\"\nkind = \"string\"\n\
+                             default = \"{{p}}\"\n\
+                             [[value]]\nname = \"left\"\nkind = \"string\"\n\
+                             default = \"{{shared}}\"\n\
+                             [[value]]\nname = \"right\"\nkind = \"string\"\n\
+                             default = \"{{shared}}\"\n\
+                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
+                             content = \"{{{{}}\"\n\
+                             format = \"jsonc\"\nowns = [\"a.{{left}}{{right}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\np = \"b.c\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let hint = &blocked(&answered, 0).hint;
+        assert_eq!(
+            hint.matches("`shared`").count(),
+            2,
+            "one default entry and one direct entry, not two of each: {hint}"
+        );
+        assert!(
+            hint.ends_with("change that answer, or answer `shared` or `left` or `right` directly"),
+            "{hint}"
+        );
+        ready(&answered, 1);
+    }
+
+    #[test]
+    fn a_committed_requires_defect_fails_the_load_whether_or_not_the_target_is_blocked() {
+        // The defect is written entirely in committed text, so it is the
+        // layer's for every account. It is checked before the probe, so an
+        // account that has not answered `acct` — whose target is blocked on
+        // that alone and never reaches substitution — gets the same load error
+        // as one that has. Checked only after substitution, the same committed
+        // line was fatal for one account and invisible to the other.
+        const LAYER: &str = "[[value]]\nname = \"acct\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/{{acct}}/env\"\n\
+                             content = \"x\"\nrequires = [\"./bin/foo\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for local in [None, Some("[values]\nacct = \"one\"\n")] {
+            let message = resolved(LAYER, local)
+                .expect_err("a committed `requires` defect fails the load for every account");
+            assert!(
+                message.contains("`requires` names a tool by a bare name"),
+                "{local:?}: {message}"
+            );
+            assert!(message.contains("./bin/foo"), "{local:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_requires_skeleton_no_text_could_complete_fails_the_load() {
+        // `bin/{{tool}}` is a relative name holding a `/` whatever text fills
+        // `{{tool}}`, so the committed skeleton alone makes it unfindable and
+        // holding a placeholder is no exemption. The three account states below are the
+        // ones that used to disagree: unanswered the target was blocked on
+        // `tool` with a hint no answer cleared, answered it was blocked naming
+        // the answer's line, and with a committed `default` the load failed.
+        // One committed line, one verdict.
+        const DECL: &str = "[[value]]\nname = \"tool\"\nkind = \"string\"\n";
+        const WITH_DEFAULT: &str =
+            "[[value]]\nname = \"tool\"\nkind = \"string\"\ndefault = \"foo\"\n";
+        const TARGETS: &str = "[[target]]\npath = \"~/.config/env\"\n\
+                               content = \"x\"\nrequires = [\"bin/{{tool}}\"]\n\
+                               [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for (global, local) in [
+            (DECL, None),
+            (DECL, Some("[values]\ntool = \"foo\"\n")),
+            (WITH_DEFAULT, None),
+        ] {
+            let message = resolved(&format!("{global}{TARGETS}"), local)
+                .expect_err("a skeleton no string completes fails the load for every account");
+            assert!(
+                message.contains("`requires` names a tool by a bare name"),
+                "{local:?}: {message}"
+            );
+            // The skeleton is reported as committed, which is the text a
+            // maintainer has to edit — not one account's filled-in version.
+            assert!(message.contains("bin/{{tool}}"), "{local:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_requires_skeleton_only_one_stand_in_satisfies_is_not_a_committed_defect() {
+        // Both halves of the pre-probe question, each satisfied by one stand-in
+        // and not the other. `{{dir}}/foo` opens with the placeholder, so an
+        // absolute answer makes it an absolute path — the `/q` stand-in — while
+        // a bare one does not. `bx{{sfx}}` holds no `/` in its committed text,
+        // so a `/`-free answer makes it a bare name — the `q` stand-in — while
+        // an absolute one does not. Asking with either stand-in alone would
+        // refuse one of these two at load, for an account that has answered
+        // nothing.
+        const LAYER: &str = "[[value]]\nname = \"dir\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"sfx\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"{{dir}}/foo\"]\n\
+                             [[target]]\npath = \"~/.config/other\"\n\
+                             content = \"y\"\nrequires = [\"bx{{sfx}}\"]\n";
+
+        // Unanswered: the load succeeds and each target waits on its value.
+        let waiting =
+            resolved(LAYER, None).expect("a skeleton some answer completes is not a load error");
+        for index in [0, 1] {
+            let entry = blocked(&waiting, index);
+            assert!(
+                matches!(entry.reason, BlockReason::UnsetValue { .. }),
+                "{index}: {:?}",
+                entry.reason
+            );
+        }
+
+        // Answered the way the stand-ins stand in for: both resolve.
+        let answered = resolved(
+            LAYER,
+            Some("[values]\ndir = \"/usr/bin\"\nsfx = \"-nightly\"\n"),
+        )
+        .expect("the answers complete both skeletons");
+        assert_eq!(ready(&answered, 0).requires, ["/usr/bin/foo"]);
+        assert_eq!(ready(&answered, 1).requires, ["bx-nightly"]);
+    }
+
+    #[test]
+    fn a_requires_skeleton_an_empty_answer_completes_is_not_a_committed_defect() {
+        // The shape the soundness argument splits on the first *piece* to
+        // cover. `{{a}}/usr/bin` opens with a name, and the answer that makes
+        // it findable contributes no text at all: `a = ""` gives `/usr/bin`,
+        // whose leading `/` is committed text that is not before the first
+        // placeholder. The `/q` stand-in still settles it, because a spelling
+        // opening with a name opens with the stand-in, but an argument split on
+        // where the `/` came from would have missed this entry and refused a
+        // load that has a perfectly good answer.
+        const LAYER: &str = "[[value]]\nname = \"a\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"{{a}}/usr/bin\"]\n";
+
+        let resolved = resolved(LAYER, Some("[values]\na = \"\"\n"))
+            .expect("an empty answer completes the skeleton, so it is no load error");
+        assert_eq!(ready(&resolved, 0).requires, ["/usr/bin"]);
+    }
+
+    #[test]
+    fn a_kind_that_narrows_a_requires_skeleton_blocks_the_target_not_the_load() {
+        // The boundary the pre-probe refusal deliberately does **not** take.
+        // `bx{{sfx}}` is satisfiable by some string — `sfx = "-nightly"` — so it
+        // is not the committed skeleton's defect; but with `sfx` declared
+        // `path`, every *answer* is absolute, so every answer leaves a relative
+        // name holding a `/`, and none is findable. The load still succeeds and
+        // the cost is the one target, because a `[[value]]` declaration is not
+        // restricted to committed layers: an account may redeclare `sfx` in
+        // `local.toml`, and a kind-aware refusal would make that edit fail or
+        // repair the whole load.
+        const LAYER: &str = "[[value]]\nname = \"sfx\"\nkind = \"path\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"bx{{sfx}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        // Unanswered, and answered with the only shape the kind allows: the
+        // load survives both, and every other target is unaffected.
+        for local in [None, Some("[values]\nsfx = \"/opt/x\"\n")] {
+            let resolved = resolved(LAYER, local)
+                .expect("a kind that narrows a skeleton is not the layer's defect");
+            blocked(&resolved, 0);
+            ready(&resolved, 1);
+        }
+
+        // The account's redeclaration is what clears it, and it clears it
+        // without the load having failed in the meantime.
+        let widened = resolved(
+            LAYER,
+            Some("[[value]]\nname = \"sfx\"\nkind = \"string\"\n[values]\nsfx = \"-nightly\"\n"),
+        )
+        .expect("the redeclaration resolves");
+        assert_eq!(ready(&widened, 0).requires, ["bx-nightly"]);
+    }
+
+    #[test]
+    fn a_requires_defect_an_answer_filled_blocks_only_that_target() {
+        // The other half of the same rule: text an answer filled is the
+        // account's, so it costs that target and names the line. The check
+        // inside `substituted` is what does this, and moving the committed case
+        // out of it did not take this with it.
+        const LAYER: &str = "[[value]]\nname = \"tool\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"{{tool}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\ntool = \"./bin/foo\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&answered, 0);
+        assert!(
+            entry
+                .hint
+                .contains("`requires` names a tool by a bare name"),
+            "{}",
+            entry.hint
+        );
+        assert!(entry.hint.contains("local.toml:2"), "{}", entry.hint);
+        ready(&answered, 1);
+    }
+
+    #[test]
+    fn an_answered_value_whose_committed_default_names_an_undeclared_value_resolves() {
+        // A default an answer overrides is never expanded, so `Unresolved::
+        // Forward` never sees the undeclared `nowhere` and the load succeeds.
+        // The `file` walk reads that unexpanded default anyway, and stops at
+        // the name with no declaration behind it rather than refusing or
+        // panicking. Pinned so that making an undeclared name in an unexpanded
+        // default an error becomes a deliberate change.
+        const LAYER: &str = "[[value]]\nname = \"s\"\nkind = \"string\"\n\
+                             default = \"{{nowhere}}\"\n\
+                             [[target]]\npath = \"~/.config/env\"\nfile = \"cfg/{{s}}\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\ns = \"one\"\n"))
+            .expect("an overridden default is never expanded, so it is never refused");
+        assert_eq!(
+            ready(&answered, 0).body,
+            Body::File(PathBuf::from("cfg/one"))
+        );
+    }
+
+    #[test]
+    fn a_file_holding_both_a_chained_and_a_direct_path_value_names_the_first_written() {
+        // `s` reaches a `path` value through its default and `b` is one
+        // directly. The refusal names whichever comes first in written order,
+        // with the chain behind it. Naming the direct reference first would
+        // tell the reader about `b` alone, and fixing that leaves `s` carrying
+        // the same absolute text in.
+        const LAYER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                             [[value]]\nname = \"s\"\nkind = \"string\"\ndefault = \"{{b}}\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             file = \"cfg/{{s}}/{{b}}/x\"\n";
+
+        let message = resolved(LAYER, None).expect_err("a `path` value in `file` is a defect");
+        assert!(
+            message.contains(
+                "`file` references `s`, whose default at bx.toml:4 is built from `b`, a `path` \
+                 value"
+            ),
+            "{message}"
+        );
+
+        // Written the other way round, `b` comes first and is a one-step chain.
+        let message = resolved(
+            &LAYER.replace("cfg/{{s}}/{{b}}/x", "cfg/{{b}}/{{s}}/x"),
+            None,
+        )
+        .expect_err("a `path` value in `file` is a defect");
+        assert!(
+            message.contains("`file` references `b`, a `path` value"),
+            "{message}"
+        );
+        assert!(!message.contains("whose default"), "{message}");
+    }
+
+    #[test]
+    fn a_dotdot_against_a_placeholder_is_not_one_path_as_written() {
+        // Reduced with its placeholder left in, `~/.config/{{p}}/../s` folds to
+        // `~/.config/s`, which read as proof that the toggle and the first entry
+        // are one path for every answer. They are not: `p = "a/b"` makes the
+        // toggle `~/.config/a/s`. With `p = "a"` the collision is the answer's,
+        // so it blocks the file's row instead of failing the load.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                             [[target]]\npath = \"~/.config/a/s\"\ncontent = \"AS\"\n\
+                             [[target]]\npath = \"~/.config/{{p}}/../s\"\nenabled = false\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let folded = resolved(LAYER, Some("[values]\np = \"a\"\n"))
+            .expect("an answer that names one file twice blocks it, not the load");
+        assert_eq!(keys(&folded), ["~/.config/s", "~/.config/a/s", "~/.zshrc"]);
+        let entry = blocked(&folded, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["p".to_string()]
+            }
+        );
+        for part in [
+            "`~/.config/s` at bx.toml:4",
+            "`~/.config/{{p}}/../s` at bx.toml:10",
+            "the answer to `p` at local.toml:2",
+        ] {
+            assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
+        }
+        ready(&folded, 1);
+        ready(&folded, 2);
+
+        // The same toggle meeting the other entry, as before.
+        let deeper = resolved(LAYER, Some("[values]\np = \"a/b\"\n"))
+            .expect("an answer that names one file twice blocks it, not the load");
+        assert_eq!(keys(&deeper), ["~/.config/s", "~/.config/a/s", "~/.zshrc"]);
+        ready(&deeper, 0);
+        blocked(&deeper, 1);
+        ready(&deeper, 2);
+    }
+
+    #[test]
+    fn a_dotdot_pair_that_is_one_path_for_every_answer_is_the_layer_s_defect() {
+        // A `bool` holds no `/`, so `~/.config/{{flag}}/../s` is `~/.config/s`
+        // for both answers. And `{{p}}/..` against `{{p}}/./..` stay one path
+        // whether `p` holds a `/` or not. Neither pair is the answer's doing, so
+        // each fails the load rather than blocking with advice no answer could
+        // follow.
+        const BOOL: &str = "[[value]]\nname = \"flag\"\nkind = \"bool\"\n\
+                            [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                            [[target]]\npath = \"~/.config/{{flag}}/../s\"\nenabled = false\n\
+                            [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        for flag in ["true", "false"] {
+            let message = resolved(BOOL, Some(&format!("[values]\nflag = {flag}\n")))
+                .expect_err("one path for every answer is the layer's defect");
+            for part in [
+                "bx.toml:7",
+                "names the same file as `~/.config/s` at bx.toml:4",
+                "in this same layer",
+            ] {
+                assert!(message.contains(part), "{flag} {part}: {message}");
+            }
+        }
+
+        const TWICE: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                             [[target]]\npath = \"~/.config/a/s\"\ncontent = \"AS\"\n\
+                             [[target]]\npath = \"~/.config/{{p}}/../s\"\nenabled = false\n\
+                             [[target]]\npath = \"~/.config/{{p}}/./../s\"\nenabled = true\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        for p in ["a", "a/b"] {
+            let message = resolved(TWICE, Some(&format!("[values]\np = \"{p}\"\n")))
+                .expect_err("one path for every answer is the layer's defect");
+            for part in [
+                "bx.toml:13",
+                "names the same file as `~/.config/{{p}}/../s` at bx.toml:10",
+                "in this same layer",
+            ] {
+                assert!(message.contains(part), "{p} {part}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pair_some_answer_separates_blocks_whatever_shape_separates_it() {
+        // Each pair is one file for these answers and two files for another, so
+        // each blocks the file's row rather than failing the load. What
+        // separates them differs: a placeholder only the earlier spelling
+        // holds, a placeholder that must be one segment (`~/s` against
+        // `~/.config/s`), and a placeholder that is not the first one named.
+        const EARLIER_ONLY: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                                    [[value]]\nname = \"q\"\nkind = \"string\"\n\
+                                    [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                                    [[target]]\npath = \"~/{{q}}/../.config/{{p}}/../s\"\n\
+                                    enabled = false\n\
+                                    [[target]]\npath = \"~/{{q}}/../.config/s\"\nenabled = true\n\
+                                    [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        const ONE_SEGMENT: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                                   [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
+                                   [[target]]\npath = \"~/.config/{{p}}/../../s\"\n\
+                                   enabled = false\n\
+                                   [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+        const SECOND_NAME: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                                   [[value]]\nname = \"q\"\nkind = \"string\"\n\
+                                   [[target]]\npath = \"~/{{p}}/.config/s\"\ncontent = \"S\"\n\
+                                   [[target]]\npath = \"~/{{p}}/.config/{{q}}/../s\"\n\
+                                   enabled = false\n\
+                                   [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for (layer, answers) in [
+            (EARLIER_ONLY, "p = \"b\"\nq = \"a\"\n"),
+            (ONE_SEGMENT, "p = \"a/b\"\n"),
+            (SECOND_NAME, "p = \"x\"\nq = \"a\"\n"),
+        ] {
+            let resolved = resolved(layer, Some(&format!("[values]\n{answers}")))
+                .unwrap_or_else(|e| panic!("{answers:?} failed the whole load: {e}"));
+            let entry = blocked(&resolved, 0);
+            assert!(
+                matches!(entry.reason, BlockReason::InvalidValue { .. }),
+                "{answers:?}: {:?}",
+                entry.reason
+            );
+            ready(&resolved, 1);
+        }
+    }
+
+    #[test]
+    fn a_path_value_pair_apart_only_by_a_dot_segment_fails_the_load() {
+        // The toggles `{{root}}/s` and `{{root}}/./s` share an opening segment
+        // and differ only by a `.`, which folds, so they are one file for every
+        // answer. That holds however the opening segment is rooted; the root a
+        // `path` value gives is pinned by
+        // `a_path_value_opening_a_spelling_is_rooted_at_slash`. (A full entry
+        // may not open with a placeholder; a toggle names a file by the spelling
+        // it reaches.)
+        const LAYER: &str = "[[value]]\nname = \"root\"\nkind = \"path\"\n\
+                             [[target]]\npath = \"/srv/data/s\"\ncontent = \"S\"\n\
+                             [[target]]\npath = \"{{root}}/s\"\nenabled = false\n\
+                             [[target]]\npath = \"{{root}}/./s\"\nenabled = true\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let message = resolved(LAYER, Some("[values]\nroot = \"/srv/data\"\n"))
+            .expect_err("one path for every answer is the layer's defect");
+        for part in [
+            "bx.toml:10",
+            "names the same file as `{{root}}/s` at bx.toml:7",
+            "in this same layer",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_path_value_opening_a_spelling_is_rooted_at_slash() {
+        // `{{r}}/s` and `/{{r}}/s` differ in their opening segment, and are one
+        // file for every answer only because every `path` answer is absolute:
+        // the `/` written before it adds nothing. So the pair is the layer's
+        // defect, not a block an answer could clear.
+        const LAYER: &str = "[[value]]\nname = \"r\"\nkind = \"path\"\n\
+                             [[target]]\npath = \"/srv/s\"\ncontent = \"S\"\n\
+                             [[target]]\npath = \"{{r}}/s\"\nenabled = false\n\
+                             [[target]]\npath = \"/{{r}}/s\"\nenabled = true\n";
+
+        let message = resolved(LAYER, Some("[values]\nr = \"/srv\"\n"))
+            .expect_err("one path for every answer is the layer's defect");
+        for part in [
+            "bx.toml:10",
+            "names the same file as `{{r}}/s` at bx.toml:7",
+            "in this same layer",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_pair_apart_only_around_its_opening_segment_fails_the_load() {
+        // Each pair names one file whatever is answered, so no answer could clear
+        // the collision and it is the layer's defect. A `path` answer is
+        // absolute, so a `/` before it adds nothing even with text glued on
+        // (`{{r}}.d/conf`), and neither does one after a `~` that precedes it
+        // (`~{{r}}/s`). An opening segment no answer makes empty (`~{{p}}`, and a
+        // lone `email`) is the same path with a separator after it or without.
+        let cases = [
+            (
+                "r",
+                "path",
+                "/srv.d/conf",
+                "{{r}}.d/conf",
+                "/{{r}}.d/conf",
+                "r = \"/srv\"",
+            ),
+            (
+                "r",
+                "path",
+                "~/srv/s",
+                "~{{r}}/s",
+                "~/{{r}}/s",
+                "r = \"/srv\"",
+            ),
+            (
+                "p",
+                "string",
+                "~/work",
+                "~{{p}}",
+                "~{{p}}/",
+                "p = \"/work\"",
+            ),
+            ("e", "email", "/a@b", "{{e}}", "{{e}}/", "e = \"/a@b\""),
+        ];
+        let mut loaded = Vec::new();
+        for (name, kind, file, first, second, answer) in cases {
+            let layer = format!(
+                "[[value]]\nname = \"{name}\"\nkind = \"{kind}\"\n\
+                 [[target]]\npath = \"{file}\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"{first}\"\nenabled = false\n\
+                 [[target]]\npath = \"{second}\"\nenabled = true\n"
+            );
+            let Err(message) = resolved(&layer, Some(&format!("[values]\n{answer}\n"))) else {
+                loaded.push(format!("{first} and {second}"));
+                continue;
+            };
+            for part in [
+                "bx.toml:10".to_string(),
+                format!("names the same file as `{first}` at bx.toml:7"),
+                "in this same layer".to_string(),
+            ] {
+                assert!(
+                    message.contains(&part),
+                    "{first} {second}: {part}: {message}"
+                );
+            }
+        }
+        assert!(
+            loaded.is_empty(),
+            "one path for every answer is the layer's defect, yet these loaded: {loaded:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_value_glued_after_text_starts_its_own_segment() {
+        // A `path` answer always begins with `/`, so text glued before a `path`
+        // value is joined to it by that `/`: `/opt{{r}}/conf` is `/opt/srv/conf`
+        // for `r = "/srv"`, as `/opt/{{r}}/conf` is, and a `/` written before the
+        // value only doubles a separator, which folds. Each pair is one file for
+        // every answer, wherever the value sits and whatever is glued before it,
+        // so it is the layer's defect rather than a block an answer could clear.
+        let cases = [
+            ("/opt/srv/conf", "/opt{{r}}/conf", "/opt/{{r}}/conf"),
+            ("/srv/d/conf", "{{r}}{{s}}/conf", "{{r}}/{{s}}/conf"),
+            ("~/srv/conf", "{{p}}{{r}}/conf", "{{p}}/{{r}}/conf"),
+            ("~/srv/d", "~{{r}}{{s}}", "~/{{r}}/{{s}}"),
+        ];
+        let mut loaded = Vec::new();
+        for (file, first, second) in cases {
+            let layer = format!(
+                "[[value]]\nname = \"r\"\nkind = \"path\"\n\
+                 [[value]]\nname = \"s\"\nkind = \"path\"\n\
+                 [[value]]\nname = \"p\"\nkind = \"string\"\n\
+                 [[target]]\npath = \"{file}\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"{first}\"\nenabled = false\n\
+                 [[target]]\npath = \"{second}\"\nenabled = true\n"
+            );
+            let answers = "[values]\nr = \"/srv\"\ns = \"/d\"\np = \"~\"\n";
+            let message = match resolved(&layer, Some(answers)) {
+                Ok(resolved) => {
+                    loaded.push(format!("{first} and {second}: {:?}", keys(&resolved)));
+                    continue;
+                }
+                Err(message) => message,
+            };
+            for part in [
+                "bx.toml:16".to_string(),
+                format!("names the same file as `{first}` at bx.toml:13"),
+                "in this same layer".to_string(),
+            ] {
+                assert!(
+                    message.contains(&part),
+                    "{first} {second}: {part}: {message}"
+                );
+            }
+        }
+        assert!(
+            loaded.is_empty(),
+            "one path for every answer is the layer's defect, yet these loaded: {loaded:#?}"
+        );
+    }
+
+    #[test]
+    fn a_dotdot_run_past_a_placeholder_is_judged_after_substitution() {
+        // A run of `..` after a placeholder reaches as far as the answer is deep.
+        // `/opt/{{p}}/../../../s` and `/opt/{{p}}/../../../../s` both name `/s`
+        // for `p = "a"` or `"a/b"`, and `p = "a/b/c"` parts them; `{{r}}/../../s`
+        // and `{{r}}/../../../s` meet for `r = "/srv/d"` and part for
+        // `"/srv/d/e"`. Where they meet it is the answer's doing, so the file
+        // blocks and the load goes on.
+        let outcome = |base: &str, top: &str, local: &str| -> Result<Resolved, String> {
+            let layers = vec![
+                layer("base.toml", LayerKind::Global, base)?,
+                layer("bx.toml", LayerKind::Global, top)?,
+                layer("local.toml", LayerKind::Local, local)?,
+            ];
+            let merged = merge(&layers, &home()).map_err(|e| e.to_string())?;
+            resolve(&merged, &home()).map_err(|e| e.to_string())
+        };
+        // A base layer, the layer holding the pair, and each answer with whether
+        // the pair meets under it.
+        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, bool)]);
+        let cases: [Case<'_>; 2] = [
+            (
+                "[[target]]\npath = \"/s\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"/opt/s\"\ncontent = \"O\"\n",
+                "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                 [[target]]\npath = \"/opt/{{p}}/../../../s\"\nenabled = false\n\
+                 [[target]]\npath = \"/opt/{{p}}/../../../../s\"\nenabled = false\n",
+                &[
+                    ("p = \"a\"", true),
+                    ("p = \"a/b\"", true),
+                    ("p = \"a/b/c\"", false),
+                ],
+            ),
+            (
+                "[[target]]\npath = \"/s\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"/srv/s\"\ncontent = \"O\"\n",
+                "[[value]]\nname = \"r\"\nkind = \"path\"\n\
+                 [[target]]\npath = \"{{r}}/../../s\"\nenabled = false\n\
+                 [[target]]\npath = \"{{r}}/../../../s\"\nenabled = false\n",
+                &[("r = \"/srv/d\"", true), ("r = \"/srv/d/e\"", false)],
+            ),
+        ];
+
+        for (base, top, answers) in cases {
+            for (answer, meet) in answers {
+                let resolved = outcome(base, top, &format!("[values]\n{answer}\n"))
+                    .unwrap_or_else(|e| panic!("{answer} failed the whole load: {e}"));
+                let blocked: Vec<&str> = resolved
+                    .targets
+                    .iter()
+                    .filter_map(|target| match target {
+                        Resolution::Blocked(entry) => Some(entry.key.as_str()),
+                        Resolution::Ready(_) => None,
+                    })
+                    .collect();
+                let expected: &[&str] = if *meet { &["/s"] } else { &[] };
+                assert_eq!(blocked, expected, "{answer}");
+            }
+        }
+    }
+
+    #[test]
+    fn toggles_one_path_past_a_placeholder_fail_the_load_for_every_answer() {
+        // `{{p}}/../../s` and `{{p}}/.././../s` differ only by a `.`: whenever
+        // they name a file they name the same one, so no answer parts them and
+        // the pair is the layer's defect. `{{p}}/s` and `{{p}}/./s` are the same
+        // with the placeholder opening the spelling, which `p = "~"` roots.
+        for prefix in ["~/", "~/x/y/"] {
+            let layer = format!(
+                "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                 [[target]]\npath = \"{prefix}s\"\ncontent = \"S\"\n\
+                 [[target]]\npath = \"{prefix}{{{{p}}}}/../../s\"\nenabled = false\n\
+                 [[target]]\npath = \"{prefix}{{{{p}}}}/.././../s\"\nenabled = true\n"
+            );
+            for answer in ["a/b", "b/c", "a", "a/b/c", "."] {
+                let message = resolved(&layer, Some(&format!("[values]\np = \"{answer}\"\n")))
+                    .expect_err("no answer loads this layer");
+                if matches!(answer, "a/b" | "b/c") {
+                    for part in [
+                        format!("names the same file as `{prefix}{{{{p}}}}/../../s`"),
+                        "in this same layer".to_string(),
+                    ] {
+                        assert!(
+                            message.contains(&part),
+                            "{prefix} {answer} {part}: {message}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let lead = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                    [[target]]\npath = \"~/s\"\ncontent = \"S\"\n\
+                    [[target]]\npath = \"{{p}}/s\"\nenabled = false\n\
+                    [[target]]\npath = \"{{p}}/./s\"\nenabled = true\n";
+        let message = resolved(lead, Some("[values]\np = \"~\"\n"))
+            .expect_err("one path for every answer is the layer's defect");
+        for part in [
+            "names the same file as `{{p}}/s` at bx.toml:7",
+            "in this same layer",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_pair_with_many_placeholders_is_decided_like_any_other() {
+        // Nothing about the rule grows with the placeholders in a spelling: a
+        // pair carrying thirteen that is one path as written fails the load like
+        // a pair carrying one.
+        let layer = |count: usize| {
+            let decls: String = (1..=count)
+                .map(|i| format!("[[value]]\nname = \"v{i}\"\nkind = \"string\"\n"))
+                .collect();
+            let segments: String = (1..=count).map(|i| format!("/{{{{v{i}}}}}")).collect();
+            let answers: String = (1..=count).map(|i| format!("v{i} = \"a\"\n")).collect();
+            (
+                format!(
+                    "{decls}[[target]]\npath = \"~{segments}/s\"\ncontent = \"S\"\n\
+                     [[target]]\npath = \"~{segments}/./s\"\nenabled = false\n\
+                     [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n"
+                ),
+                format!("[values]\n{answers}"),
+            )
+        };
+
+        for count in [1, 13] {
+            let (text, answers) = layer(count);
+            let message = resolved(&text, Some(&answers))
+                .expect_err("one path for every answer is the layer's defect");
+            assert!(message.contains("in this same layer"), "{count}: {message}");
+        }
+    }
+
+    #[test]
     fn a_later_layer_that_names_the_file_settles_what_an_answer_made_one_layer_name_twice() {
         // The account has the last word: a full entry for the file replaces
         // both, and a toggle switches both off.
@@ -1574,7 +2930,12 @@ mod tests {
         // again, once through `profile`. With `work` the module's plain spelling
         // replaces it in place; with `default` both module spellings are the
         // file, and the second may not be appended after `~/.zshrc` — the
-        // file's rows stay in the file's slot, and nothing unrelated moves.
+        // file's rows stay together, in the file's slot and in the order
+        // written. That is all it promises: which slot is the file's depends on
+        // the answer, so a row can sit ahead of an unrelated target for one
+        // answer and behind it for another, as
+        // `a_later_row_for_a_file_can_move_ahead_of_an_unrelated_target_by_answer`
+        // shows.
         const BASE: &str = "[[value]]\nname = \"profile\"\nkind = \"string\"\n\
                             [[target]]\npath = \"~/.config/default/s\"\ncontent = \"BASE\"\n\
                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
@@ -1621,6 +2982,35 @@ mod tests {
         blocked(&default, 1);
         ready(&default, 2);
         ready(&default, 3);
+    }
+
+    #[test]
+    fn a_later_row_for_a_file_can_move_ahead_of_an_unrelated_target_by_answer() {
+        // Decision 31 as narrowed: a file's rows are contiguous and in written
+        // order, and unrelated targets keep their order among themselves. It is
+        // not that nothing moves. With `default`, `~/.config/default/s` is the
+        // file the first row already holds, so its row joins that slot, ahead
+        // of `~/.zshrc`; with `work` it is a file of its own, and appends.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/{{p}}/s\"\ncontent = \"P\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n\
+                             [[target]]\npath = \"~/.config/default/s\"\ncontent = \"D\"\n";
+
+        let default = resolved(LAYER, Some("[values]\np = \"default\"\n"))
+            .expect("an account's answer does not fail the load");
+        assert_eq!(
+            keys(&default),
+            ["~/.config/{{p}}/s", "~/.config/default/s", "~/.zshrc"]
+        );
+        blocked(&default, 0);
+        blocked(&default, 1);
+        ready(&default, 2);
+
+        let work = resolved(LAYER, Some("[values]\np = \"work\"\n")).expect("work");
+        assert_eq!(
+            keys(&work),
+            ["~/.config/work/s", "~/.zshrc", "~/.config/default/s"]
+        );
     }
 
     #[test]

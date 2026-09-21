@@ -60,8 +60,9 @@ use crate::config::layers;
 use crate::config::values::ResolvedValues;
 use crate::paths;
 
-/// Names a shell defines and manages itself. A fragment may neither assign one
-/// nor refer to one.
+/// Names a shell defines and manages itself. A fragment may not assign one,
+/// and may not refer to one either — except `HOME`, which [`Scope::lookup`]
+/// answers from the root set, and which is how `$HOME` and `~` resolve at all.
 ///
 /// A value assigned to one of these does not read back as it was written:
 /// `RANDOM`, `SECONDS` and `LINENO` are computed, `HISTSIZE` is an integer the
@@ -838,8 +839,10 @@ pub enum Reason {
     /// parameter, an operator, an unclosed quote, a control character.
     #[error("is shell the guard cannot read, so it is not approved")]
     Unreadable,
-    /// It assigns, or refers to, a name the shell manages itself — `HOME`,
-    /// `RANDOM`, zsh's tied `path` — or acts on when it is assigned.
+    /// It assigns a name the shell manages itself — `HOME`, `RANDOM`, zsh's
+    /// tied `path` — or acts on when it is assigned; or it *refers* to one of
+    /// them other than `HOME`, which resolves against the root set's home
+    /// instead ([`Scope::lookup`]).
     #[error("assigns or refers to a name the shell manages itself")]
     ReservedName,
     /// It assigns a variable no bx generator declares, whatever the value: the
@@ -1007,8 +1010,14 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///
 /// A name the shell manages itself — `HOME`, `RANDOM`, `LINENO`, zsh's `path`
 /// and the rest of `SHELL_NAMES` — or acts on when it is assigned —
-/// `HISTFILESIZE` and the rest of [`ACTS_ON_ASSIGNMENT`] — may be neither
-/// assigned nor referred to, and is refused as [`Reason::ReservedName`].
+/// `HISTFILESIZE` and the rest of [`ACTS_ON_ASSIGNMENT`] — may not be
+/// assigned, and is refused as [`Reason::ReservedName`]. Nor may it be
+/// referred to, with one exception: `$HOME`, and the `~` that stands for it,
+/// resolve against the root set's home ([`Scope::lookup`]). That exception is
+/// the mechanism every value written against the home is judged through, and
+/// it is exactly why `HOME` may not be *assigned*: a fragment that moved it
+/// would move `~` with it, and the guard would judge against a home no shell
+/// will have.
 ///
 /// **What is judged.** Every accepted assignment, exported or not, since
 /// assigning a name the environment already exports changes what every child
@@ -5626,7 +5635,11 @@ mod tests {
     }
 
     #[test]
-    fn a_name_the_shell_manages_may_be_neither_assigned_nor_referred_to() {
+    fn a_name_the_shell_manages_may_not_be_assigned_and_only_home_may_be_referred_to() {
+        // `HOME` is the one reserved name a value may refer to: `Scope::lookup`
+        // answers it from the root set before it reaches the reserved branch,
+        // which is what makes `$HOME` and `~` resolvable at all. Assigning it
+        // is still refused, and so is a reference to every other reserved name.
         for name in [
             "HOME", "RANDOM", "SECONDS", "LINENO", "path", "fpath", "USERNAME", "UID", "_",
             "FUNCNAME", "ERRNO",
@@ -5663,6 +5676,33 @@ mod tests {
             reasons("HOME=/etc/evil\nCARGO_HOME=~/cargo\n", &home_rooted),
             vec![(1, Reason::ReservedName), (2, Reason::UnreadableReference)]
         );
+        // The exception the grammar names, and the whole reason it exists: a
+        // *reference* to `HOME` resolves against the root set, and so does the
+        // `~` that stands for it, while a reference to any other reserved name
+        // is refused. Without it no value could be written against the home.
+        assert_eq!(
+            check("CARGO_HOME", "$HOME/.cargo", &home_rooted),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            check("CARGO_HOME", "${HOME}/.cargo", &home_rooted),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            check("CARGO_HOME", "~/.cargo", &home_rooted),
+            Verdict::Allowed
+        );
+        for name in ["RANDOM", "SECONDS", "UID", "FUNCNAME"] {
+            assert_eq!(
+                reason_of(&check(
+                    "CARGO_HOME",
+                    &format!("${name}/.cargo"),
+                    &home_rooted
+                )),
+                Some(Reason::ReservedName),
+                "{name}"
+            );
+        }
         // `PATH` reads back as written, so it may be assigned and extended.
         assert!(!SHELL_NAMES.contains(&"PATH"));
         assert_eq!(

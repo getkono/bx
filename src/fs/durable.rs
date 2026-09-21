@@ -66,6 +66,16 @@ pub(crate) struct Dir {
 
 impl Dir {
     /// Open `path` read-only as a directory.
+    ///
+    /// Both `|` here are surviving mutants under `cargo mutants`, and both are
+    /// equivalent by arithmetic rather than by anything a test could arrange.
+    /// `RDONLY` is `0`, the identity element of `|` and of `^` alike, so
+    /// `RDONLY | x` and `RDONLY ^ x` are the same value for every `x`;
+    /// `DIRECTORY` and `CLOEXEC` are distinct single-bit flags sharing no bit,
+    /// so `|` and `^` agree on them too. Every mutant hands `open` the same
+    /// bitmask. There is no behaviour to distinguish, and the flags themselves
+    /// *are* pinned — dropping either fails
+    /// `the_destination_directory_is_opened_as_a_directory_and_closed_on_exec`.
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let fd = rustix::fs::open(
             path,

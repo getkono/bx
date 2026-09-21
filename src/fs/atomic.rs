@@ -127,6 +127,39 @@
 //! a unit test observes the kernel. That is a far smaller claim than "every
 //! call site remembered to sync", and it is not one a change to this file can
 //! break.
+//!
+//! # What the suite does not construct, and why that is a decision
+//!
+//! ## Syscall-failure arms that follow a successful syscall on the same object
+//!
+//! Several `Err` arms here are unreachable from a test, and they are one class
+//! rather than a list: an arm that handles a syscall failing **after an earlier
+//! syscall on the same path or descriptor succeeded**. Reaching one needs the
+//! object to be removed, to lose a permission, or to run the filesystem out of
+//! space or descriptors, in the microseconds between the two calls. A test
+//! cannot schedule that, and no count of the arms is worth keeping current,
+//! because the class is closed under the arms a later change adds.
+//!
+//! What would reach them is a `cfg(test)` seam that fails a chosen syscall.
+//! There is deliberately none. `fs::durable` has one for the durability calls,
+//! because an `fsync` has no result a test can read back and so no other
+//! witness exists; `process_keeps_setgid` has one because the answer that
+//! matters needs a user namespace to arrange. Both seams answer a question the
+//! filesystem will not answer. These arms are not that: each does one thing —
+//! wrap the failure in the typed error that names the path — and the object of
+//! a seam here would be to watch bx run code a reader can see is right, in
+//! exchange for a second control flow present in every test build.
+//!
+//! ## Mutants that survive because they are the same program
+//!
+//! `cargo mutants` reports survivors here that no test can kill, because the
+//! mutation produces a program that cannot behave differently — a guard around
+//! an operation that is a no-op when the guard is false, a bitwise `|` between
+//! flags that share no bit, a body that drops a value the function would drop
+//! anyway. Each such site carries the reason next to it rather than in a list
+//! somewhere else, so the reason moves with the code it is about and a later
+//! mutants run is read against the code rather than against a count taken at a
+//! head that has moved.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -235,10 +268,9 @@ pub enum Error {
     /// observed, by [`Filled::publish`] when it changed between [`stage`] and
     /// the rename — an editor saving, a symlink swapped in, a file appearing
     /// where there was none — and by [`ensure_dir`] when a directory target is
-    /// no longer what `plan` saw. Nothing is replaced: the
-    /// temporary file is removed — unless its directory no longer permits
-    /// removal, when the `.bx-` file is left for recovery — and the path keeps
-    /// what is there now.
+    /// no longer what `plan` saw. Nothing is replaced: the path keeps what is
+    /// there now, and the temporary file is dropped — see [`Staged`] for what
+    /// that is worth.
     ///
     /// From [`Filled::publish`] it arrives inside an [`Unpublished`], because
     /// "nothing was replaced" is not the whole obligation: a caller that
@@ -721,6 +753,23 @@ pub enum ParentState {
     /// Something is on the path and it does not resolve to a directory: a
     /// dangling symlink, a symlink loop, or a non-directory. The string is the
     /// cause, in the words `plan` prints and the error message `apply` returns.
+    ///
+    /// # It names an absolute path, and that is left for the renderer
+    ///
+    /// [`compare`]'s parent note is written against `home`, so `plan` prints
+    /// `~/.config`; this reason is not, so a conflict line for a target under a
+    /// dangling `~/.config` prints the user's home directory. Every
+    /// [`Error`]'s `Display` is absolute the same way.
+    ///
+    /// Closing it means carrying the unusable component and its cause as
+    /// fields and rendering them where the home is known, which is this variant
+    /// — public, and matched on by the caller that will render it — and the
+    /// [`Error::UnusableParent`] that repeats the same words, whose message
+    /// `plan` and `apply` currently share verbatim
+    /// (`a_dangling_symlink_parent_is_a_conflict_rather_than_a_create` asserts
+    /// that `err.to_string()` *is* the note). Two renderings out of one is the
+    /// decision, and it belongs to the entry that renders both rather than to
+    /// the one that produces the string.
     Unusable(String),
 }
 
@@ -1260,6 +1309,15 @@ impl Staged {
         // set-id bit set earlier would already be gone: the kernel clears
         // S_ISUID, and S_ISGID alongside group execute, on a write by a process
         // without CAP_FSETID.
+        //
+        // Forcing either guard below *true* is a surviving mutant, and
+        // equivalent: each guards an operation that does nothing when the
+        // guard is false. With no set-id bit declared the `fchmod` asks for the
+        // mode `stage` already set, and `verify_set_id_kept` looks for no bits
+        // and finds them. Only the number of syscalls differs, and nothing
+        // observes that — the `durable` recorder records durability calls, not
+        // mode calls, deliberately: see the module documentation. Forcing
+        // either *false* is killed, by the tests that declare a set-id bit.
         if self.0.mode.bits() & SET_ID != 0 {
             fchmod(self.0.temp.as_file(), self.0.mode, &temp_path)?;
         }
@@ -1662,9 +1720,27 @@ pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
 /// * [`Action::Conflict`] — anything that is not a directory, including a
 ///   symlink to one: bx does not chmod a directory through a link.
 ///
-/// A declared mode that denies the owner access is applied like any other.
-/// Whether it leaves bx unable to list, write into or search a directory
-/// depends on what lies beneath it, which only the plan layer knows.
+/// # A declared mode that denies the owner access is applied like any other
+///
+/// `fs` applies any declared directory mode. `~/.gnupg` declared `0400` is
+/// created at `0400`, and a declared `~/.gnupg/gpg.conf` beneath it then fails
+/// in [`stage`] with an `EACCES` [`Error::Write`], because bx cannot make its
+/// temporary file there. The directory is left in place and a later `plan` of
+/// the file cannot observe it.
+///
+/// That is the decision, not an omission, and the reason is that the rule that
+/// would refuse it cannot be stated here. "A directory target with a declared
+/// file beneath it must grant its owner write and search" needs to know which
+/// targets lie beneath this one. `fs` is handed one path at a time and never
+/// sees the set; the plan layer is where the set exists, and that is where the
+/// rule belongs. A rule `fs` could state instead — refuse any directory
+/// without owner `rwx` — was tried and removed, because a childless read-only
+/// directory target is legitimate and needs neither listing nor a temporary
+/// file.
+///
+/// What `fs` still refuses is the case it *can* decide from one path: a
+/// **file** target whose declared mode denies the owner read, because bx reads
+/// a file back to compare it — [`Error::OwnerLockedOut`], raised by [`compare`].
 #[must_use]
 pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
     if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
@@ -2263,6 +2339,16 @@ fn observe_parent(dir: &Path) -> Result<Parent, Error> {
 /// with nothing on it and a path that ends at a dangling symlink, and a
 /// directory bx can create from one it cannot are not the same announcement.
 fn parent_state(dir: &Path) -> Result<ParentState, Error> {
+    // The `NotFound` guard below is pinned in both directions: forcing it true
+    // or false fails a test.
+    //
+    // The `unresolvable_path` guard further down is pinned one way only.
+    // Forcing it *false* is killed; forcing it *true* survives, and is
+    // equivalent under anything a test can arrange: it would matter only for a
+    // `symlink_metadata` failure that is neither "nothing is there" nor a
+    // resolution refusal — a permission lost between the `metadata` above and
+    // it, microseconds apart. That is the class the module documentation
+    // explains is not constructed, not a gap in what this function decides.
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => return Ok(ParentState::Present(mode_of(&meta))),
         Ok(_) => {
@@ -2306,7 +2392,8 @@ fn parent_state(dir: &Path) -> Result<ParentState, Error> {
     for ancestor in dir.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
             Err(e) if unresolvable_path(&e) => {}
-            // Reachable only through a race, so no test constructs it. Every
+            // Reachable only through a race, so no test constructs it — the
+            // class the module documentation explains. Every
             // ancestor is a prefix that resolving `dir` above already walked,
             // and `lstat` does not follow its last component: a refusal here —
             // a permission denied, most often — means the permissions changed
@@ -2402,6 +2489,12 @@ fn create_missing_dirs(dir: &Path, created: &CreatedDirs) -> Result<Vec<(PathBuf
 ///
 /// Returns the mode and the device and inode of the directory it made, or
 /// `None` when something was already at `path`.
+///
+/// The `mkdir` arm itself is pinned. The `set_mode` and `symlink_metadata`
+/// arms after a successful `mkdir` are not, and are of the class the module
+/// documentation explains is not constructed: reaching either needs the
+/// directory bx has just made to be removed or made inaccessible in the
+/// microseconds before the next syscall on it.
 fn create_dir_at(path: &Path, mode: Mode) -> Result<Option<Made>, Error> {
     use std::os::unix::fs::MetadataExt as _;
 

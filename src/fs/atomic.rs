@@ -445,6 +445,23 @@ const FILE_OWNER_NEEDS: Mode = Mode::from_bits(0o400);
 
 /// The words [`Error::OwnerLockedOut`] and `plan`'s conflict note share: the
 /// owner bits of `needs` that `declared` lacks, and why bx needs them.
+/// `names` as English: `""`, `"read"`, `"read and write"`, `"read, write and
+/// search"`.
+///
+/// One function rather than one per message, because the two messages that need
+/// it — [`owner_locked_out`] and [`bits_that_did_not_stick`] — each pass a list
+/// whose length is bounded by what their caller happens to ask for today. Both
+/// had their own version, and both versions had a branch that no caller reached:
+/// a guard whose justification was the set of callers rather than the
+/// conjunction it was written to produce. Tested directly, at every length.
+fn and_list(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 fn owner_locked_out(declared: Mode, needs: Mode) -> String {
     let missing = needs.bits() & !declared.bits();
     let names: Vec<&str> = [(0o400, "read"), (0o200, "write"), (0o100, "search")]
@@ -452,10 +469,7 @@ fn owner_locked_out(declared: Mode, needs: Mode) -> String {
         .filter(|(bit, _)| missing & bit != 0)
         .map(|(_, name)| name)
         .collect();
-    let named = match names.as_slice() {
-        [init @ .., last] if !init.is_empty() => format!("{} and {last}", init.join(", ")),
-        _ => names.concat(),
-    };
+    let named = and_list(&names);
     format!(
         "declares {declared}, which denies its owner {named} ({missing:04o}): bx reads a file \
          target's bytes to compare them with what it wants there, so its mode must grant the \
@@ -525,17 +539,17 @@ fn bits_that_did_not_stick(declared: Mode, landed: Mode, what: &str) -> String {
         .filter(|(bit, _)| lost & bit != 0)
         .map(|(_, name)| name)
         .collect();
-    let (named, noun) = match names.as_slice() {
-        [one] => ((*one).to_string(), "bit"),
-        [init @ .., last] => (format!("{} and {last}", init.join(", ")), "bits"),
-        // Unreachable by construction: `bits_that_did_not_stick` is only
-        // called to word `Error::SetIdNotKept`, and
-        // `Error::DirectorySetIdNotKept` when a `chmod` was made, with the
-        // mode that `chmod` left; `verify_set_id_kept` and `set_dir_mode` only
-        // construct either error when `lost` — `declared`'s special bits
-        // minus that mode's — is non-empty, so `names` is never empty here.
-        // Kept so the match stays total rather than opening a panic path.
-        [] => ("special".to_string(), "bits"),
+    let noun = if names.len() == 1 { "bit" } else { "bits" };
+    // `names` is never empty here: `bits_that_did_not_stick` is only called to
+    // word `Error::SetIdNotKept`, and `Error::DirectorySetIdNotKept` when a
+    // `chmod` was made, with the mode that `chmod` left; `verify_set_id_kept`
+    // and `set_dir_mode` only construct either error when `lost` — `declared`'s
+    // special bits minus that mode's — is non-empty. `and_list` is total for
+    // the empty case anyway, so this opens no panic path.
+    let named = if names.is_empty() {
+        "special".to_string()
+    } else {
+        and_list(&names)
     };
     let group = if lost & SETGID != 0 {
         format!(
@@ -2828,6 +2842,49 @@ mod tests {
 
     /// `plan`'s observation, then `stage` on it, with nothing changing in
     /// between.
+    #[test]
+    fn a_list_of_names_reads_as_english_at_every_length() {
+        // Directly, at every length, because both messages that use it pass a
+        // list whose length is bounded by what their caller asks for today —
+        // one name, as it happens — and the branch that joins two or more was
+        // therefore reachable from neither of them.
+        assert_eq!(and_list(&[]), "");
+        assert_eq!(and_list(&["read"]), "read");
+        assert_eq!(and_list(&["read", "write"]), "read and write");
+        assert_eq!(
+            and_list(&["read", "write", "search"]),
+            "read, write and search",
+        );
+
+        // Through the two messages, so the wording each wraps it in is pinned
+        // with it.
+        assert!(
+            owner_locked_out(Mode::from_bits(0o000), Mode::from_bits(0o600))
+                .contains("denies its owner read and write (0600)"),
+            "{}",
+            owner_locked_out(Mode::from_bits(0o000), Mode::from_bits(0o600)),
+        );
+        assert!(
+            owner_locked_out(Mode::from_bits(0o200), Mode::from_bits(0o400))
+                .contains("denies its owner read (0400)"),
+        );
+        let three = bits_that_did_not_stick(
+            Mode::from_bits(0o7755),
+            Mode::from_bits(0o0755),
+            "directory",
+        );
+        assert!(
+            three.contains("the setuid, setgid and sticky bits did not stick"),
+            "{three}",
+        );
+        let one = bits_that_did_not_stick(
+            Mode::from_bits(0o1755),
+            Mode::from_bits(0o0755),
+            "directory",
+        );
+        assert!(one.contains("the sticky bit did not stick"), "{one}");
+    }
+
     fn stage_now(dest: &Path, mode: Mode) -> Result<Staged, Error> {
         let planned = observe(dest)?;
         stage(dest, mode, &planned, &mut CreatedDirs::new())

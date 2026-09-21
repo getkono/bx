@@ -3508,6 +3508,82 @@ mod tests {
     }
 
     #[test]
+    fn a_switched_off_declaration_is_walked_through_by_its_default() {
+        // `enabled` gates the answer edge and nothing else, so a switched-off
+        // declaration is not a wall. `d` is off, but its committed default
+        // reaches `b`, and the walk follows that default straight through it:
+        // the target blocks on the answer that led there, naming `d`'s
+        // default as the step, rather than on `d`'s switch.
+        const THROUGH: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                               [[value]]\nname = \"d\"\nkind = \"string\"\n\
+                               default = \"{{b}}\"\n\
+                               [[value]]\nname = \"s\"\nkind = \"string\"\n\
+                               [[target]]\npath = \"~/.config/thing\"\n\
+                               file = \"cfg/{{s}}/x\"\n";
+
+        let walked = resolved(
+            THROUGH,
+            Some(
+                "[[value]]\nname = \"d\"\nenabled = false\n\
+                 [values]\ns = \"{{d}}\"\n",
+            ),
+        )
+        .expect("blocked, not a load error");
+        assert_eq!(
+            blocked(&walked, 0).reason,
+            BlockReason::InvalidValue {
+                names: vec!["s".to_string()]
+            }
+        );
+        assert!(
+            blocked(&walked, 0).hint.contains(
+                "`file` references `s`, whose answer at local.toml:5 is built from `d`, \
+                 whose default at bx.toml:4 is built from `b`, a `path` value"
+            ),
+            "{}",
+            blocked(&walked, 0).hint
+        );
+
+        // The other half of "the answer edge alone": `d`'s default is now a
+        // plain string and its ANSWER is what reaches `b`. While the switch is
+        // off that answer is not this account's value, so the walk does not
+        // follow it and finds nothing; the switch is what reports.
+        const BY_ANSWER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                                 [[value]]\nname = \"d\"\nkind = \"string\"\n\
+                                 default = \"work\"\n\
+                                 [[value]]\nname = \"s\"\nkind = \"string\"\n\
+                                 [[target]]\npath = \"~/.config/thing\"\n\
+                                 file = \"cfg/{{s}}/x\"\n";
+        const ANSWERS: &str = "[values]\ns = \"{{d}}\"\nd = \"{{b}}\"\n\
+                               b = \"/var/mnt/cfg\"\n";
+
+        let gated = resolved(
+            BY_ANSWER,
+            Some(&format!(
+                "[[value]]\nname = \"d\"\nenabled = false\n{ANSWERS}"
+            )),
+        )
+        .expect("blocked, not a load error");
+        assert_eq!(
+            blocked(&gated, 0).reason,
+            BlockReason::DisabledValue {
+                names: vec!["d".to_string()]
+            }
+        );
+
+        // The same answers with the switch on: the answer really does reach
+        // `b`, so the case above is the gate working and not an answer that
+        // was never going to get there.
+        let ungated = resolved(BY_ANSWER, Some(ANSWERS)).expect("blocked, not a load error");
+        assert_eq!(
+            blocked(&ungated, 0).reason,
+            BlockReason::InvalidValue {
+                names: vec!["d".to_string(), "s".to_string()]
+            }
+        );
+    }
+
+    #[test]
     fn a_path_answer_block_outranks_an_unrelated_disabled_or_invalid_value() {
         // The placement this block was given is "before the disabled, invalid
         // and unset blocks", and only the unset half was ever exercised. Each

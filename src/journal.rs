@@ -6110,6 +6110,87 @@ pub(crate) mod tests {
         );
     }
 
+    /// What the parent tells the opt-out child to expect of its environment.
+    const EXPECT_SKIPS: &str = "BX_TEST_EXPECT_SKIPS";
+
+    #[test]
+    #[ignore = "spawned by the_opt_out_is_read_from_the_environment_not_assumed"]
+    fn skips_allowed_child() {
+        let expected = std::env::var_os(EXPECT_SKIPS).expect("the parent says what to expect");
+        let expected = expected == "yes";
+        assert_eq!(
+            skips_allowed(),
+            expected,
+            "with {ALLOW_SKIPS}={:?}",
+            std::env::var_os(ALLOW_SKIPS),
+        );
+        let live = std::panic::catch_unwind(|| cannot_build("live_probe", "a probe"));
+        assert_eq!(
+            live.is_ok(),
+            expected,
+            "cannot_build must follow the environment, not its own opinion",
+        );
+    }
+
+    #[test]
+    fn the_opt_out_is_read_from_the_environment_not_assumed() {
+        // r3 round 6, COV1. `skips_allowed() -> true` survived the whole
+        // suite: the in-process assertion beside it compared the function with
+        // an expression that moves with it, and every reported run leaves the
+        // variable unset, so no test ever saw the other state. A child can be
+        // given any state, which is the tool this lane built for the capture
+        // pin, pointed at the thing it was built to reach.
+        for (set, expect) in [(None, "no"), (Some("1"), "yes"), (Some("0"), "no")] {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("the test binary"));
+            child
+                .args([
+                    "--exact",
+                    "--ignored",
+                    "journal::tests::skips_allowed_child",
+                ])
+                .env(EXPECT_SKIPS, expect);
+            match set {
+                Some(value) => child.env(ALLOW_SKIPS, value),
+                None => child.env_remove(ALLOW_SKIPS),
+            };
+            let out = child.output().expect("spawn the opt-out child");
+            assert!(
+                out.status.success(),
+                "{ALLOW_SKIPS}={set:?} should read as {expect}:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+
+        // r3 round 6, COV2. The "unset, or exactly 1" assertion is not
+        // vacuous, but no run the gates table reports ever executes it: every
+        // one of them leaves the variable unset. A child with `=0` does, and
+        // must fail with the sentence that tells the reader what to do — the
+        // whole point of refusing a value that looks like an answer.
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "journal::tests::a_scenario_this_machine_cannot_build_fails_unless_the_run_opted_out",
+            ])
+            .env(ALLOW_SKIPS, "0")
+            .output()
+            .expect("spawn the mis-set child");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            !out.status.success(),
+            "{ALLOW_SKIPS}=0 must not pass for an opt-out:\n{said}",
+        );
+        assert!(
+            said.contains("is not a spelling of the opt-out"),
+            "and must say why:\n{said}",
+        );
+    }
+
     #[test]
     fn a_scenario_this_machine_cannot_build_fails_unless_the_run_opted_out() {
         // r3 round 4, COV1. Nothing pinned the policy itself: that the default
@@ -6168,16 +6249,11 @@ pub(crate) mod tests {
             ));
         }
 
-        // And `cannot_build`, which reads the environment, follows the policy
-        // for this run: it is the wiring between the two that a mutant hard-
-        // coding `true` would break.
-        let opted_out = skips_allowed();
-        let live = std::panic::catch_unwind(|| cannot_build("live_probe", "a probe"));
-        assert_eq!(
-            live.is_ok(),
-            opted_out,
-            "cannot_build must fail exactly when the run did not opt out",
-        );
+        // What `cannot_build` does with the *live* environment is pinned by
+        // `the_opt_out_is_read_from_the_environment_not_assumed`, which gives
+        // a child each state in turn. Asserting it here as well would only
+        // re-read this run's one state through the same function, which is
+        // how `skips_allowed() -> true` survived (r3 round 6, COV1).
     }
 
     /// What the say-out-loud child writes through the handle.
@@ -6207,6 +6283,13 @@ pub(crate) mod tests {
         // the same passing test reaches nowhere.
         let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
             .args(["--exact", "--ignored", "journal::tests::say_out_loud_child"])
+            // r3 round 6, D2. The child inherits this process's environment,
+            // and `RUST_TEST_NOCAPTURE=1` — which `cargo test` sets from
+            // `--nocapture` — turns the child's capture off, so the
+            // `eprintln!` would reach its stderr and this test would fail on
+            // its own premise rather than on the property. Removed rather than
+            // tolerated: the premise is that the child *is* capturing.
+            .env_remove("RUST_TEST_NOCAPTURE")
             .output()
             .expect("spawn the say-out-loud child");
         let (out, err) = (

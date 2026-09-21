@@ -20,10 +20,19 @@
 //!
 //! [`SharedLock::acquire`] — the lock a read-only `plan` or `doctor` takes —
 //! goes through [`open_lock_file`], which calls
-//! [`ensure_dir`][super::dir::ensure_dir]. So `bx plan` on a machine that has
-//! never applied anything creates `~/.local/state/bx`, `restore/`, `shell/`
-//! and `lock`, narrows the directory to `0700` and the lock file to `0600`.
-//! That is deliberate.
+//! [`ensure_dir`][super::dir::ensure_dir] on the state **root** and nothing
+//! else. So `bx plan` on a machine that has never applied anything creates
+//! `~/.local/state/bx` and `lock` in it, and sets the directory to `0700` and
+//! the lock file to `0600`. That is deliberate.
+//!
+//! It does **not** create `restore/` or `shell/`: a read that stores no
+//! snapshot and writes no fragment needs neither, and `restore/` is created by
+//! [`Ledger::store_blob`][super::Ledger] on the write that first needs it.
+//! [`StateDir::ensure`][super::StateDir::ensure] is what creates all three, and
+//! on this branch no command calls it — `apply` is the entry that will. The
+//! consequence is that the `ForeignOwner`, `SharedLinkedDir` and
+//! `DanglingStateDir` checks `ensure_dir` makes are applied to the root on
+//! every run and to `restore/` and `shell/` only when something creates them.
 //!
 //! Invariant 1 forbids rewriting a byte **the user wrote**; `~/.local/state/bx`
 //! is a directory bx owns, and creating it writes none of them. And the shared
@@ -402,10 +411,19 @@ fn read_holder(path: &Path) -> Holder {
     let Ok(read) = rustix::io::pread(fd, &mut buf[..], 0) else {
         return Holder::unknown();
     };
-    match std::str::from_utf8(&buf[..read]) {
-        Ok(body) => Holder::parse(body),
-        Err(_) => Holder::unknown(),
-    }
+    // The read stops at a fixed byte count, which can fall inside a multi-byte
+    // character of a program name. Parsing only the characters that are whole
+    // truncates the name exactly as an ASCII name is truncated; refusing the
+    // whole body would report "an unknown process" for a holder whose pid bx
+    // has in hand, and make a non-ASCII `argv[0]` indistinguishable from a
+    // genuinely unreadable lock file (r4 round 2, COV8). The second decode
+    // cannot fail — `valid_up_to` is by definition a character boundary — and
+    // an empty body parses to [`Holder::unknown`] anyway.
+    let body = match std::str::from_utf8(&buf[..read]) {
+        Ok(body) => body,
+        Err(why) => std::str::from_utf8(&buf[..why.valid_up_to()]).unwrap_or_default(),
+    };
+    Holder::parse(body)
 }
 
 impl Drop for ExclusiveLock {
@@ -427,8 +445,8 @@ impl Drop for ExclusiveLock {
     }
 }
 
-/// Hand back the result of one call [`ExclusiveLock::drop`] makes, noting the
-/// call on this thread first when a test is recording.
+/// Hand back the result of one call a lock's `drop` makes, noting the call on
+/// this thread first when a test is recording.
 ///
 /// The note travels in the call's own statement, so the order recorded is the
 /// order the calls ran: both of their effects are visible only once the drop
@@ -442,7 +460,7 @@ fn released<T>(call: &'static str, result: T) -> T {
     result
 }
 
-/// A test-only, per-thread record of the calls [`ExclusiveLock::drop`] makes.
+/// A test-only, per-thread record of the calls a lock's `drop` makes.
 #[cfg(test)]
 mod release_recording {
     use std::cell::RefCell;
@@ -478,7 +496,17 @@ mod release_recording {
 
 impl Drop for SharedLock {
     fn drop(&mut self) {
-        let _ = rustix::fs::flock(&self.fd, FlockOperation::Unlock);
+        // Explicit for the same reason [`ExclusiveLock::drop`] is: closing the
+        // descriptor would release the lock anyway, and the explicit unlock
+        // makes the release immediate and independent of any dup that may
+        // exist. No truncate: a reader writes no identity line, so there is
+        // none of its own to clear, and clearing a writer's would be clearing
+        // another process's. Routed through [`released`] so that difference is
+        // asserted rather than argued (r4 round 2, COV9).
+        let _ = released(
+            "unlock",
+            rustix::fs::flock(&self.fd, FlockOperation::Unlock),
+        );
     }
 }
 
@@ -573,12 +601,19 @@ mod tests {
     }
 
     #[test]
-    fn acquiring_creates_the_state_directory() {
+    fn acquiring_creates_the_state_root_and_nothing_else() {
+        // r4 round 2 (CL2): the module documentation and the change's own
+        // record said acquisition creates `restore/` and `shell/` too. It
+        // creates the root and the lock file, and nothing pinned the
+        // difference, so the record could say either.
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());
         assert!(!dir.root().exists());
-        let _lock = ExclusiveLock::acquire(&dir).expect("acquire");
+        let lock = ExclusiveLock::acquire(&dir).expect("acquire");
         assert!(dir.root().is_dir());
+        assert!(lock.path().is_file());
+        assert!(!dir.restore().exists(), "a read stores no snapshot");
+        assert!(!dir.shell().exists(), "a read writes no fragment");
     }
 
     #[test]
@@ -835,6 +870,56 @@ mod tests {
         assert_eq!(std::fs::read(dir.lock()).expect("read"), Vec::<u8>::new());
     }
 
+    #[test]
+    fn a_released_reader_unlocks_and_clears_nothing() {
+        // r4 round 2 (COV9): closing the descriptor releases the lock anyway,
+        // so no assertion about the filesystem can tell `SharedLock::drop`'s
+        // explicit unlock from its absence, and a mutant removing it survived.
+        // The call is recorded instead, which also pins the other half: a
+        // reader writes no identity line, so it must not truncate the body a
+        // writer may be holding.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        std::fs::write(dir.lock(), b"4242 someone\n").expect("a body it did not write");
+
+        let reader = SharedLock::acquire(&dir).expect("reader");
+        let calls = release_recording::record(|| drop(reader));
+        assert_eq!(calls, ["unlock"], "unlock, and no truncate");
+        assert_eq!(
+            std::fs::read(dir.lock()).expect("read"),
+            b"4242 someone\n".to_vec(),
+            "a reader leaves the body alone",
+        );
+    }
+
+    #[test]
+    fn a_holder_name_cut_inside_a_character_still_names_the_pid() {
+        // r4 round 2 (COV8): the read bound is a byte count, so an `argv[0]`
+        // with a multi-byte character across byte 256 made `from_utf8` fail
+        // and the whole holder degrade to `unknown` — reporting "another bx
+        // process" where bx had the pid in hand, and making a non-ASCII name
+        // indistinguishable from an unreadable lock file.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let held = ExclusiveLock::acquire(&dir).expect("acquire");
+
+        // `"4242 "` is 5 bytes; 250 `n`s then takes the body to 255, so the
+        // three-byte `€` that follows straddles the bound at 256.
+        let name = format!("{}€ and more", "n".repeat(250));
+        let body = format!("4242 {name}\n");
+        std::fs::write(held.path(), &body).expect("clobber");
+        assert!(
+            std::str::from_utf8(&body.as_bytes()[..BODY]).is_err(),
+            "the first {BODY} bytes must cut a character for this to stage anything",
+        );
+
+        let read = read_holder(held.path());
+        assert_eq!(read.pid, 4242, "the pid survives the cut");
+        assert_eq!(read.program, "n".repeat(250), "cut at the character before");
+        assert_ne!(read, Holder::unknown());
+    }
+
     /// The program name [`identify`] writes, derived the same way it derives it.
     fn program_name() -> String {
         std::env::args()
@@ -1009,9 +1094,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repairing_the_lock_files_mode_says_so_through_tracing() {
+        // r4 round 2 (COV1): round 1's repair reached `store.rs` only, so this
+        // warning's argument expressions ran zero times in the whole suite and
+        // deleting the macro left it green.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        std::fs::write(dir.lock(), b"").expect("seed");
+        std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o644)).expect("set");
+
+        let (lock, said) = crate::state::store::capture::capturing(|| ExclusiveLock::acquire(&dir));
+        drop(lock.expect("acquire"));
+        assert!(
+            said.contains("the bx lock file was not 0600; setting it"),
+            "{said}"
+        );
+        assert!(said.contains(&dir.lock().display().to_string()), "{said}");
+        assert_eq!(mode_of(&dir.lock()), 0o600);
+    }
+
+    /// [`child_under_umask`], against the state directory the XDG rule
+    /// resolves under `home` — ancestors and all, as a real run has them.
+    fn child_under_umask_in_home(home: &Path, umask: u32) -> String {
+        child_under_umask_with("BX_TEST_UMASK_HOME", home.as_os_str(), umask)
+    }
+
     /// Run this test binary again, under `umask`, creating a state directory
-    /// and taking the lock in it. Prints the two modes it ends up with.
+    /// and taking the lock in it. Prints the two modes it ends up with, or the
+    /// error it failed with.
     fn child_under_umask(dir: &StateDir, umask: u32) -> String {
+        child_under_umask_with("BX_TEST_UMASK_DIR", dir.root().as_os_str(), umask)
+    }
+
+    /// The two above, less which directory the child is told to use.
+    fn child_under_umask_with(key: &str, value: &std::ffi::OsStr, umask: u32) -> String {
         let exe = std::env::current_exe().expect("the test binary");
         let out = Command::new(exe)
             .args([
@@ -1020,7 +1138,7 @@ mod tests {
                 "--nocapture",
                 "state::lock::tests::child_creates_the_state_directory_under_a_umask",
             ])
-            .env("BX_TEST_UMASK_DIR", dir.root())
+            .env(key, value)
             .env("BX_TEST_UMASK", format!("{umask:o}"))
             .output()
             .expect("spawn the child");
@@ -1040,26 +1158,43 @@ mod tests {
     #[test]
     #[ignore = "spawned by the umask test"]
     fn child_creates_the_state_directory_under_a_umask() {
-        let (Some(root), Some(mask)) = (
-            std::env::var_os("BX_TEST_UMASK_DIR"),
-            std::env::var("BX_TEST_UMASK").ok(),
-        ) else {
+        let Ok(mask) = std::env::var("BX_TEST_UMASK") else {
             return;
         };
         let mask = u32::from_str_radix(&mask, 8).expect("an octal umask");
-        let dir = StateDir::new(PathBuf::from(root));
-        let was = rustix::process::umask(RawMode::from_bits_truncate(mask));
+        let dir = match (
+            std::env::var_os("BX_TEST_UMASK_DIR"),
+            std::env::var_os("BX_TEST_UMASK_HOME"),
+        ) {
+            (Some(root), _) => StateDir::new(PathBuf::from(root)),
+            // The XDG ancestors do not exist yet, so the child creates them
+            // under the mask too — the shape a real first run has.
+            (None, Some(home)) => StateDir::resolve(Path::new(&home)),
+            (None, None) => return,
+        };
+        // The mask goes back through a `Drop` guard, not a statement after the
+        // closure. `mode_of` is an `expect`, so a panic inside would unwind
+        // past a bare restore and the profile runtime would then write its
+        // `.profraw` under a mask that denies its owner — the very failure
+        // this restore exists to prevent. This diff settles the pattern twice
+        // already, at `dir::noreplace_seam::with` and at
+        // `release_recording::record`; this is the third (r4 round 2, D7).
+        struct Restore(RawMode);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                rustix::process::umask(self.0);
+            }
+        }
+        let _restore = Restore(rustix::process::umask(RawMode::from_bits_truncate(mask)));
         let made = (|| {
             dir.ensure()?;
             let lock = ExclusiveLock::acquire(&dir)?;
             Ok::<_, Error>((mode_of(dir.root()), mode_of(lock.path())))
         })();
-        // Put the mask back before anything else in this process writes a
-        // file — the coverage instrumentation writes its profile at exit, and
-        // a mask that denied the owner would leave it unreadable.
-        rustix::process::umask(was);
-        let (root_mode, lock_mode) = made.expect("the state directory, under the mask");
-        println!("dir={root_mode:04o} lock={lock_mode:04o}");
+        match made {
+            Ok((root_mode, lock_mode)) => println!("dir={root_mode:04o} lock={lock_mode:04o}"),
+            Err(why) => println!("err={why}"),
+        }
     }
 
     #[test]
@@ -1086,6 +1221,45 @@ mod tests {
             dir.ensure().expect("a second run");
             drop(ExclusiveLock::acquire(&dir).expect("a second run takes the lock"));
         }
+    }
+
+    #[test]
+    fn a_umask_that_makes_the_xdg_ancestors_unwritable_names_the_one_in_the_way() {
+        // r4 round 2 (D4): the test above stages a state directory whose
+        // parent already exists at 0700, which is not the shape a first run
+        // has. With no `~/.local/state` yet, `create_dir_all` makes the
+        // ancestors under the mask — 0500 under `umask 0277` — and the very
+        // next `mkdir` fails `EACCES` inside a directory bx created one
+        // statement earlier. It reported "creating ~/.local/state/bx:
+        // Permission denied", naming neither the directory in the way nor the
+        // umask that made it, so the condition the test above says cannot
+        // happen did, undiagnosably.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        for mask in [0o500, 0o277, 0o377] {
+            let home = guarded_home();
+            assert!(!home.child(".local").exists(), "a first run");
+            let said = child_under_umask_in_home(home.path(), mask);
+            assert!(
+                said.contains("cannot write in it"),
+                "under umask {mask:04o}: {said}",
+            );
+            assert!(
+                said.contains("umask") && said.contains("chmod u+wx"),
+                "the cause and the remedy: {said}",
+            );
+            assert!(
+                said.contains(&home.child(".local").display().to_string()),
+                "the ancestor in the way: {said}",
+            );
+        }
+
+        // And a mask that leaves the owner's own bits alone still works, so
+        // what is refused is exactly the unusable case.
+        let home = guarded_home();
+        let said = child_under_umask_in_home(home.path(), 0o077);
+        assert!(said.contains("dir=0700 lock=0600"), "{said}");
     }
 
     #[test]

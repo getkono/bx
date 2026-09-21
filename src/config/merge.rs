@@ -706,31 +706,40 @@ fn clash(
 /// entry in `layer`, its own, and suppose it reaches a clash. The two have one
 /// written form, so:
 ///
-/// - if the strings the layer stores are the same — an entry's `path` folded
-///   when it was parsed, a toggle's key raw — the parser's own duplicate check
-///   refused the layer before `merge` ran, and there is no clash;
-/// - if they differ and the spellings resolve, one form is one file, so the
-///   entry holds the toggle's [`TargetKey::File`] in this very layer and
-///   [`clash`] refuses the pair as that layer naming one file twice;
-/// - if they differ and the spellings do not resolve, each is keyed as written
-///   by its own text, so the entry does not hold the toggle's key. Something
-///   else must, or [`unknown_toggle`] refuses the toggle — and an entry in an
-///   earlier layer holding a key spelled exactly as the toggle is has the
-///   toggle's form too, so it anchors the toggle through `earlier` whatever
-///   its own layer declares.
+/// - if the strings the layer stores are the same — an entry's `path`
+///   normalised when it was parsed, a toggle's key raw — the parser's own
+///   duplicate check refused the layer before `merge` ran, and there is no
+///   clash;
+/// - if they differ and the toggle's spelling resolves, so does the entry's,
+///   one form being one file, so the entry holds the toggle's
+///   [`TargetKey::File`] in this very layer and [`clash`] refuses the pair as
+///   that layer naming one file twice;
+/// - if they differ and the toggle's spelling does not resolve, it is keyed as
+///   written, by its own text, and no entry holds that key: an entry's stored
+///   `path` is normalised, so it carries no `..`, and cancelling a fixed
+///   segment is the only way a written form drops a placeholder, which is what
+///   a spelling that does not resolve while its pair does must have done. So
+///   either [`unknown_toggle`] refuses the toggle, or something else in the
+///   merge holds its key — an entry in an *earlier* layer, spelled exactly as
+///   the toggle is, which has the toggle's form too and anchors it through
+///   `earlier` whatever its own layer declares.
 ///
 /// The split is on two facts, whether the stored strings are equal and whether
-/// the spellings resolve, so it leaves no case out. In each one the own-layer
-/// arm changes no verdict that reaches a hint. The layers after `layer` are
-/// the same story from the other end: a full entry drops every clash held for
-/// its file, so a toggle judged against one gets no hint rather than a
-/// reworded one.
+/// the toggle's spelling resolves, so it leaves no case out. A pair need not
+/// agree on the second — a `bool` left unanswered makes `/opt/{{b}}/../x` one
+/// path as written with `/opt/x`, a `bool` being always one segment, while the
+/// first is keyed as written and the second keys its file — and the third case
+/// is where every such mixed pair lands, for the reason it gives. In each case
+/// the own-layer arm changes no verdict that reaches a hint. The layers after
+/// `layer` are the same story from the other end: a full entry drops every
+/// clash held for its file, so a toggle judged against one gets no hint rather
+/// than a reworded one.
 ///
 /// Both arms are kept all the same: this answers what bx can show about one
-/// toggle, and none of those rules is its to assume. The three refusals are
-/// exhibited by
-/// `one_layer_that_declares_a_file_and_toggles_it_is_refused_by_one_of_three_routes`,
-/// the case none of them catches by
+/// toggle, and none of those rules is its to assume. Three refusals, the mixed
+/// pair among them, are exhibited by
+/// `an_own_layer_entry_and_toggle_for_one_file_meet_three_different_refusals`,
+/// the case no refusal catches by
 /// `an_own_layer_pair_no_refusal_catches_is_anchored_by_the_earlier_layer_anyway`,
 /// and the middle refusal over every folding by
 /// `one_layer_naming_one_file_twice_by_spelling_alone_is_refused_whatever_the_answer`.
@@ -2167,12 +2176,16 @@ mod tests {
     }
 
     #[test]
-    fn one_layer_that_declares_a_file_and_toggles_it_is_refused_by_one_of_three_routes() {
-        // Which route refuses an own-layer `[[target]]` entry and toggle for
-        // one file is decided textually, on the strings the layer stores — an
-        // entry's `path` folded when it was parsed, a toggle's key raw. The
-        // three rows are the three answers, and together they are why no toggle
-        // anchored by its own layer's entry ever reaches a hint.
+    fn an_own_layer_entry_and_toggle_for_one_file_meet_three_different_refusals() {
+        // Three refusals an own-layer `[[target]]` entry and toggle for one
+        // file can meet, by three different producers, and which one a pair
+        // meets turns on the strings the layer stores — an entry's `path`
+        // normalised when it was parsed, a toggle's key raw. Not every such
+        // pair is refused: the one none of these catches is
+        // `an_own_layer_pair_no_refusal_catches_is_anchored_by_the_earlier_layer_anyway`.
+        // Why no toggle anchored by its own layer's entry reaches a hint is
+        // argued at `anchored`, and rests on none of these being the whole
+        // list.
         let text = |entry: &str, toggle: &str| {
             format!(
                 "[[value]]\nname = \"p\"\nkind = \"string\"\n{}\
@@ -2220,6 +2233,28 @@ mod tests {
                 "matched by the spelling it was declared with, such as `~/.config/{{p}}/s` \
                  at bx.toml:4"
             ),
+            "{message}"
+        );
+
+        // (iv) A pair need not agree on whether its spellings resolve. With a
+        // `bool` unanswered, `/opt/{{b}}/../x` cancels to `/opt/x` as written —
+        // a `bool` is always one segment — so the two are one path, while the
+        // entry keys the file and the toggle is keyed as written. The refusal
+        // is (iii)'s all the same: an entry's stored `path` is normalised, so
+        // no entry holds a key with a `..` still in it.
+        let mixed = format!(
+            "[[value]]\nname = \"b\"\nkind = \"bool\"\n{}\
+             [[target]]\npath = \"/opt/{{{{b}}}}/../x\"\nenabled = false\n",
+            target_toml("/opt/x", "x")
+        );
+        let values = resolved(&[global("bx.toml", &mixed), local("")]);
+        assert!(
+            one_path_as_written("/opt/{{b}}/../x", "/opt/x", &values),
+            "the pair is one path as written"
+        );
+        let message = failure(&[global("bx.toml", &mixed), local("")]);
+        assert!(
+            message.contains("which no earlier layer declares"),
             "{message}"
         );
     }

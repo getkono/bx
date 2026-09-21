@@ -5974,6 +5974,32 @@ mod tests {
             )),
             Some(BxOwnedDirectory)
         );
+        // The other half of `refuses_entry_placement`'s order: containing bx's
+        // directories outranks the declared roots. Every value above that
+        // yields `ContainsBxDirectory` also lies inside a declared root, so
+        // swapping the two arms would change none of them. This one lies
+        // inside no declared root *and* contains bx's state directory, and it
+        // is the only input that tells the two orders apart: under the swap it
+        // would report `OutsideDeclaredRoots`, sending the user to declare a
+        // root that would still not make the value legal.
+        assert_eq!(
+            reason_of(&check(
+                "UV_CACHE_DIR",
+                "/var/home/example/.local",
+                &rooted()
+            )),
+            Some(ContainsBxDirectory)
+        );
+        // Not vacuous: a sibling that contains nothing of bx's, outside every
+        // root in the same way, is refused for the roots.
+        assert_eq!(
+            reason_of(&check(
+                "UV_CACHE_DIR",
+                "/var/home/example/.cache",
+                &rooted()
+            )),
+            Some(Reason::OutsideDeclaredRoots)
+        );
     }
 
     #[test]

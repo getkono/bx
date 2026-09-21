@@ -630,9 +630,16 @@ pub(crate) fn confine_to_repo(key: &str, raw: &str) -> Result<PathBuf, String> {
 /// earlier shape of this function carried one that could not decide anything. A
 /// `Portable` under the home is `~`-rooted; `~` itself is the first operand; and
 /// a `~/…` path is never a component prefix of the home, because the home
-/// reaching here is always absolute — [`Portable::parse_in`] refuses a home that
-/// is not, at both call sites, before this is called.
-/// `the_home_reaching_the_refusal_is_always_absolute` pins that precondition.
+/// reaching here is always absolute.
+///
+/// That last clause is a precondition on the **callers**, not a property of any
+/// argument's type: a `Path` is free to be relative, and nothing in this
+/// signature forbids one. Both callers hold it the same way — each builds a
+/// `Portable` against the *same* home before calling, and
+/// [`Portable::parse_in`] refuses a home that does not normalise absolute. The
+/// `debug_assert!` below states it where it is relied on, so any future caller
+/// that does not hold it trips on the first test that reaches here rather than
+/// silently reinstating the deleted operand's case.
 ///
 /// Like [`confine_to_repo`] it has two callers: the parser, on the path as
 /// written, and [`super::resolve`], on the path a substitution produced, because
@@ -645,8 +652,14 @@ pub(crate) fn refuse_file_at_home_or_above(
     body: &Body,
     home: &Path,
 ) -> Result<(), String> {
-    let at_or_above =
-        path.as_str() == "~" || crate::paths::normalize(home).starts_with(path.as_str());
+    let home = crate::paths::normalize(home);
+    debug_assert!(
+        home.is_absolute(),
+        "a caller reached refuse_file_at_home_or_above with the non-absolute home {home:?}; \
+         against such a home a `~/…` path can be a component prefix, which is the case the \
+         deleted `!path.under_home()` operand was thought to cover"
+    );
+    let at_or_above = path.as_str() == "~" || home.starts_with(path.as_str());
     if *body != Body::Dir && at_or_above {
         return Err(format!(
             "path = {shown:?} is the home directory or a directory above it, so only a \
@@ -769,8 +782,8 @@ mod tests {
         Path::new("/var/home/example")
     }
 
-    /// Parse the first `[[target]]` out of a document.
-    fn parse(text: &str) -> Result<Target, Error> {
+    /// Parse the first `[[target]]` out of a document, against `home`.
+    fn parse_in(text: &str, home: &Path) -> Result<Target, Error> {
         let doc = Document::parse(text).expect("valid TOML");
         let table = doc
             .as_table()
@@ -780,7 +793,12 @@ mod tests {
             .expect("an array of tables")
             .get(0)
             .expect("one element");
-        parse_target(table, Path::new("bx.toml"), text, home())
+        parse_target(table, Path::new("bx.toml"), text, home)
+    }
+
+    /// Parse the first `[[target]]` out of a document.
+    fn parse(text: &str) -> Result<Target, Error> {
+        parse_in(text, home())
     }
 
     /// A minimal valid target, plus whatever else the test needs.
@@ -1007,40 +1025,59 @@ mod tests {
         assert_eq!(target.path.as_str(), "~");
     }
 
-    /// The home `refuse_file_at_home_or_above` compares against is always absolute.
+    /// The parser never reaches the refusal with a home that is not absolute.
     ///
-    /// That precondition is what lets the comparison stand alone. The function
-    /// once also asked `!path.under_home()`, which could not decide anything: a
-    /// `Portable` under the home is `~`-rooted, `~` is settled before the
-    /// comparison, and a `~/…` path is a component prefix of the home only if
-    /// the home itself is `~`-rooted. No such home ever arrives, because
-    /// `Portable::parse_in` builds the path first and refuses a home that is not
-    /// absolute — so there is no input the removed operand could have changed.
-    /// Should that ever stop holding, this test fails and the guard is owed
-    /// again.
+    /// A **call-site** property, which is the only place it can live: `home`
+    /// arrives at `refuse_file_at_home_or_above` as a plain `&Path` and the type
+    /// does not forbid a relative one. `parse_target` holds it by handing the
+    /// same `home` to `Portable::parse_in` first, so a non-absolute home leaves
+    /// through that error and the refusal never runs. This drives `parse_target`
+    /// end to end rather than asserting `Portable::parse_in`'s own contract,
+    /// which `paths.rs` already pins.
+    ///
+    /// It is what lets the comparison in `refuse_file_at_home_or_above` stand
+    /// alone. The function once also asked `!path.under_home()`, which could not
+    /// decide anything: a `~/…` path is a component prefix of the home only if
+    /// the home is itself `~`-rooted. Should a home like that start reaching the
+    /// refusal, the `debug_assert!` there trips this test and the operand is
+    /// owed again.
     #[test]
-    fn the_home_reaching_the_refusal_is_always_absolute() {
-        for home in ["~/nested", "~", "relative/home", ""] {
+    fn the_parser_never_reaches_the_refusal_with_a_non_absolute_home() {
+        for home in ["~/nested", "~", "relative/home", "", "."] {
+            let message = parse_in(&with(""), Path::new(home))
+                .expect_err("a non-absolute home is refused before the refusal")
+                .to_string();
             assert!(
-                matches!(
-                    Portable::parse_in("~/x", Path::new(home)),
-                    Err(crate::paths::Error::HomeNotAbsolute(_))
-                ),
-                "home {home:?} should never reach the refusal"
+                message.contains("HOME is not an absolute path"),
+                "home {home:?} reached past the constructor: {message}"
             );
         }
 
-        // The home spelled absolutely does not reach it either: it folds to `~`
-        // and is refused as a path that should have been written portably.
-        assert!(matches!(
-            Portable::parse_in("/var/home/example", home()),
-            Err(crate::paths::Error::AbsoluteUnderHome { .. })
-        ));
-
-        // And with an absolute home every `~/…` path is below it, never at or
-        // above it, which is the case the removed operand was thought to cover.
+        // The refusal is reached, and passes, for the absolute home the rest of
+        // this module parses against -- so the loop above is a statement about
+        // the home, not about `with("")` being unparseable.
         let target = parse(&with("")).expect("a path under the home parses");
         assert_eq!(target.path.as_str(), "~/.gitconfig");
+    }
+
+    /// The precondition is checked where it is relied on, not merely argued.
+    ///
+    /// `the_parser_never_reaches_the_refusal_with_a_non_absolute_home` shows one
+    /// call site holds it today. This shows the guard that will catch the next
+    /// caller that does not: `super::resolve` reaches the same function, and no
+    /// test in this module can drive that call site. Without this, the
+    /// `debug_assert!` could be deleted and every other test still pass.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "non-absolute home")]
+    fn a_non_absolute_home_at_the_refusal_trips_its_precondition() {
+        let path = Portable::parse_in("~/x", home()).expect("a path under the home");
+        let _ = refuse_file_at_home_or_above(
+            "~/x",
+            &path,
+            &Body::Inline(String::new()),
+            Path::new("~/nested"),
+        );
     }
 
     /// The home's ancestors are directories too, and so is the home by any spelling.

@@ -87,6 +87,27 @@ use crate::paths;
 /// startup. A test re-derives the first part from whichever shells the machine
 /// running it has.
 ///
+/// Which modules are *bundled* is a property of the build, not of zsh, and that
+/// is how a name came to be missing here. `zgdbm_tied` is defined by
+/// `zsh/db/gdbm`; Ubuntu's zsh ships that module and this repository's
+/// development host does not, so the probe run by hand never loaded it and
+/// never saw the name. CI, on a runner that has the module, is what found it —
+/// the same test, the same sweep, a larger `$module_path`.
+///
+/// The rest of the list was re-checked against `zshmodules(1)` rather than
+/// against what is installed. `zsh/db/gdbm` is the only module that page
+/// documents which this host lacks, and `zgdbm_tied` is the only parameter it
+/// documents for it — `zgdbmpath` is a builtin, and it writes `REPLY` when it
+/// is called. Every other name that page attaches to a module is either already
+/// here or is created by an event rather than by the module loading: the
+/// connection-scoped `ZFTP_*` names appear on `open` and are unset on `close`,
+/// the completion specials exist only while a completion widget runs, and
+/// `MATCH`, `match` and `reply` are written by `pcre_match`, `zregexparse` and
+/// `zselect` when those builtins run. No build defines any of them at startup,
+/// so no build can widen this list through them. What could still widen it is a
+/// module no upstream manual page describes — a distribution-local one — and
+/// nothing establishes that none exists; the test is what would catch it.
+///
 /// That probe finds names a shell *defines*. It cannot find a name the shell
 /// *acts on* when it is assigned and that reads back exactly as written —
 /// `HISTFILESIZE=0` is one — so those are curated by hand in
@@ -270,6 +291,7 @@ const SHELL_NAMES: &[&str] = &[
     "zcurses_colors",
     "zcurses_keycodes",
     "zcurses_windows",
+    "zgdbm_tied",
     "zle_bracketed_paste",
     "zsh_eval_context",
     "zsh_scheduled_events",

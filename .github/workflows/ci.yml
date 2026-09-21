@@ -119,11 +119,19 @@ jobs:
       # "every" that quietly checks fewer is the failure it exists to prevent,
       # so the trailing comment is now part of the grammar and stripped.
       #
-      # A local action (`./.github/actions/x`) and a container action
-      # (`docker://…`) are named by neither a tag nor a SHA, so no registry can
-      # answer for them. They are skipped *by name* rather than reported
-      # unresolved. None is present today; this is here so adding one does not
-      # turn the step red for the wrong reason.
+      # Four forms no registry lookup can answer for are skipped *by name*
+      # rather than reported unresolved: a local action (`./.github/actions/x`),
+      # a container action (`docker://…`), and a templated ref
+      # (`uses: ${{ matrix.action }}`), which has no value until the matrix
+      # expands and would otherwise report one spurious failure per matrix leg.
+      # A subdirectory action (`github/codeql-action/init@v3`) *is* resolvable,
+      # but on `owner/repo` — asking about the subdirectory 404s, which
+      # reported a valid ref as broken until round 5.
+      #
+      # None of the four is present today, which is why the self-check in the
+      # step exercises each of them: grammar nothing runs is grammar nobody
+      # finds wrong, and that is precisely how the subdirectory form survived a
+      # round in which the two forms beside it were added.
       #
       # This job's own `actions/checkout@v4`, above, is the one ref whose
       # breakage this step cannot report: the job would die at `Set up job`
@@ -133,6 +141,73 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # One verdict word per ref, so every branch is reachable from the
+          # self-check below as well as from the real tree.
+          resolve() {
+            case $1 in
+              # A templated ref: no action ref holds `{{`, and the value
+              # does not exist until the matrix expands.
+              *'{{'*)         echo templated; return ;;
+              ./*|docker://*) echo skipped;   return ;;
+            esac
+            case $1 in
+              */*@*) rev=${1#*@}; path=${1%@*} ;;
+              */*)   rev=;        path=$1 ;;
+              *)     echo malformed; return ;;
+            esac
+            # `owner/repo/sub/dir@ref` is a subdirectory action: the ref lives
+            # on `owner/repo`, and asking the registry about the subdirectory
+            # 404s. `github/codeql-action/init@v3` is the canonical one.
+            repo=$(printf '%s\n' "$path" | cut -d/ -f1,2)
+            if [ -z "$rev" ]; then
+              gh api "repos/$repo" >/dev/null 2>&1 && echo unpinned || echo UNRESOLVED
+              return
+            fi
+            if gh api "repos/$repo/git/ref/tags/$rev" >/dev/null 2>&1 \
+              || gh api "repos/$repo/git/ref/heads/$rev" >/dev/null 2>&1 \
+              || gh api "repos/$repo/commits/$rev" >/dev/null 2>&1; then
+              echo resolves
+            else
+              echo UNRESOLVED
+            fi
+          }
+
+          # Every branch of `resolve` over forms this repository does not use
+          # today. Without this the grammar added for them is dead code that no
+          # run exercises, which is how the subdirectory form went unnoticed
+          # while two sibling forms beside it were being widened.
+          echo '-- self-check'
+          bad=0
+          for pair in \
+            'actions/checkout@v4=resolves' \
+            'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683=resolves' \
+            'github/codeql-action/init@v3=resolves' \
+            'actions/setup-node@main=resolves' \
+            'astral-sh/setup-uv@v10=UNRESOLVED' \
+            './.github/actions/local=skipped' \
+            'docker://alpine:3.20=skipped' \
+            'actions/checkout=unpinned' \
+            'not-a-ref=malformed'
+          do
+            got=$(resolve "${pair%=*}")
+            if [ "$got" = "${pair##*=}" ]; then
+              echo "  ok        ${pair%=*} -> $got"
+            else
+              echo "  BAD       ${pair%=*} -> $got (wanted ${pair##*=})"
+              bad=1
+            fi
+          done
+          templated='$'"{{ matrix.action }}"
+          got=$(resolve "$templated")
+          if [ "$got" = templated ]; then
+            echo "  ok        a templated ref -> templated"
+          else
+            echo "  BAD       a templated ref -> $got (wanted templated)"
+            bad=1
+          fi
+          test "$bad" = 0 || { echo 'the ref classifier does not behave as documented'; exit 1; }
+
+          echo '-- this repository'
           status=0
           refs=$(grep -hE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]]' \
             .github/workflows/*.yml \
@@ -141,38 +216,11 @@ jobs:
             | sort -u)
           test -n "$refs" || { echo 'no action refs found, which cannot be right'; exit 1; }
           for ref in $refs; do
-            case $ref in
-              ./*|docker://*)
-                echo "skipped     $ref (local or container action; no registry names it)"
-                continue
-                ;;
+            verdict=$(resolve "$ref")
+            case $verdict in
+              resolves|unpinned|skipped|templated) echo "  $verdict  $ref" ;;
+              *) echo "  $verdict  $ref"; status=1 ;;
             esac
-            case $ref in
-              */*@*) repo=${ref%@*}; rev=${ref#*@} ;;
-              */*)   repo=$ref;      rev= ;;
-              *)
-                echo "UNRESOLVED  $ref (not owner/repo[@ref])"
-                status=1
-                continue
-                ;;
-            esac
-            if [ -z "$rev" ]; then
-              if gh api "repos/$repo" >/dev/null 2>&1; then
-                echo "resolves    $ref (unpinned, default branch)"
-              else
-                echo "UNRESOLVED  $ref"
-                status=1
-              fi
-              continue
-            fi
-            if gh api "repos/$repo/git/ref/tags/$rev" >/dev/null 2>&1 \
-              || gh api "repos/$repo/git/ref/heads/$rev" >/dev/null 2>&1 \
-              || gh api "repos/$repo/commits/$rev" >/dev/null 2>&1; then
-              echo "resolves    $ref"
-            else
-              echo "UNRESOLVED  $ref"
-              status=1
-            fi
           done
           exit $status
       # actionlint is deliberately *not* wired in here. It would not have

@@ -702,30 +702,38 @@ fn clash(
 /// is one whose pair with a declared spelling the written form does not
 /// decide.
 ///
-/// Which source decides a hint, and which cannot: only an earlier layer's
-/// entry can. An entry in `layer` itself is one path as written with the
-/// toggle, and such a pair is refused before a hint is chosen, by one of three
-/// routes. Which one is decided textually, on the strings the layer stores —
-/// an entry's `path` folded when it was parsed, a toggle's key raw:
+/// Neither arm is the one that decides a hint. Take a toggle anchored by an
+/// entry in `layer`, its own, and suppose it reaches a clash. The two have one
+/// written form, so:
 ///
-/// - the strings coincide: the parser's own duplicate check refuses the layer,
-///   before `merge` runs at all;
-/// - they differ and the file is known: [`clash`] refuses it, as one layer
-///   naming one file twice;
-/// - they differ and the file is not known: each spelling is keyed as written,
-///   by its own text, so the toggle matches no entry and [`unknown_toggle`]
-///   refuses it.
+/// - if the strings the layer stores are the same — an entry's `path` folded
+///   when it was parsed, a toggle's key raw — the parser's own duplicate check
+///   refused the layer before `merge` ran, and there is no clash;
+/// - if they differ and the spellings resolve, one form is one file, so the
+///   entry holds the toggle's [`TargetKey::File`] in this very layer and
+///   [`clash`] refuses the pair as that layer naming one file twice;
+/// - if they differ and the spellings do not resolve, each is keyed as written
+///   by its own text, so the entry does not hold the toggle's key. Something
+///   else must, or [`unknown_toggle`] refuses the toggle — and an entry in an
+///   earlier layer holding a key spelled exactly as the toggle is has the
+///   toggle's form too, so it anchors the toggle through `earlier` whatever
+///   its own layer declares.
 ///
-/// The three rows of
-/// `one_layer_that_declares_a_file_and_toggles_it_is_refused_by_one_of_three_routes`
-/// are those three, and
-/// `one_layer_naming_one_file_twice_by_spelling_alone_is_refused_whatever_the_answer`
-/// covers the middle one over every folding.
+/// The split is on two facts, whether the stored strings are equal and whether
+/// the spellings resolve, so it leaves no case out. In each one the own-layer
+/// arm changes no verdict that reaches a hint. The layers after `layer` are
+/// the same story from the other end: a full entry drops every clash held for
+/// its file, so a toggle judged against one gets no hint rather than a
+/// reworded one.
 ///
-/// An entry a later layer declares would settle the clash rather than change
-/// its hint, since a full entry drops every clash held for its file. Both arms
-/// are kept all the same: this answers what bx can show about one toggle, and
-/// none of those rules is its to assume.
+/// Both arms are kept all the same: this answers what bx can show about one
+/// toggle, and none of those rules is its to assume. The three refusals are
+/// exhibited by
+/// `one_layer_that_declares_a_file_and_toggles_it_is_refused_by_one_of_three_routes`,
+/// the case none of them catches by
+/// `an_own_layer_pair_no_refusal_catches_is_anchored_by_the_earlier_layer_anyway`,
+/// and the middle refusal over every folding by
+/// `one_layer_naming_one_file_twice_by_spelling_alone_is_refused_whatever_the_answer`.
 fn anchored(toggle: &str, earlier: &[&Layer], layer: &Layer, values: &ResolvedValues) -> bool {
     earlier
         .iter()
@@ -2504,12 +2512,10 @@ mod tests {
     fn a_toggle_is_anchored_by_a_full_entry_in_any_layer_folded_so_far() {
         // `anchored` taken on its own, because neither source it adds to the
         // first can be told apart through a hint: a same-layer entry one path
-        // as written with the toggle is refused before a hint is chosen, by
-        // the duplicate check, by `clash` or by `unknown_toggle` according to
-        // the strings the layer stores (see
-        // `one_layer_that_declares_a_file_and_toggles_it_is_refused_by_one_of_three_routes`),
-        // and an entry a later layer declares settles the clash instead of
-        // rewording it (see resolve.rs's
+        // as written with the toggle either has the pair refused before a hint
+        // is chosen or anchors the toggle from an earlier layer as well, for
+        // the reason `anchored` gives, and an entry a later layer declares
+        // settles the clash instead of rewording it (see resolve.rs's
         // `one_file_clashing_in_two_layers_is_recorded_for_each_and_settled_only_by_name`).
         // What the predicate answers is still what the hints rest on, so each
         // source it consults is pinned here.
@@ -2607,6 +2613,69 @@ mod tests {
                     crate::config::target::Body::Inline("L".to_string())
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn an_own_layer_pair_no_refusal_catches_is_anchored_by_the_earlier_layer_anyway() {
+        // The case that is refused by nothing: `two.toml` declares
+        // `/opt{{r}}/conf` and toggles `/opt/{{r}}/conf`, which are one path as
+        // written; the stored strings differ, so the parser's duplicate check
+        // passes; `r` is unanswered, so both spellings are keyed as written, by
+        // their own text, and no statement in `two.toml` shares the toggle's
+        // key for `clash` to refuse; and `bx.toml` holds that key already, so
+        // the unknown-toggle check does not fire either. The layer set merges.
+        //
+        // The toggle still reaches no hint through its own layer's entry: what
+        // let it past the unknown-toggle check is an entry in an *earlier*
+        // layer spelled exactly as the toggle is, and that entry anchors it
+        // through the earlier-layer arm. Drop it and route (iii) returns.
+        let declaring = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "[[value]]\nname = \"r\"\nkind = \"path\"\n{}",
+                    target_toml("/opt/{{r}}/conf", "D")
+                ),
+            )
+        };
+        let pairing = || {
+            global(
+                "modules/20-two.toml",
+                &format!(
+                    "{}[[target]]\npath = \"/opt/{{{{r}}}}/conf\"\nenabled = false\n",
+                    target_toml("/opt{{r}}/conf", "G")
+                ),
+            )
+        };
+        let values = resolved(&[declaring(), pairing(), local("")]);
+
+        assert!(
+            one_path_as_written("/opt/{{r}}/conf", "/opt{{r}}/conf", &values),
+            "the own-layer pair is one path as written"
+        );
+        let config = merge(&[declaring(), pairing(), local("")])
+            .unwrap_or_else(|e| panic!("no refusal catches this pair: {e}"));
+        assert!(config.conflicts.is_empty(), "{:#?}", config.conflicts);
+
+        // Both arms answer yes here, which is the point: the entry that let the
+        // toggle past the unknown-toggle check is spelled exactly as the toggle
+        // is, so it anchors it whether or not its own layer's entry is
+        // consulted. The verdict does not rest on the own-layer arm.
+        assert!(
+            anchored("/opt/{{r}}/conf", &[&declaring()], &local(""), &values),
+            "the earlier layer's entry anchors it with nothing declared beside it"
+        );
+        assert!(
+            anchored("/opt/{{r}}/conf", &[], &pairing(), &values),
+            "its own layer's entry would too"
+        );
+
+        // Without that entry the toggle reaches nothing and is refused.
+        let message = failure(&[pairing(), local("")]);
+        assert!(
+            message.contains("which no earlier layer declares"),
+            "{message}"
         );
     }
 

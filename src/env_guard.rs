@@ -2589,30 +2589,122 @@ mod tests {
         (sentence, next)
     }
 
-    /// How many variants [`Reason`] has, as the chain must visit them.
+    /// The name of every variant [`Reason`] declares, read out of this
+    /// module's own source.
     ///
-    /// The chain cannot skip a variant without this failing, and cannot
-    /// revisit one without the bound inside the walk failing. Between them and
-    /// the exhaustive `match`, a new [`Reason`] has to be given a sentence,
-    /// placed in the chain, and counted before the suite is green again.
-    const REASONS: usize = 20;
+    /// The exhaustive `match` in [`sentence_and_next`] forces a new [`Reason`]
+    /// to be given a *sentence*. It does not force the variant to be any arm's
+    /// `next`, and round 3 proved exactly that: a variant added with an
+    /// `#[error]` and a terminating arm, chained from nothing, left the suite
+    /// green because the count it was checked against was the hand-written
+    /// `20`. **A mechanism built to replace a list must not contain a list**,
+    /// and a hand-maintained number is a list of one.
+    ///
+    /// So the census is re-derived from the enum at every run instead. Rust
+    /// cannot enumerate an enum's variants without a derive macro, and adding
+    /// a crate for it is not this module's decision — but the declaration is
+    /// right here in the source, and `include_str!` reads it at compile time.
+    /// `testing::tests::no_user_specific_literal_survives_under_src` already
+    /// establishes source-reading as how this repository holds a property no
+    /// type can carry.
+    ///
+    /// Returns names rather than a count, so the walk can say *which* variant
+    /// it never reached.
+    fn declared_reasons() -> Vec<&'static str> {
+        let body = include_str!("env_guard.rs")
+            .split_once("pub enum Reason {")
+            .expect("the Reason enum is declared in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("the Reason enum is closed")
+            .0;
+        let names: Vec<&str> = body
+            .lines()
+            .map(|line| line.trim())
+            .filter_map(|line| line.strip_suffix(','))
+            // A variant is `Name,` or `Name(Type),`. Doc comments, `#[error]`
+            // attributes and their wrapped strings are none of those shapes.
+            // The payload is dropped, so the name matches what `Debug` prints.
+            .filter_map(|line| {
+                let head = line.split('(').next().unwrap_or(line);
+                let shaped = !head.is_empty()
+                    && head.starts_with(|c: char| c.is_ascii_uppercase())
+                    && head.chars().all(|c| c.is_ascii_alphanumeric())
+                    && (head.len() == line.len() || line.ends_with(')'));
+                shaped.then_some(head)
+            })
+            .collect();
+        // If the scrape ever stops matching the declaration it must fail
+        // loudly rather than return a short list the walk would then agree
+        // with. Two variants that have been there since the enum was written
+        // are the canary.
+        assert!(
+            names.contains(&"NoRootsDeclared") && names.contains(&"ExpansionTooLong"),
+            "the Reason census read {names:?} out of the source, which is not the enum"
+        );
+        names
+    }
+
+    #[test]
+    fn the_reason_census_is_read_from_the_declaration() {
+        // The scrape is itself a mechanism, so it gets a test that fails if it
+        // silently stops seeing variants. `UnlistedCharacter(char)` is the one
+        // variant carrying data, and the one whose shape the filter could
+        // plausibly drop.
+        let names = declared_reasons();
+        assert!(names.contains(&"UnlistedCharacter"), "{names:?}");
+        assert!(names.contains(&"InsideConfigRepo"), "{names:?}");
+        // No doc prose or `#[error]` text leaked in: every name is one
+        // identifier.
+        for name in &names {
+            assert!(
+                name.chars().all(|c| c.is_ascii_alphanumeric()),
+                "{name:?} is not a variant name"
+            );
+        }
+        // And it is a set, not a list with repeats.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "{names:?}");
+    }
 
     #[test]
     fn the_reasons_render_as_sentences() {
         // The messages name no data: a caller prints the value and the roots.
         let mut reason = Some(Reason::NoRootsDeclared);
-        let mut seen = 0;
+        //
+        // The walk is held to the census read out of the declaration, so a
+        // `Reason` given a sentence but never chained in is named here by the
+        // variant it is, rather than passing because a hand-written count
+        // nobody updated still agreed with itself.
+        let declared = declared_reasons();
+        let mut walked: Vec<String> = Vec::new();
         while let Some(current) = reason {
             let (sentence, next) = sentence_and_next(current);
             assert_eq!(current.to_string(), sentence, "{current:?}");
-            seen += 1;
+            let debug = format!("{current:?}");
+            let name = debug.split('(').next().unwrap_or(&debug).to_string();
             assert!(
-                seen <= REASONS,
-                "the chain revisits a reason at {current:?}"
+                !walked.contains(&name),
+                "the chain revisits {name} after {walked:?}"
+            );
+            walked.push(name);
+            assert!(
+                walked.len() <= declared.len(),
+                "the chain outruns the declaration: {walked:?}"
             );
             reason = next;
         }
-        assert_eq!(seen, REASONS, "the chain does not visit every reason");
+        let missed: Vec<&&str> = declared
+            .iter()
+            .filter(|name| !walked.iter().any(|seen| seen == *name))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "declared, but never reached by the chain, so their messages are \
+             asserted by nothing: {missed:?}"
+        );
     }
 
     // `scan_with` — the same rule over a whole fragment, with a learned

@@ -553,6 +553,15 @@ enum Step<'a> {
 /// is not followed; its kind and default are still read, as the committed walk
 /// reads them.
 ///
+/// So `enabled` gates the **answer edge alone**, and the walk ends at a `path`
+/// declaration whether or not it is switched on. Ending only at an enabled one
+/// would block `s = "{{b}}"` with a switched-off `b` on `b` instead, advising
+/// the account to re-enable it — an act that lands straight back here, which is
+/// the one thing a hint may not name. It would also judge that same `b`
+/// differently from [`refuse_path_value_in_file`], which fails the load for a
+/// committed `file` whose chain reaches a switched-off `path` value.
+/// `a_switched_off_path_declaration_still_ends_the_walk` pins it.
+///
 /// `seen` stops the walk at a name it has already walked. It is reachable for
 /// the reason [`path_value_behind`] gives, and through answers as well: an
 /// answer may reference only an earlier value, but an overridden default
@@ -3376,6 +3385,44 @@ mod tests {
                 names: vec!["s".to_string()]
             }
         );
+    }
+
+    #[test]
+    fn a_switched_off_path_declaration_still_ends_the_walk() {
+        // The twin of the test above, for the *terminal* declaration rather
+        // than one in the middle. `enabled` gates the answer edge alone: a
+        // switched-off `b` is still a `path` declaration, and `s = "{{b}}"`
+        // still carries its absolute text into `file`. Blocking on `b` with
+        // "re-enable it" would name an act that lands straight back here, and
+        // would judge that `b` differently from the committed walk, which
+        // fails the load for a `file` whose default chain reaches a
+        // switched-off `path` value.
+        for local in [
+            "[[value]]\nname = \"b\"\nenabled = false\n\
+             [values]\ns = \"{{b}}\"\nb = \"/var/mnt/cfg\"\n",
+            // Switched off and unanswered: still this block, not `bx init`.
+            "[[value]]\nname = \"b\"\nenabled = false\n\
+             [values]\ns = \"{{b}}\"\n",
+        ] {
+            let resolved = resolved(&ANSWERED_PATH.replace("FILE", "cfg/{{s}}/x"), Some(local))
+                .expect("blocked, not a load error");
+            let entry = blocked(&resolved, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["s".to_string()]
+                },
+                "{local}"
+            );
+            assert_eq!(
+                entry.hint,
+                "target `~/.config/thing`: `file` references `s`, whose answer at \
+                 local.toml:5 is built from `b`, a `path` value; a `path` value is always \
+                 absolute and `file` is relative to the config repo root, because of the \
+                 answer to `s` at local.toml:5; change that answer",
+                "{local}"
+            );
+        }
     }
 
     #[test]

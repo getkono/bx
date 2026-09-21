@@ -196,6 +196,9 @@ fn resolve_target(
     if let Body::File(file) = &target.body {
         refuse_path_value_in_file(target, &file.to_string_lossy(), values)?;
     }
+    for tool in &target.requires {
+        refuse_committed_requirement(target, tool)?;
+    }
 
     let mut unset: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
@@ -295,6 +298,37 @@ fn resolve_target(
             block(BlockReason::InvalidValue { names }, hint)
         }
     }
+}
+
+/// Refuse a `requires` entry written entirely in committed text.
+///
+/// An entry holding no placeholder is the same text for every account, so a
+/// defect in it is the layer's whatever anyone answered — the rule this module
+/// opens with. Checked **before** the probe, beside
+/// [`refuse_path_value_in_file`], because [`substituted`] is reached only once
+/// every value the target references has a usable answer: left there alone, the
+/// very same committed line would fail the load for an account that has
+/// answered and be invisible to one that has not.
+///
+/// [`check_requirement`] still runs inside [`substituted`], for text an answer
+/// filled. That is the account's to change, and it costs that target alone.
+///
+/// A malformed placeholder is left to the probe, which reports it with the rest
+/// of the target's defects, so text `scan` refuses is passed over here.
+///
+/// The `owns` arity check needs no twin: with no placeholder in the key, the
+/// substituted text is the text as written, so its segment count cannot move.
+fn refuse_committed_requirement(target: &Target, tool: &str) -> Result<(), Error> {
+    let Ok(names) = super::values::placeholders(tool) else {
+        return Ok(());
+    };
+    if !names.is_empty() {
+        return Ok(());
+    }
+    check_requirement(tool).map_err(|problem| Error::BadValue {
+        origin: target.origin.clone(),
+        message: format!("target `{}`: {problem}", target.path),
+    })
 }
 
 /// Refuse a `file` that references a `path` value.
@@ -1675,6 +1709,55 @@ mod tests {
             }
             ready(&resolved, 2);
         }
+    }
+
+    #[test]
+    fn a_committed_requires_defect_fails_the_load_whether_or_not_the_target_is_blocked() {
+        // The defect is written entirely in committed text, so it is the
+        // layer's for every account. It is checked before the probe, so an
+        // account that has not answered `acct` — whose target is blocked on
+        // that alone and never reaches substitution — gets the same load error
+        // as one that has. Checked only after substitution, the same committed
+        // line was fatal for one account and invisible to the other.
+        const LAYER: &str = "[[value]]\nname = \"acct\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/{{acct}}/env\"\n\
+                             content = \"x\"\nrequires = [\"./bin/foo\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for local in [None, Some("[values]\nacct = \"one\"\n")] {
+            let message = resolved(LAYER, local)
+                .expect_err("a committed `requires` defect fails the load for every account");
+            assert!(
+                message.contains("`requires` names a tool by a bare name"),
+                "{local:?}: {message}"
+            );
+            assert!(message.contains("./bin/foo"), "{local:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_requires_defect_an_answer_filled_blocks_only_that_target() {
+        // The other half of the same rule: text an answer filled is the
+        // account's, so it costs that target and names the line. The check
+        // inside `substituted` is what does this, and moving the committed case
+        // out of it did not take this with it.
+        const LAYER: &str = "[[value]]\nname = \"tool\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"{{tool}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\ntool = \"./bin/foo\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&answered, 0);
+        assert!(
+            entry
+                .hint
+                .contains("`requires` names a tool by a bare name"),
+            "{}",
+            entry.hint
+        );
+        assert!(entry.hint.contains("local.toml:2"), "{}", entry.hint);
+        ready(&answered, 1);
     }
 
     #[test]

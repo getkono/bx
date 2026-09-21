@@ -2469,84 +2469,136 @@ mod tests {
         }
     }
 
+    /// The sentence a [`Reason`] renders as, and the variant that follows it
+    /// in declaration order.
+    ///
+    /// One exhaustive `match`, so a [`Reason`] added and not given a sentence
+    /// here does not compile. The `next` half chains every variant into a
+    /// single walk, so a variant cannot be given a sentence and then left
+    /// unvisited by the test.
+    ///
+    /// That is why `the_reasons_render_as_sentences` walks a chain instead of
+    /// asserting a list of variants: a list can be short by one and still
+    /// compile, and that is exactly how `InsideConfigRepo` came to be the one
+    /// message no test asserted (round-2 note COV2) under an earlier repair
+    /// that had claimed every message was pinned. A list of *n* things that
+    /// was a list of *n - 1* last time is evidence the list is the wrong
+    /// shape.
+    fn sentence_and_next(reason: Reason) -> (String, Option<Reason>) {
+        use Reason::*;
+        let (sentence, next) = match reason {
+            NoRootsDeclared => (
+                "no root is declared, so nothing may be relocated".to_string(),
+                Some(InadmissibleRoot),
+            ),
+            InadmissibleRoot => (
+                "every declared root was refused — the filesystem root, a relative \
+                 path, or one that climbs — so nothing may be relocated"
+                    .to_string(),
+                Some(MultipleAssignments),
+            ),
+            MultipleAssignments => (
+                "puts more than one assignment on one line".to_string(),
+                Some(Unreadable),
+            ),
+            Unreadable => (
+                "is shell the guard cannot read, so it is not approved".to_string(),
+                Some(ReservedName),
+            ),
+            ReservedName => (
+                "assigns or refers to a name the shell manages itself".to_string(),
+                Some(NotEmittable),
+            ),
+            NotEmittable => (
+                "assigns a variable no bx generator declares, so bx cannot judge \
+                 the value — a defect in bx, not in your configuration"
+                    .to_string(),
+                Some(BxOwnedDirectory),
+            ),
+            BxOwnedDirectory => (
+                "points inside a directory bx owns".to_string(),
+                Some(InsideConfigRepo),
+            ),
+            InsideConfigRepo => (
+                "points inside bx's config repo, which is committed and may be public".to_string(),
+                Some(ContainsBxDirectory),
+            ),
+            ContainsBxDirectory => (
+                "contains bx's state directory or its config repo, which the tool may clear"
+                    .to_string(),
+                Some(OutsideDeclaredRoots),
+            ),
+            OutsideDeclaredRoots => (
+                "resolves outside every declared root".to_string(),
+                Some(DeclaredRootItself),
+            ),
+            DeclaredRootItself => (
+                "is a declared root itself, and its tool may write beside it, outside every root"
+                    .to_string(),
+                Some(NotAbsolute),
+            ),
+            NotAbsolute => ("is not an absolute path".to_string(), Some(ParentComponent)),
+            ParentComponent => (
+                "has a `..` component, so where it points cannot be shown".to_string(),
+                Some(UnlistedCharacter('\\')),
+            ),
+            // The one variant carrying data, so its sentence is formatted
+            // rather than fixed. The wording either side of the character is
+            // still written out here, so an edit to the `#[error]` text fails.
+            UnlistedCharacter(held) => (
+                format!("holds {held:?}, a character no path bx writes may hold"),
+                Some(NotAProgram),
+            ),
+            NotAProgram => (
+                "is not one program — an absolute path or a bare command name, with no arguments"
+                    .to_string(),
+                Some(NotASetting),
+            ),
+            NotASetting => (
+                "is not a value this setting accepts".to_string(),
+                Some(UnresolvedReference),
+            ),
+            UnresolvedReference => (
+                "refers to a variable this fragment has not assigned".to_string(),
+                Some(NoHome),
+            ),
+            NoHome => (
+                "refers to the home directory, and the guard was given none".to_string(),
+                Some(UnreadableReference),
+            ),
+            UnreadableReference => (
+                "refers to a variable whose assignment the guard could not read".to_string(),
+                Some(ExpansionTooLong),
+            ),
+            ExpansionTooLong => ("expands past the guard's length bound".to_string(), None),
+        };
+        (sentence, next)
+    }
+
+    /// How many variants [`Reason`] has, as the chain must visit them.
+    ///
+    /// The chain cannot skip a variant without this failing, and cannot
+    /// revisit one without the bound inside the walk failing. Between them and
+    /// the exhaustive `match`, a new [`Reason`] has to be given a sentence,
+    /// placed in the chain, and counted before the suite is green again.
+    const REASONS: usize = 20;
+
     #[test]
     fn the_reasons_render_as_sentences() {
         // The messages name no data: a caller prints the value and the roots.
-        assert_eq!(
-            Reason::NoRootsDeclared.to_string(),
-            "no root is declared, so nothing may be relocated"
-        );
-        assert_eq!(
-            Reason::OutsideDeclaredRoots.to_string(),
-            "resolves outside every declared root"
-        );
-        assert_eq!(
-            Reason::DeclaredRootItself.to_string(),
-            "is a declared root itself, and its tool may write beside it, outside every root"
-        );
-        assert_eq!(
-            Reason::BxOwnedDirectory.to_string(),
-            "points inside a directory bx owns"
-        );
-        assert_eq!(
-            Reason::NotEmittable.to_string(),
-            "assigns a variable no bx generator declares, so bx cannot judge the \
-             value — a defect in bx, not in your configuration"
-        );
-        assert_eq!(
-            Reason::NotAProgram.to_string(),
-            "is not one program — an absolute path or a bare command name, with no arguments"
-        );
-        assert_eq!(
-            Reason::NotASetting.to_string(),
-            "is not a value this setting accepts"
-        );
-        assert_eq!(
-            Reason::ReservedName.to_string(),
-            "assigns or refers to a name the shell manages itself"
-        );
-        assert_eq!(Reason::NotAbsolute.to_string(), "is not an absolute path");
-        assert_eq!(
-            Reason::ParentComponent.to_string(),
-            "has a `..` component, so where it points cannot be shown"
-        );
-        assert_eq!(
-            Reason::ContainsBxDirectory.to_string(),
-            "contains bx's state directory or its config repo, which the tool may clear"
-        );
-        assert_eq!(
-            Reason::UnlistedCharacter('\\').to_string(),
-            "holds '\\\\', a character no path bx writes may hold"
-        );
-        assert_eq!(
-            Reason::UnresolvedReference.to_string(),
-            "refers to a variable this fragment has not assigned"
-        );
-        assert_eq!(
-            Reason::NoHome.to_string(),
-            "refers to the home directory, and the guard was given none"
-        );
-        assert_eq!(
-            Reason::InadmissibleRoot.to_string(),
-            "every declared root was refused — the filesystem root, a relative \
-             path, or one that climbs — so nothing may be relocated"
-        );
-        assert_eq!(
-            Reason::MultipleAssignments.to_string(),
-            "puts more than one assignment on one line"
-        );
-        assert_eq!(
-            Reason::Unreadable.to_string(),
-            "is shell the guard cannot read, so it is not approved"
-        );
-        assert_eq!(
-            Reason::UnreadableReference.to_string(),
-            "refers to a variable whose assignment the guard could not read"
-        );
-        assert_eq!(
-            Reason::ExpansionTooLong.to_string(),
-            "expands past the guard's length bound"
-        );
+        let mut reason = Some(Reason::NoRootsDeclared);
+        let mut seen = 0;
+        while let Some(current) = reason {
+            let (sentence, next) = sentence_and_next(current);
+            assert_eq!(current.to_string(), sentence, "{current:?}");
+            seen += 1;
+            assert!(
+                seen <= REASONS,
+                "the chain revisits a reason at {current:?}"
+            );
+            reason = next;
+        }
+        assert_eq!(seen, REASONS, "the chain does not visit every reason");
     }
 
     // `scan_with` — the same rule over a whole fragment, with a learned

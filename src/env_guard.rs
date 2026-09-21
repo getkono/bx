@@ -1520,6 +1520,37 @@ fn refuses_entry_at_root(path: &str, roots: &RootSet) -> Option<Reason> {
 /// every check [`refuses_entry_placement`] makes of one path, but containing
 /// bx's own directories. A tool-read location written in terms of the anchor
 /// is judged for that at its own line.
+///
+/// # The exemption is open, and this is what it costs
+///
+/// **Measured, not supposed.** With home `/var/home/example` and a single `~`
+/// root, `DATA_DIR=/var/home/example/.local/state` and `SCRATCH_HOME` with the
+/// same value are both `Allowed`, while `UV_CACHE_DIR` with the *identical*
+/// value is [`Reason::ContainsBxDirectory`]. Both approved values contain bx's
+/// ledger, journal and fingerprints — the record invariant 4 rests on.
+///
+/// The exemption's premise is that **no tool reads an anchor**, and that is a
+/// property of the *name*, which the guard enforces nothing about. Issue #45
+/// already falsified it once: npm's `find-cache-dir` reads an exported
+/// `CACHE_DIR`, which is why `CACHE_DIR` is a [`Kind::Location`] here and no
+/// longer an anchor. `DATA_DIR` and `SCRATCH_HOME` are generic names carrying
+/// the same unenforced premise.
+///
+/// **What closes it**, and why it is not closed here. The right shape is to
+/// condition the exemption on the assignment **not being exported** — the
+/// thing that actually makes "no tool reads it" true, and something the
+/// grammar already parses. That is not a local edit: [`Statement::Assign`]
+/// carries no `exported` flag, [`evaluate`] discards the distinction, and
+/// [`check`] — a public entry point that judges one name and value outside any
+/// fragment — has no `export` keyword to read at all, so it would have to gain
+/// a parameter or pick a default, and picking one is a decision, not a fix.
+///
+/// **What it costs today: nothing.** [`scan`], [`scan_with`] and [`check`]
+/// have zero non-test callers in this crate, so no fragment is generated and
+/// none of this reaches a user. It becomes live with the first generator, and
+/// that generator is the change that must close it.
+/// `an_anchor_may_contain_bxs_directories_and_a_tool_read_location_may_not`
+/// pins the behaviour as it stands, so closing it changes that test.
 fn refuses_anchor(path: &str, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, None, roots)
         .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))

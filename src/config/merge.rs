@@ -1899,6 +1899,18 @@ mod tests {
     /// re-derived on every run: a pair that stops being undecided fails
     /// `every_pair_the_written_form_is_known_to_miss_is_still_missed`, and a
     /// pair nobody can reproduce cannot be added.
+    ///
+    /// Every entry is an **open defect**, registered rather than repaired, and
+    /// that is a decision: the pair loads `Ok` and the file it names is blocked
+    /// as a [`Conflict`] whose hint no answer satisfies. Deciding one means
+    /// widening the reduction, and every rule proposed for these shapes so far
+    /// has been refuted — `REFUTED` holds each with the answers that killed it,
+    /// which is why no general rule is claimed and why adding a pair here is a
+    /// disposition rather than a delay. The repair for one is to decide it in
+    /// [`written_form`], prove the decision against
+    /// `one_path_as_written_agrees_with_every_answer_in_a_fuzzed_set`, and then
+    /// move the pair out of here and into that test's generators — never to
+    /// weaken either assertion.
     const UNDECIDED: [(&str, &str, &str); 9] = [
         (
             "{{p}}",

@@ -1250,9 +1250,21 @@ impl ResolvedValues {
     /// when it is not, so a value in a separating position can be withheld.
     /// Equally, a difference in count is evidence that two spellings do not
     /// carry a value alike, not a demonstration that some answer parts them.
-    /// Deciding either exactly would mean re-keying each spelling against a
-    /// hypothetical answer, which is the merge's rule and not this module's.
     /// Stated here so a reader is not told the exclusion is exact.
+    ///
+    /// That limit is **decided, not overlooked**, and the obvious repair is the
+    /// reason. Expanding both spellings with the candidate value replaced by a
+    /// marker and calling it separating when the two texts differ does decide
+    /// the positional case above — and it wrongly *offers* a value for every
+    /// pair whose spellings differ as text and normalise to one path, which is
+    /// the direction this comparison was just corrected in, and it would land
+    /// with nothing pinning it. Deciding it soundly means re-keying each
+    /// spelling against a hypothetical answer, which is the merge's rule:
+    /// `Portable::parse_in` and the written form. Putting that here would
+    /// invert the module order — the merge reads this module, not the other way
+    /// round — and duplicate the normalisation. So the rule stays a count, and
+    /// the count stays exact so that what remains is the proxy itself rather
+    /// than an error in it.
     /// `a_derived_value_one_spelling_carries_twice_is_offered_as_the_way_out`
     /// pins the counting case,
     /// `a_derived_value_every_colliding_spelling_carries_is_not_offered_as_the_way_out`

@@ -35,7 +35,10 @@
 //! a path, approved a tool it had not heard of. The guard judges only what bx
 //! generates, so the table grows with the generators and with nothing else.
 //! [`check`] is the verdict. Declare no root — [`RootSet::strict`], which is
-//! what [`scan`] uses — and no location may be set at all.
+//! what [`scan`] uses — and no location, no list of locations and no anchor
+//! may be set at all. A program, a search list, a socket and a setting move
+//! nothing, so none of them needs a root; each is still held to every other
+//! check, bx's own directories included.
 //!
 //! The guard **fails closed by shape** as well. It does not model shell syntax
 //! and approve whatever it does not recognise: it reads a fragment against a
@@ -48,9 +51,14 @@
 //!
 //! This module is that rule as code. Every environment fragment bx generates is
 //! run through [`scan_with`] before it is written, and the check is covered by
-//! tests rather than left to review. The shell-init snippet is not one: it is
-//! fixed text from bx's source that sets only `BX_`-prefixed names, and sets
-//! every other variable by sourcing a guarded environment fragment.
+//! tests rather than left to review. Generated shell content that is **not** an
+//! environment fragment carries no environment assignment at all, which is what
+//! leaves nothing outside the guard's reach. The shell-init snippet is the one
+//! file bx generates under that rule: fixed text from bx's source that sets no
+//! environment variable outside bx's own `BX_` namespace, and gets every other
+//! variable by sourcing a guarded environment fragment.
+//! `tests::the_init_snippet_is_not_an_environment_fragment` proves it of the
+//! snippet rather than assuming it.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;

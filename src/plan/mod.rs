@@ -410,7 +410,7 @@ pub fn run(
 /// with nothing to do — exits by its actions, so a declined prompt over pending
 /// work exits 2.
 ///
-/// # Decision 31: an unsettled state directory exits [`Exit::Pending`] in
+/// # Decision 34: an unsettled state directory exits [`Exit::Pending`] in
 /// either mode
 ///
 /// Two states of the state directory settle the exit before the mode or the
@@ -464,7 +464,7 @@ pub fn exit(report: &Report, mode: Mode) -> Exit {
 /// without bound. Everything under the state root is bx's own, so nothing there
 /// is legitimately either.
 ///
-/// # Decision 32: the scope is the tree, not a list of names
+/// # Decision 33: the scope is the tree, not a list of names
 ///
 /// The check used to name three files — the ledger, the fingerprints and the
 /// journal — and its doc claimed that was every state file a run opens. It was
@@ -1560,7 +1560,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn decision_31_a_declined_apply_over_a_finished_session_reports_pending_like_plan() {
+    fn decision_34_a_declined_apply_over_a_finished_session_reports_pending_like_plan() {
         // P42R2-D4, end to end, alongside decision_18's A2. A session whose
         // writes all landed but whose ledger save did not: the journal is
         // sealed with an End frame, so `pending` reports it complete and every
@@ -1617,7 +1617,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn decision_33_a_finished_sessions_rows_are_shown_in_the_plan_view() {
+    fn decision_35_a_finished_sessions_rows_are_shown_in_the_plan_view() {
         // P42R2-CL3. `command::apply_with` renders its approval prompt with
         // View::Plan, which hides Unchanged rows — and over a finished session
         // every row IS Unchanged, so the user was asked to confirm a recovery
@@ -1913,7 +1913,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn decision_32_a_fifo_at_the_restore_snapshot_is_refused_without_waiting() {
+    fn decision_33_a_fifo_at_the_restore_snapshot_is_refused_without_waiting() {
         // P42R2-D3 and P42R2-COV3, the named case. `bx plan` reads
         // <state>/restore/<digest> through `interrupted_rows` ->
         // LedgerView::restore_bytes, which is a bare std::fs::read. The guard
@@ -1950,7 +1950,7 @@ pub(crate) mod tests {
     /// Every path under `state`, deepest first, as the filesystem holds them.
     ///
     /// Re-derived from disk on every run rather than written down: the point of
-    /// [`refuse_irregular_state_files`] after decision 32 is that its scope is
+    /// [`refuse_irregular_state_files`] after decision 33 is that its scope is
     /// whatever is there, so a test that named the files would be the very
     /// artefact the decision removed.
     fn every_state_path(state: &StateDir) -> Vec<PathBuf> {
@@ -1974,7 +1974,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn decision_32_a_fifo_at_any_file_under_the_state_directory_is_refused_without_waiting() {
+    fn decision_33_a_fifo_at_any_file_under_the_state_directory_is_refused_without_waiting() {
         // P42R2-D3 and P42R2-COV3. The guard used to name three files — the
         // ledger, the fingerprints and the journal — and the three tests that
         // exercised it mirrored that same list, so neither could find what the
@@ -2299,7 +2299,7 @@ pub(crate) mod tests {
         // one: a declined apply over a session that wrote everything but did
         // not record it has nothing but Unchanged rows, so it fell through to
         // them and reported the machine converged with the journal standing.
-        // Decision 31 makes the answer mode-independent, so both cells are
+        // Decision 34 makes the answer mode-independent, so both cells are
         // asked, and `complete` — which is what makes every row Unchanged — is
         // varied rather than fixed.
         for complete in [false, true] {

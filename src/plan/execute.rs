@@ -62,6 +62,21 @@ fn progress_to(
 
 #[cfg(test)]
 mod tests {
+    //! # Decision 36: this module's uncovered lines are named, not closed
+    //!
+    //! `src/plan/execute.rs` reports the lowest line coverage in the crate.
+    //! Every uncovered line is in this module, and every production line of the
+    //! file is covered. They are the [`Terminal`] double's `move_cursor_down`,
+    //! `move_cursor_right`, `move_cursor_left` and `write_line` — which
+    //! indicatif's draw path does not call, but which `TermLike` obliges the
+    //! double to implement — and the closure the hidden case must never call,
+    //! whose whole point is that reaching it fails the test.
+    //!
+    //! Calling them from a test purely to colour the report would assert
+    //! nothing about bx, so it was not done. This is recorded here rather than
+    //! in the pull request body so that a later reader of the coverage report
+    //! finds the reason beside the lines.
+
     use super::*;
 
     /// A terminal that keeps the text drawn on it.

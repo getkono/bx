@@ -38,7 +38,7 @@ pub(super) struct Ctx<'a> {
 /// Why a write to a destination is refused, read from the mode **on disk** of
 /// the directory `apply` would have to write into.
 ///
-/// # Decision 24, revised: the basis is the observed mode, not a declared one
+/// # Decision 32, revising decision 24: the basis is the observed mode
 ///
 /// The first form of this rule was keyed on the declared mode of `dir = true`
 /// targets: `plan` built a list of the directory targets whose declared mode
@@ -359,6 +359,17 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
             }
             content.into_bytes()
         }
+        // Decision 16: directory targets are declared by the configuration and
+        // written by no entry in this stack, and issue #43 ("plan and apply:
+        // deliver directory targets (`dir = true`) end to end") owns closing
+        // that. It is the entry F1 (#37) needs, and it is open. The note stays
+        // generic rather than naming #43, because a note is user-facing text
+        // and an issue number is a fact about this repository's backlog.
+        //
+        // Every rule that reads a directory's mode depends on this arm: while
+        // it stands, no declared directory mode reaches disk, which is the
+        // argument [`locked_parent`] rests on. The entry that removes this arm
+        // has to revisit that function in the same change.
         Body::Dir => {
             return Ok(Wanted::Blocked(
                 "a directory target is not supported until a later entry".to_string(),
@@ -385,6 +396,14 @@ fn unsupported(target: &Target) -> Option<&'static str> {
 /// [`Gen`] has no variants yet, so this cannot be called. It exists so the one
 /// route from a generated body to bytes already passes through
 /// [`guard_fragment`]: the first generator adds its arm here.
+///
+/// # Decision 36: `generate -> String::new()` is an equivalent mutant
+///
+/// `cargo mutants` reports that mutant as missed, and no test can kill it:
+/// `Gen` is uninhabited, so no `Body::Generated` value exists and this function
+/// is unreachable. The entry that adds the first `Gen` variant makes the arm
+/// reachable, and must test its generated body end to end through
+/// [`guard_fragment`]; the mutant becomes killable by that entry's tests.
 const fn generate(generator: &Gen) -> String {
     match *generator {}
 }

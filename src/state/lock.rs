@@ -290,8 +290,38 @@ impl SharedLock {
     /// [`Probe::Absent`]: no writer holds a lock that does not exist, because a
     /// writer creates it before it locks it.
     ///
-    /// Like [`SharedLock::try_acquire`], the instant it holds the shared lock
-    /// is an instant in which an `apply` starting up is refused as locked.
+    /// # Decision 36: three gaps here are named rather than closed
+    ///
+    /// Each was confirmed still holding at `5d1bba7`, and each is recorded here
+    /// rather than in a body section, so the record moves with the code.
+    ///
+    /// **The probe's instant of shared lock.** Between the
+    /// `flock(LOCK_SH|LOCK_NB)` and the explicit `flock(LOCK_UN)`, a `bx apply`
+    /// starting at that instant is refused as locked and exits 1 naming no
+    /// holder. A read-only `bx plan` can therefore make a concurrent write
+    /// fail, and the user reruns it. The window is not avoidable with `flock`:
+    /// it has no test-without-taking operation, and
+    /// [`SharedLock::try_acquire`], which `plan` used before decision 8, has
+    /// the identical window. `fcntl`/OFD `F_GETLK` would answer without
+    /// acquiring, but this repository's lock is `flock` throughout, so adopting
+    /// it is a design change and not a defect repair. Plan E1 (#40) records the
+    /// same residual risk.
+    ///
+    /// **The `flock` arm that is not `EWOULDBLOCK`.** No test reaches it. The
+    /// probe's tests were enumerated at this head — absent directory, no lock
+    /// file, beneath a non-directory, free, writer in another process, writer
+    /// in this process, free-unlocks-before-close, symlink, directory, second
+    /// link, FIFO, unopenable — and none makes `flock` fail with anything else.
+    /// An OS refusal such as `EINTR` or `ENOLCK` would be reported as a
+    /// [`Error::Lock`] where a retry might be right. Decision 17 rejected a
+    /// `flock` double (`LD_PRELOAD`, or a namespace) as costing far more than
+    /// the risk, and that still holds; the gap is real rather than closed.
+    ///
+    /// **The `OFlags` equivalent mutants.** `cargo mutants` reports `|` → `^`
+    /// in the open flags below as missed. `^` binds tighter than `|`, the flags
+    /// share no bit, and `O_RDONLY` is 0, so each mutant opens with exactly the
+    /// same flags: no test can tell them apart. The `&` mutants at the same
+    /// positions do change the flags, and are caught.
     ///
     /// # Errors
     ///

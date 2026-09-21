@@ -254,7 +254,7 @@ pub fn render(report: &Report, view: View, palette: Palette, home: &Path) -> Str
 /// Whether every row in this report is about an interrupted session rather
 /// than about a configured target.
 ///
-/// # Decision 33: an interrupted session's rows are never hidden
+/// # Decision 35: an interrupted session's rows are never hidden
 ///
 /// [`View::Plan`] hides an [`Action::Unchanged`] row, because a target already
 /// in its declared state is noise in a list of work. Over an interrupted

@@ -1870,6 +1870,26 @@ mod tests {
     }
 
     #[test]
+    fn an_answered_value_whose_committed_default_names_an_undeclared_value_resolves() {
+        // A default an answer overrides is never expanded, so `Unresolved::
+        // Forward` never sees the undeclared `nowhere` and the load succeeds.
+        // The `file` walk reads that unexpanded default anyway, and stops at
+        // the name with no declaration behind it rather than refusing or
+        // panicking. Pinned so that making an undeclared name in an unexpanded
+        // default an error becomes a deliberate change.
+        const LAYER: &str = "[[value]]\nname = \"s\"\nkind = \"string\"\n\
+                             default = \"{{nowhere}}\"\n\
+                             [[target]]\npath = \"~/.config/env\"\nfile = \"cfg/{{s}}\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\ns = \"one\"\n"))
+            .expect("an overridden default is never expanded, so it is never refused");
+        assert_eq!(
+            ready(&answered, 0).body,
+            Body::File(PathBuf::from("cfg/one"))
+        );
+    }
+
+    #[test]
     fn a_file_holding_both_a_chained_and_a_direct_path_value_names_the_first_written() {
         // `s` reaches a `path` value through its default and `b` is one
         // directly. The refusal names whichever comes first in written order,

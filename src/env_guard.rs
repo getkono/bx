@@ -2379,6 +2379,55 @@ mod tests {
     }
 
     #[test]
+    fn the_kinds_that_move_nothing_need_no_root() {
+        // "Declare no root and nothing moves" is true of the three kinds that
+        // say where a tool keeps its files — a location, a list of them and an
+        // anchor — and of nothing else. A program is one the tool runs, a
+        // search list is where it looks, a socket is what it connects to, and
+        // a setting is not a path at all: none of them moves a tool's config,
+        // data or cache, which is what invariant 2 is about, so none needs a
+        // root. `CLAUDE.md`, `AGENTS.md` and `README.md` are written to say
+        // exactly that, and this is what holds them to it.
+        for (name, value) in [
+            ("PATH", "/etc/evil:/usr/bin"),
+            ("INFOPATH", "/etc/evil"),
+            ("SSH_AUTH_SOCK", "/tmp/agent/s"),
+            ("EDITOR", "/usr/bin/vim"),
+            ("RUSTC_WRAPPER", "sccache"),
+            ("MISE_JOBS", "8"),
+        ] {
+            assert_eq!(
+                scan(&format!("export {name}={value}\n")),
+                vec![],
+                "{name}={value}"
+            );
+        }
+        // And false of the three that do move something: with nothing
+        // declared each is refused for having no root, whatever its value.
+        for (name, value) in [
+            ("CARGO_HOME", "/etc/evil"),
+            ("GOPATH", "/etc/evil:/usr/lib/go"),
+            ("SCRATCH_HOME", "/etc/evil"),
+        ] {
+            assert_eq!(
+                reason_of(&check(name, value, &RootSet::strict())),
+                Some(Reason::NoRootsDeclared),
+                "{name}={value}"
+            );
+        }
+        // Needing no root is not a licence: bx's own directories are still
+        // refused to every one of them.
+        let owned = "/var/home/example/.local/state/bx/x";
+        for name in ["PATH", "INFOPATH", "SSH_AUTH_SOCK", "EDITOR"] {
+            assert_eq!(
+                reason_of(&check(name, owned, &RootSet::new(Path::new(HOME), &[]))),
+                Some(Reason::BxOwnedDirectory),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn a_set_with_no_home_is_never_asked_what_holds_bxs_directories() {
         // `owns` and `in_config_repo` recognise bx's directories under any
         // home, so a set with none still refuses a path into them. The

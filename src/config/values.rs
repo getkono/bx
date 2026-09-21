@@ -1250,6 +1250,25 @@ impl ResolvedValues {
     /// separate them.
     #[must_use]
     pub(crate) fn answers_hint(&self, problem: &str, texts: &[&str], names: &[String]) -> String {
+        let (cause, direct) = self.answer_route(texts, names);
+        if direct.is_empty() {
+            return format!("{problem}, because of {cause}; change that answer");
+        }
+        format!("{problem}, because of {cause}; change that answer, or answer {direct} directly")
+    }
+
+    /// The cause an answer route names, and the values it offers to answer.
+    ///
+    /// The cause is [`ResolvedValues::answers_named`], and where a value some
+    /// of `texts` reach through a committed `default` could part them, that
+    /// phrase followed by ", carried in by the default of `x` at …". The
+    /// second is those values, for the "or answer `x` directly" offer, and is
+    /// empty where there are none.
+    ///
+    /// One computation, so the hint that gives this route on its own and the
+    /// hint that adds it to another act cannot come to disagree about which
+    /// values carry an answer in, or about which of them can part `texts`.
+    fn answer_route(&self, texts: &[&str], names: &[String]) -> (String, String) {
         let answers = self.answers_named(names);
 
         let carried: Vec<Vec<String>> = texts
@@ -1268,7 +1287,7 @@ impl ResolvedValues {
             }
         }
         if between.is_empty() {
-            return format!("{problem}, because of {answers}; change that answer");
+            return (answers, String::new());
         }
         let between = self.in_declaration_order(between);
         let defaults = between
@@ -1282,10 +1301,7 @@ impl ResolvedValues {
             .map(|name| format!("`{name}`"))
             .collect::<Vec<_>>()
             .join(" or ");
-        format!(
-            "{problem}, because of {answers}, carried in by {defaults}; change that answer, \
-             or answer {direct} directly"
-        )
+        (format!("{answers}, carried in by {defaults}"), direct)
     }
 
     /// What to do about a file one layer names more than once because of this

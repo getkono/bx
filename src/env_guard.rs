@@ -678,6 +678,25 @@ impl RootSet {
     }
 
     /// Whether `path` contains, or is, a directory bx owns or a config repo.
+    ///
+    /// [`RootSet::owns`] and [`RootSet::in_config_repo`] both fall back to a
+    /// pattern for a set with no home, and this one deliberately does not.
+    /// The asymmetry is in the question, not in the care taken: those two ask
+    /// whether bx's directory is *in* the path, and `.local/state/bx` spells
+    /// itself out there whoever's home it is; this asks whether one lies
+    /// *under* the path, and under a path belonging to an unknown home one
+    /// always might. A fallback would therefore have to answer `true` for
+    /// every path a homeless set is shown, refusing all of them.
+    ///
+    /// Answering `false` instead is sound only because this is consulted from
+    /// [`refuses_entry`] alone, which [`judge`] reaches only for a location or
+    /// a list of them, after [`RootSet::refuses_everything`] has already
+    /// refused a set with no admissible root — and the only set without a home
+    /// is [`RootSet::strict`], which declares none. A later kind given a
+    /// containing check must not simply call this: under `scan` it would get
+    /// no protection at all, and it needs its own answer to the question
+    /// above. `a_set_with_no_home_is_never_asked_what_holds_bxs_directories`
+    /// pins both halves.
     fn holds_bx_directory(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);
         self.owned
@@ -2349,6 +2368,39 @@ mod tests {
                 "{content}"
             );
         }
+    }
+
+    #[test]
+    fn a_set_with_no_home_is_never_asked_what_holds_bxs_directories() {
+        // `owns` and `in_config_repo` recognise bx's directories under any
+        // home, so a set with none still refuses a path into them. The
+        // containing check has no such fallback and cannot have one: a
+        // `.local/state/bx` may lie under any path at all, so a fallback would
+        // have to refuse every path a homeless set is shown. Answering `false`
+        // is sound only while the check is reached from `refuses_entry` alone,
+        // behind `refuses_everything`. Both halves are pinned here, so a later
+        // kind given a containing check cannot inherit the hole unnoticed.
+        let strict = RootSet::strict();
+        assert!(strict.owns(Path::new("/x/.local/state/bx/ledger")));
+        assert!(strict.in_config_repo(Path::new("/x/.config/bx/bx.toml")));
+        assert!(!strict.holds_bx_directory(Path::new("/x")));
+        // The only set without a home declares no root, so every kind that
+        // consults the containing check is refused before it is reached.
+        assert!(strict.refuses_everything().is_some());
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", "/x", &strict)),
+            Some(Reason::NoRootsDeclared)
+        );
+        // A set that does have a home answers the containing question, which
+        // is the only configuration that asks it.
+        assert_eq!(
+            reason_of(&check(
+                "CARGO_HOME",
+                "/var/home/example/.local",
+                &RootSet::new(Path::new(HOME), &[PathBuf::from("~")])
+            )),
+            Some(Reason::ContainsBxDirectory)
+        );
     }
 
     #[test]

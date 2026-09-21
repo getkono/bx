@@ -41,6 +41,22 @@ use serde::{Deserialize, Serialize};
 /// Without the split, the transparent `u32` codec the ledger needs would also
 /// be the config schema's, and `mode = 600` would deserialise silently into
 /// exactly that.
+///
+/// # Which of the two a user actually meets
+///
+/// The **not** human-readable half is live: `ledger.mpk` and the fingerprint
+/// cache go through it on every run.
+///
+/// The human-readable half is not reached from any production path today, and
+/// saying otherwise is how its refusal wording came to be repaired twice for a
+/// message nobody sees. `bx.toml` is read through `toml_edit`'s document API
+/// and `config::target::parse_mode`, which refuses a bare integer in its own
+/// words and then calls [`Mode::parse_octal`] directly — so it never
+/// constructs a `Deserializer` for a `Mode` at all. What the human-readable
+/// codec is for is the schema staying honest: a `Mode` field on any type that
+/// *is* deserialised from TOML gets this refusal rather than the `u32` one, and
+/// the tests hold it to that. Treat its message as a contract for the next
+/// serde-driven reader, not as text a user has seen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Mode(u32);
 
@@ -225,7 +241,9 @@ impl Serialize for Mode {
 
 impl<'de> Deserialize<'de> for Mode {
     /// A quoted octal string from a human-readable format, a bare `u32`
-    /// otherwise. See the type's documentation for why there are two.
+    /// otherwise. See the type's documentation for why there are two — and for
+    /// which of them a user's config actually goes through, which is not this
+    /// one.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
             deserializer.deserialize_any(DeclaredMode)

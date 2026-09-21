@@ -372,9 +372,10 @@ pub enum Error {
     /// The destination's parent directory does not exist, and the entry point
     /// asked creates none.
     ///
-    /// Only [`write_atomically`] raises it. [`stage`] creates a missing parent;
-    /// this is the shorthand that has no [`CreatedDirs`] to record one in, no
-    /// plan to announce it in, and no caller to say what mode it should get.
+    /// Only [`write_atomically`] raises it. [`stage`] and [`ensure_dir`] create
+    /// directories; this is the shorthand that has no [`CreatedDirs`] to record
+    /// one in, no plan to announce it in, and no caller to say what mode it
+    /// should get.
     #[error(
         "{} does not exist, and bx creates no directory for this write: nothing here decides \
          what mode it would get. Create it, or declare it as a directory target",
@@ -1943,16 +1944,24 @@ pub struct CreatedDirs {
 /// whole apply — has every reason to expect `~/.ssh` and `~/.ssh/` to name one
 /// directory, and no way to check that they do.
 ///
-/// Two halves make it so, and they are different things:
+/// [`DirKey::of`] is what makes the spellings agree: it collects `components()`,
+/// which drops a trailing separator and every `.` after the first component.
+/// `Path`'s own `Ord` would agree on those two spellings without it — a key
+/// holding raw `OsStr` bytes *and* normalising passes the test below, measured
+/// — so the normalisation is the guarantee and `Ord` is not.
 ///
-/// * **Lookups agree because [`Path`] compares by components, not by bytes.**
-///   `Ord` and `Eq` for `Path` walk `components()`, which drops a trailing
-///   separator and every `.` after the first component. That is the guarantee,
-///   and it is why a key type that compared `OsStr` bytes would break the
-///   agreement even with the normalisation below.
-/// * **[`DirKey::of`] normalises on the way in** so the *stored* spelling is
-///   canonical, because it is read back out — into
-///   [`Error::DirectoryTargetPending`]'s `dir`, which a user sees.
+/// The newtype is what makes it un-skippable, and that is worth its weight for
+/// two reasons that are not about `Ord`:
+///
+/// * **`declare` and `declared` are public**, and the caller that drives them is
+///   outside this module — the apply engine that will hold one set for a whole
+///   apply. An un-normalised lookup from there is a compile error rather than a
+///   silent `None`.
+/// * **The stored spelling is dereferenced, not just compared.** [`DirKey::path`]
+///   goes into `symlink_metadata` and into [`Error::DirectoryTargetPending`]'s
+///   `dir`, which a user reads. A trailing separator there makes the kernel
+///   resolve the last component, so `link/` would be stat'd as the directory the
+///   link points at — exactly what [`lexical`] exists to prevent everywhere else.
 ///
 /// Pinned by `a_created_dirs_set_answers_for_a_directory_however_it_is_spelled`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2364,16 +2373,19 @@ fn observe_parent(dir: &Path) -> Result<Parent, Error> {
 /// with nothing on it and a path that ends at a dangling symlink, and a
 /// directory bx can create from one it cannot are not the same announcement.
 fn parent_state(dir: &Path) -> Result<ParentState, Error> {
-    // The `NotFound` guard below is pinned in both directions: forcing it true
-    // or false fails a test.
+    // Both guards below are pinned in both directions at the granularity
+    // `cargo mutants` works at: forcing the `NotFound` comparison either way
+    // fails a test, and replacing `unresolvable_path`'s body with `true` or
+    // with `false` fails a test too — re-measured at r4 round 2, correcting an
+    // r4 round 1 note that called the second one equivalent.
     //
-    // The `unresolvable_path` guard further down is pinned one way only.
-    // Forcing it *false* is killed; forcing it *true* survives, and is
-    // equivalent under anything a test can arrange: it would matter only for a
-    // `symlink_metadata` failure that is neither "nothing is there" nor a
-    // resolution refusal — a permission lost between the `metadata` above and
-    // it, microseconds apart. That is the class the module documentation
-    // explains is not constructed, not a gap in what this function decides.
+    // What is not distinguished is the *first* `unresolvable_path` call site
+    // alone, forced true. `cargo mutants` does not generate a per-call-site
+    // mutation, so it is not a survivor it reports; it is recorded here because
+    // it is real. It would matter only for a `symlink_metadata` failure that is
+    // neither "nothing is there" nor a resolution refusal — a permission lost
+    // between the `metadata` above and it, microseconds apart. That is the
+    // class the module documentation explains is not constructed.
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => return Ok(ParentState::Present(mode_of(&meta))),
         Ok(_) => {
@@ -5484,6 +5496,7 @@ mod tests {
         // `CreatedDirs` to record a directory in, no plan to announce it in,
         // and no caller to say what mode it should get — which is how a 0600
         // secret would otherwise land in a 0755 directory nobody decided on.
+        // `stage` and `ensure_dir` still create directories; this one does not.
         let home = guarded_home();
         let dest = home.child("a/b/secret.age");
 
@@ -7421,6 +7434,11 @@ mod tests {
         // caller — the apply engine that will hold one set for the whole apply
         // — could declare `~/.ssh` and be told `~/.ssh/` is undeclared. Every
         // spelling below names one directory to the kernel, and now to this set.
+        //
+        // What this pins is `DirKey::of`'s normalisation. It is not a test of
+        // `Path`'s component-wise `Ord`: measured at r4 round 2, a key holding
+        // raw `OsStr` bytes passes this as long as it normalises, and fails
+        // only when it does neither.
         let home = guarded_home();
         let dir = home.child(".ssh");
         let spellings = [

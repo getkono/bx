@@ -622,10 +622,17 @@ pub(crate) fn confine_to_repo(key: &str, raw: &str) -> Result<PathBuf, String> {
 /// The home, its ancestors and `/` are directories, so a file body at one is an
 /// `own` claim on a directory as if it were a file, which no writer can honour.
 /// Which paths those are is decided lexically from `path` and `home`, never from
-/// the disk: `path` is `~`, or it is not under the home and the normalised home
-/// starts with it component by component, so `/var/home` is above
-/// `/var/home/example` and `/var/homes` is not. A `dir = true` target may name
-/// any of them.
+/// the disk: `path` is `~`, or the normalised home starts with it component by
+/// component, so `/var/home` is above `/var/home/example` and `/var/homes` is
+/// not. A `dir = true` target may name any of them.
+///
+/// No "is `path` under the home?" test is needed beside that comparison, and an
+/// earlier shape of this function carried one that could not decide anything. A
+/// `Portable` under the home is `~`-rooted; `~` itself is the first operand; and
+/// a `~/…` path is never a component prefix of the home, because the home
+/// reaching here is always absolute — [`Portable::parse_in`] refuses a home that
+/// is not, at both call sites, before this is called.
+/// `the_home_reaching_the_refusal_is_always_absolute` pins that precondition.
 ///
 /// Like [`confine_to_repo`] it has two callers: the parser, on the path as
 /// written, and [`super::resolve`], on the path a substitution produced, because
@@ -638,8 +645,8 @@ pub(crate) fn refuse_file_at_home_or_above(
     body: &Body,
     home: &Path,
 ) -> Result<(), String> {
-    let at_or_above = path.as_str() == "~"
-        || (!path.under_home() && crate::paths::normalize(home).starts_with(path.as_str()));
+    let at_or_above =
+        path.as_str() == "~" || crate::paths::normalize(home).starts_with(path.as_str());
     if *body != Body::Dir && at_or_above {
         return Err(format!(
             "path = {shown:?} is the home directory or a directory above it, so only a \
@@ -998,6 +1005,42 @@ mod tests {
         let target = parse("[[target]]\npath = \"~\"\ndir = true\nmode = \"0700\"\n").unwrap();
         assert_eq!(target.body, Body::Dir);
         assert_eq!(target.path.as_str(), "~");
+    }
+
+    /// The home `refuse_file_at_home_or_above` compares against is always absolute.
+    ///
+    /// That precondition is what lets the comparison stand alone. The function
+    /// once also asked `!path.under_home()`, which could not decide anything: a
+    /// `Portable` under the home is `~`-rooted, `~` is settled before the
+    /// comparison, and a `~/…` path is a component prefix of the home only if
+    /// the home itself is `~`-rooted. No such home ever arrives, because
+    /// `Portable::parse_in` builds the path first and refuses a home that is not
+    /// absolute — so there is no input the removed operand could have changed.
+    /// Should that ever stop holding, this test fails and the guard is owed
+    /// again.
+    #[test]
+    fn the_home_reaching_the_refusal_is_always_absolute() {
+        for home in ["~/nested", "~", "relative/home", ""] {
+            assert!(
+                matches!(
+                    Portable::parse_in("~/x", Path::new(home)),
+                    Err(crate::paths::Error::HomeNotAbsolute(_))
+                ),
+                "home {home:?} should never reach the refusal"
+            );
+        }
+
+        // The home spelled absolutely does not reach it either: it folds to `~`
+        // and is refused as a path that should have been written portably.
+        assert!(matches!(
+            Portable::parse_in("/var/home/example", home()),
+            Err(crate::paths::Error::AbsoluteUnderHome { .. })
+        ));
+
+        // And with an absolute home every `~/…` path is below it, never at or
+        // above it, which is the case the removed operand was thought to cover.
+        let target = parse(&with("")).expect("a path under the home parses");
+        assert_eq!(target.path.as_str(), "~/.gitconfig");
     }
 
     /// The home's ancestors are directories too, and so is the home by any spelling.

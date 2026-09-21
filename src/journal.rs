@@ -1619,6 +1619,26 @@ impl Session {
         // `written` moves only once a write has succeeded, so it is this
         // write's index.
         let index = self.written;
+        // Plan's verdict **before** anything is made. `fs::stage` takes the
+        // same verdict and says why it takes it where it does — "before
+        // creating anything, so a refusal leaves nothing behind" — and the
+        // `create_dir_all` below has to run before `stage` does, which would
+        // put a directory ahead of that guarantee: a write refused because the
+        // destination changed since plan would leave the home created.
+        // `Session::remove` already opens with this pair for the same reason,
+        // so the two write paths now share one preamble rather than one of
+        // them having none.
+        //
+        // `stage` remains the authority and takes the verdict again. What is
+        // *not* taken here is its `refuse_unwritable` — which depends on the
+        // kind `refuse_moved` has just pinned to plan's, and which plan itself
+        // must already have passed to announce a write — and its
+        // `refuse_wider_than_declared`, which no target in this tree can
+        // trigger because nothing declares a directory. If either ever refuses
+        // where this does not, the cost is the directory this used to make
+        // unconditionally: the behaviour before `r3 round 7`, not worse.
+        // See decision R3R7-1.
+        refuse_unplanned(&dest, planned)?;
         // The home, and anything above it, that this destination needs and
         // that is not there. `fs::stage` would invent them like any other
         // ancestor: `mkdir` at [`Mode::DEFAULT_DIR`] and then a `chmod`, which
@@ -1795,8 +1815,7 @@ impl Session {
         created_dirs: Vec<PathBuf>,
         planned: &Observed,
     ) -> Result<(), Error> {
-        let observed = fs::observe(&dest)?;
-        refuse_moved(planned, &observed)?;
+        let observed = refuse_unplanned(&dest, planned)?;
         if !observed.kind.is_writable_destination() {
             return Err(fs::Error::NotAFile {
                 path: dest,
@@ -2065,6 +2084,24 @@ fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
     Ok(Prior::Existed(reference))
 }
 
+/// Look at `dest`, and refuse it unless it is still what `planned` observed.
+///
+/// The opening move of both write paths: [`Session::write`] before it makes
+/// any directory, and [`Session::remove`] before it stores a prior or
+/// announces an Intent. A destination that changed since `plan` is refused
+/// with nothing made, stored, announced or touched.
+///
+/// # Errors
+///
+/// [`Error::Read`] when the destination cannot be looked at — a parent that
+/// does not resolve, or one this process may not search — and [`Error::Write`]
+/// with [`crate::fs::Error::Changed`] when it is no longer what plan saw.
+fn refuse_unplanned(dest: &Path, planned: &Observed) -> Result<Observed, Error> {
+    let observed = fs::observe(dest)?;
+    refuse_moved(planned, &observed)?;
+    Ok(observed)
+}
+
 /// The deepest ancestor of `dest` that is `home` or above it and is not
 /// there, or `None` when every one of them already is.
 ///
@@ -2073,9 +2110,20 @@ fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
 /// a directory bx must make to reach the destination and must never remove,
 /// because the home lives under it.
 fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
+    // "Cannot look" is not "not there". An `EACCES` on the way up is a
+    // directory that exists and that this process may not examine, and
+    // treating it as missing would try to create it and report the failure as
+    // a write — where [`crate::fs::observe`], which has already looked at the
+    // destination through the same chain, reports it as a read (`r3 round 7`,
+    // D2).
+    let missing = |dir: &Path| {
+        std::fs::symlink_metadata(dir)
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    };
     dest.ancestors()
         .skip(1)
-        .find(|dir| home.starts_with(dir) && std::fs::symlink_metadata(dir).is_err())
+        .find(|dir| home.starts_with(dir) && missing(dir))
         .map(Path::to_path_buf)
 }
 
@@ -4435,6 +4483,151 @@ pub(crate) mod tests {
             "the umask child failed:\n{}\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn a_refused_write_makes_no_directory_at_all() {
+        // r3 round 7, D1/COV3. The `create_dir_all` sat ahead of `fs::stage`'s
+        // plan-verdict refusals, whose own comment is "before creating
+        // anything, so a refusal leaves nothing behind" — so a write refused
+        // because the destination changed since plan left the user's home
+        // created. Nothing pinned what a refused write leaves on disk.
+        let guard = guarded_home();
+        let home = guard.child("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        let (portable, dest) = target(&home, ".bashrc");
+        std::fs::create_dir_all(&home).expect("the home, for now");
+        plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+        let planned = fs::observe(&dest).expect("plan's observation");
+        // Everything plan looked at is gone by the time apply runs.
+        std::fs::remove_dir_all(guard.child("account")).expect("the user removes the tree");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let err = session
+            .apply(Request {
+                target: portable,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"bx\n".to_vec(),
+                    planned,
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect_err("the destination is not what plan observed");
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Changed { detail, .. })
+                if detail == "it has been removed"),
+            "got {err}"
+        );
+        assert!(
+            !guard.child("account").exists(),
+            "a refusal leaves nothing behind — not the home, and not its parent",
+        );
+        drop(session);
+        assert_eq!(
+            load(&state.journal()).expect("load").intents().count(),
+            0,
+            "and nothing was announced",
+        );
+    }
+
+    #[test]
+    fn a_shared_directory_that_cannot_be_made_is_the_write_that_names_it() {
+        // r3 round 7, COV2. `create_dir_all`'s error mapping had no test.
+        let guard = guarded_home();
+        let under = guard.child("locked");
+        std::fs::create_dir(&under).expect("mkdir");
+        let home = under.join("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        let (portable, dest) = target(&home, ".bashrc");
+        fs::set_mode(&under, Mode::from_bits(0o555)).expect("make it read-only");
+        if !permissions_refuse(&under) {
+            fs::set_mode(&under, Mode::DEFAULT_DIR).expect("make it writable again");
+            return cannot_build(
+                "a_shared_directory_that_cannot_be_made_is_the_write_that_names_it",
+                WRITES_THROUGH_PERMISSIONS,
+            );
+        }
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let applied = session.apply(Request {
+            target: portable,
+            dest: dest.clone(),
+            content: Content::Bytes {
+                bytes: b"bx\n".to_vec(),
+                planned: fs::observe(&dest).expect("plan's observation"),
+            },
+            mode: Mode::DEFAULT_FILE,
+            ownership: Ownership::Owned(Mechanism::Own),
+        });
+        // Before any assertion, so the tempdir can be removed whatever happens.
+        fs::set_mode(&under, Mode::DEFAULT_DIR).expect("make it writable again");
+
+        let err = applied.expect_err("the shared directory cannot be made");
+        // The path named is the one bx asked for, not the component that
+        // refused: `create_dir_all` does not say which that was, and
+        // `state::dir::ensure_dir` maps its own the same way.
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Write { path, .. }) if *path == home),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_destination_behind_a_directory_bx_cannot_search_is_a_read_not_a_write() {
+        // r3 round 7, D2. `shared_ancestor` read "cannot look" as "not there",
+        // so an `EACCES` on the way up became a failed `create_dir_all` and
+        // surfaced as `Error::Write` — where looking at the destination
+        // surfaces the same permission as `Error::Read`. Since the verdict now
+        // comes first, `fs::observe` walks that chain before anything is made,
+        // so the read error is what a caller sees; the refined predicate keeps
+        // that true if the order ever moves.
+        let guard = guarded_home();
+        let under = guard.child("sealed");
+        std::fs::create_dir(&under).expect("mkdir");
+        let home = under.join("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        let (portable, dest) = target(&home, ".bashrc");
+        // No search bit, so nothing under it can be looked at at all.
+        fs::set_mode(&under, Mode::from_bits(0o600)).expect("seal it");
+        if std::fs::symlink_metadata(under.join("account"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            fs::set_mode(&under, Mode::DEFAULT_DIR).expect("unseal");
+            return cannot_build(
+                "a_destination_behind_a_directory_bx_cannot_search_is_a_read_not_a_write",
+                WRITES_THROUGH_PERMISSIONS,
+            );
+        }
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let applied = session.apply(Request {
+            target: portable,
+            dest: dest.clone(),
+            content: Content::Bytes {
+                bytes: b"bx\n".to_vec(),
+                planned: fs::Observed {
+                    path: dest.clone(),
+                    ..fs::observe(&guard.child("elsewhere")).expect("some observation")
+                },
+            },
+            mode: Mode::DEFAULT_FILE,
+            ownership: Ownership::Owned(Mechanism::Own),
+        });
+        // Before any assertion, so the tempdir can be removed whatever happens.
+        fs::set_mode(&under, Mode::DEFAULT_DIR).expect("unseal");
+
+        let err = applied.expect_err("bx cannot look at the destination");
+        // `observe` reports the path it could not read, which is the deepest
+        // one the walk reached — the home here, not the destination beyond it.
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Read { path, .. }) if *path == home),
+            "a permission bx cannot pass is a read, not a write: got {err}"
         );
     }
 

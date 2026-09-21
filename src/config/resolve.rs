@@ -213,6 +213,9 @@ fn resolve_target(
     if let Body::File(file) = &target.body {
         refuse_path_value_in_file(target, &file.to_string_lossy(), values)?;
     }
+    for tool in &target.requires {
+        refuse_committed_requirement(target, tool)?;
+    }
 
     let mut unset: Vec<String> = Vec::new();
     let mut disabled: Vec<String> = Vec::new();
@@ -325,6 +328,37 @@ fn resolve_target(
     }
 }
 
+/// Refuse a `requires` entry written entirely in committed text.
+///
+/// An entry holding no placeholder is the same text for every account, so a
+/// defect in it is the layer's whatever anyone answered — the rule this module
+/// opens with. Checked **before** the probe, beside
+/// [`refuse_path_value_in_file`], because [`substituted`] is reached only once
+/// every value the target references has a usable answer: left there alone, the
+/// very same committed line would fail the load for an account that has
+/// answered and be invisible to one that has not.
+///
+/// [`check_requirement`] still runs inside [`substituted`], for text an answer
+/// filled. That is the account's to change, and it costs that target alone.
+///
+/// A malformed placeholder is left to the probe, which reports it with the rest
+/// of the target's defects, so text `scan` refuses is passed over here.
+///
+/// The `owns` arity check needs no twin: with no placeholder in the key, the
+/// substituted text is the text as written, so its segment count cannot move.
+fn refuse_committed_requirement(target: &Target, tool: &str) -> Result<(), Error> {
+    let Ok(names) = super::values::placeholders(tool) else {
+        return Ok(());
+    };
+    if !names.is_empty() {
+        return Ok(());
+    }
+    check_requirement(tool).map_err(|problem| Error::BadValue {
+        origin: target.origin.clone(),
+        message: format!("target `{}`: {problem}", target.path),
+    })
+}
+
 /// Refuse a `file` that references a `path` value.
 ///
 /// A `path` value is absolute by construction, and `file` names a file relative
@@ -340,6 +374,15 @@ fn resolve_target(
 /// whether or not it applies for this account, so the refusal is the same for
 /// every account; the message names each declaration on the way.
 ///
+/// `file` may hold both kinds of reference. The one refused is whichever comes
+/// **first in written order**, with the chain behind it, and there is no
+/// preference for the more direct one. A value directly of kind `path` is a
+/// one-step chain, so the two cases are one walk and one message shape; a rule
+/// that reported the direct reference first would tell the reader about the
+/// second `{{name}}` in the field and leave the first, whose chain is just as
+/// fatal, unmentioned. Written order is also the deterministic choice, which is
+/// the direction Invariant 3 points.
+///
 /// An account's answer is not read here. A way to a `path` value that runs
 /// through one is judged by [`refuse_path_answer_in_file`], and blocks the
 /// target rather than failing the load.
@@ -352,18 +395,10 @@ fn refuse_path_value_in_file(
     values: &ResolvedValues,
 ) -> Result<(), Error> {
     let names = super::values::placeholders(file).unwrap_or_default();
-    let direct = names.iter().find_map(|name| {
-        values
-            .decl(name)
-            .filter(|decl| decl.kind == super::values::ValueKind::Path)
-            .map(|decl| vec![decl])
-    });
-    let chain = direct.or_else(|| {
-        let mut seen: Vec<String> = Vec::new();
-        names
-            .iter()
-            .find_map(|name| path_value_behind(values, name, &mut seen))
-    });
+    let mut seen: Vec<String> = Vec::new();
+    let chain = names
+        .iter()
+        .find_map(|name| path_value_behind(values, name, &mut seen));
     let Some(chain) = chain else {
         return Ok(());
     };
@@ -1833,6 +1868,217 @@ mod tests {
             }
             ready(&resolved, 2);
         }
+    }
+
+    #[test]
+    fn a_derived_value_one_spelling_carries_twice_is_offered_as_the_way_out() {
+        // The exclusion above is by *count*, not by membership. `q` is carried
+        // by both spellings, but once by the first and twice by the second, so
+        // answering it does part them and the hint has to say so: with
+        // `p = ""` both key `~/x`, and `q = "a"` makes them `~/a/x` and
+        // `~/aa/x`. Before the count comparison, `q` was excluded and the hint
+        // named only `p`, whose every answer keeps them one file or parts the
+        // pair the same way.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[target]]\npath = \"~/{{q}}/x\"\ncontent = \"ONE\"\n\
+                             [[target]]\npath = \"~/{{q}}{{q}}/x\"\ncontent = \"TWO\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let blocking = resolved(LAYER, Some("[values]\np = \"\"\n"))
+            .expect("an account's answer blocks the file, not the load");
+        // A blocked entry is keyed by its spelling; both name `~/x` once `q` is
+        // empty, which is why they collide at all.
+        assert_eq!(keys(&blocking), ["~/{{q}}/x", "~/{{q}}{{q}}/x", "~/.zshrc"]);
+        for index in [0, 1] {
+            let entry = blocked(&blocking, index);
+            assert!(
+                entry.hint.ends_with(
+                    "because of the answer to `p` at local.toml:2, carried in by the default of \
+                     `q` at bx.toml:4; change that answer, or answer `q` directly"
+                ),
+                "{index}: {}",
+                entry.hint
+            );
+        }
+
+        // The act the hint names is one that clears the block.
+        let cleared = resolved(LAYER, Some("[values]\np = \"\"\nq = \"a\"\n"))
+            .expect("answering `q` directly parts the two spellings");
+        assert_eq!(keys(&cleared), ["~/a/x", "~/aa/x", "~/.zshrc"]);
+        for index in [0, 1, 2] {
+            ready(&cleared, index);
+        }
+    }
+
+    #[test]
+    fn a_derived_value_two_of_three_colliding_spellings_carry_is_offered_as_the_way_out() {
+        // Three spellings for one file. `q` is carried by two of them and not
+        // by the third, so it is in a separating position and the hint names
+        // it. The third spelling is what makes the deduplication guard matter:
+        // `q` is reached once per spelling that carries it and named once.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{p}}\"\n\
+                             [[target]]\npath = \"~/{{q}}/x\"\ncontent = \"ONE\"\n\
+                             [[target]]\npath = \"~/{{q}}{{q}}/x\"\ncontent = \"TWO\"\n\
+                             [[target]]\npath = \"~/{{p}}/x\"\ncontent = \"THREE\"\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let blocking = resolved(LAYER, Some("[values]\np = \"\"\n"))
+            .expect("an account's answer blocks the file, not the load");
+        assert_eq!(
+            keys(&blocking),
+            ["~/{{q}}/x", "~/{{q}}{{q}}/x", "~/{{p}}/x", "~/.zshrc"]
+        );
+        for index in [0, 1, 2] {
+            let hint = &blocked(&blocking, index).hint;
+            assert!(hint.ends_with("or answer `q` directly"), "{index}: {hint}");
+            assert_eq!(
+                hint.matches("`q`").count(),
+                2,
+                "named once in the defaults and once in the direct list: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_derived_value_reached_down_two_defaults_is_named_once() {
+        // `left` and `right` both default to `{{shared}}`, so one text reaches
+        // `shared` twice, by two different routes, and every value on the way
+        // is an act that clears the entry. `shared` is offered once and in
+        // declaration order. `derived_between`'s own guard is what keeps it to
+        // one entry with one count, which
+        // `derived_between_names_a_value_reached_down_two_defaults_once` pins
+        // directly; here the interest is that the whole chain reaches the
+        // account.
+        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"shared\"\nkind = \"string\"\n\
+                             default = \"{{p}}\"\n\
+                             [[value]]\nname = \"left\"\nkind = \"string\"\n\
+                             default = \"{{shared}}\"\n\
+                             [[value]]\nname = \"right\"\nkind = \"string\"\n\
+                             default = \"{{shared}}\"\n\
+                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
+                             content = \"{{{{}}\"\n\
+                             format = \"jsonc\"\nowns = [\"a.{{left}}{{right}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\np = \"b.c\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let hint = &blocked(&answered, 0).hint;
+        assert_eq!(
+            hint.matches("`shared`").count(),
+            2,
+            "one default entry and one direct entry, not two of each: {hint}"
+        );
+        assert!(
+            hint.ends_with("change that answer, or answer `shared` or `left` or `right` directly"),
+            "{hint}"
+        );
+        ready(&answered, 1);
+    }
+
+    #[test]
+    fn a_committed_requires_defect_fails_the_load_whether_or_not_the_target_is_blocked() {
+        // The defect is written entirely in committed text, so it is the
+        // layer's for every account. It is checked before the probe, so an
+        // account that has not answered `acct` — whose target is blocked on
+        // that alone and never reaches substitution — gets the same load error
+        // as one that has. Checked only after substitution, the same committed
+        // line was fatal for one account and invisible to the other.
+        const LAYER: &str = "[[value]]\nname = \"acct\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/{{acct}}/env\"\n\
+                             content = \"x\"\nrequires = [\"./bin/foo\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        for local in [None, Some("[values]\nacct = \"one\"\n")] {
+            let message = resolved(LAYER, local)
+                .expect_err("a committed `requires` defect fails the load for every account");
+            assert!(
+                message.contains("`requires` names a tool by a bare name"),
+                "{local:?}: {message}"
+            );
+            assert!(message.contains("./bin/foo"), "{local:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_requires_defect_an_answer_filled_blocks_only_that_target() {
+        // The other half of the same rule: text an answer filled is the
+        // account's, so it costs that target and names the line. The check
+        // inside `substituted` is what does this, and moving the committed case
+        // out of it did not take this with it.
+        const LAYER: &str = "[[value]]\nname = \"tool\"\nkind = \"string\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             content = \"x\"\nrequires = [\"{{tool}}\"]\n\
+                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\ntool = \"./bin/foo\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&answered, 0);
+        assert!(
+            entry
+                .hint
+                .contains("`requires` names a tool by a bare name"),
+            "{}",
+            entry.hint
+        );
+        assert!(entry.hint.contains("local.toml:2"), "{}", entry.hint);
+        ready(&answered, 1);
+    }
+
+    #[test]
+    fn an_answered_value_whose_committed_default_names_an_undeclared_value_resolves() {
+        // A default an answer overrides is never expanded, so `Unresolved::
+        // Forward` never sees the undeclared `nowhere` and the load succeeds.
+        // The `file` walk reads that unexpanded default anyway, and stops at
+        // the name with no declaration behind it rather than refusing or
+        // panicking. Pinned so that making an undeclared name in an unexpanded
+        // default an error becomes a deliberate change.
+        const LAYER: &str = "[[value]]\nname = \"s\"\nkind = \"string\"\n\
+                             default = \"{{nowhere}}\"\n\
+                             [[target]]\npath = \"~/.config/env\"\nfile = \"cfg/{{s}}\"\n";
+
+        let answered = resolved(LAYER, Some("[values]\ns = \"one\"\n"))
+            .expect("an overridden default is never expanded, so it is never refused");
+        assert_eq!(
+            ready(&answered, 0).body,
+            Body::File(PathBuf::from("cfg/one"))
+        );
+    }
+
+    #[test]
+    fn a_file_holding_both_a_chained_and_a_direct_path_value_names_the_first_written() {
+        // `s` reaches a `path` value through its default and `b` is one
+        // directly. The refusal names whichever comes first in written order,
+        // with the chain behind it. Naming the direct reference first would
+        // tell the reader about `b` alone, and fixing that leaves `s` carrying
+        // the same absolute text in.
+        const LAYER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                             [[value]]\nname = \"s\"\nkind = \"string\"\ndefault = \"{{b}}\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             file = \"cfg/{{s}}/{{b}}/x\"\n";
+
+        let message = resolved(LAYER, None).expect_err("a `path` value in `file` is a defect");
+        assert!(
+            message.contains(
+                "`file` references `s`, whose default at bx.toml:4 is built from `b`, a `path` \
+                 value"
+            ),
+            "{message}"
+        );
+
+        // Written the other way round, `b` comes first and is a one-step chain.
+        let message = resolved(
+            &LAYER.replace("cfg/{{s}}/{{b}}/x", "cfg/{{b}}/{{s}}/x"),
+            None,
+        )
+        .expect_err("a `path` value in `file` is a defect");
+        assert!(
+            message.contains("`file` references `b`, a `path` value"),
+            "{message}"
+        );
+        assert!(!message.contains("whose default"), "{message}");
     }
 
     #[test]

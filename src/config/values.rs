@@ -1241,10 +1241,25 @@ impl ResolvedValues {
     /// act that clears the entry. With no such value the hint names the
     /// answers alone.
     ///
-    /// When `texts` are two or more spellings that name one file, a value every
-    /// one of them carries is not named: answering it moves them all together,
-    /// so they stay one file. Only a value some carry and some do not can
-    /// separate them.
+    /// When `texts` are two or more spellings that name one file, a value each
+    /// of them carries **the same number of times** is not named: the spellings
+    /// hold it in equal measure, so answering it rewrites all of them alike and
+    /// the likeliest outcome is that they stay one file. A value some carry and
+    /// some do not, or that one spelling carries more often than another, *is*
+    /// named, because answering it can part them: `~/{{q}}/x` carries `q` once
+    /// and `~/{{q}}{{q}}/x` twice, so with `q` derived from an empty `p` the two
+    /// are one file and `q = "a"` makes them two.
+    ///
+    /// Counting is not a proof. Two spellings can carry a value the same number
+    /// of times and still be parted by answering it, because the value sits in
+    /// different places: `~/{{q}}/x` and `~/x/{{q}}` carry `q` once each, meet
+    /// when `q` is empty, and part when it is not. Such a value is still
+    /// withheld from the hint, and that is a known and deliberate limit of this
+    /// rule, stated here so a reader is not told the exclusion is exact.
+    /// `a_derived_value_one_spelling_carries_twice_is_offered_as_the_way_out`
+    /// pins the counting case, and
+    /// `a_derived_value_every_colliding_spelling_carries_is_not_offered_as_the_way_out`
+    /// pins the exclusion that remains.
     #[must_use]
     pub(crate) fn answers_hint(&self, problem: &str, texts: &[&str], names: &[String]) -> String {
         let answers = names
@@ -1256,17 +1271,26 @@ impl ResolvedValues {
             .collect::<Vec<_>>()
             .join(" and ");
 
-        let carried: Vec<Vec<String>> = texts
+        let carried: Vec<Vec<(String, usize)>> = texts
             .iter()
             .map(|text| {
                 let mut into = Vec::new();
-                self.derived_between(text, &mut into);
+                self.derived_between(text, 1, &mut into);
                 into
             })
             .collect();
         let mut between: Vec<String> = Vec::new();
-        for name in carried.iter().flatten() {
-            let separates = carried.len() == 1 || carried.iter().any(|set| !set.contains(name));
+        for (name, times) in carried.iter().flatten() {
+            // One text: every derived value it carries is a way out. Two or
+            // more: only one they do not all carry the same number of times.
+            let separates = carried.len() == 1
+                || carried
+                    .iter()
+                    .any(|set| !set.iter().any(|(held, also)| held == name && also == times));
+            // The `contains` is belt and braces: `in_declaration_order` below
+            // sorts and dedups, so a name reached from two of the texts is
+            // named once either way. Kept so the list this loop builds is the
+            // list the hint prints, rather than one the ordering step repairs.
             if separates && !between.contains(name) {
                 between.push(name.clone());
             }
@@ -1294,9 +1318,35 @@ impl ResolvedValues {
 
     /// Collect into `into` every value `text` reaches that carries an account
     /// answer in through its own `default` without being answered itself,
-    /// following those defaults down.
-    fn derived_between(&self, text: &str, into: &mut Vec<String>) {
-        for name in placeholders(text).unwrap_or_default() {
+    /// following those defaults down, **with how many times `text` reaches it**.
+    ///
+    /// `times` is how often the caller's own text reaches `text`, so a name
+    /// written `k` times inside a default reached `m` times is counted `k * m`.
+    /// The count is what [`ResolvedValues::answers_hint`] compares between two
+    /// spellings; a name both reach equally often is carried in equal measure
+    /// by both.
+    ///
+    /// A name already in `into` has its count added to but its own default is
+    /// **not** followed a second time. That is what keeps the walk finite
+    /// without a separate visited list, and it is exact except for the
+    /// descendants of a name a text reaches down two different defaults, which
+    /// are counted once rather than twice. Counting them twice would need the
+    /// walk to revisit, and the comparison only ever reads whether two
+    /// spellings agree, which the same under-count on both sides preserves.
+    fn derived_between(&self, text: &str, times: usize, into: &mut Vec<(String, usize)>) {
+        // Occurrences directly in `text` first, in written order, so a name
+        // written twice is one entry counted twice rather than two entries.
+        // Over [`scan`] rather than [`placeholders`], which reports each name
+        // once and so could not count a repetition.
+        let mut direct: Vec<(&str, usize, usize)> = Vec::new();
+        let written = scan(text)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|piece| match piece {
+                Piece::Name(name) => Some(name),
+                Piece::Literal(_) => None,
+            });
+        for name in written {
             // Never taken today: every text reaching here names only declared
             // values. A clash's spellings are all keyed as one file, so each
             // substituted, and a field is reported broken only after its
@@ -1315,19 +1365,30 @@ impl ResolvedValues {
                 continue;
             };
             // Empty: built from committed text alone. Its own name: answered.
-            // Already held: reached a second time, through another default.
-            // That guard never meets a cycle: only an unanswered value's default
-            // is followed, and that default was expanded, so
-            // `Unresolved::Forward` kept it referencing earlier values only.
-            if from_account.is_empty()
-                || from_account.iter().any(|input| input == name)
-                || into.iter().any(|held| held == name)
-            {
+            if from_account.is_empty() || from_account.iter().any(|input| input == name) {
                 continue;
             }
-            into.push(name.to_string());
+            match direct.iter_mut().find(|(held, _, _)| *held == name) {
+                Some((_, _, seen)) => *seen += 1,
+                None => direct.push((name, index, 1)),
+            }
+        }
+
+        for (name, index, seen) in direct {
+            let reached = times.saturating_mul(seen);
+            // Already held: reached a second time, through another default.
+            // Its count grows and its default stays walked once, which is what
+            // stops the walk. That guard never meets a cycle either: only an
+            // unanswered value's default is followed, and that default was
+            // expanded, so `Unresolved::Forward` kept it referencing earlier
+            // values only.
+            if let Some((_, count)) = into.iter_mut().find(|(held, _)| held == name) {
+                *count += reached;
+                continue;
+            }
+            into.push((name.to_string(), reached));
             if let Some(default) = &self.decls[index].default {
-                self.derived_between(&default.to_string(), into);
+                self.derived_between(&default.to_string(), reached, into);
             }
         }
     }
@@ -2291,6 +2352,172 @@ mod tests {
         let hint = values.invalid_hint(&["cache".to_string()]);
         assert!(hint.contains("`prefix` at"), "{hint}");
         assert!(hint.contains("`mid` at"), "{hint}");
+    }
+
+    // --- the derived-value hint ---------------------------------------------
+
+    /// `p` answered, `q` deriving its whole value from `p`'s answer, and `r`
+    /// deriving from `q`. Nothing here is answered but `p`.
+    fn derived_chain() -> ResolvedValues {
+        let p = a_decl("p", ValueKind::String);
+        let mut q = a_decl("q", ValueKind::String);
+        q.default = Some(AssignedValue::String("{{p}}".to_string()));
+        let mut r = a_decl("r", ValueKind::String);
+        r.default = Some(AssignedValue::String("{{q}}".to_string()));
+        resolve(vec![p, q, r], &[answer("p", "one")]).expect("the chain resolves")
+    }
+
+    #[test]
+    fn derived_between_counts_every_occurrence_of_a_name() {
+        // A name written twice is one entry counted twice, not two entries.
+        // The count is what parts two spellings that both carry it.
+        let values = derived_chain();
+
+        let mut once = Vec::new();
+        values.derived_between("~/{{q}}/x", 1, &mut once);
+        assert_eq!(once, [("q".to_string(), 1)]);
+
+        let mut twice = Vec::new();
+        values.derived_between("~/{{q}}{{q}}/x", 1, &mut twice);
+        assert_eq!(twice, [("q".to_string(), 2)]);
+    }
+
+    #[test]
+    fn derived_between_multiplies_a_count_down_a_default() {
+        // `r`'s own default reaches `q` once, and the text reaches `r` twice,
+        // so `q` is reached twice as well.
+        let values = derived_chain();
+
+        let mut into = Vec::new();
+        values.derived_between("~/{{r}}{{r}}/x", 1, &mut into);
+
+        assert_eq!(into, [("r".to_string(), 2), ("q".to_string(), 2)]);
+    }
+
+    #[test]
+    fn derived_between_names_a_value_reached_down_two_defaults_once() {
+        // `left` and `right` both default to `{{q}}`. `q` is reached twice, by
+        // two routes, and gets one entry with the total.
+        let p = a_decl("p", ValueKind::String);
+        let mut q = a_decl("q", ValueKind::String);
+        q.default = Some(AssignedValue::String("{{p}}".to_string()));
+        let mut left = a_decl("left", ValueKind::String);
+        left.default = Some(AssignedValue::String("{{q}}".to_string()));
+        let mut right = a_decl("right", ValueKind::String);
+        right.default = Some(AssignedValue::String("{{q}}".to_string()));
+        let values =
+            resolve(vec![p, q, left, right], &[answer("p", "one")]).expect("the pair resolves");
+
+        let mut into = Vec::new();
+        values.derived_between("{{left}}{{right}}", 1, &mut into);
+
+        assert_eq!(
+            into,
+            [
+                ("left".to_string(), 1),
+                ("q".to_string(), 2),
+                ("right".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_between_passes_over_a_name_no_layer_declares() {
+        // Defensive: every text the hint walks names declared values only. The
+        // walk stops at the name rather than panicking, and a future caller
+        // that breaks the invariant gets no entry rather than a crash.
+        let values = derived_chain();
+
+        let mut into = Vec::new();
+        values.derived_between("{{nowhere}}{{q}}", 1, &mut into);
+
+        assert_eq!(into, [("q".to_string(), 1)]);
+    }
+
+    #[test]
+    fn derived_between_passes_over_a_value_with_no_answer() {
+        // Defensive in the same way: the hint is only built for texts that
+        // substituted, so every name in one is `Given`. An unanswered one is
+        // passed over.
+        let p = a_decl("p", ValueKind::String);
+        let unanswered = a_decl("unanswered", ValueKind::String);
+        let mut q = a_decl("q", ValueKind::String);
+        q.default = Some(AssignedValue::String("{{p}}".to_string()));
+        let values =
+            resolve(vec![p, unanswered, q], &[answer("p", "one")]).expect("the rest resolves");
+        assert!(values.get("unanswered").is_none());
+
+        let mut into = Vec::new();
+        values.derived_between("{{unanswered}}{{q}}", 1, &mut into);
+
+        assert_eq!(into, [("q".to_string(), 1)]);
+    }
+
+    #[test]
+    fn derived_between_passes_over_a_value_answered_in_its_own_right() {
+        // `q` is answered by the account, so it is named as an answer rather
+        // than as a declaration to answer directly, and a value built from
+        // committed text alone carries no answer to offer.
+        let p = a_decl("p", ValueKind::String);
+        let mut q = a_decl("q", ValueKind::String);
+        q.default = Some(AssignedValue::String("{{p}}".to_string()));
+        let mut fixed = a_decl("fixed", ValueKind::String);
+        fixed.default = Some(AssignedValue::String("committed".to_string()));
+        let values = resolve(vec![p, q, fixed], &[answer("p", "one"), answer("q", "two")])
+            .expect("the values resolve");
+
+        let mut into = Vec::new();
+        values.derived_between("{{q}}{{fixed}}", 1, &mut into);
+
+        assert!(into.is_empty(), "{into:?}");
+    }
+
+    #[test]
+    fn answers_hint_names_every_derived_value_a_single_text_carries() {
+        // One text: there is nothing to separate it from, so every value that
+        // carries the answer in is an act that changes it.
+        let values = derived_chain();
+
+        let hint = values.answers_hint("broken", &["~/{{r}}/x"], &["p".to_string()]);
+
+        assert!(
+            hint.ends_with("change that answer, or answer `q` or `r` directly"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn answers_hint_withholds_a_derived_value_two_spellings_carry_equally() {
+        // Both spellings hold `q` once, so answering it rewrites both alike and
+        // naming it would be advice that clears nothing.
+        let values = derived_chain();
+
+        let hint = values.answers_hint(
+            "broken",
+            &["~/{{q}}/x", "~/a/{{q}}/x/.."],
+            &["p".to_string()],
+        );
+
+        assert!(hint.ends_with("; change that answer"), "{hint}");
+        assert!(!hint.contains("directly"), "{hint}");
+    }
+
+    #[test]
+    fn answers_hint_names_a_derived_value_one_spelling_carries_more_often() {
+        // The same value, carried once by one spelling and twice by the other.
+        // Answering it does part them, so the hint has to offer it.
+        let values = derived_chain();
+
+        let hint = values.answers_hint(
+            "broken",
+            &["~/{{q}}/x", "~/{{q}}{{q}}/x"],
+            &["p".to_string()],
+        );
+
+        assert!(
+            hint.ends_with("change that answer, or answer `q` directly"),
+            "{hint}"
+        );
     }
 
     #[test]

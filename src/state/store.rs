@@ -752,7 +752,7 @@ fn degrade<T>(
 /// break it.
 ///
 /// So part of the constraint is carried by a check **inside this function**,
-/// by [`assert_reencodes_identically`]: the bytes are decoded back into `T`
+/// by [`reencodes_identically`]: the bytes are decoded back into `T`
 /// and re-encoded, [`REENCODES`] times, and every encoding must equal the
 /// first. Each decode builds every `HashMap` in the payload afresh, with its
 /// own `RandomState`, so a map that iterates in hash order comes back in a
@@ -796,6 +796,27 @@ fn degrade<T>(
 ///   pins that it does. This is the class that makes the second mechanism
 ///   necessary rather than redundant.
 ///
+/// # The one class neither mechanism catches
+///
+/// **An order-dependent sequence in a field the helper's `make` leaves at its
+/// default.** It is the intersection of the two residuals above, and it is
+/// stated here, once, rather than delegated: this function's list used to send
+/// sequences to [`assert_saves_identically`] while that function's list sent
+/// default-left fields back here, so a reader following either arrived at the
+/// other and the intersection was named nowhere (r4 round 5, COV3).
+///
+/// It **is** reachable and it **does** break Invariant 3: a `Vec` drained from
+/// a `HashSet` differs between two runs, and leaving it at its default in the
+/// fixture means neither the re-encoding here nor the two constructions there
+/// ever looks at a populated one. Both mechanisms report green.
+///
+/// No third mechanism closes it, and that is a property of dynamic testing
+/// rather than of this design: no check can constrain the contents of a field
+/// nothing ever puts contents into. What closes it is a fixture that populates
+/// every field, and the obligation on whoever adds a payload field is
+/// therefore to extend `make` as well as the struct. Stated so it can be
+/// obeyed, not delegated so it can be lost.
+///
 /// # Errors
 ///
 /// [`Error::Encode`] if the value cannot be encoded — a bug, not a user
@@ -822,7 +843,12 @@ pub(crate) fn save<T: Serialize + DeserializeOwned>(
     let bytes =
         rmp_serde::to_vec_named(&envelope).map_err(|source| Error::Encode { kind, source })?;
     #[cfg(test)]
-    assert_reencodes_identically::<T>(&bytes, kind);
+    assert!(
+        reencodes_identically::<T>(&bytes, kind),
+        "{kind} does not encode the same value to the same bytes: decoding it and encoding it \
+         again gives different bytes, which means something in the payload iterates in hash \
+         order. Invariant 3 forbids it — use a BTreeMap, not a HashMap",
+    );
     // Every state file StateDir names is `root.join(<name>)`, so a parent always exists.
     if let Some(parent) = path.parent() {
         ensure_dir(parent, Mode::PRIVATE_DIR)?;
@@ -831,7 +857,7 @@ pub(crate) fn save<T: Serialize + DeserializeOwned>(
     Ok(())
 }
 
-/// How many times [`assert_reencodes_identically`] decodes and re-encodes.
+/// How many times [`reencodes_identically`] decodes and re-encodes.
 ///
 /// One decode is not enough, and saying it was is what made [`save`]'s
 /// documented catch boundary false (r4 round 4, D1). A `HashMap` of *n* keys
@@ -843,7 +869,7 @@ pub(crate) fn save<T: Serialize + DeserializeOwned>(
 /// would turn green on a re-run, which is worse than no check.
 ///
 /// Each decode draws a fresh `RandomState`, so *k* comparisons miss
-/// `0.56^k`. At 32 that is about `1.2e-8` for the worst case, two keys, and
+/// `0.56^k`. At 32 that is about `8.75e-9` for the worst case, two keys, and
 /// smaller for every other size; a one-key map is undetectable at any *k* and
 /// is also harmless, since one entry encodes identically in any order.
 ///
@@ -852,11 +878,13 @@ pub(crate) fn save<T: Serialize + DeserializeOwned>(
 #[cfg(test)]
 const REENCODES: usize = 32;
 
-/// Assert that `bytes`, decoded into `T` and encoded again, is `bytes` —
-/// [`REENCODES`] times over.
+/// Whether `bytes`, decoded into `T` and encoded again, is `bytes` — every
+/// one of [`REENCODES`] times over.
 ///
 /// Half of [`save`]'s determinism obligation, made where a call site cannot
-/// write it vacuously. The decode is what gives it teeth: it builds every
+/// write it vacuously. A verdict rather than an assertion, so that
+/// `the_re_encode_count_is_what_makes_detection_certain` can measure the
+/// detection rate [`REENCODES`] buys without catching sixty-four panics. The decode is what gives it teeth: it builds every
 /// `HashMap` in the payload afresh, with its own `RandomState`, so a map that
 /// iterates in hash order comes back in a different order and the re-encoding
 /// differs. A `BTreeMap` comes back in key order every time, as do struct
@@ -872,7 +900,10 @@ const REENCODES: usize = 32;
 /// for every payload the suite saves establishes it for every run; paying this
 /// on every production save would buy nothing.
 #[cfg(test)]
-fn assert_reencodes_identically<T: Serialize + DeserializeOwned>(bytes: &[u8], kind: &'static str) {
+fn reencodes_identically<T: Serialize + DeserializeOwned>(
+    bytes: &[u8],
+    kind: &'static str,
+) -> bool {
     for _ in 0..REENCODES {
         // Decoded from the original bytes each time, so each round draws a new
         // `RandomState` and the rounds are independent.
@@ -880,14 +911,11 @@ fn assert_reencodes_identically<T: Serialize + DeserializeOwned>(bytes: &[u8], k
             Ok(decoded) => decoded,
             Err(why) => panic!("{kind} does not decode the bytes it just encoded: {why}"),
         };
-        let again = rmp_serde::to_vec_named(&decoded).expect("re-encoding a decoded envelope");
-        assert!(
-            again == bytes,
-            "{kind} does not encode the same value to the same bytes: decoding it and encoding \
-             it again gives different bytes, which means something in the payload iterates in \
-             hash order. Invariant 3 forbids it — use a BTreeMap, not a HashMap",
-        );
+        if rmp_serde::to_vec_named(&decoded).expect("re-encoding a decoded envelope") != bytes {
+            return false;
+        }
     }
+    true
 }
 
 /// Assert that a value built twice saves to the same bytes — [`save`]'s
@@ -922,9 +950,13 @@ fn assert_reencodes_identically<T: Serialize + DeserializeOwned>(bytes: &[u8], k
 /// builds the fields it knew about and leaves a newly added `HashMap` at its
 /// default satisfies this assertion while saying nothing about it — the third
 /// way a call site has satisfied the obligation vacuously (r4 round 3, D3).
-/// **That hole is closed in [`save`] itself, not here**: every save a test
-/// makes decodes its own bytes and re-encodes them. Read [`save`]'s own
-/// section for what that catches and what it leaves.
+/// For a **map**, [`save`]'s own re-encoding check covers it the moment
+/// anything populates the field. For a **sequence**, nothing does: a
+/// default-left order-dependent sequence is caught by neither mechanism, is a
+/// real Invariant 3 breach, and is stated in full under [`save`]'s heading
+/// "The one class neither mechanism catches" — which is the single place it is
+/// written down, because two lists delegating to each other is how it went
+/// unnamed until r4 round 5 (COV3).
 ///
 /// What this adds, and the reason it stays rather than being subsumed: `save`'s
 /// check works on **one** value, and this works on **two independently built**
@@ -1128,6 +1160,51 @@ mod tests {
     // inside `save` before the helper's comparison ran, so neutering either
     // mechanism alone left the suite green and only their disjunction was
     // tested (r4 round 4, COV1).
+
+    #[test]
+    fn the_re_encode_count_is_what_makes_detection_certain() {
+        // r4 round 5 (COV1): `REENCODES` was a constant nothing defended. The
+        // suite was green at `REENCODES = 1`, where a two-key `HashMap` is
+        // missed 56% of the time — so the intermittency the previous round
+        // removed was one edit from coming back, and the 300/300 measurement
+        // that justified 32 lived in a report rather than in the suite.
+        //
+        // This measures instead of restating. Each trial encodes a freshly
+        // built two-key map — the worst case, and the only size where one
+        // comparison is close to a coin toss — and asks the verdict function
+        // whether it looks deterministic. For a `HashMap` the honest answer is
+        // always "no", so every `true` is a miss.
+        //
+        // Why it is not flaky, and why it fails at 1. A round misses with
+        // probability 0.56, and the rounds are independent because each decodes
+        // the original bytes afresh. At `REENCODES = 32` a trial misses with
+        // `0.56^32` ≈ 8.75e-9, so 64 trials fail this assertion with
+        // probability about 5.6e-7 — once in two million runs. At
+        // `REENCODES = 1` a trial misses with probability 0.56, so 64 trials
+        // pass with probability `0.44^64` ≈ 1e-23: it fails every time.
+        const TRIALS: usize = 64;
+        let mut missed = 0;
+        for _ in 0..TRIALS {
+            let two: std::collections::HashMap<String, u32> =
+                [("a".to_string(), 1), ("b".to_string(), 2)]
+                    .into_iter()
+                    .collect();
+            let bytes = rmp_serde::to_vec_named(&Envelope {
+                kind: KIND.to_string(),
+                version: VERSION,
+                payload: &two,
+            })
+            .expect("encode");
+            if reencodes_identically::<std::collections::HashMap<String, u32>>(&bytes, KIND) {
+                missed += 1;
+            }
+        }
+        assert_eq!(
+            missed, 0,
+            "{missed} of {TRIALS} two-key hash-ordered payloads went undetected; REENCODES is \
+             {REENCODES} and has to be large enough that they do not",
+        );
+    }
 
     #[test]
     #[should_panic(expected = "decoding it and encoding it again gives different bytes")]

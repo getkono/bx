@@ -6547,6 +6547,23 @@ mod tests {
             ),
             vec![(1, Reason::ReservedName)]
         );
+        // A reserved reference reaching a *later* line through an ordinary
+        // name, which is the one input that separates `as_reference`'s default
+        // arm from `_ => reason`. Both lines above assign a reserved name, so
+        // both answer through `Scope::lost`; here line 1 assigns `X`, which is
+        // reserved by nothing and emittable by nothing, so its value is
+        // learned as `Err(ReservedName)` and only `as_reference` decides what
+        // line 2 is told. Under `_ => reason` line 2 would say "use a name the
+        // shell does not manage" — an action about a name line 2 does not
+        // contain — instead of naming the line whose assignment could not be
+        // read.
+        // Line 1 is reported for its *name* — `X` is in no generator's emit
+        // table — while the value the scope learns for it is still
+        // `Err(ReservedName)`, which is what line 2 then refers to.
+        assert_eq!(
+            reasons("X=$RANDOM\nexport CARGO_HOME=$X/cargo\n", &rooted()),
+            vec![(1, Reason::NotEmittable), (2, Reason::UnreadableReference)]
+        );
         // The review's case: a fragment that moves `HOME` no longer moves `~`.
         let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
         assert_eq!(

@@ -60,6 +60,33 @@
 //! tests rather than left to review. The shell-init snippet is not one: it is
 //! fixed text from bx's source that sets only `BX_`-prefixed names, and sets
 //! every other variable by sourcing a guarded environment fragment.
+//!
+//! **Reasons, and the one assertion.** Everything this module can be given —
+//! any name, any value, any fragment, well formed or not — comes back as a
+//! [`Verdict`], and every rejection as a [`Reason`]. The guard never panics on
+//! input, because its whole job is to have an answer for input it does not
+//! like. There is exactly one `debug_assert!`, in `judge`, and it is not an
+//! input check: it states a **theorem about this module's own code** — that
+//! once every `:`-entry of a location has been judged, the whole value the tool
+//! reads lies strictly beneath a declared root as well. No value can falsify
+//! it; only an edit to the entry rules can. It is written as an assertion
+//! rather than as a [`Reason`] precisely because a [`Reason`] there could never
+//! be returned, which is a branch no test can reach and no mutant can kill —
+//! the defect it replaced (#47 round 3). Being a `debug_assert!`, it is
+//! compiled out of a release build and costs a release binary nothing; what it
+//! buys is that every test in the suite, not only the one that targets the
+//! property, checks it on every location it judges.
+//!
+//! **Before adding a second one**, ask which of the two it is. A statement
+//! about a *value* is a [`Reason`], always, even when it seems impossible —
+//! values come from a user's configuration and the guard's own reading of a
+//! shell fragment, and neither is a place to be certain. A statement about
+//! *this module's internal consistency*, which no input can reach and whose
+//! falsification would be a bug in bx, may be a `debug_assert!` — and should
+//! be, rather than an unreachable [`Reason`] that reads like a verdict. Pair it
+//! with a test that pins the same property through the public API, as
+//! `every_entry_beneath_a_root_leaves_the_whole_value_beneath_one` does, so the
+//! property is still pinned where assertions are compiled out.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -1275,6 +1302,12 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
                 // the property is asserted where a future change to the entry
                 // rules would trip it, and pinned by
                 // `every_entry_beneath_a_root_leaves_the_whole_value_beneath_one`.
+                //
+                // This is the module's only assertion, and the only place it
+                // may be one: it says nothing about the value, which is a
+                // `Reason`'s job, and everything about this module's own
+                // consistency, which no input can reach. The module docs state
+                // the policy, and what to do before adding a second.
                 debug_assert!(
                     reason.is_some()
                         || whole.is_none_or(|value| {

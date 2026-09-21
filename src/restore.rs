@@ -946,10 +946,10 @@ mod tests {
         if std::fs::read(&unreadable).is_ok() {
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
                 .expect("chmod back");
-            eprintln!(
-                "skipped: this process reads through file permissions, so the failure cannot be produced"
+            return crate::journal::tests::cannot_build(
+                "a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore",
+                crate::journal::tests::WRITES_THROUGH_PERMISSIONS,
             );
-            return;
         }
 
         let done = restore(&state, home.path(), &targets);
@@ -1689,7 +1689,15 @@ mod tests {
             fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make it read-only");
             if !crate::journal::tests::permissions_refuse(&locked) {
                 fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
-                return;
+                // `continue`, not `return`: r3 coverage COV1. Returning out of
+                // the whole test meant the `remove` half's skip took the
+                // `revert` half with it, and the revert half needs no
+                // privilege this one lacks that the remove half does not.
+                crate::journal::tests::cannot_build(
+                    "a_write_rm_cannot_make_is_the_sessions_own_error",
+                    crate::journal::tests::WRITES_THROUGH_PERMISSIONS,
+                );
+                continue;
             }
             let result = restore(&state, &home, std::slice::from_ref(&portable));
             // Before any assertion, so the tempdir can be removed whatever happens.
@@ -1803,7 +1811,10 @@ mod tests {
     ) {
         use std::os::unix::fs::MetadataExt as _;
 
-        let skip = |why: &str| eprintln!("skipped {name}: {why}");
+        // r3 coverage COV1. Not an `eprintln!` that passes: a scenario this
+        // machine cannot build fails unless a human opted the skip in. See
+        // `crate::journal::tests::cannot_build`.
+        let skip = |why: &str| crate::journal::tests::cannot_build(name, why);
         let home = guarded_home();
         // Another uid has to reach the directory and run this test binary.
         fs::set_mode(home.path(), Mode::DEFAULT_DIR).expect("open the home to traversal");

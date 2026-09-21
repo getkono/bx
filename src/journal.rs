@@ -3815,7 +3815,10 @@ pub(crate) mod tests {
         };
         if !permissions_refuse(&dir) {
             writable(&dir);
-            return;
+            return cannot_build(
+                "a_named_temp_recovery_cannot_unlink_is_left_and_the_rollback_goes_on",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let temp = load(&state.journal())
             .expect("load")
@@ -4322,7 +4325,10 @@ pub(crate) mod tests {
         fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make the directory read-only");
         if !permissions_refuse(&locked) {
             fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
-            return;
+            return cannot_build(
+                "a_failed_removal_keeps_the_ledger_entry_and_poisons_the_session",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let mut session =
             Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
@@ -4375,7 +4381,10 @@ pub(crate) mod tests {
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
         if !permissions_refuse(state.root()) {
             fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
-            return;
+            return cannot_build(
+                "a_journal_that_cannot_be_moved_aside_is_an_error_and_stays_in_place",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let loaded = load_exclusive(&state.journal(), &lock);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
@@ -4489,19 +4498,47 @@ pub(crate) mod tests {
 
     /// Whether a directory without write permission refuses this process.
     ///
-    /// It does not refuse root, so a test that needs a refused rename or unlink
-    /// cannot produce one there. Such a test skips and says so, rather than
-    /// failing for a reason that has nothing to do with bx.
+    /// It does not refuse root, so a test that needs a refused rename or
+    /// unlink cannot produce one there. A caller that finds `false` restores
+    /// whatever it broke and then calls [`cannot_build`], which fails unless
+    /// the skip was opted into.
     pub(crate) fn permissions_refuse(dir: &Path) -> bool {
         let probe = dir.join("permission-probe");
         if std::fs::write(&probe, b"").is_err() {
             return true;
         }
         std::fs::remove_file(&probe).expect("remove the probe");
-        eprintln!(
-            "skipped: this process writes through directory permissions, so the failure cannot be produced"
-        );
         false
+    }
+
+    /// Why a test that needs a refused write cannot run as this user.
+    pub(crate) const WRITES_THROUGH_PERMISSIONS: &str = "this process writes through file or directory permissions, so the \
+         failure cannot be produced";
+
+    /// The variable that turns a scenario this machine cannot build from a
+    /// failure into a skip.
+    ///
+    /// r3 round 3, COV1. A test that prints a line and passes when it could
+    /// not run is not a test: the arms it is the only cover for go unverified
+    /// while the suite reports green, and nobody reads the line. So an
+    /// unbuildable scenario **fails**, and the only way to have it skip is to
+    /// say so in the environment — which is a decision a human takes, and
+    /// which the gate report then has to carry.
+    pub(crate) const ALLOW_SKIPS: &str = "BX_ALLOW_UNBUILDABLE_SCENARIOS";
+
+    /// Fail because `name`'s scenario cannot be built here, or skip loudly if
+    /// [`ALLOW_SKIPS`] says to.
+    pub(crate) fn cannot_build(name: &str, why: &str) {
+        assert!(
+            std::env::var_os(ALLOW_SKIPS).is_some_and(|allow| allow == "1"),
+            "{name} could not be run on this machine: {why}.\n\
+             That is a failure, not a skip: everything this test is the only \
+             cover for is now unverified. Run the suite as an unprivileged \
+             user, on a kernel with unprivileged user namespaces and with \
+             util-linux present; or set {ALLOW_SKIPS}=1 to accept the gap, \
+             which leaves it unverified and makes the suite say so.",
+        );
+        eprintln!("SKIPPED, opted out with {ALLOW_SKIPS}=1 — {name}: {why}");
     }
 
     /// A state directory, not yet created, whose files' paths fit Linux's
@@ -4945,10 +4982,10 @@ pub(crate) mod tests {
         if std::fs::read(&path).is_ok() {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod back");
-            eprintln!(
-                "skipped: this process reads through file permissions, so the failure cannot be produced"
+            return cannot_build(
+                "a_journal_that_cannot_be_read_is_an_error_and_a_session_does_not_replace_it",
+                WRITES_THROUGH_PERMISSIONS,
             );
-            return;
         }
 
         let loaded = load(&path).expect_err("an unreadable journal is not an absent one");
@@ -5202,7 +5239,10 @@ pub(crate) mod tests {
         if !permissions_refuse(&parent) {
             std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
                 .expect("chmod back");
-            return;
+            return cannot_build(
+                "a_directory_that_cannot_be_removed_for_another_reason_is_an_error",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let err = prune_dirs(std::slice::from_ref(&child));
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))

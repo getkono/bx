@@ -1019,8 +1019,9 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        crash_phases, finish_crash_phases, frame_starts, names_in, peek, permissions_refuse,
-        plant_file, raw_journal, seal, state_beyond_set_aside_names, target, write_to,
+        WRITES_THROUGH_PERMISSIONS, cannot_build, crash_phases, finish_crash_phases, frame_starts,
+        names_in, peek, permissions_refuse, plant_file, raw_journal, seal,
+        state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
@@ -2473,7 +2474,10 @@ mod tests {
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
         if !permissions_refuse(state.root()) {
             fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
-            return;
+            return cannot_build(
+                "abandoning_a_journal_that_cannot_be_moved_is_an_error_and_moves_nothing",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let abandoned = abandon(&state);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
@@ -3257,7 +3261,10 @@ mod tests {
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
         if !permissions_refuse(state.root()) {
             fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
-            return;
+            return cannot_build(
+                "a_set_aside_that_fails_after_the_rollback_leaves_the_journal_in_place",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let first = recover(&state);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");

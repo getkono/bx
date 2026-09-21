@@ -590,6 +590,24 @@ fn degrade<T>(
 
 /// Write a state file atomically, at `0600`, creating its directory at `0700`.
 ///
+/// # `T` must encode the same value to the same bytes, every time
+///
+/// Invariant 3 requires a generated file to be byte-identical between runs,
+/// with "no nondeterministic iteration order". That is a constraint on the
+/// payload type, and this function cannot impose it: `Serialize` says nothing
+/// about iteration order, and Rust's type system has no bound that does — a
+/// marker trait would be as easy to implement wrongly as the convention it
+/// replaced. Every payload here uses `BTreeMap` for that reason, and
+/// `HashMap`, `HashSet` and anything iterating over them are the shapes that
+/// break it.
+///
+/// So the constraint is carried as a shared *obligation* rather than a bound:
+/// every payload type's test module calls
+/// [`assert_saves_identically`][self::tests::assert_saves_identically], which
+/// saves twice and compares the bytes. A new payload type that adds a
+/// `HashMap` field fails that test rather than passing a suite nobody thought
+/// to extend.
+///
 /// # Errors
 ///
 /// [`Error::Encode`] if the value cannot be encoded — a bug, not a user
@@ -621,6 +639,43 @@ pub(crate) fn save<T: Serialize>(
     }
     write_atomically(path, &bytes, Mode::PRIVATE_FILE)?;
     Ok(())
+}
+
+/// Assert that a value built twice saves to the same bytes — [`save`]'s
+/// stated obligation on every payload type, in one place.
+///
+/// Called from each payload type's own test module. Invariant 3's
+/// byte-identical guarantee rests on each of them choosing `BTreeMap`, and
+/// `save` can impose no bound that says so: `Serialize` says nothing about
+/// iteration order. A shared assertion is what a later payload type has to
+/// pass rather than remember (r4 round 1, CL9).
+///
+/// `make` is called twice, rather than one value being saved twice, and that
+/// is what gives the assertion its teeth. One `HashMap` iterates the same way
+/// however often it is encoded in one process; *two* with the same contents do
+/// not, because `RandomState` gives each its own hash keys. Building the value
+/// twice is therefore the in-process stand-in for "between runs", which is
+/// what Invariant 3 actually says.
+///
+/// [`save`] itself is called, rather than the encoder, so the property pinned
+/// is the one the file on disk has.
+#[cfg(test)]
+pub(crate) fn assert_saves_identically<T: Serialize>(
+    kind: &'static str,
+    version: u16,
+    make: impl Fn() -> T,
+) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("twice.mpk");
+    save(&path, kind, version, &make()).expect("first");
+    let first = std::fs::read(&path).expect("read");
+    save(&path, kind, version, &make()).expect("second");
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        first,
+        "{kind} does not encode the same value to the same bytes; Invariant 3 requires it, and \
+         a HashMap anywhere in the payload breaks it",
+    );
 }
 
 #[cfg(test)]
@@ -771,12 +826,24 @@ mod tests {
 
     #[test]
     fn saving_the_same_value_twice_produces_identical_bytes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
-        save(&path, KIND, VERSION, &sample()).expect("first");
-        let first = std::fs::read(&path).expect("read");
-        save(&path, KIND, VERSION, &sample()).expect("second");
-        assert_eq!(std::fs::read(&path).expect("read"), first);
+        assert_saves_identically(KIND, VERSION, sample);
+    }
+
+    #[test]
+    fn the_shared_determinism_assertion_refuses_a_hash_ordered_payload() {
+        // The obligation is only worth stating if it can fail. A `HashMap`
+        // payload is the shape it exists to catch: two of them with the same
+        // contents iterate differently, because `RandomState` gives each its
+        // own keys, so the encoded bytes differ between one construction and
+        // the next — which is what Invariant 3 forbids.
+        let checked = std::panic::catch_unwind(|| {
+            assert_saves_identically(KIND, VERSION, || {
+                (0..128_u32)
+                    .map(|n| (format!("k{n}"), n))
+                    .collect::<std::collections::HashMap<String, u32>>()
+            });
+        });
+        assert!(checked.is_err(), "a HashMap payload must not pass");
     }
 
     #[test]

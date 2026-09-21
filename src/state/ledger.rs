@@ -2851,6 +2851,10 @@ mod tests {
         let first = std::fs::read(dir.ledger()).expect("read");
         ledger.save().expect("second");
         assert_eq!(std::fs::read(dir.ledger()).expect("read"), first);
+
+        // And the obligation `store::save` states on every payload type, so a
+        // later field that iterates in hash order fails here.
+        store::assert_saves_identically(KIND, VERSION, || (*ledger).clone());
     }
 
     #[test]

@@ -391,10 +391,42 @@ pub fn recover(state: &StateDir) -> Result<Outcome, Error> {
 /// As [`recover`], plus [`Error::Blocked`] when a destination cannot be
 /// accounted for. The escape from that is [`abandon`].
 pub fn before_writing(state: &StateDir) -> Result<Outcome, Error> {
-    match recover(state)? {
+    let lock = ExclusiveLock::acquire(state)?;
+    resolved_or_blocked(state, &lock)
+}
+
+/// [`before_writing`] with the lock already held.
+fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
+    match resolve(state, lock)? {
         Outcome::Blocked { conflicts } => Err(Error::Blocked { conflicts }),
         resolved => Ok(resolved),
     }
+}
+
+/// Recover, refuse if it is blocked, and **keep the lock**.
+///
+/// The call every writing command makes. [`before_writing`] followed by
+/// [`journal::Session::open`] releases the state directory between the two, so
+/// a second bx can win it in between and this one's session then refuses with
+/// [`journal::Error::InProgress`] naming a journal that belongs to a live run
+/// rather than to an interruption. Handing the guard to
+/// [`journal::Session::open_locked`] makes that error mean what it says: there
+/// was an interruption this run could not resolve. See `r3 round 3`
+/// decision 3.
+///
+/// The recovery's [`Outcome`] comes back with the lock, because a caller that
+/// rolled writes back has something to tell the user before it makes its own.
+/// The caller opens the session itself, so a session's failure stays a
+/// session's failure rather than becoming a recovery's.
+///
+/// # Errors
+///
+/// As [`before_writing`].
+pub fn lock_for_writing(state: &StateDir) -> Result<(Outcome, ExclusiveLock), Error> {
+    state.ensure()?;
+    let lock = ExclusiveLock::acquire(state)?;
+    let outcome = resolved_or_blocked(state, &lock)?;
+    Ok((outcome, lock))
 }
 
 /// Move an unresolvable journal aside without touching any destination.

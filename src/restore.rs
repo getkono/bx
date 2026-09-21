@@ -269,7 +269,10 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
 ///
 /// Resolves any interrupted session first — `rm` is a writing command — then
 /// opens a [`SessionKind::Restore`] session, so an `rm` interrupted halfway is
-/// itself rolled back by the next run.
+/// itself rolled back by the next run. Both happen under one exclusive lock
+/// ([`recover::lock_for_writing`]), so a second bx cannot win the state
+/// directory between the recovery and the session and be reported as an
+/// interruption.
 ///
 /// A target that conflicts is reported and skipped; the rest still restore. A
 /// target bx has never written is [`Restored::Unmanaged`], which is what makes
@@ -293,9 +296,11 @@ pub fn restore(
     home: &Path,
     targets: &[Portable],
 ) -> Result<Vec<Restored>, Error> {
-    recover::before_writing(state)?;
-
-    let mut session = Session::open(state, SessionKind::Restore, home, targets.to_vec())?;
+    // One lock across the recovery and the session: see
+    // `recover::lock_for_writing`.
+    let (_recovered, lock) = recover::lock_for_writing(state)?;
+    let mut session =
+        Session::open_locked(state, SessionKind::Restore, home, targets.to_vec(), lock)?;
     let mut done = Vec::with_capacity(targets.len());
     for target in targets {
         done.push(restore_one(&mut session, target)?);

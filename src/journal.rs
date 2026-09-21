@@ -1325,8 +1325,29 @@ impl Session {
         scope: Vec<Portable>,
     ) -> Result<Self, Error> {
         state.ensure()?;
-        // The lock first, so the check below cannot race a second bx.
+        // The lock first, so the check inside cannot race a second bx.
         let lock = ExclusiveLock::acquire(state)?;
+        Self::open_locked(state, kind, home, scope, lock)
+    }
+
+    /// Open a session under a lock the caller already holds.
+    ///
+    /// The one-lock form: a writing command takes the lock, resolves any
+    /// interruption under it, and hands the same guard here, so no second bx
+    /// can win the directory in between and be reported as an interruption.
+    /// [`crate::recover::lock_for_writing`] hands out that guard.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::open`], minus the acquisition of the lock.
+    pub fn open_locked(
+        state: &StateDir,
+        kind: SessionKind,
+        home: &Path,
+        scope: Vec<Portable>,
+        lock: ExclusiveLock,
+    ) -> Result<Self, Error> {
+        state.ensure()?;
         // Before the journal exists, because the loader refuses the *whole*
         // journal over one unportable scope entry: a session that wrote one
         // could never be rolled back. The same rule `admit` applies to a

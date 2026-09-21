@@ -1849,8 +1849,8 @@ mod tests {
         // `left` and `right` both default to `{{shared}}`, so one text reaches
         // `shared` twice, by two different routes, and every value on the way
         // is an act that clears the entry. `shared` is offered once and in
-        // declaration order. `derived_between`'s own guard is what keeps it to
-        // one entry with one count, which
+        // declaration order. `add_reach` is what keeps it to one entry with one
+        // total, which
         // `derived_between_names_a_value_reached_down_two_defaults_once` pins
         // directly; here the interest is that the whole chain reaches the
         // account.

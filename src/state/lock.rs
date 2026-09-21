@@ -270,8 +270,16 @@ fn optional<T>(result: Result<T, Error>) -> Result<Option<T>, Error> {
 /// `~/.bashrc`, say, or to a path that does not exist yet — is refused rather
 /// than followed and truncated or created. The descriptor must then be a
 /// regular file with exactly one link, so a hard link to a user's file, a FIFO
-/// or a device is refused too. A lock file found readable beyond its owner is
-/// narrowed to `0600`, as the state directory itself is.
+/// or a device is refused too.
+///
+/// A lock file whose mode is anything but `0600` is set to it — not only one
+/// that is readable beyond its owner. The `0600` argument to `open` is masked
+/// by the process `umask`, so a `umask` with owner bits in it (`0277`, say)
+/// leaves the file this call just created at `0400`. Run 1 still succeeds,
+/// because `open` skips the permission check for a file it creates; every run
+/// after it fails `Permission denied` on a file bx owns and could repair, and
+/// `is_shared` cannot see it, because `0400` shares nothing. Repairing on
+/// inequality rather than on sharing is what makes the check able to notice.
 ///
 /// Returns the descriptor and its `stat`, whose device and inode identify the
 /// file locked through it.
@@ -300,12 +308,12 @@ fn open_lock_file(dir: &StateDir, path: &Path) -> Result<(OwnedFd, rustix::fs::S
         return Err(not_a_file());
     }
     let found = Mode::from_bits(stat.st_mode);
-    if found.is_shared() {
+    if found != Mode::PRIVATE_FILE {
         tracing::warn!(
             path = %path.display(),
             found = %found,
-            tightened_to = %Mode::PRIVATE_FILE,
-            "the bx lock file was readable beyond its owner; tightening it",
+            set_to = %Mode::PRIVATE_FILE,
+            "the bx lock file was not 0600; setting it",
         );
         rustix::fs::fchmod(&fd, Mode::PRIVATE_FILE.into()).map_err(failed)?;
     }
@@ -904,6 +912,109 @@ mod tests {
             .expect("widen again");
         let _lock = ExclusiveLock::acquire(&dir).expect("writer");
         assert_eq!(mode_of(&dir.lock()), 0o600);
+    }
+
+    #[test]
+    fn a_lock_file_whose_mode_is_not_0600_is_set_to_it_even_when_it_shares_nothing() {
+        // r4 round 1 (D2): the repair fired only on `is_shared`, which is
+        // `mode & 0o077` — structurally unable to see a mode wrong in the OWNER
+        // bits. `0700` shares nothing with anybody, so the old condition left
+        // it; the file bx promises at `0600` was not at `0600`.
+        for wrong in [0o700, 0o606, 0o644] {
+            let home = guarded_home();
+            let dir = StateDir::resolve(home.path());
+            dir.ensure().expect("ensure");
+            std::fs::write(dir.lock(), b"").expect("seed");
+            std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(wrong))
+                .expect("set");
+
+            drop(SharedLock::acquire(&dir).expect("reader"));
+            assert_eq!(mode_of(&dir.lock()), 0o600, "from {wrong:04o}, a reader");
+
+            std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(wrong))
+                .expect("set again");
+            drop(ExclusiveLock::acquire(&dir).expect("writer"));
+            assert_eq!(mode_of(&dir.lock()), 0o600, "from {wrong:04o}, a writer");
+        }
+    }
+
+    /// Run this test binary again, under `umask`, creating a state directory
+    /// and taking the lock in it. Prints the two modes it ends up with.
+    fn child_under_umask(dir: &StateDir, umask: u32) -> String {
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = Command::new(exe)
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "state::lock::tests::child_creates_the_state_directory_under_a_umask",
+            ])
+            .env("BX_TEST_UMASK_DIR", dir.root())
+            .env("BX_TEST_UMASK", format!("{umask:o}"))
+            .output()
+            .expect("spawn the child");
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The child half of [`an_unusual_umask_does_not_leave_bx_unusable`].
+    ///
+    /// A separate process because `umask(2)` is process-global and `cargo test`
+    /// runs every test in threads of one process: setting it here would change
+    /// the mode of files other tests create, at whatever moment they ran.
+    #[test]
+    #[ignore = "spawned by the umask test"]
+    fn child_creates_the_state_directory_under_a_umask() {
+        let (Some(root), Some(mask)) = (
+            std::env::var_os("BX_TEST_UMASK_DIR"),
+            std::env::var("BX_TEST_UMASK").ok(),
+        ) else {
+            return;
+        };
+        let mask = u32::from_str_radix(&mask, 8).expect("an octal umask");
+        let dir = StateDir::new(PathBuf::from(root));
+        let was = rustix::process::umask(RawMode::from_bits_truncate(mask));
+        let made = (|| {
+            dir.ensure()?;
+            let lock = ExclusiveLock::acquire(&dir)?;
+            Ok::<_, Error>((mode_of(dir.root()), mode_of(lock.path())))
+        })();
+        // Put the mask back before anything else in this process writes a
+        // file — the coverage instrumentation writes its profile at exit, and
+        // a mask that denied the owner would leave it unreadable.
+        rustix::process::umask(was);
+        let (root_mode, lock_mode) = made.expect("the state directory, under the mask");
+        println!("dir={root_mode:04o} lock={lock_mode:04o}");
+    }
+
+    #[test]
+    fn an_unusual_umask_does_not_leave_bx_unusable() {
+        // r4 round 1 (COV1, D2): `mkdir(0700)` and `open(…, 0600)` are both
+        // masked by the process `umask`, and no test in the repository set one.
+        // Under every `umask` a developer runs — 022, 002, 077 — the mask takes
+        // away only bits that were not asked for, so the post-create `chmod` in
+        // `ensure_dir` and the repair here were both unreachable by any test
+        // that could make them matter, and deleting either left the suite green.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        for mask in [0o500, 0o277, 0o377] {
+            let home = guarded_home();
+            let dir = StateDir::new(home.child("state"));
+            let said = child_under_umask(&dir, mask);
+            assert!(
+                said.contains("dir=0700 lock=0600"),
+                "under umask {mask:04o}: {said}",
+            );
+            // And a second process, with no unusual mask, can still use it —
+            // the failure the stripped bits actually cause.
+            dir.ensure().expect("a second run");
+            drop(ExclusiveLock::acquire(&dir).expect("a second run takes the lock"));
+        }
     }
 
     #[test]

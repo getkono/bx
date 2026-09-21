@@ -1294,19 +1294,26 @@ impl ResolvedValues {
                 between.push(name.clone());
             }
         }
+        // Both halves of the sentence are read off **one** list of
+        // declarations, so they cannot disagree about how many values there
+        // are. Every name here reached `answers_hint` through a successful
+        // `index_of` inside `derived_between`, so no lookup fails today; the
+        // shape is what keeps a future one from naming N declarations and N + 1
+        // values to answer, or from printing "carried in by ;" with nothing in
+        // the clause. When nothing resolves, the short form is the hint.
+        let ordered = self.in_declaration_order(between);
+        let between: Vec<&ValueDecl> = ordered.iter().filter_map(|name| self.decl(name)).collect();
         if between.is_empty() {
             return format!("{problem}, because of {answers}; change that answer");
         }
-        let between = self.in_declaration_order(between);
         let defaults = between
             .iter()
-            .filter_map(|name| self.decl(name))
             .map(|decl| format!("the default of `{}` at {}", decl.name, decl.origin))
             .collect::<Vec<_>>()
             .join(" and ");
         let direct = between
             .iter()
-            .map(|name| format!("`{name}`"))
+            .map(|decl| format!("`{}`", decl.name))
             .collect::<Vec<_>>()
             .join(" or ");
         format!(

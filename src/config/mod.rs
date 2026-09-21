@@ -819,13 +819,32 @@ mod tests {
         // A process that can read a 0000 directory -- root, or one holding
         // CAP_DAC_READ_SEARCH -- cannot construct this case at all. Say so
         // rather than assert something else and call it covered.
+        //
+        // The skip below is reached by no gate this repository runs, and that is
+        // recorded rather than fixed here. Every job in `.github/workflows/ci.yml`
+        // is a plain `runs-on: ubuntu-latest` with no `container:` and no `user:`,
+        // and `mise run test` runs as the invoking user, so `constructible` is
+        // true under all of them and the assertions below always run. The branch
+        // exists so the test does not *fail* for the privileged reader, which is
+        // what issue #13 item 3 asked for; covering it would need a test that
+        // re-execs under `unshare`, which this repository does not do for the two
+        // sibling skips it already carries on `master`.
         let constructible = std::fs::read_dir(&modules).is_err();
         let result = layer_files(dir.path());
         std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
             .expect("restore, so the tempdir can be removed");
 
         if !constructible {
-            eprintln!(
+            // Through the stderr handle, not `eprintln!`: libtest captures the
+            // print macros and discards the capture for a test that passes, so
+            // an `eprintln!` here would reach nobody on the one kind of machine
+            // that takes this branch -- the suite would go green with the
+            // assertions below never run and nothing said. A direct write
+            // survives that capture. Issue #56 records the same defect at the
+            // two sibling skip sites, which this pull request does not modify.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
                 "skipped: this process can read a 0000 directory, so the io error cannot be \
                  constructed here"
             );

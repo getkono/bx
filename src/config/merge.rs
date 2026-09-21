@@ -32,9 +32,9 @@
 //! answer goes in, which is decided by reducing each spelling with its
 //! placeholders unanswered. That is sound: a pair the reduction calls one path
 //! is one file for every answer, or none. It is complete over the shapes the
-//! fixed-seed property test generates, not over every spelling. The known
-//! shapes it does not decide are listed under *Shapes the written form does not
-//! decide* below. A `..` cancels a placeholder's segment only for a `bool`,
+//! fixed-seed property test generates, not over every spelling. The shapes it
+//! is known not to decide are registered and executed under *Shapes the written
+//! form does not decide* below. A `..` cancels a placeholder's segment only for a `bool`,
 //! which is always one segment, as a `string` need not be.
 //!
 //! When one did, the collision is the account's. `bx.toml` declaring
@@ -47,8 +47,8 @@
 //!
 //! # Shapes the written form does not decide
 //!
-//! This is the register [`written_form`], [`one_path_as_written`] and [`Root`]
-//! point at. It is here, in the tree, rather than in a review thread, so that a
+//! This is what [`written_form`], [`one_path_as_written`] and [`Root`] point
+//! at. It is here, in the tree, rather than in a review thread, so that a
 //! maintainer changing the reduction reads the limitation beside the code it
 //! limits, and so that it outlives whatever tracker entry carried it.
 //!
@@ -63,45 +63,38 @@
 //! file twice loads `Ok` and the file is blocked as a [`Conflict`], whose
 //! "change that answer" hint no answer satisfies. **No general rule is claimed
 //! for which pairs are missed.** Several rounds of review each proposed one and
-//! each was found unsound or too narrow, so the register is a list of executed
-//! examples, not a rule.
+//! each was found unsound or too narrow.
 //!
-//! **Known examples.** Each pair below was keyed under 35,756 answer sets with
-//! the home `/var/home/example`, over `string` `p` and `q`, `bool` `f`, `path`
-//! `r` and `s`, an `email` and an `ssh-key`, and **no answer parted it**, while
-//! the two written forms differ:
+//! **A miss is reached as a toggle, not as a full entry.** A `[[target]]`'s
+//! `path` is a [`Portable`](crate::paths::Portable) parsed by
+//! `Portable::parse_in`, which normalises the spelling with its placeholders
+//! still in it and refuses one that opens with a placeholder or reduces to a
+//! root; and two full entries whose normalised spellings coincide are refused
+//! as a duplicate target before `merge` runs. A toggle names a key by the
+//! spelling it reaches and is held to neither rule, so that is the route by
+//! which one of these pairs becomes a [`Conflict`].
+//! `a_registered_pair_reaches_the_comparison_as_a_toggle_and_not_as_a_full_entry`
+//! executes both halves.
 //!
-//! - `~/{{p}}x/..` against `~/{{p}}y/..` — literal text glued after a
-//!   placeholder, ending the segment the following `..` cancels.
-//! - `{{r}}./..` against `{{r}}/..`, and `{{r}}x/..` against `{{r}}/..` — glue
-//!   after a `path` value where nothing but the root `/` stands above it.
-//! - `/opt/{{r}}../../conf` against `/opt/{{r}}/../conf`, and
-//!   `/opt/{{r}}x/../../conf` against `/opt/{{r}}/../../conf`, and
-//!   `/a/b/{{r}}../../..` against `/a/b/{{r}}/../..` — a `..` glued after a
-//!   `path` value that then climbs through every fixed segment above it to `/`.
-//! - `~/{{p}}{{f}}/..` against `~/{{p}}x/..` — a glued tail holding a `bool`,
-//!   whose answer is never empty, never only dots and never holds a `/`, so the
-//!   `..` cancels the segment either way.
-//! - `~{{p}}/.{{p}}` against `~{{p}}/{{p}}` — each occurrence of a placeholder
-//!   is read on its own, so an *opening* occurrence that limits which answers
-//!   name a file at all is not carried to the later one.
-//! - With the home set to `/`: `{{p}}` against `{{p}}/`.
+//! **The two registers are tests, not prose**, so that each entry is measured
+//! at the head it is published against rather than carried forward:
 //!
-//! **Rules already shown to be unsound**, so that none of them is re-adopted:
-//! treating any glued placeholder tail like literal text (`{{r}}{{p}}/..`
-//! against `{{r}}/..` is parted by `p = "~/a"`, `r = "//srv/"`); and treating
-//! glue with no following `..` as one path (`{{r}}x/conf` against
-//! `{{r}}/conf` is parted by `r = "/srv"`, and `/opt/{{r}}./conf` against
-//! `/opt/{{r}}/conf` by `r = "/srv"`). Equally, a `..` glued after a `path`
-//! value is *not* always undecided: with two fixed segments above the value,
-//! `/a/b/{{r}}../..` against `/a/b/{{r}}/..` is parted by `r = "/"`, and so is
-//! `/opt/{{r}}x/../conf` against `/opt/{{r}}/../conf`, which key as
-//! `/opt/conf` and `/conf`.
+//! - `UNDECIDED`, asserted by
+//!   `every_pair_the_written_form_is_known_to_miss_is_still_missed`, holds the
+//!   pairs whose forms differ while, under some home, every answer keys them as
+//!   one file. Each entry says what makes it undecided. A repair that decides
+//!   one turns that test red, and the pair then moves into the fuzz's
+//!   `segments` and `openers` arrays.
+//! - `REFUTED`, asserted by `every_rule_the_written_form_refused_is_still_refuted`,
+//!   holds each proposed rule with the two spellings and the answer that parts
+//!   them, so none is re-adopted on the strength of a claim nobody re-ran.
 //!
-//! Any future rule must be proven sound against
-//! `one_path_as_written_agrees_with_every_answer_in_a_fuzzed_set` and a wider
-//! fuzz before it is adopted, and every example above belongs in that test as a
-//! case once it is decided.
+//! Both draw their answers from `answer_sets`, which the fuzz draws from too,
+//! and which varies the home as well as the values — so neither register can
+//! claim evidence the fuzz was not asserted over. Widening the fuzz's
+//! generators to draw a registered shape turns its completeness assertion red,
+//! which is the same fact as a register entry and not a second instruction:
+//! decide the shape in `written_form` first, then move it.
 //!
 //! # Toggles: how an account opts out cheaply
 //!
@@ -713,9 +706,9 @@ fn clash(
 /// file for any: the comparison is sound. It is complete over the shapes the
 /// fixed-seed property test generates: there, forms that differ are parted by
 /// some answer, so the collision is one the account can clear. It is not
-/// complete over every spelling. The known shapes it does not decide are listed
-/// under *Shapes the written form does not decide* in the [module
-/// documentation](self).
+/// complete over every spelling. The shapes it is known not to decide are
+/// registered and executed as `UNDECIDED`, under *Shapes the written form does
+/// not decide* in the [module documentation](self).
 ///
 /// Only spellings whose keys are one [`TargetKey::File`] are compared here, so
 /// every placeholder in either is declared, enabled and answered: a
@@ -776,8 +769,9 @@ enum Segment<'a> {
 ///
 /// The form is sound: identical forms name one file for every answer, or none.
 /// It is complete over the shapes the fixed-seed property test generates; the
-/// known shapes it does not decide are listed under *Shapes the written form
-/// does not decide* in the [module documentation](self).
+/// shapes it is known not to decide are registered and executed as `UNDECIDED`,
+/// under *Shapes the written form does not decide* in the [module
+/// documentation](self).
 ///
 /// A `path` value starts its own segment wherever it sits, as though a `/` were
 /// written before it. That changes no file. A `path` answer is absolute and
@@ -1611,15 +1605,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn one_path_as_written_agrees_with_every_answer_in_a_fuzzed_set() {
-        // Soundness: a pair the rule calls one path has one key, or no key, under
-        // every answer below. Completeness over that set: a pair it does not call
-        // one path, which some answer gives one key, is parted by another answer,
-        // so the block its hint describes is one an answer can clear. The pairs
-        // come from a fixed seed, so every run tries the same ones.
+    /// The homes the written-form properties are asserted over.
+    ///
+    /// The home is one of the axes, not a fixture detail: `Portable::parse_in`
+    /// folds against it and can refuse an absolute path under it, so which file
+    /// a spelling names is home-dependent. `/` is the degenerate one — `~` and
+    /// `/` coincide there and a `..` under the home has no parent to climb to —
+    /// and a pair that is one file under one home and two under another is a
+    /// property of that account rather than of the rule.
+    fn homes() -> [PathBuf; 2] {
+        [home(), PathBuf::from("/")]
+    }
+
+    /// Every answer set drawn against `at`, each labelled with its answers.
+    fn answer_sets_at(at: &Path) -> Vec<(String, ResolvedValues)> {
         use crate::config::values::AssignedValue;
-        use std::collections::HashSet;
 
         let decl = |name: &str, kind: ValueKind| ValueDecl {
             name: name.into(),
@@ -1678,9 +1678,12 @@ mod tests {
                                 assign("r", AssignedValue::String(r.into())),
                                 assign("e", AssignedValue::String(e.into())),
                             ];
-                            if let Ok(values) = ResolvedValues::resolve(decls(), &given, &home()) {
+                            if let Ok(values) = ResolvedValues::resolve(decls(), &given, at) {
                                 answers.push((
-                                    format!("p={p:?} q={q:?} f={f} r={r:?} e={e:?}"),
+                                    format!(
+                                        "home={} p={p:?} q={q:?} f={f} r={r:?} e={e:?}",
+                                        at.display()
+                                    ),
                                     values,
                                 ));
                             }
@@ -1689,6 +1692,51 @@ mod tests {
                 }
             }
         }
+        answers
+    }
+
+    /// Every answer set, over every home.
+    ///
+    /// The fuzz asserts over all of them at once, which is the strict
+    /// direction: more answers can only part more pairs, so soundness is
+    /// checked harder and completeness is never weakened.
+    fn answer_sets() -> Vec<(String, ResolvedValues)> {
+        homes().iter().flat_map(|at| answer_sets_at(at)).collect()
+    }
+
+    /// How `first` and `second` key across `answers`: whether some answer gives
+    /// them one file, and the first answer that gives them different keys.
+    ///
+    /// A pair is **undecided** when some answer met, none parted, and
+    /// [`one_path_as_written`] says false — one file for every answer in the
+    /// set, which the written form does not see.
+    fn keying(
+        first: &str,
+        second: &str,
+        answers: &[(String, ResolvedValues)],
+    ) -> (bool, Option<String>) {
+        let mut met = false;
+        for (label, values) in answers {
+            let (key_a, key_b) = (TargetKey::of(first, values), TargetKey::of(second, values));
+            match (&key_a, &key_b) {
+                (TargetKey::File(x), TargetKey::File(y)) if x == y => met = true,
+                (TargetKey::AsWritten(_), TargetKey::AsWritten(_)) => {}
+                _ => return (met, Some(format!("{label}: {key_a:?} against {key_b:?}"))),
+            }
+        }
+        (met, None)
+    }
+
+    #[test]
+    fn one_path_as_written_agrees_with_every_answer_in_a_fuzzed_set() {
+        // Soundness: a pair the rule calls one path has one key, or no key, under
+        // every answer below. Completeness over that set: a pair it does not call
+        // one path, which some answer gives one key, is parted by another answer,
+        // so the block its hint describes is one an answer can clear. The pairs
+        // come from a fixed seed, so every run tries the same ones.
+        use std::collections::HashSet;
+
+        let answers = answer_sets();
 
         let segments = [
             "x",
@@ -1806,19 +1854,7 @@ mod tests {
             }
 
             let one_path = one_path_as_written(&a, &b, &answers[0].1);
-            let mut met = false;
-            let mut apart = None;
-            for (label, values) in &answers {
-                let (key_a, key_b) = (TargetKey::of(&a, values), TargetKey::of(&b, values));
-                match (&key_a, &key_b) {
-                    (TargetKey::File(x), TargetKey::File(y)) if x == y => met = true,
-                    (TargetKey::AsWritten(_), TargetKey::AsWritten(_)) => {}
-                    _ => {
-                        apart = Some(format!("{label}: {key_a:?} against {key_b:?}"));
-                        break;
-                    }
-                }
-            }
+            let (met, apart) = keying(&a, &b, &answers);
             match (one_path, apart) {
                 (true, Some(why)) => unsound.push(format!("{a:?} and {b:?}, parted by {why}")),
                 (true, None) => proven += 1,
@@ -1836,13 +1872,13 @@ mod tests {
         );
         // Completeness is asserted **over the shapes generated above**, not
         // over every spelling. The `segments` and `openers` arrays are what
-        // bounds it, and that exclusion is load-bearing: the shapes listed
-        // under *Shapes the written form does not decide* in the module
-        // documentation are known to be undecided and are deliberately not
-        // generated. Widening either array will turn one of them red. The
-        // repair for that is to re-decide the limitation in `written_form`,
-        // adding the shape to the register once it is decided — never to
-        // weaken this assertion.
+        // bounds it, and that exclusion is load-bearing: the pairs `UNDECIDED`
+        // holds are known to be undecided and are deliberately not generated.
+        // Widening either array will turn one of them red — the same fact
+        // `every_pair_the_written_form_is_known_to_miss_is_still_missed`
+        // records, not a second obligation. The repair is to decide the shape
+        // in `written_form`, then move the pair out of `UNDECIDED` and into
+        // these arrays — never to weaken this assertion.
         assert!(
             incomplete.is_empty(),
             "{} pairs no answer parts were not called one path:\n{}",
@@ -1853,6 +1889,266 @@ mod tests {
             proven >= 100 && parted >= 100,
             "the set must exercise both verdicts: {proven} one path, {parted} parted"
         );
+    }
+
+    /// The pairs the written form is known **not** to decide.
+    ///
+    /// Each names one file under every answer [`answer_sets`] draws, and the
+    /// two written forms differ anyway. This is the register the module
+    /// documentation points at, kept here rather than in prose so that it is
+    /// re-derived on every run: a pair that stops being undecided fails
+    /// `every_pair_the_written_form_is_known_to_miss_is_still_missed`, and a
+    /// pair nobody can reproduce cannot be added.
+    const UNDECIDED: [(&str, &str, &str); 9] = [
+        (
+            "{{p}}",
+            "{{p}}/",
+            "under a home of `/` alone: a trailing separator after an opening \
+             placeholder, where the home is the root the empty answer names",
+        ),
+        (
+            "~/{{p}}x/..",
+            "~/{{p}}y/..",
+            "literal text glued after a placeholder, ending the segment the \
+             following `..` cancels",
+        ),
+        (
+            "{{r}}./..",
+            "{{r}}/..",
+            "glue after a `path` value where nothing but the root `/` stands above it",
+        ),
+        ("{{r}}x/..", "{{r}}/..", "the same, with the glue not a dot"),
+        (
+            "/opt/{{r}}../../conf",
+            "/opt/{{r}}/../conf",
+            "a `..` glued after a `path` value that climbs through every fixed \
+             segment above it to `/`",
+        ),
+        (
+            "/opt/{{r}}x/../../conf",
+            "/opt/{{r}}/../../conf",
+            "the same climb, with the glue not a dot",
+        ),
+        (
+            "/a/b/{{r}}../../..",
+            "/a/b/{{r}}/../..",
+            "the same climb, from two fixed segments",
+        ),
+        (
+            "~/{{p}}{{f}}/..",
+            "~/{{p}}x/..",
+            "a glued tail holding a `bool`, whose answer is never empty, never \
+             only dots and never holds a `/`, so the `..` cancels the segment \
+             either way",
+        ),
+        (
+            "~{{p}}/.{{p}}",
+            "~{{p}}/{{p}}",
+            "an opening occurrence limits which answers name a file at all, and \
+             each occurrence is read on its own",
+        ),
+    ];
+
+    #[test]
+    fn every_pair_the_written_form_is_known_to_miss_is_still_missed() {
+        // The register, executed. A pair belongs in it when, under **some**
+        // home, every answer keys it as one file and the two written forms
+        // differ anyway — which is exactly the account that gets a `Conflict`
+        // no answer clears. Judged per home rather than over the union,
+        // because a pair one home parts is still an unclearable block for an
+        // account under the home that does not.
+        //
+        // The list is therefore a measurement at this head, not a claim carried
+        // forward from an earlier one. A pair a repair to `written_form`
+        // decides turns this red and must move into the fuzz's `segments` and
+        // `openers` arrays, which is the one instruction this register gives.
+        let by_home: Vec<(PathBuf, Vec<(String, ResolvedValues)>)> = homes()
+            .into_iter()
+            .map(|at| {
+                let sets = answer_sets_at(&at);
+                (at, sets)
+            })
+            .collect();
+        let declarations = &by_home[0].1[0].1;
+
+        let mut decided: Vec<String> = Vec::new();
+        for (first, second, why) in UNDECIDED {
+            if one_path_as_written(first, second, declarations) {
+                decided.push(format!(
+                    "{first:?} and {second:?} ({why}): now one path as written"
+                ));
+                continue;
+            }
+            let mut per_home = Vec::new();
+            for (at, answers) in &by_home {
+                match keying(first, second, answers) {
+                    (true, None) => per_home.clear(),
+                    (_, Some(apart)) => {
+                        per_home.push(format!("{}: parted by {apart}", at.display()))
+                    }
+                    (false, None) => per_home.push(format!(
+                        "{}: no answer keys it as a file at all",
+                        at.display()
+                    )),
+                }
+                if per_home.is_empty() {
+                    break;
+                }
+            }
+            if !per_home.is_empty() {
+                decided.push(format!(
+                    "{first:?} and {second:?} ({why}): undecided under no home — {}",
+                    per_home.join("; ")
+                ));
+            }
+        }
+        assert!(
+            decided.is_empty(),
+            "{} registered pairs no longer describe a miss:\n{}",
+            decided.len(),
+            decided.join("\n")
+        );
+    }
+
+    /// Rules for deciding a pair that were proposed and refuted, each with the
+    /// two spellings, the answers to `p` and `r` that part them, and the rule
+    /// the parting kills.
+    ///
+    /// Kept so that none is re-adopted, and kept executable so that a refutation
+    /// cannot outlive the behaviour it rests on.
+    const REFUTED: [(&str, &str, &str, &str, &str); 5] = [
+        (
+            "{{r}}{{p}}/..",
+            "{{r}}/..",
+            "~/a",
+            "//srv/",
+            "treat any glued placeholder tail like literal text",
+        ),
+        (
+            "{{r}}x/conf",
+            "{{r}}/conf",
+            "",
+            "/srv",
+            "treat glue with no following `..` as one path",
+        ),
+        (
+            "/opt/{{r}}./conf",
+            "/opt/{{r}}/conf",
+            "",
+            "/srv",
+            "treat a dot glued after a `path` value as one path",
+        ),
+        (
+            "/a/b/{{r}}../..",
+            "/a/b/{{r}}/..",
+            "",
+            "/",
+            "treat a `..` glued after a `path` value as always undecided",
+        ),
+        (
+            "/opt/{{r}}x/../conf",
+            "/opt/{{r}}/../conf",
+            "",
+            "/",
+            "the same, with one fixed segment above the value",
+        ),
+    ];
+
+    /// The classifier's declarations, with `p` and `r` answered.
+    fn answered(p: &str, r: &str) -> ResolvedValues {
+        use crate::config::values::AssignedValue;
+
+        let decl = |name: &str, kind: ValueKind| ValueDecl {
+            name: name.into(),
+            description: None,
+            kind,
+            required: false,
+            is_root: false,
+            default: None,
+            enabled: true,
+            origin: Origin::unknown(Path::new("bx.toml")),
+        };
+        let assign = |name: &str, text: &str| ValueAssignment {
+            name: name.into(),
+            value: AssignedValue::String(text.into()),
+            origin: Origin::unknown(Path::new("local.toml")),
+        };
+        ResolvedValues::resolve(
+            classifier_kinds()
+                .into_iter()
+                .map(|(name, kind)| decl(name, kind))
+                .collect(),
+            &[assign("p", p), assign("r", r)],
+            &home(),
+        )
+        .expect("the answers resolve")
+    }
+
+    #[test]
+    fn every_rule_the_written_form_refused_is_still_refuted() {
+        // A proposed rule is dead when one answer gives its two spellings
+        // different keys, because a rule calling them one path would refuse a
+        // whole load an account could have cleared. Executed rather than
+        // recited, so a refutation is re-measured at the head it is published
+        // against instead of being carried forward.
+        for (first, second, p, r, rule) in REFUTED {
+            let values = answered(p, r);
+            assert!(
+                !one_path_as_written(first, second, &values),
+                "{rule}: {first:?} and {second:?} are called one path today"
+            );
+            assert_ne!(
+                TargetKey::of(first, &values),
+                TargetKey::of(second, &values),
+                "{rule}: {first:?} and {second:?} with p={p:?} r={r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_registered_pair_reaches_the_comparison_as_a_toggle_and_not_as_a_full_entry() {
+        // Why the register's consequence is a toggle's, and why a maintainer
+        // cannot reproduce a registered pair by writing its two spellings as
+        // `[[target]]` entries. A full `path` is a `Portable` parsed by
+        // `Portable::parse_in`, which normalises the spelling with its
+        // placeholders still in it: both spellings below store as `/conf`, and
+        // `check_unique` refuses the layer before `merge` compares anything. A
+        // toggle names a key by the spelling it reaches and is held to neither
+        // that rule nor the one refusing a spelling that opens with a
+        // placeholder, so it is the route by which a miss becomes a `Conflict`
+        // whose "change that answer" hint no answer satisfies.
+        const VALUES: &str = "[[value]]\nname = \"r\"\nkind = \"path\"\n";
+        let (first, second) = ("/opt/{{r}}x/../../conf", "/opt/{{r}}/../../conf");
+
+        let as_entries = parse_str(
+            &format!(
+                "{VALUES}{}{}",
+                target_toml(first, "ONE"),
+                target_toml(second, "TWO")
+            ),
+            Path::new("bx.toml"),
+            &home(),
+        )
+        .expect_err("two full entries whose normalised spellings coincide are refused")
+        .to_string();
+        assert!(as_entries.contains("duplicate target"), "{as_entries}");
+        assert!(as_entries.contains("`/conf`"), "{as_entries}");
+
+        let as_toggles = merge(&[
+            global(
+                "bx.toml",
+                &format!(
+                    "{VALUES}{}[[target]]\npath = \"{first}\"\nenabled = false\n\
+                     [[target]]\npath = \"{second}\"\nenabled = true\n",
+                    target_toml("/conf", "C")
+                ),
+            ),
+            local("[values]\nr = \"/srv\"\n"),
+        ])
+        .unwrap_or_else(|e| panic!("the toggle route loads rather than failing: {e}"));
+
+        assert_eq!(as_toggles.conflicts.len(), 1, "{:?}", as_toggles.conflicts);
+        assert_eq!(as_toggles.conflicts[0].file, "/conf");
     }
 
     #[test]
@@ -2090,16 +2386,62 @@ mod tests {
             origin: Origin::unknown(Path::new("bx.toml")),
         };
         ResolvedValues::resolve(
-            vec![
-                decl("p", ValueKind::String),
-                decl("f", ValueKind::Bool),
-                decl("r", ValueKind::Path),
-                decl("e", ValueKind::Email),
-            ],
+            classifier_kinds()
+                .into_iter()
+                .map(|(name, kind)| decl(name, kind))
+                .collect(),
             &[],
             &home(),
         )
         .expect("the declarations resolve")
+    }
+
+    /// Every kind a value may be declared with, under the name the classifier
+    /// tests declare it as.
+    ///
+    /// One list, so a kind cannot be declared for these fixtures without
+    /// `every_kind_but_a_string_fills_an_opening_segment` deciding it, and that
+    /// test's match is exhaustive, so a new [`ValueKind`] does not compile
+    /// until someone has.
+    fn classifier_kinds() -> [(&'static str, ValueKind); 6] {
+        [
+            ("p", ValueKind::String),
+            ("f", ValueKind::Bool),
+            ("r", ValueKind::Path),
+            ("e", ValueKind::Email),
+            ("k", ValueKind::SshKey),
+            ("g", ValueKind::AgeRecipient),
+        ]
+    }
+
+    #[test]
+    fn every_kind_but_a_string_fills_an_opening_segment() {
+        // `may_be_empty` is the one place `written_form` reads a kind, and it
+        // names `String` alone. Every other kind therefore makes a separator
+        // after an opening placeholder change no file, which is what
+        // `followed = false` records. Asserted over the kinds themselves rather
+        // than over the four a spelling happened to use, because the
+        // discrimination is on the kind axis.
+        let values = classifier_values();
+
+        for (name, kind) in classifier_kinds() {
+            let spelling = format!("{{{{{name}}}}}/a");
+            let opening = |followed| Root::Opening {
+                first: vec![Piece::Name(name)],
+                followed,
+            };
+            let root = form_of(&spelling, &values).root;
+            match kind {
+                // A `path` answer is absolute, so it roots the spelling instead
+                // of opening a segment and `may_be_empty` never reaches it.
+                ValueKind::Path => assert_eq!(root, Root::Absolute, "{spelling}"),
+                ValueKind::String => assert_eq!(root, opening(true), "{spelling}"),
+                ValueKind::Bool
+                | ValueKind::Email
+                | ValueKind::SshKey
+                | ValueKind::AgeRecipient => assert_eq!(root, opening(false), "{spelling}"),
+            }
+        }
     }
 
     /// `written_form`, for a spelling the caller knows is well-formed.

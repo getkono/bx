@@ -1445,6 +1445,14 @@ impl ResolvedValues {
         // future caller that breaks the invariant gets the name alone.
         if let Some(default) = &self.decls[index].default {
             for (inner, seen) in self.derived_directly(&default.to_string()) {
+                // Never taken. A default is expanded by `expand_before` with
+                // this declaration's own index as the horizon, so a reference
+                // at or after it is `Unresolved::Forward`, which fails the
+                // load — a declaration whose default named a later value is
+                // never `Given` from that default and so never reaches here.
+                // Kept because it is what makes the recursion finite by
+                // construction rather than by that argument holding: it can
+                // only ever descend in declaration order.
                 if inner >= index {
                     continue;
                 }

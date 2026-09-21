@@ -14,6 +14,15 @@
 //! is why a machine that puts its toolchain caches on a scratch mount is a
 //! configuration bx serves rather than one it refuses.
 //!
+//! A tool-read location must lie **strictly beneath** a declared root, never at
+//! one, because a tool may derive a directory beside its own — uv puts
+//! executables in `$XDG_DATA_HOME/../bin`. That bound is **one level**, and the
+//! guard claims no more: an approved value's parent is inside a declared root,
+//! its grandparent need not be, and a tool deriving a path two or more levels
+//! above its value is not modelled. bx knows of none.
+//! [`Reason::DeclaredRootItself`] is where the bound and its consequences are
+//! written out.
+//!
 //! bx *may never* point a tool at a directory **bx itself owns**, and that one
 //! is unconditional: it holds inside a declared root too, because bx's state
 //! directory holds the record that makes an uninstall exact, and a tool writing
@@ -337,7 +346,11 @@ enum Kind {
     /// root itself, and outside bx's own directories. A tool may derive a
     /// directory beside its own, as uv puts executables in
     /// `$XDG_DATA_HOME/../bin`, so at a root that directory is outside every
-    /// root. A bare word, a relative path and a URL are all relative to
+    /// root. *Strictly beneath* buys exactly one level: an approved value's
+    /// parent is inside a declared root, and its grandparent need not be, so a
+    /// tool deriving a path two or more levels above its value is not modelled
+    /// — bx knows of none. [`Reason::DeclaredRootItself`] states the bound in
+    /// full. A bare word, a relative path and a URL are all relative to
     /// wherever the shell happens to be, and are refused. Every `:`-separated
     /// entry is held to the same checks first, which costs only a path with a
     /// `:` in it. Every character is an ASCII letter or digit, `.`, `_`, `-`,
@@ -888,6 +901,16 @@ pub enum Reason {
     /// the value is one. A tool given a whole root also clears everything else
     /// the root holds. Point the value beneath the root.
     ///
+    /// **The rule covers one level above the value, and no more.** Refusing a
+    /// value that is a root leaves every approved value with a parent inside a
+    /// declared root, so the directory a tool derives one level up is inside
+    /// one too. It says nothing about the grandparent: a value one level
+    /// beneath a root is approved, and `<value>/../..` is the root's own
+    /// parent, outside every root. A tool that derives a path **two or more
+    /// levels above its value is not modelled**, and bx knows of none.
+    /// [`Kind::Location`] states the same bound, and
+    /// `the_rule_covers_one_level_above_a_location_and_no_more` pins it.
+    ///
     /// Every other reason outranks it, at any entry and in a location's whole
     /// value: every entry, and then the whole value, is judged for bx's
     /// directories, and every entry for lying inside a root, before any entry
@@ -1051,7 +1074,8 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///   a root itself ([`Reason::DeclaredRootItself`]). The whole value, read as
 ///   one path, is judged for bx's own directories too; being strictly beneath
 ///   a root then follows from the entries and is not asked again
-///   ([`Reason::DeclaredRootItself`] says why);
+///   ([`Reason::DeclaredRootItself`] says why). Strictly beneath covers the one
+///   level a tool may derive above its value, and no more;
 /// * a **list of locations** is judged the same way entry by entry, and not
 ///   as a whole;
 /// * an **anchor** is judged as a location's one path, except that it may

@@ -920,10 +920,19 @@ fn frame(bytes: &[u8], at: usize, nonce: &[u8; NONCE]) -> Result<(Record, usize)
     // Past the bound is garbage however many bytes follow, and is what stops four
     // bytes of garbage asking for a gigabyte.
     //
-    // A zero length has no test of its own. An empty body's checksum is not four
-    // NUL bytes, and an empty slice never decodes, so a run of NUL bytes is
-    // `Invalid` twice over, which `a_run_of_nul_bytes_is_not_a_valid_frame` pins.
-    if len > MAX_FRAME {
+    // Zero is refused here rather than left to the checksum, and that is a cost
+    // rule, not a correctness one: an empty body's checksum is not four NUL
+    // bytes and an empty slice never decodes, so a zero length was already
+    // `Invalid` twice over. But both of those refusals come *after*
+    // `checksum`, and a zero length is the one length every offset of a
+    // zero-filled tail carries, so `whole_frame_after` would hash once per
+    // byte — a SHA-256 per byte of a power-loss tail, on the lock-free path
+    // every read-only command takes. A record body is never empty: every
+    // `Record` variant encodes at least a MessagePack tag.
+    // `a_run_of_nul_bytes_is_not_a_valid_frame` pins the verdict and
+    // `a_zero_length_frame_is_refused_before_its_checksum_is_taken` pins that
+    // it is reached without hashing.
+    if len == 0 || len > MAX_FRAME {
         return Err(Damage::Invalid);
     }
     let end = body_start.checked_add(len).ok_or(Damage::Invalid)?;
@@ -939,10 +948,14 @@ fn frame(bytes: &[u8], at: usize, nonce: &[u8; NONCE]) -> Result<(Record, usize)
 /// decoding both good — starts anywhere after `at`.
 ///
 /// Every offset is tried, because the damaged frame's own length cannot be
-/// trusted to say where the next one starts. Each try is a bounds check for
-/// all but a length that fits in the file, so a zero-filled or random tail
-/// costs a few comparisons per byte; only bytes crafted to be all plausible
-/// lengths hash much, and a journal is not a file anyone else writes.
+/// trusted to say where the next one starts. An offset hashes only when its
+/// four length bytes read as a non-zero length that is both within
+/// [`MAX_FRAME`] and inside the file — every other offset is refused by
+/// [`frame`]'s comparisons alone. A zero-filled tail therefore hashes not at
+/// all (zero is refused), and a random tail hashes at about one offset in 256
+/// for a journal large enough for the length to fit; only bytes crafted to be
+/// all plausible lengths hash much, and a journal is not a file anyone else
+/// writes.
 ///
 /// A whole frame an earlier journal left in reused blocks fails here, because
 /// its checksum was taken under that journal's nonce.
@@ -950,9 +963,20 @@ fn whole_frame_after(bytes: &[u8], at: usize, nonce: &[u8; NONCE]) -> bool {
     (at + 1..bytes.len()).any(|start| frame(bytes, start, nonce).is_ok())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has taken a frame [`checksum`], so a test
+    /// can pin that scanning a zero-filled tail does not hash once per byte.
+    /// Thread-local rather than global so that a parallel suite cannot make
+    /// one test's count another's.
+    pub(crate) static CHECKSUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The checksum a frame carries: the first [`CHECK`] bytes of the SHA-256 of
 /// the session's nonce, the frame's length prefix, and its body.
 fn checksum(nonce: &[u8; NONCE], prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
+    #[cfg(test)]
+    CHECKSUMS.with(|taken| taken.set(taken.get() + 1));
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     hasher.update(nonce);
@@ -2391,6 +2415,37 @@ pub(crate) mod tests {
             load(&path).expect("load"),
             Loaded::Unreadable { .. }
         ));
+    }
+
+    #[test]
+    fn a_zero_length_frame_is_refused_before_its_checksum_is_taken() {
+        // r3 round 3, D3. A zero length passes the `MAX_FRAME` bound, and an
+        // empty body is always inside the file, so without the `len == 0`
+        // refusal `frame` reaches `checksum` at every offset of a zero-filled
+        // tail: one SHA-256 per byte, on the lock-free path every read-only
+        // command takes. The verdict is the same either way, so only the cost
+        // can be pinned.
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(FORMAT);
+        let nonce = fresh_nonce();
+        bytes.extend_from_slice(&nonce);
+        bytes.extend(encode(&Record::Begin(some_begin()), &nonce).expect("encode"));
+        let tail = 64 * 1024;
+        bytes.extend(std::iter::repeat_n(0_u8, tail));
+
+        let before = CHECKSUMS.with(std::cell::Cell::get);
+        assert!(
+            !whole_frame_after(&bytes, HEADER, &nonce),
+            "a zero-filled tail holds no whole frame",
+        );
+        let taken = CHECKSUMS.with(std::cell::Cell::get) - before;
+        // Scanning the tail must not hash per byte. The header and the one
+        // whole Begin frame are the only offsets that can carry a plausible
+        // length here, so the bound is generous and still far below `tail`.
+        assert!(
+            taken < tail / 64,
+            "scanning {tail} zero bytes took {taken} checksums",
+        );
     }
 
     #[test]

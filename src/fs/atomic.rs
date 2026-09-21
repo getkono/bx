@@ -1091,7 +1091,7 @@ pub fn stage(
     let dir = parent_of(dest)?;
     // Before creating anything, so a refusal leaves nothing behind.
     refuse_wider_than_declared(dest, dir, created)?;
-    let made = create_missing_dirs(dir, None, created)?;
+    let made = create_missing_dirs(dir, created)?;
     let created_dirs = created.record(made, None);
 
     let temp = tempfile::Builder::new()
@@ -1701,9 +1701,47 @@ pub struct EnsuredDir {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreatedDirs {
     /// Every directory this apply created, and how.
-    made: BTreeMap<PathBuf, Made>,
+    made: BTreeMap<DirKey, Made>,
     /// The mode each directory target in this apply declares.
-    declared: BTreeMap<PathBuf, Mode>,
+    declared: BTreeMap<DirKey, Mode>,
+}
+
+/// A directory path as [`CreatedDirs`] keys it.
+///
+/// Both maps are keyed on this and nothing else, and the only way to make one is
+/// [`DirKey::of`]. So no method of `CreatedDirs` can read or write either map
+/// with a path that did not pass through here: a lookup that forgot to would
+/// not compile. That matters because `declare` and `declared` are public, and a
+/// caller outside this module — the apply engine that will hold one set for the
+/// whole apply — has every reason to expect `~/.ssh` and `~/.ssh/` to name one
+/// directory, and no way to check that they do.
+///
+/// Two halves make it so, and they are different things:
+///
+/// * **Lookups agree because [`Path`] compares by components, not by bytes.**
+///   `Ord` and `Eq` for `Path` walk `components()`, which drops a trailing
+///   separator and every `.` after the first component. That is the guarantee,
+///   and it is why a key type that compared `OsStr` bytes would break the
+///   agreement even with the normalisation below.
+/// * **[`DirKey::of`] normalises on the way in** so the *stored* spelling is
+///   canonical, because it is read back out — into
+///   [`Error::DirectoryTargetPending`]'s `dir`, which a user sees.
+///
+/// Pinned by `a_created_dirs_set_answers_for_a_directory_however_it_is_spelled`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DirKey(PathBuf);
+
+impl DirKey {
+    /// The key for `path`: its components, which drops a trailing separator and
+    /// every `.`, exactly as [`lexical`] spells a path before using it.
+    fn of(path: &Path) -> Self {
+        Self(path.components().collect())
+    }
+
+    /// The normalised path this key is.
+    fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
 /// One directory an apply created: the mode it was created at, and which
@@ -1728,7 +1766,7 @@ impl CreatedDirs {
     /// Whether this apply created `path`.
     #[must_use]
     pub fn contains(&self, path: &Path) -> bool {
-        self.made.contains_key(path)
+        self.made.contains_key(&DirKey::of(path))
     }
 
     /// Declare that a directory target in this apply wants `path` at `mode`.
@@ -1739,25 +1777,34 @@ impl CreatedDirs {
     /// call — but one that does not, and skips this, gets
     /// [`Error::UndeclaredDirectory`] from the directory target.
     pub fn declare(&mut self, path: &Path, mode: Mode) {
-        self.declared.insert(path.components().collect(), mode);
+        self.declared.insert(DirKey::of(path), mode);
     }
 
     /// The mode a directory target in this apply declares for `path`, if any.
+    ///
+    /// Answers for the same directory however it is spelled — see [`DirKey`].
     #[must_use]
     pub fn declared(&self, path: &Path) -> Option<Mode> {
-        self.declared.get(path).copied()
+        self.declared.get(&DirKey::of(path)).copied()
+    }
+
+    /// How this apply made `path`, if it did.
+    fn made(&self, path: &Path) -> Option<Made> {
+        self.made.get(&DirKey::of(path)).copied()
     }
 
     /// Note the directories a call just created, deepest first, and return the
     /// ones that call claims: all of them but a declared directory, unless it
     /// is `own`, the path of the directory target making the call.
     fn record(&mut self, made: Vec<(PathBuf, Made)>, own: Option<&Path>) -> Vec<PathBuf> {
+        let own = own.map(DirKey::of);
         let mut claimed = Vec::with_capacity(made.len());
         for (path, how) in made {
-            if own == Some(path.as_path()) || !self.declared.contains_key(&path) {
-                claimed.push(path.clone());
+            let key = DirKey::of(&path);
+            if own.as_ref() == Some(&key) || !self.declared.contains_key(&key) {
+                claimed.push(path);
             }
-            self.made.insert(path, how);
+            self.made.insert(key, how);
         }
         claimed
     }
@@ -1781,7 +1828,7 @@ fn act_on_dir(
     // the declaration made it at 0755 and may already have published into it.
     if announced.action == Action::Create
         && fresh.kind == Kind::Dir
-        && let (Some(made), Some(stamp)) = (created.made.get(path).copied(), fresh.stamp)
+        && let (Some(made), Some(stamp)) = (created.made(path), fresh.stamp)
         && (made.dev, made.ino) == (stamp.dev, stamp.ino)
     {
         if made.mode != mode {
@@ -1820,7 +1867,7 @@ fn act_on_dir(
     let mut created_dirs = Vec::new();
     match outcome.action {
         Action::Create => {
-            let made = create_missing_dirs(path, Some(mode), created)?;
+            let made = create_missing_dirs(path, created)?;
             // The path itself is the deepest entry when this call made it. When
             // it is not there, something took the path between the observation
             // and the `mkdir` — somebody else's directory, or not a directory at
@@ -1951,7 +1998,8 @@ fn refuse_unwritable(observed: &Observed) -> Result<(), Error> {
 /// [`Error::DirectoryTargetPending`], and [`Error::Read`] when a declared
 /// directory above `dest` cannot be stat'd.
 fn refuse_wider_than_declared(dest: &Path, dir: &Path, created: &CreatedDirs) -> Result<(), Error> {
-    for (declared_dir, &declared) in &created.declared {
+    for (key, &declared) in &created.declared {
+        let declared_dir = key.path();
         if !dir.starts_with(declared_dir) {
             continue;
         }
@@ -1965,7 +2013,7 @@ fn refuse_wider_than_declared(dest: &Path, dir: &Path, created: &CreatedDirs) ->
         if meta.is_dir() && found.grants_more_than(declared) {
             return Err(Error::DirectoryTargetPending {
                 path: dest.to_path_buf(),
-                dir: declared_dir.clone(),
+                dir: declared_dir.to_path_buf(),
                 found,
                 declared,
             });
@@ -2163,18 +2211,17 @@ fn parent_state(dir: &Path) -> Result<ParentState, Error> {
     Ok(ParentState::Absent(Mode::DEFAULT_DIR))
 }
 
-/// Create every missing component of `dir`: `dir` itself at `leaf_mode` when
-/// one is given, and every other component — `dir` too, when none is — at the
-/// mode a directory target in this apply declares for it, or at
-/// [`Mode::DEFAULT_DIR`] when none does.
+/// Create every missing component of `dir`, each at the mode a directory target
+/// in this apply declares for it, or at [`Mode::DEFAULT_DIR`] when none does.
+///
+/// There is no separate mode for the leaf. [`act_on_dir`] declares its own path
+/// at the mode it is applying before it calls this, so `created.declared(dir)`
+/// already *is* the leaf mode; a second way to say it would be a second thing
+/// to keep in agreement.
 ///
 /// Returns what it created and how, **deepest first**, which is the order a
 /// reversal removes them in.
-fn create_missing_dirs(
-    dir: &Path,
-    leaf_mode: Option<Mode>,
-    created: &CreatedDirs,
-) -> Result<Vec<(PathBuf, Made)>, Error> {
+fn create_missing_dirs(dir: &Path, created: &CreatedDirs) -> Result<Vec<(PathBuf, Made)>, Error> {
     // `ancestors` yields deepest first, so the collected prefix is already in
     // removal order; reversing it gives shallowest-first creation order.
     let missing: Vec<PathBuf> = dir
@@ -2198,10 +2245,7 @@ fn create_missing_dirs(
     let modes: Vec<(&PathBuf, Mode)> = missing
         .iter()
         .rev()
-        .map(|path| match leaf_mode {
-            Some(mode) if path == dir => (path, mode),
-            _ => (path, created.declared(path).unwrap_or(Mode::DEFAULT_DIR)),
-        })
+        .map(|path| (path, created.declared(path).unwrap_or(Mode::DEFAULT_DIR)))
         .collect();
     let mut made_here = Vec::with_capacity(missing.len());
     for (path, mode) in modes {
@@ -6656,6 +6700,67 @@ mod tests {
         write_atomically(&dest, &bytes, reference.mode).expect("reverse");
         assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host *\n");
+    }
+
+    #[test]
+    fn a_created_dirs_set_answers_for_a_directory_however_it_is_spelled() {
+        // `declare` normalised its key and `declared` did not, so an external
+        // caller — the apply engine that will hold one set for the whole apply
+        // — could declare `~/.ssh` and be told `~/.ssh/` is undeclared. Every
+        // spelling below names one directory to the kernel, and now to this set.
+        let home = guarded_home();
+        let dir = home.child(".ssh");
+        let spellings = [
+            dir.clone(),
+            dir.join(""),                                         // a trailing separator
+            dir.parent().expect("a home").join(".").join(".ssh"), // a `.` component
+            dir.components().collect::<PathBuf>(),                // rebuilt component by component
+        ];
+
+        for declared_as in &spellings {
+            let mut created = CreatedDirs::new();
+            created.declare(declared_as, Mode::PRIVATE_DIR);
+            for asked_as in &spellings {
+                assert_eq!(
+                    created.declared(asked_as),
+                    Some(Mode::PRIVATE_DIR),
+                    "declared as {}, asked as {}",
+                    declared_as.display(),
+                    asked_as.display(),
+                );
+            }
+            assert_eq!(created.declared(&home.child(".config")), None);
+        }
+
+        // `contains` and the claim rule key on the same thing: a write that
+        // creates the directory under one spelling leaves it unclaimed for a
+        // target that declared it under another.
+        let mut created = CreatedDirs::new();
+        created.declare(&dir.join(""), Mode::PRIVATE_DIR);
+        let dest = dir.join("config");
+        let planned = observe(&dest).expect("observe");
+        let filled = stage(&dest, Mode::PRIVATE_FILE, &planned, &mut created)
+            .expect("stage")
+            .fill(b"Host *\n")
+            .expect("fill");
+        assert_eq!(
+            filled.created_dirs(),
+            Vec::<PathBuf>::new(),
+            "the declared directory is its own target's to claim, however it was spelled",
+        );
+        assert_eq!(
+            mode_of_path(&dir),
+            Mode::PRIVATE_DIR,
+            "at its declared mode"
+        );
+        for asked_as in &spellings {
+            assert!(
+                created.contains(asked_as),
+                "contains {}",
+                asked_as.display()
+            );
+        }
+        filled.publish().expect("publish");
     }
 
     #[test]

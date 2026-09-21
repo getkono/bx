@@ -5562,6 +5562,52 @@ mod tests {
             ),
             vec![]
         );
+        // The one refusal this change turns into an approval. As an anchor,
+        // `CACHE_DIR` was one path with no `:` at all, so any `:` value was
+        // `UnlistedCharacter(':')`. As a location it is judged per `:`-entry
+        // and then as the whole path find-cache-dir joins its consumer's name
+        // onto, exactly as a tool reads `CARGO_HOME` — so a value whose
+        // entries and whole path all lie strictly beneath a root is allowed,
+        // and its verdict is `CARGO_HOME`'s. Revert the table line to
+        // `Kind::Anchor` and this fails.
+        // `Verdict` carries the name, so the two are compared by reason.
+        let colon_home = RootSet::new(
+            Path::new(&format!("{ROOT}/x:{ROOT}/y")),
+            &[PathBuf::from(ROOT)],
+        );
+        for (value, roots, reason) in [
+            (format!("{ROOT}/x:{ROOT}/y"), &rooted(), None),
+            (
+                format!("{ROOT}/x:{ROOT}/y/.local/state"),
+                &colon_home,
+                Some(Reason::ContainsBxDirectory),
+            ),
+            (
+                format!("{ROOT}/x:/etc"),
+                &rooted(),
+                Some(Reason::OutsideDeclaredRoots),
+            ),
+            (
+                format!("{ROOT}/x:{ROOT}"),
+                &rooted(),
+                Some(Reason::DeclaredRootItself),
+            ),
+        ] {
+            assert_eq!(
+                reason_of(&check("CACHE_DIR", &value, roots)),
+                reason,
+                "{value}"
+            );
+            assert_eq!(
+                reason_of(&check("CACHE_DIR", &value, roots)),
+                reason_of(&check("CARGO_HOME", &value, roots)),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            check("CACHE_DIR", &format!("{ROOT}/x:{ROOT}/y"), &rooted()),
+            Verdict::Allowed
+        );
     }
 
     #[test]

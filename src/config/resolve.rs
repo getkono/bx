@@ -562,10 +562,22 @@ enum Step<'a> {
 /// committed `file` whose chain reaches a switched-off `path` value.
 /// `a_switched_off_path_declaration_still_ends_the_walk` pins it.
 ///
-/// `seen` stops the walk at a name it has already walked. It is reachable for
-/// the reason [`path_value_behind`] gives, and through answers as well: an
-/// answer may reference only an earlier value, but an overridden default
-/// referencing a later one is never expanded.
+/// `seen` stops the walk at a name it has already walked, and it is
+/// load-bearing here for the reason [`path_value_behind`] gives: an overridden
+/// default is never expanded, so
+/// [`Unresolved::Forward`](super::values::Unresolved::Forward) never refuses a
+/// cycle that one closes, and the walk reads it anyway. Following answers opens
+/// a second shape of that cycle — `q` answered `{{r}}` with `r`'s overridden
+/// default naming `q` back — because an answer may name only an earlier value,
+/// but the default it overrides may name a later one.
+/// `an_answer_re_entering_a_walked_name_still_resolves` pins that shape;
+/// `a_file_body_through_an_answered_value_whose_default_names_itself_resolves`
+/// pins the one-declaration one.
+///
+/// `seen` is also shared across the names in `file`, so a subtree walked for
+/// one of them is not walked again for the next. The walk is a function of the
+/// declarations and this account's answers alone, so the second visit would
+/// have returned what the first did.
 fn path_value_through_answer<'a>(
     values: &'a ResolvedValues,
     assignments: &'a [ValueAssignment],
@@ -3423,6 +3435,35 @@ mod tests {
                 "{local}"
             );
         }
+    }
+
+    #[test]
+    fn an_answer_re_entering_a_walked_name_still_resolves() {
+        // The `seen` guard along the answer edge. `q`'s answer names `r`,
+        // whose committed default names `q` back. That default is never
+        // expanded, because `r` is answered, so value resolution never refuses
+        // the forward reference and the walk is the one thing that meets the
+        // cycle — at `q`, a second time. Without `seen` it recurses until the
+        // stack runs out. Nothing on the way is a `path` value, so the target
+        // resolves.
+        let resolved = resolved(
+            "[[value]]\nname = \"r\"\nkind = \"string\"\ndefault = \"{{q}}\"\n\
+             [[value]]\nname = \"q\"\nkind = \"string\"\n\
+             [[target]]\npath = \"~/.config/thing\"\nfile = \"cfg/{{q}}/x\"\n",
+            Some("[values]\nr = \"work\"\nq = \"{{r}}\"\n"),
+        )
+        .expect("an overridden default may name a later value");
+
+        assert_eq!(
+            ready(&resolved, 0).body,
+            Body::File(PathBuf::from("cfg/work/x"))
+        );
+        // `q` has no committed default, so the committed walk returns at once
+        // and never reaches its own guard: this cycle is the answer walk's.
+        assert_eq!(
+            path_value_behind(&resolved.values, "q", &mut Vec::new()).map(|chain| chain.len()),
+            None
+        );
     }
 
     #[test]

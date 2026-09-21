@@ -2600,7 +2600,8 @@ fn refuse_setgid_a_chmod_strips(path: &Path, found: Mode, declared: Mode) -> Res
         path: path.to_path_buf(),
         source,
     })?;
-    refuse_unless_setgid_survives(path, declared, &meta, process_keeps_setgid(meta.gid()))
+    let keeps = process_keeps_setgid(meta.uid(), meta.gid());
+    refuse_unless_setgid_survives(path, declared, &meta, keeps)
 }
 
 /// The refusal itself: pass when `keeps` names a confirmation, refuse when it
@@ -2649,10 +2650,11 @@ enum KeepsSetgid {
     Group,
 }
 
-/// Whether a `chmod` by this process keeps the setgid bit of a directory whose
-/// group `stat` reports as `gid` — [`keeps_setgid`] against this process's own
-/// capabilities, effective gid, supplementary groups and overflow gid.
-fn process_keeps_setgid(gid: u32) -> Option<KeepsSetgid> {
+/// Whether a `chmod` by this process keeps the setgid bit of a directory that
+/// `stat`s as owner `uid` and group `gid` — [`keeps_setgid`] against this
+/// process's own capabilities, effective gid, supplementary groups and this
+/// namespace's overflow ids.
+fn process_keeps_setgid(uid: u32, gid: u32) -> Option<KeepsSetgid> {
     // The test build can force either answer on this thread, because the
     // `None` one needs a user namespace most hosts do not offer.
     #[cfg(test)]
@@ -2668,49 +2670,137 @@ fn process_keeps_setgid(gid: u32) -> Option<KeepsSetgid> {
         .map(rustix::process::Gid::as_raw)
         .collect();
     keeps_setgid(
+        uid,
         gid,
         has_cap_fsetid(),
         rustix::process::getegid().as_raw(),
         &groups,
-        overflow_gid(),
+        overflow_ids(),
     )
 }
 
 /// Whether the kernel keeps a directory's setgid bit through a `chmod` by a
 /// process holding `cap_fsetid`, with effective gid `egid` and supplementary
-/// groups `groups`, when the directory's group reads as `gid` and this user
-/// namespace's overflow gid is `overflow`.
+/// groups `groups`, when the directory `stat`s as owner `uid` and group `gid`
+/// and this user namespace's overflow ids are `overflow`.
 ///
-/// `chmod(2)` clears `S_ISGID` unless the caller holds `CAP_FSETID` or is in
-/// the file's group. Both halves are **confirmed**, never inferred, and
-/// anything else is refused:
+/// # The rule the kernel applies
 ///
-/// * **The capability, not the uid.** A process can hold `CAP_FSETID` without
-///   being uid 0, and can be uid 0 without holding it — uid 0 in a user
-///   namespace whose bounding set was dropped is the case bx meets, and there
-///   the kernel strips the bit from a chmod that uid 0 made.
-/// * **A gid the kernel resolved, not the number `stat` printed.** A group with
-///   no mapping in this user namespace is reported as the overflow gid, which
-///   names no group at all. Comparing it against this process's groups answers
-///   a different question from the one `chmod(2)` will ask, so it confirms
-///   nothing — including when this process's own gids read as the overflow gid
-///   too, which is how an equality between two unmapped groups would otherwise
-///   look like membership.
+/// `chmod_common` keeps `S_ISGID` when either holds:
+///
+/// ```text
+/// in_group_p(i_gid) || capable_wrt_inode_uidgid(inode, CAP_FSETID)
+/// ```
+///
+/// and `capable_wrt_inode_uidgid` is `ns_capable(CAP_FSETID)` **and**
+/// `kuid_has_mapping(ns, i_uid)` **and** `kgid_has_mapping(ns, i_gid)`. So the
+/// capability does **not** outrank an unmapped id: it is the *weaker* of the
+/// two paths, because it carries two mapping requirements the group path does
+/// not. An id the namespace does not map is what makes `stat` report the
+/// overflow uid or gid, which is how this function sees it.
+///
+/// # Why the order is not a choice here
+///
+/// An earlier version tested the capability first and returned on it, so a
+/// process holding `CAP_FSETID` was confirmed for a directory whose group was
+/// unmapped — and the kernel stripped the bit anyway. That was a claim about a
+/// shape ("fail closed") whose *sequence* was load-bearing and only written
+/// down in prose.
+///
+/// It is now carried by the types instead. [`MappedGid`] has one constructor,
+/// which refuses the overflow gid, and **every** confirmation below takes one:
+/// [`in_group`] because `in_group_p` compares against that gid, and
+/// [`inode_capability`] because `kgid_has_mapping` must hold for it. An arm
+/// added later that skipped the mapping test would have nothing to take and
+/// would not compile.
+///
+/// `None` means refuse. There is no variant for "probably" and none for a uid.
 fn keeps_setgid(
+    uid: u32,
     gid: u32,
     cap_fsetid: bool,
     egid: u32,
     groups: &[u32],
-    overflow: u32,
+    overflow: Overflow,
 ) -> Option<KeepsSetgid> {
-    if cap_fsetid {
+    // Nothing below this line can be reached without it, and that is the point:
+    // both paths the kernel offers are judged against this gid.
+    let gid = MappedGid::of(gid, overflow)?;
+    if inode_capability(uid, gid, cap_fsetid, overflow).is_some() {
         return Some(KeepsSetgid::Capability);
     }
-    if gid == overflow {
-        return None;
-    }
-    (egid == gid || groups.contains(&gid)).then_some(KeepsSetgid::Group)
+    in_group(gid, egid, groups).then_some(KeepsSetgid::Group)
 }
+
+/// The overflow ids of a user namespace: what `stat` reports for an owner or a
+/// group it does not map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Overflow {
+    uid: u32,
+    gid: u32,
+}
+
+/// A directory's group, as a gid this user namespace actually maps.
+///
+/// The one constructor refuses the overflow gid, and every arm of
+/// [`keeps_setgid`] takes one, so no arm can compare a gid the kernel would not
+/// compare. `stat` reports the overflow gid precisely when the mapping the
+/// kernel needs is absent, so this is that mapping, as far as a `stat` can see
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MappedGid(u32);
+
+impl MappedGid {
+    /// The group, or `None` when this namespace does not map it.
+    const fn of(gid: u32, overflow: Overflow) -> Option<Self> {
+        if gid == overflow.gid {
+            return None;
+        }
+        Some(Self(gid))
+    }
+}
+
+/// Whether this process is in the group `gid` — the kernel's `in_group_p`.
+///
+/// Takes a [`MappedGid`]: an unmapped group reads as the overflow gid, and
+/// matching *that* against this process's own gids answers a different question
+/// from the one `chmod(2)` asks. Two distinct unmapped groups read alike.
+const fn in_group(gid: MappedGid, egid: u32, groups: &[u32]) -> bool {
+    if egid == gid.0 {
+        return true;
+    }
+    let mut i = 0;
+    while i < groups.len() {
+        if groups[i] == gid.0 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Evidence that `CAP_FSETID` applies to *this* inode — the kernel's
+/// `capable_wrt_inode_uidgid`.
+///
+/// Needs the capability in the effective set **and** both of the inode's ids
+/// mapped. The gid is already a [`MappedGid`], so only the owner is checked
+/// here; an unmapped owner reads as the overflow uid.
+const fn inode_capability(
+    uid: u32,
+    _gid: MappedGid,
+    cap_fsetid: bool,
+    overflow: Overflow,
+) -> Option<InodeCapability> {
+    if cap_fsetid && uid != overflow.uid {
+        return Some(InodeCapability);
+    }
+    None
+}
+
+/// `CAP_FSETID`, established against one inode. Constructible only by
+/// [`inode_capability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InodeCapability;
 
 /// `CAP_FSETID`, capability 4 in `linux/capability.h`.
 const CAP_FSETID: u32 = 4;
@@ -2724,10 +2814,20 @@ const CAP_FSETID: u32 = 4;
 ///
 /// A set that cannot be read or parsed confirms nothing and is `false`. The
 /// caller then refuses, which changes nothing; the other guess strips a bit.
+/// The whole judgement is [`cap_fsetid_in`], which takes the text, so the only
+/// part no test reaches is the `read_to_string` itself.
 fn has_cap_fsetid() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| cap_eff(&status))
+    cap_fsetid_in(std::fs::read_to_string("/proc/self/status").ok().as_deref())
+}
+
+/// Whether `CAP_FSETID` is set in the `CapEff` mask of `status`, the text of
+/// `/proc/self/status`.
+///
+/// `None` — the file could not be read — and text with no usable `CapEff` line
+/// both confirm nothing, and so are `false`.
+fn cap_fsetid_in(status: Option<&str>) -> bool {
+    status
+        .and_then(cap_eff)
         .is_some_and(|effective| effective & (1 << CAP_FSETID) != 0)
 }
 
@@ -2741,20 +2841,29 @@ fn cap_eff(status: &str) -> Option<u64> {
         .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
 }
 
-/// The gid `stat` reports for a group with no mapping in this process's user
-/// namespace, from `/proc/sys/kernel/overflowgid`.
+/// The ids `stat` reports for an owner or a group with no mapping in this
+/// process's user namespace, from `/proc/sys/kernel/overflowuid` and
+/// `overflowgid`.
 ///
-/// `65534` when it cannot be read: that is the kernel's own compiled-in
-/// default, and assuming anything else is what would let an unmapped group
-/// through the comparison [`keeps_setgid`] makes.
-fn overflow_gid() -> u32 {
-    /// The kernel's `DEFAULT_OVERFLOWGID`.
+/// The kernel's own compiled-in defaults when they cannot be read: assuming
+/// anything else is what would let an unmapped id through the comparisons
+/// [`keeps_setgid`] makes. The reads are one line each; the judgement is
+/// [`overflow_in`], which takes the text.
+fn overflow_ids() -> Overflow {
+    let read = |name: &str| std::fs::read_to_string(name).ok();
+    Overflow {
+        uid: overflow_in(read("/proc/sys/kernel/overflowuid").as_deref()),
+        gid: overflow_in(read("/proc/sys/kernel/overflowgid").as_deref()),
+    }
+}
+
+/// The overflow id in `text`, or the kernel's `DEFAULT_OVERFLOWUID` /
+/// `DEFAULT_OVERFLOWGID` — both `65534` — when there is none to read.
+fn overflow_in(text: Option<&str>) -> u32 {
+    /// The kernel's `DEFAULT_OVERFLOWUID` and `DEFAULT_OVERFLOWGID`.
     const DEFAULT: u32 = 65534;
 
-    std::fs::read_to_string("/proc/sys/kernel/overflowgid")
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(DEFAULT)
+    text.and_then(|t| t.trim().parse().ok()).unwrap_or(DEFAULT)
 }
 
 /// A forced answer for [`process_keeps_setgid`], per thread, in the test build
@@ -3911,6 +4020,83 @@ mod tests {
         );
     }
 
+    /// The variable the capability child finds its setgid directory in.
+    const SET_ID_CAP_CHILD_DIR: &str = "BX_TEST_SET_ID_CAP_CHILD_DIR";
+
+    #[test]
+    fn a_capability_does_not_survive_a_group_this_namespace_does_not_map() {
+        const NAME: &str = "fs::atomic::tests::\
+                            a_capability_does_not_survive_a_group_this_namespace_does_not_map";
+
+        if let Some(dir) = std::env::var_os(SET_ID_CAP_CHILD_DIR) {
+            // The child: uid 0 in a user namespace that maps only the invoking
+            // ids, holding a full capability set — so `CAP_FSETID` really is
+            // held — in a setgid directory whose group 5 that namespace does
+            // **not** map. `capable_wrt_inode_uidgid` needs the inode's uid and
+            // gid mapped as well as the capability, so the kernel strips the
+            // bit from a chmod this child makes, and the capability does not
+            // save it.
+            //
+            // This is the arm nothing else exercises against a real kernel: the
+            // other two harness callers drop the capability, one with
+            // `--bounding-set=-all` and one with `--reuid=1`.
+            println!("{SET_ID_CHILD_RAN}");
+            let dir = PathBuf::from(dir);
+            assert!(rustix::process::geteuid().is_root(), "the child is uid 0");
+            assert!(
+                has_cap_fsetid(),
+                "the child holds CAP_FSETID: CapEff {:?}",
+                cap_eff(&std::fs::read_to_string("/proc/self/status").expect("status")),
+            );
+            let overflow = overflow_ids();
+            let shared = std::fs::metadata(&dir).expect("stat");
+            assert_eq!(
+                shared.gid(),
+                overflow.gid,
+                "the shared directory's group is unmapped here, so it reads as the overflow gid",
+            );
+
+            rustix::process::umask(Mode::from_bits(0o022).into());
+            let team = dir.join("team-cap");
+            rustix::fs::mkdir(&team, Mode::DEFAULT_DIR.into()).expect("mkdir");
+            let inherited = Mode::from_bits(0o2755);
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "a setgid parent gives it the bit and its unmapped group",
+            );
+
+            let declared = Mode::from_bits(0o2775);
+            let planned = observe(&team).expect("observe");
+            let err = ensure_dir(&team, declared, &planned, &mut CreatedDirs::new())
+                .expect_err("CAP_FSETID does not outrank an unmapped gid");
+            assert!(
+                matches!(
+                    &err,
+                    Error::DirectorySetIdNotKept { path, chmod_left: None, .. } if *path == team
+                ),
+                "{err:?}",
+            );
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "the setgid bit the directory had is still on it",
+            );
+            return;
+        }
+
+        run_in_a_foreign_setgid_directory_under(
+            NAME,
+            SET_ID_CAP_CHILD_DIR,
+            // The child's namespace maps only the invoking ids, so group 5 is
+            // unmapped in it. No `setpriv`: the child keeps uid 0 and the full
+            // capability set the namespace gives its creator.
+            &["--map-root-user"],
+            &[],
+            |_| {},
+        );
+    }
+
     /// The refusal `set_dir_mode` returns for `dir`, declared `declared`, when
     /// its chmod left `left`.
     fn not_kept(dir: &Path, declared: Mode, left: Mode) -> Error {
@@ -3923,93 +4109,174 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_setgid_predicate_confirms_a_capability_or_a_resolved_group_and_nothing_else() {
-        const GID: u32 = 5;
-        const OVERFLOW: u32 = 65534;
+    /// The overflow ids of a namespace that maps everything below 65534.
+    const OVER: Overflow = Overflow {
+        uid: 65534,
+        gid: 65534,
+    };
 
-        // The capability is what chmod(2) tests, and it is the only thing that
-        // lets a process outside the directory's group through.
+    #[test]
+    fn the_setgid_predicate_confirms_a_capability_or_a_mapped_group_and_nothing_else() {
+        const UID: u32 = 1000;
+        const GID: u32 = 5;
+
+        // The capability is one of the two things chmod(2) tests, and it is the
+        // only one that passes a process outside the directory's group.
         assert_eq!(
-            keeps_setgid(GID, true, 1, &[], OVERFLOW),
+            keeps_setgid(UID, GID, true, 1, &[], OVER),
             Some(KeepsSetgid::Capability),
             "CAP_FSETID, held by a process in none of the groups",
         );
         assert_eq!(
-            keeps_setgid(GID, false, GID, &[], OVERFLOW),
+            keeps_setgid(UID, GID, false, GID, &[], OVER),
             Some(KeepsSetgid::Group),
             "the effective group",
         );
         assert_eq!(
-            keeps_setgid(GID, false, 1, &[3, GID], OVERFLOW),
+            keeps_setgid(UID, GID, false, 1, &[3, GID], OVER),
             Some(KeepsSetgid::Group),
             "a supplementary group",
         );
         assert_eq!(
-            keeps_setgid(GID, false, 1, &[3, 4], OVERFLOW),
+            keeps_setgid(UID, GID, false, 1, &[3, 4], OVER),
             None,
             "other groups only",
         );
         assert_eq!(
-            keeps_setgid(GID, false, 1, &[], OVERFLOW),
+            keeps_setgid(UID, GID, false, 1, &[], OVER),
             None,
             "no groups"
         );
 
-        // uid 0 is not a parameter at all, and that is the repair: a process
-        // that is root in a user namespace without CAP_FSETID has its chmod
-        // stripped like any other, and there is no arm left for it to take.
+        // uid 0 is not a parameter at all, and that is r4 round 1's repair: a
+        // process that is root in a user namespace without CAP_FSETID has its
+        // chmod stripped like any other, and there is no arm left for it.
         //
+        // These are r4 round 2's. `capable_wrt_inode_uidgid` requires both of
+        // the inode's ids to be mapped, so the capability does NOT outrank an
+        // unmapped id — it is the weaker path, not the stronger one. The
+        // assertion below used to read `Some(Capability)`, and the kernel
+        // disagreed: see
+        // `a_capability_does_not_survive_a_group_this_namespace_does_not_map`.
+        assert_eq!(
+            keeps_setgid(UID, OVER.gid, true, 1, &[], OVER),
+            None,
+            "an unmapped group defeats the capability too",
+        );
+        assert_eq!(
+            keeps_setgid(OVER.uid, GID, true, 1, &[], OVER),
+            None,
+            "so does an unmapped owner",
+        );
+        // ...but only for the capability. The group path has no uid
+        // requirement, so an unmapped owner in a group this process is in still
+        // keeps the bit, and refusing there would refuse a chmod that works.
+        assert_eq!(
+            keeps_setgid(OVER.uid, GID, false, GID, &[], OVER),
+            Some(KeepsSetgid::Group),
+            "an unmapped owner does not defeat membership",
+        );
         // An unmapped group reads as the overflow gid, which names no group.
         // Matching it confirms nothing, even against gids that read the same
         // way, which is how two distinct unmapped groups would otherwise look
         // like one membership.
         assert_eq!(
-            keeps_setgid(OVERFLOW, false, OVERFLOW, &[OVERFLOW], OVERFLOW),
+            keeps_setgid(UID, OVER.gid, false, OVER.gid, &[OVER.gid], OVER),
             None,
             "the overflow gid never confirms a membership",
         );
+        // The overflow ids are only whatever this namespace reports: on a host
+        // where they are something else, 65534 is an ordinary group again.
         assert_eq!(
-            keeps_setgid(OVERFLOW, true, 1, &[], OVERFLOW),
-            Some(KeepsSetgid::Capability),
-            "the capability settles it whatever the gid reads as",
-        );
-        // The overflow gid is only the overflow gid: a host whose value it is
-        // not still compares that number as an ordinary group.
-        assert_eq!(
-            keeps_setgid(OVERFLOW, false, OVERFLOW, &[], 65533),
+            keeps_setgid(
+                UID,
+                65534,
+                false,
+                65534,
+                &[],
+                Overflow {
+                    uid: 65533,
+                    gid: 65533
+                },
+            ),
             Some(KeepsSetgid::Group),
         );
 
         // The same answers for this process, read through rustix and /proc.
-        let egid = rustix::process::getegid().as_raw();
-        let overflow = overflow_gid();
+        let (uid, egid) = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+        let overflow = overflow_ids();
         let groups: Vec<u32> = rustix::process::getgroups()
             .expect("getgroups")
             .into_iter()
             .map(rustix::process::Gid::as_raw)
             .collect();
-        if egid != overflow {
+        if egid != overflow.gid && uid != overflow.uid {
             assert_eq!(
-                process_keeps_setgid(egid),
+                process_keeps_setgid(uid, egid),
                 Some(KeepsSetgid::Group),
                 "this process's own group",
             );
         }
-        for member in groups.iter().filter(|gid| **gid != overflow) {
+        for member in groups.iter().filter(|gid| **gid != overflow.gid) {
             assert_eq!(
-                process_keeps_setgid(*member),
+                process_keeps_setgid(uid, *member),
                 Some(KeepsSetgid::Group),
                 "supplementary group {member}",
             );
         }
         let foreign = (1..)
-            .find(|gid| *gid != egid && *gid != overflow && !groups.contains(gid))
+            .find(|gid| *gid != egid && *gid != overflow.gid && !groups.contains(gid))
             .expect("a group this process is not in");
         assert_eq!(
-            process_keeps_setgid(foreign).is_some(),
-            has_cap_fsetid(),
+            process_keeps_setgid(uid, foreign).is_some(),
+            has_cap_fsetid() && uid != overflow.uid,
             "group {foreign}, which this process is not in: only the capability confirms it",
+        );
+        assert_eq!(
+            process_keeps_setgid(uid, overflow.gid),
+            None,
+            "a group this namespace does not map is refused whatever this process holds",
+        );
+    }
+
+    #[test]
+    fn no_confirmation_can_skip_the_mapping_test() {
+        // The ordering bug this repair is about was reachable because the
+        // capability arm ran before the mapping test. It cannot now: both arms
+        // take a `MappedGid`, and the only constructor refuses the overflow
+        // gid, so there is nothing for an arm that skipped the test to be
+        // handed.
+        assert_eq!(MappedGid::of(OVER.gid, OVER), None);
+        assert_eq!(MappedGid::of(5, OVER), Some(MappedGid(5)));
+        assert_eq!(
+            MappedGid::of(OVER.gid, Overflow { uid: 0, gid: 0 }),
+            Some(MappedGid(OVER.gid)),
+            "the overflow gid is whatever the namespace says it is",
+        );
+
+        let gid = MappedGid::of(5, OVER).expect("a mapped gid");
+        assert!(in_group(gid, 5, &[]), "the effective group");
+        assert!(in_group(gid, 1, &[9, 5]), "a supplementary group");
+        assert!(!in_group(gid, 1, &[9]), "neither");
+        assert!(!in_group(gid, 1, &[]), "no groups at all");
+
+        // `capable_wrt_inode_uidgid`: the capability, and the owner mapped.
+        assert_eq!(
+            inode_capability(1000, gid, true, OVER),
+            Some(InodeCapability)
+        );
+        assert_eq!(
+            inode_capability(1000, gid, false, OVER),
+            None,
+            "no capability"
+        );
+        assert_eq!(
+            inode_capability(OVER.uid, gid, true, OVER),
+            None,
+            "an unmapped owner",
         );
     }
 
@@ -4031,18 +4298,42 @@ mod tests {
 
         // CAP_FSETID is capability 4, so the mask above is that bit alone.
         assert_eq!(1u64 << CAP_FSETID, 0x10);
+        assert!(cap_fsetid_in(Some("CapEff:\t0000000000000018\n")));
         assert!(
-            !cap_eff("CapEff:\t0000000000000008\n").is_some_and(|e| e & (1 << CAP_FSETID) != 0)
+            !cap_fsetid_in(Some("CapEff:\t0000000000000008\n")),
+            "another bit"
         );
-        assert!(cap_eff("CapEff:\t0000000000000018\n").is_some_and(|e| e & (1 << CAP_FSETID) != 0));
+        assert!(!cap_fsetid_in(Some("CapEff:\tnot a mask\n")), "unparsable");
+        assert!(!cap_fsetid_in(Some("")), "no CapEff line");
+        assert!(
+            !cap_fsetid_in(None),
+            "a /proc that could not be read confirms nothing, so it is not held",
+        );
 
-        // The overflow gid is the kernel's, read rather than assumed, and it
-        // is a gid either way.
-        let overflow = overflow_gid();
-        if let Ok(text) = std::fs::read_to_string("/proc/sys/kernel/overflowgid") {
-            assert_eq!(overflow.to_string(), text.trim());
-        } else {
-            assert_eq!(overflow, 65534);
+        // The overflow ids: the kernel's value when there is one, and the
+        // kernel's own default when there is not. Both arms, without needing a
+        // host that lacks /proc.
+        assert_eq!(overflow_in(Some("65534\n")), 65534);
+        assert_eq!(overflow_in(Some(" 60000 ")), 60000, "trimmed");
+        assert_eq!(
+            overflow_in(Some("nonsense")),
+            65534,
+            "unparsable falls back"
+        );
+        assert_eq!(overflow_in(Some("")), 65534, "empty falls back");
+        assert_eq!(overflow_in(Some("-1")), 65534, "not a u32 falls back");
+        assert_eq!(overflow_in(None), 65534, "unreadable falls back");
+
+        // And what this host actually reports, read rather than assumed.
+        let overflow = overflow_ids();
+        for (name, got) in [
+            ("/proc/sys/kernel/overflowuid", overflow.uid),
+            ("/proc/sys/kernel/overflowgid", overflow.gid),
+        ] {
+            match std::fs::read_to_string(name) {
+                Ok(text) => assert_eq!(got.to_string(), text.trim(), "{name}"),
+                Err(_) => assert_eq!(got, 65534, "{name}"),
+            }
         }
     }
 
@@ -4425,6 +4716,32 @@ mod tests {
         credentials: &[&str],
         seed: impl FnOnce(&Path),
     ) {
+        run_in_a_foreign_setgid_directory_under(
+            name,
+            child_env,
+            &["--map-auto", "--map-root-user"],
+            credentials,
+            seed,
+        );
+    }
+
+    /// As above, but with the namespace the **child** runs in given
+    /// separately from the one the setup steps run in.
+    ///
+    /// They differ for one case and it is the case D1 was about. The setup
+    /// needs `--map-auto` to `chown` the directory to group 5. A child run
+    /// under `--map-root-user` alone is in a namespace that maps *only* the
+    /// invoking ids, so group 5 has no mapping there and `stat` reports the
+    /// overflow gid — while the child is uid 0 with a full capability set.
+    /// That is the one combination `capable_wrt_inode_uidgid` refuses and
+    /// nothing else here constructs.
+    fn run_in_a_foreign_setgid_directory_under(
+        name: &str,
+        child_env: &str,
+        child_namespace: &[&str],
+        credentials: &[&str],
+        seed: impl FnOnce(&Path),
+    ) {
         // Written to the process's own stderr, not through `eprintln!`:
         // libtest captures the macro's output and discards it for a test that
         // passes, so a skip announced that way is invisible and the suite still
@@ -4455,13 +4772,16 @@ mod tests {
         // Each step in a user namespace mapping this user to root and its
         // subordinate ids above that: give the directory group 5, make it
         // setgid and world-writable, and run the child as uid 1.
-        let in_namespace = |args: &[&std::ffi::OsStr]| {
+        let unshared = |ns: &[&str], args: &[&std::ffi::OsStr]| {
             std::process::Command::new("unshare")
-                .args(["--map-auto", "--map-root-user", "--"])
+                .args(ns)
+                .arg("--")
                 .args(args)
                 .env(child_env, &dir)
                 .output()
         };
+        let in_namespace =
+            |args: &[&std::ffi::OsStr]| unshared(&["--map-auto", "--map-root-user"], args);
         for step in [
             [
                 std::ffi::OsStr::new("chown"),
@@ -4486,16 +4806,23 @@ mod tests {
             return skip("the directory is not setgid to a foreign group");
         }
 
-        let mut argv: Vec<&std::ffi::OsStr> = vec!["setpriv".as_ref()];
-        argv.extend(credentials.iter().map(|arg| std::ffi::OsStr::new(*arg)));
+        // No credentials asked for means no `setpriv` at all: the child keeps
+        // the ids and the capability set its namespace gave it. `setpriv`
+        // cannot be used for that anyway — a namespace created without
+        // `--map-auto` has `setgroups` denied, so even `--clear-groups` fails.
+        let mut argv: Vec<&std::ffi::OsStr> = Vec::new();
+        if !credentials.is_empty() {
+            argv.push("setpriv".as_ref());
+            argv.extend(credentials.iter().map(|arg| std::ffi::OsStr::new(*arg)));
+            argv.push("--".as_ref());
+        }
         argv.extend([
-            "--".as_ref(),
             exe.as_os_str(),
             "--exact".as_ref(),
             name.as_ref(),
             "--nocapture".as_ref(),
         ]);
-        let child = in_namespace(&argv);
+        let child = unshared(child_namespace, &argv);
         let out = match child {
             Ok(out) => out,
             Err(e) => return skip(&format!("unshare could not run: {e}")),

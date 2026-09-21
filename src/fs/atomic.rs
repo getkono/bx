@@ -165,14 +165,33 @@ pub enum Error {
         /// What is actually there.
         kind: Kind,
     },
-    /// The destination is a symlink the user created.
+    /// The destination is a symlink, and bx replaces no symlink.
     ///
     /// `rename(2)` onto a link's path replaces **the link itself**, so writing
-    /// "through" one would silently convert a link the user made into a regular
-    /// file. bx refuses instead.
+    /// "through" one would silently convert a link into a regular file. bx
+    /// refuses instead.
+    ///
+    /// # Including at a path bx owns
+    ///
+    /// The refusal is the same for a link found at a blob name inside the
+    /// state directory as for one at a file the user declared, and that is a
+    /// decision, not an oversight. bx did not make the link — it writes none —
+    /// so it is something that arrived from a restored backup, an `rsync
+    /// --links`, or a hand. Unlinking it would be bx deleting a name a person
+    /// or a tool put there, which is Invariant 1 whatever directory it is in,
+    /// and the content-addressed name gives bx no way to tell a stray link from
+    /// a deliberate one.
+    ///
+    /// What the refusal owes such a caller is a remedy that makes sense for a
+    /// file nobody declared, so the message leads with the one action that is
+    /// always right — remove the link it names — and offers the target-shaped
+    /// advice only as the alternative it is. A blob at
+    /// `<state>/restore/<digest>` is reconstructed on the next `record` once the
+    /// link is gone; nothing else has to be repaired.
     #[error(
-        "{} is a symlink; bx will not replace a link you created. \
-         Point the target at the file the link resolves to, or remove the link",
+        "{} is a symlink, and bx replaces no symlink: a rename onto it would replace the link \
+         itself. Remove the link. If you declared this path as a target, you can instead point \
+         the target at the file the link resolves to",
         .0.display()
     )]
     Symlink(PathBuf),
@@ -6570,6 +6589,56 @@ mod tests {
         write_atomically(&dest, &bytes, reference.mode).expect("restore");
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host old\n");
         assert_eq!(mode_of_path(&dest), Mode::from_bits(0o640));
+    }
+
+    #[test]
+    fn a_link_at_a_blob_name_is_refused_with_a_remedy_that_fits_a_path_bx_owns() {
+        // `write_atomically` refuses a symlink, and `Ledger::record` snapshots
+        // the prior through it, so a link at `restore/<digest>` — from a
+        // restored backup, an `rsync --links`, a hand — fails every record that
+        // needs that content. bx will not unlink it: it made no link, so the
+        // link is somebody's, and removing it inside bx's own directory is
+        // still removing it. What it owes is a remedy that makes sense for a
+        // file nobody declared.
+        let home = guarded_home();
+        let (dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host old\n", Mode::from_bits(0o640));
+        let blob = dir.restore().join(ContentHash::of(b"Host old\n").to_hex());
+        std::fs::create_dir_all(dir.restore()).expect("restore/");
+        let elsewhere = home.child("elsewhere");
+        std::fs::write(&elsewhere, b"not a blob\n").expect("seed");
+        std::os::unix::fs::symlink(&elsewhere, &blob).expect("symlink");
+
+        let filled = stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host new\n")
+            .expect("fill");
+        let entry = filled
+            .new_entry(home.path(), Mechanism::Own)
+            .expect("a portable entry");
+        let err = ledger
+            .record(entry.clone())
+            .expect_err("a link at the blob name is not bx's to replace");
+        let message = err.to_string();
+        assert!(
+            message.contains(&blob.display().to_string()),
+            "the refusal names the file to remove: {message}",
+        );
+        assert!(message.contains("Remove the link"), "{message}");
+        assert_eq!(
+            std::fs::read_link(&blob).expect("readlink"),
+            elsewhere,
+            "the link and what it names are left alone",
+        );
+        assert_eq!(std::fs::read(&elsewhere).expect("read"), b"not a blob\n");
+
+        // The remedy the message gives is the whole repair: the blob is
+        // content-addressed, so the next record reconstructs it.
+        std::fs::remove_file(&blob).expect("the remedy");
+        ledger.record(entry).expect("record repairs itself");
+        assert_eq!(std::fs::read(&blob).expect("read"), b"Host old\n");
+        filled.publish().expect("publish");
     }
 
     #[test]

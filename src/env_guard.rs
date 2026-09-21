@@ -5775,6 +5775,75 @@ mod tests {
             reason_of(&check("DATA_DIR", ROOT, &RootSet::strict())),
             Some(NoRootsDeclared)
         );
+        // The three measurements `refuses_anchor`'s doc records as the open
+        // exemption. They are asserted here so that record cannot rot: the
+        // doc says these two are `Allowed` and the third is not, and when the
+        // exemption is closed these fail and send whoever closed it to the
+        // paragraph that has to change with them (round-4 note COV4).
+        for name in ["DATA_DIR", "SCRATCH_HOME"] {
+            assert_eq!(
+                check(name, "/var/home/example/.local/state", &home_rooted),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            reason_of(&check(
+                "UV_CACHE_DIR",
+                "/var/home/example/.local/state",
+                &home_rooted
+            )),
+            Some(ContainsBxDirectory)
+        );
+    }
+
+    #[test]
+    fn the_guard_has_no_caller_outside_this_module() {
+        // The fact that caps the open anchor exemption at zero real-world
+        // impact, and makes invariant 2's "every generated environment
+        // fragment must pass through it" vacuously true: nothing calls the
+        // guard yet.
+        //
+        // Round-4 note COV3: that was prose, and prose is the same shape as
+        // the premise the exemption itself is criticised for — a safety claim
+        // nothing enforces. So it is a tripwire now. The first generator makes
+        // this fail, which is exactly when someone needs to read what it was
+        // capping. Reading the crate's own source to hold a property no type
+        // can carry is how `testing::tests::no_user_specific_literal_survives_        // under_src` already works.
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let own = src.join("env_guard.rs");
+        let mut callers = Vec::new();
+        let mut pending = vec![src];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src is readable") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") || path == own {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a source file");
+                for (idx, line) in text.lines().enumerate() {
+                    // A doc comment or a comment naming the module is prose,
+                    // not a call. `pub mod env_guard;` names no path into it.
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    if line.contains("env_guard::") {
+                        callers.push(format!("{}:{}", path.display(), idx + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            callers.is_empty(),
+            "the guard now has a caller: {callers:?}. Everything this module's docs cap at \
+             zero impact because nothing calls it — the open `Kind::Anchor` containing-check \
+             exemption on `refuses_anchor` above all — is live from here on. Read that \
+             paragraph before deleting this test."
+        );
     }
 
     #[test]

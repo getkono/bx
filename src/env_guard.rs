@@ -1794,8 +1794,23 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_root_contains_itself() {
+    fn a_declared_root_contains_itself_and_a_location_may_still_not_be_one() {
+        // The reflexivity issue #45 turns on, and the choice made about it.
+        // `contains` stays reflexive: it answers "is this path inside a root",
+        // and a root is. What changed is that the `Kind::Location` arm no
+        // longer reads reflexive containment as approval — `refuses_entry_at_root`
+        // asks separately whether the path's *parent* is inside a root, and a
+        // root's parent is not. The alternative, making `contains` irreflexive,
+        // would also move `refuses_anchor`, `refuses_program`, the search list
+        // and the socket, none of which issue #45 is about.
+        //
+        // Both halves are asserted here, so this cannot be read as sanctioning
+        // a location at a root.
         assert!(rooted().contains(Path::new(ROOT)));
+        assert_eq!(
+            reason_of(&check("CARGO_HOME", ROOT, &rooted())),
+            Some(Reason::DeclaredRootItself)
+        );
     }
 
     #[test]

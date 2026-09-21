@@ -84,11 +84,15 @@
 //! tests rather than left to review. Generated shell content that is **not** an
 //! environment fragment carries no environment assignment at all, which is what
 //! leaves nothing outside the guard's reach. The shell-init snippet is the one
-//! file bx generates under that rule: fixed text from bx's source that sets no
-//! environment variable outside bx's own `BX_` namespace, and gets every other
-//! variable by sourcing a guarded environment fragment.
-//! `tests::the_init_snippet_is_not_an_environment_fragment` proves it of the
-//! snippet rather than assuming it.
+//! file under that rule: fixed text that sets no environment variable outside
+//! bx's own `BX_` namespace, and gets every other variable by sourcing a
+//! guarded environment fragment.
+//! `tests::the_init_snippet_is_not_an_environment_fragment` holds the
+//! snippet's bytes to the rule rather than assuming it, and holds the bytes
+//! the repository actually keeps — `bench/fixtures/bx/bx-init.zsh`, which at
+//! this head is the snippet's only copy, because no bx code generates shell
+//! content yet. Nothing holds a *second* non-fragment file to the rule, so the
+//! generator that adds one carries the proof of its own bytes with it.
 //!
 //! **Reasons, and the one assertion.** Everything this module can be given —
 //! any name, any value, any fragment, well formed or not — comes back as a

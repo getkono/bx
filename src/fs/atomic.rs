@@ -318,6 +318,18 @@ pub enum Error {
         /// mode `plan` saw; `None` when bx set nothing back.
         set_back: Option<Mode>,
     },
+    /// The destination's parent directory does not exist, and the entry point
+    /// asked creates none.
+    ///
+    /// Only [`write_atomically`] raises it. [`stage`] creates a missing parent;
+    /// this is the shorthand that has no [`CreatedDirs`] to record one in, no
+    /// plan to announce it in, and no caller to say what mode it should get.
+    #[error(
+        "{} does not exist, and bx creates no directory for this write: nothing here decides \
+         what mode it would get. Create it, or declare it as a directory target",
+        .0.display()
+    )]
+    MissingParent(PathBuf),
     /// The path has a `..` component.
     ///
     /// The kernel resolves `..` *after* following the component before it, so
@@ -526,6 +538,7 @@ impl Error {
     pub fn path(&self) -> &Path {
         match self {
             Self::NoParent(path)
+            | Self::MissingParent(path)
             | Self::Symlink(path)
             | Self::NotAFile { path, .. }
             | Self::UnusableParent { path, .. }
@@ -1466,11 +1479,36 @@ impl std::error::Error for Unpublished {
 /// hands that plan's observation to [`stage`], and a caller that must record
 /// something between the `fsync` and the `rename` uses the phases directly.
 ///
+/// # The parent directory must already exist
+///
+/// This function creates no directories. [`stage`] does — at the mode a
+/// directory target declares, or at [`Mode::DEFAULT_DIR`] — and it is the only
+/// entry point that does, because creating one is a decision that needs three
+/// things this shorthand has none of: a [`CreatedDirs`] to record the directory
+/// in so a reversal can remove it, a [`compare`] to announce it in a plan
+/// before `apply` makes it, and a caller who knows what the directory is for
+/// and therefore what mode it should get. Inventing a `0755` directory here to
+/// hold a `0600` decrypted secret would answer that last question by default,
+/// silently, in the one function billed as the single place a secret is
+/// written.
+///
+/// So a missing parent is [`Error::MissingParent`]: the caller creates the
+/// directory it means, at the mode it means, and both state-directory callers
+/// already do.
+///
 /// # Errors
 ///
-/// Whatever [`observe`], [`stage`] or [`Staged::commit`] returns.
+/// [`Error::MissingParent`] when the destination's parent does not exist, and
+/// whatever [`observe`], [`stage`] or [`Staged::commit`] returns.
 pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Error> {
     let planned = observe(path)?;
+    // A parent that is there but does not resolve, or is a link, is left to the
+    // verdicts `stage` already has for it; only "nothing is there" is this one.
+    if let Some(parent) = &planned.parent
+        && matches!(parent.state, ParentState::Absent(_))
+    {
+        return Err(Error::MissingParent(parent.path.clone()));
+    }
     stage(path, mode, &planned, &mut CreatedDirs::new())?.commit(bytes)
 }
 
@@ -4260,7 +4298,9 @@ mod tests {
         let previous = rustix::process::umask(Mode::from_bits(0o077).into());
 
         let dest = home.child("wide/f");
-        let result = write_atomically(&dest, b"x", Mode::DEFAULT_FILE);
+        // Through the phases, not `write_atomically`: the parent is missing,
+        // and creating one is `stage`'s to do.
+        let result = stage_now(&dest, Mode::DEFAULT_FILE).and_then(|s| s.commit(b"x"));
 
         rustix::process::umask(previous);
         result.expect("write");
@@ -4846,7 +4886,11 @@ mod tests {
     fn a_missing_parent_directory_is_created_at_the_default_dir_mode() {
         let home = guarded_home();
         let dest = home.child("a/b/c/f");
-        write_atomically(&dest, b"x", Mode::PRIVATE_FILE).expect("write");
+        // `stage`, which is the only entry point that creates a directory.
+        stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .commit(b"x")
+            .expect("commit");
 
         assert_eq!(std::fs::read(&dest).expect("read"), b"x");
         for rel in ["a", "a/b", "a/b/c"] {
@@ -4856,6 +4900,47 @@ mod tests {
                 "{rel} is an implicit parent, created at 0755",
             );
         }
+    }
+
+    #[test]
+    fn the_one_call_shorthand_creates_no_directory_and_says_so() {
+        // The base's contract, kept for the entry point that has no
+        // `CreatedDirs` to record a directory in, no plan to announce it in,
+        // and no caller to say what mode it should get — which is how a 0600
+        // secret would otherwise land in a 0755 directory nobody decided on.
+        let home = guarded_home();
+        let dest = home.child("a/b/secret.age");
+
+        let err = write_atomically(&dest, b"x", Mode::PRIVATE_FILE)
+            .expect_err("the shorthand invents no directory");
+        assert!(
+            matches!(&err, Error::MissingParent(dir) if *dir == home.child("a/b")),
+            "{err:?}",
+        );
+        assert_eq!(err.path(), home.child("a/b"));
+        assert!(
+            err.to_string()
+                .contains("bx creates no directory for this write"),
+            "{err}",
+        );
+        assert!(!home.child("a").exists(), "nothing was created");
+        assert_eq!(names_in(home.path()), Vec::<OsString>::new());
+
+        // With the directory there it writes, and the mode of the directory is
+        // the caller's own decision rather than a default.
+        std::fs::create_dir_all(home.child("a/b")).expect("the caller creates it");
+        set_mode(&home.child("a/b"), Mode::PRIVATE_DIR).expect("chmod");
+        write_atomically(&dest, b"x", Mode::PRIVATE_FILE).expect("write");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"x");
+        assert_eq!(mode_of_path(&home.child("a/b")), Mode::PRIVATE_DIR);
+
+        // A parent that is there but does not resolve is still the conflict it
+        // was, not this.
+        let dangling = home.child("dangling");
+        std::os::unix::fs::symlink("nowhere", &dangling).expect("symlink");
+        let err = write_atomically(&dangling.join("f"), b"x", Mode::DEFAULT_FILE)
+            .expect_err("a dangling parent is unusable, not missing");
+        assert!(matches!(err, Error::UnusableParent { .. }), "{err:?}");
     }
 
     #[test]
@@ -4922,7 +5007,7 @@ mod tests {
         std::fs::create_dir(&dir).expect("mkdir");
         set_mode(&dir, Mode::from_bits(0o500)).expect("chmod");
 
-        let result = write_atomically(&dir.join("sub/f"), b"x", Mode::DEFAULT_FILE);
+        let result = stage_now(&dir.join("sub/f"), Mode::DEFAULT_FILE).and_then(|s| s.commit(b"x"));
         set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for the assertions");
 
         let err = result.expect_err("a read-only directory refuses the mkdir");
@@ -4993,8 +5078,10 @@ mod tests {
         // through an actual write.
         let bare = write_atomically(Path::new("bare"), b"x", Mode::DEFAULT_FILE);
         // And a relative path more than one component deep, where `ancestors`
-        // ends with `""`.
-        let deep = write_atomically(Path::new("a/b/c.txt"), b"y", Mode::PRIVATE_FILE);
+        // ends with `""`. Its directories are missing, so it goes through the
+        // phases: only `stage` creates one.
+        let deep =
+            stage_now(Path::new("a/b/c.txt"), Mode::PRIVATE_FILE).and_then(|s| s.commit(b"y"));
 
         std::env::set_current_dir(&previous).expect("restore the working directory");
         bare.expect("a bare relative name");

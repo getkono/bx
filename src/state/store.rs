@@ -163,34 +163,78 @@ pub enum Damage {
         /// order the file stores them. Never empty.
         rows: Vec<(String, String)>,
     },
+    /// The envelope decoded, and a ledger entry lists a directory among the
+    /// ones bx created on the way to its target that is not an ancestor of
+    /// that target.
+    ///
+    /// `record` refuses one on the way in, so a stored one is not something bx
+    /// wrote. Left in place it would be sorted among real ancestors by a depth
+    /// that says nothing about it, and `bx rm` would remove a directory it
+    /// never created for that target.
+    UnrelatedCreatedDirs {
+        /// Every damaged row, as `(target, the directory that is not its
+        /// ancestor)`, in the order the file stores them. Never empty.
+        rows: Vec<(String, String)>,
+    },
 }
 
 /// Why a file's loader did not accept a value that decoded.
+///
+/// There is no whole-file damage variant. Whole-file damage is what `decode`
+/// finds, before any `check` runs; a `check` looks at rows, removes the ones
+/// it rejects, and reports them — even when it rejects every row, which leaves
+/// the empty default and is [`Rejected::PartialDamage`] with nothing left. A
+/// `Damage` variant here was constructed by nothing in the crate, so its `From`
+/// impl and both of its arms in [`judge`] were branches no input could take and
+/// no test could pin, and the `Loss::Permanent` guard it carried was a second
+/// copy of the one on the decode path with nothing able to establish the two
+/// agreed (r4 round 2, D8).
 #[derive(Debug)]
 pub(crate) enum Rejected {
-    /// The contents are damaged, and nothing in them is usable. The value is
-    /// the empty default. Quarantined under the lock, reported without.
-    Damage(Damage),
-    /// Part of the contents is damaged, and the check has already removed it
-    /// from the value, which holds the rest.
+    /// The rows the check rejected, which it has already removed from the
+    /// value; the value holds the rest, and may hold nothing.
     ///
-    /// The file is quarantined exactly as for [`Rejected::Damage`], so nothing
-    /// is lost, and the health says the same thing — but the caller gets the
-    /// rows that do check out rather than an empty default. For the ledger
-    /// that is the difference between losing one target's restore index and
-    /// losing every target's: `CLAUDE.md` requires a corrupt machine-owned
-    /// file to degrade to recomputation, and the ledger is the one file
-    /// recomputation cannot rebuild, so the degradation has to be as small as
-    /// the damage.
+    /// The file is quarantined exactly as for damage `decode` found, so nothing
+    /// is lost — but the caller gets the rows that do check out rather than an
+    /// empty default. For the ledger that is the difference between losing one
+    /// target's restore index and losing every target's: `CLAUDE.md` requires a
+    /// corrupt machine-owned file to degrade to recomputation, and the ledger
+    /// is the one file recomputation cannot rebuild, so the degradation has to
+    /// be as small as the damage.
+    ///
+    /// The [`Damage`] carried must be one [`Damage::is_partial`] accepts, so
+    /// that a caller reading the health can tell partial survival from a total
+    /// reset.
     PartialDamage(Damage),
     /// The contents may be intact, and the context they were checked against is
     /// what is wrong. Returned to the caller; nothing is renamed.
     Refused(Error),
 }
 
-impl From<Damage> for Rejected {
-    fn from(damage: Damage) -> Self {
-        Self::Damage(damage)
+impl Damage {
+    /// Whether this damage is confined to rows a loader can remove, leaving
+    /// the rest of the file's contents loaded.
+    ///
+    /// This is what tells a caller holding a [`Health::Reset`] or a
+    /// [`Health::Damaged`] whether the value beside it is the empty default or
+    /// what survived. Row-shaped damage is found by a loader's `check`, which
+    /// removes the rows it names and keeps the others; every other variant is
+    /// found by `decode`, before there is a value at all, and costs the whole
+    /// file.
+    ///
+    /// A `true` here does **not** promise the value is non-empty: a file whose
+    /// every row was damaged keeps none. It promises that the rows named are
+    /// the whole of what was lost (r4 round 2, D2 and CL4).
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        match self {
+            Self::KeyMismatch { .. } | Self::UnrelatedCreatedDirs { .. } => true,
+            Self::Malformed
+            | Self::TrailingBytes
+            | Self::WrongKind { .. }
+            | Self::FutureVersion { .. }
+            | Self::DanglingLink => false,
+        }
     }
 }
 
@@ -217,29 +261,54 @@ impl std::fmt::Display for Damage {
                     .collect::<Vec<_>>();
                 f.write_str(&named.join("; "))
             }
+            Self::UnrelatedCreatedDirs { rows } => {
+                let named = rows
+                    .iter()
+                    .map(|(target, dir)| {
+                        format!("its entry for {target} lists {dir}, which is not above it")
+                    })
+                    .collect::<Vec<_>>();
+                f.write_str(&named.join("; "))
+            }
         }
     }
 }
 
 /// Where a loaded value came from.
+///
+/// # What survived is the value, not the variant
+///
+/// [`Health::Reset`] and [`Health::Damaged`] say *the file was damaged and how
+/// bx responded*. They do not say the value is empty: a loader that finds
+/// row-shaped damage removes the rows it names and keeps the rest, and the
+/// value then holds every row that checked out. [`Damage::is_partial`] is what
+/// tells the two apart, and `health.damage().is_some_and(Damage::is_partial)`
+/// is the question a `plan` or a `doctor` has to ask before it tells a user
+/// that nothing bx wrote survived (r4 round 2, D2 and CL4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
     /// There was no file. The value is the empty default, and nothing is wrong.
     Fresh,
     /// The file was read and decoded.
     Loaded,
-    /// The file was damaged, has been quarantined, and the value is the empty
-    /// default.
+    /// The file was damaged and has been quarantined. The value is what
+    /// survived the damage: the empty default unless [`Damage::is_partial`],
+    /// and the rows that checked out if it is.
     Reset(Damage),
     /// The file is damaged, and was **left where it is**, because the reader
-    /// holds no exclusive lock. The value is the empty default. The next holder
-    /// of the lock quarantines it.
+    /// holds no exclusive lock. The value is what survived, as for
+    /// [`Health::Reset`]. The next holder of the lock quarantines it.
     Damaged(Damage),
 }
 
 impl Health {
-    /// Whether the caller is looking at recovered-from-nothing state that has
-    /// been moved aside.
+    /// Whether the damaged file has been moved aside, and the value beside this
+    /// is what was recovered from it rather than what it held.
+    ///
+    /// **Not** "nothing survived": see the type's own documentation. A caller
+    /// that means *nothing bx wrote is left* must ask
+    /// `health.damage().is_some_and(Damage::is_partial)` as well, or look at
+    /// the value.
     #[must_use]
     pub fn is_reset(&self) -> bool {
         matches!(self, Self::Reset(_))
@@ -304,8 +373,25 @@ pub struct Loaded<T> {
     /// `Fingerprints::read` with no remedy named, though each file in it read
     /// perfectly well.
     ///
-    /// The cause is logged with the failure through `tracing::warn!`.
-    pub unlisted: Option<PathBuf>,
+    /// The cause travels with it: `EACCES` is a `chmod` the user can make, and
+    /// `EIO` or `EMFILE` are not, and a caller that only logs would otherwise
+    /// have to say "could not be listed" and stop there (r4 round 2, CL5).
+    pub unlisted: Option<Unlisted>,
+}
+
+/// A state directory that could not be listed, and why.
+///
+/// Not an `io::Error`: [`Loaded`] is `Clone` and `PartialEq`, and `io::Error`
+/// is neither. [`std::io::ErrorKind`] is both, and is the part a caller
+/// branches on; the rendered cause is kept beside it for the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unlisted {
+    /// The directory that could not be listed.
+    pub path: PathBuf,
+    /// What kind of failure it was — `PermissionDenied` is the remediable one.
+    pub kind: std::io::ErrorKind,
+    /// The failure as it renders, for a message.
+    pub cause: String,
 }
 
 impl<T> Loaded<T> {
@@ -356,13 +442,12 @@ pub(crate) fn load<T: DeserializeOwned + Default>(
 /// [`load`], with a check on the decoded value that decoding alone cannot make.
 ///
 /// `check` runs only on a value that decoded whole, and takes it by `&mut` so
-/// that it can *remove* what it rejects. [`Rejected::Damage`] is handled like
-/// any other decode failure and the value is discarded.
-/// [`Rejected::PartialDamage`] quarantines the file exactly the same way, and
-/// keeps whatever `check` left in the value. [`Rejected::Refused`] is returned
-/// as the error and renames nothing: a value refused against context the
-/// decoder did not have — the account's home — is never believed, and never
-/// discarded either.
+/// that it can *remove* what it rejects. [`Rejected::PartialDamage`]
+/// quarantines the file exactly as damage found by `decode` does, and keeps
+/// whatever `check` left in the value — which may be nothing, when every row
+/// was damaged. [`Rejected::Refused`] is returned as the error and renames
+/// nothing: a value refused against context the decoder did not have — the
+/// account's home — is never believed, and never discarded either.
 ///
 /// # Errors
 ///
@@ -392,10 +477,16 @@ pub(crate) fn load_checked<T: DeserializeOwned + Default>(
             tracing::warn!(
                 path = %path.display(),
                 directory = %dir.display(),
-                "{why}. {} was read; the quarantines of it that are present are not known.",
+                "listing {}: {why}. {} was read; the quarantines of it that are present are not \
+                 known.",
+                dir.display(),
                 path.display(),
             );
-            loaded.unlisted = Some(dir);
+            loaded.unlisted = Some(Unlisted {
+                path: dir,
+                kind: why.kind(),
+                cause: why.to_string(),
+            });
         }
     }
     Ok(loaded)
@@ -443,6 +534,17 @@ fn judge<T: DeserializeOwned + Default>(
                     unlisted: None,
                 });
             }
+            // `ENOTDIR` with no link at `path` means a component above the file
+            // is not a directory — a plain file at `~/.local/state/bx`, say.
+            // "reading ~/.local/state/bx/ledger.mpk: Not a directory" names a
+            // file inside a file and no remedy, while `Error::NotADirectory`
+            // says exactly the right thing and, until now, was raised only from
+            // `ensure_dir` — which a lockless read never calls (r4 round 2, D5).
+            if source.raw_os_error() == Some(rustix::io::Errno::NOTDIR.raw_os_error())
+                && let Some(blocking) = not_a_directory_above(path)
+            {
+                return Err(Error::NotADirectory { path: blocking });
+            }
             return Err(Error::Read {
                 path: path.to_path_buf(),
                 source,
@@ -481,18 +583,35 @@ fn judge<T: DeserializeOwned + Default>(
             quarantined: Vec::new(),
             unlisted: None,
         }),
-        Err(Rejected::Damage(Damage::FutureVersion { found, supported }))
-            if loss == Loss::Permanent =>
-        {
-            future_version(found, supported)
-        }
-        Err(Rejected::Damage(damage)) => degrade(path, damage, lock, T::default()),
         // The same quarantine, so nothing is lost, and the rows that did check
         // out rather than the empty default. `check` has already removed the
         // damaged ones from `value`.
-        Err(Rejected::PartialDamage(damage)) => degrade(path, damage, lock, value),
+        Err(Rejected::PartialDamage(damage)) => {
+            debug_assert!(
+                damage.is_partial(),
+                "a check's damage must be one `Damage::is_partial` accepts, or the health \
+                 reports a total reset for a file that kept rows",
+            );
+            degrade(path, damage, lock, value)
+        }
         Err(Rejected::Refused(error)) => Err(error),
     }
+}
+
+/// The shallowest component of `path`'s own directory chain that exists and is
+/// not a directory.
+///
+/// What an `ENOTDIR` from a read is actually about: the read names a file, and
+/// the thing in the way is one of the directories it was to be found in.
+/// `None` when every ancestor is a directory — the `ENOTDIR` then came from
+/// somewhere else, and inventing a cause would be worse than the errno.
+fn not_a_directory_above(path: &Path) -> Option<PathBuf> {
+    let mut chain: Vec<_> = path.ancestors().skip(1).collect();
+    chain.reverse();
+    chain
+        .into_iter()
+        .find(|a| std::fs::metadata(a).is_ok_and(|m| !m.is_dir()))
+        .map(Path::to_path_buf)
 }
 
 /// Whether a failed `read` is one that following a symbolic link to nowhere
@@ -686,33 +805,19 @@ pub(crate) fn assert_saves_identically<T: Serialize>(
     );
 }
 
+/// A `tracing` sink that captures this thread's diagnostics, for the tests
+/// of every module that raises one.
+///
+/// Beside [`assert_saves_identically`] and for the same reason: the harness
+/// was private to `store.rs`'s own test module, so the `tracing::warn!` in
+/// `dir::tighten` and the one in `lock::open_lock_file` could be deleted
+/// whole and the suite stayed green (r4 round 2, COV1).
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::path::PathBuf;
-
-    use crate::state::StateDir;
-
-    const KIND: &str = "bx.test";
-    const OTHER: &str = "bx.other";
-    const VERSION: u16 = 3;
-
-    type Value = BTreeMap<String, u32>;
-
-    /// [`load`] under the exclusive lock of `path`'s directory, as a writer does.
-    fn locked_load<T: DeserializeOwned + Default>(path: &Path) -> Result<Loaded<T>, Error> {
-        let dir = StateDir::new(path.parent().expect("a parent").to_path_buf());
-        let lock = ExclusiveLock::acquire(&dir).expect("lock");
-        load(path, KIND, VERSION, Loss::Recomputable, Some(&lock))
-    }
-
+pub(crate) mod capture {
     /// A `tracing` sink that keeps what was written to it.
     ///
     /// No test in the repository installed a subscriber, so every
-    /// `tracing::warn!` in this module had its *argument expressions* executed
+    /// `tracing::warn!` in `state` had its *argument expressions* executed
     /// zero times: the enabled-check ran, found no subscriber, and the body
     /// never did. Deleting a warning whose text the module documentation and
     /// `state/mod.rs` both state as part of the contract left the whole suite
@@ -757,7 +862,7 @@ mod tests {
     /// caches each callsite's interest process-wide, so a thread with no
     /// subscriber installed can cache "never" for a callsite another thread is
     /// about to use, and the capture comes back empty at random.
-    fn capturing<T>(f: impl FnOnce() -> T) -> (T, String) {
+    pub(crate) fn capturing<T>(f: impl FnOnce() -> T) -> (T, String) {
         static INSTALLED: std::sync::Once = std::sync::Once::new();
         INSTALLED.call_once(|| {
             tracing::subscriber::set_global_default(
@@ -783,6 +888,31 @@ mod tests {
         let out = f();
         let bytes = into.lock().expect("the sink").clone();
         (out, String::from_utf8(bytes).expect("utf-8 diagnostics"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+
+    use super::capture::capturing;
+    use crate::state::StateDir;
+
+    const KIND: &str = "bx.test";
+    const OTHER: &str = "bx.other";
+    const VERSION: u16 = 3;
+
+    type Value = BTreeMap<String, u32>;
+
+    /// [`load`] under the exclusive lock of `path`'s directory, as a writer does.
+    fn locked_load<T: DeserializeOwned + Default>(path: &Path) -> Result<Loaded<T>, Error> {
+        let dir = StateDir::new(path.parent().expect("a parent").to_path_buf());
+        let lock = ExclusiveLock::acquire(&dir).expect("lock");
+        load(path, KIND, VERSION, Loss::Recomputable, Some(&lock))
     }
 
     /// Every name in `dir` but the lock file, sorted.
@@ -1320,6 +1450,12 @@ mod tests {
         )
         .expect("a missing directory lists nothing");
         assert!(absent.quarantined.is_empty());
+        // r4 round 2 (COV4): "no directory, so none — *known*" is the whole
+        // distinction `unlisted` exists to draw, and nothing pinned it here.
+        // It holds because `numbered`'s `NotFound` arm returns an empty list
+        // rather than a listing failure; without that this would be `Some`,
+        // and an empty `quarantined` beside it would mean nothing is known.
+        assert_eq!(absent.unlisted, None, "absent is known, not unknown");
 
         std::fs::write(&path, b"garbage").expect("seed");
         let reset: Loaded<Value> = locked_load(&path).expect("load");
@@ -1390,11 +1526,15 @@ mod tests {
         let loaded = loaded.expect("the file itself read perfectly");
         assert_eq!(loaded.value, sample(), "the load stands");
         assert_eq!(loaded.health, Health::Loaded);
-        assert_eq!(
-            loaded.unlisted.as_deref(),
-            Some(root.as_path()),
-            "the directory it could not list",
-        );
+        let unlisted = loaded
+            .unlisted
+            .clone()
+            .expect("the directory it could not list");
+        assert_eq!(unlisted.path, root);
+        // r4 round 2 (CL5): the cause used to be logged and dropped, so a
+        // caller could not tell a remediable `chmod` from a failing disk.
+        assert_eq!(unlisted.kind, std::io::ErrorKind::PermissionDenied);
+        assert!(unlisted.cause.contains("Permission denied"), "{unlisted:?}");
         assert!(
             loaded.quarantined.is_empty(),
             "empty because nothing is known",
@@ -1455,13 +1595,18 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
+        // A *linked* state directory at `0500`. `ensure_dir` never `chmod`s
+        // through a link — see `dir::tighten` — so this is the one shape it
+        // leaves unwritable, and the atomic write's temporary file cannot be
+        // created in it. An unlinked `0500` would be set back to `0700` and
+        // the write would succeed (r4 round 2, CL3).
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o500)).expect("chmod");
         let root = dir.path().join("state");
-        std::fs::create_dir(&root).expect("root");
-        // `0500` shares nothing, so `ensure_dir` leaves it exactly as it is —
-        // and the atomic write's temporary file cannot be created in it.
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        std::os::unix::fs::symlink(&real, &root).expect("link");
         let result = save(&root.join("v.mpk"), KIND, VERSION, &sample());
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("restore");
 
         let err = result.expect_err("must fail");
         assert!(
@@ -1472,6 +1617,48 @@ mod tests {
             names_but_the_lock(&root),
             Vec::<String>::new(),
             "nothing left"
+        );
+    }
+
+    #[test]
+    fn a_file_where_the_state_directory_should_be_is_named_as_such_on_a_lockless_read() {
+        // r4 round 2 (D5): `LedgerView::read` and `Fingerprints::read` never
+        // call `ensure`, so the only code that raised `Error::NotADirectory`
+        // was out of reach on the read path. With a plain file at
+        // `~/.local/state/bx`, the read failed `ENOTDIR` and reported
+        // "reading ~/.local/state/bx/ledger.mpk: Not a directory" — a file
+        // inside a file, with no remedy — while the right error existed and
+        // said exactly the right thing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking = dir.path().join("bx");
+        std::fs::write(&blocking, b"not a directory").expect("seed");
+
+        let err = load::<Value>(
+            &blocking.join("v.mpk"),
+            KIND,
+            VERSION,
+            Loss::Recomputable,
+            None,
+        )
+        .expect_err("must fail");
+        assert!(
+            matches!(&err, Error::NotADirectory { path } if *path == blocking),
+            "got {err}",
+        );
+        assert!(err.to_string().contains("move or remove it"), "{err}");
+
+        // Deeper, too: the component in the way is named, not the leaf.
+        let err = load::<Value>(
+            &blocking.join("restore/v.mpk"),
+            KIND,
+            VERSION,
+            Loss::Recomputable,
+            None,
+        )
+        .expect_err("must fail");
+        assert!(
+            matches!(&err, Error::NotADirectory { path } if *path == blocking),
+            "got {err}",
         );
     }
 
@@ -1503,10 +1690,12 @@ mod tests {
         let loaded: Loaded<Value> =
             load_checked(&path, KIND, VERSION, Loss::Recomputable, None, |_| {
                 save(&path, KIND, VERSION, &sample()).expect("the writer saves");
-                Err(Damage::Malformed.into())
+                Err(Rejected::PartialDamage(Damage::KeyMismatch {
+                    rows: vec![("k".to_string(), "other".to_string())],
+                }))
             })
             .expect("load");
-        assert_eq!(loaded.health, Health::Damaged(Damage::Malformed));
+        assert!(loaded.health.damage().is_some_and(Damage::is_partial));
 
         let now: Loaded<Value> =
             load(&path, KIND, VERSION, Loss::Recomputable, None).expect("reload");
@@ -1744,12 +1933,16 @@ mod tests {
             value: 1_u32,
             health: Health::Reset(Damage::Malformed),
             quarantined: vec![PathBuf::from("/s/v.mpk.corrupt")],
-            unlisted: Some(PathBuf::from("/s")),
+            unlisted: Some(Unlisted {
+                path: PathBuf::from("/s"),
+                kind: std::io::ErrorKind::PermissionDenied,
+                cause: "Permission denied".to_string(),
+            }),
         };
         let mapped = loaded.map(|v| v + 1);
         assert_eq!(mapped.value, 2);
         assert_eq!(mapped.health, Health::Reset(Damage::Malformed));
         assert_eq!(mapped.quarantined, vec![PathBuf::from("/s/v.mpk.corrupt")]);
-        assert_eq!(mapped.unlisted, Some(PathBuf::from("/s")));
+        assert_eq!(mapped.unlisted.map(|u| u.path), Some(PathBuf::from("/s")),);
     }
 }

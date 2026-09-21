@@ -148,24 +148,28 @@ impl StateDir {
     /// Missing **ancestors** (`~/.local`, `~/.local/state`) are created with the
     /// process `umask`, because they are shared with every other XDG-aware tool
     /// and are not bx's to tighten. The directories bx invents — `bx/`,
-    /// `bx/restore/`, `bx/shell/` — are created at `0700` and tightened back to
-    /// `0700` if they are found wider, because they hold `local.toml`, the age
-    /// identity, and prior copies of the user's private files. See [`tighten`]
-    /// for why a directory already there is narrowed whoever made it, why a
-    /// linked one is refused rather than narrowed, and what ownership is
-    /// checked.
+    /// `bx/restore/`, `bx/shell/` — are created at `0700` and set back to
+    /// `0700` whenever they are found at anything else, because they hold
+    /// `local.toml`, the age identity, and prior copies of the user's private
+    /// files. See [`tighten`] for why a directory already there is repaired
+    /// whoever made it, why a linked one is refused rather than changed, and
+    /// what ownership is checked.
     ///
-    /// **A read-only command calls this.** `bx plan` and `bx doctor` take the
-    /// shared lock, and a lock needs a file, so they create the state
-    /// directory on a machine that has never applied anything. Invariant 1
-    /// forbids rewriting a byte the *user* wrote, and none of these paths is
-    /// one; see the [`super::lock`] module documentation for the argument.
+    /// **No command calls this yet.** On this branch every caller is a test;
+    /// `apply` is the entry that will call it. A read-only command still
+    /// creates the state *root*, because `bx plan` and `bx doctor` take the
+    /// shared lock and a lock needs a file — but that goes through
+    /// [`ensure_dir`] on the root alone, not through here, so `restore/` and
+    /// `shell/` are not created by a read. Invariant 1 forbids rewriting a byte
+    /// the *user* wrote, and none of these paths is one; see the
+    /// [`super::lock`] module documentation for the argument.
     ///
     /// # Errors
     ///
     /// [`Error::NotADirectory`] when something that is not a directory occupies
-    /// one of those paths, naming the path to clear, and [`Error::CreateDir`]
-    /// for any other failure.
+    /// one of those paths, naming the path to clear,
+    /// [`Error::UnwritableAncestor`] when a directory above one of them cannot
+    /// be written in, and [`Error::CreateDir`] for any other failure.
     pub fn ensure(&self) -> Result<(), Error> {
         ensure_dir(&self.root, Mode::PRIVATE_DIR)?;
         ensure_dir(&self.restore(), Mode::PRIVATE_DIR)?;
@@ -182,23 +186,74 @@ impl StateDir {
 /// The explicit `chmod` after `mkdir` is not redundant: `mkdir` applies the
 /// process `umask`, so an unusual `umask` would otherwise leave a directory bx
 /// promised at `0700` at something else.
+///
+/// # A `umask` that strips the owner's own bits
+///
+/// The ancestors get the process `umask`, and a `umask` with owner bits in it
+/// — `0277`, `0377`, `0500` — leaves the `~/.local` this call just created at
+/// `0500`, which this account cannot write in. The `mkdir` of the next
+/// component then fails `EACCES` inside a directory bx made one statement
+/// earlier, and "creating ~/.local/state/bx: Permission denied" names neither
+/// the directory that is in the way nor the `umask` that made it. So an
+/// `EACCES` or `EPERM` is turned into [`Error::UnwritableAncestor`], which
+/// names the ancestor, its mode, and the `chmod` that clears it (r4 round 2,
+/// D4). The ancestor mode itself is left alone: it is shared with every other
+/// XDG-aware tool and is not bx's to widen behind the user's `umask`.
 pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
-    let create_failed = |source: Errno| Error::CreateDir {
-        path: path.to_path_buf(),
-        source: source.into(),
+    let create_failed = |source: std::io::Error| {
+        blame_ancestor(path, &source).unwrap_or(Error::CreateDir {
+            path: path.to_path_buf(),
+            source,
+        })
     };
     // No parent only for `/` or an empty path: never a resolved root, `restore/` or `shell/`.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
-            path: parent.to_path_buf(),
-            source,
+        std::fs::create_dir_all(parent).map_err(|source| {
+            blame_ancestor(parent, &source).unwrap_or(Error::CreateDir {
+                path: parent.to_path_buf(),
+                source,
+            })
         })?;
     }
     match rustix::fs::mkdir(path, mode.into()) {
-        Ok(()) => rustix::fs::chmod(path, mode.into()).map_err(create_failed),
+        Ok(()) => rustix::fs::chmod(path, mode.into()).map_err(|s| create_failed(s.into())),
         Err(Errno::EXIST) => tighten(path, mode),
-        Err(source) => Err(create_failed(source)),
+        Err(source) => Err(create_failed(source.into())),
     }
+}
+
+/// [`Error::UnwritableAncestor`] when `source` is a permission failure and a
+/// directory above `path` is one this account cannot write in.
+///
+/// Only the deepest existing ancestor is named: it is the one the failing
+/// `mkdir` was inside, and the one a `chmod` has to reach for. `None` when the
+/// failure is not a permission failure, or when every ancestor that exists is
+/// writable — then the original error is the honest one, and inventing a
+/// diagnosis from a race would be worse than the errno.
+fn blame_ancestor(path: &Path, source: &std::io::Error) -> Option<Error> {
+    if source.kind() != std::io::ErrorKind::PermissionDenied {
+        return None;
+    }
+    let ancestor = path.ancestors().skip(1).find(|a| a.exists())?;
+    let found = Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(ancestor).ok()?.permissions(),
+    ));
+    // `W_OK | X_OK` for the invoking account, asked of the kernel rather than
+    // inferred from the bits: ownership, group membership and root all change
+    // the answer, and only `access` knows all three.
+    if rustix::fs::access(
+        ancestor,
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+    )
+    .is_ok()
+    {
+        return None;
+    }
+    Some(Error::UnwritableAncestor {
+        path: path.to_path_buf(),
+        ancestor: ancestor.to_path_buf(),
+        mode: found,
+    })
 }
 
 /// Move a damaged state file aside, to the quarantine number after the highest
@@ -326,14 +381,13 @@ pub(crate) mod noreplace_seam {
 ///
 /// # Errors
 ///
-/// [`Error::Read`] if the directory exists and cannot be listed: an empty list
-/// there would be a guess.
-pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, Error> {
-    let numbers = numbered(path).map_err(|source| Error::Read {
-        path: path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
-        source,
-    })?;
-    Ok(numbers
+/// The listing failure itself if the directory exists and cannot be listed: an
+/// empty list there would be a guess. The `io::Error` is handed back rather
+/// than wrapped, because the only caller reports the *kind* as well as the
+/// text — `EACCES` is a `chmod` the user can make and `EIO` is not — and
+/// wrapping it here threw that away (r4 round 2, CL5).
+pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    Ok(numbered(path)?
         .into_iter()
         .map(|n| StateDir::quarantine_nth(path, n))
         .collect())
@@ -440,6 +494,19 @@ fn open_beyond_owner(mode: Mode) -> bool {
 /// directory holding that file can be searched by others too; otherwise no
 /// other account can open it, whatever its mode.
 ///
+/// # One component, and why that is the whole question
+///
+/// Only the immediate parent of the resolved file is judged, not the whole
+/// ancestor chain, and that is conservative in **both** directions (r4 round 2,
+/// CL9). Traversal needs search permission on every component, so a parent
+/// another account cannot search makes the file unreachable whatever the
+/// components above it are: the early `Ok` cannot be wrong. And a parent that
+/// others *can* search is only assumed reachable — an ancestor above it may
+/// close the path — so the refusal that follows can over-refuse and never
+/// under-refuse. Decision 34's rule, "no state directory bx accepts lets
+/// another account open `local.toml`", is therefore kept by one `stat` rather
+/// than by walking to the root of a filesystem bx did not lay out.
+///
 /// # Errors
 ///
 /// [`Error::ExposedLocalLayer`], and [`Error::Read`] if the file, or the
@@ -519,10 +586,27 @@ pub(crate) fn check_owner(path: &Path, uid: u32) -> Result<(), Error> {
     })
 }
 
-/// Check that an existing `path` is a directory owned by this account, and
-/// narrow it to `mode` if it is reachable by anyone but its owner.
+/// Check that an existing `path` is a directory owned by this account, and set
+/// it to `mode` if it is at anything else.
 ///
-/// # Why a pre-existing directory is narrowed at all
+/// # One rule for both objects bx promises a mode for
+///
+/// A directory bx created at its own state path is repaired on **inequality**,
+/// exactly as [`open_lock_file`][super::lock] repairs the lock file: the
+/// object bx promises at `0700` was not at `0700`. Sharing alone is not the
+/// test, because `mode & 0o077` is structurally unable to see a mode wrong in
+/// the owner bits — and a state directory left at `0500`, by a crash between
+/// the `mkdir` and the `chmod` below, by an exotic `umask`, or by the user's
+/// own hand, makes every later write fail `EACCES` with no repair and no
+/// diagnostic. Two rules for the same question was the round-1 defect on the
+/// lock file; one rule for both is the answer (r4 round 2, CL3).
+///
+/// Narrowing and widening are sanctioned by different arguments, and both
+/// hold here. Narrowing is the privacy argument below. Widening is not bx
+/// dictating a layout: it applies only to the three directories bx creates at
+/// its own state path and promises at `0700`, and it is logged.
+///
+/// # Why a pre-existing directory is repaired at all
 ///
 /// bx narrows a directory found at its own state path, whoever made it,
 /// because that directory holds `restore/` — verbatim copies of the user's
@@ -590,12 +674,17 @@ fn tighten(path: &Path, mode: Mode) -> Result<(), Error> {
         }
         return check_local_layer(path, found);
     }
-    if found.is_shared() {
+    if found != mode {
         tracing::warn!(
             path = %path.display(),
             found = %found,
-            tightened_to = %mode,
-            "the bx state directory was readable beyond its owner; tightening it",
+            set_to = %mode,
+            "the bx state directory was {found}, not {mode}{}; setting it",
+            if found.is_shared() {
+                ", and was reachable beyond its owner"
+            } else {
+                ""
+            },
         );
         rustix::fs::chmod(path, mode.into()).map_err(|source| Error::CreateDir {
             path: path.to_path_buf(),
@@ -760,15 +849,57 @@ mod tests {
     }
 
     #[test]
-    fn ensure_leaves_an_owner_only_directory_alone() {
+    fn repairing_a_directorys_mode_says_so_through_tracing() {
+        // r4 round 2 (COV1): round 1's repair reached `store.rs` only. No test
+        // in the repository installed a subscriber reachable from here, so
+        // this warning's argument expressions ran zero times and deleting the
+        // macro whole left the suite green — and this is the only signal a
+        // user gets that bx narrowed a directory they own, which is what
+        // decision 50 was sanctioned on.
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("first");
-        // 0500 is not shared, so it is not bx's business to change it.
-        std::fs::set_permissions(dir.shell(), std::fs::Permissions::from_mode(0o500))
+        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o755))
+            .expect("widen");
+        let (result, said) = crate::state::store::capture::capturing(|| dir.ensure());
+        result.expect("second");
+        assert!(
+            said.contains("the bx state directory was 0755, not 0700"),
+            "{said}"
+        );
+        assert!(said.contains("reachable beyond its owner"), "{said}");
+        assert!(said.contains(&dir.root().display().to_string()), "{said}");
+
+        // A mode wrong only in the owner bits is repaired too, and says so
+        // without claiming anyone else could reach it.
+        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o500))
             .expect("narrow");
-        dir.ensure().expect("second");
-        assert_eq!(mode_of(&dir.shell()), Mode::from_bits(0o500));
+        let (result, said) = crate::state::store::capture::capturing(|| dir.ensure());
+        result.expect("third");
+        assert!(
+            said.contains("the bx state directory was 0500, not 0700"),
+            "{said}"
+        );
+        assert!(!said.contains("reachable beyond its owner"), "{said}");
+    }
+
+    #[test]
+    fn ensure_sets_a_directory_that_is_not_0700_back_to_it() {
+        // r4 round 2 (CL3): the repair fired on `is_shared` — `mode & 0o077` —
+        // which is structurally unable to see a mode wrong in the OWNER bits,
+        // so a `0500` state directory was deliberately left, and every later
+        // write into it failed `EACCES` with no repair and no diagnostic. The
+        // lock file is repaired on inequality for exactly this reason; one
+        // rule now governs both.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("first");
+        for wrong in [0o500, 0o600, 0o755, 0o770] {
+            std::fs::set_permissions(dir.shell(), std::fs::Permissions::from_mode(wrong))
+                .expect("set");
+            dir.ensure().expect("second");
+            assert_eq!(mode_of(&dir.shell()), Mode::PRIVATE_DIR, "from {wrong:04o}",);
+        }
     }
 
     #[test]
@@ -1372,20 +1503,34 @@ mod tests {
         );
         assert!(err.to_string().contains("Move it aside"), "{err}");
 
-        if rustix::process::geteuid().is_root() {
-            // `/` is this process's own directory then, so the refusal below
-            // cannot be staged without making a second account.
-            return;
-        }
-        // `/` is a real directory this account does not own, and `tighten`
-        // used to judge it by its mode alone: 0755 is shared, so it would
-        // reach for the `chmod` and report whatever that failed with.
-        let err = tighten(Path::new("/"), Mode::PRIVATE_DIR).expect_err("not ours");
+        // r4 round 2 (COV6): the call site used to be reached only when this
+        // process was unprivileged, so on a root CI runner nothing exercised
+        // `tighten`'s `check_owner` at all and a mutant deleting the call
+        // survived there. Root is the case that can *stage* a foreign owner
+        // rather than the case that cannot, so it gets its own staging.
+        let home = guarded_home();
+        let (foreign, owner) = if rustix::process::geteuid().is_root() {
+            // `/` is this process's own directory now, so one is made and
+            // given away — which only root can do.
+            let made = home.child("theirs");
+            std::fs::create_dir(&made).expect("mkdir");
+            let nobody = rustix::fs::Uid::from_raw(65_534);
+            rustix::fs::chown(&made, Some(nobody), None).expect("chown");
+            (made, 65_534)
+        } else {
+            // `/` is a real directory this account does not own, and `tighten`
+            // used to judge it by its mode alone: 0755 is shared, so it would
+            // reach for the `chmod` and report whatever that failed with.
+            (PathBuf::from("/"), 0)
+        };
+        let before = mode_of(&foreign);
+        let err = tighten(&foreign, Mode::PRIVATE_DIR).expect_err("not ours");
         assert!(
-            matches!(&err, Error::ForeignOwner { path, .. } if path == Path::new("/")),
+            matches!(&err, Error::ForeignOwner { path, owner: uid, .. }
+                if *path == foreign && *uid == owner),
             "got {err}",
         );
-        assert_eq!(mode_of(Path::new("/")).bits() & 0o7777, 0o755, "untouched");
+        assert_eq!(mode_of(&foreign), before, "untouched");
     }
 
     #[test]

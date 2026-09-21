@@ -54,9 +54,21 @@
 //! renamed. A newer fingerprint cache is still damage: losing it costs a
 //! recomputation.
 //!
+//! # `sudo bx` is refused, on purpose
+//!
+//! [`StateDir::ensure`] and the lock path compare the state directory's owner
+//! against the *effective* uid, so a `~/.local/state/bx` owned by the ordinary
+//! user is [`Error::ForeignOwner`] to a root process and `sudo bx` stops there.
+//! That is the intended consequence and not an oversight (r4 round 2, CL8): the
+//! directory holds verbatim copies of the user's private files, and a root run
+//! writing into a directory an unprivileged account controls is a directory
+//! that account can swap under it. The message says "run bx as the account that
+//! owns it", which is the supported way to run it.
+//!
 //! A file that **cannot be read** is a different thing and is handled the
-//! opposite way. `EACCES` left behind by a `sudo bx`, `EIO` from a failing
-//! disk, `EMFILE` from fd exhaustion — in none of those is anything known about
+//! opposite way. `EACCES` on a state file — left in a directory an earlier root
+//! run created — `EIO` from a failing
+//! disk, `EMFILE` from fd exhaustion: in none of those is anything known about
 //! the file's contents, and the bytes a quarantine would move aside may be a
 //! perfectly good ledger. So nothing is renamed, nothing is replaced, and
 //! [`Error::Read`] is returned: [`Ledger::open`], [`LedgerView::read`] and
@@ -97,7 +109,7 @@ pub use hash::ContentHash;
 pub use ledger::RestoreRef;
 pub use ledger::{Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes};
 pub use lock::{ExclusiveLock, Holder, SharedLock};
-pub use store::{Damage, Health, Loaded};
+pub use store::{Damage, Health, Loaded, Unlisted};
 
 /// Everything that can go wrong in the state directory.
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +119,31 @@ pub enum Error {
     NotADirectory {
         /// The offending path.
         path: PathBuf,
+    },
+    /// A directory could not be created because a directory above it cannot be
+    /// written in by this account.
+    ///
+    /// Usually a `umask` with owner bits in it — `0277`, `0377`, `0500` — met
+    /// on a home with no `~/.local/state` yet: the ancestors bx creates take
+    /// the process `umask`, and one at `0500` is a directory this account can
+    /// read and search and not write. Reported separately from
+    /// [`Error::CreateDir`] because "Permission denied" alone names neither the
+    /// directory in the way nor the `umask` that made it.
+    #[error(
+        "creating {}: {} is {mode}, and this account cannot write in it. If your umask strips \
+         the owner's write or execute bit, that is what made it. Run `chmod u+wx {}` and run bx \
+         again",
+        .path.display(),
+        .ancestor.display(),
+        .ancestor.display()
+    )]
+    UnwritableAncestor {
+        /// The directory bx was trying to create.
+        path: PathBuf,
+        /// The deepest directory above it that exists, and cannot be written.
+        ancestor: PathBuf,
+        /// That directory's mode.
+        mode: Mode,
     },
     /// A directory could not be created.
     #[error("creating {}: {source}", .path.display())]
@@ -468,16 +505,16 @@ pub enum Error {
     /// Something other than the plain file bx wrote occupies a restore
     /// snapshot's name.
     ///
-    /// A symlink, a second hard link, a directory, a FIFO or a device. The
-    /// write side establishes a snapshot's length through `O_PATH | O_NOFOLLOW` and
-    /// refuses anything but a single-linked regular file; the read side asks
-    /// the same question, so that what `bx rm` restores is the file bx wrote
-    /// and not whatever was put at its name. Reading one of these would block
-    /// forever on a FIFO, or allocate without bound through a link to
-    /// `/dev/zero`.
+    /// A symlink, a directory, a FIFO or a device. Reading one of these would
+    /// block forever on a FIFO, or allocate without bound through a link to
+    /// `/dev/zero`, so the read side refuses anything but a regular file.
+    ///
+    /// A second hard link is **not** one of them: see
+    /// [`LedgerView::restore_bytes`] for why the write side's `nlink` test is
+    /// not repeated on the read side.
     #[error(
         "the restore snapshot {digest} is not the plain file bx wrote: {} is a symbolic link, a \
-         hard link, a directory or a special file. Move it aside and run bx again",
+         directory or a special file. Move it aside and run bx again",
         .path.display()
     )]
     RestoreNotAFile {

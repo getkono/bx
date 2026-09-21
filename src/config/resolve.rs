@@ -346,6 +346,15 @@ fn refuse_committed_requirement(target: &Target, tool: &str) -> Result<(), Error
 /// whether or not it applies for this account, so the refusal is the same for
 /// every account; the message names each declaration on the way.
 ///
+/// `file` may hold both kinds of reference. The one refused is whichever comes
+/// **first in written order**, with the chain behind it, and there is no
+/// preference for the more direct one. A value directly of kind `path` is a
+/// one-step chain, so the two cases are one walk and one message shape; a rule
+/// that reported the direct reference first would tell the reader about the
+/// second `{{name}}` in the field and leave the first, whose chain is just as
+/// fatal, unmentioned. Written order is also the deterministic choice, which is
+/// the direction Invariant 3 points.
+///
 /// A malformed placeholder is left to the probe, which reports it with the
 /// rest of the target's defects.
 fn refuse_path_value_in_file(
@@ -354,18 +363,10 @@ fn refuse_path_value_in_file(
     values: &ResolvedValues,
 ) -> Result<(), Error> {
     let names = super::values::placeholders(file).unwrap_or_default();
-    let direct = names.iter().find_map(|name| {
-        values
-            .decl(name)
-            .filter(|decl| decl.kind == super::values::ValueKind::Path)
-            .map(|decl| vec![decl])
-    });
-    let chain = direct.or_else(|| {
-        let mut seen: Vec<String> = Vec::new();
-        names
-            .iter()
-            .find_map(|name| path_value_behind(values, name, &mut seen))
-    });
+    let mut seen: Vec<String> = Vec::new();
+    let chain = names
+        .iter()
+        .find_map(|name| path_value_behind(values, name, &mut seen));
     let Some(chain) = chain else {
         return Ok(());
     };
@@ -1866,6 +1867,40 @@ mod tests {
         );
         assert!(entry.hint.contains("local.toml:2"), "{}", entry.hint);
         ready(&answered, 1);
+    }
+
+    #[test]
+    fn a_file_holding_both_a_chained_and_a_direct_path_value_names_the_first_written() {
+        // `s` reaches a `path` value through its default and `b` is one
+        // directly. The refusal names whichever comes first in written order,
+        // with the chain behind it. Naming the direct reference first would
+        // tell the reader about `b` alone, and fixing that leaves `s` carrying
+        // the same absolute text in.
+        const LAYER: &str = "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                             [[value]]\nname = \"s\"\nkind = \"string\"\ndefault = \"{{b}}\"\n\
+                             [[target]]\npath = \"~/.config/env\"\n\
+                             file = \"cfg/{{s}}/{{b}}/x\"\n";
+
+        let message = resolved(LAYER, None).expect_err("a `path` value in `file` is a defect");
+        assert!(
+            message.contains(
+                "`file` references `s`, whose default at bx.toml:4 is built from `b`, a `path` \
+                 value"
+            ),
+            "{message}"
+        );
+
+        // Written the other way round, `b` comes first and is a one-step chain.
+        let message = resolved(
+            &LAYER.replace("cfg/{{s}}/{{b}}/x", "cfg/{{b}}/{{s}}/x"),
+            None,
+        )
+        .expect_err("a `path` value in `file` is a defect");
+        assert!(
+            message.contains("`file` references `b`, a `path` value"),
+            "{message}"
+        );
+        assert!(!message.contains("whose default"), "{message}");
     }
 
     #[test]

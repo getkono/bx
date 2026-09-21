@@ -1351,7 +1351,15 @@ impl Session {
         // Before the journal exists, because the loader refuses the *whole*
         // journal over one unportable scope entry: a session that wrote one
         // could never be rolled back. The same rule `admit` applies to a
-        // request's target, at the one other place a path enters the journal.
+        // request's target, and `Session::write` to a write's created
+        // directories — the three places a path enters a journal.
+        //
+        // `home` itself needs no check here: `Ledger::open` below applies the
+        // loader's own rule to it — absolute, and UTF-8 — and it runs before
+        // `Journal::create`, so no `Begin` naming a home the loader would
+        // refuse is ever written.
+        // `a_home_the_loader_would_refuse_never_reaches_a_begin_frame` pins
+        // that ordering.
         for entry in &scope {
             entry
                 .check_against(home)
@@ -1486,6 +1494,11 @@ impl Session {
             mode,
             ownership,
         } = request;
+        // A removal names the directories it claims up front, so `admit`
+        // checks them before anything is touched. A write does not have them
+        // yet — `fs::stage` invents them — so `Session::write` applies the
+        // same rule the moment they exist, which is still before the Intent
+        // that records them.
         let claimed: &[PathBuf] = match &content {
             Content::Bytes { .. } => &[],
             Content::Absent { created_dirs, .. } => created_dirs,
@@ -1531,7 +1544,11 @@ impl Session {
     /// A removal's `created_dirs` are what it prunes and what its Intent
     /// records, so each must be a strict parent of the destination below the
     /// home — the loader's rule — or the removal is [`Error::StrayCreatedDir`],
-    /// before anything is observed, stored or touched.
+    /// before anything is observed, stored or touched. A **write's** claims do
+    /// not exist yet: [`crate::fs::stage`] invents them. They go through the
+    /// same rule in [`Session::write`], at the first point they exist and
+    /// still before the Intent that records them — so neither entry point can
+    /// write a `created_dirs` the loader refuses.
     fn admit(
         &mut self,
         target: &Portable,
@@ -1579,6 +1596,11 @@ impl Session {
     /// Staged against `planned`, the observation plan compared, and with the
     /// session's one set of created directories, so every later write in the
     /// session knows a directory an earlier one made.
+    ///
+    /// A directory this write invents that the loader would refuse is
+    /// [`Error::StrayCreatedDir`] here — the same refusal [`Session::admit`]
+    /// gives a removal's declared claim, made at the first point a write's
+    /// claims exist.
     fn write(
         &mut self,
         target: Portable,
@@ -1599,6 +1621,22 @@ impl Session {
         self.crash.reached(index, Phase::AfterFill);
 
         let created_dirs = filled.created_dirs().to_vec();
+        // The directories the write invented are what its Intent records, and
+        // `refusal` puts them through `stray_created_dir` exactly as it does a
+        // removal's — one that fails makes the whole journal unreadable, so a
+        // session that announced one could never be rolled back. `admit`
+        // cannot make this check: a write's claims do not exist until
+        // `fs::stage` has made the parents. Made here, at the first point they
+        // do exist, which is still before the prior is stored, before the
+        // Intent is appended and before the destination is published, so the
+        // refusal poisons the session with nothing announced and the
+        // destination untouched. See `r3 round 4` decision R3R4-2.
+        if let Some(dir) = stray_created_dir(&dest, &self.home, &created_dirs) {
+            return Err(Error::StrayCreatedDir {
+                target,
+                dir: dir.clone(),
+            });
+        }
         // Assembled now, while the writer still holds the prior, and handed to
         // the ledger only once the write has landed. `None` is the restore half
         // of `bx rm`: bx is handing the target back, so there is nothing left for
@@ -4191,6 +4229,78 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_write_that_would_create_a_directory_the_loader_refuses_is_refused_before_it_lands() {
+        // r3 round 4, D2. Round 3's D1 repair closed `Begin.scope`, but a
+        // journal stores paths at two entry points and `admit` sees `&[]` for
+        // a write's claims — they do not exist until `fs::stage` has made the
+        // parents. So a write could publish and then record an Intent whose
+        // `created_dirs` the loader's `stray_created_dir` rule refuses, making
+        // the whole journal unreadable with the destination already replaced:
+        // the round-1 asymmetry at the second entry point.
+        //
+        // The one shape that reaches the rule is a created directory that is an
+        // *ancestor of the home*, which needs the home not to exist when the
+        // write runs — so the state directory has to be somewhere else. That
+        // is `$XDG_STATE_HOME`, which `StateDir::resolve_in` honours, so
+        // `state.ensure()` does not make the home on its way past. A service
+        // account with a state directory under `/var/lib` and a home that has
+        // not been created is the real one.
+        let guard = guarded_home();
+        let home = guard.child("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        assert!(
+            !state.root().starts_with(guard.child("account")),
+            "the state directory is not under the home",
+        );
+        let dest = guard.child("account/beside.conf");
+        let absolute = Portable::try_from(dest.to_str().expect("utf-8").to_string())
+            .expect("a well-formed absolute path");
+        assert_eq!(absolute.render(&home), dest, "it renders to itself");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        assert!(
+            !guard.child("account").exists(),
+            "the write is the first thing to make the home's parent",
+        );
+        let err = session
+            .apply(Request {
+                target: absolute.clone(),
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"bx\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect_err("a created directory the loader refuses");
+        assert!(
+            matches!(&err, Error::StrayCreatedDir { dir, .. } if *dir == guard.child("account")),
+            "got {err}"
+        );
+        assert!(peek(&dest).is_none(), "the destination was never published");
+        assert!(!holds_a_temporary_file(&guard.child("account")));
+        let finished = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
+
+        // What the refusal buys: the journal the session leaves is one bx
+        // believes, so recovery can act on it.
+        let loaded = load(&state.journal()).expect("load");
+        assert_eq!(loaded.intents().count(), 0, "nothing was announced");
+        assert!(
+            !matches!(loaded, Loaded::Unreadable { .. }),
+            "and the journal is still one the loader believes",
+        );
+        assert_eq!(
+            crate::recover::before_writing(&state).expect("the next writing run"),
+            crate::recover::Outcome::RolledBack { undone: 0 },
+        );
+    }
+
+    #[test]
     fn a_target_spelled_absolutely_under_the_home_is_refused_before_anything_is_touched() {
         // Stack integration of #7's round 4: a caller holding a `Ledger` gets
         // its home check. `new_entry` folds the destination into `~/…`, so the
@@ -5705,6 +5815,37 @@ pub(crate) mod tests {
             saved_ledger(&state, home.path()).get(&portable).is_none(),
             "and the ledger holds nothing for the target",
         );
+    }
+
+    #[test]
+    fn a_home_the_loader_would_refuse_never_reaches_a_begin_frame() {
+        // r3 round 4. The round-1 panel noted that `Session::open_locked`
+        // checks `Begin.scope` against the home but never checks the home
+        // itself, and declined to report it. It is not merely inert: the
+        // session never opens. `Ledger::open` applies the same rule the loader
+        // applies to `Begin.home` — absolute, and UTF-8 — and it runs *before*
+        // `Journal::create`, so no header naming such a home is ever written.
+        // Pinned here because that guarantee is an ordering, and an ordering
+        // can be changed by accident.
+        let guard = guarded_home();
+        let unusable = {
+            use std::os::unix::ffi::OsStrExt as _;
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff"))
+        };
+        for (name, home) in [
+            ("relative", PathBuf::from("relative/home")),
+            ("tilde", PathBuf::from("~/tilde")),
+            ("not utf-8", unusable),
+        ] {
+            let state = StateDir::new(guard.child(format!("state-{name}")));
+            let err = Session::open(&state, SessionKind::Apply, &home, Vec::new())
+                .expect_err("a home the loader would refuse");
+            assert!(matches!(err, Error::State(_)), "{name}: got {err}");
+            assert!(
+                !state.journal().exists(),
+                "{name}: no header was written for it to refuse",
+            );
+        }
     }
 
     #[test]

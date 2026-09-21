@@ -2510,6 +2510,70 @@ mod tests {
     }
 
     #[test]
+    fn a_removal_hint_does_not_offer_to_answer_a_value_a_default_carries_an_answer_into() {
+        // `q` is not answered: its committed `default` carries the answer to
+        // `p` in. `answers_hint` would name that default and offer to answer
+        // `q` directly. The removal hint does not (decision 6), and the reason
+        // is the same as for the answer it already withholds: answering `q`
+        // directly is an answer change, and under one the toggle names a file
+        // no earlier layer declares, which fails the whole load.
+        let base = || {
+            global(
+                "bx.toml",
+                &format!(
+                    "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                     [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{{{p}}}}\"\n\
+                     {}{}",
+                    target_toml("~/.config/default/s", "D"),
+                    target_toml("~/.zshrc", "setopt")
+                ),
+            )
+        };
+        let answered = |values: &str, toggles: &[&str]| {
+            [
+                base(),
+                local(&format!(
+                    "{values}{}",
+                    toggles
+                        .iter()
+                        .map(|path| toggle_toml(path))
+                        .collect::<String>()
+                )),
+            ]
+        };
+        let both = ["~/.config/default/s", "~/.config/{{q}}/s"];
+
+        let config = merge(&answered("[values]\np = \"default\"\n", &both)).unwrap();
+        assert_eq!(config.conflicts.len(), 1, "{:#?}", config.conflicts);
+        let hint = &config.conflicts[0].hint;
+        assert!(
+            hint.ends_with(&format!(
+                "because of the answer to `p` at local.toml:2; remove the toggle \
+                 `~/.config/{{{{q}}}}/s` at local.toml:6{CANNOT_SHOW_ONE}"
+            )),
+            "{hint}"
+        );
+        assert!(!hint.contains("carried in by"), "{hint}");
+        assert!(!hint.contains("answer `q` directly"), "{hint}");
+
+        // What it does say loads.
+        assert_eq!(
+            loads(&answered("[values]\np = \"default\"\n", &both[..1])).len(),
+            1,
+            "only `~/.zshrc` is left"
+        );
+        // What it withholds does not: `q` answered directly strands the toggle.
+        let message = failure(&answered(
+            "[values]\np = \"default\"\nq = \"other\"\n",
+            &both,
+        ));
+        assert!(
+            message.contains("toggles `~/.config/{{q}}/s`, which no earlier layer declares"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn toggles_that_each_reach_a_target_only_through_an_answer_keep_one() {
         // `two_toggles_that_each_cancel_a_placeholder_meet_for_one_answer_only`'s
         // toggles. Neither is the declared spelling, so neither is the one to

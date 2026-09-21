@@ -3337,15 +3337,19 @@ mod tests {
 
     #[test]
     fn a_path_answer_outside_file_still_resolves() {
-        // Only `file` is relative to the repo root. The same answer in another
-        // field of a `file` target, or in inline content, is what a `path`
-        // value is for.
+        // Only `file` is relative to the repo root. Every other field this
+        // walk could have been widened to is what a `path` value is for: two
+        // more fields of the very target whose `file` is walked (`requires`,
+        // an owned key), the target path, and inline content. `owns` matters
+        // most of the four, being the other field that looks repo-shaped.
         let resolved = resolved(
             "[[value]]\nname = \"b\"\nkind = \"path\"\n\
              [[value]]\nname = \"s\"\nkind = \"string\"\n\
              [[target]]\npath = \"~/.config/thing\"\nfile = \"cfg/x\"\n\
+             format = \"jsonc\"\nowns = [\"tool.{{s}}\"]\n\
              requires = [\"{{s}}/bin/tool\"]\n\
-             [[target]]\npath = \"~/.config/env\"\ncontent = \"DIR={{s}}\"\n",
+             [[target]]\npath = \"~/.config/env\"\ncontent = \"DIR={{s}}\"\n\
+             [[target]]\npath = \"~/.config/{{s}}/x\"\ncontent = \"x\"\n",
             Some("[values]\ns = \"{{b}}\"\nb = \"/var/mnt/work\"\n"),
         )
         .unwrap();
@@ -3353,8 +3357,21 @@ mod tests {
         assert_eq!(ready(&resolved, 0).requires, ["/var/mnt/work/bin/tool"]);
         assert_eq!(ready(&resolved, 0).body, Body::File(PathBuf::from("cfg/x")));
         assert_eq!(
+            ready(&resolved, 0).format,
+            Format::Jsonc {
+                owns: vec![KeyPath::parse("tool./var/mnt/work").unwrap()]
+            }
+        );
+        assert_eq!(
             ready(&resolved, 1).body,
             Body::Inline("DIR=/var/mnt/work".to_string())
+        );
+        // A target path may not *open* with a placeholder — the parser refuses
+        // that, which is why the plan's own spelling was unusable — but one
+        // further along is legal, and the answer reaches it unrefused.
+        assert_eq!(
+            ready(&resolved, 2).path.as_str(),
+            "~/.config/var/mnt/work/x"
         );
     }
 

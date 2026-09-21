@@ -391,20 +391,45 @@ pub fn run(
 
 /// The process status a report implies.
 ///
-/// A read-only run exits [`Exit::Pending`] while an interruption stands, and by
-/// its actions otherwise. An executed `apply` has done its pending work, so
-/// only a row still needing attention keeps it pending. An `apply` that wrote
-/// nothing — declined, or with nothing to do — exits by its actions, so a
-/// declined prompt over pending work exits 2. An `apply` that recovered an
-/// interrupted session stopped there, with every configured target still
-/// undecided, so it exits [`Exit::Pending`] too: the machine is not converged
-/// until the next `apply`.
+/// An executed `apply` has done its pending work, so only a row still needing
+/// attention keeps it pending. An `apply` that wrote nothing — declined, or
+/// with nothing to do — exits by its actions, so a declined prompt over pending
+/// work exits 2.
+///
+/// # Decision 31: an unsettled state directory exits [`Exit::Pending`] in
+/// either mode
+///
+/// Two states of the state directory settle the exit before the mode or the
+/// rows are consulted, and both settle it the same way.
+///
+/// **A standing interruption.** The rule used to be keyed on the mode:
+/// [`Mode::Plan`] over an interruption exited [`Exit::Pending`], and so did an
+/// `apply` that *recovered* one, but an `apply` that saw the interruption and
+/// was **declined** fell through to the rows — and over a session that wrote
+/// everything but did not record it, every row is [`Action::Unchanged`], so it
+/// exited [`Exit::Converged`]. `bx plan` and a declined `bx apply` therefore
+/// disagreed about whether the same machine was converged, with an unrecovered
+/// journal standing in both. Nothing about a decline makes the machine more
+/// converged than the `plan` that preceded it, so the mode is not what the
+/// answer depends on: while a journal stands, every configured target is
+/// undecided, whoever is asking. The recovered case is not a second arm but the
+/// same one — an `apply` that recovered stopped there, and the next `apply` is
+/// what converges the machine.
+///
+/// **A running `apply`.** [`Mode::Apply`] never reaches here, having refused in
+/// [`run`]. A `plan` does reach it, and its rows were decided against a state
+/// directory the running `apply` is concurrently changing: they say what was
+/// true at no single instant. Reporting [`Exit::Converged`] from them would let
+/// a script move on from a machine it has not seen settled, and it would
+/// contradict this run's own banner, which says what the other `apply` has not
+/// finished yet is still to do.
 #[must_use]
 pub fn exit(report: &Report, mode: Mode) -> Exit {
     let actions = report.actions();
+    if report.interrupted.is_some() || report.apply_running {
+        return Exit::Pending;
+    }
     match mode {
-        Mode::Plan if report.interrupted.is_some() => Exit::Pending,
-        Mode::Apply if report.recovered.is_some() => Exit::Pending,
         Mode::Apply if report.executed => {
             if actions.iter().any(|action| action.needs_attention()) {
                 Exit::Pending
@@ -1521,6 +1546,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn decision_31_a_declined_apply_over_a_finished_session_reports_pending_like_plan() {
+        // P42R2-D4, end to end, alongside decision_18's A2. A session whose
+        // writes all landed but whose ledger save did not: the journal is
+        // sealed with an End frame, so `pending` reports it complete and every
+        // row is Unchanged — recording a write touches no file.
+        //
+        // At 5d1bba7 `bx plan` exited 2 and a DECLINED `bx apply` over the same
+        // state exited 0, with the journal still standing: answering "no" on a
+        // terminal reported the machine converged, and a driver keying on exit
+        // 0 moved on.
+        let guard = guarded_home();
+        let home = guard.child("home");
+        seed_crash(&home);
+        let after_end = finish_crash_phases()[0];
+        assert!(
+            !spawn_crash_child(&home, CRASH_WRITES, after_end)
+                .status
+                .success()
+        );
+        let inputs = load(&home);
+
+        let planned = plan(&inputs);
+        let interrupted = planned.interrupted.as_ref().expect("an interruption");
+        assert!(
+            interrupted.complete,
+            "the fixture is not a finished session"
+        );
+        assert_eq!(planned.actions(), vec![Action::Unchanged; CRASH_WRITES]);
+        assert_eq!(exit(&planned, Mode::Plan), Exit::Pending);
+
+        let mut asked = 0;
+        let declined = run(&inputs, Mode::Apply, &mut |_| {
+            asked += 1;
+            Ok(false)
+        })
+        .expect("a declined apply");
+
+        assert_eq!(asked, 1, "the decline was never offered");
+        assert!(!declined.executed);
+        assert!(
+            declined.recovered.is_none(),
+            "a decline recovered something"
+        );
+        assert_eq!(declined.actions(), vec![Action::Unchanged; CRASH_WRITES]);
+        assert!(
+            StateDir::resolve(&home).journal().exists(),
+            "the journal went on a declined apply"
+        );
+        assert_eq!(
+            exit(&declined, Mode::Apply),
+            Exit::Pending,
+            "a declined apply reported converged over a standing journal"
+        );
+        assert_eq!(exit(&declined, Mode::Apply), exit(&planned, Mode::Plan));
+    }
+
+    #[test]
     fn t14_a_standing_interruption_is_reported_as_its_roll_back_and_plan_writes_nothing() {
         // Decision 18 reverses this test's earlier expectation, that every
         // interrupted write is a conflict. A write recovery resolves on its own
@@ -2144,15 +2226,40 @@ pub(crate) mod tests {
         assert_eq!(exit(&report_of(&[Unchanged]), Mode::Plan), Exit::Converged);
         assert_eq!(exit(&report_of(&[Create]), Mode::Plan), Exit::Pending);
 
-        let mut interrupted = report_of(&[Unchanged]);
-        interrupted.interrupted = Some(Interrupted {
-            kind: SessionKind::Apply,
-            journal: PathBuf::from("/state/journal"),
-            complete: false,
-            unreadable: true,
-            unfinished: Vec::new(),
-        });
-        assert_eq!(exit(&interrupted, Mode::Plan), Exit::Pending);
+        // P42R2-D4 and P42R2-COV2. The table used to ask the interrupted report
+        // under Mode::Plan only, and the unasked Mode::Apply cell was the wrong
+        // one: a declined apply over a session that wrote everything but did
+        // not record it has nothing but Unchanged rows, so it fell through to
+        // them and reported the machine converged with the journal standing.
+        // Decision 31 makes the answer mode-independent, so both cells are
+        // asked, and `complete` — which is what makes every row Unchanged — is
+        // varied rather than fixed.
+        for complete in [false, true] {
+            let mut interrupted = report_of(&[Unchanged]);
+            interrupted.interrupted = Some(Interrupted {
+                kind: SessionKind::Apply,
+                journal: PathBuf::from("/state/journal"),
+                complete,
+                unreadable: !complete,
+                unfinished: Vec::new(),
+            });
+            assert_eq!(exit(&interrupted, Mode::Plan), Exit::Pending, "{complete}");
+            assert_eq!(exit(&interrupted, Mode::Apply), Exit::Pending, "{complete}");
+
+            // An apply that recovered stopped there: the configured targets are
+            // still undecided, so it is the same answer and not a second arm.
+            let mut recovered = interrupted.clone();
+            recovered.recovered = Some(recover::Outcome::Recorded { entries: 1 });
+            assert_eq!(exit(&recovered, Mode::Apply), Exit::Pending, "{complete}");
+        }
+
+        // P42R2-D5. A run against another apply's held state directory decided
+        // its rows against a directory that apply is concurrently changing.
+        // Mode::Apply never reaches here — `run` refuses first — and a plan
+        // that does must not contradict its own banner by reporting converged.
+        let mut running = report_of(&[Unchanged]);
+        running.apply_running = true;
+        assert_eq!(exit(&running, Mode::Plan), Exit::Pending);
 
         let mut executed = report_of(&[Create, Unchanged]);
         executed.executed = true;

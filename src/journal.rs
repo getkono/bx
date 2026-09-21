@@ -1214,8 +1214,11 @@ pub struct Session {
     /// Every directory a target this session removed claimed. Pruned, as one
     /// union, once the session's `End` is durable, and handed on.
     released: std::collections::BTreeSet<PathBuf>,
-    /// Every directory a target [`Session::forget`] dropped claimed. Handed on
-    /// when the session finishes, and never pruned: no removal was announced.
+    /// Every directory claimed by a target this session dropped from the ledger
+    /// without announcing a removal: one [`Session::forget`] dropped, and one a
+    /// [`Ownership::Released`] write handed back. Handed on when the session
+    /// finishes, and never pruned — no removal was announced, so there is
+    /// nothing `plan` promised to remove.
     forgotten: std::collections::BTreeSet<PathBuf>,
     crash: Crash,
     /// Called with the destination just before a write is published, so a test
@@ -1292,7 +1295,9 @@ pub enum Ownership {
     Owned(Mechanism),
     /// bx is handing the target back — the restore half of `bx rm`. The prior
     /// bytes are still copied into `restore/`, because that is what an
-    /// interrupted restore is rolled back from; only the ledger entry goes.
+    /// interrupted restore is rolled back from; only the ledger entry goes,
+    /// and the directories that entry claimed are handed to a surviving entry
+    /// beneath them when the session finishes rather than dropped.
     Released,
 }
 
@@ -1623,8 +1628,23 @@ impl Session {
             Some(entry) => {
                 self.ledger.record(entry)?;
             }
+            // The restore half of `bx rm`. The entry goes, but the directories
+            // it claimed still stand and bx still made them, so its claims are
+            // handed to a surviving entry beneath them when the session
+            // finishes — exactly as `Session::forget` and `Session::remove`
+            // hand theirs on. Dropped here instead, no entry would claim them
+            // and no later `rm` could remove them: see `r3 round 3` decision 2.
+            // `self.forgotten`, not `self.released`, because this write
+            // announced no removal and so prunes nothing.
             None => {
-                self.ledger.forget(&target);
+                if let Some(dropped) = self.ledger.forget(&target) {
+                    self.forgotten.extend(
+                        dropped
+                            .created_dirs
+                            .iter()
+                            .map(|dir| dir.render(&self.home)),
+                    );
+                }
             }
         }
         self.crash.reached(index, Phase::AfterPublish);
@@ -1712,7 +1732,9 @@ impl Session {
     /// claimed directory is tried once, deepest first. Nothing is assumed
     /// about which entry claimed it: it is removed when it is empty and no
     /// entry the ledger still holds names it. A claim still standing — a
-    /// released one, or one of a target [`Session::forget`] dropped — is
+    /// released one, or one of a target this session dropped from the ledger
+    /// without announcing a removal ([`Session::forget`], or a
+    /// [`Ownership::Released`] write) — is
     /// given to a surviving entry beneath it, so the `rm` that removes that
     /// entry removes the directory too.
     fn settle_claims(&mut self) -> Result<(), Error> {
@@ -5383,6 +5405,104 @@ pub(crate) mod tests {
             }
             assert_eq!(after, Some(before), "{case}: nothing half-recorded");
         }
+    }
+
+    /// The ledger as it stands on disk under `state`.
+    fn saved_ledger(state: &StateDir, home: &Path) -> Ledger {
+        let lock = ExclusiveLock::acquire(state).expect("lock");
+        Ledger::open(state, &lock, home)
+            .expect("open the ledger")
+            .value
+    }
+
+    #[test]
+    fn a_released_write_hands_on_the_directories_its_entry_claimed() {
+        // r3 round 3, D2 and CL2. `Session::write`'s released arm dropped the
+        // entry `forget` returns, and with it the entry's `created_dirs`, while
+        // `Session::remove` and `Session::forget` both carry theirs on. A
+        // directory bx made then had no claimant at all: no later `rm` could
+        // remove it, and recovery's rebuild could not either.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dir = home.child(".config/app");
+        let claims: Vec<PathBuf> = vec![dir.clone(), home.child(".config")];
+
+        // bx makes both directories for a.conf, which claims them.
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(write_to(
+                home.path(),
+                ".config/app/a.conf",
+                "bx a\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        session.finish().expect("finish");
+        // An entry beneath the same directories that survives the hand-back.
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(write_to(
+                home.path(),
+                ".config/app/heir.conf",
+                "bx heir\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        session.finish().expect("finish");
+
+        let (a, a_dest) = target(home.path(), ".config/app/a.conf");
+        let (heir, _) = target(home.path(), ".config/app/heir.conf");
+        let ledger = saved_ledger(&state, home.path());
+        assert_eq!(
+            ledger
+                .get(&a)
+                .expect("a.conf")
+                .created_dirs
+                .iter()
+                .map(|dir| dir.render(home.path()))
+                .collect::<Vec<_>>(),
+            claims,
+            "a.conf claims both directories bx made",
+        );
+        assert!(ledger.get(&heir).expect("heir").created_dirs.is_empty());
+        drop(ledger);
+
+        // `rm` hands a.conf back: the entry goes, the file stays as the
+        // user's. Both claims must reach the surviving entry beneath them.
+        let mut session = Session::open(&state, SessionKind::Restore, home.path(), vec![a.clone()])
+            .expect("open");
+        session
+            .apply(Request {
+                target: a.clone(),
+                dest: a_dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"theirs\n".to_vec(),
+                    planned: fs::observe(&a_dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Released,
+            })
+            .expect("hand it back");
+        session.finish().expect("finish");
+
+        let ledger = saved_ledger(&state, home.path());
+        assert!(ledger.get(&a).is_none(), "the entry was handed back");
+        assert_eq!(
+            ledger
+                .get(&heir)
+                .expect("heir")
+                .created_dirs
+                .iter()
+                .map(|dir| dir.render(home.path()))
+                .collect::<Vec<_>>(),
+            claims,
+            "and its claims reached the entry still beneath them",
+        );
+        drop(ledger);
+        assert_eq!(peek(&a_dest).expect("handed back").0, b"theirs\n");
+        assert!(dir.is_dir(), "nothing was pruned: no removal was announced");
     }
 
     #[test]

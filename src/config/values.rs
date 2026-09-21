@@ -852,6 +852,11 @@ fn broken_answer_why(decl: &ValueDecl, assignment: &ValueAssignment, error: &Val
 /// written, so it can name one whose value is unset or invalid: with the
 /// `path` value unanswered the answer referencing it resolves to nothing, and
 /// it is still the answer to change.
+///
+/// `answers` is never empty: an empty one would read "…, because of ; change
+/// that answer", naming nothing to change. The one caller holds a way to the
+/// `path` value that runs through at least one answer, and enforces it rather
+/// than assuming it, so this takes the slice as it finds it.
 #[must_use]
 pub(crate) fn path_answer_hint(problem: &str, answers: &[&ValueAssignment]) -> String {
     let answers = answers

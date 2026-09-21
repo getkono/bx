@@ -466,10 +466,19 @@ fn path_value_behind<'a>(
 /// answer, returning the answers' names and the hint.
 ///
 /// Called once [`refuse_path_value_in_file`] has found no way there through
-/// committed defaults alone from the same names, so every way found here runs
-/// through at least one answer. That answer is the account's to change, which
-/// is why this blocks rather than fails; the hint names each one on the way,
-/// with its line.
+/// committed defaults alone from the same names, so a way found here is
+/// expected to run through at least one answer. That answer is the account's to
+/// change, which is why this blocks rather than fails; the hint names each one
+/// on the way, with its line.
+///
+/// That expectation is a claim about a **different** function — that
+/// [`path_value_behind`] is a complete walk of the committed graph this one
+/// also walks — so it is enforced here rather than left to prose. A chain of
+/// [`Step::Default`] and [`Step::Terminal`] alone names no answer, and the hint
+/// would read "…repo root, because of ; change that answer": no target is
+/// blocked on that, and the load error the committed walk owes is left to it.
+/// `a_committed_chain_alone_is_not_an_answer_block` calls this with exactly
+/// that chain, so the coupling is pinned rather than asserted.
 fn refuse_path_answer_in_file(
     target: &Target,
     file: &str,
@@ -481,6 +490,9 @@ fn refuse_path_answer_in_file(
         .unwrap_or_default()
         .into_iter()
         .find_map(|name| path_value_through_answer(values, assignments, name, &mut seen))?;
+    if !chain.iter().any(|step| matches!(step, Step::Answer(..))) {
+        return None;
+    }
 
     let steps: String = chain
         .iter()
@@ -3363,6 +3375,47 @@ mod tests {
             BlockReason::DisabledValue {
                 names: vec!["s".to_string()]
             }
+        );
+    }
+
+    #[test]
+    fn a_committed_chain_alone_is_not_an_answer_block() {
+        // `refuse_path_answer_in_file` may name only answers, and it may say
+        // so only because `refuse_path_value_in_file` has already failed the
+        // load for every committed way to a `path` value from the same names.
+        // That is a claim about a different function, so the guard is called
+        // with the chain the claim forbids: `s`'s committed default reaches
+        // `b` and the account answered nothing. Were the two walks ever to
+        // disagree, this must stay `None` rather than block a target on an
+        // empty list of answers to change.
+        let layers = vec![
+            layer(
+                "bx.toml",
+                LayerKind::Global,
+                "[[value]]\nname = \"b\"\nkind = \"path\"\n\
+                 [[value]]\nname = \"s\"\nkind = \"string\"\ndefault = \"{{b}}\"\n\
+                 [[target]]\npath = \"~/.config/thing\"\ncontent = \"x\"\n",
+            )
+            .unwrap(),
+        ];
+        let merged = merge(&layers, &home()).unwrap();
+        let values =
+            ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, &home())
+                .unwrap();
+
+        // The chain is there for the committed walk, which owes the load error.
+        assert!(
+            refuse_path_value_in_file(&merged.targets[0], "cfg/{{s}}/x", &values).is_err(),
+            "the committed walk is the one that reaches this chain"
+        );
+        assert_eq!(
+            refuse_path_answer_in_file(
+                &merged.targets[0],
+                "cfg/{{s}}/x",
+                &values,
+                &merged.value_assignments,
+            ),
+            None
         );
     }
 }

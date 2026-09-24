@@ -131,7 +131,8 @@ pub enum Body {
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
 /// ([`super::env`]), which also carries the `[[plugin]]` entries, the
-/// declared aliases and the declared functions into the interactive file, and
+/// declared aliases, the declared functions and the declared optional sources
+/// into the interactive file, and
 /// none is named by a config author: a fragment carries the variables
 /// resolution placed in it, which no `generated = "…"` string could spell. A
 /// generator a config author may name adds its variant here and its arm in

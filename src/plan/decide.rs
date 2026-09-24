@@ -217,7 +217,9 @@ pub(super) fn decide_all(
 /// owner bits are tested, write first. Walking up from the parent, the first
 /// directory that is declared or already there governs the write; every one
 /// between it and the parent is made by `apply` at [`Mode::DEFAULT_DIR`], or
-/// is declared itself and would have governed.
+/// is declared itself and would have governed. A declared directory further up
+/// is searched on the way, so each one above the governing directory is tested
+/// for owner search as well: see [`unreachable_beneath`].
 ///
 /// `write` says what `apply` does inside the parent. A directory whose mode
 /// alone changes is chmod'd in place, which needs search on the parent and not
@@ -240,7 +242,7 @@ fn locked_parent(
     } else if mode.bits() & 0o100 == 0 {
         "search"
     } else {
-        return None;
+        return unreachable_beneath(dir, &parent.path, home, declared);
     };
     let shown = paths::to_portable(dir, home);
     let basis = if is_declared {
@@ -259,6 +261,34 @@ fn locked_parent(
     Some(format!(
         "{basis}, which denies its owner {denied}, so apply could not {what} inside it"
     ))
+}
+
+/// Why the parent of a write cannot be reached: a declared directory above the
+/// one that governs the write, `governing`, that denies its owner search.
+///
+/// Every directory on the way to the parent is searched to reach it, not only
+/// the one that governs the write. One on disk that denies search already
+/// stopped [`crate::fs::observe`], and one `apply` makes is made at
+/// [`Mode::DEFAULT_DIR`], but a declared one is set to its declared mode before
+/// any write beneath it and was never observed at that mode. So each declared
+/// ancestor of `governing` is tested here, the nearest first.
+fn unreachable_beneath(
+    governing: &Path,
+    parent: &Path,
+    home: &Path,
+    declared: &Declared,
+) -> Option<String> {
+    governing.ancestors().skip(1).find_map(|dir| {
+        let mode = *declared.get(dir)?;
+        (mode.bits() & 0o100 == 0).then(|| {
+            format!(
+                "{} is declared {mode}, which denies its owner search, so apply could not \
+                 reach {} beneath it",
+                paths::to_portable(dir, home),
+                paths::to_portable(parent, home)
+            )
+        })
+    })
 }
 
 /// What `apply` does inside the parent [`locked_parent`] tests.
@@ -1477,6 +1507,49 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(inner.diff, None, "{report:?}");
+    }
+
+    #[test]
+    fn writes_beneath_a_declared_grandparent_without_owner_search_are_conflicts() {
+        // `~/a/b` and `~/a/c` are already there and undeclared, so each
+        // governs the write inside it and allows it. But `~/a` is chmod'd to
+        // 0600 first, and nothing beneath it can be reached from then on: a
+        // file created in `~/a/b` and a mode change of `~/a/c/d` are refused in
+        // plan, and apply does exactly what plan announced.
+        let home = guarded_home();
+        let _b = locked_dir_at(home.path(), "a/b", 0o755);
+        let _d = locked_dir_at(home.path(), "a/c/d", 0o755);
+        let _a = locked_dir_at(home.path(), "a", 0o700);
+        let inputs = crate::plan::tests::inputs(
+            &home,
+            "[[target]]\npath = \"~/a\"\ndir = true\nmode = \"0600\"\n\
+             [[target]]\npath = \"~/a/c/d\"\ndir = true\nmode = \"0700\"\n\
+             [[target]]\npath = \"~/a/b/f\"\ncontent = \"x\\n\"\n",
+        );
+
+        let report = plan_of(&inputs);
+        assert_eq!(row_for(&report, "~/a").action, Action::Modify, "{report:?}");
+        for (target, parent) in [("~/a/b/f", "~/a/b"), ("~/a/c/d", "~/a/c")] {
+            let row = row_for(&report, target);
+            assert_eq!(row.action, Action::Conflict, "{report:?}");
+            assert!(
+                row.note
+                    .as_deref()
+                    .is_some_and(|note| note.starts_with(&format!(
+                        "~/a is declared 0600, which denies its owner search, so apply could not \
+                     reach {parent} beneath it"
+                    ))),
+                "{report:?}"
+            );
+        }
+
+        // Invariant 7: apply makes only the change plan announced, and fails
+        // on nothing.
+        assert!(apply_of(&inputs).executed);
+        assert_eq!(mode_on_disk(home.path(), "a"), Some(Mode::from_bits(0o600)));
+        fs::set_mode(&home.path().join("a"), Mode::from_bits(0o700)).expect("unlock");
+        assert!(!home.child("a/b/f").exists());
+        assert_eq!(mode_on_disk(home.path(), "a/c/d"), Some(Mode::DEFAULT_DIR));
     }
 
     #[test]

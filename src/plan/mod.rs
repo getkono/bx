@@ -24,9 +24,11 @@ use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
+pub(crate) use decide::read_repo_file;
 pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
 
-use crate::config::resolve::{self, Resolved};
+use crate::config::resolve::{self, Resolution, Resolved};
+use crate::config::target::Target;
 use crate::config::{self, Origin, layers, merge};
 use crate::env_guard::RootSet;
 use crate::journal::{self, Session, SessionKind};
@@ -114,6 +116,10 @@ pub struct Inputs {
     home: PathBuf,
     repo: PathBuf,
     state: StateDir,
+    /// Every enabled target as the merged layers wrote it, before substitution:
+    /// one per entry of `resolved.targets`, in the same order, so a blocked
+    /// target's body is still known.
+    declared: Vec<Target>,
     resolved: Resolved,
     roots: RootSet,
     progress: bool,
@@ -143,10 +149,23 @@ impl Inputs {
             home,
             repo,
             state,
+            declared: merged.targets,
             resolved,
             roots,
             progress: env.stderr_tty,
         })
+    }
+
+    /// The resolved configuration.
+    #[must_use]
+    pub const fn resolved(&self) -> &Resolved {
+        &self.resolved
+    }
+
+    /// Every enabled target as written, paired with its resolution, in
+    /// configuration order.
+    pub fn targets(&self) -> impl Iterator<Item = (&Target, &Resolution<Target>)> {
+        self.declared.iter().zip(&self.resolved.targets)
     }
 
     /// The account's home.
@@ -556,17 +575,27 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
     let mut rows = Vec::with_capacity(interrupted.unfinished.len());
     for unfinished in &interrupted.unfinished {
         let target = unfinished.target.as_str();
-        let origin = inputs
+        let configured = inputs
             .resolved
             .targets
             .iter()
             .find_map(|resolution| match resolution {
-                resolve::Resolution::Ready(ready) if ready.path.as_str() == target => {
-                    Some(ready.origin.clone())
-                }
+                resolve::Resolution::Ready(ready) if ready.path.as_str() == target => Some(ready),
                 _ => None,
-            })
-            .unwrap_or_else(|| Origin::unknown(&interrupted.journal));
+            });
+        let origin = configured.map_or_else(
+            || Origin::unknown(&interrupted.journal),
+            |ready| ready.origin.clone(),
+        );
+        // A secret's plaintext is on one side of its roll back, or both, and
+        // is never shown here either.
+        let between = if configured
+            .is_some_and(|ready| matches!(ready.body, crate::config::target::Body::Secret(_)))
+        {
+            Diff::concealed
+        } else {
+            Diff::between
+        };
         let row = |action, diff, note: String| Change {
             target: target.to_string(),
             origin: origin.clone(),
@@ -608,14 +637,13 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
                     .filter(|mode| *mode != reference.mode)
                     .map(|mode| (mode, reference.mode));
                 (
-                    prior.and_then(|prior| {
-                        Diff::between(target, observed.bytes.as_deref(), &prior, mode)
-                    }),
+                    prior
+                        .and_then(|prior| between(target, observed.bytes.as_deref(), &prior, mode)),
                     "rolls back: puts back what was there before",
                 )
             }
             (true, Some(state::Prior::Absent)) => (
-                Diff::between(target, observed.bytes.as_deref(), b"", None),
+                between(target, observed.bytes.as_deref(), b"", None),
                 "rolls back: removes the file the session created",
             ),
             (true, None) => (None, "rolls back what the session wrote"),
@@ -2302,6 +2330,48 @@ pub(crate) mod tests {
                     to: FileMode::DEFAULT_FILE
                 }
             })
+        );
+    }
+
+    #[test]
+    fn d1_an_interrupted_secret_write_is_rolled_back_without_showing_either_side() {
+        let home = guarded_home();
+        let recipient = age_identity(&home);
+        seal(&home, &recipient, b"hunter3\n");
+        own(home.path(), ".token", b"hunter2\n", Mechanism::Own);
+        std::fs::set_permissions(home.child(".token"), std::fs::Permissions::from_mode(0o600))
+            .expect("private");
+        let inputs = inputs(&home, SECRET_TARGET);
+        let target = Portable::parse_in("~/.token", home.path()).expect("a portable target");
+        let dest = home.child(".token");
+        let mut session = Session::open(
+            inputs.state(),
+            SessionKind::Apply,
+            home.path(),
+            vec![target.clone()],
+        )
+        .expect("a session");
+        session
+            .apply(Request {
+                target,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"hunter3\n".to_vec(),
+                    planned: fs::observe(&dest).expect("observe"),
+                },
+                mode: FileMode::PRIVATE_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("the write");
+        drop(session);
+
+        let report = plan(&inputs);
+        assert_eq!(report.actions(), vec![Action::Modify]);
+        let shown = render(&report, View::Plan, Palette::PLAIN, home.path());
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(
+            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
+            "{shown}"
         );
     }
 

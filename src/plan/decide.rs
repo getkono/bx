@@ -398,7 +398,7 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
 /// # Errors
 ///
 /// [`Error::Body`] naming the file when it cannot be read.
-pub(super) fn read_repo_file(target: &Target, repo: &Path, rel: &Path) -> Result<Vec<u8>, Error> {
+pub(crate) fn read_repo_file(target: &Target, repo: &Path, rel: &Path) -> Result<Vec<u8>, Error> {
     let path = repo.join(rel);
     let body = |source| Error::Body {
         origin: target.origin.clone(),

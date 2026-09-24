@@ -56,6 +56,11 @@
 //! `bx sync`'s apply: a fast-forward-only pull before it, and a push after it
 //! that never carries a state file.
 //!
+//! [`shell`] is the generated interactive shell file's load order: eleven
+//! named phases assembled in one fixed order whatever order their content was
+//! contributed in, the declared plugins sourced only once readable, and the
+//! single terminal slot at most one of them may claim.
+//!
 //! [`doctor`] reads the same resolved targets without deciding them, and asks
 //! read-only questions about what is on disk — whether systemd has reloaded,
 //! enabled, or failed a unit file bx wrote — changing nothing itself.
@@ -101,6 +106,7 @@ pub mod recover;
 pub mod report;
 pub mod restore;
 pub mod secret;
+pub mod shell;
 pub mod state;
 pub mod sync;
 #[doc(hidden)]

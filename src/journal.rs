@@ -2433,10 +2433,13 @@ pub(crate) fn hand_off_claims<'a>(
 /// Refuse unless `now` is still what `planned` observed: the same path, the
 /// same kind and the same stamp, or still nothing at all.
 ///
+/// Shared with [`crate::recover`], whose rollback of a create checks the
+/// destination it judged the same way before unlinking it.
+///
 /// # Errors
 ///
 /// [`Error::Write`] with [`crate::fs::Error::Changed`] naming what moved.
-fn refuse_moved(planned: &Observed, now: &Observed) -> Result<(), Error> {
+pub(crate) fn refuse_moved(planned: &Observed, now: &Observed) -> Result<(), Error> {
     if planned.path != now.path {
         return Err(fs::Error::Changed {
             path: now.path.clone(),

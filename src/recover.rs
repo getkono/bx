@@ -557,11 +557,31 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                     journal::prune_dirs(&intent.created_dirs)?;
                 }
             }
-            Step::Unlink => {
+            // Both act against the observation `decide` judged, never a fresh
+            // one: a destination the user edited after that look holds
+            // neither recorded state, and is refused with
+            // [`fs::Error::Changed`] rather than removed or overwritten. The
+            // journal is kept, so the next run judges the edit as `decide`
+            // judges any other, and blocks on it. What stays open is the
+            // window between the last look and the `unlink` or `rename`
+            // itself, as for `Session::remove` and [`fs::Filled::publish`].
+            Step::Unlink { observed } => {
+                #[cfg(test)]
+                tests::before_act(&intent.dest);
+                journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
                 journal::unlink(&intent.dest)?;
                 journal::prune_dirs(&intent.created_dirs)?;
             }
-            Step::Rewrite { bytes, mode } => fs::write_atomically(&intent.dest, &bytes, mode)?,
+            Step::Rewrite {
+                bytes,
+                mode,
+                observed,
+            } => {
+                #[cfg(test)]
+                tests::before_act(&intent.dest);
+                fs::stage(&intent.dest, mode, &observed, &mut fs::CreatedDirs::new())?
+                    .commit(&bytes)?;
+            }
             // Rebuilding the bookkeeping touches no destination, so it is not
             // work `plan` failed to announce: the ledger is machine state, not
             // the user's.
@@ -649,13 +669,23 @@ enum Step {
     /// Only the directories a create invented are left to prune.
     Keep,
     /// Rolling back a create whose file is there: unlink it, then prune.
-    Unlink,
+    Unlink {
+        /// The destination [`decide`] judged to be the write's own. It is
+        /// looked at again immediately before the unlink, as
+        /// `Session::remove` does, so a file edited since is refused rather
+        /// than removed.
+        observed: fs::Observed,
+    },
     /// Rolling back over a file that existed: put these bytes back at this mode.
     Rewrite {
         /// The prior bytes, digest-verified.
         bytes: Vec<u8>,
         /// The mode they had.
         mode: Mode,
+        /// The destination [`decide`] judged to be the write's own, handed to
+        /// [`fs::stage`] so a file edited since is refused rather than
+        /// overwritten.
+        observed: fs::Observed,
     },
     /// Bringing the ledger up to date for a write that landed.
     Record(NewEntry),
@@ -708,7 +738,8 @@ fn decide(
     ledger: Option<&LedgerView>,
     landed: bool,
 ) -> Result<(Step, Unfinished), Error> {
-    let standing = standing(intent, &look(&intent.dest)?);
+    let (found, observed) = look(&intent.dest)?;
+    let standing = standing(intent, &found);
     let report = |resolvable: bool, note: String| Unfinished {
         target: intent.target.clone(),
         dest: intent.dest.clone(),
@@ -730,12 +761,15 @@ fn decide(
         };
         return Ok(match (standing, &intent.before) {
             (Standing::Prior, _) => (Step::Keep, report(true, rolls_back())),
-            (Standing::Written, Prior::Absent) => (Step::Unlink, report(true, rolls_back())),
+            (Standing::Written, Prior::Absent) => {
+                (Step::Unlink { observed }, report(true, rolls_back()))
+            }
             (Standing::Written, Prior::Existed(reference)) => match snapshot(state, reference)? {
                 Ok(bytes) => (
                     Step::Rewrite {
                         bytes,
                         mode: reference.mode,
+                        observed,
                     },
                     report(true, rolls_back()),
                 ),
@@ -928,21 +962,23 @@ enum Found {
     Unreachable,
 }
 
-/// Read a destination.
-fn look(dest: &Path) -> Result<Found, Error> {
+/// Read a destination: what recovery compares, and the observation it was
+/// reduced from, which a rollback acts against.
+fn look(dest: &Path) -> Result<(Found, fs::Observed), Error> {
     let observed = fs::observe(dest)?;
     if observed
         .parent
         .as_ref()
         .is_some_and(|parent| parent.unusable().is_some())
     {
-        return Ok(Found::Unreachable);
+        return Ok((Found::Unreachable, observed));
     }
-    Ok(match (observed.kind, observed.digest(), observed.mode) {
+    let found = match (observed.kind, observed.digest(), observed.mode) {
         (Kind::Absent, _, _) => Found::Absent,
         (Kind::File, Some(digest), Some(mode)) => Found::File { digest, mode },
         _ => Found::Foreign,
-    })
+    };
+    Ok((found, observed))
 }
 
 /// Classify a destination against the two states its intent permits.
@@ -1044,6 +1080,95 @@ mod tests {
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
     use crate::testing::guarded_home;
+
+    thread_local! {
+        /// What a test does to a destination between `decide`'s look and the
+        /// rollback acting on it. Per thread, so tests running in parallel
+        /// never see each other's.
+        static BEFORE_ACT: std::cell::Cell<Option<fn(&Path)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The seam [`resolve`] calls before an `Unlink` or a `Rewrite` acts.
+    pub(super) fn before_act(dest: &Path) {
+        if let Some(meddle) = BEFORE_ACT.with(std::cell::Cell::get) {
+            meddle(dest);
+        }
+    }
+
+    /// Recover with `meddle` run on each destination a rollback is about to
+    /// unlink or rewrite, after `decide` has judged it.
+    fn recover_meddled(state: &StateDir, meddle: fn(&Path)) -> Result<Outcome, Error> {
+        BEFORE_ACT.with(|cell| cell.set(Some(meddle)));
+        let outcome = recover(state);
+        BEFORE_ACT.with(|cell| cell.set(None));
+        outcome
+    }
+
+    /// An editor's save: a sibling renamed over the destination.
+    fn editors_save(dest: &Path) {
+        let sibling = dest.with_file_name(".bx-test-edit~");
+        std::fs::write(&sibling, "the user's edit\n").expect("write the sibling");
+        std::fs::rename(&sibling, dest).expect("rename it over");
+    }
+
+    #[test]
+    fn an_edit_after_recovery_judged_a_create_is_not_unlinked() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".made");
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".made", "made\n", Mode::DEFAULT_FILE)],
+        );
+
+        let err = recover_meddled(&state, editors_save).expect_err("the edit is refused");
+        assert!(
+            matches!(
+                err,
+                Error::Journal(journal::Error::Write(fs::Error::Changed { .. }))
+            ),
+            "got {err}",
+        );
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's edit\n");
+        // The journal stands, and the next run blocks on the edit.
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::Blocked { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's edit\n");
+    }
+
+    #[test]
+    fn an_edit_after_recovery_judged_a_modify_is_not_overwritten() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "before\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(
+                home.path(),
+                ".conf",
+                "after\n",
+                Mode::DEFAULT_FILE,
+            )],
+        );
+
+        let err = recover_meddled(&state, editors_save).expect_err("the edit is refused");
+        assert!(
+            matches!(err, Error::Write(fs::Error::Changed { .. })),
+            "got {err}"
+        );
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's edit\n");
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::Blocked { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's edit\n");
+    }
 
     /// Run a session and abandon it without finishing, which is exactly the
     /// state a crash leaves: a journal that stands, and a ledger that does not

@@ -1604,6 +1604,75 @@ mod tests {
     }
 
     #[test]
+    fn discovery_leaves_out_what_a_blocked_target_or_a_switched_off_toggle_declares() {
+        let values = "[[value]]\nname = \"who\"\nkind = \"string\"\n";
+        let home = repo(&format!(
+            "{values}\n{}\n{}",
+            inline("~/.blocked", "{{who}}\\n"),
+            inline("~/.toggled", "t\\n"),
+        ));
+        let local = StateDir::resolve(home.path()).local_toml();
+        std::fs::create_dir_all(local.parent().expect("parent")).expect("state dir");
+        std::fs::write(
+            &local,
+            "[[target]]\npath = \"~/.toggled\"\nenabled = false\n",
+        )
+        .expect("local.toml");
+        for rel in [".blocked", ".toggled", ".free"] {
+            plant(&home, rel, b"x\n", 0o644);
+        }
+
+        let ctx = context(&home);
+        assert!(
+            ctx.resolved
+                .targets
+                .iter()
+                .any(|r| matches!(r, Resolution::Blocked(entry) if entry.key == "~/.blocked")),
+            "the fixture holds a blocked target"
+        );
+        assert!(
+            ctx.layers
+                .iter()
+                .any(|layer| { layer.config.toggles.iter().any(|t| t.key == "~/.toggled") }),
+            "and a switched-off toggle"
+        );
+        assert_eq!(
+            discover(&ctx, &home.child(".config")).expect("discover"),
+            [target(&home, ".free")]
+        );
+    }
+
+    #[test]
+    fn discovery_leaves_out_what_programs_write_about_their_own_use() {
+        let home = repo("");
+        let written = [
+            ".zcompdump",
+            ".zcompdump-host-5.9",
+            ".lesshst",
+            ".viminfo",
+            ".wget-hsts",
+            ".Xauthority",
+            ".ICEauthority",
+            ".xsession-errors",
+            ".sudo_as_admin_successful",
+            ".python_history",
+        ];
+        for name in written {
+            assert!(machine_written(name), "{name}");
+            plant(&home, name, b"x\n", 0o600);
+        }
+        for name in [".zshrc", ".vimrc", ".lessrc"] {
+            assert!(!machine_written(name), "{name}");
+        }
+        plant(&home, ".vimrc", b"x\n", 0o644);
+
+        assert_eq!(
+            discover(&context(&home), &home.child(".config")).expect("discover"),
+            [target(&home, ".vimrc")]
+        );
+    }
+
+    #[test]
     fn a_body_already_in_the_repo_is_reused_when_identical_and_refused_otherwise() {
         let home = repo(MINE);
         plant(&home, ".same", b"s\n", 0o644);

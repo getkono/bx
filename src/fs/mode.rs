@@ -273,21 +273,47 @@ impl serde::de::Visitor<'_> for DeclaredMode {
     }
 
     fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Mode, E> {
-        Err(E::custom(unquoted(&value.to_string())))
+        Err(E::custom(unquoted(i128::from(value))))
     }
 
     fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Mode, E> {
-        Err(E::custom(unquoted(&value.to_string())))
+        Err(E::custom(unquoted(i128::from(value))))
     }
 }
 
-/// The message an unquoted mode gets: what it would have meant, and the fix.
-fn unquoted(digits: &str) -> String {
-    format!(
-        "a mode must be quoted: `mode = {digits}` is decimal {digits}, and TOML's own octal \
-         literal (0o{digits}) is not how a mode is written anywhere else. Write \
-         `mode = \"{digits}\"` if {digits} is the octal you meant"
-    )
+/// The message an unquoted mode gets: what it arrived as, and each fix that
+/// fits it.
+///
+/// The visitor sees only the integer, never how it was spelled, so `mode =
+/// 384` and `mode = 0o600` arrive the same. Each remedy is offered only when
+/// its reading is one [`Mode::parse_octal`] accepts: the integer's own decimal
+/// digits, if they are one to four octal digits — the author meant `"600"` and
+/// forgot the quotes — and its value in octal, if it is a mode at all — the
+/// author wrote TOML's `0o600`. Echoing the decimal digits as an octal literal
+/// or a quoted mode without that check told a `0o600` author about `0o384` and
+/// to write `mode = "384"`, which is refused in turn.
+fn unquoted(value: i128) -> String {
+    let mut message = format!(
+        "a mode must be quoted: this one is the bare integer {value} (decimal), and TOML's own \
+         octal literal is not how a mode is written anywhere else."
+    );
+    let digits = value.to_string();
+    let digits_are_a_mode = digits.len() <= 4 && digits.bytes().all(|b| (b'0'..=b'7').contains(&b));
+    let value_is_a_mode = (0..=0o7777).contains(&value);
+    if digits_are_a_mode {
+        message.push_str(&format!(
+            " Write `mode = \"{digits}\"` if {digits} is the octal you meant."
+        ));
+    }
+    if value_is_a_mode {
+        message.push_str(&format!(
+            " Write `mode = \"{value:04o}\"` if you wrote the octal literal 0o{value:o}."
+        ));
+    }
+    if !digits_are_a_mode && !value_is_a_mode {
+        message.push_str(" Write one to four octal digits in quotes, like `mode = \"0600\"`.");
+    }
+    message
 }
 
 /// A mode that could not be read.
@@ -460,12 +486,19 @@ mod tests {
     /// drift apart while both go through here.
     fn assert_unquoted_refusal(message: &str, digits: &str) {
         assert!(message.contains("must be quoted"), "{message}");
-        assert!(message.contains(&format!("decimal {digits}")), "{message}");
+        assert!(
+            message.contains(&format!("bare integer {digits} (decimal)")),
+            "{message}"
+        );
         assert!(
             message.contains(&format!("mode = \"{digits}\"")),
             "{message}"
         );
-        assert!(message.contains(&format!("0o{digits}")), "{message}");
+        // Its value in octal is the literal a `0o` author wrote. The decimal
+        // digits read as one are not: `0o600` arrives as 384, and there is no
+        // `0o384`.
+        let octal = format!("0o{:o}", digits.parse::<u32>().expect("decimal digits"));
+        assert!(message.contains(&octal), "{message}");
         // TOML has an octal literal; the message may not tell the user it does
         // not (the base corrected the same claim in `config::target`).
         assert!(!message.contains("no octal literal"), "{message}");
@@ -590,11 +623,81 @@ mod tests {
 
         // And the whole of it, once, so no clause can be rewritten unnoticed.
         assert_eq!(
-            unquoted("600"),
-            "a mode must be quoted: `mode = 600` is decimal 600, and TOML's own octal literal \
-             (0o600) is not how a mode is written anywhere else. Write `mode = \"600\"` if 600 \
-             is the octal you meant",
+            unquoted(600),
+            "a mode must be quoted: this one is the bare integer 600 (decimal), and TOML's own \
+             octal literal is not how a mode is written anywhere else. Write `mode = \"600\"` \
+             if 600 is the octal you meant. Write `mode = \"1130\"` if you wrote the octal \
+             literal 0o1130.",
         );
+    }
+
+    #[test]
+    fn a_toml_octal_literal_mode_is_told_the_quoted_form_of_that_literal() {
+        // `mode = 0o600` reaches the visitor as the integer 384, and nothing
+        // says how it was spelled. The refusal used to echo 384 back as
+        // `0o384`, which is not an octal literal, and as `mode = "384"`, which
+        // `parse_octal` refuses in turn — a remedy that is itself refused.
+        let err = toml_edit::de::from_str::<Declared>("mode = 0o600").expect_err("must be refused");
+        let message = err.to_string();
+        assert!(message.contains("must be quoted"), "{message}");
+        assert!(
+            message.contains("Write `mode = \"0600\"` if you wrote the octal literal 0o600."),
+            "{message}",
+        );
+        assert!(!message.contains("0o384"), "{message}");
+        assert!(!message.contains("mode = \"384\""), "{message}");
+        assert_eq!(
+            Mode::parse_octal("0600"),
+            Ok(Mode::PRIVATE_FILE),
+            "the remedy the refusal offers is one the parser accepts",
+        );
+
+        // Whose decimal digits are octal too: both readings are offered, and
+        // each is a mode `parse_octal` accepts.
+        let err = toml_edit::de::from_str::<Declared>("mode = 0o644").expect_err("must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("Write `mode = \"0644\"` if you wrote the octal literal 0o644."),
+            "{message}",
+        );
+        assert!(
+            message.contains("Write `mode = \"420\"` if 420 is the octal you meant."),
+            "{message}",
+        );
+
+        // And the whole of the one with no decimal reading.
+        assert_eq!(
+            unquoted(0o600),
+            "a mode must be quoted: this one is the bare integer 384 (decimal), and TOML's own \
+             octal literal is not how a mode is written anywhere else. Write `mode = \"0600\"` \
+             if you wrote the octal literal 0o600.",
+        );
+    }
+
+    #[test]
+    fn an_integer_that_is_no_mode_either_way_is_told_the_form_to_write() {
+        // 99999 is five digits and above 0o7777, and -1 is below zero: neither
+        // reading is a mode, so no quoted form of either is suggested.
+        for value in [99_999_i128, -1, 0o10000] {
+            let message = unquoted(value);
+            assert!(message.contains("must be quoted"), "{message}");
+            assert!(
+                message
+                    .ends_with("Write one to four octal digits in quotes, like `mode = \"0600\"`."),
+                "{message}",
+            );
+            assert!(!message.contains("octal you meant"), "{message}");
+            assert!(!message.contains("octal literal 0o"), "{message}");
+        }
+        // 0o10000 is 4096: four decimal digits, but not octal ones.
+        assert!(!unquoted(0o10000).contains("mode = \"4096\""));
+        // Each boundary on the other side is offered.
+        assert!(
+            unquoted(0o7777).contains("mode = \"7777\"` if you wrote the octal literal 0o7777")
+        );
+        assert!(unquoted(7777).contains("mode = \"7777\"` if 7777 is the octal you meant"));
+        assert!(unquoted(0).contains("mode = \"0\"` if 0 is the octal you meant"));
+        assert!(unquoted(0).contains("mode = \"0000\"` if you wrote the octal literal 0o0"));
     }
 
     #[test]

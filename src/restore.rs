@@ -1590,6 +1590,7 @@ mod tests {
                     ContentHash::of(b""),
                     Mode::DEFAULT_DIR,
                     crate::state::Mechanism::Own,
+                    crate::state::PriorBytes::Absent,
                 ))
                 .expect("a directory target");
             ledger.save().expect("save");
@@ -1713,7 +1714,12 @@ mod tests {
         let err =
             restore(&state, home.path(), std::slice::from_ref(&portable)).expect_err("rm stops");
         assert!(
-            matches!(err, Error::State(crate::state::Error::Read { .. })),
+            // The state layer refuses to read a snapshot that is not a
+            // regular file, and that refusal is neither of the two verdicts.
+            matches!(
+                err,
+                Error::State(crate::state::Error::RestoreNotAFile { .. })
+            ),
             "got {err}"
         );
         assert_eq!(peek(&dest).expect("untouched").0, b"bx's\n");

@@ -19,8 +19,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # convco needs full history to walk the commit range
-      # mise provisions convco (see mise.toml); the install is cached across runs.
+      # convco is a `cargo:` tool, so mise builds it from source and the build
+      # needs a toolchain that is pinned here rather than whatever the runner
+      # image happens to carry.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # mise provisions convco (see mise.toml); the install is cached across
+      # runs. Only convco is installed: this job runs nothing else, and building
+      # the rest of the table from source is time spent on tools it never calls.
       - uses: jdx/mise-action@v2
+        with:
+          install_args: cargo:convco
       - name: Conventional Commits check
         run: convco check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
 
@@ -34,6 +43,64 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v2
+      # env_guard's strongest evidence is differential: it holds its grammar
+      # against what real bash, zsh, bun and uv actually do with a value. A
+      # missing program fails those tests rather than skipping them, so the
+      # runner has to supply every one of them or the property never runs. bash
+      # is on the image already.
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      # Some tests run a copy of the suite as another uid, inside a user
+      # namespace `unshare --map-auto --map-root-user` builds, against a
+      # directory set-group-ID to a group that uid is not in. A scenario the
+      # machine cannot build fails the test rather than skipping it
+      # (`journal::tests::cannot_build`), so the runner has to be able to build
+      # it. Three things stand in the way on the stock image: Ubuntu's AppArmor
+      # policy strips every capability from an unprivileged user namespace, so
+      # the `chown` inside it is refused; `--map-auto` needs `newuidmap` and
+      # `newgidmap` from `uidmap`; and it needs a subordinate id range for the
+      # runner's user to map.
+      - name: Allow unprivileged user namespaces with subordinate ids
+        run: |
+          sudo apt-get install -y uidmap
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+          user=$(id -un)
+          for file in /etc/subuid /etc/subgid; do
+            grep -q "^$user:" "$file" 2>/dev/null || echo "$user:100000:65536" | sudo tee -a "$file"
+          done
+      - uses: oven-sh/setup-bun@v2
+      # uv is pinned, not floated. `Reason::DeclaredRootItself` exists because
+      # uv derives its executable directory as `$XDG_DATA_HOME/../bin`, and the
+      # test that holds the rule to a real uv was written against the version
+      # below. Floating it would let a uv release turn this red at a time
+      # nobody chose. When uv does change that layout,
+      # `uv_puts_executables_beside_its_data_home_and_the_guard_refuses_a_root`
+      # fails on its `dir --bin` assertion at the commit that raises the pin,
+      # where the rule can be re-derived deliberately — which is the point.
+      #
+      # It comes from the action rather than from mise.toml's [tools] because
+      # mise puts a *shim* on PATH — `core.addPath(<miseDir>/shims)`, run
+      # unconditionally at src/index.ts:69-71 of mise-action@v2, with no input
+      # to disable it — and a shim resolves the real binary out of mise's data
+      # directory, which `miseDir()` finds through MISE_DATA_DIR, XDG_DATA_HOME
+      # then the home. The test spawns uv with `env_clear()` and redirects both
+      # of the latter two into a scratch temporary directory, so a shim there
+      # reports "uv is not a valid shim" and the test fails on `an installed uv
+      # runs` instead.
+      #
+      # The ref is an exact release tag, and that is a deliberate departure from
+      # the floating major every other action here uses. setup-uv publishes no
+      # floating major past v7 — v8, v9 and v10 exist only as release series —
+      # so `@v10` does not resolve and `@v7` would mean choosing a three-major-
+      # old action to match a tag shape. An exact tag pins the action's
+      # *version*, where a floating major does not; it is not immutable, since
+      # a tag can be force-moved, and only a commit SHA would be. Readability
+      # won that trade here. The cost is that a human bumps it, which is the
+      # same deliberate bump the uv version pin above already asks for.
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.11.30"
       - name: Check formatting
         run: mise run format-check
       - name: Clippy
@@ -51,6 +118,137 @@ jobs:
       - uses: actions/checkout@v4
       - name: ShellCheck
         run: shellcheck install.sh bench/run.sh bench/stubs/gen.sh
+      # An action ref that does not resolve fails every job that uses it at
+      # `Set up job`, having run no step — so the jobs that would have caught a
+      # problem are exactly the ones that never start. Nothing else here would
+      # notice: actionlint does not check whether a ref exists, and was clean
+      # over this file while `astral-sh/setup-uv@v10`, which resolves to
+      # nothing, stood in it. Resolving each ref against the registry is the
+      # check that does catch it, which is why it is a step and not a habit.
+      #
+      # Tags, branches and commit SHAs are all accepted, so pinning a ref
+      # harder never fails this.
+      #
+      # The match is anchored at the *start* only. `^` is what stops it reading
+      # this step's own source, since the extraction contains the string it
+      # greps for and no line of it begins with `uses:`. Anchoring the end too
+      # was an over-correction: it required a line to be bare to its end, which
+      # silently skipped `uses: owner/repo@<sha> # v4.2.2` — the conventional
+      # harder pin, and the very form the note above recommends. A step called
+      # "every" that quietly checks fewer is the failure it exists to prevent,
+      # so the trailing comment is now part of the grammar and stripped.
+      #
+      # Four forms no registry lookup can answer for are skipped *by name*
+      # rather than reported unresolved: a local action (`./.github/actions/x`),
+      # a container action (`docker://…`), and a templated ref
+      # (`uses: ${{ matrix.action }}`), which has no value until the matrix
+      # expands and would otherwise report one spurious failure per matrix leg.
+      # A subdirectory action (`github/codeql-action/init@v3`) *is* resolvable,
+      # but on `owner/repo` — asking about the subdirectory 404s, which
+      # reported a valid ref as broken until round 5.
+      #
+      # None of the four is present today, which is why the self-check in the
+      # step exercises each of them: grammar nothing runs is grammar nobody
+      # finds wrong, and that is precisely how the subdirectory form survived a
+      # round in which the two forms beside it were added.
+      #
+      # This job's own `actions/checkout@v4`, above, is the one ref whose
+      # breakage this step cannot report: the job would die at `Set up job`
+      # before the step ran. It is the same hole the step exists to close, one
+      # level up, and nothing inside a workflow can close it for itself.
+      - name: Resolve every action ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # One verdict word per ref, so every branch is reachable from the
+          # self-check below as well as from the real tree.
+          resolve() {
+            case $1 in
+              # A templated ref: no action ref holds `{{`, and the value
+              # does not exist until the matrix expands.
+              *'{{'*)         echo templated; return ;;
+              ./*|docker://*) echo skipped;   return ;;
+            esac
+            case $1 in
+              */*@*) rev=${1#*@}; path=${1%@*} ;;
+              */*)   rev=;        path=$1 ;;
+              *)     echo malformed; return ;;
+            esac
+            # `owner/repo/sub/dir@ref` is a subdirectory action: the ref lives
+            # on `owner/repo`, and asking the registry about the subdirectory
+            # 404s. `github/codeql-action/init@v3` is the canonical one.
+            repo=$(printf '%s\n' "$path" | cut -d/ -f1,2)
+            if [ -z "$rev" ]; then
+              gh api "repos/$repo" >/dev/null 2>&1 && echo unpinned || echo UNRESOLVED
+              return
+            fi
+            if gh api "repos/$repo/git/ref/tags/$rev" >/dev/null 2>&1 \
+              || gh api "repos/$repo/git/ref/heads/$rev" >/dev/null 2>&1 \
+              || gh api "repos/$repo/commits/$rev" >/dev/null 2>&1; then
+              echo resolves
+            else
+              echo UNRESOLVED
+            fi
+          }
+
+          # Every branch of `resolve` over forms this repository does not use
+          # today. Without this the grammar added for them is dead code that no
+          # run exercises, which is how the subdirectory form went unnoticed
+          # while two sibling forms beside it were being widened.
+          echo '-- self-check'
+          bad=0
+          for pair in \
+            'actions/checkout@v4=resolves' \
+            'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683=resolves' \
+            'github/codeql-action/init@v3=resolves' \
+            'actions/setup-node@main=resolves' \
+            'astral-sh/setup-uv@v10=UNRESOLVED' \
+            './.github/actions/local=skipped' \
+            'docker://alpine:3.20=skipped' \
+            'actions/checkout=unpinned' \
+            'not-a-ref=malformed'
+          do
+            got=$(resolve "${pair%=*}")
+            if [ "$got" = "${pair##*=}" ]; then
+              echo "  ok        ${pair%=*} -> $got"
+            else
+              echo "  BAD       ${pair%=*} -> $got (wanted ${pair##*=})"
+              bad=1
+            fi
+          done
+          templated='$'"{{ matrix.action }}"
+          got=$(resolve "$templated")
+          if [ "$got" = templated ]; then
+            echo "  ok        a templated ref -> templated"
+          else
+            echo "  BAD       a templated ref -> $got (wanted templated)"
+            bad=1
+          fi
+          test "$bad" = 0 || { echo 'the ref classifier does not behave as documented'; exit 1; }
+
+          echo '-- this repository'
+          status=0
+          refs=$(grep -hE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]]' \
+            .github/workflows/*.yml \
+            | sed -E -e 's/^.*uses:[[:space:]]*//' -e 's/[[:space:]]*#.*$//' \
+                     -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' \
+            | sort -u)
+          test -n "$refs" || { echo 'no action refs found, which cannot be right'; exit 1; }
+          for ref in $refs; do
+            verdict=$(resolve "$ref")
+            case $verdict in
+              resolves|unpinned|skipped|templated) echo "  $verdict  $ref" ;;
+              *) echo "  $verdict  $ref"; status=1 ;;
+            esac
+          done
+          exit $status
+      # actionlint is deliberately *not* wired in here. It would not have
+      # caught the unresolvable ref — it was clean over this file while that
+      # ref stood — and at this head it reports a real pre-existing SC2155 in
+      # release-plz.yml, a file outside this change's scope. Adding it scoped
+      # to ci.yml alone would be a linter that skips the one workflow with a
+      # known finding, which is worse than not claiming the check. Wiring it in
+      # belongs with the change that fixes release-plz.yml.
 
   coverage:
     name: Coverage
@@ -62,6 +260,25 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: jdx/mise-action@v2
+      # Coverage runs the same suite as `check`, so it needs the same programs;
+      # without them the differential tests fail here too. The uv pin is the
+      # same one, and so is the exact-release-tag ref, for the reasons written
+      # out in `check`. So are the user-namespace provisions.
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Allow unprivileged user namespaces with subordinate ids
+        run: |
+          sudo apt-get install -y uidmap
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+          user=$(id -un)
+          for file in /etc/subuid /etc/subgid; do
+            grep -q "^$user:" "$file" 2>/dev/null || echo "$user:100000:65536" | sudo tee -a "$file"
+          done
+      - uses: oven-sh/setup-bun@v2
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.11.30"
       - name: Collect coverage data
         run: cargo llvm-cov --no-report
       - name: Generate lcov report and enforce threshold
@@ -81,9 +298,23 @@ jobs:
     # requirement — and an unmeasured requirement is one that regresses. The
     # fixture is hermetic (scratch HOME, stub tools), so this is a real gate and
     # not a measurement of the runner's mood. See bench/README.md.
+    #
+    # `mise run` installs every missing tool in the table before it runs a task,
+    # so `install_args` alone would be undone by the Measure step. Turning that
+    # off is what makes the narrowed install hold; a tool this job needs and
+    # does not have fails loudly in bench/run.sh, which checks for each one.
+    env:
+      MISE_AUTO_INSTALL: "false"
     steps:
       - uses: actions/checkout@v4
+      # The measurement needs no cargo, but a pinned toolchain keeps any tool
+      # mise does build from source off the runner image's mood (issue #55).
+      - uses: dtolnay/rust-toolchain@stable
+      # hyperfine is the only tool this job calls; the rest of the table would
+      # be built from source for nothing.
       - uses: jdx/mise-action@v2
+        with:
+          install_args: aqua:sharkdp/hyperfine
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
       - name: Measure

@@ -18,6 +18,9 @@
 //! 5. the prior state recorded — [`Filled::new_entry`] assembles it and
 //!    [`crate::state::Ledger::record`] makes it durable — **before** the
 //!    rename, so a crash after the rename still has a recoverable prior state.
+//!    Steps 6 and 7 can still refuse or fail, so this record can outlive a
+//!    write that never lands; [`Unpublished`] names the write so its record
+//!    can be withdrawn, and [`Filled::new_entry`] says when and how.
 //! 6. the destination `lstat`ed again and compared with what step 1 saw, and
 //!    the write refused if it changed.
 //! 7. `rename`.
@@ -124,6 +127,39 @@
 //! a unit test observes the kernel. That is a far smaller claim than "every
 //! call site remembered to sync", and it is not one a change to this file can
 //! break.
+//!
+//! # What the suite does not construct, and why that is a decision
+//!
+//! ## Syscall-failure arms that follow a successful syscall on the same object
+//!
+//! Several `Err` arms here are unreachable from a test, and they are one class
+//! rather than a list: an arm that handles a syscall failing **after an earlier
+//! syscall on the same path or descriptor succeeded**. Reaching one needs the
+//! object to be removed, to lose a permission, or to run the filesystem out of
+//! space or descriptors, in the microseconds between the two calls. A test
+//! cannot schedule that, and no count of the arms is worth keeping current,
+//! because the class is closed under the arms a later change adds.
+//!
+//! What would reach them is a `cfg(test)` seam that fails a chosen syscall.
+//! There is deliberately none. `fs::durable` has one for the durability calls,
+//! because an `fsync` has no result a test can read back and so no other
+//! witness exists; `process_keeps_setgid` has one because the answer that
+//! matters needs a user namespace to arrange. Both seams answer a question the
+//! filesystem will not answer. These arms are not that: each does one thing —
+//! wrap the failure in the typed error that names the path — and the object of
+//! a seam here would be to watch bx run code a reader can see is right, in
+//! exchange for a second control flow present in every test build.
+//!
+//! ## Mutants that survive because they are the same program
+//!
+//! `cargo mutants` reports survivors here that no test can kill, because the
+//! mutation produces a program that cannot behave differently — a guard around
+//! an operation that is a no-op when the guard is false, a bitwise `|` between
+//! flags that share no bit, a body that drops a value the function would drop
+//! anyway. Each such site carries the reason next to it rather than in a list
+//! somewhere else, so the reason moves with the code it is about and a later
+//! mutants run is read against the code rather than against a count taken at a
+//! head that has moved.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -162,14 +198,33 @@ pub enum Error {
         /// What is actually there.
         kind: Kind,
     },
-    /// The destination is a symlink the user created.
+    /// The destination is a symlink, and bx replaces no symlink.
     ///
     /// `rename(2)` onto a link's path replaces **the link itself**, so writing
-    /// "through" one would silently convert a link the user made into a regular
-    /// file. bx refuses instead.
+    /// "through" one would silently convert a link into a regular file. bx
+    /// refuses instead.
+    ///
+    /// # Including at a path bx owns
+    ///
+    /// The refusal is the same for a link found at a blob name inside the
+    /// state directory as for one at a file the user declared, and that is a
+    /// decision, not an oversight. bx did not make the link — it writes none —
+    /// so it is something that arrived from a restored backup, an `rsync
+    /// --links`, or a hand. Unlinking it would be bx deleting a name a person
+    /// or a tool put there, which is Invariant 1 whatever directory it is in,
+    /// and the content-addressed name gives bx no way to tell a stray link from
+    /// a deliberate one.
+    ///
+    /// What the refusal owes such a caller is a remedy that makes sense for a
+    /// file nobody declared, so the message leads with the one action that is
+    /// always right — remove the link it names — and offers the target-shaped
+    /// advice only as the alternative it is. A blob at
+    /// `<state>/restore/<digest>` is reconstructed on the next `record` once the
+    /// link is gone; nothing else has to be repaired.
     #[error(
-        "{} is a symlink; bx will not replace a link you created. \
-         Point the target at the file the link resolves to, or remove the link",
+        "{} is a symlink, and bx replaces no symlink: a rename onto it would replace the link \
+         itself. Remove the link. If you declared this path as a target, you can instead point \
+         the target at the file the link resolves to",
         .0.display()
     )]
     Symlink(PathBuf),
@@ -213,10 +268,15 @@ pub enum Error {
     /// observed, by [`Filled::publish`] when it changed between [`stage`] and
     /// the rename — an editor saving, a symlink swapped in, a file appearing
     /// where there was none — and by [`ensure_dir`] when a directory target is
-    /// no longer what `plan` saw. Nothing is replaced: the
-    /// temporary file is removed — unless its directory no longer permits
-    /// removal, when the `.bx-` file is left for recovery — and the path keeps
-    /// what is there now.
+    /// no longer what `plan` saw. Nothing is replaced: the path keeps what is
+    /// there now, and the temporary file is dropped — see [`Staged`] for what
+    /// that is worth.
+    ///
+    /// From [`Filled::publish`] it arrives inside an [`Unpublished`], because
+    /// "nothing was replaced" is not the whole obligation: a caller that
+    /// recorded a ledger entry before publishing, as [`Filled::new_entry`]
+    /// requires, is holding an entry for a write that did not happen, and must
+    /// withdraw it before it saves.
     #[error(
         "{} changed after bx looked at it ({detail}); nothing was replaced. Run plan again",
         .path.display()
@@ -250,8 +310,8 @@ pub enum Error {
     /// with `quiet`, and some FUSE and network filesystems — can drop any of
     /// the three the same way. Publishing it would put a mode on disk that is
     /// not the declared one and make every later `plan` announce a `Modify` no
-    /// `apply` can close. The temporary file is removed and the destination is
-    /// untouched.
+    /// `apply` can close. The destination is untouched and the temporary file is
+    /// dropped — see [`Staged`] for what that is worth.
     ///
     /// The message names the bits that were lost, and blames group membership
     /// only when the setgid bit is among them.
@@ -282,10 +342,13 @@ pub enum Error {
     ///
     /// The kernel's own cause is refused before any `chmod`: [`ensure_dir`]
     /// does not `chmod` an existing directory that has `S_ISGID`, or is
-    /// declared with it, when the process is neither root nor in the
-    /// directory's group. That `chmod` would strip the bit, and a set-back by
-    /// the same process would strip it again, so a bit the user had would be
-    /// lost for good. Then `chmod_left` is `None` and nothing was changed.
+    /// declared with it, unless a `chmod` by this process is **confirmed** to
+    /// keep the bit — by `CAP_FSETID` in the effective set, or by the
+    /// directory's group being one the kernel resolved and this process is in
+    /// (see [`keeps_setgid`]). Anything it cannot confirm is refused. That
+    /// `chmod` would strip the bit, and a set-back by the same process would
+    /// strip it again, so a bit the user had would be lost for good. Then
+    /// `chmod_left` is `None` and nothing was changed.
     ///
     /// The message is worded from `landed`, the mode on the directory when bx
     /// returned, and says whether a set-back restored the mode `plan` saw.
@@ -306,6 +369,19 @@ pub enum Error {
         /// mode `plan` saw; `None` when bx set nothing back.
         set_back: Option<Mode>,
     },
+    /// The destination's parent directory does not exist, and the entry point
+    /// asked creates none.
+    ///
+    /// Only [`write_atomically`] raises it. [`stage`] and [`ensure_dir`] create
+    /// directories; this is the shorthand that has no [`CreatedDirs`] to record
+    /// one in, no plan to announce it in, and no caller to say what mode it
+    /// should get.
+    #[error(
+        "{} does not exist, and bx creates no directory for this write: nothing here decides \
+         what mode it would get. Create it, or declare it as a directory target",
+        .0.display()
+    )]
+    MissingParent(PathBuf),
     /// The path has a `..` component.
     ///
     /// The kernel resolves `..` *after* following the component before it, so
@@ -402,6 +478,23 @@ const FILE_OWNER_NEEDS: Mode = Mode::from_bits(0o400);
 
 /// The words [`Error::OwnerLockedOut`] and `plan`'s conflict note share: the
 /// owner bits of `needs` that `declared` lacks, and why bx needs them.
+/// `names` as English: `""`, `"read"`, `"read and write"`, `"read, write and
+/// search"`.
+///
+/// One function rather than one per message, because the two messages that need
+/// it — [`owner_locked_out`] and [`bits_that_did_not_stick`] — each pass a list
+/// whose length is bounded by what their caller happens to ask for today. Both
+/// had their own version, and both versions had a branch that no caller reached:
+/// a guard whose justification was the set of callers rather than the
+/// conjunction it was written to produce. Tested directly, at every length.
+fn and_list(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 fn owner_locked_out(declared: Mode, needs: Mode) -> String {
     let missing = needs.bits() & !declared.bits();
     let names: Vec<&str> = [(0o400, "read"), (0o200, "write"), (0o100, "search")]
@@ -409,10 +502,7 @@ fn owner_locked_out(declared: Mode, needs: Mode) -> String {
         .filter(|(bit, _)| missing & bit != 0)
         .map(|(_, name)| name)
         .collect();
-    let named = match names.as_slice() {
-        [init @ .., last] if !init.is_empty() => format!("{} and {last}", init.join(", ")),
-        _ => names.concat(),
-    };
+    let named = and_list(&names);
     format!(
         "declares {declared}, which denies its owner {named} ({missing:04o}): bx reads a file \
          target's bytes to compare them with what it wants there, so its mode must grant the \
@@ -446,9 +536,9 @@ fn directory_set_id_not_kept(
         };
         return format!(
             "{} declares {declared} and is {landed}: the kernel drops a directory's setgid bit \
-             on a chmod by a process that is neither root nor in the directory's group, and this \
-             one is neither, so the directory would {lost}. bx did not chmod it, and nothing was \
-             changed",
+             on a chmod unless the process holds CAP_FSETID or is in the directory's group, and \
+             bx could confirm neither for this process, so the directory would {lost}. bx did \
+             not chmod it, and nothing was changed",
             path.display()
         );
     };
@@ -482,17 +572,17 @@ fn bits_that_did_not_stick(declared: Mode, landed: Mode, what: &str) -> String {
         .filter(|(bit, _)| lost & bit != 0)
         .map(|(_, name)| name)
         .collect();
-    let (named, noun) = match names.as_slice() {
-        [one] => ((*one).to_string(), "bit"),
-        [init @ .., last] => (format!("{} and {last}", init.join(", ")), "bits"),
-        // Unreachable by construction: `bits_that_did_not_stick` is only
-        // called to word `Error::SetIdNotKept`, and
-        // `Error::DirectorySetIdNotKept` when a `chmod` was made, with the
-        // mode that `chmod` left; `verify_set_id_kept` and `set_dir_mode` only
-        // construct either error when `lost` — `declared`'s special bits
-        // minus that mode's — is non-empty, so `names` is never empty here.
-        // Kept so the match stays total rather than opening a panic path.
-        [] => ("special".to_string(), "bits"),
+    let noun = if names.len() == 1 { "bit" } else { "bits" };
+    // `names` is never empty here: `bits_that_did_not_stick` is only called to
+    // word `Error::SetIdNotKept`, and `Error::DirectorySetIdNotKept` when a
+    // `chmod` was made, with the mode that `chmod` left; `verify_set_id_kept`
+    // and `set_dir_mode` only construct either error when `lost` — `declared`'s
+    // special bits minus that mode's — is non-empty. `and_list` is total for
+    // the empty case anyway, so this opens no panic path.
+    let named = if names.is_empty() {
+        "special".to_string()
+    } else {
+        and_list(&names)
     };
     let group = if lost & SETGID != 0 {
         format!(
@@ -514,6 +604,7 @@ impl Error {
     pub fn path(&self) -> &Path {
         match self {
             Self::NoParent(path)
+            | Self::MissingParent(path)
             | Self::Symlink(path)
             | Self::NotAFile { path, .. }
             | Self::UnusableParent { path, .. }
@@ -663,6 +754,23 @@ pub enum ParentState {
     /// Something is on the path and it does not resolve to a directory: a
     /// dangling symlink, a symlink loop, or a non-directory. The string is the
     /// cause, in the words `plan` prints and the error message `apply` returns.
+    ///
+    /// # It names an absolute path, and that is left for the renderer
+    ///
+    /// [`compare`]'s parent note is written against `home`, so `plan` prints
+    /// `~/.config`; this reason is not, so a conflict line for a target under a
+    /// dangling `~/.config` prints the user's home directory. Every
+    /// [`Error`]'s `Display` is absolute the same way.
+    ///
+    /// Closing it means carrying the unusable component and its cause as
+    /// fields and rendering them where the home is known, which is this variant
+    /// — public, and matched on by the caller that will render it — and the
+    /// [`Error::UnusableParent`] that repeats the same words, whose message
+    /// `plan` and `apply` currently share verbatim
+    /// (`a_dangling_symlink_parent_is_a_conflict_rather_than_a_create` asserts
+    /// that `err.to_string()` *is* the note). Two renderings out of one is the
+    /// decision, and it belongs to the entry that renders both rather than to
+    /// the one that produces the string.
     Unusable(String),
 }
 
@@ -836,6 +944,38 @@ pub struct Outcome {
 ///   [`stage`] does not refuse such a mode: a reversal restores a recorded
 ///   prior mode through it as recorded.
 ///
+/// # The parent note is about the immediate parent, and only about it
+///
+/// A directory anywhere above the immediate parent can be group- or
+/// world-writable and no note says so — `~/.config` at `0777` holding
+/// `~/.config/foo` at `0700` holding a `0600` file produces nothing. That is
+/// the scope this function has, deliberately, and the reason is what the note
+/// is *for* rather than what the danger is.
+///
+/// The immediate parent is the one directory this write interacts with: bx puts
+/// its temporary file there, renames within it, and may create it — at a mode
+/// this target's own declaration fixes ([`stage`]). Its mode is therefore
+/// comparable with the mode this target declares, which is exactly what the
+/// note compares, and the remedy is this target's author's: declare the
+/// directory, or narrow it.
+///
+/// A writable ancestor is a different fact with a different remedy. It is one
+/// fact about the home, not one per target: repeating it on every plan line
+/// beneath it would say the same thing as many times as there are targets, and
+/// the one action that fixes it is not this target's. It is also not the same
+/// danger — an ancestor's *write* bit lets somebody rename a subtree, which no
+/// mode on this file or its parent prevents — so reporting it through a
+/// predicate built to compare a directory against a file inside it
+/// ([`Mode::is_wider_than`], which excludes execute for that reason) would
+/// answer the wrong question. A whole-home audit is where it belongs.
+///
+/// What this scope does **not** leave open: a wide ancestor bx made itself.
+/// [`stage`] creates a missing ancestor at [`Mode::DEFAULT_DIR`] or at the mode
+/// a directory target declares, never wider, and refuses to write beneath a
+/// declared directory that is still wider than declared
+/// ([`Error::DirectoryTargetPending`]). Every unreported ancestor was already
+/// there and is the user's.
+///
 /// `home` only names things: a directory the parent note mentions is written
 /// `~/…` when it is under `home`, through [`crate::paths::to_portable`],
 /// because `plan` prints the note and plan output names no absolute home. The
@@ -949,8 +1089,25 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
 
 /// A write that has a temporary file at its final mode and no content yet.
 ///
-/// Created by [`stage`]. Dropping it removes the temporary file and leaves the
-/// destination exactly as it was.
+/// Created by [`stage`]. Dropping it leaves the destination exactly as it was.
+///
+/// # What "the temporary file is removed" is worth
+///
+/// This is the one place that statement is qualified, and every other mention
+/// of it in this module and in [`crate::fs::durable`] points here rather than
+/// repeating it, so there is one sentence to be right rather than six.
+///
+/// Dropping a `Staged` or a [`Filled`] asks the kernel to unlink the `.bx-`
+/// file, and **that unlink can fail**: it needs write permission on the
+/// destination directory, which the directory can lose after [`stage`] made
+/// the file. A directory narrowed to `0500` between `stage` and
+/// [`Filled::publish`] fails the rename and keeps the temporary file. `tempfile`
+/// reports nothing from `Drop`, so bx does not learn of it either.
+///
+/// Nothing in the writer can close that: removal is exactly what the directory
+/// now refuses. It is why the prefix is reserved
+/// ([`TEMP_PREFIX`]) — a leftover is identifiable as bx's by name, and recovery
+/// and `doctor` find it there. Pinned by `a_failed_rename_syncs_no_directory`.
 #[derive(Debug)]
 pub struct Staged(Pending);
 
@@ -1079,7 +1236,7 @@ pub fn stage(
     let dir = parent_of(dest)?;
     // Before creating anything, so a refusal leaves nothing behind.
     refuse_wider_than_declared(dest, dir, created)?;
-    let made = create_missing_dirs(dir, None, created)?;
+    let made = create_missing_dirs(dir, created)?;
     let created_dirs = created.record(made, None);
 
     let temp = tempfile::Builder::new()
@@ -1153,6 +1310,15 @@ impl Staged {
         // set-id bit set earlier would already be gone: the kernel clears
         // S_ISUID, and S_ISGID alongside group execute, on a write by a process
         // without CAP_FSETID.
+        //
+        // Forcing either guard below *true* is a surviving mutant, and
+        // equivalent: each guards an operation that does nothing when the
+        // guard is false. With no set-id bit declared the `fchmod` asks for the
+        // mode `stage` already set, and `verify_set_id_kept` looks for no bits
+        // and finds them. Only the number of syscalls differs, and nothing
+        // observes that — the `durable` recorder records durability calls, not
+        // mode calls, deliberately: see the module documentation. Forcing
+        // either *false* is killed, by the tests that declare a set-id bit.
         if self.0.mode.bits() & SET_ID != 0 {
             fchmod(self.0.temp.as_file(), self.0.mode, &temp_path)?;
         }
@@ -1176,12 +1342,18 @@ impl Staged {
     ///
     /// Whatever [`Staged::fill`] or [`Filled::publish`] returns.
     pub fn commit(self, bytes: &[u8]) -> Result<(), Error> {
-        self.fill(bytes)?.publish()
+        // No ledger entry can exist for this write: `commit` never hands the
+        // caller a `Filled`, so `new_entry` was never reachable for it.
+        self.fill(bytes)?.publish().map_err(Unpublished::into_error)
     }
 
-    /// Discard the write. The temporary file is removed and the destination is
-    /// untouched. Identical to dropping it; named so a caller can say so.
+    /// Discard the write. The destination is untouched and the temporary file
+    /// is dropped — see [`Staged`] for what that is worth. Identical to
+    /// dropping it; named so a caller can say so.
     pub fn abandon(self) {
+        // A surviving mutant, and equivalent: `self` is dropped at the end of
+        // this function whether or not the body says so, so emptying the body
+        // gives the same program. The call is here to be read, not to act.
         drop(self);
     }
 }
@@ -1249,6 +1421,33 @@ impl Filled {
     /// `restore/` before it returns. A crash after the rename is then
     /// recoverable, because the bytes that were displaced are already durable.
     ///
+    /// # The entry is owed a withdrawal if the publish is refused
+    ///
+    /// That ordering is not a preference: the displaced bytes must be durable
+    /// before anything can displace them, so the record has to precede a rename
+    /// that may still fail. An entry recorded here therefore describes a write
+    /// that has not happened yet, and [`Filled::publish`] can refuse — a
+    /// destination changed after `stage` looked, a directory that cannot be
+    /// opened, a `rename` out of space.
+    ///
+    /// So a caller that records an entry **must withdraw it when the publish is
+    /// refused**, before it saves the ledger: take
+    /// [`crate::state::LedgerView::withdrawal`] for the entry's path before the
+    /// `record`, and hand it to [`crate::state::Ledger::withdraw`] on refusal.
+    /// That puts back the entry as it was before the record — on a re-record,
+    /// with the prior the user had before bx — rather than dropping the key,
+    /// which [`crate::state::Ledger::forget`] would do and which loses that
+    /// prior. [`Unpublished`] names the destination the entry is keyed on,
+    /// because `publish` consumes the `Filled`. A durable entry for a write
+    /// that never landed makes `bx rm` restore the recorded prior over content
+    /// bx never replaced, which is Invariant 4 inverted.
+    ///
+    /// Pinned by
+    /// `a_ledger_entry_for_a_refused_publish_is_withdrawn_through_what_the_refusal_names`
+    /// for a first record, and by
+    /// `a_refused_re_record_is_withdrawn_to_the_entry_it_replaced` for a
+    /// re-record.
+    ///
     /// # Errors
     ///
     /// [`Error::NotPortable`] if the destination or a created directory is not
@@ -1266,8 +1465,8 @@ impl Filled {
             self.written(),
             self.pending.mode,
             mechanism,
+            self.pending.prior.prior_bytes(),
         )
-        .with_prior(self.pending.prior.prior_bytes())
         .with_created_dirs(
             self.pending
                 .created_dirs
@@ -1305,14 +1504,19 @@ impl Filled {
     ///
     /// # Errors
     ///
-    /// [`Error::Changed`] when the destination is no longer what [`stage`]
-    /// observed; nothing is replaced. [`Error::Write`] wrapping the failing
-    /// `open` of the directory, `rename`, or `fsync`. The temporary file is
-    /// removed either way, unless the directory no longer permits removal,
-    /// which also fails the rename; the `.bx-` file is then left for recovery.
-    /// Only a failing `fsync` of the directory is returned after the
-    /// destination was replaced.
-    pub fn publish(self) -> Result<(), Error> {
+    /// [`Unpublished`], which names the destination as well as the cause, so a
+    /// caller that recorded a ledger entry for this write before calling — as
+    /// [`Filled::new_entry`] requires — can withdraw it. `publish` consumes the
+    /// `Filled`, so the refusal is the only thing left that knows which write
+    /// it was.
+    ///
+    /// The cause is [`Error::Changed`] when the destination is no longer what
+    /// [`stage`] observed; nothing is replaced. [`Error::Write`] wrapping the
+    /// failing `open` of the directory, `rename`, or `fsync`. The temporary file
+    /// is dropped either way — see [`Staged`] for what that is worth. Only a
+    /// failing `fsync` of the directory is returned after the destination was
+    /// replaced.
+    pub fn publish(self) -> Result<(), Unpublished> {
         let Self {
             pending:
                 Pending {
@@ -1325,29 +1529,112 @@ impl Filled {
             ..
         } = self;
 
-        let dir = parent_of(&dest)?;
-        let dir_fail = |source| Error::Write {
-            path: dir.to_path_buf(),
-            source,
+        // Every refusal below names `dest`, because that is the key of the
+        // ledger entry a caller was obliged to record before calling. There is
+        // no early return that forgets to: the closure is the only way out.
+        let refused = |error: Error| Unpublished {
+            error,
+            dest: dest.clone(),
         };
-        let handle = durable::Dir::open(dir).map_err(dir_fail)?;
-        // The last thing before the rename, so the window it leaves open is as
-        // narrow as it can be. Refusing drops `temp`, which removes it.
-        verify_unchanged(&prior)?;
-        durable::rename(temp, &dest).map_err(|e| Error::Write {
-            path: dest.clone(),
-            source: e.error,
-        })?;
-        handle.sync().map_err(dir_fail)?;
+        let publish = || -> Result<(), Error> {
+            let dir = parent_of(&dest)?;
+            let dir_fail = |source| Error::Write {
+                path: dir.to_path_buf(),
+                source,
+            };
+            let handle = durable::Dir::open(dir).map_err(dir_fail)?;
+            // The last thing before the rename, so the window it leaves open is
+            // as narrow as it can be. Refusing drops `temp`, which removes it.
+            verify_unchanged(&prior)?;
+            durable::rename(temp, &dest).map_err(|e| Error::Write {
+                path: dest.clone(),
+                source: e.error,
+            })?;
+            handle.sync().map_err(dir_fail)
+        };
+        publish().map_err(refused)?;
 
         tracing::debug!(dest = %dest.display(), %mode, "wrote a file atomically");
         Ok(())
     }
 
-    /// Discard the write. The temporary file is removed and the destination is
-    /// untouched. Identical to dropping it; named so a caller can say so.
+    /// Discard the write. The destination is untouched and the temporary file
+    /// is dropped — see [`Staged`] for what that is worth. Identical to
+    /// dropping it; named so a caller can say so.
     pub fn abandon(self) {
+        // A surviving mutant, and equivalent: `self` is dropped at the end of
+        // this function whether or not the body says so, so emptying the body
+        // gives the same program. The call is here to be read, not to act.
         drop(self);
+    }
+}
+
+/// A write [`Filled::publish`] refused: why, and which write it was.
+///
+/// The second half is the point. [`Filled::new_entry`] must be called before
+/// `publish`, because the bytes a rename displaces have to be durable before
+/// anything displaces them — so by the time a publish is refused, a caller with
+/// a ledger has already recorded an entry for a write that did not happen. That
+/// record has to be withdrawn with [`crate::state::Ledger::withdraw`] before
+/// the ledger is saved, or `bx rm` will restore the recorded prior over content
+/// bx never replaced; see [`Filled::new_entry`].
+///
+/// `publish` consumes the [`Filled`], so nothing the caller still holds names
+/// the write afterwards. This does: [`Unpublished::dest`] is the path
+/// [`Filled::new_entry`] keyed the entry on.
+///
+/// # It is deliberately not an error type
+///
+/// No [`Display`](std::fmt::Display) and no
+/// [`std::error::Error`], so `?` converts it into nothing: not into
+/// [`Error`], and not into an aggregating type like `eyre::Report`, whose
+/// blanket `From` needs exactly those impls. The ledger-holding caller lives in
+/// that second layer, so an error impl here would have made the guard look
+/// present and not be.
+///
+/// ```compile_fail
+/// fn publish(filled: bx::fs::Filled) -> Result<(), bx::fs::Error> {
+///     filled.publish()?; // no `From<Unpublished> for fs::Error`
+///     Ok(())
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn publish(filled: bx::fs::Filled) -> eyre::Result<()> {
+///     filled.publish()?; // and none for `eyre::Report` either
+///     Ok(())
+/// }
+/// ```
+///
+/// ```
+/// fn publish(filled: bx::fs::Filled) -> Result<(), bx::fs::Error> {
+///     // Written out, because it says "this write had no ledger entry".
+///     filled.publish().map_err(bx::fs::Unpublished::into_error)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct Unpublished {
+    /// Why the write was refused.
+    pub error: Error,
+    /// The destination it would have replaced, and the path the entry to
+    /// withdraw is keyed on.
+    pub dest: PathBuf,
+}
+
+impl Unpublished {
+    /// The cause alone, for a caller that recorded nothing to withdraw.
+    ///
+    /// Deliberately a named call rather than a `From` impl: `?` would then
+    /// convert a refused publish into a plain [`Error`] silently, and a caller
+    /// that *had* recorded an entry would lose the only thing that still names
+    /// it. Writing this out says "there is no entry", which is true of
+    /// [`Staged::commit`] and [`write_atomically`] and of nothing else here.
+    ///
+    /// The [`Error`] it returns does not name [`Unpublished::dest`], because by
+    /// then the caller has said there is nothing keyed on it.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        self.error
     }
 }
 
@@ -1359,20 +1646,48 @@ impl Filled {
 /// [`Error::Changed`], whatever changed it after bx looked — with one
 /// exception. A failing `fsync` of the destination directory is reported after
 /// the rename, so that [`Error::Write`] comes back with `path` already holding
-/// all of `bytes`, in a rename a power loss may still undo. No temporary file
-/// is left behind in any case, unless the directory no longer permits its
-/// removal — see [`Filled::publish`].
+/// all of `bytes`, in a rename a power loss may still undo. The temporary file
+/// is dropped in any case — see [`Staged`] for what that is worth.
 ///
 /// The shorthand for [`observe`] + [`stage`] + [`Staged::commit`], for a caller
 /// whose `plan` and `apply` are this one call. A caller that printed a plan
 /// hands that plan's observation to [`stage`], and a caller that must record
 /// something between the `fsync` and the `rename` uses the phases directly.
 ///
+/// # The parent directory must already exist
+///
+/// This function creates no directories, and that is the whole of the claim.
+/// Two entry points in this module do: [`stage`], for the parents a write
+/// needs, and [`ensure_dir`], which is a directory target's own apply. Both
+/// take a [`CreatedDirs`] to record what they made so a reversal can remove it,
+/// both are announced by a [`compare`] or [`compare_dir`] first, and both get
+/// their mode from a declaration. (Outside `fs` entirely,
+/// `state::dir::ensure_dir` creates the state directory; it is bx's own and
+/// does not pass through here.)
+///
+/// This shorthand has none of the three: no set to record in, no plan to
+/// announce in, and no caller to say what mode a new directory should get.
+/// Inventing a `0755` directory here to hold a `0600` decrypted secret would
+/// answer that last question by default, silently, in the one function billed
+/// as the single place a secret is written.
+///
+/// So a missing parent is [`Error::MissingParent`]: the caller creates the
+/// directory it means, at the mode it means, and both state-directory callers
+/// already do.
+///
 /// # Errors
 ///
-/// Whatever [`observe`], [`stage`] or [`Staged::commit`] returns.
+/// [`Error::MissingParent`] when the destination's parent does not exist, and
+/// whatever [`observe`], [`stage`] or [`Staged::commit`] returns.
 pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Error> {
     let planned = observe(path)?;
+    // A parent that is there but does not resolve, or is a link, is left to the
+    // verdicts `stage` already has for it; only "nothing is there" is this one.
+    if let Some(parent) = &planned.parent
+        && matches!(parent.state, ParentState::Absent(_))
+    {
+        return Err(Error::MissingParent(parent.path.clone()));
+    }
     stage(path, mode, &planned, &mut CreatedDirs::new())?.commit(bytes)
 }
 
@@ -1438,9 +1753,27 @@ pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
 /// * [`Action::Conflict`] — anything that is not a directory, including a
 ///   symlink to one: bx does not chmod a directory through a link.
 ///
-/// A declared mode that denies the owner access is applied like any other.
-/// Whether it leaves bx unable to list, write into or search a directory
-/// depends on what lies beneath it, which only the plan layer knows.
+/// # A declared mode that denies the owner access is applied like any other
+///
+/// `fs` applies any declared directory mode. `~/.gnupg` declared `0400` is
+/// created at `0400`, and a declared `~/.gnupg/gpg.conf` beneath it then fails
+/// in [`stage`] with an `EACCES` [`Error::Write`], because bx cannot make its
+/// temporary file there. The directory is left in place and a later `plan` of
+/// the file cannot observe it.
+///
+/// That is the decision, not an omission, and the reason is that the rule that
+/// would refuse it cannot be stated here. "A directory target with a declared
+/// file beneath it must grant its owner write and search" needs to know which
+/// targets lie beneath this one. `fs` is handed one path at a time and never
+/// sees the set; the plan layer is where the set exists, and that is where the
+/// rule belongs. A rule `fs` could state instead — refuse any directory
+/// without owner `rwx` — was tried and removed, because a childless read-only
+/// directory target is legitimate and needs neither listing nor a temporary
+/// file.
+///
+/// What `fs` still refuses is the case it *can* decide from one path: a
+/// **file** target whose declared mode denies the owner read, because bx reads
+/// a file back to compare it — [`Error::OwnerLockedOut`], raised by [`compare`].
 #[must_use]
 pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
     if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
@@ -1536,8 +1869,8 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 /// setuid, setgid or sticky bit is not on the directory after its `chmod` — a
 /// refused `Modify` sets the directory back to the mode `plan` saw first, and
 /// reads it back — and, before any `chmod`, when the directory has `S_ISGID`
-/// or `mode` adds it and the process is neither root nor in the directory's
-/// group, so the kernel would strip the bit;
+/// or `mode` adds it and nothing confirms that a `chmod` by this process keeps
+/// the bit, so the kernel may strip it;
 /// [`Error::ParentComponent`] when it has a `..`
 /// component; [`Error::Read`]
 /// when the path or its parent cannot be stat'd; and [`Error::Write`] when a
@@ -1603,9 +1936,55 @@ pub struct EnsuredDir {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreatedDirs {
     /// Every directory this apply created, and how.
-    made: BTreeMap<PathBuf, Made>,
+    made: BTreeMap<DirKey, Made>,
     /// The mode each directory target in this apply declares.
-    declared: BTreeMap<PathBuf, Mode>,
+    declared: BTreeMap<DirKey, Mode>,
+}
+
+/// A directory path as [`CreatedDirs`] keys it.
+///
+/// Both maps are keyed on this and nothing else, and the only way to make one is
+/// [`DirKey::of`]. So no method of `CreatedDirs` can read or write either map
+/// with a path that did not pass through here: a lookup that forgot to would
+/// not compile. That matters because `declare` and `declared` are public, and a
+/// caller outside this module — the apply engine that will hold one set for the
+/// whole apply — has every reason to expect `~/.ssh` and `~/.ssh/` to name one
+/// directory, and no way to check that they do.
+///
+/// [`DirKey::of`] is what makes the spellings agree: it collects `components()`,
+/// which drops a trailing separator and every `.` after the first component.
+/// `Path`'s own `Ord` would agree on those two spellings without it — a key
+/// holding raw `OsStr` bytes *and* normalising passes the test below, measured
+/// — so the normalisation is the guarantee and `Ord` is not.
+///
+/// The newtype is what makes it un-skippable, and that is worth its weight for
+/// two reasons that are not about `Ord`:
+///
+/// * **`declare` and `declared` are public**, and the caller that drives them is
+///   outside this module — the apply engine that will hold one set for a whole
+///   apply. An un-normalised lookup from there is a compile error rather than a
+///   silent `None`.
+/// * **The stored spelling is dereferenced, not just compared.** [`DirKey::path`]
+///   goes into `symlink_metadata` and into [`Error::DirectoryTargetPending`]'s
+///   `dir`, which a user reads. A trailing separator there makes the kernel
+///   resolve the last component, so `link/` would be stat'd as the directory the
+///   link points at — exactly what [`lexical`] exists to prevent everywhere else.
+///
+/// Pinned by `a_created_dirs_set_answers_for_a_directory_however_it_is_spelled`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DirKey(PathBuf);
+
+impl DirKey {
+    /// The key for `path`: its components, which drops a trailing separator and
+    /// every `.`, exactly as [`lexical`] spells a path before using it.
+    fn of(path: &Path) -> Self {
+        Self(path.components().collect())
+    }
+
+    /// The normalised path this key is.
+    fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
 /// One directory an apply created: the mode it was created at, and which
@@ -1630,7 +2009,7 @@ impl CreatedDirs {
     /// Whether this apply created `path`.
     #[must_use]
     pub fn contains(&self, path: &Path) -> bool {
-        self.made.contains_key(path)
+        self.made.contains_key(&DirKey::of(path))
     }
 
     /// Declare that a directory target in this apply wants `path` at `mode`.
@@ -1641,25 +2020,34 @@ impl CreatedDirs {
     /// call — but one that does not, and skips this, gets
     /// [`Error::UndeclaredDirectory`] from the directory target.
     pub fn declare(&mut self, path: &Path, mode: Mode) {
-        self.declared.insert(path.components().collect(), mode);
+        self.declared.insert(DirKey::of(path), mode);
     }
 
     /// The mode a directory target in this apply declares for `path`, if any.
+    ///
+    /// Answers for the same directory however it is spelled — see [`DirKey`].
     #[must_use]
     pub fn declared(&self, path: &Path) -> Option<Mode> {
-        self.declared.get(path).copied()
+        self.declared.get(&DirKey::of(path)).copied()
+    }
+
+    /// How this apply made `path`, if it did.
+    fn made(&self, path: &Path) -> Option<Made> {
+        self.made.get(&DirKey::of(path)).copied()
     }
 
     /// Note the directories a call just created, deepest first, and return the
     /// ones that call claims: all of them but a declared directory, unless it
     /// is `own`, the path of the directory target making the call.
     fn record(&mut self, made: Vec<(PathBuf, Made)>, own: Option<&Path>) -> Vec<PathBuf> {
+        let own = own.map(DirKey::of);
         let mut claimed = Vec::with_capacity(made.len());
         for (path, how) in made {
-            if own == Some(path.as_path()) || !self.declared.contains_key(&path) {
-                claimed.push(path.clone());
+            let key = DirKey::of(&path);
+            if own.as_ref() == Some(&key) || !self.declared.contains_key(&key) {
+                claimed.push(path);
             }
-            self.made.insert(path, how);
+            self.made.insert(key, how);
         }
         claimed
     }
@@ -1683,7 +2071,7 @@ fn act_on_dir(
     // the declaration made it at 0755 and may already have published into it.
     if announced.action == Action::Create
         && fresh.kind == Kind::Dir
-        && let (Some(made), Some(stamp)) = (created.made.get(path).copied(), fresh.stamp)
+        && let (Some(made), Some(stamp)) = (created.made(path), fresh.stamp)
         && (made.dev, made.ino) == (stamp.dev, stamp.ino)
     {
         if made.mode != mode {
@@ -1722,7 +2110,7 @@ fn act_on_dir(
     let mut created_dirs = Vec::new();
     match outcome.action {
         Action::Create => {
-            let made = create_missing_dirs(path, Some(mode), created)?;
+            let made = create_missing_dirs(path, created)?;
             // The path itself is the deepest entry when this call made it. When
             // it is not there, something took the path between the observation
             // and the `mkdir` — somebody else's directory, or not a directory at
@@ -1853,7 +2241,8 @@ fn refuse_unwritable(observed: &Observed) -> Result<(), Error> {
 /// [`Error::DirectoryTargetPending`], and [`Error::Read`] when a declared
 /// directory above `dest` cannot be stat'd.
 fn refuse_wider_than_declared(dest: &Path, dir: &Path, created: &CreatedDirs) -> Result<(), Error> {
-    for (declared_dir, &declared) in &created.declared {
+    for (key, &declared) in &created.declared {
+        let declared_dir = key.path();
         if !dir.starts_with(declared_dir) {
             continue;
         }
@@ -1867,7 +2256,7 @@ fn refuse_wider_than_declared(dest: &Path, dir: &Path, created: &CreatedDirs) ->
         if meta.is_dir() && found.grants_more_than(declared) {
             return Err(Error::DirectoryTargetPending {
                 path: dest.to_path_buf(),
-                dir: declared_dir.clone(),
+                dir: declared_dir.to_path_buf(),
                 found,
                 declared,
             });
@@ -1991,6 +2380,19 @@ fn observe_parent(dir: &Path) -> Result<Parent, Error> {
 /// with nothing on it and a path that ends at a dangling symlink, and a
 /// directory bx can create from one it cannot are not the same announcement.
 fn parent_state(dir: &Path) -> Result<ParentState, Error> {
+    // Both guards below are pinned in both directions at the granularity
+    // `cargo mutants` works at: forcing the `NotFound` comparison either way
+    // fails a test, and replacing `unresolvable_path`'s body with `true` or
+    // with `false` fails a test too — re-measured at r4 round 2, correcting an
+    // r4 round 1 note that called the second one equivalent.
+    //
+    // What is not distinguished is the *first* `unresolvable_path` call site
+    // alone, forced true. `cargo mutants` does not generate a per-call-site
+    // mutation, so it is not a survivor it reports; it is recorded here because
+    // it is real. It would matter only for a `symlink_metadata` failure that is
+    // neither "nothing is there" nor a resolution refusal — a permission lost
+    // between the `metadata` above and it, microseconds apart. That is the
+    // class the module documentation explains is not constructed.
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => return Ok(ParentState::Present(mode_of(&meta))),
         Ok(_) => {
@@ -2034,7 +2436,8 @@ fn parent_state(dir: &Path) -> Result<ParentState, Error> {
     for ancestor in dir.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
             Err(e) if unresolvable_path(&e) => {}
-            // Reachable only through a race, so no test constructs it. Every
+            // Reachable only through a race, so no test constructs it — the
+            // class the module documentation explains. Every
             // ancestor is a prefix that resolving `dir` above already walked,
             // and `lstat` does not follow its last component: a refusal here —
             // a permission denied, most often — means the permissions changed
@@ -2065,18 +2468,17 @@ fn parent_state(dir: &Path) -> Result<ParentState, Error> {
     Ok(ParentState::Absent(Mode::DEFAULT_DIR))
 }
 
-/// Create every missing component of `dir`: `dir` itself at `leaf_mode` when
-/// one is given, and every other component — `dir` too, when none is — at the
-/// mode a directory target in this apply declares for it, or at
-/// [`Mode::DEFAULT_DIR`] when none does.
+/// Create every missing component of `dir`, each at the mode a directory target
+/// in this apply declares for it, or at [`Mode::DEFAULT_DIR`] when none does.
+///
+/// There is no separate mode for the leaf. [`act_on_dir`] declares its own path
+/// at the mode it is applying before it calls this, so `created.declared(dir)`
+/// already *is* the leaf mode; a second way to say it would be a second thing
+/// to keep in agreement.
 ///
 /// Returns what it created and how, **deepest first**, which is the order a
 /// reversal removes them in.
-fn create_missing_dirs(
-    dir: &Path,
-    leaf_mode: Option<Mode>,
-    created: &CreatedDirs,
-) -> Result<Vec<(PathBuf, Made)>, Error> {
+fn create_missing_dirs(dir: &Path, created: &CreatedDirs) -> Result<Vec<(PathBuf, Made)>, Error> {
     // `ancestors` yields deepest first, so the collected prefix is already in
     // removal order; reversing it gives shallowest-first creation order.
     let missing: Vec<PathBuf> = dir
@@ -2100,10 +2502,7 @@ fn create_missing_dirs(
     let modes: Vec<(&PathBuf, Mode)> = missing
         .iter()
         .rev()
-        .map(|path| match leaf_mode {
-            Some(mode) if path == dir => (path, mode),
-            _ => (path, created.declared(path).unwrap_or(Mode::DEFAULT_DIR)),
-        })
+        .map(|path| (path, created.declared(path).unwrap_or(Mode::DEFAULT_DIR)))
         .collect();
     let mut made_here = Vec::with_capacity(missing.len());
     for (path, mode) in modes {
@@ -2134,6 +2533,12 @@ fn create_missing_dirs(
 ///
 /// Returns the mode and the device and inode of the directory it made, or
 /// `None` when something was already at `path`.
+///
+/// The `mkdir` arm itself is pinned. The `set_mode` and `symlink_metadata`
+/// arms after a successful `mkdir` are not, and are of the class the module
+/// documentation explains is not constructed: reaching either needs the
+/// directory bx has just made to be removed or made inaccessible in the
+/// microseconds before the next syscall on it.
 fn create_dir_at(path: &Path, mode: Mode) -> Result<Option<Made>, Error> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -2180,29 +2585,50 @@ fn set_dir_mode(path: &Path, mode: Mode) -> Result<std::fs::Metadata, Error> {
         path: path.to_path_buf(),
         source,
     })?;
-    let landed = mode_of(&meta);
-    let declared = mode.bits() & SPECIAL;
-    if landed.bits() & declared != declared {
-        return Err(Error::DirectorySetIdNotKept {
-            path: path.to_path_buf(),
-            declared: mode,
-            landed,
-            chmod_left: Some(landed),
-            set_back: None,
-        });
-    }
+    refuse_dir_set_id_dropped(path, mode, &meta)?;
     Ok(meta)
 }
 
-/// Refuse to `chmod` the existing directory at `path`, which `plan` found at
-/// `found`, to `declared` when the kernel would strip its setgid bit: the
-/// directory has `S_ISGID` or `declared` adds it, and this process is neither
-/// root nor in the directory's group — see [`keeps_setgid`].
+/// Refuse when a declared setuid, setgid or sticky bit is missing from the
+/// directory `meta` describes, after a `chmod` to `mode` that reported success.
 ///
-/// A `chmod` by such a process clears `S_ISGID` whatever mode it asks for, so
-/// a bit declared would not stick, and a bit the directory had would be lost
-/// for good: setting it back is another `chmod` by the same process. Refused
-/// before any `chmod`, nothing changes.
+/// Apart from [`set_dir_mode`] so that the refusal is constructible from a
+/// metadata alone. Making the kernel actually drop a bit needs a directory in a
+/// group the process is not in, which only a user namespace arranges; what
+/// every caller depends on is this answer, and it does not need the kernel to
+/// produce it.
+///
+/// # Errors
+///
+/// [`Error::DirectorySetIdNotKept`], naming what the `chmod` left.
+fn refuse_dir_set_id_dropped(
+    path: &Path,
+    mode: Mode,
+    meta: &std::fs::Metadata,
+) -> Result<(), Error> {
+    let landed = mode_of(meta);
+    let declared = mode.bits() & SPECIAL;
+    if landed.bits() & declared == declared {
+        return Ok(());
+    }
+    Err(Error::DirectorySetIdNotKept {
+        path: path.to_path_buf(),
+        declared: mode,
+        landed,
+        chmod_left: Some(landed),
+        set_back: None,
+    })
+}
+
+/// Refuse to `chmod` the existing directory at `path`, which `plan` found at
+/// `found`, to `declared` unless the setgid bit is confirmed to survive it: the
+/// directory has `S_ISGID` or `declared` adds it, and nothing confirms that a
+/// `chmod` by this process keeps it — see [`keeps_setgid`].
+///
+/// A `chmod` by a process the kernel does not exempt clears `S_ISGID` whatever
+/// mode it asks for, so a bit declared would not stick, and a bit the directory
+/// had would be lost for good: setting it back is another `chmod` by the same
+/// process. Refused before any `chmod`, nothing changes.
 ///
 /// # Errors
 ///
@@ -2218,22 +2644,67 @@ fn refuse_setgid_a_chmod_strips(path: &Path, found: Mode, declared: Mode) -> Res
         path: path.to_path_buf(),
         source,
     })?;
-    if process_keeps_setgid(meta.gid()) {
+    let keeps = process_keeps_setgid(meta.uid(), meta.gid());
+    refuse_unless_setgid_survives(path, declared, &meta, keeps)
+}
+
+/// The refusal itself: pass when `keeps` names a confirmation, refuse when it
+/// is `None`.
+///
+/// The confirmation is an argument rather than something this function reads,
+/// so that both answers are constructible on any host. The `None` answer is the
+/// one that matters and the one a real filesystem cannot produce here: it needs
+/// a directory in a group the process is not in, which only a user namespace
+/// arranges.
+///
+/// # Errors
+///
+/// [`Error::DirectorySetIdNotKept`] with no `chmod_left`: nothing was changed.
+fn refuse_unless_setgid_survives(
+    path: &Path,
+    declared: Mode,
+    meta: &std::fs::Metadata,
+    keeps: Option<KeepsSetgid>,
+) -> Result<(), Error> {
+    if keeps.is_some() {
         return Ok(());
     }
     Err(Error::DirectorySetIdNotKept {
         path: path.to_path_buf(),
         declared,
-        landed: mode_of(&meta),
+        landed: mode_of(meta),
         chmod_left: None,
         set_back: None,
     })
 }
 
-/// Whether a `chmod` by this process keeps the setgid bit of a directory
-/// whose group is `gid` — [`keeps_setgid`] for the process's effective uid,
-/// effective gid and supplementary groups.
-fn process_keeps_setgid(gid: u32) -> bool {
+/// Why a `chmod` by this process is known to keep a directory's setgid bit.
+///
+/// There is no variant for "probably" and none for a uid. The preflight passes
+/// only on a confirmation named here, so a setup nobody anticipated is refused
+/// rather than waved through: refusing costs a plan line, and guessing wrong
+/// costs a setgid bit that no second `chmod` by the same process can put back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepsSetgid {
+    /// This process holds `CAP_FSETID` in its effective set.
+    Capability,
+    /// The directory's group is this process's effective group or one of its
+    /// supplementary groups, and it is a group the kernel resolved into this
+    /// process's user namespace.
+    Group,
+}
+
+/// Whether a `chmod` by this process keeps the setgid bit of a directory that
+/// `stat`s as owner `uid` and group `gid` — [`keeps_setgid`] against this
+/// process's own capabilities, effective gid, supplementary groups and this
+/// namespace's overflow ids.
+fn process_keeps_setgid(uid: u32, gid: u32) -> Option<KeepsSetgid> {
+    // The test build can force either answer on this thread, because the
+    // `None` one needs a user namespace most hosts do not offer.
+    #[cfg(test)]
+    if let Some(forced) = forced::confirmation() {
+        return forced;
+    }
     // A process whose groups cannot be read is taken to be in none of them:
     // the refusal that follows changes nothing, where a wrong guess the
     // other way would strip a bit.
@@ -2243,21 +2714,238 @@ fn process_keeps_setgid(gid: u32) -> bool {
         .map(rustix::process::Gid::as_raw)
         .collect();
     keeps_setgid(
+        uid,
         gid,
-        rustix::process::geteuid().as_raw(),
+        has_cap_fsetid(),
         rustix::process::getegid().as_raw(),
         &groups,
+        overflow_ids(),
     )
 }
 
 /// Whether the kernel keeps a directory's setgid bit through a `chmod` by a
-/// process with effective uid `euid`, effective gid `egid` and supplementary
-/// groups `groups`, when the directory's group is `gid`.
+/// process holding `cap_fsetid`, with effective gid `egid` and supplementary
+/// groups `groups`, when the directory `stat`s as owner `uid` and group `gid`
+/// and this user namespace's overflow ids are `overflow`.
 ///
-/// `chmod(2)` clears `S_ISGID` unless the caller is in the file's group or
-/// has `CAP_FSETID`. Root stands for the capability here.
-fn keeps_setgid(gid: u32, euid: u32, egid: u32, groups: &[u32]) -> bool {
-    euid == 0 || egid == gid || groups.contains(&gid)
+/// # The rule the kernel applies
+///
+/// `chmod_common` keeps `S_ISGID` when either holds:
+///
+/// ```text
+/// in_group_p(i_gid) || capable_wrt_inode_uidgid(inode, CAP_FSETID)
+/// ```
+///
+/// and `capable_wrt_inode_uidgid` is `ns_capable(CAP_FSETID)` **and**
+/// `kuid_has_mapping(ns, i_uid)` **and** `kgid_has_mapping(ns, i_gid)`. So the
+/// capability does **not** outrank an unmapped id: it is the *weaker* of the
+/// two paths, because it carries two mapping requirements the group path does
+/// not. An id the namespace does not map is what makes `stat` report the
+/// overflow uid or gid, which is how this function sees it.
+///
+/// # Why the order is not a choice here
+///
+/// An earlier version tested the capability first and returned on it, so a
+/// process holding `CAP_FSETID` was confirmed for a directory whose group was
+/// unmapped — and the kernel stripped the bit anyway. That was a claim about a
+/// shape ("fail closed") whose *sequence* was load-bearing and only written
+/// down in prose.
+///
+/// It is now carried by the types instead. [`MappedGid`] has one constructor,
+/// which refuses the overflow gid, and **every** confirmation below takes one:
+/// [`in_group`] because `in_group_p` compares against that gid, and
+/// [`inode_capability`] because `kgid_has_mapping` must hold for it. An arm
+/// added later that skipped the mapping test would have nothing to take and
+/// would not compile.
+///
+/// `None` means refuse. There is no variant for "probably" and none for a uid.
+fn keeps_setgid(
+    uid: u32,
+    gid: u32,
+    cap_fsetid: bool,
+    egid: u32,
+    groups: &[u32],
+    overflow: Overflow,
+) -> Option<KeepsSetgid> {
+    // Nothing below this line can be reached without it, and that is the point:
+    // both paths the kernel offers are judged against this gid.
+    let gid = MappedGid::of(gid, overflow)?;
+    if inode_capability(uid, gid, cap_fsetid, overflow).is_some() {
+        return Some(KeepsSetgid::Capability);
+    }
+    in_group(gid, egid, groups).then_some(KeepsSetgid::Group)
+}
+
+/// The overflow ids of a user namespace: what `stat` reports for an owner or a
+/// group it does not map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Overflow {
+    uid: u32,
+    gid: u32,
+}
+
+/// A directory's group, as a gid this user namespace actually maps.
+///
+/// The one constructor refuses the overflow gid, and every arm of
+/// [`keeps_setgid`] takes one, so no arm can compare a gid the kernel would not
+/// compare. `stat` reports the overflow gid precisely when the mapping the
+/// kernel needs is absent, so this is that mapping, as far as a `stat` can see
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MappedGid(u32);
+
+impl MappedGid {
+    /// The group, or `None` when this namespace does not map it.
+    const fn of(gid: u32, overflow: Overflow) -> Option<Self> {
+        if gid == overflow.gid {
+            return None;
+        }
+        Some(Self(gid))
+    }
+}
+
+/// Whether this process is in the group `gid` — the kernel's `in_group_p`.
+///
+/// Takes a [`MappedGid`]: an unmapped group reads as the overflow gid, and
+/// matching *that* against this process's own gids answers a different question
+/// from the one `chmod(2)` asks. Two distinct unmapped groups read alike.
+const fn in_group(gid: MappedGid, egid: u32, groups: &[u32]) -> bool {
+    if egid == gid.0 {
+        return true;
+    }
+    let mut i = 0;
+    while i < groups.len() {
+        if groups[i] == gid.0 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Evidence that `CAP_FSETID` applies to *this* inode — the kernel's
+/// `capable_wrt_inode_uidgid`.
+///
+/// Needs the capability in the effective set **and** both of the inode's ids
+/// mapped. The gid is already a [`MappedGid`], so only the owner is checked
+/// here; an unmapped owner reads as the overflow uid.
+const fn inode_capability(
+    uid: u32,
+    _gid: MappedGid,
+    cap_fsetid: bool,
+    overflow: Overflow,
+) -> Option<InodeCapability> {
+    if cap_fsetid && uid != overflow.uid {
+        return Some(InodeCapability);
+    }
+    None
+}
+
+/// `CAP_FSETID`, established against one inode. Constructible only by
+/// [`inode_capability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InodeCapability;
+
+/// `CAP_FSETID`, capability 4 in `linux/capability.h`.
+const CAP_FSETID: u32 = 4;
+
+/// Whether this process holds `CAP_FSETID` in its effective capability set.
+///
+/// Read from `/proc/self/status`, which is the whole interface: bx forbids
+/// `unsafe`, so `capget(2)` is not reachable without a dependency that adds
+/// one, and bx is Linux-only, so `/proc` is the native answer rather than a
+/// portability compromise.
+///
+/// A set that cannot be read or parsed confirms nothing and is `false`. The
+/// caller then refuses, which changes nothing; the other guess strips a bit.
+/// The whole judgement is [`cap_fsetid_in`], which takes the text, so the only
+/// part no test reaches is the `read_to_string` itself.
+fn has_cap_fsetid() -> bool {
+    cap_fsetid_in(std::fs::read_to_string("/proc/self/status").ok().as_deref())
+}
+
+/// Whether `CAP_FSETID` is set in the `CapEff` mask of `status`, the text of
+/// `/proc/self/status`.
+///
+/// `None` — the file could not be read — and text with no usable `CapEff` line
+/// both confirm nothing, and so are `false`.
+fn cap_fsetid_in(status: Option<&str>) -> bool {
+    status
+        .and_then(cap_eff)
+        .is_some_and(|effective| effective & (1 << CAP_FSETID) != 0)
+}
+
+/// The effective capability mask on a `/proc/<pid>/status` `CapEff:` line.
+///
+/// `None` when the line is absent or is not the hex mask the kernel writes.
+fn cap_eff(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+}
+
+/// The ids `stat` reports for an owner or a group with no mapping in this
+/// process's user namespace, from `/proc/sys/kernel/overflowuid` and
+/// `overflowgid`.
+///
+/// The kernel's own compiled-in defaults when they cannot be read: assuming
+/// anything else is what would let an unmapped id through the comparisons
+/// [`keeps_setgid`] makes. The reads are one line each; the judgement is
+/// [`overflow_in`], which takes the text.
+fn overflow_ids() -> Overflow {
+    let read = |name: &str| std::fs::read_to_string(name).ok();
+    Overflow {
+        uid: overflow_in(read("/proc/sys/kernel/overflowuid").as_deref()),
+        gid: overflow_in(read("/proc/sys/kernel/overflowgid").as_deref()),
+    }
+}
+
+/// The overflow id in `text`, or the kernel's `DEFAULT_OVERFLOWUID` /
+/// `DEFAULT_OVERFLOWGID` — both `65534` — when there is none to read.
+fn overflow_in(text: Option<&str>) -> u32 {
+    /// The kernel's `DEFAULT_OVERFLOWUID` and `DEFAULT_OVERFLOWGID`.
+    const DEFAULT: u32 = 65534;
+
+    text.and_then(|t| t.trim().parse().ok()).unwrap_or(DEFAULT)
+}
+
+/// A forced answer for [`process_keeps_setgid`], per thread, in the test build
+/// only.
+///
+/// The refusal a foreign group causes is the whole point of the preflight, and
+/// a foreign group needs unprivileged user namespaces and subordinate ids to
+/// arrange. Forcing the answer constructs the refusal on every path that asks
+/// for it, on any host. `cfg(test)`, not a feature gate: no configuration of
+/// the binary differs from another, and the product build has no branch here.
+#[cfg(test)]
+mod forced {
+    use std::cell::Cell;
+
+    use super::KeepsSetgid;
+
+    thread_local! {
+        static ANSWER: Cell<Option<Option<KeepsSetgid>>> = const { Cell::new(None) };
+    }
+
+    /// The answer forced on this thread, if any.
+    pub(super) fn confirmation() -> Option<Option<KeepsSetgid>> {
+        ANSWER.get()
+    }
+
+    /// Run `f` with every [`super::process_keeps_setgid`] call on this thread
+    /// answering `answer`. Cleared on unwind too.
+    pub(super) fn answering<R>(answer: Option<KeepsSetgid>, f: impl FnOnce() -> R) -> R {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                ANSWER.set(None);
+            }
+        }
+        ANSWER.set(Some(answer));
+        let _clear = Clear;
+        f()
+    }
 }
 
 /// Set a directory whose `Modify` was `refused` back to `prior`, the mode
@@ -2373,7 +3061,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Mutex;
 
-    use crate::state::{ExclusiveLock, Ledger, Prior, StateDir};
+    use crate::state::{ExclusiveLock, Ledger, LedgerView, Prior, StateDir};
     use crate::testing::{GuardedHome, guarded_home};
 
     /// Serialises the one test that mutates the process `umask`.
@@ -2423,6 +3111,49 @@ mod tests {
 
     /// `plan`'s observation, then `stage` on it, with nothing changing in
     /// between.
+    #[test]
+    fn a_list_of_names_reads_as_english_at_every_length() {
+        // Directly, at every length, because both messages that use it pass a
+        // list whose length is bounded by what their caller asks for today —
+        // one name, as it happens — and the branch that joins two or more was
+        // therefore reachable from neither of them.
+        assert_eq!(and_list(&[]), "");
+        assert_eq!(and_list(&["read"]), "read");
+        assert_eq!(and_list(&["read", "write"]), "read and write");
+        assert_eq!(
+            and_list(&["read", "write", "search"]),
+            "read, write and search",
+        );
+
+        // Through the two messages, so the wording each wraps it in is pinned
+        // with it.
+        assert!(
+            owner_locked_out(Mode::from_bits(0o000), Mode::from_bits(0o600))
+                .contains("denies its owner read and write (0600)"),
+            "{}",
+            owner_locked_out(Mode::from_bits(0o000), Mode::from_bits(0o600)),
+        );
+        assert!(
+            owner_locked_out(Mode::from_bits(0o200), Mode::from_bits(0o400))
+                .contains("denies its owner read (0400)"),
+        );
+        let three = bits_that_did_not_stick(
+            Mode::from_bits(0o7755),
+            Mode::from_bits(0o0755),
+            "directory",
+        );
+        assert!(
+            three.contains("the setuid, setgid and sticky bits did not stick"),
+            "{three}",
+        );
+        let one = bits_that_did_not_stick(
+            Mode::from_bits(0o1755),
+            Mode::from_bits(0o0755),
+            "directory",
+        );
+        assert!(one.contains("the sticky bit did not stick"), "{one}");
+    }
+
     fn stage_now(dest: &Path, mode: Mode) -> Result<Staged, Error> {
         let planned = observe(dest)?;
         stage(dest, mode, &planned, &mut CreatedDirs::new())
@@ -3212,10 +3943,10 @@ mod tests {
                     message,
                     format!(
                         "{} declares {declared} and is {inherited}: the kernel drops a \
-                         directory's setgid bit on a chmod by a process that is neither root \
-                         nor in the directory's group, and this one is neither, so the \
-                         directory would lose the setgid bit it has. bx did not chmod it, and \
-                         nothing was changed",
+                         directory's setgid bit on a chmod unless the process holds CAP_FSETID \
+                         or is in the directory's group, and bx could confirm neither for this \
+                         process, so the directory would lose the setgid bit it has. bx did not \
+                         chmod it, and nothing was changed",
                         team.display()
                     ),
                 );
@@ -3266,6 +3997,150 @@ mod tests {
         run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_PREFLIGHT_CHILD_DIR, |_| {});
     }
 
+    /// The variable the uid-0 child finds its setgid directory in.
+    const SET_ID_ROOT_CHILD_DIR: &str = "BX_TEST_SET_ID_ROOT_CHILD_DIR";
+
+    #[test]
+    fn uid_zero_without_cap_fsetid_is_refused_like_any_other_process() {
+        const NAME: &str =
+            "fs::atomic::tests::uid_zero_without_cap_fsetid_is_refused_like_any_other_process";
+
+        if let Some(dir) = std::env::var_os(SET_ID_ROOT_CHILD_DIR) {
+            // The child: uid 0 in a user namespace, with an empty capability
+            // bounding set, so `execve` left it no `CAP_FSETID`. The kernel
+            // strips `S_ISGID` from a chmod it makes of a directory in a group
+            // it is not in, exactly as it would for any other uid — and the
+            // predicate that once read `euid == 0` said otherwise, passed the
+            // preflight, and lost the bit for good.
+            println!("{SET_ID_CHILD_RAN}");
+            let dir = PathBuf::from(dir);
+            assert!(rustix::process::geteuid().is_root(), "the child is uid 0");
+            let status = std::fs::read_to_string("/proc/self/status").expect("status");
+            assert!(
+                !has_cap_fsetid(),
+                "uid 0 with no capabilities: CapEff {:?}",
+                cap_eff(&status),
+            );
+            // This child runs one test, so its umask is its own to set.
+            rustix::process::umask(Mode::from_bits(0o022).into());
+            let team = dir.join("team-root");
+            rustix::fs::mkdir(&team, Mode::DEFAULT_DIR.into()).expect("mkdir");
+            let inherited = Mode::from_bits(0o2755);
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "a setgid parent gives it the bit and its group",
+            );
+
+            let declared = Mode::from_bits(0o2775);
+            let planned = observe(&team).expect("observe");
+            let err = ensure_dir(&team, declared, &planned, &mut CreatedDirs::new())
+                .expect_err("uid 0 is not CAP_FSETID");
+            assert!(
+                matches!(
+                    &err,
+                    Error::DirectorySetIdNotKept { path, chmod_left: None, .. } if *path == team
+                ),
+                "{err:?}",
+            );
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "the setgid bit the directory had is still on it",
+            );
+            return;
+        }
+
+        run_in_a_foreign_setgid_directory(
+            NAME,
+            SET_ID_ROOT_CHILD_DIR,
+            &[
+                "--reuid=0",
+                "--regid=0",
+                "--clear-groups",
+                "--bounding-set=-all",
+            ],
+            |_| {},
+        );
+    }
+
+    /// The variable the capability child finds its setgid directory in.
+    const SET_ID_CAP_CHILD_DIR: &str = "BX_TEST_SET_ID_CAP_CHILD_DIR";
+
+    #[test]
+    fn a_capability_does_not_survive_a_group_this_namespace_does_not_map() {
+        const NAME: &str = "fs::atomic::tests::\
+                            a_capability_does_not_survive_a_group_this_namespace_does_not_map";
+
+        if let Some(dir) = std::env::var_os(SET_ID_CAP_CHILD_DIR) {
+            // The child: uid 0 in a user namespace that maps only the invoking
+            // ids, holding a full capability set — so `CAP_FSETID` really is
+            // held — in a setgid directory whose group 5 that namespace does
+            // **not** map. `capable_wrt_inode_uidgid` needs the inode's uid and
+            // gid mapped as well as the capability, so the kernel strips the
+            // bit from a chmod this child makes, and the capability does not
+            // save it.
+            //
+            // This is the arm nothing else exercises against a real kernel: the
+            // other two harness callers drop the capability, one with
+            // `--bounding-set=-all` and one with `--reuid=1`.
+            println!("{SET_ID_CHILD_RAN}");
+            let dir = PathBuf::from(dir);
+            assert!(rustix::process::geteuid().is_root(), "the child is uid 0");
+            assert!(
+                has_cap_fsetid(),
+                "the child holds CAP_FSETID: CapEff {:?}",
+                cap_eff(&std::fs::read_to_string("/proc/self/status").expect("status")),
+            );
+            let overflow = overflow_ids();
+            let shared = std::fs::metadata(&dir).expect("stat");
+            assert_eq!(
+                shared.gid(),
+                overflow.gid,
+                "the shared directory's group is unmapped here, so it reads as the overflow gid",
+            );
+
+            rustix::process::umask(Mode::from_bits(0o022).into());
+            let team = dir.join("team-cap");
+            rustix::fs::mkdir(&team, Mode::DEFAULT_DIR.into()).expect("mkdir");
+            let inherited = Mode::from_bits(0o2755);
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "a setgid parent gives it the bit and its unmapped group",
+            );
+
+            let declared = Mode::from_bits(0o2775);
+            let planned = observe(&team).expect("observe");
+            let err = ensure_dir(&team, declared, &planned, &mut CreatedDirs::new())
+                .expect_err("CAP_FSETID does not outrank an unmapped gid");
+            assert!(
+                matches!(
+                    &err,
+                    Error::DirectorySetIdNotKept { path, chmod_left: None, .. } if *path == team
+                ),
+                "{err:?}",
+            );
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "the setgid bit the directory had is still on it",
+            );
+            return;
+        }
+
+        run_in_a_foreign_setgid_directory_under(
+            NAME,
+            SET_ID_CAP_CHILD_DIR,
+            // The child's namespace maps only the invoking ids, so group 5 is
+            // unmapped in it. No `setpriv`: the child keeps uid 0 and the full
+            // capability set the namespace gives its creator.
+            &["--map-root-user"],
+            &[],
+            |_| {},
+        );
+    }
+
     /// The refusal `set_dir_mode` returns for `dir`, declared `declared`, when
     /// its chmod left `left`.
     fn not_kept(dir: &Path, declared: Mode, left: Mode) -> Error {
@@ -3278,36 +4153,350 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_kernel_keeps_a_setgid_bit_for_root_and_the_directory_s_group_alone() {
-        const GID: u32 = 5;
-        assert!(keeps_setgid(GID, 0, 1, &[]), "root");
-        assert!(keeps_setgid(GID, 1, GID, &[]), "the effective group");
-        assert!(keeps_setgid(GID, 1, 1, &[3, GID]), "a supplementary group");
-        assert!(!keeps_setgid(GID, 1, 1, &[3, 4]), "other groups only");
-        assert!(!keeps_setgid(GID, 1, 1, &[]), "no groups");
+    /// The overflow ids of a namespace that maps everything below 65534.
+    const OVER: Overflow = Overflow {
+        uid: 65534,
+        gid: 65534,
+    };
 
-        // The same answer for this process, read through rustix.
-        let egid = rustix::process::getegid().as_raw();
-        assert!(process_keeps_setgid(egid), "this process's own group");
+    #[test]
+    fn the_setgid_predicate_confirms_a_capability_or_a_mapped_group_and_nothing_else() {
+        const UID: u32 = 1000;
+        const GID: u32 = 5;
+
+        // The capability is one of the two things chmod(2) tests, and it is the
+        // only one that passes a process outside the directory's group.
+        assert_eq!(
+            keeps_setgid(UID, GID, true, 1, &[], OVER),
+            Some(KeepsSetgid::Capability),
+            "CAP_FSETID, held by a process in none of the groups",
+        );
+        assert_eq!(
+            keeps_setgid(UID, GID, false, GID, &[], OVER),
+            Some(KeepsSetgid::Group),
+            "the effective group",
+        );
+        assert_eq!(
+            keeps_setgid(UID, GID, false, 1, &[3, GID], OVER),
+            Some(KeepsSetgid::Group),
+            "a supplementary group",
+        );
+        assert_eq!(
+            keeps_setgid(UID, GID, false, 1, &[3, 4], OVER),
+            None,
+            "other groups only",
+        );
+        assert_eq!(
+            keeps_setgid(UID, GID, false, 1, &[], OVER),
+            None,
+            "no groups"
+        );
+
+        // uid 0 is not a parameter at all, and that is r4 round 1's repair: a
+        // process that is root in a user namespace without CAP_FSETID has its
+        // chmod stripped like any other, and there is no arm left for it.
+        //
+        // These are r4 round 2's. `capable_wrt_inode_uidgid` requires both of
+        // the inode's ids to be mapped, so the capability does NOT outrank an
+        // unmapped id — it is the weaker path, not the stronger one. The
+        // assertion below used to read `Some(Capability)`, and the kernel
+        // disagreed: see
+        // `a_capability_does_not_survive_a_group_this_namespace_does_not_map`.
+        assert_eq!(
+            keeps_setgid(UID, OVER.gid, true, 1, &[], OVER),
+            None,
+            "an unmapped group defeats the capability too",
+        );
+        assert_eq!(
+            keeps_setgid(OVER.uid, GID, true, 1, &[], OVER),
+            None,
+            "so does an unmapped owner",
+        );
+        // ...but only for the capability. The group path has no uid
+        // requirement, so an unmapped owner in a group this process is in still
+        // keeps the bit, and refusing there would refuse a chmod that works.
+        assert_eq!(
+            keeps_setgid(OVER.uid, GID, false, GID, &[], OVER),
+            Some(KeepsSetgid::Group),
+            "an unmapped owner does not defeat membership",
+        );
+        // An unmapped group reads as the overflow gid, which names no group.
+        // Matching it confirms nothing, even against gids that read the same
+        // way, which is how two distinct unmapped groups would otherwise look
+        // like one membership.
+        assert_eq!(
+            keeps_setgid(UID, OVER.gid, false, OVER.gid, &[OVER.gid], OVER),
+            None,
+            "the overflow gid never confirms a membership",
+        );
+        // The overflow ids are only whatever this namespace reports: on a host
+        // where they are something else, 65534 is an ordinary group again.
+        assert_eq!(
+            keeps_setgid(
+                UID,
+                65534,
+                false,
+                65534,
+                &[],
+                Overflow {
+                    uid: 65533,
+                    gid: 65533
+                },
+            ),
+            Some(KeepsSetgid::Group),
+        );
+
+        // The same answers for this process, read through rustix and /proc.
+        let (uid, egid) = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+        let overflow = overflow_ids();
         let groups: Vec<u32> = rustix::process::getgroups()
             .expect("getgroups")
             .into_iter()
             .map(rustix::process::Gid::as_raw)
             .collect();
-        for member in &groups {
-            assert!(
-                process_keeps_setgid(*member),
-                "supplementary group {member}"
+        if egid != overflow.gid && uid != overflow.uid {
+            assert_eq!(
+                process_keeps_setgid(uid, egid),
+                Some(KeepsSetgid::Group),
+                "this process's own group",
+            );
+        }
+        for member in groups.iter().filter(|gid| **gid != overflow.gid) {
+            assert_eq!(
+                process_keeps_setgid(uid, *member),
+                Some(KeepsSetgid::Group),
+                "supplementary group {member}",
             );
         }
         let foreign = (1..)
-            .find(|gid| *gid != egid && !groups.contains(gid))
+            .find(|gid| *gid != egid && *gid != overflow.gid && !groups.contains(gid))
             .expect("a group this process is not in");
         assert_eq!(
-            process_keeps_setgid(foreign),
-            rustix::process::geteuid().is_root(),
-            "group {foreign}, which this process is not in",
+            process_keeps_setgid(uid, foreign).is_some(),
+            has_cap_fsetid() && uid != overflow.uid,
+            "group {foreign}, which this process is not in: only the capability confirms it",
+        );
+        assert_eq!(
+            process_keeps_setgid(uid, overflow.gid),
+            None,
+            "a group this namespace does not map is refused whatever this process holds",
+        );
+    }
+
+    #[test]
+    fn no_confirmation_can_skip_the_mapping_test() {
+        // The ordering bug this repair is about was reachable because the
+        // capability arm ran before the mapping test. It cannot now: both arms
+        // take a `MappedGid`, and the only constructor refuses the overflow
+        // gid, so there is nothing for an arm that skipped the test to be
+        // handed.
+        assert_eq!(MappedGid::of(OVER.gid, OVER), None);
+        assert_eq!(MappedGid::of(5, OVER), Some(MappedGid(5)));
+        assert_eq!(
+            MappedGid::of(OVER.gid, Overflow { uid: 0, gid: 0 }),
+            Some(MappedGid(OVER.gid)),
+            "the overflow gid is whatever the namespace says it is",
+        );
+
+        let gid = MappedGid::of(5, OVER).expect("a mapped gid");
+        assert!(in_group(gid, 5, &[]), "the effective group");
+        assert!(in_group(gid, 1, &[9, 5]), "a supplementary group");
+        assert!(!in_group(gid, 1, &[9]), "neither");
+        assert!(!in_group(gid, 1, &[]), "no groups at all");
+
+        // `capable_wrt_inode_uidgid`: the capability, and the owner mapped.
+        assert_eq!(
+            inode_capability(1000, gid, true, OVER),
+            Some(InodeCapability)
+        );
+        assert_eq!(
+            inode_capability(1000, gid, false, OVER),
+            None,
+            "no capability"
+        );
+        assert_eq!(
+            inode_capability(OVER.uid, gid, true, OVER),
+            None,
+            "an unmapped owner",
+        );
+    }
+
+    #[test]
+    fn the_effective_capability_set_is_read_from_the_line_that_names_it() {
+        assert_eq!(
+            cap_eff("Name:\tbx\nCapInh:\t0000000000000000\nCapEff:\t0000000000000010\n"),
+            Some(0x10),
+        );
+        assert_eq!(cap_eff("CapEff: 1ffffffffff\n"), Some(0x1ff_ffff_ffff));
+        assert_eq!(cap_eff("CapEff:\t0\n"), Some(0));
+        assert_eq!(
+            cap_eff("CapInh:\t0000000000000010\n"),
+            None,
+            "a different capability set is not the effective one",
+        );
+        assert_eq!(cap_eff("CapEff:\tnot a mask\n"), None);
+        assert_eq!(cap_eff(""), None);
+
+        // CAP_FSETID is capability 4, so the mask above is that bit alone.
+        assert_eq!(1u64 << CAP_FSETID, 0x10);
+        assert!(cap_fsetid_in(Some("CapEff:\t0000000000000018\n")));
+        assert!(
+            !cap_fsetid_in(Some("CapEff:\t0000000000000008\n")),
+            "another bit"
+        );
+        assert!(!cap_fsetid_in(Some("CapEff:\tnot a mask\n")), "unparsable");
+        assert!(!cap_fsetid_in(Some("")), "no CapEff line");
+        assert!(
+            !cap_fsetid_in(None),
+            "a /proc that could not be read confirms nothing, so it is not held",
+        );
+
+        // The overflow ids: the kernel's value when there is one, and the
+        // kernel's own default when there is not. Both arms, without needing a
+        // host that lacks /proc.
+        assert_eq!(overflow_in(Some("65534\n")), 65534);
+        assert_eq!(overflow_in(Some(" 60000 ")), 60000, "trimmed");
+        assert_eq!(
+            overflow_in(Some("nonsense")),
+            65534,
+            "unparsable falls back"
+        );
+        assert_eq!(overflow_in(Some("")), 65534, "empty falls back");
+        assert_eq!(overflow_in(Some("-1")), 65534, "not a u32 falls back");
+        assert_eq!(overflow_in(None), 65534, "unreadable falls back");
+
+        // And what this host actually reports, read rather than assumed.
+        let overflow = overflow_ids();
+        for (name, got) in [
+            ("/proc/sys/kernel/overflowuid", overflow.uid),
+            ("/proc/sys/kernel/overflowgid", overflow.gid),
+        ] {
+            match std::fs::read_to_string(name) {
+                Ok(text) => assert_eq!(got.to_string(), text.trim(), "{name}"),
+                Err(_) => assert_eq!(got, 65534, "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_setgid_preflight_refuses_a_directory_whose_group_it_cannot_confirm() {
+        let home = guarded_home();
+        let dir = home.child("team");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let found = Mode::from_bits(0o2755);
+        set_mode(&dir, found).expect("chmod");
+        let declared = Mode::from_bits(0o2775);
+
+        // Forced rather than arranged: an unconfirmable group needs a user
+        // namespace, and the preflight's answer is the same either way.
+        let err = forced::answering(None, || refuse_setgid_a_chmod_strips(&dir, found, declared))
+            .expect_err("an unconfirmed process may not chmod a setgid directory");
+        assert!(
+            matches!(
+                &err,
+                Error::DirectorySetIdNotKept {
+                    path,
+                    declared: said,
+                    landed,
+                    chmod_left: None,
+                    set_back: None,
+                } if *path == dir && *said == declared && *landed == found
+            ),
+            "{err:?}",
+        );
+        assert_eq!(
+            mode_of_path(&dir),
+            found,
+            "the refusal comes before any chmod",
+        );
+        let message = err.to_string();
+        assert!(message.contains("CAP_FSETID"), "{message}");
+        assert!(
+            message.contains("bx did not chmod it, and nothing was changed"),
+            "{message}",
+        );
+
+        // Either confirmation passes it.
+        for keeps in [KeepsSetgid::Capability, KeepsSetgid::Group] {
+            assert!(
+                forced::answering(Some(keeps), || refuse_setgid_a_chmod_strips(
+                    &dir, found, declared
+                ))
+                .is_ok(),
+                "{keeps:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_this_apply_created_is_refused_when_its_group_stops_being_confirmable() {
+        // The adopt path: a directory this apply made at a declared setgid
+        // mode, met again by its own directory target. It runs the same
+        // preflight before its chmod, and nothing else constructs that call's
+        // refusal.
+        let home = guarded_home();
+        let dir = home.child("shared");
+        let declared = Mode::from_bits(0o2755);
+        let planned = observe(&dir).expect("plan sees nothing");
+        let mut created = CreatedDirs::new();
+        let made = ensure_dir(&dir, declared, &planned, &mut created).expect("create");
+        assert_eq!(made.action, Action::Create);
+        assert_eq!(
+            mode_of_path(&dir),
+            declared,
+            "the bit stuck for its creator"
+        );
+
+        let err = forced::answering(None, || ensure_dir(&dir, declared, &planned, &mut created))
+            .expect_err("the adopt path refuses a chmod it cannot confirm");
+        assert!(
+            matches!(
+                &err,
+                Error::DirectorySetIdNotKept { path, chmod_left: None, .. } if *path == dir
+            ),
+            "{err:?}",
+        );
+        assert_eq!(mode_of_path(&dir), declared, "nothing was changed");
+    }
+
+    #[test]
+    fn a_declared_directory_bit_missing_after_its_chmod_is_a_typed_error() {
+        // The read-back `set_dir_mode` makes, apart from the chmod: the kernel
+        // drops the bit only for a process outside the directory's group, and
+        // the answer every caller depends on is this one.
+        let home = guarded_home();
+        let dir = home.child("plain");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let landed = Mode::DEFAULT_DIR;
+        set_mode(&dir, landed).expect("chmod");
+        let meta = std::fs::symlink_metadata(&dir).expect("stat");
+
+        assert!(
+            refuse_dir_set_id_dropped(&dir, landed, &meta).is_ok(),
+            "no special bit declared, nothing to lose",
+        );
+        let declared = Mode::from_bits(0o2755);
+        let err = refuse_dir_set_id_dropped(&dir, declared, &meta)
+            .expect_err("a declared setgid bit that is not on the directory");
+        assert!(
+            matches!(
+                &err,
+                Error::DirectorySetIdNotKept {
+                    path,
+                    declared: said,
+                    landed: found,
+                    chmod_left: Some(left),
+                    set_back: None,
+                } if *path == dir && *said == declared && *found == landed && *left == landed
+            ),
+            "{err:?}",
+        );
+        assert!(
+            err.to_string().contains("the setgid bit did not stick"),
+            "{err}"
         );
     }
 
@@ -3551,7 +4740,61 @@ mod tests {
         child_env: &str,
         seed: impl FnOnce(&Path),
     ) {
-        let skip = |why: &str| eprintln!("skipped {name}: {why}");
+        run_in_a_foreign_setgid_directory(
+            name,
+            child_env,
+            &["--reuid=1", "--regid=1", "--clear-groups"],
+            seed,
+        );
+    }
+
+    /// Run the test `name` again under `setpriv`'s `credentials`, inside a user
+    /// namespace, with `child_env` naming a world-writable setgid directory
+    /// owned by a group those credentials are not in.
+    ///
+    /// Skips, with a message on stderr, wherever the scenario cannot be
+    /// constructed; fails only when the child ran and failed.
+    fn run_in_a_foreign_setgid_directory(
+        name: &str,
+        child_env: &str,
+        credentials: &[&str],
+        seed: impl FnOnce(&Path),
+    ) {
+        run_in_a_foreign_setgid_directory_under(
+            name,
+            child_env,
+            &["--map-auto", "--map-root-user"],
+            credentials,
+            seed,
+        );
+    }
+
+    /// As above, but with the namespace the **child** runs in given
+    /// separately from the one the setup steps run in.
+    ///
+    /// They differ for one case and it is the case D1 was about. The setup
+    /// needs `--map-auto` to `chown` the directory to group 5. A child run
+    /// under `--map-root-user` alone is in a namespace that maps *only* the
+    /// invoking ids, so group 5 has no mapping there and `stat` reports the
+    /// overflow gid — while the child is uid 0 with a full capability set.
+    /// That is the one combination `capable_wrt_inode_uidgid` refuses and
+    /// nothing else here constructs.
+    fn run_in_a_foreign_setgid_directory_under(
+        name: &str,
+        child_env: &str,
+        child_namespace: &[&str],
+        credentials: &[&str],
+        seed: impl FnOnce(&Path),
+    ) {
+        // Written to the process's own stderr, not through `eprintln!`:
+        // libtest captures the macro's output and discards it for a test that
+        // passes, so a skip announced that way is invisible and the suite still
+        // reports green. This goes to file descriptor 2, which libtest does not
+        // intercept.
+        let skip = |why: &str| {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "skipped {name}: {why}");
+        };
         let home = guarded_home();
         // Another uid has to reach the directory and run this test binary,
         // whose own directory it may not be able to read.
@@ -3573,13 +4816,16 @@ mod tests {
         // Each step in a user namespace mapping this user to root and its
         // subordinate ids above that: give the directory group 5, make it
         // setgid and world-writable, and run the child as uid 1.
-        let in_namespace = |args: &[&std::ffi::OsStr]| {
+        let unshared = |ns: &[&str], args: &[&std::ffi::OsStr]| {
             std::process::Command::new("unshare")
-                .args(["--map-auto", "--map-root-user", "--"])
+                .args(ns)
+                .arg("--")
                 .args(args)
                 .env(child_env, &dir)
                 .output()
         };
+        let in_namespace =
+            |args: &[&std::ffi::OsStr]| unshared(&["--map-auto", "--map-root-user"], args);
         for step in [
             [
                 std::ffi::OsStr::new("chown"),
@@ -3604,17 +4850,23 @@ mod tests {
             return skip("the directory is not setgid to a foreign group");
         }
 
-        let child = in_namespace(&[
-            "setpriv".as_ref(),
-            "--reuid=1".as_ref(),
-            "--regid=1".as_ref(),
-            "--clear-groups".as_ref(),
-            "--".as_ref(),
+        // No credentials asked for means no `setpriv` at all: the child keeps
+        // the ids and the capability set its namespace gave it. `setpriv`
+        // cannot be used for that anyway — a namespace created without
+        // `--map-auto` has `setgroups` denied, so even `--clear-groups` fails.
+        let mut argv: Vec<&std::ffi::OsStr> = Vec::new();
+        if !credentials.is_empty() {
+            argv.push("setpriv".as_ref());
+            argv.extend(credentials.iter().map(|arg| std::ffi::OsStr::new(*arg)));
+            argv.push("--".as_ref());
+        }
+        argv.extend([
             exe.as_os_str(),
             "--exact".as_ref(),
             name.as_ref(),
             "--nocapture".as_ref(),
         ]);
+        let child = unshared(child_namespace, &argv);
         let out = match child {
             Ok(out) => out,
             Err(e) => return skip(&format!("unshare could not run: {e}")),
@@ -3641,7 +4893,9 @@ mod tests {
         let previous = rustix::process::umask(Mode::from_bits(0o077).into());
 
         let dest = home.child("wide/f");
-        let result = write_atomically(&dest, b"x", Mode::DEFAULT_FILE);
+        // Through the phases, not `write_atomically`: the parent is missing,
+        // and creating one is `stage`'s to do.
+        let result = stage_now(&dest, Mode::DEFAULT_FILE).and_then(|s| s.commit(b"x"));
 
         rustix::process::umask(previous);
         result.expect("write");
@@ -3915,9 +5169,11 @@ mod tests {
             save(&dest);
             let saved = std::fs::read(&dest).expect("read the save");
 
-            let err = filled
+            let refused = filled
                 .publish()
                 .expect_err("a destination that changed after it was observed is not replaced");
+            assert_eq!(refused.dest, dest, "{how}: the refusal names the write");
+            let err = refused.into_error();
             assert!(matches!(err, Error::Changed { .. }), "{how}: {err:?}");
             assert_eq!(err.path(), dest, "{how}");
             assert_eq!(
@@ -3952,9 +5208,11 @@ mod tests {
         std::fs::remove_file(&dest).expect("rm");
         std::os::unix::fs::symlink("elsewhere", &dest).expect("symlink");
 
-        let err = filled
+        let refused = filled
             .publish()
             .expect_err("the link is not bx's to replace");
+        assert_eq!(refused.dest, dest, "the refusal names the write");
+        let err = refused.into_error();
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert!(
             std::fs::symlink_metadata(&dest)
@@ -3983,9 +5241,11 @@ mod tests {
         assert_eq!(filled.prior().stamp, None, "nothing was there to stamp");
         std::fs::write(&dest, b"another tool's\n").expect("another tool creates it");
 
-        let err = filled
+        let refused = filled
             .publish()
             .expect_err("bx announced a create, and there is now a file to replace");
+        assert_eq!(refused.dest, dest, "the refusal names the write");
+        let err = refused.into_error();
         assert!(matches!(err, Error::Changed { .. }), "{err:?}");
         assert_eq!(std::fs::read(&dest).expect("read"), b"another tool's\n");
         assert_eq!(names_in(home.path()), vec![OsString::from(".conf")]);
@@ -4221,7 +5481,11 @@ mod tests {
     fn a_missing_parent_directory_is_created_at_the_default_dir_mode() {
         let home = guarded_home();
         let dest = home.child("a/b/c/f");
-        write_atomically(&dest, b"x", Mode::PRIVATE_FILE).expect("write");
+        // `stage`, which is the only entry point that creates a directory.
+        stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .commit(b"x")
+            .expect("commit");
 
         assert_eq!(std::fs::read(&dest).expect("read"), b"x");
         for rel in ["a", "a/b", "a/b/c"] {
@@ -4231,6 +5495,48 @@ mod tests {
                 "{rel} is an implicit parent, created at 0755",
             );
         }
+    }
+
+    #[test]
+    fn the_one_call_shorthand_creates_no_directory_and_says_so() {
+        // The base's contract, kept for the entry point that has no
+        // `CreatedDirs` to record a directory in, no plan to announce it in,
+        // and no caller to say what mode it should get — which is how a 0600
+        // secret would otherwise land in a 0755 directory nobody decided on.
+        // `stage` and `ensure_dir` still create directories; this one does not.
+        let home = guarded_home();
+        let dest = home.child("a/b/secret.age");
+
+        let err = write_atomically(&dest, b"x", Mode::PRIVATE_FILE)
+            .expect_err("the shorthand invents no directory");
+        assert!(
+            matches!(&err, Error::MissingParent(dir) if *dir == home.child("a/b")),
+            "{err:?}",
+        );
+        assert_eq!(err.path(), home.child("a/b"));
+        assert!(
+            err.to_string()
+                .contains("bx creates no directory for this write"),
+            "{err}",
+        );
+        assert!(!home.child("a").exists(), "nothing was created");
+        assert_eq!(names_in(home.path()), Vec::<OsString>::new());
+
+        // With the directory there it writes, and the mode of the directory is
+        // the caller's own decision rather than a default.
+        std::fs::create_dir_all(home.child("a/b")).expect("the caller creates it");
+        set_mode(&home.child("a/b"), Mode::PRIVATE_DIR).expect("chmod");
+        write_atomically(&dest, b"x", Mode::PRIVATE_FILE).expect("write");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"x");
+        assert_eq!(mode_of_path(&home.child("a/b")), Mode::PRIVATE_DIR);
+
+        // A parent that is there but does not resolve is still the conflict it
+        // was, not this.
+        let dangling = home.child("dangling");
+        std::os::unix::fs::symlink("nowhere", &dangling).expect("symlink");
+        let err = write_atomically(&dangling.join("f"), b"x", Mode::DEFAULT_FILE)
+            .expect_err("a dangling parent is unusable, not missing");
+        assert!(matches!(err, Error::UnusableParent { .. }), "{err:?}");
     }
 
     #[test]
@@ -4297,7 +5603,7 @@ mod tests {
         std::fs::create_dir(&dir).expect("mkdir");
         set_mode(&dir, Mode::from_bits(0o500)).expect("chmod");
 
-        let result = write_atomically(&dir.join("sub/f"), b"x", Mode::DEFAULT_FILE);
+        let result = stage_now(&dir.join("sub/f"), Mode::DEFAULT_FILE).and_then(|s| s.commit(b"x"));
         set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for the assertions");
 
         let err = result.expect_err("a read-only directory refuses the mkdir");
@@ -4368,8 +5674,10 @@ mod tests {
         // through an actual write.
         let bare = write_atomically(Path::new("bare"), b"x", Mode::DEFAULT_FILE);
         // And a relative path more than one component deep, where `ancestors`
-        // ends with `""`.
-        let deep = write_atomically(Path::new("a/b/c.txt"), b"y", Mode::PRIVATE_FILE);
+        // ends with `""`. Its directories are missing, so it goes through the
+        // phases: only `stage` creates one.
+        let deep =
+            stage_now(Path::new("a/b/c.txt"), Mode::PRIVATE_FILE).and_then(|s| s.commit(b"y"));
 
         std::env::set_current_dir(&previous).expect("restore the working directory");
         bare.expect("a bare relative name");
@@ -5545,7 +6853,9 @@ mod tests {
         let (published, events) = durable::recording(|| filled.publish());
         set_mode(&dir, Mode::PRIVATE_DIR).expect("unlock for the assertions");
 
-        let err = published.expect_err("an unwritable directory refuses the rename");
+        let refused = published.expect_err("an unwritable directory refuses the rename");
+        assert_eq!(refused.dest, dest, "the refusal names the write");
+        let err = refused.into_error();
         let Error::Write { path, source } = &err else {
             panic!("expected a write error, got {err:?}");
         };
@@ -5859,6 +7169,225 @@ mod tests {
     }
 
     #[test]
+    fn a_link_at_a_blob_name_is_refused_with_a_remedy_that_fits_a_path_bx_owns() {
+        // `write_atomically` refuses a symlink, and `Ledger::record` snapshots
+        // the prior through it, so a link at `restore/<digest>` — from a
+        // restored backup, an `rsync --links`, a hand — fails every record that
+        // needs that content. bx will not unlink it: it made no link, so the
+        // link is somebody's, and removing it inside bx's own directory is
+        // still removing it. What it owes is a remedy that makes sense for a
+        // file nobody declared.
+        let home = guarded_home();
+        let (dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host old\n", Mode::from_bits(0o640));
+        let blob = dir.restore().join(ContentHash::of(b"Host old\n").to_hex());
+        std::fs::create_dir_all(dir.restore()).expect("restore/");
+        let elsewhere = home.child("elsewhere");
+        std::fs::write(&elsewhere, b"not a blob\n").expect("seed");
+        std::os::unix::fs::symlink(&elsewhere, &blob).expect("symlink");
+
+        let filled = stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host new\n")
+            .expect("fill");
+        let entry = filled
+            .new_entry(home.path(), Mechanism::Own)
+            .expect("a portable entry");
+        let err = ledger
+            .record(entry.clone())
+            .expect_err("a link at the blob name is not bx's to replace");
+        let message = err.to_string();
+        assert!(
+            message.contains(&blob.display().to_string()),
+            "the refusal names the file to remove: {message}",
+        );
+        assert!(message.contains("Remove the link"), "{message}");
+        assert_eq!(
+            std::fs::read_link(&blob).expect("readlink"),
+            elsewhere,
+            "the link and what it names are left alone",
+        );
+        assert_eq!(std::fs::read(&elsewhere).expect("read"), b"not a blob\n");
+
+        // The remedy the message gives is the whole repair: the blob is
+        // content-addressed, so the next record reconstructs it.
+        std::fs::remove_file(&blob).expect("the remedy");
+        ledger.record(entry).expect("record repairs itself");
+        assert_eq!(std::fs::read(&blob).expect("read"), b"Host old\n");
+        filled.publish().expect("publish");
+    }
+
+    #[test]
+    fn a_ledger_entry_for_a_refused_publish_is_withdrawn_through_what_the_refusal_names() {
+        // The one state the seam makes reachable and no other test reached:
+        // `record` has succeeded, so the prior bytes are durable in `restore/`
+        // and the in-memory ledger claims the target — and then `publish`
+        // refuses, so the destination still holds what the user has.
+        //
+        // Saving the ledger from here would make `bx rm` write the recorded
+        // prior over content bx never replaced. What stops it is that the
+        // refusal names the write, so the entry can be withdrawn.
+        let home = guarded_home();
+        let (dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host old\n", Mode::from_bits(0o640));
+
+        let filled = stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host new\n")
+            .expect("fill");
+        let key = Portable::from_path(&dest, home.path()).expect("portable");
+        let withdrawal = ledger.withdrawal(&key);
+        let recorded = ledger
+            .record(
+                filled
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry"),
+            )
+            .expect("record")
+            .clone();
+        let Prior::Existed(reference) = &recorded.prior else {
+            panic!("the prior state must be Existed, got {:?}", recorded.prior);
+        };
+
+        // The user saves over the destination between the record and the
+        // rename, which is exactly what `publish` refuses.
+        std::fs::write(&dest, b"Host theirs\n").expect("the user saves");
+        let refused = filled.publish().expect_err("the destination changed");
+        assert_eq!(refused.dest, dest, "the refusal names the write");
+        assert!(
+            matches!(refused.error, Error::Changed { .. }),
+            "{:?}",
+            refused.error,
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read"),
+            b"Host theirs\n",
+            "bx wrote nothing",
+        );
+
+        // What the ledger is left holding: the entry, and the blob its prior
+        // names. Both are real, and both describe a write that did not happen.
+        assert_eq!(ledger.len(), 1, "the entry is still in the ledger");
+        assert_eq!(
+            ledger
+                .restore_bytes(&dir, reference)
+                .expect("the blob record fsynced"),
+            b"Host old\n",
+            "the snapshot is durable, and it is not what is on disk now",
+        );
+
+        // The withdrawal: the refusal names the entry's key, and the entry
+        // before the record was none, so none is put back.
+        assert_eq!(
+            Portable::from_path(&refused.dest, home.path()).expect("portable"),
+            key,
+            "the refusal names the key the withdrawal was taken for",
+        );
+        let withdrawn = ledger
+            .withdraw(withdrawal)
+            .expect("the entry is there to withdraw");
+        assert_eq!(withdrawn.written, ContentHash::of(b"Host new\n"));
+        assert!(ledger.is_empty(), "nothing claims the target now");
+        ledger.save().expect("save");
+
+        // Read back from disk: no entry, so `bx rm` has nothing to restore
+        // over the user's file. The blob is left in `restore/`, which is
+        // content-addressed and reused rather than owned by one entry.
+        let reread = LedgerView::read(&dir, home.path()).expect("read").value;
+        assert!(reread.is_empty(), "the durable ledger claims nothing");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host theirs\n");
+    }
+
+    #[test]
+    fn a_refused_re_record_is_withdrawn_to_the_entry_it_replaced() {
+        // Every apply after the first re-records a target bx already has an
+        // entry for, and that entry holds the prior the user had before bx.
+        // Withdrawing a refused re-record by dropping the key — `forget` —
+        // loses that prior for good. The withdrawal puts back the whole entry
+        // as it was before the record: prior, history and all.
+        let home = guarded_home();
+        let (dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host old\n", Mode::from_bits(0o640));
+        let key = Portable::from_path(&dest, home.path()).expect("portable");
+
+        // The first apply lands, and the ledger is saved.
+        let first = stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host v1\n")
+            .expect("fill");
+        ledger
+            .record(
+                first
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry"),
+            )
+            .expect("record");
+        first.publish().expect("publish");
+        ledger.save().expect("save");
+        let before = ledger.get(&key).expect("recorded").clone();
+        let Prior::Existed(original) = &before.prior else {
+            panic!("the prior state must be Existed, got {:?}", before.prior);
+        };
+
+        // The user edits the result, so the second apply's record adopts the
+        // edit as the prior and moves the original to the history — the
+        // re-record that changes the most.
+        std::fs::write(&dest, b"Host edited\n").expect("the user edits");
+        let withdrawal = ledger.withdrawal(&key);
+        let second = stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host v2\n")
+            .expect("fill");
+        let recorded = ledger
+            .record(
+                second
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry"),
+            )
+            .expect("record")
+            .clone();
+        assert_ne!(recorded, before, "the re-record changed the entry");
+        assert_eq!(recorded.superseded, vec![original.clone()]);
+
+        // The user saves again between the record and the rename.
+        std::fs::write(&dest, b"Host theirs\n").expect("the user saves");
+        let refused = second.publish().expect_err("the destination changed");
+        assert!(
+            matches!(refused.error, Error::Changed { .. }),
+            "{:?}",
+            refused.error,
+        );
+        assert_eq!(
+            Portable::from_path(&refused.dest, home.path()).expect("portable"),
+            key,
+        );
+
+        let withdrawn = ledger.withdraw(withdrawal).expect("the refused record");
+        assert_eq!(withdrawn, recorded, "the refused record is handed back");
+        assert_eq!(
+            ledger.get(&key),
+            Some(&before),
+            "the entry is exactly what it was before the record",
+        );
+        ledger.save().expect("save");
+
+        // Durably: `bx rm` still restores the file the user had before bx.
+        let reread = LedgerView::read(&dir, home.path()).expect("read").value;
+        let entry = reread.get(&key).expect("the entry survives the withdrawal");
+        assert_eq!(entry, &before);
+        assert_eq!(
+            reread
+                .restore_bytes(&dir, original)
+                .expect("the original prior"),
+            b"Host old\n",
+        );
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host theirs\n");
+    }
+
+    #[test]
     fn re_applying_after_an_edit_keeps_every_byte_the_user_wrote() {
         // The ordinary case, not an edge one: a user applies, edits the result,
         // and applies again. The second apply displaces the user's edit, so the
@@ -5899,15 +7428,13 @@ mod tests {
         }
 
         let recorded = ledger
-            .record(
-                NewEntry::new(
-                    Portable::from_path(&dest, home.path()).expect("portable"),
-                    ContentHash::of(b"Host v2\n"),
-                    Mode::PRIVATE_FILE,
-                    Mechanism::Own,
-                )
-                .with_prior(PriorBytes::Absent),
-            )
+            .record(NewEntry::new(
+                Portable::from_path(&dest, home.path()).expect("portable"),
+                ContentHash::of(b"Host v2\n"),
+                Mode::PRIVATE_FILE,
+                Mechanism::Own,
+                PriorBytes::Absent,
+            ))
             .expect("record")
             .clone();
 
@@ -6000,6 +7527,72 @@ mod tests {
         write_atomically(&dest, &bytes, reference.mode).expect("reverse");
         assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host *\n");
+    }
+
+    #[test]
+    fn a_created_dirs_set_answers_for_a_directory_however_it_is_spelled() {
+        // `declare` normalised its key and `declared` did not, so an external
+        // caller — the apply engine that will hold one set for the whole apply
+        // — could declare `~/.ssh` and be told `~/.ssh/` is undeclared. Every
+        // spelling below names one directory to the kernel, and now to this set.
+        //
+        // What this pins is `DirKey::of`'s normalisation. It is not a test of
+        // `Path`'s component-wise `Ord`: measured at r4 round 2, a key holding
+        // raw `OsStr` bytes passes this as long as it normalises, and fails
+        // only when it does neither.
+        let home = guarded_home();
+        let dir = home.child(".ssh");
+        let spellings = [
+            dir.clone(),
+            dir.join(""),                                         // a trailing separator
+            dir.parent().expect("a home").join(".").join(".ssh"), // a `.` component
+            dir.components().collect::<PathBuf>(),                // rebuilt component by component
+        ];
+
+        for declared_as in &spellings {
+            let mut created = CreatedDirs::new();
+            created.declare(declared_as, Mode::PRIVATE_DIR);
+            for asked_as in &spellings {
+                assert_eq!(
+                    created.declared(asked_as),
+                    Some(Mode::PRIVATE_DIR),
+                    "declared as {}, asked as {}",
+                    declared_as.display(),
+                    asked_as.display(),
+                );
+            }
+            assert_eq!(created.declared(&home.child(".config")), None);
+        }
+
+        // `contains` and the claim rule key on the same thing: a write that
+        // creates the directory under one spelling leaves it unclaimed for a
+        // target that declared it under another.
+        let mut created = CreatedDirs::new();
+        created.declare(&dir.join(""), Mode::PRIVATE_DIR);
+        let dest = dir.join("config");
+        let planned = observe(&dest).expect("observe");
+        let filled = stage(&dest, Mode::PRIVATE_FILE, &planned, &mut created)
+            .expect("stage")
+            .fill(b"Host *\n")
+            .expect("fill");
+        assert_eq!(
+            filled.created_dirs(),
+            Vec::<PathBuf>::new(),
+            "the declared directory is its own target's to claim, however it was spelled",
+        );
+        assert_eq!(
+            mode_of_path(&dir),
+            Mode::PRIVATE_DIR,
+            "at its declared mode"
+        );
+        for asked_as in &spellings {
+            assert!(
+                created.contains(asked_as),
+                "contains {}",
+                asked_as.display()
+            );
+        }
+        filled.publish().expect("publish");
     }
 
     #[test]

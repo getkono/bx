@@ -105,9 +105,12 @@ or a login banner without anyone parsing its output:
   you declared. It sets only variables it knows how to judge, and judges each
   value for what it is — a location, a list of locations, an anchor, a program,
   a search list, a socket or a setting: declare your scratch mount as a root
-  and your toolchain caches may live there; declare nothing and nothing moves at
-  all. It will write only a variable in bx's emit table, which grows with the
-  generators that need it.
+  and your toolchain caches may live there; declare nothing and no location,
+  list of locations or anchor is allowed at all. The other kinds say what a
+  tool runs, where it looks and what it connects to rather than where its files
+  live, so they move nothing and need no root — and none of them, root or no
+  root, may point inside a directory `bx` owns. It will write only a variable
+  in bx's emit table, which grows with the generators that need it.
 - Uninstalling is a supported operation, not an afterthought.
 
 ### Idempotent and reversible

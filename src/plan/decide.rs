@@ -898,8 +898,8 @@ fn unsupported(target: &Target) -> Option<&'static str> {
 ///
 /// The interactive file is judged by its `env` phase alone, rendered with the
 /// same `present` as the file, since that phase is its one environment
-/// fragment; every other phase holds plugin lines that set nothing, which the
-/// guard's grammar would refuse as unreadable, and the tests of
+/// fragment; every other phase holds plugin and alias lines that set nothing,
+/// which the guard's grammar would refuse as unreadable, and the tests of
 /// [`crate::config::target::Interactive`] hold them to carrying no assignment.
 /// A line number in the note is still the file's own: the phase is found in
 /// the file's bytes, and each line is counted from the top of the file.
@@ -2550,6 +2550,138 @@ mod tests {
                 "{err}"
             );
             assert!(err.contains("bx.toml:1"), "{err}");
+        }
+
+        /// The `aliases` phase of an interactive file's bytes: from its
+        /// heading up to the next phase's, headings excluded.
+        fn aliases_phase(written: &str) -> &str {
+            let heading = "# bx phase: aliases\n";
+            let start = written.find(heading).expect("an aliases phase") + heading.len();
+            let rest = &written[start..];
+            rest.find("\n# bx phase: ")
+                .map_or(rest, |end| &rest[..=end])
+        }
+
+        #[test]
+        fn declared_aliases_arrive_as_their_tool_does_and_set_no_variable() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            // A tool bx does not find yet, by absolute path so no `PATH` is
+            // consulted.
+            let tool = home.child("opt/bat");
+            std::fs::create_dir_all(tool.parent().expect("a parent")).expect("mkdir");
+            let tool = tool.to_str().expect("a UTF-8 path").to_string();
+            let layer = format!(
+                "[aliases]\nll = \"ls -la\"\nsudo = \"sudo \"\n\
+                 [[alias]]\nname = \"cat\"\ncommand = \"bat --paging=never\"\n\
+                 when = \"has:{tool}\"\n\
+                 [[alias]]\nname = \"x\"\ncommand = \"export X=1\"\nwhen = \"env:TMUX\"\n\
+                 [[alias]]\nname = \"off\"\ncommand = \"y\"\nenabled = false\n"
+            );
+
+            // Aliases alone place the file, and the region that sources it.
+            let first = apply(&home, &layer);
+            assert_eq!(
+                rows(&first),
+                vec![
+                    ("~/.local/share/bx/zshrc.zsh", Action::Create),
+                    ("~/.zshrc", Action::Modify),
+                ]
+            );
+            let written = read(&home, ".local/share/bx/zshrc.zsh");
+            let runtime = "if [[ -n ${TMUX+x} ]]; then\n  alias x='export X=1'\nfi\n";
+            assert_eq!(
+                written,
+                format!(
+                    "{}\n# bx phase: aliases\nalias ll='ls -la'\nalias sudo='sudo '\n{runtime}",
+                    interactive("")
+                )
+            );
+
+            // Idempotent while the tool is missing.
+            let second = plan(&home, &layer);
+            assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&second)
+            );
+
+            // Installing the tool is a change the next plan shows, and the
+            // alias arrives, written plainly, with no `command -v`.
+            std::fs::write(&tool, "#!/bin/sh\n").expect("write");
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let installed = plan(&home, &layer);
+            assert_eq!(
+                row(&installed, "~/.local/share/bx/zshrc.zsh").action,
+                Action::Modify
+            );
+            assert_eq!(row(&installed, "~/.zshrc").action, Action::Unchanged);
+            apply(&home, &layer);
+            let written = read(&home, ".local/share/bx/zshrc.zsh");
+            let phase = aliases_phase(&written);
+            assert_eq!(
+                phase,
+                format!(
+                    "alias ll='ls -la'\nalias sudo='sudo '\n\
+                     alias cat='bat --paging=never'\n{runtime}"
+                )
+            );
+            assert!(!written.contains("command -v"), "{written}");
+            assert!(!written.contains("off"), "{written}");
+            let settled = plan(&home, &layer);
+            assert!(
+                settled
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&settled)
+            );
+
+            // Invariant 2: the written `aliases` phase is not an environment
+            // fragment, so sourcing its bytes, with its runtime condition
+            // true, changes no parameter and exports nothing.
+            if let Some(zsh) = crate::shell::testing::installed("zsh") {
+                let dump = "__bx_dump() { local n; for n in ${(ok)parameters}; do \
+                            [[ ${parameters[$n]} == *special* ]] || \
+                            print -r -- \"$n=${(P)n}\"; \
+                            done; print -r -- ---; export; print -r -- ---; }\n";
+                let dumps = |body: &str| {
+                    let script =
+                        format!("TMUX=1\n{dump}__bx_dump >/dev/null\n__bx_dump\n{body}__bx_dump\n");
+                    let got = String::from_utf8(crate::shell::testing::run(&zsh, &["-f"], &script))
+                        .expect("utf-8");
+                    got.split("---\n").map(str::to_string).collect::<Vec<_>>()
+                };
+                let parts = dumps(phase);
+                assert_eq!(parts[1], parts[3], "nothing is exported");
+                assert_eq!(parts[0], parts[2], "no parameter changes");
+                // The aliases were defined, so the phase ran at all.
+                let defined = crate::shell::testing::run(
+                    &zsh,
+                    &["-f"],
+                    &format!("TMUX=1\n{phase}print -r -- \"${{aliases[x]}}\"\n"),
+                );
+                assert_eq!(defined, b"export X=1\n");
+                // The dump does see an assignment, so the equalities mean
+                // something.
+                let parts = dumps("Z=1\n");
+                assert_ne!(parts[2], parts[0]);
+            }
+
+            // Reversible: `rm` puts back the bytes each file held before bx.
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
+                .iter()
+                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+                .collect();
+            crate::restore::restore(&state, home.path(), &targets).expect("rm");
+            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
+            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
         }
 
         #[test]

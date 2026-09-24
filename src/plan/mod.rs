@@ -1899,6 +1899,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn link_text_that_differs_only_by_normalisation_is_different_text() {
+        // `Path` equality would call each pair equal; the link text is compared
+        // byte for byte, as it is stored exactly as written.
+        let pairs = [
+            ("/opt/x", "/opt/x/"),
+            ("/opt/x/", "/opt/x"),
+            ("a//b", "a/b"),
+            ("a/./b", "a/b"),
+        ];
+        for (made, declared) in pairs {
+            // A link bx made is retargeted to the declared text.
+            let home = guarded_home();
+            apply(&inputs(&home, &symlink("~/.tool", made)));
+            let retarget = inputs(&home, &symlink("~/.tool", declared));
+            let planned = plan(&retarget);
+            assert_eq!(
+                planned.actions(),
+                vec![Action::Modify],
+                "{made} -> {declared}"
+            );
+            assert_eq!(link(&planned.changes[0]), (Some(made), Some(declared)));
+            apply(&retarget);
+            assert_eq!(
+                text_of(&home.child(".tool")).as_os_str(),
+                std::ffi::OsStr::new(declared)
+            );
+            assert_eq!(plan(&retarget).actions(), vec![Action::Unchanged]);
+
+            // A user's link with that text is theirs, not adopted.
+            let home = guarded_home();
+            std::os::unix::fs::symlink(made, home.child(".tool")).expect("the user's link");
+            let theirs = inputs(&home, &symlink("~/.tool", declared));
+            assert_eq!(
+                plan(&theirs).actions(),
+                vec![Action::Conflict],
+                "{made} -> {declared}"
+            );
+            assert!(!apply(&theirs).executed);
+            let os = std::fs::read_link(home.child(".tool")).expect("a link");
+            assert_eq!(os.as_os_str(), std::ffi::OsStr::new(made));
+        }
+    }
+
+    #[test]
     fn a_link_retargeted_since_bx_made_it_and_a_path_bx_owns_otherwise_are_conflicts() {
         let home = guarded_home();
         apply(&inputs(&home, &symlink("~/.tool", "/opt/one")));

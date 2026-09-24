@@ -779,7 +779,12 @@ fn decide_link(
             )
         }
         (None, Kind::Absent) => (Action::Create, None),
-        (None, Kind::Symlink) if observed.link.as_deref() == Some(text.as_path()) => {
+        // Byte for byte: `Path` equality compares normalised components, so
+        // `/opt/x/` would equal `/opt/x` and a retarget that changes how the
+        // link resolves would never be delivered.
+        (None, Kind::Symlink)
+            if observed.link.as_deref().map(Path::as_os_str) == Some(text.as_os_str()) =>
+        {
             (Action::Unchanged, None)
         }
         (None, Kind::Symlink) => (Action::Modify, None),
@@ -1531,6 +1536,41 @@ mod tests {
         assert_eq!(row_for(&plan_of(&inputs), "~/.d/f").action, Action::Create);
         assert!(apply_of(&inputs).executed);
         assert_eq!(mode_on_disk(control.path(), ".d"), Some(Mode::DEFAULT_DIR));
+    }
+
+    #[test]
+    fn a_symlink_whose_parent_denies_its_owner_write_or_search_is_a_conflict() {
+        // Making a link writes an entry in its parent, so `decide_link` asks
+        // `locked_parent` as a file's write does: one parent on disk that
+        // denies write, and one declared at a mode that denies search.
+        let link = |path: &str| format!("[[target]]\npath = \"{path}\"\nsymlink = \"/opt/x\"\n");
+        let home = guarded_home();
+        let inputs = crate::plan::tests::inputs(&home, &link("~/locked/tool"));
+        let _unlock = locked_dir_at(home.path(), "locked", 0o500);
+
+        let row = row_for(&plan_of(&inputs), "~/locked/tool").clone();
+        assert_eq!(row.action, Action::Conflict, "{row:?}");
+        assert_eq!(
+            row.note.as_deref(),
+            Some(
+                "~/locked is 0500 on disk, which denies its owner write, so apply could not \
+                 write a file inside it"
+            )
+        );
+        assert!(!apply_of(&inputs).executed, "apply wrote");
+        assert!(std::fs::symlink_metadata(home.child("locked/tool")).is_err());
+
+        let home = guarded_home();
+        let inputs =
+            crate::plan::tests::inputs(&home, &a_directory_target("0600", &link("~/.d/tool")));
+        let row = row_for(&plan_of(&inputs), "~/.d/tool").clone();
+        assert_eq!(row.action, Action::Conflict, "{row:?}");
+        assert!(
+            row.note
+                .as_deref()
+                .is_some_and(|note| note.contains("denies its owner search")),
+            "{row:?}"
+        );
     }
 
     #[test]

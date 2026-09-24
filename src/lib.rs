@@ -48,8 +48,12 @@
 //! comparison, and a diff of each decision, shared by `bx plan`, `bx apply`
 //! and the status view. [`adopt`] is `bx add` and `bx rm`: existing config
 //! taken into the repo byte for byte, and handed back exactly. [`command`]
-//! holds the commands' bodies, so the binary only parses its arguments and
-//! dispatches.
+//! holds the commands' bodies, `bx doctor`'s among them, so the binary only
+//! parses its arguments and dispatches.
+//!
+//! [`doctor`] reads the same resolved targets without deciding them, and asks
+//! read-only questions about what is on disk — whether systemd has reloaded,
+//! enabled, or failed a unit file bx wrote — changing nothing itself.
 //!
 //! # How one repo serves many accounts
 //!
@@ -81,6 +85,7 @@ pub mod adopt;
 pub mod command;
 pub mod config;
 pub mod detect;
+pub mod doctor;
 pub mod env_guard;
 pub mod fs;
 pub mod journal;

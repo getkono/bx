@@ -144,7 +144,7 @@ fn unified(target: &str, old: &str, new: &str) -> String {
 /// `text` with every control character but a tab spelled out — `\r`, `\n`,
 /// `\x1b` — so nothing a file or a path holds can move the cursor, colour the
 /// terminal, or start a line the rendering did not.
-fn escape(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn escape(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.chars().any(|c| c != '\t' && c.is_control()) {
         return std::borrow::Cow::Borrowed(text);
     }

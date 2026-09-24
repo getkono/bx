@@ -69,6 +69,24 @@ pub struct Holder {
 }
 
 impl Holder {
+    /// Whoever holds `dir`'s lock, as far as the lock file's body says.
+    ///
+    /// Read-only and best effort: an absent, unopenable or malformed lock file
+    /// is [`Holder::unknown`], exactly as it is on
+    /// [`ExclusiveLock::acquire`]'s refusal path, and nothing is created,
+    /// narrowed or written.
+    ///
+    /// The kernel remains the authority on whether the directory is held —
+    /// [`SharedLock::probe`] asks it. This answers only *who*, so a writing
+    /// command that has already been told the directory is held can refuse with
+    /// the same [`Error::Locked`] `acquire` would have raised, before it does
+    /// any other work, rather than reaching `acquire` at the end of a run it
+    /// was never going to be allowed to finish.
+    #[must_use]
+    pub fn of(dir: &StateDir) -> Self {
+        read_holder(&dir.lock())
+    }
+
     /// The holder bx reports when the lock file says nothing usable.
     ///
     /// An empty or unreadable body is not an error: the kernel is the authority
@@ -278,6 +296,127 @@ impl SharedLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Whether a writer holds the state directory, found without writing.
+    ///
+    /// This is the call a read-only command makes — `plan`, and `doctor` after
+    /// it. Taking a [`SharedLock`] to ask would write: it creates the state
+    /// directory and the lock file, and narrows both to their private modes,
+    /// and a command that promises to write nothing must not do that.
+    ///
+    /// The lock file is opened read-only with `O_NOFOLLOW` and never `O_CREAT`,
+    /// and `O_NONBLOCK` so a FIFO put there cannot hang the open. Nothing is
+    /// created, narrowed or written. The file must pass the checks every guard
+    /// applies — a regular file with one link — so a symlink, a directory or a
+    /// hard link at the lock path is refused here exactly as a writer would
+    /// refuse it. One non-blocking shared `flock` then answers the question,
+    /// and a lock it took is unlocked before it returns — explicitly, as both
+    /// guards' `Drop` does, so no copy of the descriptor keeps it held.
+    ///
+    /// A missing lock file, or a state directory that is not there, is
+    /// [`Probe::Absent`]: no writer holds a lock that does not exist, because a
+    /// writer creates it before it locks it.
+    ///
+    /// # Decision 36: three gaps here are named rather than closed
+    ///
+    /// Each was confirmed still holding at `5d1bba7`, and each is recorded here
+    /// rather than in a body section, so the record moves with the code.
+    ///
+    /// **The probe's instant of shared lock.** Between the
+    /// `flock(LOCK_SH|LOCK_NB)` and the explicit `flock(LOCK_UN)`, a `bx apply`
+    /// starting at that instant is refused as locked and exits 1 naming no
+    /// holder. A read-only `bx plan` can therefore make a concurrent write
+    /// fail, and the user reruns it. The window is not avoidable with `flock`:
+    /// it has no test-without-taking operation, and
+    /// [`SharedLock::try_acquire`], which `plan` used before decision 8, has
+    /// the identical window. `fcntl`/OFD `F_GETLK` would answer without
+    /// acquiring, but this repository's lock is `flock` throughout, so adopting
+    /// it is a design change and not a defect repair. Plan E1 (#40) records the
+    /// same residual risk.
+    ///
+    /// **The `flock` arm that is not `EWOULDBLOCK`.** No test reaches it. The
+    /// probe's tests were enumerated at this head — absent directory, no lock
+    /// file, beneath a non-directory, free, writer in another process, writer
+    /// in this process, free-unlocks-before-close, symlink, directory, second
+    /// link, FIFO, unopenable — and none makes `flock` fail with anything else.
+    /// An OS refusal such as `EINTR` or `ENOLCK` would be reported as a
+    /// [`Error::Lock`] where a retry might be right. Decision 17 rejected a
+    /// `flock` double (`LD_PRELOAD`, or a namespace) as costing far more than
+    /// the risk, and that still holds; the gap is real rather than closed.
+    ///
+    /// **The `OFlags` equivalent mutants.** `cargo mutants` reports `|` → `^`
+    /// in the open flags below as missed. `^` binds tighter than `|`, the flags
+    /// share no bit, and `O_RDONLY` is 0, so each mutant opens with exactly the
+    /// same flags: no test can tell them apart. The `&` mutants at the same
+    /// positions do change the flags, and are caught.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LockNotAFile`] when what is at the lock path is not a lock
+    /// file bx could have made, and [`Error::Lock`] when it cannot be opened,
+    /// examined or asked.
+    pub fn probe(dir: &StateDir) -> Result<Probe, Error> {
+        let path = dir.lock();
+        let failed = |source: Errno| Error::Lock {
+            path: path.clone(),
+            source: source.into(),
+        };
+        let fd = match rustix::fs::open(
+            &path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            RawMode::empty(),
+        ) {
+            Ok(fd) => fd,
+            // `ENOTDIR`: something that is not a directory where the state
+            // directory or one of its parents should be. No writer can have
+            // created a lock file beneath it; what the later reads make of it
+            // is theirs to report.
+            Err(Errno::NOENT | Errno::NOTDIR) => return Ok(Probe::Absent),
+            Err(Errno::LOOP) => return Err(Error::LockNotAFile { path: dir.lock() }),
+            Err(source) => return Err(failed(source)),
+        };
+        let stat = rustix::fs::fstat(&fd).map_err(failed)?;
+        if !is_lock_file(&stat) {
+            return Err(Error::LockNotAFile { path: dir.lock() });
+        }
+        match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockShared) {
+            Ok(()) => {
+                // Unlocked explicitly rather than by the close: a process
+                // spawned from another thread while the descriptor is open has
+                // a copy of it until it execs, and the close alone would leave
+                // the lock held by that copy.
+                let _ = released("unlock", rustix::fs::flock(&fd, FlockOperation::Unlock));
+                Ok(Probe::Free)
+            }
+            Err(Errno::WOULDBLOCK) => Ok(Probe::Held),
+            Err(source) => Err(failed(source)),
+        }
+    }
+}
+
+/// What [`SharedLock::probe`] found at the lock path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// There is no lock file, or no state directory to hold one.
+    Absent,
+    /// The lock file is there, and no writer holds it.
+    Free,
+    /// A writer holds the lock: an `apply` is running.
+    Held,
+}
+
+impl Probe {
+    /// Whether a writer holds the lock.
+    #[must_use]
+    pub const fn is_held(self) -> bool {
+        matches!(self, Self::Held)
+    }
+}
+
+/// Whether a `stat` is of a file bx could have made its lock file: a regular
+/// file with exactly one link.
+fn is_lock_file(stat: &rustix::fs::Stat) -> bool {
+    FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_nlink == 1
 }
 
 /// Turn a refusal into `None`, keeping every other failure.
@@ -331,7 +470,7 @@ fn open_lock_file(dir: &StateDir, path: &Path) -> Result<(OwnedFd, rustix::fs::S
         Err(source) => return Err(failed(source)),
     };
     let stat = rustix::fs::fstat(&fd).map_err(failed)?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1 {
+    if !is_lock_file(&stat) {
         return Err(not_a_file());
     }
     // Owner is the last component of "is this ours", and the one this call
@@ -552,6 +691,13 @@ mod tests {
         };
         let dir = StateDir::new(PathBuf::from(root));
         match ExclusiveLock::acquire(&dir) {
+            Ok(lock) if std::env::var_os(HOLD).is_some() => {
+                // Hold the lock until the parent closes standard input.
+                println!("acquired");
+                std::io::Write::flush(&mut std::io::stdout()).expect("flush");
+                let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+                drop(lock);
+            }
             Ok(lock) => {
                 println!("acquired");
                 // Leak the guard: the process is about to exit, and the point
@@ -564,6 +710,285 @@ mod tests {
             }
             Err(e) => panic!("unexpected failure: {e}"),
         }
+    }
+
+    /// Set for [`child_attempts_the_lock`] to hold what it acquired until its
+    /// standard input closes.
+    const HOLD: &str = "BX_TEST_LOCK_HOLD";
+
+    /// A writer in another process: this test binary again, holding the
+    /// exclusive lock until the returned child's standard input is closed.
+    fn writer_elsewhere(dir: &StateDir) -> std::process::Child {
+        use std::io::BufRead as _;
+        use std::process::Stdio;
+
+        let mut writer = Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "state::lock::tests::child_attempts_the_lock",
+            ])
+            .env("BX_TEST_LOCK_DIR", dir.root())
+            .env(HOLD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the writer");
+        // Borrowed, not taken: the pipe must stay open until the writer exits,
+        // or its harness's last lines fail to write and it reports a failure.
+        let out = writer.stdout.as_mut().expect("the writer's output");
+        let acquired = std::io::BufReader::new(out)
+            .lines()
+            .map(|line| line.expect("a line"))
+            .any(|line| line.contains("acquired"));
+        assert!(acquired, "the writer did not take the lock");
+        writer
+    }
+
+    /// Permission bits, symlinks not followed.
+    fn lmode_of(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .expect("lstat")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn a_probe_of_a_missing_state_directory_is_absent_and_creates_nothing() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+
+        assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Absent);
+        assert!(
+            !home.child(".local").exists(),
+            "the probe created a directory"
+        );
+    }
+
+    #[test]
+    fn a_probe_of_a_directory_with_no_lock_file_is_absent_and_changes_nothing() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        std::fs::create_dir_all(dir.root()).expect("the state directory");
+        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o755))
+            .expect("widen");
+
+        assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Absent);
+        assert!(!dir.lock().exists(), "the probe created the lock file");
+        assert_eq!(mode_of(dir.root()), 0o755);
+    }
+
+    #[test]
+    fn a_probe_beneath_something_that_is_not_a_directory_is_absent() {
+        let home = guarded_home();
+        home.write("state", "a file where the state directory would be\n");
+        let dir = StateDir::new(home.child("state"));
+
+        assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Absent);
+        assert_eq!(
+            std::fs::read(home.child("state")).expect("kept"),
+            b"a file where the state directory would be\n"
+        );
+    }
+
+    #[test]
+    fn a_probe_of_a_free_lock_is_free_narrows_nothing_and_keeps_nothing_locked() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        std::fs::create_dir_all(dir.root()).expect("the state directory");
+        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o755))
+            .expect("widen");
+        std::fs::write(dir.lock(), b"4242 bx\n").expect("the lock file");
+        std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o644))
+            .expect("widen");
+
+        assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Free);
+        assert_eq!(mode_of(dir.root()), 0o755);
+        assert_eq!(mode_of(&dir.lock()), 0o644);
+        assert_eq!(std::fs::read(dir.lock()).expect("read"), b"4242 bx\n");
+        assert!(!Probe::Free.is_held());
+        assert!(!Probe::Absent.is_held());
+        // The shared lock the probe took is gone with it.
+        drop(ExclusiveLock::acquire(&dir).expect("nothing is left holding the lock"));
+    }
+
+    #[test]
+    fn a_probe_sees_a_writer_in_another_process_and_then_its_release() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let writer = writer_elsewhere(&dir);
+
+        let held = SharedLock::probe(&dir).expect("probe");
+        assert_eq!(held, Probe::Held);
+        assert!(held.is_held());
+
+        // Closes the writer's standard input, then drains it until it exits.
+        let exited = writer.wait_with_output().expect("the writer exits");
+        assert!(
+            exited.status.success(),
+            "{}",
+            String::from_utf8_lossy(&exited.stderr)
+        );
+        assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Free);
+    }
+
+    #[test]
+    fn a_probe_sees_a_writer_in_this_process() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let writer = ExclusiveLock::acquire(&dir).expect("writer");
+
+        assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Held);
+        drop(writer);
+        assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Free);
+    }
+
+    #[test]
+    fn a_free_probe_unlocks_before_it_closes_and_no_other_answer_has_a_lock_to_release() {
+        // A shared lock released only by closing its descriptor stays held
+        // while a process spawned in that instant, from any thread, still has
+        // a copy of the descriptor: the apply that follows a plan is then
+        // refused as locked, as `t13` once was under load. Explicit, as both
+        // guards' `Drop` is.
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        let mut found = None;
+
+        let calls = release_recording::record(|| found = SharedLock::probe(&dir).ok());
+        assert_eq!(found, Some(Probe::Absent));
+        assert!(calls.is_empty(), "{calls:?}");
+
+        std::fs::create_dir_all(dir.root()).expect("the state directory");
+        std::fs::write(dir.lock(), b"").expect("the lock file");
+        let calls = release_recording::record(|| found = SharedLock::probe(&dir).ok());
+        assert_eq!(found, Some(Probe::Free));
+        assert_eq!(calls, ["unlock"]);
+
+        let writer = ExclusiveLock::acquire(&dir).expect("writer");
+        let calls = release_recording::record(|| found = SharedLock::probe(&dir).ok());
+        assert_eq!(found, Some(Probe::Held));
+        assert!(calls.is_empty(), "{calls:?}");
+        drop(writer);
+    }
+
+    #[test]
+    fn a_probe_refuses_a_symlink_at_the_lock_path_and_reaches_nothing_through_it() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        std::fs::create_dir_all(dir.root()).expect("the state directory");
+        home.write(".bashrc", "the user wrote this\n");
+        let before = mode_of(&home.child(".bashrc"));
+        std::os::unix::fs::symlink(home.child(".bashrc"), dir.lock()).expect("symlink");
+
+        let err = SharedLock::probe(&dir).expect_err("a link is not a lock file");
+        assert!(
+            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
+            "got {err}"
+        );
+        assert_eq!(
+            std::fs::read(home.child(".bashrc")).expect("read"),
+            b"the user wrote this\n"
+        );
+        assert_eq!(mode_of(&home.child(".bashrc")), before);
+
+        std::fs::remove_file(dir.lock()).expect("unlink the link");
+        std::os::unix::fs::symlink(home.child("elsewhere"), dir.lock()).expect("dangling");
+        let err = SharedLock::probe(&dir).expect_err("a dangling link is not a lock file");
+        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
+        assert!(!home.child("elsewhere").exists());
+        assert_eq!(lmode_of(&dir.lock()), 0o777);
+    }
+
+    #[test]
+    fn a_probe_refuses_a_directory_at_the_lock_path() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        std::fs::create_dir_all(dir.lock()).expect("occupy");
+        std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o755))
+            .expect("widen");
+
+        let err = SharedLock::probe(&dir).expect_err("a directory is not a lock file");
+        assert!(
+            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
+            "got {err}"
+        );
+        assert_eq!(mode_of(&dir.lock()), 0o755);
+    }
+
+    #[test]
+    fn a_probe_refuses_a_lock_file_with_a_second_link() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        std::fs::create_dir_all(dir.root()).expect("the state directory");
+        home.write(".profile", "the user wrote this too\n");
+        std::fs::hard_link(home.child(".profile"), dir.lock()).expect("hard link");
+
+        let err = SharedLock::probe(&dir).expect_err("a second link is not bx's file");
+        assert!(
+            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
+            "got {err}"
+        );
+        assert_eq!(
+            std::fs::read(home.child(".profile")).expect("read"),
+            b"the user wrote this too\n"
+        );
+    }
+
+    #[test]
+    fn a_probe_refuses_a_fifo_at_the_lock_path_without_waiting_for_a_writer() {
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        std::fs::create_dir_all(dir.root()).expect("the state directory");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.lock(),
+            FileType::Fifo,
+            RawMode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("mkfifo");
+
+        // Probed on a thread, so an open that waits for a writer to open the
+        // FIFO fails this test instead of hanging the suite until it is
+        // killed. Such a thread is left blocked; the process ends it.
+        let (sent, answer) = std::sync::mpsc::channel();
+        let probed = dir.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(SharedLock::probe(&probed));
+        });
+        let err = answer
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the probe blocked opening a FIFO")
+            .expect_err("a fifo is not a lock file");
+        assert!(
+            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_probe_reports_a_lock_file_it_cannot_open() {
+        if rustix::process::geteuid().is_root() {
+            // `0000` denies nothing to root, so the condition cannot be staged.
+            return;
+        }
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        std::fs::create_dir_all(dir.root()).expect("the state directory");
+        std::fs::write(dir.lock(), b"").expect("seed");
+        std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+
+        let err = SharedLock::probe(&dir).expect_err("must fail");
+        assert!(
+            matches!(&err, Error::Lock { path, source }
+                if *path == dir.lock()
+                    && source.raw_os_error() == Some(Errno::ACCESS.raw_os_error())),
+            "got {err}"
+        );
+        assert_eq!(mode_of(&dir.lock()), 0o000);
     }
 
     #[test]

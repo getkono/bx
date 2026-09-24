@@ -25,19 +25,33 @@
 //!
 //! # Who recovers, and who only reports
 //!
-//! A **writing** command — `apply`, `sync`, `init`, `add`, `rm` — calls
-//! [`lock_for_writing`] first, which recovers under the state directory's lock,
-//! refuses to go on if it cannot, and hands that same lock to the session it is
-//! about to open, so no second bx can win the directory in between. Nothing in
-//! the type system makes a writing command use it rather than [`recover`]
-//! followed by a fresh [`journal::Session::open`]; what makes it the obvious
-//! one is that `lock_for_writing` is the only call that produces the guard
-//! [`journal::Session::open_locked`] consumes, and the only one that turns a
-//! blocked recovery into a refusal. A
-//! **read-only** command — `plan`, `status`, `doctor` — calls [`pending`],
-//! reports every named target as [`Action::Conflict`], exits
-//! [`Exit::Pending`](crate::report::Exit::Pending), and writes nothing. That is
-//! what keeps `plan` usable from CI, a prompt segment or a login banner.
+//! A **writing** command that recovers and then writes in the same run — `rm`
+//! today — calls [`lock_for_writing`] first, which recovers under the state
+//! directory's lock, refuses to go on if it cannot, and hands that same lock to
+//! the session it is about to open, so no second bx can win the directory in
+//! between. Nothing in the type system makes such a command use it rather than
+//! [`recover`] followed by a fresh [`journal::Session::open`]; what makes it the
+//! obvious one is that `lock_for_writing` is the only call that produces the
+//! guard [`journal::Session::open_locked`] consumes, and the only one that
+//! turns a blocked recovery into a refusal.
+//!
+//! `apply` is the exception, because recovery is itself work `plan` must
+//! announce (Invariant 7). It reads the interruption with [`pending`], refuses
+//! before rolling anything back when a write cannot be accounted for, shows the
+//! rows recovery would make for approval, and once approved calls [`recover`] —
+//! turning an [`Outcome::Blocked`] it returns into [`Error::Blocked`] itself —
+//! and stops without opening a session. The next run decides the configured
+//! targets against the disk recovery left.
+//!
+//! A **read-only** command — `plan`, `status`, `doctor` — calls [`pending`] and
+//! writes nothing. It reports each write the session named as the row recovery
+//! would make of it: a write to roll back as an [`Action::Modify`] with its
+//! diff, one already holding what was there before as [`Action::Unchanged`]
+//! (or a modify naming the directories recovery removes where empty), every
+//! write of a session that finished as [`Action::Unchanged`], and a write
+//! recovery cannot account for as an [`Action::Conflict`] naming [`abandon`].
+//! It exits [`Exit::Pending`] whatever the rows are. That is what keeps `plan` usable from CI, a prompt segment or a login
+//! banner.
 //!
 //! # Why recovery is not itself journalled
 //!
@@ -359,9 +373,15 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
         }
         None => None,
     };
+    // What this returns is what `plan` prints, so a note names a path the way
+    // plan output does, against the home the session wrote against. A journal
+    // with no header has no write to name.
+    let spelling = loaded
+        .begin()
+        .map_or(Spelling::Absolute, |begin| Spelling::Portable(&begin.home));
     let mut unfinished = Vec::new();
     for (intent, landed) in loaded.landed() {
-        unfinished.push(decide(state, intent, home, ledger.as_ref(), landed)?.1);
+        unfinished.push(decide(state, intent, home, ledger.as_ref(), landed, spelling)?.1);
     }
     Ok(Some(Interrupted {
         kind,
@@ -523,7 +543,14 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         intents.reverse();
     }
     for (intent, landed) in intents {
-        let (step, report) = decide(state, intent, home, ledger.as_deref(), landed)?;
+        let (step, report) = decide(
+            state,
+            intent,
+            home,
+            ledger.as_deref(),
+            landed,
+            Spelling::Absolute,
+        )?;
         // A temporary file the journal names is this write's, and goes once
         // recovery is acting on the write at all: a blocked write is not
         // recovery's to touch, its temporary file included. The loader has
@@ -714,7 +741,10 @@ enum Step {
 /// with paths made portable against it, and `None` for an unterminated one,
 /// which is rolled back. `ledger` is the ledger a rebuild would record into —
 /// the saved one, for a report — and is only read for a terminated journal.
-/// `landed` is whether a `Done` follows the intent.
+/// `landed` is whether a `Done` follows the intent. `spelling` is how a note
+/// names a path: [`pending`] builds the rows `plan` prints, which spell paths
+/// under the home portably, and [`resolve`] builds recovery's own report,
+/// which keeps them absolute. The verdict never depends on it.
 ///
 /// # A rebuild over a ledger that was already saved
 ///
@@ -741,6 +771,7 @@ fn decide(
     home: Option<&Path>,
     ledger: Option<&LedgerView>,
     landed: bool,
+    spelling: Spelling<'_>,
 ) -> Result<(Step, Unfinished), Error> {
     let (found, observed) = look(&intent.dest)?;
     let standing = standing(intent, &found);
@@ -768,17 +799,19 @@ fn decide(
             (Standing::Written, Prior::Absent) => {
                 (Step::Unlink { observed }, report(true, rolls_back()))
             }
-            (Standing::Written, Prior::Existed(reference)) => match snapshot(state, reference)? {
-                Ok(bytes) => (
-                    Step::Rewrite {
-                        bytes,
-                        mode: reference.mode,
-                        observed,
-                    },
-                    report(true, rolls_back()),
-                ),
-                Err(why) => (Step::Blocked, report(false, why)),
-            },
+            (Standing::Written, Prior::Existed(reference)) => {
+                match snapshot(state, reference, spelling)? {
+                    Ok(bytes) => (
+                        Step::Rewrite {
+                            bytes,
+                            mode: reference.mode,
+                            observed,
+                        },
+                        report(true, rolls_back()),
+                    ),
+                    Err(why) => (Step::Blocked, report(false, why)),
+                }
+            }
             (Standing::Vanished | Standing::Diverged | Standing::Foreign, _) => {
                 (Step::Blocked, report(false, note(intent, standing)))
             }
@@ -843,7 +876,7 @@ fn decide(
     }
     let prior = match &intent.before {
         Prior::Absent => PriorBytes::Absent,
-        Prior::Existed(reference) => match snapshot(state, reference)? {
+        Prior::Existed(reference) => match snapshot(state, reference, spelling)? {
             Ok(bytes) => PriorBytes::Bytes {
                 bytes,
                 mode: reference.mode,
@@ -871,6 +904,25 @@ fn decide(
         return Ok((Step::Blocked, report(false, conflict.to_string())));
     }
     Ok((Step::Record(entry), report(true, recorded())))
+}
+
+/// How a note [`decide`] builds spells a path it names.
+#[derive(Debug, Clone, Copy)]
+enum Spelling<'a> {
+    /// As it is. Recovery's own report, which its error and its log print.
+    Absolute,
+    /// `~/…` under this home and absolute outside it, as `plan` prints a row.
+    Portable(&'a Path),
+}
+
+impl Spelling<'_> {
+    /// `path`, spelled this way.
+    fn path(self, path: PathBuf) -> PathBuf {
+        match self {
+            Self::Absolute => path,
+            Self::Portable(home) => PathBuf::from(crate::paths::to_portable(&path, home)),
+        }
+    }
 }
 
 /// The name of the temporary file `intent` names, when it is still there and
@@ -914,17 +966,31 @@ fn empty_claims(dirs: &[PathBuf], home: &Path) -> Vec<String> {
 /// The bytes a [`RestoreRef`] names, digest-verified, or why they cannot be had.
 ///
 /// A missing or corrupt snapshot is a verdict — recovery will not guess at the
-/// bytes a write displaced — and any other failure is an error.
-fn snapshot(state: &StateDir, reference: &RestoreRef) -> Result<Result<Vec<u8>, String>, Error> {
+/// bytes a write displaced — and any other failure is an error. The verdict's
+/// text names the snapshot's path as `spelling` spells it, rebuilt from the
+/// error's own path rather than from its text.
+fn snapshot(
+    state: &StateDir,
+    reference: &RestoreRef,
+    spelling: Spelling<'_>,
+) -> Result<Result<Vec<u8>, String>, Error> {
+    use crate::state::Error::{RestoreCorrupt, RestoreMissing};
+
     // `restore_bytes` reads the content-addressed blob and consults no entry, so
     // an empty view reads it exactly as the ledger would, and a read-only report
     // needs no lock to do it.
     match LedgerView::default().restore_bytes(state, reference) {
         Ok(bytes) => Ok(Ok(bytes)),
-        Err(
-            e @ (crate::state::Error::RestoreMissing { .. }
-            | crate::state::Error::RestoreCorrupt { .. }),
-        ) => Ok(Err(e.to_string())),
+        Err(RestoreMissing { digest, path }) => Ok(Err(RestoreMissing {
+            digest,
+            path: spelling.path(path),
+        }
+        .to_string())),
+        Err(RestoreCorrupt { digest, path }) => Ok(Err(RestoreCorrupt {
+            digest,
+            path: spelling.path(path),
+        }
+        .to_string())),
         Err(e) => Err(e.into()),
     }
 }
@@ -4551,7 +4617,14 @@ mod tests {
         let mut intent = intent_for(home.path(), ".config/app/a.toml");
         intent.created_dirs = vec![home.path().join(std::ffi::OsStr::from_bytes(b"\xff"))];
 
-        let err = match decide(&state, &intent, Some(home.path()), None, true) {
+        let err = match decide(
+            &state,
+            &intent,
+            Some(home.path()),
+            None,
+            true,
+            Spelling::Absolute,
+        ) {
             Err(err) => err,
             Ok((_, report)) => panic!("rebuilt: {report:?}"),
         };

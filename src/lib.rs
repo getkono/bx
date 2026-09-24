@@ -43,6 +43,12 @@
 //! bytes bx displaced to put a file back exactly as it was — or to remove one
 //! bx created, which is not the same as emptying it.
 //!
+//! [`plan`] is where those pieces meet and Invariant 7 is kept: one traversal
+//! that decides every resolved target against the ledger and the one
+//! comparison, and a diff of each decision, shared by `bx plan`, `bx apply`
+//! and the status view. [`command`] holds those three commands' bodies, so the
+//! binary only parses its arguments and dispatches.
+//!
 //! # How one repo serves many accounts
 //!
 //! A developer with several Linux accounts has several *differences*, not
@@ -69,12 +75,14 @@
 //! crate runs behind. It is compiled unconditionally, and hidden from the docs,
 //! so an integration test can reach it too.
 
+pub mod command;
 pub mod config;
 pub mod detect;
 pub mod env_guard;
 pub mod fs;
 pub mod journal;
 pub mod paths;
+pub mod plan;
 pub mod recover;
 pub mod report;
 pub mod restore;

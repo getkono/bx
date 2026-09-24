@@ -218,11 +218,21 @@ fn inside_on_disk(dir: &Path, repo: &Path) -> Result<bool, Error> {
         }
         _ => None,
     };
+    // Each later step opens `..` relative to the directory the last one
+    // opened, never the growing spelling `at/../..`: that spelling passes
+    // `PATH_MAX` beneath a deep state directory, and the kernel refuses it
+    // with `ENAMETOOLONG` long before the walk reaches `/`. `at` is kept only
+    // to name the step in an error.
     let mut at = lexical_parent.map_or_else(|| existing.join(".."), Path::to_path_buf);
+    let Some(mut handle) = open_step(rustix::fs::CWD, &at, &at)? else {
+        return Ok(false);
+    };
     loop {
-        let Some(id) = identity(&at)? else {
-            return Ok(false);
-        };
+        let stat = rustix::fs::fstat(&handle).map_err(|source| Error::Io {
+            path: at.clone(),
+            source: source.into(),
+        })?;
+        let id = (stat.st_dev, stat.st_ino);
         if id == repo_id {
             return Ok(true);
         }
@@ -232,6 +242,35 @@ fn inside_on_disk(dir: &Path, repo: &Path) -> Result<bool, Error> {
         }
         previous = id;
         at.push("..");
+        let Some(parent) = open_step(&handle, Path::new(".."), &at)? else {
+            return Ok(false);
+        };
+        handle = parent;
+    }
+}
+
+/// An `O_PATH` handle on `name`, resolved against `dir`, or `None` where
+/// nothing is there to hold ([`identity`]'s `NotFound` and `NotADirectory`).
+/// `spelled` names the step in an error.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming `spelled` when it cannot be opened.
+fn open_step(
+    dir: impl rustix::fd::AsFd,
+    name: &Path,
+    spelled: &Path,
+) -> Result<Option<rustix::fd::OwnedFd>, Error> {
+    use rustix::fs::{Mode, OFlags};
+    use rustix::io::Errno;
+
+    match rustix::fs::openat(dir, name, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) {
+        Ok(handle) => Ok(Some(handle)),
+        Err(Errno::NOENT | Errno::NOTDIR) => Ok(None),
+        Err(source) => Err(Error::Io {
+            path: spelled.to_path_buf(),
+            source: source.into(),
+        }),
     }
 }
 
@@ -673,6 +712,33 @@ mod tests {
             inside_on_disk(&home.child("missing/../.config/bx/sub"), &repo).unwrap(),
             "a cancelled missing component resumes the search from where it began"
         );
+    }
+
+    /// The walk up from a state directory near `PATH_MAX` reaches `/` and the
+    /// repo alike. Spelled `dir/../..`, each step lengthens the path until the
+    /// kernel refuses it with `ENAMETOOLONG`; each step is opened relative to
+    /// the last instead, so the depth costs nothing.
+    #[test]
+    fn a_state_directory_near_path_max_is_walked_to_the_root() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        std::fs::create_dir_all(&repo).expect("the repo");
+        let deep = |base: PathBuf| {
+            let mut path = base.into_os_string();
+            while 4080 - path.len() > 256 {
+                path.push(format!("/{}", "d".repeat(200)));
+            }
+            path.push(format!("/{}", "b".repeat(4080 - path.len() - 1)));
+            let path = PathBuf::from(path);
+            assert_eq!(path.as_os_str().len(), 4080);
+            std::fs::create_dir_all(&path).expect("the deep directory");
+            path
+        };
+
+        let beneath = deep(repo.join("s"));
+        assert!(inside_on_disk(&beneath, &repo).expect("walked, not ENAMETOOLONG"));
+        let outside = deep(home.child("s"));
+        assert!(!inside_on_disk(&outside, &repo).expect("walked, not ENAMETOOLONG"));
     }
 
     /// Guards against over-reach on disk: a state directory that is a symlink to

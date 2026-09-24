@@ -43,7 +43,12 @@ wrong even if it passes CI.
    environment fragment, and `env_guard`'s
    `the_init_snippet_is_not_an_environment_fragment` holds its bytes to the
    rule. Nothing holds a *second* such file to it, so the change that generates
-   one carries the proof of its own bytes with it. Declare no root and nothing
+   one carries the proof of its own bytes with it. Cached tool activation
+   output is the second admitted non-fragment file, and the one exception to
+   the no-assignment rule: it is searched by name for every relocating
+   variable, and each such assignment is judged by `env_guard`, so a tool's
+   own variables that relocate nothing pass and an output with any refused
+   assignment is not written. Declare no root and nothing
    moves: no location, no list of locations and no anchor is permitted at all.
    A program, a search list and a socket say what a tool runs, where it looks
    and what it connects to rather than where its files live, so they move

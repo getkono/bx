@@ -330,7 +330,10 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
 
     let branch = git
         .query(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map_err(|_| Error::Detached(repo.clone()))?;
+        .map_err(|error| match error {
+            Error::Spawn { .. } => error,
+            _ => Error::Detached(repo.clone()),
+        })?;
     let upstream = upstream(git, &repo, &branch)?;
 
     git.remote(&repo, &["fetch", "--quiet", &upstream.remote])?;
@@ -399,13 +402,18 @@ fn refuse_state_in_repo(repo: &Path, state: &Path) -> Result<(), Error> {
 
 /// Refuse a config repo that is not the top of a git working tree: none at
 /// all, or a directory inside some other repository, whose history `sync`
-/// must not pull into or push from.
+/// must not pull into or push from. A `git` that cannot be started at all is
+/// [`Error::Spawn`], not a missing repository: `git init` would not help.
 fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
-    let Ok(top) = git.query(repo, &["rev-parse", "--show-toplevel"]) else {
-        return Err(Error::NotARepo {
-            repo: repo.to_path_buf(),
-            toplevel: None,
-        });
+    let top = match git.query(repo, &["rev-parse", "--show-toplevel"]) {
+        Ok(top) => top,
+        Err(error @ Error::Spawn { .. }) => return Err(error),
+        Err(_) => {
+            return Err(Error::NotARepo {
+                repo: repo.to_path_buf(),
+                toplevel: None,
+            });
+        }
     };
     let top = PathBuf::from(top);
     // Git names the top with symlinks resolved, so the repo is too.
@@ -994,6 +1002,20 @@ pub(crate) mod tests {
             .expect_err("no such program");
         assert!(matches!(error, Error::Spawn { .. }), "{error:?}");
         assert!(error.to_string().contains("needs git on PATH"), "{error}");
+    }
+
+    #[test]
+    fn a_pull_without_git_on_path_is_a_spawn_error_not_a_missing_repository() {
+        let home = guarded_home();
+        cloned(&home, "");
+        let mut git = git(home.path());
+        git.program = OsString::from("/nonexistent/git");
+
+        let error = pull(&env(home.path()), &git).expect_err("no git");
+
+        assert!(matches!(error, Error::Spawn { .. }), "{error:?}");
+        assert!(error.to_string().contains("needs git on PATH"), "{error}");
+        assert!(!error.to_string().contains("git init"), "{error}");
     }
 
     #[test]

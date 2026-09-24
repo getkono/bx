@@ -47,7 +47,10 @@
 //! that decides every resolved target against the ledger and the one
 //! comparison, and a diff of each decision, shared by `bx plan`, `bx apply`
 //! and the status view. [`adopt`] is `bx add` and `bx rm`: existing config
-//! taken into the repo byte for byte, and handed back exactly. [`command`]
+//! taken into the repo byte for byte, and handed back exactly. [`init`] is
+//! `bx init`'s setup before it plans: the repo created when there is none,
+//! this account's unset values asked for and saved to `local.toml`, and the
+//! config already on the machine offered to `bx add`. [`command`]
 //! holds the commands' bodies, `bx doctor`'s among them, so the binary only
 //! parses its arguments and dispatches.
 //!
@@ -88,6 +91,7 @@ pub mod detect;
 pub mod doctor;
 pub mod env_guard;
 pub mod fs;
+pub mod init;
 pub mod journal;
 pub mod paths;
 pub mod plan;

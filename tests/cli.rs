@@ -1,4 +1,5 @@
-//! The binary's surface for `bx`, `bx plan`, `bx apply`, `bx add` and `bx rm`:
+//! The binary's surface for `bx`, `bx init`, `bx plan`, `bx apply`, `bx add`
+//! and `bx rm`:
 //! exit codes, what reaches standard output, and what is written.
 //!
 //! Every invocation gets its home per command, from a guarded tempdir; nothing
@@ -614,6 +615,145 @@ fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
     let unnamed = bx(home.path(), &["add"]);
     assert_eq!(unnamed.status.code(), Some(1));
     assert!(stderr(&unnamed).contains("name the file or directory to add"));
+}
+
+#[test]
+fn init_on_a_fresh_machine_creates_the_repo_and_a_second_init_writes_nothing() {
+    let home = guarded_home();
+    home.write(".zshrc", "z\n");
+
+    let first = bx(home.path(), &["init", "--yes"]);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    assert!(
+        stdout(&first).starts_with("Created the config repo ~/.config/bx with bx.toml.\n"),
+        "{}",
+        stdout(&first)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.child(".config/bx/bx.toml")).expect("bx.toml"),
+        bx::init::HEADER
+    );
+    assert!(
+        !home.child(".config/bx/files").exists(),
+        "a non-interactive init adopts nothing"
+    );
+
+    let before = snapshot(home.path());
+    for args in [&["init", "--yes"][..], &["init"]] {
+        let again = bx(home.path(), args);
+        assert_eq!(again.status.code(), Some(0), "{args:?}: {}", stderr(&again));
+        assert_eq!(
+            stdout(&again),
+            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
+        );
+        assert_eq!(snapshot(home.path()), before, "{args:?} wrote");
+    }
+    let planned = bx(home.path(), &["plan"]);
+    assert_eq!(planned.status.code(), Some(0), "{}", stdout(&planned));
+}
+
+#[test]
+fn init_without_a_terminal_names_each_unset_value_and_its_flag_and_writes_nothing() {
+    let home = guarded_home();
+    seed(
+        home.path(),
+        "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n\n\
+         [[value]]\nname = \"mail\"\nkind = \"email\"\nrequired = true\n\n\
+         [[target]]\npath = \"~/.greeting\"\ncontent = \"hi {{who}} at {{mail}}\\n\"\n",
+    );
+    let before = snapshot(home.path());
+
+    for args in [
+        &["init"][..],
+        &["init", "--yes"],
+        &["init", "--yes", "--set", "who=x"],
+    ] {
+        let output = bx(home.path(), args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let said = stderr(&output);
+        assert!(
+            said.contains("bx init --set mail=VALUE"),
+            "{args:?}: {said}"
+        );
+        assert!(said.contains("nothing was written"), "{args:?}: {said}");
+        assert_eq!(snapshot(home.path()), before, "{args:?} wrote");
+    }
+
+    let bad = bx(home.path(), &["init", "--yes", "--set", "mail=nope"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(stderr(&bad).contains("--set mail"), "{}", stderr(&bad));
+    assert_eq!(snapshot(home.path()), before);
+
+    let answered = bx(
+        home.path(),
+        &[
+            "init",
+            "--yes",
+            "--set",
+            "mail=a@b.invalid",
+            "--set",
+            "who=there",
+        ],
+    );
+    assert_eq!(answered.status.code(), Some(0), "{}", stderr(&answered));
+    assert!(
+        stdout(&answered)
+            .starts_with("Saved this account's answers to ~/.local/state/bx/local.toml.\n"),
+        "{}",
+        stdout(&answered)
+    );
+    assert_eq!(
+        std::fs::read(home.child(".greeting")).expect("applied"),
+        b"hi there at a@b.invalid\n"
+    );
+    let local = home.child(".local/state/bx/local.toml");
+    assert!(
+        std::fs::read_to_string(&local)
+            .expect("local.toml")
+            .ends_with("[values]\nwho = \"there\"\nmail = \"a@b.invalid\"\n"),
+        "answers are written in declaration order"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&local)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600);
+    }
+    assert!(
+        !std::fs::read_to_string(home.child(".config/bx/bx.toml"))
+            .expect("bx.toml")
+            .contains("there"),
+        "no answer reaches the repo"
+    );
+
+    let converged = snapshot(home.path());
+    let again = bx(home.path(), &["init"]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    assert_eq!(snapshot(home.path()), converged, "a second init wrote");
+}
+
+#[test]
+fn init_with_pending_work_and_no_yes_or_terminal_refuses_as_apply_does() {
+    let home = guarded_home();
+    seed(home.path(), A_TARGET);
+
+    let output = bx(home.path(), &["init"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stdout(&output).starts_with("  + ~/.a"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("rerun with --yes"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!home.child(".a").exists());
 }
 
 #[test]

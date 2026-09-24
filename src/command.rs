@@ -1,9 +1,10 @@
-//! The bodies of `bx`, `bx plan`, `bx apply`, `bx doctor`, `bx add`, `bx rm`
-//! and `bx secret list`.
+//! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx doctor`,
+//! `bx add`, `bx rm` and `bx secret list`.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
-//! or, for `doctor`, the read-only checks in [`crate::doctor`], and for `add`
-//! and `rm`, [`crate::adopt`] — writes the rendering to the output it is
+//! or, for `doctor`, the read-only checks in [`crate::doctor`], for `add` and
+//! `rm`, [`crate::adopt`], and for `init`, [`crate::init`] before the
+//! traversal — writes the rendering to the output it is
 //! handed, and returns the exit status. `main` does nothing but call one of
 //! them.
 
@@ -14,6 +15,7 @@ use crate::adopt::{self, Adoption, Removal};
 use crate::config::resolve::Resolution;
 use crate::config::target::Body;
 use crate::doctor::{self, Probes, systemd};
+use crate::init;
 use crate::paths;
 use crate::plan::{self, Env, Error, Inputs, Mode, Palette, Report, View};
 use crate::report::Exit;
@@ -135,6 +137,64 @@ fn apply_with(
         writeln!(out, "Nothing was written.").map_err(Error::Output)?;
     }
     Ok(plan::exit(&report, Mode::Apply))
+}
+
+/// `bx init`: create the repo when there is none, answer this account's unset
+/// values, offer the config already on the machine, then plan and apply
+/// exactly as `bx apply` does.
+///
+/// Questions are asked only when standard input is a terminal and `yes` is
+/// not given; see [`init::prepare`]. The plan and its approval are
+/// [`apply`]'s, so `yes` is the same approval, and without it or a terminal
+/// nothing pending is written.
+///
+/// # Errors
+///
+/// Whatever [`init::prepare`] returns, then as [`apply`].
+pub fn init(
+    env: &Env,
+    sets: &[String],
+    yes: bool,
+    out: &mut dyn Write,
+) -> Result<Exit, init::Error> {
+    init_with(env, sets, yes, out, &mut init::Terminal, &mut confirm)
+}
+
+/// [`init`], with its questions asked through `ask` and `confirm`.
+fn init_with(
+    env: &Env,
+    sets: &[String],
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn init::Ask,
+    confirm: &mut dyn FnMut() -> Result<bool, Error>,
+) -> Result<Exit, init::Error> {
+    let prepared = init::prepare(env, sets, env.stdin_tty && !yes, ask)?;
+    let mut text = String::new();
+    if let Some(repo) = &prepared.created {
+        text.push_str(&format!(
+            "Created the config repo {} with bx.toml.\n",
+            paths::to_portable(repo, &env.home)
+        ));
+    }
+    if let Some(local) = &prepared.saved {
+        text.push_str(&format!(
+            "Saved this account's answers to {}.\n",
+            paths::to_portable(local, &env.home)
+        ));
+    }
+    for row in &prepared.adopted {
+        text.push_str(&adoption_row(row));
+    }
+    if prepared.adoption_deferred {
+        text.push_str(
+            "Offered nothing to adopt: an interrupted session must be recovered first, \
+             as the plan shows. Run `bx init` again once it is.\n",
+        );
+    }
+    out.write_all(text.as_bytes())
+        .map_err(init::Error::Output)?;
+    Ok(apply_with(env, yes, out, confirm)?)
 }
 
 /// What an `apply` that recovered an interrupted session, and did nothing else,
@@ -617,6 +677,181 @@ mod tests {
 
         assert!(matches!(error, Error::NeedsConfirmation), "{error:?}");
         assert!(!home.child(".a").exists());
+    }
+
+    #[test]
+    fn init_on_a_fresh_machine_creates_the_repo_applies_and_converges_on_a_second_run() {
+        use crate::init::tests::Silent;
+
+        let home = guarded_home();
+        let mut out = Vec::new();
+        let exit = init_with(
+            &env(home.path()),
+            &[],
+            false,
+            &mut out,
+            &mut Silent,
+            &mut never,
+        )
+        .expect("init");
+        assert_eq!(exit, Exit::Converged);
+        assert_eq!(
+            text(&out),
+            "Created the config repo ~/.config/bx with bx.toml.\n\
+             Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
+        );
+
+        let mut out = Vec::new();
+        let exit = init_with(
+            &env(home.path()),
+            &[],
+            false,
+            &mut out,
+            &mut Silent,
+            &mut never,
+        )
+        .expect("init");
+        assert_eq!(exit, Exit::Converged);
+        assert_eq!(
+            text(&out),
+            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
+        );
+    }
+
+    #[test]
+    fn init_answers_adopts_then_applies_with_apply_s_approval_rule() {
+        use crate::init::tests::Script;
+
+        let home = guarded_home();
+        seed(
+            home.path(),
+            &format!(
+                "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n\n{}",
+                inline("~/.greeting", "hi {{who}}\\n")
+            ),
+        );
+        home.write(".zshrc", "z\n");
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut script = Script {
+            answers: vec!["there"],
+            pick: vec!["~/.zshrc"],
+            ..Script::default()
+        };
+
+        let mut out = Vec::new();
+        let mut asked = 0;
+        let exit = init_with(&tty, &[], false, &mut out, &mut script, &mut || {
+            asked += 1;
+            Ok(true)
+        })
+        .expect("init");
+
+        assert_eq!(exit, Exit::Converged);
+        assert_eq!(asked, 1, "the plan was confirmed once, as bx apply asks");
+        assert!(
+            text(&out).starts_with(
+                "Saved this account's answers to ~/.local/state/bx/local.toml.\n  + ~/.zshrc  \
+                 (copied to files/.zshrc)\n  + ~/.greeting"
+            ),
+            "{}",
+            text(&out)
+        );
+        assert!(
+            text(&out).ends_with("Applied 1 change(s).\n"),
+            "{}",
+            text(&out)
+        );
+        assert_eq!(
+            std::fs::read(home.child(".greeting")).expect("applied"),
+            b"hi there\n"
+        );
+
+        let exit = init_with(
+            &tty,
+            &[],
+            false,
+            &mut Vec::new(),
+            &mut Script::default(),
+            &mut || panic!("nothing to confirm"),
+        )
+        .expect("init");
+        assert_eq!(exit, Exit::Converged);
+    }
+
+    #[test]
+    fn init_says_it_left_adoption_for_later_while_a_session_is_interrupted() {
+        use crate::init::tests::Silent;
+        use crate::journal::{Session, SessionKind};
+
+        let home = guarded_home();
+        seed(home.path(), "");
+        home.write(".zshrc", "z\n");
+        let state = crate::state::StateDir::resolve(home.path());
+        drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+
+        let mut out = Vec::new();
+        init_with(&tty, &[], false, &mut out, &mut Silent, &mut || Ok(true)).expect("init");
+
+        assert!(
+            text(&out).starts_with(
+                "Offered nothing to adopt: an interrupted session must be recovered first, \
+                 as the plan shows. Run `bx init` again once it is.\n"
+            ),
+            "{}",
+            text(&out)
+        );
+    }
+
+    #[test]
+    fn init_without_yes_or_a_terminal_shows_the_plan_and_writes_nothing_pending() {
+        use crate::init::tests::Silent;
+
+        let home = guarded_home();
+        seed(home.path(), &inline("~/.a", "a\\n"));
+
+        let error = init_with(
+            &env(home.path()),
+            &[],
+            false,
+            &mut Vec::new(),
+            &mut Silent,
+            &mut never,
+        )
+        .expect_err("no confirmation");
+        assert!(
+            matches!(error, init::Error::Plan(Error::NeedsConfirmation)),
+            "{error:?}"
+        );
+        assert!(!home.child(".a").exists());
+
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let exit = init_with(&tty, &[], true, &mut Vec::new(), &mut Silent, &mut never)
+            .expect("--yes asks nothing, on a terminal too");
+        assert_eq!(exit, Exit::Converged);
+        assert!(home.child(".a").exists());
+
+        let fresh = guarded_home();
+        assert!(matches!(
+            init_with(
+                &env(fresh.path()),
+                &[],
+                true,
+                &mut Refusing,
+                &mut Silent,
+                &mut never
+            ),
+            Err(init::Error::Output(_))
+        ));
     }
 
     #[test]

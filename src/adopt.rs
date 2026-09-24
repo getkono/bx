@@ -248,6 +248,34 @@ impl Context {
         }
         Declared::No
     }
+
+    /// Every path the configuration declares, whether ready, held back, or
+    /// switched off, each read as [`Context::declared`] reads it.
+    fn declared_paths(&self) -> Vec<Portable> {
+        let values = &self.resolved.values;
+        let mut paths = Vec::new();
+        for resolution in &self.resolved.targets {
+            match resolution {
+                Resolution::Ready(ready) => paths.push(ready.path.clone()),
+                Resolution::Blocked(entry) => paths.extend(resolved_path(&entry.key, values)),
+            }
+        }
+        for layer in &self.layers {
+            let targets = layer.config.targets.iter().map(|t| t.path.as_str());
+            let toggles = layer
+                .config
+                .toggles
+                .iter()
+                .filter(|t| t.section == merge::Section::Target)
+                .map(|t| t.key.as_str());
+            paths.extend(
+                targets
+                    .chain(toggles)
+                    .filter_map(|raw| resolved_path(raw, values)),
+            );
+        }
+        paths
+    }
 }
 
 /// What the configuration says about one path.
@@ -463,13 +491,127 @@ fn visit(
     Ok(())
 }
 
+/// The existing tool config `bx init` offers to adopt, in byte order of the
+/// paths.
+///
+/// Two places are looked in, one level deep each: the home's dotfiles that are
+/// regular files, and every regular file or directory directly inside
+/// `config_home` (`$XDG_CONFIG_HOME`, or `~/.config`). A dot-directory in the
+/// home is not offered: `~/.cache`, `~/.local` and `~/.cargo` hold data and
+/// caches rather than config, and a file inside one is still `bx add`'s to
+/// take by name.
+///
+/// Not offered: a symbolic link or anything else that is not a regular file or
+/// directory; a path that conventionally holds a credential, or a directory
+/// whose whole content does; a shell history or another file a program writes
+/// about its own use, which is state rather than config and often holds a
+/// secret typed at a prompt; bx's own config repo and state directory; and
+/// anything already declared, at the path or beneath it — so a second
+/// `bx init` does not offer what the first one adopted. A `config_home`
+/// outside the home is not looked in: bx manages files beneath the home.
+///
+/// Reads directory listings and `lstat`s only; no file's content is read.
+///
+/// # Errors
+///
+/// [`Error::Read`] when the home or `config_home` cannot be listed, or an
+/// entry in either cannot be examined. Either being absent is nothing to
+/// offer.
+pub fn discover(ctx: &Context, config_home: &Path) -> Result<Vec<Portable>, Error> {
+    let declared = ctx.declared_paths();
+    let mut found = Vec::new();
+    let mut offer = |dest: &Path, meta: &std::fs::Metadata| {
+        let Ok(target) = Portable::from_path(dest, &ctx.home) else {
+            return;
+        };
+        let offered = target.as_str().starts_with("~/")
+            && ctx.bx_own(dest).is_none()
+            && secret(&target).is_none()
+            && !credential_dir(&target)
+            && !declared
+                .iter()
+                .any(|path| beneath(path, &target) || beneath(&target, path));
+        if offered && matches!(Kind::from(meta.file_type()), Kind::File | Kind::Dir) {
+            found.push(target);
+        }
+    };
+    for (name, dest, meta) in listing(&ctx.home)? {
+        let name = name.to_string_lossy();
+        if name.starts_with('.') && meta.is_file() && !machine_written(&name) {
+            offer(&dest, &meta);
+        }
+    }
+    if paths::normalize(config_home).starts_with(paths::normalize(&ctx.home)) {
+        for (_, dest, meta) in listing(config_home)? {
+            offer(&dest, &meta);
+        }
+    }
+    found.sort_by(|a, b| a.as_str().as_bytes().cmp(b.as_str().as_bytes()));
+    found.dedup();
+    Ok(found)
+}
+
+/// Every entry of `dir`, with its `lstat`; nothing when `dir` is absent.
+fn listing(dir: &Path) -> Result<Vec<(std::ffi::OsString, PathBuf, std::fs::Metadata)>, Error> {
+    let read = |source| Error::Read {
+        path: dir.to_path_buf(),
+        source,
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(read(source)),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let name = entry.map_err(read)?.file_name();
+        let dest = dir.join(&name);
+        let meta = std::fs::symlink_metadata(&dest).map_err(|source| Error::Read {
+            path: dest.clone(),
+            source,
+        })?;
+        out.push((name, dest, meta));
+    }
+    Ok(out)
+}
+
+/// Whether a home dotfile named `name` is one a program writes about its own
+/// use — a history, a cache of hosts it has seen, an X authority cookie —
+/// rather than config a person wrote.
+fn machine_written(name: &str) -> bool {
+    name.contains("history")
+        || name.starts_with(".zcompdump")
+        || [
+            ".lesshst",
+            ".viminfo",
+            ".wget-hsts",
+            ".Xauthority",
+            ".ICEauthority",
+            ".xsession-errors",
+            ".sudo_as_admin_successful",
+        ]
+        .contains(&name)
+}
+
+/// Whether `target` is a directory [`secret`] refuses every file beneath.
+fn credential_dir(target: &Portable) -> bool {
+    target
+        .as_str()
+        .strip_prefix("~/")
+        .is_some_and(|rel| secret_rel(&format!("{rel}/x")).is_some())
+}
+
 /// Why a path must not be copied into the repo in cleartext, when it is one of
 /// the files that conventionally hold a credential.
 ///
 /// Conservative, and deliberately a list rather than a scan of the content:
 /// which files hold secrets in general is the commit guard's to decide.
 fn secret(target: &Portable) -> Option<String> {
-    let rel = target.as_str().strip_prefix("~/")?;
+    secret_rel(target.as_str().strip_prefix("~/")?)
+}
+
+/// [`secret`], for a path relative to the home.
+fn secret_rel(rel: &str) -> Option<String> {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     let listed = [
         ".netrc",
@@ -1459,6 +1601,75 @@ mod tests {
         );
         assert_eq!(layer(&home), on, "not declared a second time");
         assert_eq!(std::fs::read_to_string(&local).expect("local.toml"), toggle);
+    }
+
+    #[test]
+    fn discovery_leaves_out_what_a_blocked_target_or_a_switched_off_toggle_declares() {
+        let values = "[[value]]\nname = \"who\"\nkind = \"string\"\n";
+        let home = repo(&format!(
+            "{values}\n{}\n{}",
+            inline("~/.blocked", "{{who}}\\n"),
+            inline("~/.toggled", "t\\n"),
+        ));
+        let local = StateDir::resolve(home.path()).local_toml();
+        std::fs::create_dir_all(local.parent().expect("parent")).expect("state dir");
+        std::fs::write(
+            &local,
+            "[[target]]\npath = \"~/.toggled\"\nenabled = false\n",
+        )
+        .expect("local.toml");
+        for rel in [".blocked", ".toggled", ".free"] {
+            plant(&home, rel, b"x\n", 0o644);
+        }
+
+        let ctx = context(&home);
+        assert!(
+            ctx.resolved
+                .targets
+                .iter()
+                .any(|r| matches!(r, Resolution::Blocked(entry) if entry.key == "~/.blocked")),
+            "the fixture holds a blocked target"
+        );
+        assert!(
+            ctx.layers
+                .iter()
+                .any(|layer| { layer.config.toggles.iter().any(|t| t.key == "~/.toggled") }),
+            "and a switched-off toggle"
+        );
+        assert_eq!(
+            discover(&ctx, &home.child(".config")).expect("discover"),
+            [target(&home, ".free")]
+        );
+    }
+
+    #[test]
+    fn discovery_leaves_out_what_programs_write_about_their_own_use() {
+        let home = repo("");
+        let written = [
+            ".zcompdump",
+            ".zcompdump-host-5.9",
+            ".lesshst",
+            ".viminfo",
+            ".wget-hsts",
+            ".Xauthority",
+            ".ICEauthority",
+            ".xsession-errors",
+            ".sudo_as_admin_successful",
+            ".python_history",
+        ];
+        for name in written {
+            assert!(machine_written(name), "{name}");
+            plant(&home, name, b"x\n", 0o600);
+        }
+        for name in [".zshrc", ".vimrc", ".lessrc"] {
+            assert!(!machine_written(name), "{name}");
+        }
+        plant(&home, ".vimrc", b"x\n", 0o644);
+
+        assert_eq!(
+            discover(&context(&home), &home.child(".config")).expect("discover"),
+            [target(&home, ".vimrc")]
+        );
     }
 
     #[test]

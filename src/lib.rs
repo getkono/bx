@@ -43,8 +43,12 @@
 //! [`plan`] is where those pieces meet and Invariant 7 is kept: one traversal
 //! that decides every resolved target against the ledger and the one
 //! comparison, and a diff of each decision, shared by `bx plan`, `bx apply`
-//! and the status view. [`command`] holds those three commands' bodies, so the
-//! binary only parses its arguments and dispatches.
+//! and the status view. [`command`] holds those three commands' bodies, and
+//! `bx doctor`'s, so the binary only parses its arguments and dispatches.
+//!
+//! [`doctor`] reads the same resolved targets without deciding them, and asks
+//! read-only questions about what is on disk — whether systemd has reloaded,
+//! enabled, or failed a unit file bx wrote — changing nothing itself.
 //!
 //! # How one repo serves many accounts
 //!
@@ -75,6 +79,7 @@
 pub mod command;
 pub mod config;
 pub mod detect;
+pub mod doctor;
 pub mod env_guard;
 pub mod fs;
 pub mod journal;

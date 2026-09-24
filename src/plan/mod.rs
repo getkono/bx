@@ -24,9 +24,11 @@ use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
+pub(crate) use diff::escape;
 pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
 
-use crate::config::resolve::{self, Resolved};
+use crate::config::resolve::{self, Resolution, Resolved};
+use crate::config::target::Target;
 use crate::config::{self, Origin, layers, merge};
 use crate::env_guard::RootSet;
 use crate::journal::{self, Session, SessionKind};
@@ -165,6 +167,14 @@ impl Inputs {
     #[must_use]
     pub const fn state(&self) -> &StateDir {
         &self.state
+    }
+
+    /// Every enabled target, ready or held back, in configuration order — the
+    /// list `plan` decides, for a read-only command that looks at the same
+    /// targets without deciding them.
+    #[must_use]
+    pub fn targets(&self) -> &[Resolution<Target>] {
+        &self.resolved.targets
     }
 }
 

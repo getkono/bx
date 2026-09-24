@@ -168,8 +168,11 @@ pub fn decrypt(
     shown: &str,
     unlock: Unlock<'_>,
 ) -> Result<Vec<u8>, Refusal> {
-    // The ciphertext is judged before the identity is unlocked, so a secret
-    // that could never be decrypted costs nobody a passphrase.
+    // The ciphertext's format is judged before the identity is unlocked, so a
+    // body that is not an age file, or is passphrase-encrypted, costs nobody a
+    // passphrase. Whether the identity is one of its recipients is learned
+    // only by trying its keys, after unlocking: a locked identity is asked for
+    // even on a secret encrypted to another recipient.
     let decryptor = Decryptor::new_buffered(ArmoredReader::new(ciphertext)).map_err(|error| {
         Refusal::NotAgeFile {
             reason: error.to_string(),

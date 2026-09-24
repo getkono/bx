@@ -257,6 +257,21 @@ impl NewEntry {
     }
 }
 
+/// A target's entry as it was before a [`Ledger::record`], kept so that a
+/// record whose write never landed can be undone with [`Ledger::withdraw`].
+///
+/// Taken by [`LedgerView::withdrawal`]. A record is made before the write it
+/// describes is published, and the publish can still be refused; on a
+/// re-record the entry it replaced holds the prior `bx rm` restores, so
+/// undoing the record means putting that entry back, not dropping the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawal {
+    /// The target the record is keyed on.
+    path: crate::paths::Portable,
+    /// Its entry before the record, or `None` when it had none.
+    before: Option<LedgerEntry>,
+}
+
 /// The ledger, read-only.
 ///
 /// Takes no lock. Every state file is replaced by `rename`, so the worst a
@@ -527,6 +542,16 @@ impl LedgerView {
     #[must_use]
     pub fn get(&self, path: &crate::paths::Portable) -> Option<&LedgerEntry> {
         self.entries.get(path)
+    }
+
+    /// What [`Ledger::withdraw`] needs to undo the next record of `path`: the
+    /// entry as it is now, or that there is none.
+    #[must_use]
+    pub fn withdrawal(&self, path: &crate::paths::Portable) -> Withdrawal {
+        Withdrawal {
+            path: path.clone(),
+            before: self.entries.get(path).cloned(),
+        }
     }
 
     /// Every entry, in ascending path order.
@@ -1048,9 +1073,34 @@ impl Ledger {
     /// The restore blob is deliberately left in place: it may be shared with
     /// another entry, and content-addressed bytes cost far less than a wrong
     /// deletion. Reclaiming unreferenced blobs is not implemented.
+    ///
+    /// It is **not** how a record whose write was then refused is undone:
+    /// on any apply after the first there was an entry before that record, and
+    /// dropping it loses the prior the user had before bx, which is Invariant 4
+    /// inverted. [`Ledger::withdraw`] puts back exactly what was there.
     #[must_use = "the entry removed is the only record of what was there; drop it deliberately"]
     pub fn forget(&mut self, path: &crate::paths::Portable) -> Option<LedgerEntry> {
         self.view.entries.remove(path)
+    }
+
+    /// Undo a [`Ledger::record`] whose write never landed, by putting back the
+    /// entry `withdrawal` captured before it — or no entry, when there was none.
+    ///
+    /// Take the [`Withdrawal`] with [`LedgerView::withdrawal`] **before** the
+    /// `record`, keep it across the publish, and hand it here when the publish
+    /// is refused. The entry comes back exactly as it was: its prior, its
+    /// history and its created directories, not only its key. Returns the
+    /// entry the refused record had left, if any.
+    ///
+    /// Any blob that `record` stored in `restore/` stays there: blobs are
+    /// content-addressed and may be shared, as [`Ledger::forget`] says.
+    #[must_use = "the entry withdrawn describes a write that never landed; drop it deliberately"]
+    pub fn withdraw(&mut self, withdrawal: Withdrawal) -> Option<LedgerEntry> {
+        let Withdrawal { path, before } = withdrawal;
+        match before {
+            Some(entry) => self.view.entries.insert(path, entry),
+            None => self.view.entries.remove(&path),
+        }
     }
 
     /// Accept a target as it is now as the version `bx rm` restores — the way
@@ -1228,7 +1278,10 @@ impl Ledger {
     ///
     /// The `stat` is of the name itself, never of what it links to: see
     /// [`blob_len`]. A symlink or a second hard link of the right length is not
-    /// a blob bx wrote, so it is rewritten too.
+    /// a blob bx wrote, so it is never trusted. A second hard link is rewritten.
+    /// A symlink is refused: [`write_atomically`] never replaces a link, so
+    /// this returns [`Error::Write`] carrying [`crate::fs::Error::Symlink`] and
+    /// leaves the link and what it names alone.
     fn store_blob(
         dir: &StateDir,
         digest: ContentHash,
@@ -1333,8 +1386,9 @@ fn merge_created_dirs(
 /// names: a decoy link to a same-length file elsewhere used to satisfy the
 /// check with none of the user's bytes behind it. It must be a regular file
 /// with exactly one link. `O_PATH` reads nothing and cannot block on a FIFO.
-/// The rewrite goes through [`write_atomically`], whose rename replaces the
-/// entry, so a link is replaced and never written through.
+/// The rewrite goes through [`write_atomically`]: its rename replaces a second
+/// hard link, and it refuses a symlink outright, so a link is never written
+/// through.
 fn blob_len(path: &Path) -> Option<u64> {
     let fd = rustix::fs::open(
         path,
@@ -2176,38 +2230,67 @@ mod tests {
     }
 
     #[test]
-    fn a_decoy_link_at_a_blob_name_is_replaced_rather_than_trusted() {
+    fn a_decoy_link_at_a_blob_name_is_refused_and_a_decoy_hard_link_replaced_never_trusted() {
         // Review round 3: `blob_len` followed a symlink, so a link at
         // `restore/<digest>` to any file of the same length made `record`
         // return Ok with none of the user's bytes on disk — found only at rm,
         // as RestoreCorrupt. A second hard link was trusted the same way.
+        //
+        // Stack integration with #8: the writer refuses to replace a symlink
+        // anywhere (`fs::Error::Symlink`), state files included. So a symlink
+        // decoy is refused, not replaced: `record` fails, stores nothing, and
+        // neither the link nor what it names is touched. A hard link is a
+        // regular file to the writer, and is still replaced.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         home.write("decoy", "ZZZZZ");
         home.write("other", "YYYYY");
-        std::os::unix::fs::symlink(home.child("decoy"), dir.restore().join(hex(b"prior")))
-            .expect("symlink");
+        let link = dir.restore().join(hex(b"prior"));
+        std::os::unix::fs::symlink(home.child("decoy"), &link).expect("symlink");
         std::fs::hard_link(home.child("other"), dir.restore().join(hex(b"third")))
             .expect("hard link");
 
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
-        for (name, body) in [("~/.a", &b"prior"[..]), ("~/.b", b"third")] {
-            let stored = ledger
-                .record(entry(name, b"bx").with_prior(prior(body, 0o644)))
-                .expect("record")
-                .clone();
-            let Prior::Existed(reference) = &stored.prior else {
-                panic!("expected a snapshot");
-            };
-            assert_eq!(
-                ledger.restore_bytes(&dir, reference).expect("restore"),
-                body
-            );
-            let blob = dir.restore().join(hex(body));
-            let meta = std::fs::symlink_metadata(&blob).expect("stat");
-            assert!(meta.file_type().is_file(), "the decoy was replaced");
-            assert_eq!(meta.nlink(), 1);
-        }
+
+        let err = ledger
+            .record(entry("~/.a", b"bx").with_prior(prior(b"prior", 0o644)))
+            .expect_err("a symlink at the blob name is never trusted");
+        assert!(
+            matches!(&err, Error::Write(crate::fs::Error::Symlink(path)) if *path == link),
+            "{err:?}",
+        );
+        assert!(
+            ledger.get(&target("~/.a")).is_none(),
+            "nothing was recorded"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the link is left where it is",
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("readlink"),
+            home.child("decoy")
+        );
+
+        let stored = ledger
+            .record(entry("~/.b", b"bx").with_prior(prior(b"third", 0o644)))
+            .expect("record")
+            .clone();
+        let Prior::Existed(reference) = &stored.prior else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(
+            ledger.restore_bytes(&dir, reference).expect("restore"),
+            b"third"
+        );
+        let blob = dir.restore().join(hex(b"third"));
+        let meta = std::fs::symlink_metadata(&blob).expect("stat");
+        assert!(meta.file_type().is_file(), "the hard link was replaced");
+        assert_eq!(meta.nlink(), 1);
+
         // Neither decoy was written through.
         assert_eq!(std::fs::read(home.child("decoy")).expect("read"), b"ZZZZZ");
         assert_eq!(std::fs::read(home.child("other")).expect("read"), b"YYYYY");

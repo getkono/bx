@@ -1675,29 +1675,34 @@ mod tests {
     }
 
     #[test]
-    fn saving_over_a_symlinked_state_file_replaces_the_link_not_its_target() {
+    fn saving_over_a_symlinked_state_file_refuses_and_touches_neither_end() {
         let dir = tempfile::tempdir().expect("tempdir");
         let elsewhere = dir.path().join("elsewhere");
         std::fs::write(&elsewhere, b"the user wrote this").expect("seed");
         let path = dir.path().join("v.mpk");
         std::os::unix::fs::symlink(&elsewhere, &path).expect("symlink");
 
-        save(&path, KIND, VERSION, &sample()).expect("save");
+        let err = save(&path, KIND, VERSION, &sample()).expect_err("must refuse");
+        assert!(
+            matches!(err, Error::Write(crate::fs::Error::Symlink(_))),
+            "{err:?}",
+        );
 
-        // Invariant 1: the atomic write renames over the link, so nothing is
-        // written through it to a file bx does not own.
+        // Invariant 1, at both ends of the link. Nothing is written *through*
+        // it to a file bx does not own, and the link itself — which the user
+        // made — is not replaced either. A `rename` onto the link's path would
+        // have destroyed it silently; refusing says so instead.
         assert_eq!(
             std::fs::read(&elsewhere).expect("read"),
             b"the user wrote this",
         );
         assert!(
-            !std::fs::symlink_metadata(&path)
+            std::fs::symlink_metadata(&path)
                 .expect("stat")
                 .file_type()
                 .is_symlink(),
         );
-        let loaded: Loaded<Value> = locked_load(&path).expect("load");
-        assert_eq!(loaded.value, sample());
+        assert_eq!(std::fs::read_link(&path).expect("readlink"), elsewhere);
     }
 
     #[test]

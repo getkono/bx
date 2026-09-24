@@ -109,7 +109,9 @@ pub use dir::StateDir;
 pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use ledger::RestoreRef;
-pub use ledger::{Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes};
+pub use ledger::{
+    Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, Withdrawal,
+};
 pub use lock::{ExclusiveLock, Holder, SharedLock};
 pub use store::{Damage, Health, Loaded, MAX_STATE_FILE, Unlisted};
 

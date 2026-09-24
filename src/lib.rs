@@ -21,8 +21,13 @@
 //! never a git working tree and never published. It holds the ledger of what bx
 //! wrote and the bytes it displaced — the record `bx rm` restores from and the
 //! one `bx plan` decides against — the fingerprint cache, and the advisory lock
-//! that keeps two mutating `bx` processes from interleaving. [`fs`] holds the
-//! one atomic write every one of those files but the lock goes through. The
+//! that keeps two mutating `bx` processes from interleaving.
+//!
+//! [`fs`] is the single place a byte reaches the filesystem, for every one of
+//! those files but the lock and for every target: the one atomic write in the
+//! crate — temporary file in the destination directory, the mode set before any
+//! content, `fsync`, `rename`, `fsync` the directory — the one comparison
+//! `plan` and `apply` share, and the one type that carries a file mode. The
 //! lock file's body — a best-effort line naming the holder — is truncated and
 //! written in place through the locked descriptor, because an atomic write
 //! renames a new inode over the name, and the lock is held on the old one.

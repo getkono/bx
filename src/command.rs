@@ -161,8 +161,9 @@ fn converge(
 /// upstream, and a push that would carry a state file, all before anything is
 /// changed. The apply is [`apply`]'s, with its one confirmation and its `yes`.
 /// The push follows only when [`sync::may_push`] says the apply left nothing
-/// undone: a declined apply, or one that only recovered an interrupted
-/// session, pushes nothing, and the next `sync` picks up where it stopped.
+/// undone: a declined apply, one that left a target in conflict or blocked,
+/// or one that only recovered an interrupted session, pushes nothing, and the
+/// next `sync` picks up where it stopped.
 ///
 /// Exits as `bx apply` would over the same report, so a sync that applied
 /// every pending change exits [`Exit::Converged`].
@@ -203,8 +204,8 @@ fn sync_with(
         } else {
             writeln!(
                 out,
-                "Pushed nothing: {} commit(s) wait for an apply that finishes; run `bx sync` \
-                 again.",
+                "Pushed nothing: {} commit(s) wait for an apply that leaves nothing undone; run \
+                 `bx sync` again.",
                 pulled.ahead
             )
         }
@@ -1393,12 +1394,49 @@ mod tests {
             assert!(
                 text(&out).ends_with(
                     "Nothing was written.\nPushed nothing: 1 commit(s) wait for an apply that \
-                     finishes; run `bx sync` again.\n"
+                     leaves nothing undone; run `bx sync` again.\n"
                 ),
                 "{}",
                 text(&out)
             );
             assert!(!home.child(".a").exists());
+            assert_eq!(
+                rev(home.path(), &home.child("remote.git"), "master"),
+                before
+            );
+        }
+
+        #[test]
+        fn a_sync_that_leaves_a_conflict_pushes_nothing() {
+            let home = guarded_home();
+            let repo = cloned(&home, "");
+            home.write(".mine", "mine\n");
+            std::fs::write(repo.join("bx.toml"), inline("~/.mine", "bx\\n")).expect("bx.toml");
+            commit_all(home.path(), &repo, "mine");
+            let before = rev(home.path(), &home.child("remote.git"), "master");
+
+            let mut out = Vec::new();
+            let exit = sync_with(
+                &env(home.path()),
+                true,
+                &mut out,
+                &git(home.path()),
+                &mut never,
+            )
+            .expect("a sync with a conflict");
+
+            assert_eq!(exit, Exit::Pending, "{}", text(&out));
+            assert!(text(&out).starts_with("  ! ~/.mine"), "{}", text(&out));
+            assert!(
+                text(&out).ends_with(
+                    "Pushed nothing: 1 commit(s) wait for an apply that leaves nothing undone; \
+                     run `bx sync` again.\n"
+                ),
+                "{}",
+                text(&out)
+            );
+            assert!(!text(&out).contains("Pushed 1"), "{}", text(&out));
+            assert_eq!(std::fs::read(home.child(".mine")).expect("kept"), b"mine\n");
             assert_eq!(
                 rev(home.path(), &home.child("remote.git"), "master"),
                 before

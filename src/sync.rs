@@ -377,13 +377,20 @@ pub fn push(git: &Git, pulled: &Pulled) -> Result<(), Error> {
 }
 
 /// Whether the apply `report` describes left `sync` free to push: it wrote
-/// everything it had to, or had nothing to write, and no interrupted session
-/// stood. A declined apply pushes nothing, and neither does one that only
-/// recovered, because the next `sync` has to apply what this one did not.
+/// everything it had to, or had nothing to write, no target was left in
+/// conflict or blocked, and no interrupted session stood. A declined apply
+/// pushes nothing, and neither does one that only recovered, because the next
+/// `sync` has to apply what this one did not; nor does one that skipped a
+/// conflicted or blocked target, because the configuration being pushed was
+/// not wholly applied here.
 #[must_use]
 pub fn may_push(report: &Report) -> bool {
     report.interrupted.is_none()
         && report.recovered.is_none()
+        && !report
+            .changes
+            .iter()
+            .any(|change| change.action.needs_attention())
         && (report.executed
             || !report
                 .changes
@@ -1084,9 +1091,26 @@ pub(crate) mod tests {
         };
         assert!(may_push(&Report::default()));
         assert!(may_push(&Report {
-            changes: vec![row(Action::Conflict), row(Action::Unchanged)],
+            changes: vec![row(Action::Unchanged)],
             ..Report::default()
         }));
+        for undone in [Action::Conflict, Action::Blocked] {
+            assert!(
+                !may_push(&Report {
+                    changes: vec![row(undone), row(Action::Unchanged)],
+                    ..Report::default()
+                }),
+                "{undone} with nothing pending"
+            );
+            assert!(
+                !may_push(&Report {
+                    changes: vec![row(undone), row(Action::Create)],
+                    executed: true,
+                    ..Report::default()
+                }),
+                "{undone} after an apply"
+            );
+        }
         assert!(!may_push(&pending), "declined");
         assert!(may_push(&Report {
             executed: true,

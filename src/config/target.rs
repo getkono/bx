@@ -38,6 +38,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::shell::alias::AliasDecl;
 use crate::shell::plugin::PluginDecl;
 use crate::shell::{Assembly, Phase};
 
@@ -168,8 +169,10 @@ impl Gen {
 /// The interactive `[[env]]` fragment lands in the `env` phase, whole, and is
 /// the one part of the file [`crate::env_guard`] judges; every enabled
 /// `[[plugin]]` lands in the `plugins` phase, or in the `terminal` slot when it
-/// claims it, as the one guarded line [`PluginDecl::line`] renders. No phase
-/// but `env` holds an assignment (Invariant 2).
+/// claims it, as the one guarded line [`PluginDecl::line`] renders; and every
+/// enabled alias lands in the `aliases` phase, as the line
+/// [`crate::shell::alias::AliasDecl::render`] renders for it. No phase but
+/// `env` holds an assignment (Invariant 2).
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what
@@ -180,16 +183,36 @@ pub struct Interactive {
     env: super::env::Fragment,
     /// The enabled plugins, in declaration order.
     plugins: Vec<PluginDecl>,
+    /// The enabled aliases, in the merged configuration's order.
+    aliases: Vec<AliasDecl>,
 }
 
 impl Interactive {
-    /// The file holding `env` and no plugin.
+    /// The file holding `env` and no plugin or alias.
     #[must_use]
     pub const fn new(env: super::env::Fragment) -> Self {
         Self {
             env,
             plugins: Vec::new(),
+            aliases: Vec::new(),
         }
+    }
+
+    /// The file with `aliases` added, the disabled ones dropped.
+    ///
+    /// Whether a `has:TOOL` alias is written is not decided here: it is
+    /// decided by [`Interactive::render`]'s `present`, so the file carries
+    /// every enabled alias and the bytes follow the machine.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: &[AliasDecl]) -> Self {
+        self.aliases = aliases.iter().filter(|a| a.enabled).cloned().collect();
+        self
+    }
+
+    /// The enabled aliases, in the merged configuration's order.
+    #[must_use]
+    pub fn aliases(&self) -> &[AliasDecl] {
+        &self.aliases
     }
 
     /// The file with `plugins` added, the disabled ones dropped.
@@ -219,8 +242,10 @@ impl Interactive {
     /// The file's bytes.
     ///
     /// The fragment is contributed only when it holds a variable, so a file
-    /// with plugins alone has no `env` phase. The bytes are a function of the
-    /// variables, the plugins and `present`'s answers alone.
+    /// with plugins alone has no `env` phase, and a file whose every alias is
+    /// gated on a missing tool has no `aliases` phase. The bytes are a
+    /// function of the variables, the plugins, the aliases and `present`'s
+    /// answers alone.
     ///
     /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
     /// file is absent returns 1, and a file sourced at startup returns the
@@ -239,6 +264,7 @@ impl Interactive {
         // Only the terminal slot refuses a contribution, and `with_plugins`
         // admitted at most one claimant.
         contributed.expect("an `Interactive` holds at most one terminal claimant");
+        crate::shell::alias::contribute(&mut assembly, &self.aliases, present);
         let mut out = assembly.render();
         if !self.plugins.is_empty() {
             out.push_str(SETTLE);

@@ -65,6 +65,7 @@ use super::target::{Attach, Body, Direction, Format, Gen, Interactive, KeyPath, 
 use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
+use crate::shell::alias::AliasDecl;
 use crate::shell::plugin::PluginDecl;
 
 /// A configuration entry that either resolved or could not.
@@ -187,6 +188,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         &merged.envs,
         &merged.path,
         &merged.plugins,
+        &merged.aliases,
         &values,
     )?);
 
@@ -238,6 +240,14 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// plugin never holds the file back; a variable that holds it back holds its
 /// plugins back with it.
 ///
+/// The enabled `[aliases]` and `[[alias]]` entries land in that file's
+/// `aliases` phase, and an enabled alias places the file on its own as a
+/// plugin does. Its `when = "has:TOOL"` is decided when the file is rendered,
+/// with the `present` the plan decides every other `has:TOOL` through, so an
+/// alias gated on a missing tool still places the file and adds no line to
+/// it. Nothing in an alias is substituted, and a variable that holds the file
+/// back holds its aliases back with it.
+///
 /// # Errors
 ///
 /// [`Error::BadValue`] for a variable whose value is a repo defect: a
@@ -248,6 +258,7 @@ fn place_envs(
     envs: &[EnvDecl],
     path: &[PathEntry],
     plugins: &[PluginDecl],
+    aliases: &[AliasDecl],
     values: &ResolvedValues,
 ) -> Result<Vec<Resolution<Target>>, Error> {
     let resolved = envs
@@ -262,13 +273,19 @@ fn place_envs(
             .filter(|(decl, _)| decl.kind.places().contains(&place))
             .collect();
         let entries = if place == Place::Zshenv { path } else { &[] };
-        let interactive = if place == Place::Zshrc { plugins } else { &[] };
+        let (interactive, declared) = if place == Place::Zshrc {
+            (plugins, aliases)
+        } else {
+            (&[][..], &[][..])
+        };
         let plugin = interactive.iter().find(|p| p.enabled);
-        let origin = match (here.first(), entries.first(), plugin) {
-            (Some((first, _)), _, _) => first.origin.clone(),
-            (None, Some(entry), _) => entry.origin.clone(),
-            (None, None, Some(plugin)) => plugin.origin.clone(),
-            (None, None, None) => continue,
+        let alias = declared.iter().find(|a| a.enabled);
+        let origin = match (here.first(), entries.first(), plugin, alias) {
+            (Some((first, _)), _, _, _) => first.origin.clone(),
+            (None, Some(entry), _, _) => entry.origin.clone(),
+            (None, None, Some(plugin), _) => plugin.origin.clone(),
+            (None, None, None, Some(alias)) => alias.origin.clone(),
+            (None, None, None, None) => continue,
         };
         let portable = |raw: &str| {
             Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
@@ -293,7 +310,9 @@ fn place_envs(
                 })
                 .collect();
             let generator = match fragment_gen(place, vars, entries.to_vec()) {
-                Gen::Interactive(file) => Gen::Interactive(file.with_plugins(interactive)?),
+                Gen::Interactive(file) => {
+                    Gen::Interactive(file.with_plugins(interactive)?.with_aliases(declared))
+                }
                 other => other,
             };
             Resolution::Ready(fragment_target(place, fragment.clone(), generator, &origin))

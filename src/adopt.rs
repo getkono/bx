@@ -53,6 +53,7 @@ use toml_edit::{ArrayOfTables, Document, DocumentMut, Item, Table, value};
 
 use crate::config::resolve::{Resolution, Resolved};
 use crate::config::target::{Attach, Body, Direction, Format};
+use crate::config::values::ResolvedValues;
 use crate::config::{self, Layer, Origin, layers, merge, resolve};
 use crate::env_guard::{self, Reason, RootSet};
 use crate::fs::{self, Kind, Mode};
@@ -825,7 +826,7 @@ fn declarations(ctx: &Context, under: &Portable) -> Result<Vec<Declaration>, Err
             continue;
         };
         for table in tables {
-            let Some(target) = declared_path(table, &ctx.home) else {
+            let Some(target) = declared_path(table, &ctx.resolved.values) else {
                 continue;
             };
             if beneath(&target, under) {
@@ -840,10 +841,17 @@ fn declarations(ctx: &Context, under: &Portable) -> Result<Vec<Declaration>, Err
     Ok(found)
 }
 
-/// The path a `[[target]]` table declares, when it is one bx can read.
-fn declared_path(table: &Table, home: &Path) -> Option<Portable> {
+/// The file a `[[target]]` table declares, when it is one bx can read.
+///
+/// The path as the resolved configuration names it — every `{{name}}`
+/// substituted — because that is the path the ledger records and `rm` is
+/// given: `~/.config/{{profile}}/s` is `~/.config/work/s` once `profile` is
+/// answered `work`. A path whose values are not all answered names no file
+/// yet, so it is read as written.
+fn declared_path(table: &Table, values: &ResolvedValues) -> Option<Portable> {
     let raw = table.get("path").and_then(Item::as_str)?;
-    Portable::parse_in(raw, home).ok()
+    let rendered = values.substitute(raw).unwrap_or_else(|_| raw.to_string());
+    Portable::parse_in(&rendered, values.home()).ok()
 }
 
 /// Remove every `[[target]]` table naming one of `released` from `layer`.
@@ -854,7 +862,12 @@ fn declared_path(table: &Table, home: &Path) -> Option<Portable> {
 /// may introduce more than this one target — except one blank line directly
 /// above the header, which is the separator [`declare`] wrote, so `add` then
 /// `rm` leaves `bx.toml` exactly as it was.
-fn undeclare(layer: &Path, released: &BTreeSet<&Portable>, home: &Path) -> Result<(), Error> {
+fn undeclare(
+    layer: &Path,
+    released: &BTreeSet<&Portable>,
+    values: &ResolvedValues,
+) -> Result<(), Error> {
+    let home = values.home();
     let (text, mode) = open_layer(layer)?;
     let doc = parse_layer(layer, &text)?;
     let Some(tables) = doc.get("target").and_then(Item::as_array_of_tables) else {
@@ -862,7 +875,7 @@ fn undeclare(layer: &Path, released: &BTreeSet<&Portable>, home: &Path) -> Resul
     };
     let mut ranges = Vec::new();
     for table in tables {
-        if !declared_path(table, home).is_some_and(|t| released.contains(&t)) {
+        if !declared_path(table, values).is_some_and(|t| released.contains(&t)) {
             continue;
         }
         let Some(header) = table.span() else {
@@ -938,7 +951,7 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
     if !layers.is_empty() {
         let _lock = lock(&ctx.state)?;
         for layer in layers {
-            undeclare(layer, &released, &ctx.home)?;
+            undeclare(layer, &released, &ctx.resolved.values)?;
         }
     }
 
@@ -1205,6 +1218,41 @@ mod tests {
         );
         assert!(!body(&home, ".ssh/id_ed25519").exists());
         assert!(!layer(&home).contains("id_ed25519\""));
+    }
+
+    #[test]
+    fn every_file_under_a_credential_directory_is_refused() {
+        let home = repo(MINE);
+        for rel in [
+            ".gnupg/private-keys-v1.d/key.key",
+            ".password-store/site.gpg",
+            ".local/share/keyrings/login.keyring",
+            ".config/age/keys.txt",
+        ] {
+            plant(&home, rel, b"SECRET\n", 0o600);
+            let rows = add_rel(&home, rel);
+            assert!(
+                matches!(rows.as_slice(), [Adoption::Refused { note, .. }] if note.contains("credential")),
+                "{rel}: {rows:?}",
+            );
+            assert!(!body(&home, rel).exists(), "{rel}");
+        }
+        assert_eq!(layer(&home), MINE);
+    }
+
+    #[test]
+    fn a_path_holding_a_placeholder_delimiter_is_refused() {
+        let home = repo(MINE);
+        for rel in [".cfg/{{name}}", ".cfg/a{{b", ".cfg/a}}b"] {
+            plant(&home, rel, b"x\n", 0o644);
+            let rows = add_rel(&home, rel);
+            assert!(
+                matches!(rows.as_slice(), [Adoption::Refused { note, .. }] if note.contains("placeholder")),
+                "{rel}: {rows:?}",
+            );
+            assert!(!body(&home, rel).exists(), "{rel}");
+        }
+        assert_eq!(layer(&home), MINE);
     }
 
     #[test]
@@ -1486,6 +1534,37 @@ mod tests {
         assert_eq!(layer(&home), "");
         assert_eq!(std::fs::read_to_string(&local).expect("local.toml"), "");
         assert!(rm_rel(&home, ".never").is_empty(), "a second rm is a no-op");
+    }
+
+    #[test]
+    fn rm_of_a_placeholder_pathed_target_undeclares_it_by_the_path_it_resolves_to() {
+        let values = "[[value]]\nname = \"profile\"\nkind = \"string\"\ndefault = \"work\"\n";
+        let home = repo(&format!(
+            "{values}\n{}",
+            inline("~/.config/{{profile}}/s", "s\\n")
+        ));
+        apply_yes(&home);
+        assert!(home.child(".config/work/s").exists());
+
+        let removals = rm_rel(&home, ".config/work/s");
+        assert!(
+            matches!(
+                removals.as_slice(),
+                [Removal { restored: Restored::Removed { .. }, undeclared, .. }] if undeclared.len() == 1
+            ),
+            "{removals:?}"
+        );
+        assert!(!home.child(".config/work/s").exists());
+        assert_eq!(layer(&home), values, "the templated declaration is gone");
+        assert_eq!(
+            plan_exit(&home).0,
+            Exit::Converged,
+            "and apply would not recreate it"
+        );
+        assert!(
+            rm_rel(&home, ".config/work/s").is_empty(),
+            "a second rm is a no-op"
+        );
     }
 
     #[test]

@@ -575,23 +575,37 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
     let mut rows = Vec::with_capacity(interrupted.unfinished.len());
     for unfinished in &interrupted.unfinished {
         let target = unfinished.target.as_str();
+        // The target as written, found by where it resolved to or, when its
+        // resolution is blocked, by the path as written. Whether it is a
+        // secret is read from the declared body, which a blocked resolution
+        // still has.
         let configured = inputs
-            .resolved
-            .targets
-            .iter()
-            .find_map(|resolution| match resolution {
-                resolve::Resolution::Ready(ready) if ready.path.as_str() == target => Some(ready),
-                _ => None,
-            });
+            .targets()
+            .find(|(declared, resolution)| match resolution {
+                Resolution::Ready(ready) => ready.path.as_str() == target,
+                Resolution::Blocked(_) => declared.path.as_str() == target,
+            })
+            .map(|(declared, _)| declared);
         let origin = configured.map_or_else(
             || Origin::unknown(&interrupted.journal),
-            |ready| ready.origin.clone(),
+            |declared| declared.origin.clone(),
         );
         // A secret's plaintext is on one side of its roll back, or both, and
-        // is never shown here either.
-        let between = if configured
-            .is_some_and(|ready| matches!(ready.body, crate::config::target::Body::Secret(_)))
-        {
+        // is never shown here either. A blocked secret whose path is itself
+        // blocked cannot be matched to this write, so any such secret conceals
+        // every write no declared target claims: showing a secret's bytes is
+        // worse than hiding an ordinary file's.
+        let is_secret =
+            |declared: &Target| matches!(declared.body, crate::config::target::Body::Secret(_));
+        let conceal = configured.map_or_else(
+            || {
+                inputs.targets().any(|(declared, resolution)| {
+                    is_secret(declared) && matches!(resolution, Resolution::Blocked(_))
+                })
+            },
+            is_secret,
+        );
+        let between = if conceal {
             Diff::concealed
         } else {
             Diff::between
@@ -2373,6 +2387,74 @@ pub(crate) mod tests {
             shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
             "{shown}"
         );
+    }
+
+    /// Leave an interrupted write of `hunter3` over `~/.token`'s `hunter2`,
+    /// then plan `layer` and render the plan.
+    fn render_an_interrupted_token_write(layer: &str) -> String {
+        let home = guarded_home();
+        age_identity(&home);
+        own(home.path(), ".token", b"hunter2\n", Mechanism::Own);
+        let inputs = inputs(&home, layer);
+        let target = Portable::parse_in("~/.token", home.path()).expect("a portable target");
+        let dest = home.child(".token");
+        let mut session = Session::open(
+            inputs.state(),
+            SessionKind::Apply,
+            home.path(),
+            vec![target.clone()],
+        )
+        .expect("a session");
+        session
+            .apply(Request {
+                target,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"hunter3\n".to_vec(),
+                    planned: fs::observe(&dest).expect("observe"),
+                },
+                mode: FileMode::PRIVATE_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("the write");
+        drop(session);
+
+        let report = plan(&inputs);
+        render(&report, View::Plan, Palette::PLAIN, home.path())
+    }
+
+    const WHO: &str = "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n";
+
+    #[test]
+    fn d1_an_interrupted_write_of_a_blocked_secret_is_rolled_back_without_showing_it() {
+        // The secret's body waits on an unanswered value, so its resolution is
+        // blocked; the declared body still says it is a secret.
+        let layer = format!(
+            "{WHO}[[target]]\npath = \"~/.token\"\nsecret = \"secrets/{{{{who}}}}.age\"\n\
+             mode = \"0600\"\n"
+        );
+        let shown = render_an_interrupted_token_write(&layer);
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(
+            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn d1_a_blocked_secret_path_conceals_a_write_no_target_claims() {
+        // The secret's path waits on the value, so the write cannot be matched
+        // to it; it is concealed rather than risk printing the secret.
+        let layer = format!(
+            "{WHO}[[target]]\npath = \"~/.{{{{who}}}}\"\nsecret = \"secrets/token.age\"\n\
+             mode = \"0600\"\n"
+        );
+        let shown = render_an_interrupted_token_write(&layer);
+        assert!(!shown.contains("hunter"), "{shown}");
+
+        // With no secret declared, an unclaimed write is shown as before.
+        let shown = render_an_interrupted_token_write(WHO);
+        assert!(shown.contains("hunter"), "{shown}");
     }
 
     #[test]

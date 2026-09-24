@@ -461,12 +461,17 @@ fn counts(git: &Git, repo: &Path) -> Result<(u64, u64), Error> {
     ))
 }
 
-/// Refuse the push when an object it would publish is named as a state file.
+/// Refuse the push when a commit it would publish touches a path named as a
+/// state file.
 ///
-/// `rev-list --objects` lists every object reachable from `HEAD` and not from
-/// the upstream, each blob and tree with the path it was first reached by: the
-/// content the push would add to the remote, whether a later commit on the
-/// branch deleted it again or not.
+/// `log --name-only @{upstream}..HEAD` lists, for every outgoing commit, each
+/// path it adds, changes or deletes — a merge against its first parent, so
+/// what the merge itself brings in is listed too. Paths are what is checked,
+/// not objects: an object list names each blob once, under the first path
+/// that reaches it, and leaves out a blob the upstream already has, so a
+/// state file whose bytes happen to exist elsewhere (an empty `local.toml`)
+/// would pass unseen. A state file a later commit deleted again is still
+/// listed by the commit that added it.
 fn refuse_outgoing_state(
     git: &Git,
     repo: &Path,
@@ -475,12 +480,20 @@ fn refuse_outgoing_state(
 ) -> Result<(), Error> {
     let listed = git.query(
         repo,
-        &["rev-list", "--objects", "HEAD", "--not", "@{upstream}"],
+        &[
+            "log",
+            "-z",
+            "--name-only",
+            "--format=",
+            "--no-renames",
+            "--diff-merges=first-parent",
+            "@{upstream}..HEAD",
+        ],
     )?;
     let names = StateNames::of(state);
     let mut paths: Vec<String> = listed
-        .lines()
-        .filter_map(|line| line.split_once(' ').map(|(_, path)| path))
+        .split('\0')
+        .map(|path| path.trim_start_matches('\n'))
         .filter(|path| names.matches(path))
         .map(str::to_string)
         .collect();
@@ -878,6 +891,58 @@ pub(crate) mod tests {
 
         let error = pull(&env(home.path()), &git(home.path())).expect_err("still in history");
         assert!(matches!(error, Error::WouldPushState { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn a_state_file_whose_bytes_the_upstream_already_has_is_still_refused() {
+        let home = guarded_home();
+        let repo = cloned(&home, "");
+        // The seeded `bx.toml` is empty, so the upstream already has the
+        // empty blob this `local.toml` is.
+        assert_eq!(std::fs::read(repo.join("bx.toml")).expect("bx.toml"), b"");
+        std::fs::write(repo.join("local.toml"), "").expect("local.toml");
+        commit_all(home.path(), &repo, "oops");
+
+        let error = pull(&env(home.path()), &git(home.path())).expect_err("empty local.toml");
+        let Error::WouldPushState { paths, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(paths, &vec!["local.toml".to_string()]);
+    }
+
+    #[test]
+    fn a_state_file_sharing_its_bytes_with_another_outgoing_path_is_still_refused() {
+        let home = guarded_home();
+        let repo = cloned(&home, "");
+        // `a.toml` sorts first, so an object list names the shared blob by it.
+        std::fs::write(repo.join("a.toml"), "shared\n").expect("a.toml");
+        std::fs::write(repo.join("journal.mpk"), "shared\n").expect("journal.mpk");
+        commit_all(home.path(), &repo, "oops");
+
+        let error = pull(&env(home.path()), &git(home.path())).expect_err("shared blob");
+        let Error::WouldPushState { paths, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(paths, &vec!["journal.mpk".to_string()]);
+    }
+
+    #[test]
+    fn a_state_file_in_any_of_several_outgoing_commits_is_refused() {
+        let home = guarded_home();
+        let repo = cloned(&home, "");
+        std::fs::write(repo.join("mine.toml"), "a\n").expect("mine");
+        commit_all(home.path(), &repo, "mine");
+        std::fs::create_dir_all(repo.join("sub")).expect("sub");
+        std::fs::write(repo.join("sub/ledger.mpk"), "b\n").expect("ledger");
+        commit_all(home.path(), &repo, "oops");
+        std::fs::write(repo.join("mine.toml"), "c\n").expect("mine again");
+        commit_all(home.path(), &repo, "later");
+
+        let error = pull(&env(home.path()), &git(home.path())).expect_err("middle commit");
+        let Error::WouldPushState { paths, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(paths, &vec!["sub/ledger.mpk".to_string()]);
     }
 
     #[test]

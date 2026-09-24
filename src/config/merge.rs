@@ -1590,6 +1590,53 @@ mod tests {
     }
 
     #[test]
+    fn sources_merge_by_name_and_a_toggle_flips_one() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[[source]]\nname = \"a\"\npath = \"~/a\"\n\
+                 [[source]]\nname = \"b\"\npath = \"~/b\"\n\
+                 [[source]]\nname = \"c\"\npath = \"~/c\"\nenabled = false\n",
+            ),
+            global(
+                "modules/m.toml",
+                "[[source]]\nname = \"a\"\npath = \"/opt/a\"\nphase = \"options\"\n",
+            ),
+            local(
+                "[[source]]\nname = \"b\"\nenabled = false\n\
+                 [[source]]\nname = \"c\"\nenabled = true\n",
+            ),
+        ])
+        .unwrap();
+        let sources: Vec<(&str, &str, &str, &Path)> = merged
+            .sources
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    s.path.as_str(),
+                    s.phase.name(),
+                    s.origin.file.as_path(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                ("a", "/opt/a", "options", Path::new("modules/m.toml")),
+                ("c", "~/c", "plugins", Path::new("bx.toml")),
+            ]
+        );
+
+        let message = failure(&[
+            global("bx.toml", "[[source]]\nname = \"a\"\npath = \"~/a\"\n"),
+            local("[[source]]\nname = \"z\"\nenabled = true\n"),
+        ]);
+        assert!(message.contains("`z`"), "{message}");
+        assert!(message.contains("a `path`"), "{message}");
+    }
+
+    #[test]
     fn a_second_terminal_claimant_fails_the_merge_unless_a_layer_switches_one_off() {
         let claimants = "[[plugin]]\nname = \"zsh-syntax-highlighting\"\n\
                          source = \"~/zsh/zsh-syntax-highlighting.zsh\"\nterminal = true\n";

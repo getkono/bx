@@ -120,6 +120,8 @@ pub struct Resolved {
     /// Blocked targets keep their position, so the order `bx plan` reports in is
     /// the configuration's own order with nothing silently moved to the end.
     pub targets: Vec<Resolution<Target>>,
+    /// The merged `[secrets]` table: nothing in it is substituted.
+    pub secrets: super::secrets::Secrets,
 }
 
 /// Resolve a merged configuration.
@@ -146,7 +148,11 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
 
     refuse_shared_files(&targets)?;
 
-    Ok(Resolved { values, targets })
+    Ok(Resolved {
+        values,
+        targets,
+        secrets: merged.secrets.clone(),
+    })
 }
 
 /// Refuse two ready targets that write one file.
@@ -191,8 +197,14 @@ fn resolve_target(
     values: &ResolvedValues,
     conflicts: &[Conflict],
 ) -> Result<Resolution<Target>, Error> {
-    if let Body::File(file) = &target.body {
-        refuse_path_value_in_file(target, &file.to_string_lossy(), values)?;
+    match &target.body {
+        Body::File(file) => {
+            refuse_path_value_in_file(target, "file", &file.to_string_lossy(), values)?
+        }
+        Body::Secret(file) => {
+            refuse_path_value_in_file(target, "secret", &file.to_string_lossy(), values)?;
+        }
+        Body::Inline(_) | Body::Generated(_) | Body::Dir => {}
     }
 
     let mut unset: Vec<String> = Vec::new();
@@ -306,8 +318,12 @@ fn resolve_target(
 ///
 /// A malformed placeholder is left to the probe, which reports it with the
 /// rest of the target's defects.
+///
+/// `key` is the body key that names the repo file: `file`, or `secret`, whose
+/// ciphertext is a repo file by the same rule.
 fn refuse_path_value_in_file(
     target: &Target,
+    key: &str,
     file: &str,
     values: &ResolvedValues,
 ) -> Result<(), Error> {
@@ -324,8 +340,8 @@ fn refuse_path_value_in_file(
         Some(name) => Err(Error::BadValue {
             origin: target.origin.clone(),
             message: format!(
-                "target `{}`: `file` references `{name}`, a `path` value; a `path` value \
-                 is always absolute and `file` is relative to the config repo root, so no \
+                "target `{}`: `{key}` references `{name}`, a `path` value; a `path` value \
+                 is always absolute and `{key}` is relative to the config repo root, so no \
                  answer could make it name a file in the repo; reference a `string` value",
                 target.path
             ),
@@ -358,7 +374,7 @@ fn for_each_string(target: &Target, visit: &mut impl FnMut(&str)) {
     visit(target.path.as_str());
 
     match &target.body {
-        Body::File(path) => visit(&path.to_string_lossy()),
+        Body::File(path) | Body::Secret(path) => visit(&path.to_string_lossy()),
         Body::Inline(text) => visit(text),
         Body::Generated(_) | Body::Dir => {}
     }
@@ -420,6 +436,15 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
             let raw = path.to_string_lossy();
             Body::File(
                 super::target::confine_to_repo("file", &sub(&raw)?)
+                    .map_err(|message| field(&raw, message))?,
+            )
+        }
+        // The ciphertext is a repo file by the same rule, and an escape through
+        // it would decrypt whatever age file it reached into the target.
+        Body::Secret(path) => {
+            let raw = path.to_string_lossy();
+            Body::Secret(
+                super::target::confine_to_repo("secret", &sub(&raw)?)
                     .map_err(|message| field(&raw, message))?,
             )
         }
@@ -654,6 +679,56 @@ mod tests {
             Body::File(PathBuf::from("cfg/work/gitconfig")),
             "the case this spelling exists for still resolves"
         );
+    }
+
+    #[test]
+    fn a_substituted_secret_is_confined_to_the_config_repo_like_a_file() {
+        const LAYER: &str = "[[value]]\n\
+                             name = \"account\"\n\
+                             kind = \"KIND\"\n\
+                             [[target]]\n\
+                             path = \"~/.token\"\n\
+                             secret = \"secrets/{{account}}/token.age\"\n\
+                             mode = \"0600\"\n";
+        let string = LAYER.replace("KIND", "string");
+
+        let climbing = resolved(&string, Some("[values]\naccount = \"../../../../etc\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&climbing, 0);
+        assert!(
+            entry
+                .hint
+                .contains("`secret` may not climb out of the config repo"),
+            "{}",
+            entry.hint
+        );
+
+        let ordinary = resolved(&string, Some("[values]\naccount = \"work\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::Secret(PathBuf::from("secrets/work/token.age"))
+        );
+
+        let message = resolved(&LAYER.replace("KIND", "path"), None)
+            .expect_err("a `path` value in `secret` is the layer's defect");
+        assert!(
+            message.contains("`secret` references `account`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_secrets_table_is_carried_through_resolution() {
+        let resolved = resolved(
+            "[secrets]\nrecipients = [\"ssh-ed25519 AAAAC3Nz one\"]\n",
+            Some("[secrets]\nidentity = \"~/.config/age/key.txt\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.secrets.identity_spelling(),
+            "~/.config/age/key.txt"
+        );
+        assert!(resolved.secrets.recipients.is_some());
     }
 
     #[test]

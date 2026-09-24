@@ -215,7 +215,8 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// that fragment alone: every other fragment, every region and every declared
 /// target still resolve. A region is never held back: its bytes name the
 /// fragment and nothing else, and it sources the fragment only once one is
-/// there to read.
+/// there to read. A place no variable lands in emits nothing here; a fragment
+/// bx wrote there earlier is planned empty by [`vacated_fragments`].
 ///
 /// # Errors
 ///
@@ -261,20 +262,7 @@ fn place_envs(envs: &[EnvDecl], values: &ResolvedValues) -> Result<Vec<Resolutio
                     Resolution::Blocked(_) => None,
                 })
                 .collect();
-            let format = match place.syntax() {
-                Syntax::EnvironmentD => Format::EnvD,
-                Syntax::Zsh => Format::Opaque,
-            };
-            Resolution::Ready(placed_target(
-                fragment.clone(),
-                Gen::Env(Fragment {
-                    syntax: place.syntax(),
-                    vars,
-                }),
-                Attach::Own,
-                format,
-                &origin,
-            ))
+            Resolution::Ready(fragment_target(place, fragment.clone(), vars, &origin))
         } else {
             let (reason, hint) = held_together(&held, values);
             Resolution::Blocked(BlockedEntry {
@@ -295,6 +283,71 @@ fn place_envs(envs: &[EnvDecl], values: &ResolvedValues) -> Result<Vec<Resolutio
         }
     }
     Ok(placed)
+}
+
+/// The fragment bx owns whole at `place`, holding `vars`.
+fn fragment_target(
+    place: Place,
+    path: Portable,
+    vars: Vec<(String, String)>,
+    origin: &Origin,
+) -> Target {
+    let format = match place.syntax() {
+        Syntax::EnvironmentD => Format::EnvD,
+        Syntax::Zsh => Format::Opaque,
+    };
+    placed_target(
+        path,
+        Gen::Env(Fragment {
+            syntax: place.syntax(),
+            vars,
+        }),
+        Attach::Own,
+        format,
+        origin,
+    )
+}
+
+/// A header-only fragment for each place the placement graph no longer puts a
+/// variable in, but whose fragment bx wrote earlier.
+///
+/// [`place_envs`] emits nothing for a place no enabled variable lands in, so a
+/// variable switched off, removed, or moved to another `kind` would otherwise
+/// leave the fragment bx wrote for it in place — `export EDITOR=…` still
+/// sourced by every shell, with no plan row saying so. `recorded` answers
+/// whether bx has written a path as a file it owns whole, which only the
+/// ledger knows; resolution itself stays a pure function of the layers and the
+/// home. While it is recorded, the fragment is planned with no variable in it,
+/// so the change shows as a `modify` row and `apply` writes the empty
+/// fragment; the startup file's region is left as it is, sourcing a fragment
+/// that sets nothing, and `bx rm` restores both from the ledger.
+///
+/// A place `placed` already names — ready, or held back under the fragment's
+/// path — is left to it. Each vacated fragment is attributed to `ledger`, the
+/// record that put it in the plan.
+#[must_use]
+pub fn vacated_fragments(
+    placed: &[Resolution<Target>],
+    recorded: impl Fn(&Portable) -> bool,
+    home: &Path,
+    ledger: &Path,
+) -> Vec<Resolution<Target>> {
+    let origin = Origin {
+        file: ledger.to_path_buf(),
+        line: 0,
+    };
+    Place::ALL
+        .into_iter()
+        .filter_map(|place| {
+            let path = Portable::parse_in(place.fragment(), home).ok()?;
+            let named = placed.iter().any(|resolution| match resolution {
+                Resolution::Ready(target) => target.path == path,
+                Resolution::Blocked(entry) => entry.key == path.to_string(),
+            });
+            (!named && recorded(&path))
+                .then(|| Resolution::Ready(fragment_target(place, path, Vec::new(), &origin)))
+        })
+        .collect()
 }
 
 /// A target the placement graph derives, attributed to the first variable
@@ -1502,6 +1555,49 @@ mod tests {
             region.body,
             Body::Generated(Gen::Source(zshrc_fragment.path.clone()))
         );
+    }
+
+    #[test]
+    fn a_recorded_fragment_no_place_names_is_planned_empty_and_no_other() {
+        // environment.d is held back on `b`, zshrc.zsh is placed, and the
+        // other two fragments are named by nothing.
+        let placed = resolved(
+            &format!(
+                "{ABC}{}{}",
+                env("X", "{{b}}", "gui"),
+                env("EDITOR", "nvim", "interactive")
+            ),
+            None,
+        )
+        .unwrap();
+        let ledger = Path::new("/var/home/example/.local/state/bx/ledger");
+        let every = vacated_fragments(&placed.targets, |_| true, &home(), ledger);
+        let paths: Vec<String> = every
+            .iter()
+            .map(|resolution| match resolution {
+                Resolution::Ready(target) => {
+                    assert_eq!(
+                        target.body,
+                        Body::Generated(Gen::Env(Fragment {
+                            syntax: Syntax::Zsh,
+                            vars: Vec::new(),
+                        }))
+                    );
+                    assert_eq!(target.origin.file, ledger);
+                    target.path.to_string()
+                }
+                Resolution::Blocked(entry) => panic!("{entry:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "~/.local/share/bx/zshenv.zsh",
+                "~/.local/share/bx/zprofile.zsh"
+            ]
+        );
+        // Nothing bx has not written is planned.
+        assert!(vacated_fragments(&placed.targets, |_| false, &home(), ledger).is_empty());
     }
 
     #[test]

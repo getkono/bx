@@ -150,6 +150,7 @@ use super::values::{
 };
 use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
+use crate::shell::alias::AliasDecl;
 
 /// A list entry that merges by a natural key.
 ///
@@ -219,6 +220,21 @@ impl Keyed for EnvDecl {
     }
 }
 
+impl Keyed for AliasDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 impl Keyed for PathEntry {
     /// The directory as zsh is given it, so two spellings of one directory
     /// are one entry.
@@ -254,6 +270,9 @@ pub enum Section {
     Value,
     /// `[[env]]`, keyed by `name`.
     Env,
+    /// `[[alias]]`, keyed by `name`. The flat `[aliases]` table holds no
+    /// toggle, since its entries have no `enabled` key to hold.
+    Alias,
 }
 
 impl Section {
@@ -264,6 +283,7 @@ impl Section {
             Self::Target => "target",
             Self::Value => "value",
             Self::Env => "env",
+            Self::Alias => "alias",
         }
     }
 
@@ -274,6 +294,7 @@ impl Section {
             Self::Target => super::target::SECTION,
             Self::Value => super::values::DECL_SECTION,
             Self::Env => super::env::SECTION,
+            Self::Alias => crate::shell::alias::SECTION,
         }
     }
 
@@ -282,7 +303,7 @@ impl Section {
     pub fn natural_key(self) -> &'static str {
         match self {
             Self::Target => "path",
-            Self::Value | Self::Env => "name",
+            Self::Value | Self::Env | Self::Alias => "name",
         }
     }
 
@@ -296,6 +317,7 @@ impl Section {
             Self::Target => "one of `file`, `content`, `generated` or `dir`",
             Self::Value => "a `kind`",
             Self::Env => "a `value` and a `kind`",
+            Self::Alias => "a `command`",
         }
     }
 }
@@ -672,7 +694,7 @@ impl Merged<Target, TargetKey> {
                         fragile,
                     });
                 }
-                Section::Value | Section::Env => {}
+                Section::Value | Section::Env | Section::Alias => {}
             }
         }
 
@@ -1077,6 +1099,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut assignments: Vec<ValueAssignment> = Vec::new();
     let mut envs: Merged<EnvDecl> = Merged::default();
     let mut path: Merged<PathEntry> = Merged::default();
+    let mut aliases: Merged<AliasDecl> = Merged::default();
     let mut secrets = Secrets::default();
 
     // Values first, across every layer. A value never depends on a target, and
@@ -1086,7 +1109,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     //
     // An `[[env]]` entry is keyed by its name as written, which no answer can
     // change, so it folds here beside the values; so does a `[path]` entry,
-    // keyed by its directory, which holds no placeholder.
+    // keyed by its directory, which holds no placeholder; and so does an
+    // alias, keyed by its name, whichever of its two tables it is written in.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1095,6 +1119,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         values.absorb(layer.config.values.iter().cloned());
         envs.absorb(layer.config.envs.iter().cloned());
         path.absorb(layer.config.path.iter().cloned());
+        aliases.absorb(layer.config.aliases.iter().cloned());
 
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
@@ -1102,6 +1127,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
             match toggle.section {
                 Section::Value => values.toggle(toggle)?,
                 Section::Env => envs.toggle(toggle)?,
+                Section::Alias => aliases.toggle(toggle)?,
                 Section::Target => {}
             }
         }
@@ -1142,6 +1168,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         envs: envs.into_enabled(),
         // Nothing refers to a `[path]` entry either.
         path: path.into_enabled(),
+        // Nor to an alias.
+        aliases: aliases.into_enabled(),
         secrets,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
@@ -1321,6 +1349,54 @@ mod tests {
         ]);
         assert!(message.contains("PAGER"), "{message}");
         assert!(message.contains("a `value` and a `kind`"), "{message}");
+    }
+
+    #[test]
+    fn aliases_merge_by_name_across_both_tables_and_a_toggle_flips_one() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[aliases]\nll = \"ls -la\"\ngs = \"git status\"\n\
+                 [[alias]]\nname = \"cat\"\ncommand = \"bat\"\nwhen = \"has:bat\"\nenabled = false\n",
+            ),
+            // A flat entry replaces a conditional one in place, and the reverse.
+            global(
+                "modules/a.toml",
+                "[aliases]\ncat = \"batcat\"\n\
+                 [[alias]]\nname = \"ll\"\ncommand = \"eza -l\"\nwhen = \"has:eza\"\n",
+            ),
+            local(
+                "[[alias]]\nname = \"gs\"\nenabled = false\n\
+                 [[alias]]\nname = \"cat\"\nenabled = true\n",
+            ),
+        ])
+        .unwrap();
+        let aliases: Vec<(&str, &str, bool, &Path)> = merged
+            .aliases
+            .iter()
+            .map(|a| {
+                (
+                    a.name.as_str(),
+                    a.command.as_str(),
+                    a.when.is_some(),
+                    a.origin.file.as_path(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            aliases,
+            vec![
+                ("ll", "eza -l", true, Path::new("modules/a.toml")),
+                ("cat", "batcat", false, Path::new("modules/a.toml")),
+            ]
+        );
+
+        let message = failure(&[
+            global("bx.toml", "[aliases]\nll = \"ls -la\"\n"),
+            local("[[alias]]\nname = \"la\"\nenabled = false\n"),
+        ]);
+        assert!(message.contains("`la`"), "{message}");
+        assert!(message.contains("a `command`"), "{message}");
     }
 
     #[test]
@@ -1526,6 +1602,7 @@ mod tests {
             (Section::Target, "target", "[[target]]", "path"),
             (Section::Value, "value", "[[value]]", "name"),
             (Section::Env, "env", "[[env]]", "name"),
+            (Section::Alias, "alias", "[[alias]]", "name"),
         ] {
             assert_eq!(section.key(), key);
             assert_eq!(section.header(), header);

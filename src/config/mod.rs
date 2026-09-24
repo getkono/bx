@@ -34,6 +34,7 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::shell::alias;
 use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
@@ -70,6 +71,10 @@ pub struct Config {
     /// `[path]`'s entries, every list's in one `Vec`, keyed by the directory
     /// as zsh is given it. See [`path`].
     pub path: Vec<path::PathEntry>,
+    /// `[aliases]` and `[[alias]]` together, keyed by `name`: table by table,
+    /// in the order each table first appears in the file, and each table's
+    /// entries in the order written. See [`crate::shell::alias`].
+    pub aliases: Vec<crate::shell::alias::AliasDecl>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
@@ -403,6 +408,25 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                 })?;
                 config.path = path::parse_path(table, file, text)?;
             }
+            "aliases" => {
+                let table = item.as_table().ok_or_else(|| Error::WrongType {
+                    origin: section_origin(root, name, file, text),
+                    key: name.to_string(),
+                    expected: "a table `[aliases]`",
+                    found: item.type_name(),
+                })?;
+                config
+                    .aliases
+                    .extend(alias::parse_aliases(table, file, text)?);
+            }
+            "alias" => {
+                for table in entries(root, name, item, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Alias, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config.aliases.push(alias::parse_alias(table, file, text)?),
+                    }
+                }
+            }
             unknown => {
                 return Err(Error::UnknownSection {
                     origin: section_origin(root, unknown, file, text),
@@ -448,6 +472,16 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .path
             .iter()
             .map(|entry| (entry.shell.as_str(), &entry.origin))
+            .collect(),
+    )?;
+    // Both alias tables at once, so one name in each is a duplicate too.
+    check_unique(
+        "alias",
+        config
+            .aliases
+            .iter()
+            .map(|a| (a.name.as_str(), &a.origin))
+            .chain(toggles_in(&config, merge::Section::Alias))
             .collect(),
     )?;
 
@@ -1320,10 +1354,10 @@ mod tests {
 
     #[test]
     fn an_unknown_section_is_rejected_with_its_line() {
-        let text = "[[target]]\npath = \"~/a\"\nfile = \"f\"\n\n[[alias]]\nname = \"ll\"\n";
+        let text = "[[target]]\npath = \"~/a\"\nfile = \"f\"\n\n[[abbr]]\nname = \"ll\"\n";
         let message = message(text);
 
-        assert!(message.contains("unknown section `alias`"), "{message}");
+        assert!(message.contains("unknown section `abbr`"), "{message}");
         assert!(message.contains("bx.toml:5"), "{message}");
     }
 

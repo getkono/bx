@@ -347,10 +347,22 @@ impl LedgerView {
 
     /// Reject a ledger bx could not have written, or cannot use with `home`.
     ///
-    /// Damage is looked for across every entry before any path is checked
-    /// against the home, so a damaged ledger is never reported as a home
-    /// problem. `home` has already been accepted, so the only home failure left
-    /// is [`crate::paths::Error::AbsoluteUnderHome`].
+    /// The order is: key mismatches across every entry, then the home check,
+    /// then directories that are not above their target. `home` has already
+    /// been accepted, so the only home failure left is
+    /// [`crate::paths::Error::AbsoluteUnderHome`].
+    ///
+    /// So a key mismatch is never reported as a home problem, but a stray
+    /// directory can be: a ledger with a stray directory in one entry and a
+    /// path spelled absolutely under the home in another is refused as a home
+    /// problem, nothing is renamed or dropped, and the stray is reported only
+    /// once the home problem is cleared (r5, C1). That is deliberate, not an
+    /// oversight. A `created_dirs` entry spelled absolutely under the home is
+    /// itself "not above its target" to the stray test, so running the stray
+    /// test first would drop it as damage — quietly losing a directory the
+    /// likeliest cause of which is the same account with its home spelled
+    /// another way. Refusing the whole ledger loses nothing, and the stray is
+    /// still there to be reported on the load after.
     ///
     /// # Damage is isolated to the rows that carry it
     ///
@@ -618,8 +630,16 @@ impl LedgerView {
                 path,
             });
         }
+        // The `st_size` test above is a statement about the file when it was
+        // `fstat`ed, not when it is read: a blob with a second hard link can
+        // grow in between, and `read_to_end` would follow it (r5, D2). So the
+        // read itself stops at `reference.len`. Whatever the first
+        // `reference.len` bytes are, the digest below judges them.
         let mut bytes = Vec::new();
-        if let Err(source) = std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes) {
+        if let Err(source) = std::io::Read::read_to_end(
+            &mut std::io::Read::take(std::fs::File::from(fd), reference.len),
+            &mut bytes,
+        ) {
             return Err(Error::Read { path, source });
         }
         if ContentHash::of(&bytes) == reference.digest {
@@ -1280,7 +1300,12 @@ fn merge_created_dirs(
     let mut merged = Vec::with_capacity(existing.len() + incoming.len());
     for dir in existing {
         if is_ancestor(dir, target) {
-            merged.push(dir.clone());
+            // The stored list is deduplicated as the incoming one is: bx never
+            // writes a duplicate, so one here is tampering, and carrying it
+            // forward would make the result the doc promises false (r5, C2).
+            if !merged.contains(dir) {
+                merged.push(dir.clone());
+            }
         } else {
             tracing::warn!(
                 target = %target,
@@ -3876,6 +3901,68 @@ mod tests {
             "got {err}",
         );
         assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
+    }
+
+    #[test]
+    fn a_home_problem_in_one_entry_is_reported_before_a_stray_directory_in_another() {
+        // r5 (C1): the order `check_paths` documents. The home check runs
+        // before the stray test, so a stray in one entry is not reported while
+        // another entry has a home problem — and nothing is renamed or
+        // dropped, so the stray is still there for the load after.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut entries = BTreeMap::new();
+        for (key, dirs) in [
+            (target("~/.aaaa/x.conf"), vec![target("~/.bbbb")]),
+            (
+                target("~/.config/tool/y.conf"),
+                vec![absolute_under(&home, ".config")],
+            ),
+        ] {
+            entries.insert(
+                key.clone(),
+                LedgerEntry {
+                    path: key,
+                    written: ContentHash::of(b"x"),
+                    mode: Mode::DEFAULT_FILE,
+                    mechanism: Mechanism::Own,
+                    prior: Prior::Absent,
+                    created_dirs: dirs,
+                    superseded: Vec::new(),
+                    superseded_absent: false,
+                },
+            );
+        }
+        store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
+        let seeded = std::fs::read(dir.ledger()).expect("read the seed");
+
+        let err = Ledger::open(&dir, &lock, home.path()).expect_err("must refuse");
+        assert!(matches!(err, Error::ForeignPath { .. }), "got {err}");
+        assert_eq!(std::fs::read(dir.ledger()).expect("in place"), seeded);
+        assert!(!dir.root().join("ledger.mpk.corrupt").exists());
+    }
+
+    #[test]
+    fn a_stored_duplicate_directory_is_not_recorded_again() {
+        // r5 (C2): `merge_created_dirs` promised a deduplicated result, and
+        // deduplicated only the incoming list. A stored duplicate — which bx
+        // never writes — was carried through every re-record.
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let file = "~/.config/tool/x.conf";
+        seed_ledger(
+            &dir,
+            target(file),
+            vec![target("~/.config/tool"), target("~/.config/tool")],
+        );
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger
+            .record(entry(file, b"v2").with_created_dirs(vec![target("~/.config")]))
+            .expect("record");
+        assert_eq!(
+            ledger.get(&target(file)).expect("entry").created_dirs,
+            vec![target("~/.config/tool"), target("~/.config")],
+        );
     }
 
     /// A one-entry ledger whose entry names `path` but is stored under `key`.

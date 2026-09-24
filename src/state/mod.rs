@@ -111,7 +111,7 @@ pub use hash::ContentHash;
 pub use ledger::RestoreRef;
 pub use ledger::{Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes};
 pub use lock::{ExclusiveLock, Holder, SharedLock};
-pub use store::{Damage, Health, Loaded, Unlisted};
+pub use store::{Damage, Health, Loaded, MAX_STATE_FILE, Unlisted};
 
 /// Everything that can go wrong in the state directory.
 #[derive(Debug, thiserror::Error)]
@@ -336,6 +336,38 @@ pub enum Error {
         .path.display()
     )]
     DanglingLink {
+        /// The state file.
+        path: PathBuf,
+    },
+    /// The ledger's path — itself, or through a symbolic link — names
+    /// something other than a regular file or a directory: a FIFO, a device or
+    /// a socket. A directory is [`Error::Read`], as it always was.
+    ///
+    /// Nothing is read from it: a FIFO would block until a writer appeared,
+    /// and a device such as `/dev/zero` would never end. Nothing is renamed
+    /// either, because nothing is known about what it holds. The same thing at
+    /// the fingerprint cache is [`Damage::NotAFile`], and degrades to
+    /// recomputation.
+    #[error(
+        "{} is not a regular file (a FIFO, a device or a socket, or a symbolic link to one); bx will not read it as the ledger. Put the ledger back, or move it aside",
+        .path.display()
+    )]
+    StateNotAFile {
+        /// The state file.
+        path: PathBuf,
+    },
+    /// The ledger is longer than [`MAX_STATE_FILE`], a length no ledger bx
+    /// writes comes near.
+    ///
+    /// At most one byte past the limit is read, so the refusal costs a bounded
+    /// allocation. Nothing is renamed. The same length at the fingerprint cache
+    /// is [`Damage::TooLarge`], and degrades to recomputation.
+    #[error(
+        "{} is longer than {MAX_STATE_FILE} bytes, which no ledger bx writes comes near; bx will \
+         not read it. If it is a symbolic link, check what it points at",
+        .path.display()
+    )]
+    StateTooLarge {
         /// The state file.
         path: PathBuf,
     },

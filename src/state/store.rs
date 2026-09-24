@@ -74,6 +74,14 @@
 //! discarded, so silently degrading to an empty ledger would make `bx rm`
 //! restore bx's own generated content over the user's files. Losing a cache is
 //! a delay; losing the ledger is permanent.
+//!
+//! Three conditions of the *name* rather than the bytes are the exception, and
+//! only for a cache: a symbolic link that leads nowhere
+//! ([`Damage::DanglingLink`]), a name that leads to something other than a
+//! regular file ([`Damage::NotAFile`]), and a file longer than
+//! [`MAX_STATE_FILE`] ([`Damage::TooLarge`]). None of them can be read as a
+//! cache bx wrote, so a cache degrades and the name is moved aside, never what
+//! a link names. For the ledger each is refused and nothing is renamed.
 
 use std::path::{Path, PathBuf};
 
@@ -84,6 +92,15 @@ use super::Error;
 use super::dir::{check_lock, ensure_dir, move_aside, quarantines};
 use super::lock::ExclusiveLock;
 use crate::fs::{Mode, write_atomically};
+
+/// The longest state file [`load`] reads: 256 MiB.
+///
+/// Far beyond anything bx writes — the ledger indexes restore blobs rather
+/// than holding their bytes, and the fingerprint cache holds one hash per
+/// target — and small enough that reading one is a bounded allocation. A
+/// symbolic link at a state file to some large file elsewhere is otherwise
+/// read whole before the decoder can say it is not a state file.
+pub const MAX_STATE_FILE: u64 = 256 * 1024 * 1024;
 
 /// What every state file is wrapped in.
 ///
@@ -125,9 +142,12 @@ pub(crate) enum Loss {
 
 /// What was wrong with a state file that had to be discarded.
 ///
-/// Every variant but [`Damage::DanglingLink`] is a decode failure: the bytes
-/// were read, and they are not a usable envelope. A file that could not be read
-/// is not represented here — see [`Error::Read`] and the module documentation.
+/// Every variant but [`Damage::DanglingLink`], [`Damage::NotAFile`] and
+/// [`Damage::TooLarge`] is a decode failure: the bytes were read, and they are
+/// not a usable envelope. Those three are what is at the name rather than what
+/// is in it, and are damage only for a [`Loss::Recomputable`] file. A file
+/// that could not be read is not represented here — see [`Error::Read`] and the
+/// module documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Damage {
     /// The bytes are not a well-formed envelope.
@@ -156,6 +176,24 @@ pub enum Damage {
     /// [`Error::DanglingLink`]. Nothing is read through the link, and the
     /// quarantine moves the link itself, never what it names.
     DanglingLink,
+    /// What the file's path names — itself, or through a symbolic link — is
+    /// not a regular file or a directory: a FIFO, a device or a socket. A
+    /// directory is [`Error::Read`], as it always was.
+    ///
+    /// Only ever the health of a [`Loss::Recomputable`] file; for the ledger
+    /// this is [`Error::StateNotAFile`]. Nothing is read from it — a FIFO
+    /// would block the read until a writer appeared, and a link to
+    /// `/dev/zero` would never end — and the quarantine moves the name, never
+    /// what a link names.
+    NotAFile,
+    /// The file is longer than [`MAX_STATE_FILE`], a length no state file bx
+    /// writes comes near.
+    ///
+    /// Only ever the health of a [`Loss::Recomputable`] file; for the ledger
+    /// this is [`Error::StateTooLarge`]. At most one byte past the limit is
+    /// read, so an oversized file costs a bounded allocation rather than
+    /// whatever its length is.
+    TooLarge,
     /// The envelope decoded, and a ledger entry names a different path from
     /// the key it is stored under.
     ///
@@ -261,7 +299,9 @@ impl Damage {
             | Self::TrailingBytes
             | Self::WrongKind { .. }
             | Self::FutureVersion { .. }
-            | Self::DanglingLink => false,
+            | Self::DanglingLink
+            | Self::NotAFile
+            | Self::TooLarge => false,
         }
     }
 }
@@ -279,6 +319,14 @@ impl std::fmt::Display for Damage {
             Self::DanglingLink => f.write_str(
                 "it is a symbolic link to something that does not exist, or that cannot be \
                  followed",
+            ),
+            Self::NotAFile => f.write_str(
+                "it is not a regular file (a FIFO, a device or a socket), so it was not read",
+            ),
+            Self::TooLarge => write!(
+                f,
+                "it is longer than {MAX_STATE_FILE} bytes, which no state file bx writes comes \
+                 near",
             ),
             Self::KeyMismatch { rows } => {
                 let named = rows
@@ -452,6 +500,10 @@ impl<T> Loaded<T> {
 /// [`Error::FutureVersion`] for a [`Loss::Permanent`] file written by a newer
 /// bx; nothing is renamed.
 ///
+/// [`Error::StateNotAFile`] and [`Error::StateTooLarge`] for a
+/// [`Loss::Permanent`] file whose name leads to something other than a regular
+/// file, or to one longer than [`MAX_STATE_FILE`]; nothing is renamed.
+///
 /// [`Error::WrongLock`] if `lock` is not the lock of the directory holding
 /// `path`; nothing is read.
 ///
@@ -534,8 +586,27 @@ fn judge<T: DeserializeOwned + Default>(
     if let Some(lock) = lock {
         check_lock(path, lock)?;
     }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let bytes = match read_state_file(path) {
+        Ok(StateRead::Bytes(bytes)) => bytes,
+        // Neither was read, so neither can be called intact or damaged. The
+        // ledger is refused, as for a dangling link; a cache is moved aside
+        // like any other damage, and recomputed.
+        Ok(StateRead::NotAFile) => {
+            return match loss {
+                Loss::Permanent => Err(Error::StateNotAFile {
+                    path: path.to_path_buf(),
+                }),
+                Loss::Recomputable => degrade(path, Damage::NotAFile, lock, T::default()),
+            };
+        }
+        Ok(StateRead::TooLarge) => {
+            return match loss {
+                Loss::Permanent => Err(Error::StateTooLarge {
+                    path: path.to_path_buf(),
+                }),
+                Loss::Recomputable => degrade(path, Damage::TooLarge, lock, T::default()),
+            };
+        }
         Err(source) => {
             // `read` follows a symlink, so a link to nothing reads as no file,
             // a link that loops as `ELOOP`, and a link whose path runs through
@@ -624,6 +695,73 @@ fn judge<T: DeserializeOwned + Default>(
         }
         Err(Rejected::Refused(error)) => Err(error),
     }
+}
+
+/// What [`read_state_file`] found at a state file's path.
+#[derive(Debug)]
+enum StateRead {
+    /// A regular file of at most [`MAX_STATE_FILE`] bytes, and its bytes.
+    Bytes(Vec<u8>),
+    /// Something other than a regular file. Nothing was read from it.
+    NotAFile,
+    /// A regular file longer than [`MAX_STATE_FILE`]. At most one byte past
+    /// the limit was read.
+    TooLarge,
+}
+
+/// Read a state file, following a symbolic link, but only if what it names is
+/// a regular file, and only up to [`MAX_STATE_FILE`] bytes.
+///
+/// Plain `std::fs::read` accepted anything that opens: a FIFO at the ledger's
+/// name blocked `bx` forever in `open`, and a link to `/dev/zero` allocated
+/// until the process was killed. The restore blobs and the lock file were
+/// already guarded against both; this is the same guard for the state files.
+///
+/// A symbolic link is still followed, unlike for a restore blob: a state file
+/// kept elsewhere and linked into the state directory is a layout this module
+/// supports, and [`Error::DanglingLink`] exists for the one that leads
+/// nowhere. So the question asked is what the descriptor is, not what the name
+/// is. `O_NONBLOCK` is what keeps `open` from blocking on a FIFO before there
+/// is a descriptor to ask; on a regular file it changes nothing.
+///
+/// The length is bounded twice: by `st_size` before anything is allocated, and
+/// by reading at most one byte past the limit, so a file that grows after the
+/// `fstat` is still refused rather than read whole.
+///
+/// # Errors
+///
+/// The `open`, `fstat` or read failure, with its `errno`, so the caller's
+/// dangling-link and not-a-directory judgements see what `std::fs::read` gave
+/// them.
+fn read_state_file(path: &Path) -> std::io::Result<StateRead> {
+    use rustix::fs::{FileType, Mode as RawMode, OFlags};
+    use std::io::Read as _;
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        RawMode::empty(),
+    )?;
+    let stat = rustix::fs::fstat(&fd)?;
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::RegularFile => {}
+        // What `std::fs::read` gave for a directory, and what the caller has
+        // always reported as a read failure rather than damage: a directory
+        // neither blocks nor runs forever, and moving one aside as a damaged
+        // cache would be a stranger act than naming it.
+        FileType::Directory => return Err(rustix::io::Errno::ISDIR.into()),
+        _ => return Ok(StateRead::NotAFile),
+    }
+    if u64::try_from(stat.st_size).map_or(true, |size| size > MAX_STATE_FILE) {
+        return Ok(StateRead::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::from(fd)
+        .take(MAX_STATE_FILE + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_STATE_FILE) {
+        return Ok(StateRead::TooLarge);
+    }
+    Ok(StateRead::Bytes(bytes))
 }
 
 /// The shallowest component of `path`'s own directory chain that exists and is
@@ -1446,6 +1584,14 @@ mod tests {
                  followed",
             ),
             (
+                Damage::NotAFile,
+                "it is not a regular file (a FIFO, a device or a socket), so it was not read",
+            ),
+            (
+                Damage::TooLarge,
+                "it is longer than 268435456 bytes, which no state file bx writes comes near",
+            ),
+            (
                 Damage::KeyMismatch {
                     rows: vec![("~/.aaaa".to_string(), "~/.bbbb".to_string())],
                 },
@@ -2061,6 +2207,102 @@ mod tests {
         assert!(
             matches!(&err, Error::Read { path: at, .. } if *at == path),
             "got {err}",
+        );
+    }
+
+    /// Put a FIFO at `path`.
+    fn mkfifo(path: &Path) {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .expect("mkfifo");
+    }
+
+    #[test]
+    fn a_state_file_that_is_not_a_regular_file_is_never_read() {
+        // r5 (D1): `judge` read state files with plain `std::fs::read`, so a
+        // FIFO at the name blocked in `open` until a writer appeared, and a
+        // link to `/dev/zero` allocated until the process was killed. Both
+        // return at once now, whether the name is the thing or a link to it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        let fifo = || mkfifo(&path);
+        let to_zero = || std::os::unix::fs::symlink("/dev/zero", &path).expect("symlink");
+        for (stage, seed) in [("fifo", &fifo as &dyn Fn()), ("/dev/zero", &to_zero)] {
+            seed();
+            // The ledger is refused, lock or no lock, and nothing is renamed.
+            for held in [None, Some(&lock)] {
+                let err = load::<Value>(&path, KIND, VERSION, Loss::Permanent, held)
+                    .expect_err("a permanent file that is not a file is refused");
+                assert!(
+                    matches!(&err, Error::StateNotAFile { path: at } if *at == path),
+                    "{stage}: got {err}",
+                );
+                assert!(err.to_string().contains("not a regular file"), "{err}");
+                assert_eq!(names_but_the_lock(dir.path()), vec!["v.mpk"], "{stage}");
+            }
+            // A cache is reported without the lock, and moved aside with it.
+            let read: Loaded<Value> =
+                load(&path, KIND, VERSION, Loss::Recomputable, None).expect("lockless");
+            assert_eq!(read.health, Health::Damaged(Damage::NotAFile), "{stage}");
+            let opened: Loaded<Value> =
+                load(&path, KIND, VERSION, Loss::Recomputable, Some(&lock)).expect("locked");
+            assert_eq!(opened.health, Health::Reset(Damage::NotAFile), "{stage}");
+            assert!(opened.value.is_empty(), "{stage}");
+            assert!(std::fs::symlink_metadata(&path).is_err(), "{stage}: moved");
+            std::fs::remove_file(StateDir::quarantine(&path)).expect("clear");
+        }
+    }
+
+    #[test]
+    fn a_state_file_longer_than_the_limit_is_never_read_whole() {
+        // r5 (D1): the length was not bounded at all. A sparse file one byte
+        // past the limit costs nothing to make and is refused before any of
+        // it is allocated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        let seed = || {
+            std::fs::File::create(&path)
+                .expect("create")
+                .set_len(MAX_STATE_FILE + 1)
+                .expect("set_len");
+        };
+        seed();
+        for held in [None, Some(&lock)] {
+            let err = load::<Value>(&path, KIND, VERSION, Loss::Permanent, held)
+                .expect_err("an oversized permanent file is refused");
+            assert!(
+                matches!(&err, Error::StateTooLarge { path: at } if *at == path),
+                "got {err}",
+            );
+            assert!(err.to_string().contains("268435456 bytes"), "{err}");
+            assert_eq!(names_but_the_lock(dir.path()), vec!["v.mpk"]);
+        }
+        let read: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, None).expect("lockless");
+        assert_eq!(read.health, Health::Damaged(Damage::TooLarge));
+        let opened: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, Some(&lock)).expect("locked");
+        assert_eq!(opened.health, Health::Reset(Damage::TooLarge));
+        assert!(!path.exists(), "moved aside");
+
+        // Exactly the limit is still read, and judged on its bytes.
+        std::fs::File::create(&path)
+            .expect("create")
+            .set_len(MAX_STATE_FILE)
+            .expect("set_len");
+        let at_limit: Loaded<Value> =
+            load(&path, KIND, VERSION, Loss::Recomputable, None).expect("lockless");
+        assert!(
+            !matches!(at_limit.health.damage(), Some(Damage::TooLarge)),
+            "{:?}",
+            at_limit.health,
         );
     }
 

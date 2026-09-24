@@ -506,3 +506,526 @@ pub fn note(held: &[&BlockedEntry]) -> Option<String> {
             .join("; ")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::parse_str;
+    use crate::shell::testing::{installed, run};
+    use std::path::PathBuf;
+
+    const FILE: &str = "/repo/bx.toml";
+
+    fn load(text: &str) -> Result<crate::config::Config, String> {
+        parse_str(text, Path::new(FILE), Path::new("/home/u")).map_err(|e| e.to_string())
+    }
+
+    /// Parse `text` as one layer, resolve its values, and resolve its
+    /// functions against them.
+    fn resolved(text: &str) -> Result<Vec<Resolution<Function>>, String> {
+        let config = load(text)?;
+        let values = ResolvedValues::resolve(
+            config.values,
+            &config.value_assignments,
+            Path::new("/home/u"),
+        )
+        .map_err(|e| e.to_string())?;
+        resolve(&config.functions, &values).map_err(|e| e.to_string())
+    }
+
+    fn function(name: &str, body: &str, hook: Option<Hook>, when: Option<When>) -> Function {
+        Function {
+            name: name.to_string(),
+            body: body.to_string(),
+            hook,
+            when,
+        }
+    }
+
+    fn render_all(functions: &[Resolution<Function>], present: &dyn Fn(&str) -> bool) -> String {
+        let mut assembly = Assembly::new();
+        contribute(&mut assembly, functions, present);
+        assembly.render()
+    }
+
+    #[test]
+    fn an_entry_parses_every_key() {
+        let config = load(
+            "[[function]]\nname = \"venv\"\nbody = '''\nsource .venv/bin/activate\n'''\n\
+             tool = \"python3\"\nhook = \"chpwd\"\nwhen = \"interactive\"\n\
+             [[function]]\nname = \"x\"\nbody = \"y\"\nenabled = false\n",
+        )
+        .expect("parses");
+        let file = PathBuf::from(FILE);
+        assert_eq!(
+            config.functions,
+            vec![
+                FunctionDecl {
+                    name: "venv".to_string(),
+                    body: "source .venv/bin/activate\n".to_string(),
+                    tool: Some("python3".to_string()),
+                    hook: Some(Hook::Chpwd),
+                    when: Some(When::Interactive),
+                    enabled: true,
+                    origin: Origin {
+                        file: file.clone(),
+                        line: 1
+                    },
+                },
+                FunctionDecl {
+                    name: "x".to_string(),
+                    body: "y".to_string(),
+                    tool: None,
+                    hook: None,
+                    when: None,
+                    enabled: false,
+                    origin: Origin { file, line: 9 },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn every_hook_point_parses_and_names_its_array() {
+        for hook in Hook::ALL {
+            assert_eq!(Hook::parse(hook.name()), Ok(hook));
+            assert_eq!(hook.array(), format!("{}_functions", hook.name()));
+        }
+        let err = Hook::parse("prompt").expect_err("not a hook point");
+        assert!(err.contains("\"zsh_directory_name\""), "{err}");
+        assert!(err.contains("got \"prompt\""), "{err}");
+    }
+
+    #[test]
+    fn a_name_declared_twice_in_one_file_fails_the_load() {
+        for text in [
+            "[[function]]\nname = \"f\"\nbody = \"a\"\n[[function]]\nname = \"f\"\nbody = \"b\"\n",
+            "[[function]]\nname = \"f\"\nbody = \"a\"\n[[function]]\nname = \"f\"\nenabled = false\n",
+        ] {
+            let err = load(text).expect_err(text);
+            assert!(err.contains("duplicate function `f`"), "{text}: {err}");
+            assert!(err.contains("first declared at /repo/bx.toml:1"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_function_is_refused_naming_why() {
+        for (text, needle) in [
+            ("[[function]]\nbody = \"a\"\n", "`name`"),
+            ("[[function]]\nname = \"f\"\n", "`body`"),
+            (
+                "[[function]]\nname = \"f\"\nbody = 1\n",
+                "`body` must be a string",
+            ),
+            (
+                "[[function]]\nname = \"\"\nbody = \"a\"\n",
+                "not a function name",
+            ),
+            (
+                "[[function]]\nname = \"1f\"\nbody = \"a\"\n",
+                "not a function name",
+            ),
+            (
+                "[[function]]\nname = \"-f\"\nbody = \"a\"\n",
+                "not a function name",
+            ),
+            (
+                "[[function]]\nname = \"f g\"\nbody = \"a\"\n",
+                "not a function name",
+            ),
+            (
+                "[[function]]\nname = \"f()\"\nbody = \"a\"\n",
+                "not a function name",
+            ),
+            (
+                "[[function]]\nname = \"f$\"\nbody = \"a\"\n",
+                "not a function name",
+            ),
+            (
+                "[[function]]\nname = \"__bx_x\"\nbody = \"a\"\n",
+                "`__bx_` opens",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \" \\n\\t\"\n",
+                "the body is empty",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\\rb\"\n",
+                "control character",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\\u0000\"\n",
+                "control character",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"{{x\"\n",
+                "unterminated placeholder",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"{{X}}\"\n",
+                "not a value name",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\ntool = \"$(id)\"\n",
+                "`tool` names a tool",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nhook = \"prompt\"\n",
+                "zsh's own hook points",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nhook = \"chpwd\"\nwhen = \"tty\"\n",
+                "`when` must be one of",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nwhen = \"interactive\"\n",
+                "give it a `hook`",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nenabled = \"no\"\n",
+                "a boolean",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\ncommand = \"y\"\n",
+                "unknown key `command`",
+            ),
+            ("function = \"x\"\n", "a repeated section"),
+        ] {
+            let err = load(text).expect_err(text);
+            assert!(err.contains(needle), "{text}: {err}");
+            assert!(err.starts_with("/repo/bx.toml:"), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_body_is_substituted_and_spliced_verbatim() {
+        let functions = resolved(
+            "[[value]]\nname = \"scratch\"\nkind = \"string\"\n\
+             [values]\nscratch = \"/scratch/me\"\n\
+             [[function]]\nname = \"s\"\nbody = '''\ncd {{scratch}}/\"$1\" && echo {{{{x}}\n\
+             cat <<EOF\n  kept\nEOF\n'''\n",
+        )
+        .expect("resolves");
+        let [Resolution::Ready(ready)] = functions.as_slice() else {
+            panic!("{functions:?}");
+        };
+        assert_eq!(
+            ready.definition(),
+            "function s {\ncd /scratch/me/\"$1\" && echo {{x}}\ncat <<EOF\n  kept\nEOF\n}\n"
+        );
+        // A body with no trailing newline still closes on a line of its own.
+        assert_eq!(
+            function("f", "a", None, None).definition(),
+            "function f {\na\n}\n"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_value_holds_back_only_its_function_and_the_note_names_it() {
+        let text = "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\"\n\
+                    [[value]]\nname = \"b\"\nkind = \"string\"\n\
+                    [[function]]\nname = \"first\"\nbody = \"echo {{a}}\"\n\
+                    [[function]]\nname = \"needs_b\"\nbody = \"echo {{b}}\"\nhook = \"precmd\"\n\
+                    [[function]]\nname = \"last\"\nbody = \"echo plain\"\n";
+        let functions = resolved(text).expect("an unset value is not a load error");
+        let rendered = render_all(&functions, &|_| true);
+        assert!(
+            rendered.contains("function first {\necho x\n}\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("function last {\necho plain\n}\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("needs_b"), "{rendered}");
+        assert!(!rendered.contains("precmd"), "{rendered}");
+
+        let mut assembly = Assembly::new();
+        let held = contribute(&mut assembly, &functions, &|_| true);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].key, "needs_b");
+        assert_eq!(
+            held[0].reason,
+            BlockReason::UnsetValue {
+                names: vec!["b".to_string()]
+            }
+        );
+        assert_eq!(
+            note(&held).as_deref(),
+            Some("function `needs_b` held back: run `bx init` to set b")
+        );
+        assert_eq!(note(&[]), None);
+
+        // Answered, it arrives.
+        let answered = resolved(&format!("{text}[values]\nb = \"y\"\n")).expect("resolves");
+        assert!(answered.iter().all(|f| matches!(f, Resolution::Ready(_))));
+    }
+
+    #[test]
+    fn a_switched_off_or_unusable_value_holds_the_function_back_too() {
+        let off = resolved(
+            "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\"\nenabled = false\n\
+             [[function]]\nname = \"f\"\nbody = \"echo {{a}}\"\n",
+        )
+        .expect("resolves");
+        let [Resolution::Blocked(entry)] = off.as_slice() else {
+            panic!("{off:?}");
+        };
+        assert!(matches!(entry.reason, BlockReason::DisabledValue { .. }));
+        assert!(entry.hint.contains("re-enable a"), "{}", entry.hint);
+
+        let unusable = resolved(
+            "[[value]]\nname = \"root\"\nkind = \"path\"\n\
+             [values]\nroot = \"relative\"\n\
+             [[function]]\nname = \"f\"\nbody = \"cd {{root}}\"\n",
+        )
+        .expect("resolves");
+        let [Resolution::Blocked(entry)] = unusable.as_slice() else {
+            panic!("{unusable:?}");
+        };
+        assert!(matches!(entry.reason, BlockReason::InvalidValue { .. }));
+
+        // An answer that brings a control character into the body blocks it,
+        // naming the answer's line.
+        let carriage = resolved(
+            "[[value]]\nname = \"a\"\nkind = \"string\"\n\
+             [values]\na = \"x\\ry\"\n\
+             [[function]]\nname = \"f\"\nbody = \"echo {{a}}\"\n",
+        )
+        .expect("resolves");
+        let [Resolution::Blocked(entry)] = carriage.as_slice() else {
+            panic!("{carriage:?}");
+        };
+        assert!(matches!(entry.reason, BlockReason::InvalidValue { .. }));
+        assert!(entry.hint.contains("control character"), "{}", entry.hint);
+        assert!(
+            entry.hint.contains("the answer to `a` at /repo/bx.toml:5"),
+            "{}",
+            entry.hint
+        );
+    }
+
+    #[test]
+    fn a_repo_defect_in_a_body_fails_the_load() {
+        let err = resolved("[[function]]\nname = \"f\"\nbody = \"echo {{nobody}}\"\n")
+            .expect_err("an undeclared value");
+        assert!(err.contains("function `f`"), "{err}");
+        assert!(err.contains("`nobody`"), "{err}");
+        // A committed default alone brings the control character in.
+        let err = resolved(
+            "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\\ry\"\n\
+             [[function]]\nname = \"f\"\nbody = \"echo {{a}}\"\n",
+        )
+        .expect_err("no answer can clear it");
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
+    fn a_disabled_function_resolves_to_nothing() {
+        let functions =
+            resolved("[[function]]\nname = \"f\"\nbody = \"echo {{nobody}}\"\nenabled = false\n")
+                .expect("a disabled body is not read");
+        assert!(functions.is_empty());
+    }
+
+    #[test]
+    fn a_named_tool_never_gates_the_function() {
+        let functions =
+            resolved("[[function]]\nname = \"pick\"\nbody = \"fzf --multi\"\ntool = \"fzf\"\n")
+                .expect("resolves");
+        let rendered = render_all(&functions, &|_| panic!("the tool is never looked up"));
+        assert!(
+            rendered.ends_with("\n# bx phase: functions\nfunction pick {\nfzf --multi\n}\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_hooked_function_is_renamed_and_only_its_registration_is_gated() {
+        let hooked = function("venv", "echo v", Some(Hook::Chpwd), None);
+        assert_eq!(hooked.defined_name(), "__bx_hook_venv");
+        let definition = "function __bx_hook_venv {\necho v\n}\n";
+        let registration = "(( ${+chpwd_functions} )) && \
+                            (( ${chpwd_functions[(Ie)__bx_hook_venv]} )) || \
+                            chpwd_functions+=(__bx_hook_venv)\n";
+        assert_eq!(
+            hooked.render(&|_| false),
+            format!("{definition}{registration}")
+        );
+
+        let has = Function {
+            when: Some(When::Has("direnv".to_string())),
+            ..hooked.clone()
+        };
+        assert_eq!(
+            has.render(&|tool| tool == "direnv"),
+            format!("{definition}{registration}")
+        );
+        assert_eq!(has.render(&|_| false), definition);
+
+        let ssh = Function {
+            when: Some(When::Ssh),
+            ..hooked
+        };
+        assert_eq!(
+            ssh.render(&|_| unreachable!("a runtime test asks for no tool")),
+            format!("{definition}if [[ -n ${{SSH_CONNECTION-}} ]]; then\n  {registration}fi\n")
+        );
+
+        let plain = function("f", "x", None, None);
+        assert_eq!(plain.defined_name(), "f");
+        assert_eq!(plain.registration(), None);
+    }
+
+    #[test]
+    fn re_resolving_and_re_rendering_is_byte_identical_and_in_declared_order() {
+        let text = "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\"\n\
+                    [[function]]\nname = \"zz\"\nbody = \"echo {{a}}\"\nhook = \"precmd\"\n\
+                    [[function]]\nname = \"aa\"\nbody = \"echo a\"\nhook = \"precmd\"\n\
+                    when = \"interactive\"\n\
+                    [[function]]\nname = \"mm\"\nbody = \"echo m\"\n";
+        let render = || render_all(&resolved(text).expect("resolves"), &|_| true);
+        let first = render();
+        assert_eq!(first, render());
+        let zz = first.find("__bx_hook_zz {").expect("zz");
+        let aa = first.find("__bx_hook_aa {").expect("aa");
+        let mm = first.find("function mm {").expect("mm");
+        assert!(zz < aa && aa < mm, "{first}");
+    }
+
+    /// Run `script` in `zsh -f`, returning what it printed.
+    fn zsh(script: &str) -> Option<String> {
+        let zsh = installed("zsh")?;
+        Some(String::from_utf8(run(&zsh, &["-f"], script)).expect("utf-8"))
+    }
+
+    fn rendered_phase(functions: &[Function]) -> String {
+        let ready: Vec<Resolution<Function>> =
+            functions.iter().cloned().map(Resolution::Ready).collect();
+        render_all(&ready, &|_| true)
+    }
+
+    #[test]
+    fn co_registrants_all_run_and_nothing_outside_bx_is_clobbered() {
+        let ours = rendered_phase(&[
+            function("one", "print -r -- one", Some(Hook::Chpwd), None),
+            function("two", "print -r -- two", Some(Hook::Chpwd), None),
+        ]);
+        // A plugin defined its own `chpwd` and a function named as one of ours,
+        // and registered a hook of its own, before the functions phase; the
+        // user defines `one` again after it.
+        let script = format!(
+            "setopt nounset\n\
+             chpwd() {{ print -r -- plugin-chpwd }}\n\
+             one() {{ print -r -- plugin-one }}\n\
+             plugin_hook() {{ print -r -- plugin-hook }}\n\
+             chpwd_functions=(plugin_hook)\n\
+             {ours}{ours}\
+             one() {{ print -r -- user-one }}\n\
+             cd /\n\
+             print -r -- ${{(j:,:)chpwd_functions}}\n\
+             one\n"
+        );
+        let Some(got) = zsh(&script) else {
+            return;
+        };
+        assert_eq!(
+            got,
+            "plugin-chpwd\nplugin-hook\none\ntwo\n\
+             plugin_hook,__bx_hook_one,__bx_hook_two\n\
+             user-one\n"
+        );
+    }
+
+    #[test]
+    fn registration_is_safe_on_an_unset_array_under_nounset() {
+        let ours = rendered_phase(&[function("one", "print -r -- one", Some(Hook::Chpwd), None)]);
+        let Some(got) = zsh(&format!("setopt nounset\n{ours}cd /\n")) else {
+            return;
+        };
+        assert_eq!(got, "one\n");
+    }
+
+    #[test]
+    fn a_function_is_defined_past_an_alias_of_its_name_and_a_missing_tool_fails_only_its_call() {
+        let ours = rendered_phase(&[function(
+            "ll",
+            "definitely-not-installed-bx-tool \"$@\"",
+            None,
+            None,
+        )]);
+        let script = format!(
+            "alias ll='ls -la'\n{ours}unalias ll\n\
+             ll x 2>/dev/null\nprint -r -- status=$?\nprint -r -- still-running\n"
+        );
+        let Some(got) = zsh(&script) else {
+            return;
+        };
+        assert_eq!(got, "status=127\nstill-running\n");
+    }
+
+    #[test]
+    fn rendering_functions_changes_only_the_hook_arrays() {
+        // Invariant 2: the functions phase is not an environment fragment.
+        // Defining functions, and registering them, must leave every
+        // parameter as it was but the hook arrays, and export nothing. The
+        // hooked bodies decline to act, since zsh may call one of them — the
+        // directory-name hook — while the dump reads parameters; the unhooked
+        // one would export, were defining it to run it.
+        let mut functions: Vec<Function> = Hook::ALL
+            .iter()
+            .map(|hook| {
+                function(
+                    &format!("on_{}", hook.name()),
+                    "return 1",
+                    Some(*hook),
+                    None,
+                )
+            })
+            .collect();
+        functions.push(function(
+            "plain",
+            "export XDG_CONFIG_HOME=/elsewhere\nZ=3",
+            None,
+            None,
+        ));
+        functions.push(function(
+            "gated",
+            "true",
+            Some(Hook::Precmd),
+            Some(When::Interactive),
+        ));
+        let ours = rendered_phase(&functions);
+        let dump = "__bx_dump() { local n; for n in ${(ok)parameters}; do \
+                    [[ ${parameters[$n]} == *special* ]] || print -r -- \"$n=${(P)n}\"; \
+                    done; print -r -- ---; export; print -r -- ---; }\n";
+        let script = format!("{dump}__bx_dump >/dev/null\n__bx_dump\n{ours}__bx_dump\n");
+        let Some(got) = zsh(&script) else {
+            return;
+        };
+        let parts: Vec<&str> = got.split("---\n").collect();
+        let (before, exported_before, after, exported_after) =
+            (parts[0], parts[1], parts[2], parts[3]);
+        assert_eq!(exported_after, exported_before, "nothing is exported");
+        let arrays: Vec<String> = Hook::ALL.iter().map(|hook| hook.array()).collect();
+        let changed = |line: &&str| {
+            let name = line.split('=').next().unwrap_or_default();
+            !arrays.iter().any(|array| array == name)
+        };
+        let kept = |dump: &str| dump.lines().filter(changed).collect::<Vec<_>>().join("\n");
+        assert_eq!(kept(after), kept(before));
+        for hook in Hook::ALL {
+            let expected = format!("{}=__bx_hook_on_{}", hook.array(), hook.name());
+            assert!(
+                after.lines().any(|line| line == expected),
+                "{expected}: {after}"
+            );
+        }
+        // The dump does see an assignment, so the equality above means
+        // something.
+        let script = format!("{dump}__bx_dump >/dev/null\n__bx_dump\nZ=1\n__bx_dump\n");
+        let got = zsh(&script).expect("zsh is installed");
+        let parts: Vec<&str> = got.split("---\n").collect();
+        assert_ne!(parts[2], parts[0]);
+    }
+}

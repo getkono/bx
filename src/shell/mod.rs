@@ -57,6 +57,53 @@ pub mod alias;
 pub mod function;
 pub mod plugin;
 
+/// Running generated shell text in a real shell, for the submodules' tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
+
+    /// The installed shell `program`, or `None` on a machine excused from
+    /// supplying it. A runner may not excuse itself, as `env_guard`'s
+    /// differential checks rule.
+    pub(crate) fn installed(program: &str) -> Option<PathBuf> {
+        if let crate::detect::Presence::Present { path } = crate::detect::locate_in_env(program) {
+            return Some(path);
+        }
+        let excused = std::env::var_os("BX_TEST_WITHOUT_SHELLS").is_some();
+        assert!(
+            excused && std::env::var_os("CI").is_none(),
+            "{program} is not installed, so the shell checks held against it would assert \
+             nothing — install it, or set BX_TEST_WITHOUT_SHELLS off a runner"
+        );
+        None
+    }
+
+    /// Run `script` in `shell` with `flags` and an empty environment, and
+    /// return what it printed.
+    ///
+    /// The script is a file rather than `-c`, because zsh parses a `-c`
+    /// string whole, before any `alias` in it has run, and a startup file is
+    /// read the way a script file is: each line parsed once the ones before
+    /// it have run.
+    pub(crate) fn run(shell: &Path, flags: &[&str], script: &str) -> Vec<u8> {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let file = scratch.path().join("script");
+        std::fs::write(&file, script).expect("the script is written");
+        let output = std::process::Command::new(shell)
+            .args(flags)
+            .arg(&file)
+            .current_dir(scratch.path())
+            .env_clear()
+            .env("HOME", scratch.path())
+            .env("PATH", "/nonexistent")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("an installed shell runs");
+        assert!(output.status.success(), "{script}: {output:?}");
+        output.stdout
+    }
+}
+
 /// One named section of the generated interactive shell file.
 ///
 /// Declared in load order, so the derived `Ord` is the load order.

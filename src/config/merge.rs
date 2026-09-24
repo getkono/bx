@@ -1428,6 +1428,46 @@ mod tests {
     }
 
     #[test]
+    fn functions_merge_by_name_and_a_toggle_flips_one() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[[function]]\nname = \"a\"\nbody = \"one\"\n\
+                 [[function]]\nname = \"b\"\nbody = \"two\"\n\
+                 [[function]]\nname = \"c\"\nbody = \"three\"\nhook = \"chpwd\"\nenabled = false\n",
+            ),
+            global(
+                "modules/m.toml",
+                "[[function]]\nname = \"a\"\nbody = \"replaced\"\nhook = \"precmd\"\n",
+            ),
+            local(
+                "[[function]]\nname = \"b\"\nenabled = false\n\
+                 [[function]]\nname = \"c\"\nenabled = true\n",
+            ),
+        ])
+        .unwrap();
+        let functions: Vec<(&str, &str, &Path)> = merged
+            .functions
+            .iter()
+            .map(|f| (f.name.as_str(), f.body.as_str(), f.origin.file.as_path()))
+            .collect();
+        assert_eq!(
+            functions,
+            vec![
+                ("a", "replaced", Path::new("modules/m.toml")),
+                ("c", "three", Path::new("bx.toml")),
+            ]
+        );
+
+        let message = failure(&[
+            global("bx.toml", "[[function]]\nname = \"a\"\nbody = \"one\"\n"),
+            local("[[function]]\nname = \"z\"\nenabled = true\n"),
+        ]);
+        assert!(message.contains("`z`"), "{message}");
+        assert!(message.contains("a `body`"), "{message}");
+    }
+
+    #[test]
     fn a_later_layer_replaces_an_entry_in_place() {
         let merged = merge(&[
             global("bx.toml", &target_toml("~/.gitconfig", "global")),

@@ -54,13 +54,15 @@
 //! # Invariant 2
 //!
 //! The history settings are shell parameters the shell reads for itself, never
-//! exported, and none moves another tool's file. A history file is a file the
+//! exported — the rendered text unexports each one it assigns, because a shell
+//! keeps the export flag on a parameter it inherited from its environment —
+//! and none moves another tool's file. A history file is a file the
 //! shell itself keeps, and zsh has no default one at all, so declaring it
 //! relocates nothing; it is still refused inside a directory bx owns or bx's
 //! config repo, which the plan judges with
 //! [`crate::env_guard::refuses_bx_location`]. The tests run the rendered bytes
 //! in zsh and bash and hold them to changing only the parameters named above
-//! and exporting nothing.
+//! and exporting nothing, including when a parent exported them first.
 
 use std::path::Path;
 
@@ -147,16 +149,29 @@ impl History {
     /// The declaration in zsh's names, or nothing when it says nothing zsh
     /// reads.
     ///
-    /// `HISTFILE` first, then the sizes, then one `setopt` line and one
-    /// `unsetopt` line, each option in a fixed order.
+    /// `HISTFILE` first, then the sizes, then one `typeset -g +x` line naming
+    /// every parameter assigned, then one `setopt` line and one `unsetopt`
+    /// line, each option in a fixed order.
+    ///
+    /// The `typeset` line is what keeps the parameters unexported: zsh
+    /// exports a parameter it inherited from its environment, and assigning
+    /// one keeps that flag, so without it a `HISTFILE` an exported parent set
+    /// would carry the declared value to every child. `-g` keeps it from
+    /// declaring a local when the file is sourced inside a function.
     #[must_use]
     pub fn render_zsh(&self) -> String {
         let mut out = String::new();
+        let mut assigned: Vec<&str> = Vec::new();
         if let Some(file) = &self.zsh_file {
             out.push_str(&format!("HISTFILE={}\n", spell(file)));
+            assigned.push("HISTFILE");
         }
         if let Some(size) = self.size {
             out.push_str(&format!("HISTSIZE={size}\nSAVEHIST={size}\n"));
+            assigned.extend(["HISTSIZE", "SAVEHIST"]);
+        }
+        if !assigned.is_empty() {
+            out.push_str(&format!("typeset -g +x {}\n", assigned.join(" ")));
         }
         let mut options: Vec<ZshOption> = Vec::new();
         match self.duplicates {
@@ -196,15 +211,21 @@ impl History {
     /// order would truncate bash's default file rather than the declared one.
     /// `HISTCONTROL` is written whole whenever `duplicates` or `ignore_space`
     /// is declared, from exactly what is declared. `share` has no bash
-    /// equivalent and writes nothing.
+    /// equivalent and writes nothing. A last `export -n` line names every
+    /// variable assigned, for the reason [`History::render_zsh`] gives: an
+    /// assignment keeps the export flag a variable inherited from the
+    /// environment carries.
     #[must_use]
     pub fn render_bash(&self) -> String {
         let mut out = String::new();
+        let mut assigned: Vec<&str> = Vec::new();
         if let Some(file) = &self.bash_file {
             out.push_str(&format!("HISTFILE={}\n", spell(file)));
+            assigned.push("HISTFILE");
         }
         if let Some(size) = self.size {
             out.push_str(&format!("HISTSIZE={size}\nHISTFILESIZE={size}\n"));
+            assigned.extend(["HISTSIZE", "HISTFILESIZE"]);
         }
         if self.duplicates.is_some() || self.ignore_space.is_some() {
             let mut control = Vec::new();
@@ -217,6 +238,10 @@ impl History {
                 Some(Duplicates::Keep) | None => {}
             }
             out.push_str(&format!("HISTCONTROL={}\n", control.join(":")));
+            assigned.push("HISTCONTROL");
+        }
+        if !assigned.is_empty() {
+            out.push_str(&format!("export -n {}\n", assigned.join(" ")));
         }
         out
     }
@@ -511,10 +536,13 @@ mod tests {
             size: Some(10000),
             ..History::default()
         };
-        assert_eq!(history.render_zsh(), "HISTSIZE=10000\nSAVEHIST=10000\n");
+        assert_eq!(
+            history.render_zsh(),
+            "HISTSIZE=10000\nSAVEHIST=10000\ntypeset -g +x HISTSIZE SAVEHIST\n"
+        );
         assert_eq!(
             history.render_bash(),
-            "HISTSIZE=10000\nHISTFILESIZE=10000\n"
+            "HISTSIZE=10000\nHISTFILESIZE=10000\nexport -n HISTSIZE HISTFILESIZE\n"
         );
     }
 
@@ -524,14 +552,20 @@ mod tests {
             zsh_file: Some(portable("~/.zsh_history")),
             ..History::default()
         };
-        assert_eq!(zsh_only.render_zsh(), "HISTFILE=\"${HOME}/.zsh_history\"\n");
+        assert_eq!(
+            zsh_only.render_zsh(),
+            "HISTFILE=\"${HOME}/.zsh_history\"\ntypeset -g +x HISTFILE\n"
+        );
         assert_eq!(zsh_only.render_bash(), "");
         let bash_only = History {
             bash_file: Some(portable("/srv/history/bash")),
             ..History::default()
         };
         assert_eq!(bash_only.render_zsh(), "");
-        assert_eq!(bash_only.render_bash(), "HISTFILE=\"/srv/history/bash\"\n");
+        assert_eq!(
+            bash_only.render_bash(),
+            "HISTFILE=\"/srv/history/bash\"\nexport -n HISTFILE\n"
+        );
     }
 
     #[test]
@@ -539,36 +573,38 @@ mod tests {
         assert_eq!(
             declared().render_zsh(),
             "HISTFILE=\"${HOME}/.zsh_history\"\nHISTSIZE=10000\nSAVEHIST=10000\n\
+             typeset -g +x HISTFILE HISTSIZE SAVEHIST\n\
              setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n"
         );
         assert_eq!(
             declared().render_bash(),
-            "HISTSIZE=10000\nHISTFILESIZE=10000\nHISTCONTROL=erasedups\n"
+            "HISTSIZE=10000\nHISTFILESIZE=10000\nHISTCONTROL=erasedups\n\
+             export -n HISTSIZE HISTFILESIZE HISTCONTROL\n"
         );
         let cases = [
             (
                 Some(Duplicates::Keep),
                 None,
                 "unsetopt HIST_IGNORE_DUPS HIST_IGNORE_ALL_DUPS\n",
-                "HISTCONTROL=\n",
+                "HISTCONTROL=\nexport -n HISTCONTROL\n",
             ),
             (
                 Some(Duplicates::Adjacent),
                 Some(true),
                 "setopt HIST_IGNORE_DUPS HIST_IGNORE_SPACE\nunsetopt HIST_IGNORE_ALL_DUPS\n",
-                "HISTCONTROL=ignorespace:ignoredups\n",
+                "HISTCONTROL=ignorespace:ignoredups\nexport -n HISTCONTROL\n",
             ),
             (
                 None,
                 Some(false),
                 "unsetopt HIST_IGNORE_SPACE\n",
-                "HISTCONTROL=\n",
+                "HISTCONTROL=\nexport -n HISTCONTROL\n",
             ),
             (
                 None,
                 Some(true),
                 "setopt HIST_IGNORE_SPACE\n",
-                "HISTCONTROL=ignorespace\n",
+                "HISTCONTROL=ignorespace\nexport -n HISTCONTROL\n",
             ),
         ];
         for (duplicates, ignore_space, zsh, bash) in cases {
@@ -778,5 +814,72 @@ mod tests {
             "a\nb\nc\n"
         );
         assert_eq!(std::fs::read_to_string(&declared).expect("read"), "c\n");
+    }
+
+    #[test]
+    fn zsh_unexports_history_parameters_an_exported_parent_set() {
+        // A shell exports every parameter it imports from its environment,
+        // and assigning one keeps the flag: without the rendered `typeset +x`
+        // the declared values would reach every child process.
+        let Some(zsh) = installed("zsh") else {
+            return;
+        };
+        let child = format!(
+            "'{}' -f -c 'print -r -- child: ${{(ok)parameters[(R)*export*]}}'\n",
+            zsh.display()
+        );
+        let script = format!(
+            "export HISTFILE=/inherited HISTSIZE=5 SAVEHIST=5\n{}\
+             print -r -- \"$HISTFILE $HISTSIZE $SAVEHIST\"\n\
+             print -r -- ${{(t)HISTFILE}} ${{(t)HISTSIZE}} ${{(t)SAVEHIST}}\n{child}",
+            declared().render_zsh()
+        );
+        let got = String::from_utf8(run(&zsh, &["-f"], &script)).expect("utf-8");
+        let lines: Vec<&str> = got.lines().collect();
+        assert!(lines[0].ends_with("/.zsh_history 10000 10000"), "{got}");
+        assert!(!lines[1].contains("export"), "{got}");
+        assert!(lines[2].starts_with("child: "), "{got}");
+        for name in ["HISTFILE", "HISTSIZE", "SAVEHIST"] {
+            assert!(!lines[2].split(' ').any(|n| n == name), "{name}: {got}");
+        }
+    }
+
+    #[test]
+    fn bash_unexports_history_variables_an_exported_parent_set() {
+        let Some(bash) = installed("bash") else {
+            return;
+        };
+        let history = History {
+            bash_file: Some(portable("~/.bash_history")),
+            ignore_space: Some(true),
+            ..declared()
+        };
+        let child = format!(
+            "'{}' --norc --noprofile -c 'echo child: $(compgen -e)'\n",
+            bash.display()
+        );
+        let script = format!(
+            "export HISTFILE=/inherited HISTSIZE=5 HISTFILESIZE=5 HISTCONTROL=ignoreboth\n{}\
+             printf '%s|' \"$HISTFILE\" \"$HISTSIZE\" \"$HISTFILESIZE\" \"$HISTCONTROL\"\n\
+             echo; echo exported: $(compgen -e)\n{child}",
+            history.render_bash()
+        );
+        let got =
+            String::from_utf8(run(&bash, &["--norc", "--noprofile"], &script)).expect("utf-8");
+        assert!(
+            got.lines()
+                .next()
+                .is_some_and(|l| l.ends_with("/.bash_history|10000|10000|ignorespace:erasedups|")),
+            "{got}"
+        );
+        assert!(
+            got.contains("\nexported:") && got.contains("\nchild:"),
+            "{got}"
+        );
+        for name in ["HISTFILE", "HISTSIZE", "HISTFILESIZE", "HISTCONTROL"] {
+            for line in got.lines().skip(1) {
+                assert!(!line.split_whitespace().any(|n| n == name), "{name}: {got}");
+            }
+        }
     }
 }

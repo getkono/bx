@@ -2035,6 +2035,7 @@ mod tests {
                  HISTFILE=\"${HOME}/.zsh_history\"\n\
                  HISTSIZE=10000\n\
                  SAVEHIST=10000\n\
+                 typeset -g +x HISTFILE HISTSIZE SAVEHIST\n\
                  setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n\
                  \n# bx phase: terminal\n\
                  [[ -r ~/t.zsh ]] && source ~/t.zsh\n\

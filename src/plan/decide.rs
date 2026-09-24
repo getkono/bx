@@ -2445,6 +2445,7 @@ mod tests {
                     "{}\n# bx phase: options\n\
                      HISTFILE=\"${{HOME}}/.zsh_history\"\n\
                      HISTSIZE=10000\nSAVEHIST=10000\n\
+                     typeset -g +x HISTFILE HISTSIZE SAVEHIST\n\
                      setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n",
                     interactive("")
                 )

@@ -62,7 +62,8 @@
 //! establish that those arrays are the only parameters it changes. The
 //! `options` phase holds the declared `[history]` in zsh's names
 //! ([`crate::config::history`]): `HISTFILE`, `HISTSIZE` and `SAVEHIST`, which
-//! zsh reads for itself and does not export, and `setopt` lines. The history
+//! zsh reads for itself, a `typeset -g +x` line that keeps them unexported
+//! even when a parent exported them, and `setopt` lines. The history
 //! file is judged by the plan against bx's own directories, and that module's
 //! tests run the phase in zsh to establish that those three are the only
 //! parameters it changes and that it exports nothing.

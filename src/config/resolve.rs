@@ -217,7 +217,7 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
     match body {
         Body::File(path) => Some(("file", path.to_string_lossy())),
         Body::Secret(path) => Some(("secret", path.to_string_lossy())),
-        Body::Inline(_) | Body::Generated(_) | Body::Dir => None,
+        Body::Inline(_) | Body::Generated(_) | Body::Symlink(_) | Body::Dir => None,
     }
 }
 
@@ -1229,7 +1229,7 @@ fn for_each_string(target: &Target, visit: &mut impl FnMut(&str)) {
 
     match &target.body {
         Body::File(path) | Body::Secret(path) => visit(&path.to_string_lossy()),
-        Body::Inline(text) => visit(text),
+        Body::Inline(text) | Body::Symlink(text) => visit(text),
         Body::Generated(_) | Body::Dir => {}
     }
 
@@ -1304,6 +1304,13 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
             Body::Secret(confined)
         }
         Body::Inline(text) => Body::Inline(sub(text)?),
+        // Through the parser's own rule, as a `file` is: an answer can empty
+        // the text, or put a NUL or a `~name` at its start.
+        Body::Symlink(text) => {
+            let linked = sub(text)?;
+            super::target::check_link_text(&linked).map_err(|message| field(text, message))?;
+            Body::Symlink(linked)
+        }
         other => other.clone(),
     };
 
@@ -2039,6 +2046,47 @@ mod tests {
             ready(&ordinary, 0).body,
             Body::File(PathBuf::from("cfg/work/gitconfig")),
             "the case this spelling exists for still resolves"
+        );
+    }
+
+    #[test]
+    fn a_symlink_text_is_substituted_and_checked_again() {
+        const LAYER: &str = "[[value]]\n\
+                             name = \"tool\"\n\
+                             kind = \"string\"\n\
+                             [[target]]\n\
+                             path = \"~/.local/bin/tool\"\n\
+                             symlink = \"{{tool}}/bin/tool\"\n";
+
+        // An absolute answer is a link to an absolute path: a link's text is
+        // not confined to anything, and bx never follows it.
+        let ordinary = resolved(LAYER, Some("[values]\ntool = \"/opt/tool\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::Symlink("/opt/tool/bin/tool".to_string())
+        );
+        let home = resolved(LAYER, Some("[values]\ntool = \"~/src/tool\"\n")).unwrap();
+        assert_eq!(
+            ready(&home, 0).body,
+            Body::Symlink("~/src/tool/bin/tool".to_string()),
+            "stored as written; the home is rendered where the link is made"
+        );
+
+        // An answer that makes the text one no link can hold blocks the
+        // target, naming the answer.
+        let other = resolved(LAYER, Some("[values]\ntool = \"~other\"\n"))
+            .expect("an answer blocks its target, not the load");
+        let entry = blocked(&other, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["tool".to_string()]
+            }
+        );
+        assert!(
+            entry.hint.contains("another account's home"),
+            "{}",
+            entry.hint
         );
     }
 

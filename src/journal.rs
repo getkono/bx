@@ -2054,10 +2054,13 @@ impl Session {
                     mode,
                 });
                 (
-                    Some(
-                        NewEntry::new(target.clone(), dir_digest(), mode, mechanism.clone())
-                            .with_prior(prior),
-                    ),
+                    Some(NewEntry::new(
+                        target.clone(),
+                        dir_digest(),
+                        mode,
+                        mechanism.clone(),
+                        prior,
+                    )),
                     Some(mechanism.clone()),
                 )
             }
@@ -2105,7 +2108,9 @@ impl Session {
                 self.ledger.record(entry.with_created_dirs(claimed))?;
             }
             None => {
-                self.ledger.forget(&target);
+                // Released: bx gives the directory up, so the entry is
+                // dropped deliberately, as `remove` drops a file's.
+                let _ = self.ledger.forget(&target);
             }
         }
         self.crash.reached(index, Phase::AfterPublish);
@@ -2160,8 +2165,10 @@ impl Session {
         }
         refuse_moved(planned, &fs::observe(&dest)?)?;
         // The entry goes first here: `prune_claims` never removes a directory
-        // an entry still names, and this one names the directory itself.
-        self.ledger.forget(&target);
+        // an entry still names, and this one names the directory itself. The
+        // entry is dropped deliberately: its claims are `created_dirs`, which
+        // are pruned and released below.
+        let _ = self.ledger.forget(&target);
         let mut claims = Vec::with_capacity(created_dirs.len() + 1);
         claims.push(dest);
         claims.extend(created_dirs);

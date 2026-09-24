@@ -20,6 +20,7 @@
 //! binary through one install channel, so a repo and a binary are versioned
 //! together, and a silent no-op is the failure mode this tool exists to end.
 
+pub mod env;
 pub mod layers;
 pub mod merge;
 pub mod origin;
@@ -30,6 +31,7 @@ pub mod values;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
 use toml_edit::{Document, Item, Table};
@@ -60,6 +62,8 @@ pub struct Config {
     pub values: Vec<ValueDecl>,
     /// `[values]`, in document order. Parsed, never resolved.
     pub value_assignments: Vec<ValueAssignment>,
+    /// `[[env]]`, keyed by `name`.
+    pub envs: Vec<EnvDecl>,
     /// List entries that restate only their natural key and `enabled`.
     ///
     /// A **toggle**: it flips the flag on an entry an earlier layer introduced
@@ -354,6 +358,14 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     }
                 }
             }
+            "env" => {
+                for table in entries(root, name, item, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Env, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config.envs.push(env::parse_env(table, file, text)?),
+                    }
+                }
+            }
             "values" => {
                 let table = item.as_table().ok_or_else(|| Error::WrongType {
                     origin: section_origin(root, name, file, text),
@@ -391,6 +403,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|v| (v.name.as_str(), &v.origin))
             .chain(toggles_in(&config, merge::Section::Value))
+            .collect(),
+    )?;
+    check_unique(
+        "env",
+        config
+            .envs
+            .iter()
+            .map(|e| (e.name.as_str(), &e.origin))
+            .chain(toggles_in(&config, merge::Section::Env))
             .collect(),
     )?;
 
@@ -1237,13 +1258,28 @@ mod tests {
     fn every_section_lands_in_its_own_field() {
         let text = "[[target]]\npath = \"~/.gitconfig\"\nfile = \"f\"\n\n\
                     [[value]]\nname = \"git_email\"\nkind = \"email\"\nrequired = true\n\n\
-                    [values]\ngit_email = \"someone@example.invalid\"\n";
+                    [values]\ngit_email = \"someone@example.invalid\"\n\n\
+                    [[env]]\nname = \"LANG\"\nvalue = \"C.UTF-8\"\nkind = \"environment\"\n";
         let config = parse(text).unwrap();
 
         assert_eq!(config.targets.len(), 1);
         assert_eq!(config.values.len(), 1);
         assert_eq!(config.value_assignments.len(), 1);
         assert_eq!(config.value_assignments[0].name, "git_email");
+        assert_eq!(config.envs.len(), 1);
+        assert_eq!(config.envs[0].name, "LANG");
+    }
+
+    #[test]
+    fn a_duplicate_env_name_in_one_layer_is_rejected() {
+        let entry = "[[env]]\nname = \"LANG\"\nvalue = \"C\"\nkind = \"gui\"\n";
+        let twice = message(&format!("{entry}{entry}"));
+        assert!(twice.contains("duplicate env `LANG`"), "{twice}");
+        // And a toggle beside the entry it flips is the same ambiguity.
+        let toggled = message(&format!(
+            "{entry}[[env]]\nname = \"LANG\"\nenabled = false\n"
+        ));
+        assert!(toggled.contains("duplicate env `LANG`"), "{toggled}");
     }
 
     #[test]

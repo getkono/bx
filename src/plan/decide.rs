@@ -18,7 +18,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{Change, Diff, Error};
+use super::{Change, Diff, Error, region};
+use crate::config::env::Syntax;
 use crate::config::resolve::Resolution;
 use crate::config::target::{Attach, Body, Direction, Format, Gen, Target};
 use crate::env_guard::{self, RootSet};
@@ -343,6 +344,9 @@ pub(super) struct Op {
 enum Made {
     /// A file holding these bytes, owned whole.
     Bytes(Vec<u8>),
+    /// A file holding these bytes, whole, of which bx owns the one region
+    /// delimited with this comment character.
+    Region(Vec<u8>, char),
     /// A directory, created or set to the op's mode.
     Dir,
 }
@@ -354,7 +358,10 @@ impl Op {
     }
 
     /// The journal request that makes this write: bx owning the whole file,
-    /// or the directory.
+    /// a region of it, or the directory.
+    ///
+    /// A region is written as the whole file it sits in, so the journal holds
+    /// the bytes it displaces whole and a roll back restores every one of them.
     pub(super) fn into_request(self) -> Request {
         let (content, mechanism) = match self.made {
             Made::Bytes(bytes) => (
@@ -363,6 +370,13 @@ impl Op {
                     planned: self.planned,
                 },
                 Mechanism::Own,
+            ),
+            Made::Region(bytes, comment) => (
+                Content::Bytes {
+                    bytes,
+                    planned: self.planned,
+                },
+                Mechanism::Region { comment },
             ),
             Made::Dir => (
                 Content::Dir {
@@ -421,7 +435,19 @@ pub(super) fn decide(
 
     let dest = target.path.render(ctx.home);
     let observed = fs::observe(&dest)?;
-    let mode = Mode::resolve(target.mode, Kind::File);
+    let (bytes, mode) = match target.attach {
+        Attach::Region { comment } => match placed_in_region(&observed, comment, &bytes, target) {
+            Ok(placed) => placed,
+            Err(why) => {
+                let note = format!(
+                    "bx's region in this file is damaged: {why}. Leave one `{comment} >>> bx \
+                     >>>` line and one `{comment} <<< bx <<<` line after it, or none"
+                );
+                return Ok((row(Action::Conflict, None, Some(note)), None));
+            }
+        },
+        _ => (bytes, Mode::resolve(target.mode, Kind::File)),
+    };
     let outcome = fs::compare(
         &observed,
         &Desired {
@@ -440,15 +466,17 @@ pub(super) fn decide(
             Some(portable_reason(&parent.path, reason, ctx.home))
         })
         .or(outcome.note);
-    let (action, note) = ownership(
-        outcome.action,
-        &observed,
-        ctx.ledger.get(&target.path),
-        join([
-            note,
-            parent_note(&observed, mode, ctx).unwrap_or(outcome.parent_note),
-        ]),
-    );
+    let note = join([
+        note,
+        parent_note(&observed, mode, ctx).unwrap_or(outcome.parent_note),
+    ]);
+    let entry = ctx.ledger.get(&target.path);
+    let (action, note) = match target.attach {
+        Attach::Region { comment } => {
+            region_ownership(outcome.action, &observed, entry, comment, note)
+        }
+        _ => ownership(outcome.action, &observed, entry, note),
+    };
 
     // A write into a directory its owner cannot write or search is refused
     // here, so `apply` never reaches `stage` for it. A row with no write is
@@ -488,11 +516,95 @@ pub(super) fn decide(
     let op = action.is_pending().then(|| Op {
         target: target.path.clone(),
         dest,
-        made: Made::Bytes(bytes),
+        made: match target.attach {
+            Attach::Region { comment } => Made::Region(bytes, comment),
+            _ => Made::Bytes(bytes),
+        },
         planned: observed,
         mode,
     });
     Ok((change, op))
+}
+
+/// The whole file a region target leaves, and the mode it leaves it at.
+///
+/// Every byte outside the region is the file's own, carried through. The mode
+/// is the target's when it declares one, and otherwise the file's own, so
+/// attaching to a file the user keeps at `0600` never widens it; a file bx
+/// creates gets the default.
+///
+/// # Errors
+///
+/// Why the file's delimiters do not make one region.
+fn placed_in_region(
+    observed: &Observed,
+    comment: char,
+    body: &[u8],
+    target: &Target,
+) -> Result<(Vec<u8>, Mode), &'static str> {
+    let file = observed
+        .bytes
+        .as_deref()
+        .filter(|_| observed.kind == Kind::File);
+    let whole = region::splice(file, comment, body)?;
+    let mode = match (target.mode, file.and(observed.mode)) {
+        (Some(declared), _) => declared,
+        (None, Some(own)) => own,
+        (None, None) => Mode::resolve(None, Kind::File),
+    };
+    Ok((whole, mode))
+}
+
+/// Settle what the comparison found for a region target against the ledger.
+///
+/// The region is bx's and the rest of the file is the user's, so an edit
+/// outside the region is never a conflict: while the region holds what bx
+/// wants the comparison finds nothing to do, and a region appended to a file
+/// the user wrote is additive. What is refused is a rewrite that would undo
+/// the user's own act on bx's lines:
+///
+/// * the ledger says bx attached to this file some other way;
+/// * bx wrote a region here and it is gone — the user removed it;
+/// * a region is there that bx has no record of writing;
+/// * the region differs from what bx wants and the file is not as bx last
+///   left it. Whether the edit was inside the region or beside it cannot be
+///   told from a whole-file record, so the region is left as it is.
+///
+/// A rewrite of a region bx wrote, in a file nobody else has touched since, is
+/// a modify, as a file bx owns whole is.
+fn region_ownership(
+    action: Action,
+    observed: &Observed,
+    entry: Option<&LedgerEntry>,
+    comment: char,
+    note: Option<String>,
+) -> (Action, Option<String>) {
+    let conflict = |why: &str| {
+        (
+            Action::Conflict,
+            join([Some(why.to_string()), note.clone()]),
+        )
+    };
+    if let (Action::Create | Action::Modify, Some(entry)) = (action, entry)
+        && entry.mechanism != (Mechanism::Region { comment })
+    {
+        return conflict(&format!(
+            "bx attached to this file as {}",
+            attached_as(&entry.mechanism)
+        ));
+    }
+    let (Action::Modify, Some(bytes)) = (action, observed.bytes.as_deref()) else {
+        return (action, note);
+    };
+    match (region::find(bytes, comment), entry) {
+        (region::Found::Absent, None) => (action, note),
+        (region::Found::Absent, Some(_)) => conflict("bx's region was removed since bx wrote it"),
+        (_, None) => conflict("it holds a bx region bx has no record of writing"),
+        (_, Some(entry)) if observed.digest() != Some(entry.written) => {
+            conflict("edited since bx last wrote it, and bx's region differs from what bx wants")
+        }
+        _ => (action, note),
+    }
 }
 
 /// Decide a directory target: create it, set its mode, leave it, or refuse.
@@ -704,8 +816,8 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
             std::fs::read(&path).map_err(body)?
         }
         Body::Generated(generator) => {
-            let content = generate(generator);
-            if let Some(note) = guard_fragment(&content, ctx.roots) {
+            let content = generator.render();
+            if let Some(note) = guard_generated(generator, &content, ctx.roots) {
                 return Ok(Wanted::Blocked(note));
             }
             content.into_bytes()
@@ -718,32 +830,40 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
 }
 
 /// Why a target's attachment, direction or format cannot be written yet.
+///
+/// A region is written for a generated body only. The placement graph's
+/// regions hold fixed text, so a rewrite of one is never a question of whose
+/// edit wins; a region a config author fills with a body of their own changes
+/// whenever the body does, and deciding that against an edit beside it is
+/// entry C1's.
 fn unsupported(target: &Target) -> Option<&'static str> {
     match (&target.attach, target.direction, &target.format) {
-        (Attach::Region { .. }, _, _) => Some("a managed region is not supported until entry C1"),
+        (Attach::Region { .. }, _, _) if !matches!(target.body, Body::Generated(_)) => {
+            Some("a managed region is not supported until entry C1")
+        }
         (Attach::Include { .. }, _, _) => Some("an include line is not supported until entry C1"),
         (_, Direction::Track, _) => Some("track mode is not supported until entry C4"),
         (_, _, Format::Jsonc { .. }) => Some("owning JSONC keys is not supported until entry C3"),
-        (_, _, Format::EnvD) => Some("an env.d fragment is not supported until entry B1"),
-        (Attach::Own, Direction::Apply, Format::Opaque) => None,
+        (Attach::Own | Attach::Region { .. }, Direction::Apply, Format::Opaque | Format::EnvD) => {
+            None
+        }
     }
 }
 
-/// The content a generator produces.
+/// Judge a generated body against Invariant 2, as what it is.
 ///
-/// [`Gen`] has no variants yet, so this cannot be called. It exists so the one
-/// route from a generated body to bytes already passes through
-/// [`guard_fragment`]: the first generator adds its arm here.
-///
-/// # Decision 36: `generate -> String::new()` is an equivalent mutant
-///
-/// `cargo mutants` reports that mutant as missed, and no test can kill it:
-/// `Gen` is uninhabited, so no `Body::Generated` value exists and this function
-/// is unreachable. The entry that adds the first `Gen` variant makes the arm
-/// reachable, and must test its generated body end to end through
-/// [`guard_fragment`]; the mutant becomes killable by that entry's tests.
-const fn generate(generator: &Gen) -> String {
-    match *generator {}
+/// An environment fragment goes through the guard in its own syntax. The line
+/// a region sources a fragment with sets nothing, so it is not a fragment:
+/// the guard's grammar would refuse it as unreadable, and `env_guard`'s tests
+/// hold its bytes to carrying no assignment instead.
+fn guard_generated(generator: &Gen, content: &str, roots: &RootSet) -> Option<String> {
+    match generator {
+        Gen::Env(fragment) => match fragment.syntax {
+            Syntax::Zsh => guard_fragment(content, roots),
+            Syntax::EnvironmentD => guard_environment_d(content, roots),
+        },
+        Gen::Source(_) => None,
+    }
 }
 
 /// Judge a generated environment fragment against Invariant 2.
@@ -753,8 +873,19 @@ const fn generate(generator: &Gen) -> String {
 /// the guard's grammar admits nothing but assignments, and a file the user
 /// wrote is not bx's output to judge.
 pub(super) fn guard_fragment(content: &str, roots: &RootSet) -> Option<String> {
+    violations(&env_guard::scan_with(content, roots))
+}
+
+/// [`guard_fragment`] for an `environment.d` fragment, where every line is
+/// exported although none says `export`.
+fn guard_environment_d(content: &str, roots: &RootSet) -> Option<String> {
+    violations(&env_guard::scan_exported(content, roots))
+}
+
+/// One note naming each violation as `line N: NAME <reason>`.
+fn violations(found: &[env_guard::Violation]) -> Option<String> {
     join(
-        env_guard::scan_with(content, roots)
+        found
             .iter()
             .map(|v| Some(format!("line {}: {} {}", v.line, v.name, v.reason))),
     )
@@ -902,7 +1033,9 @@ mod tests {
             change(&mut target);
             target
         };
-        let cases: [(Target, &str); 6] = [
+        // An env.d fragment is written since entry B1, and a region around a
+        // generated body; a region around a body a config author wrote is not.
+        let cases: [(Target, &str); 5] = [
             (
                 shaped(|t| t.attach = Attach::Region { comment: '#' }),
                 "entry C1",
@@ -924,7 +1057,6 @@ mod tests {
                 }),
                 "entry C3",
             ),
-            (shaped(|t| t.format = Format::EnvD), "entry B1"),
             // A directory is blocked by its shape like a file, before the
             // destination is looked at.
             (

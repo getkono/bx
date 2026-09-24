@@ -111,20 +111,45 @@ pub enum Body {
 
 /// The generators a target's body can be produced by.
 ///
-/// **Empty at this entry, and that is honest**: nothing generates anything yet,
-/// so every `generated = "…"` is an unknown generator and a parse error naming
-/// its origin. Each generating entry adds one variant here and one arm in
-/// [`parse_generated`], keyed by the string a config author writes.
+/// Each variant carries everything its bytes are made of, so producing them is
+/// a pure function of the resolved target: the plan decides on exactly the
+/// bytes `apply` writes. [`Gen::render`] is that function.
+///
+/// Every variant so far is produced by the `[[env]]` placement graph
+/// ([`super::env`]) and none is named by a config author: a fragment carries
+/// the variables resolution placed in it, which no `generated = "…"` string
+/// could spell. A generator a config author may name adds its variant here and
+/// its arm in [`parse_generated`] together.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Gen {}
+pub enum Gen {
+    /// An environment fragment: the variables one place holds. The plan judges
+    /// it against the declared roots before it is written.
+    Env(super::env::Fragment),
+    /// The one line of a fixed region, sourcing a fragment when it is readable.
+    /// Sets nothing, so it is not an environment fragment and is not judged as
+    /// one; `env_guard`'s tests hold its bytes to carrying no assignment.
+    Source(Portable),
+}
+
+impl Gen {
+    /// The body this generator produces.
+    #[must_use]
+    pub fn render(&self) -> String {
+        match self {
+            Self::Env(fragment) => fragment.render(),
+            Self::Source(fragment) => super::env::source_line(fragment),
+        }
+    }
+}
 
 /// Resolve the name a config author wrote as `generated = "…"`.
 ///
-/// Returns `None` for every name, because [`Gen`] has no variants yet.
+/// Returns `None` for every name: each generator there is so far is placed by
+/// the `[[env]]` placement graph, carrying data no name could spell. See
+/// [`Gen`].
 #[must_use]
 pub fn parse_generated(_name: &str) -> Option<Gen> {
-    // `Gen` has no variants, so there is nothing any name could resolve to.
-    // Each generating entry adds its variant and a `match` arm here together.
+    // A generator a config author may name adds its `match` arm here.
     None
 }
 

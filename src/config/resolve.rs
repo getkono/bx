@@ -58,8 +58,9 @@
 
 use std::path::Path;
 
+use super::env::{EnvDecl, Fragment, Place, Syntax};
 use super::merge::Conflict;
-use super::target::{Attach, Body, Format, KeyPath, Target};
+use super::target::{Attach, Body, Direction, Format, Gen, KeyPath, Target};
 use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
@@ -165,7 +166,7 @@ pub struct Resolved {
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
-    let targets = merged
+    let mut targets = merged
         .targets
         .iter()
         .map(|target| {
@@ -177,10 +178,230 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;
+    targets.extend(place_envs(&merged.envs, &values)?);
 
     refuse_shared_files(&targets)?;
 
     Ok(Resolved { values, targets })
+}
+
+/// The targets the `[[env]]` placement graph derives, after every declared
+/// target.
+///
+/// For each [`Place`] at least one variable lands in, in [`Place::ALL`]'s
+/// order: the fragment bx owns whole, and for a shell place the fixed region
+/// in the user's startup file that sources it. A fragment is held back when
+/// any variable it holds is — naming every value it waits on — and that costs
+/// that fragment alone: every other fragment, every region and every declared
+/// target still resolve. A region is never held back: its bytes name the
+/// fragment and nothing else, and it sources the fragment only once one is
+/// there to read.
+///
+/// # Errors
+///
+/// [`Error::BadValue`] for a variable whose value is a repo defect: a
+/// malformed placeholder, a reference to a value no layer declares, or a
+/// committed `default` that puts a character no fragment line can hold into
+/// it.
+fn place_envs(envs: &[EnvDecl], values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
+    let resolved = envs
+        .iter()
+        .map(|decl| Ok((decl, resolve_env(decl, values)?)))
+        .collect::<Result<Vec<_>, Error>>()?;
+
+    let mut placed = Vec::new();
+    for place in Place::ALL {
+        let here: Vec<&(&EnvDecl, Resolution<(String, String)>)> = resolved
+            .iter()
+            .filter(|(decl, _)| decl.kind.places().contains(&place))
+            .collect();
+        let Some((first, _)) = here.first() else {
+            continue;
+        };
+        let origin = first.origin.clone();
+        let portable = |raw: &str| {
+            Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
+                origin: origin.clone(),
+                message: format!("`{raw}` cannot be placed under this home: {source}"),
+            })
+        };
+        let fragment = portable(place.fragment())?;
+        let held: Vec<&BlockedEntry> = here
+            .iter()
+            .filter_map(|(_, resolution)| match resolution {
+                Resolution::Blocked(entry) => Some(entry),
+                Resolution::Ready(_) => None,
+            })
+            .collect();
+        placed.push(if held.is_empty() {
+            let vars = here
+                .iter()
+                .filter_map(|(_, resolution)| match resolution {
+                    Resolution::Ready(var) => Some(var.clone()),
+                    Resolution::Blocked(_) => None,
+                })
+                .collect();
+            let format = match place.syntax() {
+                Syntax::EnvironmentD => Format::EnvD,
+                Syntax::Zsh => Format::Opaque,
+            };
+            Resolution::Ready(placed_target(
+                fragment.clone(),
+                Gen::Env(Fragment {
+                    syntax: place.syntax(),
+                    vars,
+                }),
+                Attach::Own,
+                format,
+                &origin,
+            ))
+        } else {
+            let (reason, hint) = held_together(&held, values);
+            Resolution::Blocked(BlockedEntry {
+                key: fragment.to_string(),
+                origin: origin.clone(),
+                reason,
+                hint,
+            })
+        });
+        if let Some(file) = place.startup_file() {
+            placed.push(Resolution::Ready(placed_target(
+                portable(file)?,
+                Gen::Source(fragment),
+                Attach::Region { comment: '#' },
+                Format::Opaque,
+                &origin,
+            )));
+        }
+    }
+    Ok(placed)
+}
+
+/// A target the placement graph derives, attributed to the first variable
+/// that put it there.
+fn placed_target(
+    path: Portable,
+    generator: Gen,
+    attach: Attach,
+    format: Format,
+    origin: &Origin,
+) -> Target {
+    Target {
+        path,
+        body: Body::Generated(generator),
+        mode: None,
+        attach,
+        direction: Direction::Apply,
+        format,
+        requires: Vec::new(),
+        references: Vec::new(),
+        enabled: true,
+        origin: origin.clone(),
+    }
+}
+
+/// Substitute one variable's value, or explain why it cannot be — in the
+/// vocabulary a target is held back in, keyed by the variable's name.
+///
+/// # Errors
+///
+/// [`Error::BadValue`] for a repo defect, as [`place_envs`] lists.
+fn resolve_env(
+    decl: &EnvDecl,
+    values: &ResolvedValues,
+) -> Result<Resolution<(String, String)>, Error> {
+    let block = |reason, hint| {
+        Ok(Resolution::Blocked(BlockedEntry {
+            key: decl.name.clone(),
+            origin: decl.origin.clone(),
+            reason,
+            hint,
+        }))
+    };
+    let names_of = |names: Vec<String>| in_declaration_order(values, names);
+    match values.substitute(&decl.value) {
+        Ok(value) => {
+            let Some(problem) = super::env::unwritable(&value) else {
+                return Ok(Resolution::Ready((decl.name.clone(), value)));
+            };
+            // Checked as written at parse, so the character came in through a
+            // value: an account's answer, whose line the hint names, or a
+            // committed `default` alone, which no answer can clear.
+            let problem = format!("env `{}`: {problem}", decl.name);
+            let causes = values.account_inputs(&decl.value);
+            if causes.is_empty() {
+                return Err(Error::BadValue {
+                    origin: decl.origin.clone(),
+                    message: problem,
+                });
+            }
+            let names = names_of(causes);
+            let hint = values.answers_hint(&problem, &[decl.value.as_str()], &names);
+            block(BlockReason::InvalidValue { names }, hint)
+        }
+        Err(Unresolved::Disabled { names }) => {
+            let names = names_of(names);
+            let hint =
+                super::values::disabled_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            block(BlockReason::DisabledValue { names }, hint)
+        }
+        Err(Unresolved::Invalid { names }) => {
+            let names = names_of(names);
+            let hint = values.invalid_hint(&names);
+            block(BlockReason::InvalidValue { names }, hint)
+        }
+        Err(Unresolved::Unset { names }) => {
+            let names = names_of(names);
+            let hint =
+                super::values::init_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            block(BlockReason::UnsetValue { names }, hint)
+        }
+        Err(defect) => Err(Error::BadValue {
+            origin: decl.origin.clone(),
+            message: format!("env `{}`: {defect}", decl.name),
+        }),
+    }
+}
+
+/// One reason and one hint for a fragment several held-back variables share,
+/// ranked as [`resolve_target`] ranks one target's: a switched-off declaration
+/// first, then an unusable answer, then an unanswered value. Every name of the
+/// winning class is named, in declaration order.
+fn held_together(held: &[&BlockedEntry], values: &ResolvedValues) -> (BlockReason, String) {
+    let mut disabled = Vec::new();
+    let mut invalid = Vec::new();
+    let mut invalid_hints: Vec<&str> = Vec::new();
+    let mut unset = Vec::new();
+    for entry in held {
+        match &entry.reason {
+            BlockReason::DisabledValue { names } => disabled.extend(names.iter().cloned()),
+            BlockReason::InvalidValue { names } => {
+                invalid.extend(names.iter().cloned());
+                if !invalid_hints.contains(&entry.hint.as_str()) {
+                    invalid_hints.push(&entry.hint);
+                }
+            }
+            BlockReason::UnsetValue { names } => unset.extend(names.iter().cloned()),
+        }
+    }
+    fn spelled(names: &[String]) -> Vec<&str> {
+        names.iter().map(String::as_str).collect()
+    }
+    if !disabled.is_empty() {
+        let names = in_declaration_order(values, disabled);
+        let hint = super::values::disabled_hint(&spelled(&names));
+        (BlockReason::DisabledValue { names }, hint)
+    } else if !invalid.is_empty() {
+        let names = in_declaration_order(values, invalid);
+        (
+            BlockReason::InvalidValue { names },
+            invalid_hints.join("; "),
+        )
+    } else {
+        let names = in_declaration_order(values, unset);
+        let hint = super::values::init_hint(&spelled(&names));
+        (BlockReason::UnsetValue { names }, hint)
+    }
 }
 
 /// Refuse two ready targets that write one file.

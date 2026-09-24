@@ -19,6 +19,7 @@
 mod decide;
 mod diff;
 mod execute;
+mod region;
 
 use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;

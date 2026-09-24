@@ -1978,6 +1978,47 @@ mod tests {
     }
 
     #[test]
+    fn history_and_shell_options_merge_key_by_key_the_last_layer_winning() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[history]\nsize = 10000\nshare = true\n[history.file]\nzsh = \"~/.zsh_history\"\n\
+                 [shell-options]\nhistappend = true\ncheckwinsize = true\n",
+            ),
+            global("modules/k.toml", "[history]\nsize = 500\n"),
+            local(
+                "[history.file]\nbash = \"~/.bash_history\"\n[shell-options]\nhistappend = false\n",
+            ),
+        ])
+        .expect("merges");
+
+        let history = merged.history;
+        assert_eq!(history.size, Some(500), "the later layer wins");
+        assert_eq!(
+            history.share,
+            Some(true),
+            "a key no later layer sets is kept"
+        );
+        assert_eq!(
+            history
+                .zsh_file
+                .as_ref()
+                .map(crate::paths::Portable::as_str),
+            Some("~/.zsh_history")
+        );
+        assert_eq!(
+            history
+                .bash_file
+                .as_ref()
+                .map(crate::paths::Portable::as_str),
+            Some("~/.bash_history"),
+            "each shell's file is its own key"
+        );
+        assert_eq!(merged.shell_options.checkwinsize, Some(true));
+        assert_eq!(merged.shell_options.histappend, Some(false));
+    }
+
+    #[test]
     fn a_path_entry_merges_by_its_directory_in_place_across_lists() {
         use super::super::path::Position;
         let merged = merge(&[

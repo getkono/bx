@@ -16,8 +16,11 @@
 //! enabled = true                  # default true
 //! ```
 //!
-//! Both land in one list, [`AliasDecl`], keyed by `name`, in the order they
-//! are written in the file. A name declared twice in one layer — twice in
+//! Both land in one list, [`AliasDecl`], keyed by `name`: table by table, in
+//! the order each table first appears in the file, and each table's entries in
+//! the order they are written. So `[[alias]]` A, `[aliases]` B, `[[alias]]` C
+//! lists A, C, B. The order is deterministic, and since no alias's definition
+//! depends on another's, it changes nothing a shell does. A name declared twice in one layer — twice in
 //! `[aliases]`, twice in `[[alias]]`, or once in each — fails the load, naming
 //! both lines. A later layer's alias with the same name replaces the earlier
 //! one in place, whichever table either is written in, and a `[[alias]]`
@@ -342,6 +345,18 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_tables_are_listed_in_the_order_each_first_appears() {
+        let aliases = load(
+            "[[alias]]\nname = \"a\"\ncommand = \"x\"\n\
+             [aliases]\nb = \"y\"\n\
+             [[alias]]\nname = \"c\"\ncommand = \"z\"\n",
+        )
+        .expect("parses");
+        let names: Vec<&str> = aliases.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["a", "c", "b"]);
     }
 
     #[test]

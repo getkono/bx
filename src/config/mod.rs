@@ -71,8 +71,9 @@ pub struct Config {
     /// `[path]`'s entries, every list's in one `Vec`, keyed by the directory
     /// as zsh is given it. See [`path`].
     pub path: Vec<path::PathEntry>,
-    /// `[aliases]` and `[[alias]]` together, in file order, keyed by `name`.
-    /// See [`crate::shell::alias`].
+    /// `[aliases]` and `[[alias]]` together, keyed by `name`: table by table,
+    /// in the order each table first appears in the file, and each table's
+    /// entries in the order written. See [`crate::shell::alias`].
     pub aliases: Vec<crate::shell::alias::AliasDecl>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may

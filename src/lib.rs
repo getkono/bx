@@ -59,9 +59,11 @@
 //! [`shell`] is the generated interactive shell file's load order: eleven
 //! named phases assembled in one fixed order whatever order their content was
 //! contributed in, the declared plugins sourced only once readable, the
-//! single terminal slot at most one of them may claim, and the declared
+//! single terminal slot at most one of them may claim, the declared
 //! aliases, each body single-quoted so it reaches the alias exactly as
-//! written.
+//! written, and the declared functions, each body substituted from the
+//! declared values and written whether or not the tool it runs is installed,
+//! a hooked one under a name of bx's own so registering it clobbers nothing.
 //!
 //! [`doctor`] reads the same resolved targets without deciding them, and asks
 //! read-only questions about what is on disk — whether systemd has reloaded,

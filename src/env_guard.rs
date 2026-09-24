@@ -1552,10 +1552,12 @@ fn refuses_entry_at_root(path: &str, roots: &RootSet) -> Option<Reason> {
 /// fragment — has no `export` keyword to read at all, so it would have to gain
 /// a parameter or pick a default, and picking one is a decision, not a fix.
 ///
-/// **What it costs today: nothing.** [`scan`], [`scan_with`] and [`check`]
-/// have zero non-test callers in this crate, so no fragment is generated and
-/// none of this reaches a user. It becomes live with the first generator, and
-/// that generator is the change that must close it.
+/// **What it costs today: nothing.** The one non-test caller is the plan's
+/// `guard_fragment`, and it judges only a generated body. Generated bodies come
+/// from `config::target::Gen`, which has no variant, so no fragment is
+/// generated and none of this reaches a user. It becomes live with the first
+/// `Gen` variant, and the change that adds it must close it first.
+/// `the_guard_judges_no_generated_fragment_yet` fails when either fact moves.
 /// `an_anchor_may_contain_bxs_directories_and_a_tool_read_location_may_not`
 /// pins the behaviour as it stands, so closing it changes that test.
 fn refuses_anchor(path: &str, roots: &RootSet) -> Option<Reason> {
@@ -5459,8 +5461,8 @@ mod tests {
         // established of it rather than assumed.
         //
         // The bytes below are the benchmark's copy, and at this head they are
-        // the *only* copy: no bx code generates shell content yet, because the
-        // guard has no non-test caller. So this holds the snippet bx will
+        // the *only* copy: no bx code generates shell content yet, because
+        // `Gen` has no variant and so no generator exists. So this holds the snippet bx will
         // emit, in the one place the repository keeps it, and the first
         // generator must emit these bytes for it to keep meaning that.
         //
@@ -6080,11 +6082,23 @@ mod tests {
     }
 
     #[test]
-    fn the_guard_has_no_caller_outside_this_module() {
+    fn the_guard_judges_no_generated_fragment_yet() {
         // The fact that caps the open anchor exemption at zero real-world
-        // impact, and makes invariant 2's "every generated environment
-        // fragment must pass through it" vacuously true: nothing calls the
-        // guard yet.
+        // impact: no generated environment fragment reaches the guard yet.
+        //
+        // Until the plan landed that was "nothing calls the guard". The plan
+        // wires the one route a generated body takes to bytes through
+        // `guard_fragment`, ahead of any generator, so the fact is now two
+        // facts, and this test holds both:
+        //
+        // 1. **Every site outside this module that names the guard is one of
+        //    `KNOWN`**: the plan's `guard_fragment`, its type imports, and a
+        //    test that reads a `Reason`'s text. A new site fails here, and
+        //    so does a known one that is gone, so the list cannot rot.
+        // 2. **`config::target::Gen` has no variant**, so `guard_fragment` is
+        //    unreachable outside tests: no `Body::Generated` value exists.
+        //    The first generator adds a variant, fails here, and is the change
+        //    that must close the anchor exemption first.
         //
         // Round-4 note COV3: that was prose, and prose is the same shape as
         // the premise the exemption itself is criticised for. Round-5 note D1:
@@ -6105,10 +6119,24 @@ mod tests {
         // prose this test must not fire on — `src/config/values.rs` quotes
         // "the env_guard root set" inside a user-facing diagnostic, and a
         // bare-name search reports it as a caller.
+        const KNOWN: [(&str, &str); 4] = [
+            ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
+            ("plan/decide.rs", "env_guard::scan_with(content, roots)"),
+            ("plan/mod.rs", "use crate::env_guard::RootSet;"),
+            (
+                "plan/mod.rs",
+                "let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();",
+            ),
+        ];
+        let live = "Everything this module's docs cap at zero impact because no generated \
+                    fragment reaches the guard — the open `Kind::Anchor` containing-check \
+                    exemption on `refuses_anchor` above all — is live from here on. Read that \
+                    paragraph before changing this test.";
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let own = src.join("env_guard.rs");
         let mut callers = Vec::new();
-        let mut pending = vec![src];
+        let mut seen = Vec::new();
+        let mut pending = vec![src.clone()];
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(&dir).expect("src is readable") {
                 let path = entry.expect("a directory entry").path();
@@ -6124,7 +6152,20 @@ mod tests {
                     if code.trim() == "pub mod env_guard;" {
                         continue;
                     }
-                    if names_the_guard(&code) {
+                    if !names_the_guard(&code) {
+                        continue;
+                    }
+                    let relative = path.strip_prefix(&src).expect("beneath src");
+                    let site = (
+                        relative.to_string_lossy().into_owned(),
+                        code.trim().to_owned(),
+                    );
+                    if KNOWN
+                        .iter()
+                        .any(|&(file, known)| site.0 == file && site.1 == known)
+                    {
+                        seen.push(site);
+                    } else {
                         callers.push(format!("{}:{line}", path.display()));
                     }
                 }
@@ -6132,10 +6173,24 @@ mod tests {
         }
         assert!(
             callers.is_empty(),
-            "the guard now has a caller: {callers:?}. Everything this module's docs cap at \
-             zero impact because nothing calls it — the open `Kind::Anchor` containing-check \
-             exemption on `refuses_anchor` above all — is live from here on. Read that \
-             paragraph before deleting this test."
+            "the guard has a new caller: {callers:?}. {live}"
+        );
+        let gone: Vec<_> = KNOWN
+            .iter()
+            .filter(|&&(file, known)| !seen.iter().any(|(f, k)| f == file && k == known))
+            .collect();
+        assert!(
+            gone.is_empty(),
+            "a known site no longer names the guard: {gone:?}. Update `KNOWN`, and check the \
+             route it took still passes a generated body through `guard_fragment`."
+        );
+        let target = std::fs::read_to_string(src.join("config/target.rs")).expect("target.rs");
+        assert!(
+            code_only(&target)
+                .iter()
+                .any(|(_, code)| code.trim() == "pub enum Gen {}"),
+            "`config::target::Gen` has a variant, so a generated fragment now reaches the \
+             guard. {live}"
         );
     }
 

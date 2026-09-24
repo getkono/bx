@@ -57,8 +57,9 @@ anstyle = "1.0.14"
 indicatif = "0.18.6"
 # Secrets: age in-process, so the static binary needs no external `age`/`sops`.
 # The default identity is the user's existing ssh ed25519 key, which age
-# supports natively — hence the `ssh` feature.
-age = { version = "0.12.1", features = ["ssh"] }
+# supports natively — hence the `ssh` feature. `armor` reads the ASCII-armored
+# form (`age -a`) as well as the binary one; it adds no crate.
+age = { version = "0.12.1", features = ["armor", "ssh"] }
 # Machine-owned state (ledger, fingerprints, write-ahead journal). MessagePack,
 # not JSON: same data model, but length-prefixed rather than delimited and with
 # a native binary type, so restore hashes and file modes need no base64.

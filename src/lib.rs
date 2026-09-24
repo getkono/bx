@@ -83,6 +83,7 @@ pub mod plan;
 pub mod recover;
 pub mod report;
 pub mod restore;
+pub mod secret;
 pub mod state;
 #[doc(hidden)]
 pub mod testing;

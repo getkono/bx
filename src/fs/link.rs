@@ -264,6 +264,41 @@ mod tests {
     }
 
     #[test]
+    fn a_link_whose_parent_does_not_resolve_is_refused_before_anything_is_made() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let file = root.path().join("file");
+        std::fs::write(&file, b"x").expect("a file where the parent would be");
+
+        // Plan already saw the parent as a file.
+        let dest = file.join("tool");
+        let planned = observe(&dest).expect("observe");
+        let err = link_at(&dest, "x", &planned).expect_err("unusable parent");
+        assert!(
+            matches!(&err, Error::UnusableParent { path, .. } if *path == file),
+            "{err}"
+        );
+
+        // Plan saw a usable parent, which became a file before apply.
+        let dir = root.path().join("dir");
+        std::fs::create_dir(&dir).expect("a directory");
+        let dest = dir.join("tool");
+        let planned = observe(&dest).expect("observe");
+        std::fs::remove_dir(&dir).expect("rmdir");
+        std::fs::write(&dir, b"x").expect("a file in its place");
+        let err = link_at(&dest, "x", &planned).expect_err("unusable parent");
+        assert!(
+            matches!(&err, Error::UnusableParent { path, .. } if *path == dir),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&dir).expect("kept"),
+            b"x",
+            "nothing replaced it"
+        );
+        assert_eq!(names(root.path()), ["dir", "file"], "no temporary link");
+    }
+
+    #[test]
     fn a_link_that_changed_since_plan_is_refused() {
         let root = tempfile::tempdir().expect("tempdir");
         let dest = root.path().join("tool");

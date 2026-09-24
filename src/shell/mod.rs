@@ -60,7 +60,9 @@
 //! appends to zsh's hook arrays — shell arrays zsh cannot export, which name
 //! what runs at a hook and relocate nothing — and its tests run it in zsh to
 //! establish that those arrays are the only parameters it changes. The
-//! `options` phase holds the declared `[history]` in zsh's names
+//! `keybindings` phase [`keybindings`] renders is `bindkey` lines, some guarded
+//! by a test of zsh's `$terminfo`, and its tests run it in zsh to establish
+//! that it changes no parameter. The `options` phase holds the declared `[history]` in zsh's names
 //! ([`crate::config::history`]): `HISTFILE`, `HISTSIZE` and `SAVEHIST`, which
 //! zsh reads for itself, a `typeset -g +x` line that keeps them unexported
 //! even when a parent exported them, and `setopt` lines. The history
@@ -93,6 +95,7 @@
 pub mod activation;
 pub mod alias;
 pub mod function;
+pub mod keybindings;
 pub mod plugin;
 
 /// Running generated shell text in a real shell, for the submodules' tests.

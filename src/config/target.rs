@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::Function;
+use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::PluginDecl;
 use crate::shell::{Assembly, Phase};
 
@@ -147,8 +148,9 @@ pub enum Gen {
     Source(Portable),
     /// The interactive shell file, assembled phase by phase. Only its `env`
     /// phase is an environment fragment, and only that phase is judged as
-    /// one; see [`Interactive`].
-    Interactive(Interactive),
+    /// one; see [`Interactive`]. Boxed, because it carries every interactive
+    /// declaration and would otherwise size every other generator to match.
+    Interactive(Box<Interactive>),
 }
 
 impl Gen {
@@ -190,7 +192,9 @@ impl Gen {
 /// [`History::render_zsh`] renders it; every enabled alias lands in the
 /// `aliases` phase, as the line [`crate::shell::alias::AliasDecl::render`]
 /// renders for it; and every enabled `[[function]]` whose body resolved lands
-/// in the `functions` phase, as [`Function::render`] renders it. No phase but
+/// in the `functions` phase, as [`Function::render`] renders it; and the
+/// declared `[keybindings]` land in the `keybindings` phase, as
+/// [`Keybindings::render_zsh`] renders them. No phase but
 /// `env` holds an environment assignment (Invariant 2): the `options` phase
 /// assigns only zsh's own unexported history parameters, which
 /// [`super::history`]'s tests hold it to, and the `functions` phase assigns
@@ -213,10 +217,13 @@ pub struct Interactive {
     /// The enabled functions, each resolved or held back in its own
     /// position, in the merged configuration's order.
     functions: Vec<Resolution<Function>>,
+    /// The declared keybindings, rendered into the `keybindings` phase.
+    keybindings: Keybindings,
 }
 
 impl Interactive {
-    /// The file holding `env`, and no plugin, history, alias or function.
+    /// The file holding `env`, and no plugin, history, alias, function or
+    /// keybinding.
     #[must_use]
     pub fn new(env: super::env::Fragment) -> Self {
         Self {
@@ -225,7 +232,21 @@ impl Interactive {
             history: History::default(),
             aliases: Vec::new(),
             functions: Vec::new(),
+            keybindings: Keybindings::default(),
         }
+    }
+
+    /// The file with `keybindings` in its `keybindings` phase.
+    #[must_use]
+    pub fn with_keybindings(mut self, keybindings: Keybindings) -> Self {
+        self.keybindings = keybindings;
+        self
+    }
+
+    /// The declared keybindings.
+    #[must_use]
+    pub const fn keybindings(&self) -> &Keybindings {
+        &self.keybindings
     }
 
     /// The file with `history` in its `options` phase.
@@ -321,8 +342,9 @@ impl Interactive {
     /// with plugins alone has no `env` phase, a history declaring nothing zsh
     /// reads adds no `options` phase, a file whose every alias is gated on a
     /// missing tool has no `aliases` phase, and a file whose every function is
-    /// held back has no `functions` phase. The bytes are a function of the
-    /// variables, the plugins, the history, the aliases, the functions and
+    /// held back has no `functions` phase, and a file binding no key has no
+    /// `keybindings` phase. The bytes are a function of the variables, the
+    /// plugins, the history, the aliases, the functions, the keybindings and
     /// `present`'s answers alone.
     ///
     /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
@@ -352,6 +374,7 @@ impl Interactive {
         crate::shell::alias::contribute(&mut assembly, &self.aliases, present);
         // The held-back functions are the note's to name, not the bytes'.
         crate::shell::function::contribute(&mut assembly, &self.functions, present);
+        crate::shell::keybindings::contribute(&mut assembly, &self.keybindings);
         let mut out = assembly.render();
         if !self.plugins.is_empty() {
             out.push_str(SETTLE);
@@ -2139,7 +2162,7 @@ mod tests {
                 Some("function `goproj` held back: run `bx init` to set proj")
             );
             assert_eq!(
-                Gen::Interactive(file.clone()).note(),
+                Gen::Interactive(Box::new(file.clone())).note(),
                 file.note(),
                 "the generator's note is the file's"
             );

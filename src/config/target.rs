@@ -586,7 +586,7 @@ fn repo_relative(ctx: &Ctx, table: &Table, key: &str, raw: &str) -> Result<PathB
 /// have different provenance to attach: a table and a key, or a target and its
 /// origin.
 pub(crate) fn confine_to_repo(key: &str, raw: &str) -> Result<PathBuf, String> {
-    if raw.starts_with('/') || raw.starts_with('~') {
+    if names_a_machine_location(raw) {
         return Err(format!(
             "`{key}` names a file inside the config repo, so it is relative to the \
              repo root; got {raw:?}"
@@ -615,6 +615,18 @@ pub(crate) fn confine_to_repo(key: &str, raw: &str) -> Result<PathBuf, String> {
     }
 
     Ok(PathBuf::from(parts.join("/")))
+}
+
+/// Whether `text` is rooted at the filesystem or the home rather than at the
+/// config repo: it opens with `/` or `~`.
+///
+/// One predicate with two uses. [`confine_to_repo`] asks it of a whole `file`;
+/// [`super::resolve`] asks it of each value's text as substituted into one,
+/// because `cfg/{{dir}}/x` with `dir` answered `/home/example/…` normalises to
+/// a relative path that still carries the account's machine location into the
+/// repo.
+pub(crate) fn names_a_machine_location(text: &str) -> bool {
+    text.starts_with('/') || text.starts_with('~')
 }
 
 /// Refuse a file body at the home or at any directory above it.

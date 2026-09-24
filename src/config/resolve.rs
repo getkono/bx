@@ -49,9 +49,12 @@
 //! "{{b}}"` into `file = "cfg/{{s}}/x"`, with `b` a `path` value — the target
 //! is blocked, naming that answer's line, whether or not `b` is answered.
 //!
-//! What is refused is reaching a **`path` value**, not every absolute text: an
-//! account answering a plain `string` value `/home/example/…` still resolves,
-//! because nothing separates that from a string the account meant.
+//! A value of any other kind whose text is absolute, or opens with `~`, is
+//! refused in `file` too, judged on the text substituted in rather than the
+//! declared kind: `cfg/{{dir}}/x` with a `string` value `dir` answered
+//! `/home/example/…` would otherwise carry the account's machine location into
+//! the repo. An answer blocks the target, naming its line; a committed
+//! `default` with no answer in it fails the load.
 
 use std::path::Path;
 
@@ -524,7 +527,8 @@ fn refuse_path_value_in_file(
             "target `{}`: `file` references `{}`{steps}, a `path` value; a `path` value \
              is always absolute and `file` is relative to the config repo root, so no \
              answer could make it name a file in the repo; reference a `string` value\
-             {not_built}",
+             {not_built}, with relative text: an absolute text is refused in `file` \
+             whatever its kind",
             target.path, chain[0].name
         ),
     })
@@ -582,11 +586,10 @@ fn path_value_behind<'a>(
 /// that chain, so the coupling is pinned rather than asserted.
 ///
 /// Only a declaration of kind `path` ends the walk, so this closes the route an
-/// account's answer opens *into a `path` value*, not every way an absolute
-/// literal reaches `file`. An account answering a plain `string` value
-/// `/home/example/…` still resolves Ready: that text is what a `string` value
-/// is for, and nothing separates a machine location from a string an account
-/// meant.
+/// account's answer opens *into a `path` value*. An absolute literal reaching
+/// `file` through a value of another kind — a plain `string` answered
+/// `/home/example/…` — is judged on its substituted text by
+/// [`refuse_rooted_value_in_file`], once every value is answered.
 fn refuse_path_answer_in_file(
     target: &Target,
     file: &str,
@@ -875,10 +878,10 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
         // a file off the machine and write it into a target.
         Body::File(path) => {
             let raw = path.to_string_lossy();
-            Body::File(
-                super::target::confine_to_repo("file", &sub(&raw)?)
-                    .map_err(|message| field(&raw, message))?,
-            )
+            let confined = super::target::confine_to_repo("file", &sub(&raw)?)
+                .map_err(|message| field(&raw, message))?;
+            refuse_rooted_value_in_file(&raw, &sub)?;
+            Body::File(confined)
         }
         Body::Inline(text) => Body::Inline(sub(text)?),
         other => other.clone(),
@@ -948,6 +951,47 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
         enabled: target.enabled,
         origin: target.origin.clone(),
     })
+}
+
+/// Refuse a `file` any of whose values is substituted in as rooted text.
+///
+/// [`super::target::confine_to_repo`] judges the whole substituted `file`, and
+/// that is not enough: `cfg/{{dir}}/gitconfig` with `dir` answered
+/// `/home/example/…` normalises to `cfg/home/example/…/gitconfig`, which is
+/// relative and inside the repo, and carries the account's machine location
+/// into a repository meant to be account-independent. So each value's text is
+/// judged as it is substituted in, in written order, whatever the value's
+/// declared kind — the refusal is decided on the text, so choosing a different
+/// kind does not walk around it.
+///
+/// A `path` value never reaches here: [`refuse_path_value_in_file`] and
+/// [`refuse_path_answer_in_file`] have refused or blocked every `file` that
+/// reaches one, with their own messages. This closes the remaining route, an
+/// absolute literal in a value of any other kind.
+///
+/// The field carried out is the one `{{name}}`, not the whole `file`, so
+/// [`resolve_target`] asks which answers went into **that value**: an account's
+/// answer blocks this target naming its line, and a committed `default` with
+/// no answer in it fails the load.
+fn refuse_rooted_value_in_file(
+    raw: &str,
+    sub: &impl Fn(&str) -> Result<String, Broken>,
+) -> Result<(), Broken> {
+    for name in super::values::placeholders(raw).unwrap_or_default() {
+        let reference = format!("{{{{{name}}}}}");
+        let text = sub(&reference)?;
+        if super::target::names_a_machine_location(&text) {
+            return Err(Broken::Field {
+                raw: reference,
+                problem: format!(
+                    "`file` takes `{name}` as {text:?}, which is rooted at the filesystem or \
+                     the home; `file` is relative to the config repo root, so a value in it \
+                     must be relative text whatever its kind"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a `requires` entry detection could never find.
@@ -1190,6 +1234,81 @@ mod tests {
     }
 
     #[test]
+    fn a_rooted_text_substituted_into_a_file_body_is_refused_whatever_its_kind() {
+        // Inside `file`, an absolute answer normalises away its leading `/`:
+        // `cfg/{{cfg_dir}}/gitconfig` with `/home/example/…` became the
+        // relative `cfg/home/example/…/gitconfig` and resolved Ready, carrying
+        // the account's machine location into the repo. The refusal reads the
+        // text substituted in, so no declared kind walks around it.
+        const LAYER: &str = "[[value]]\n\
+                             name = \"cfg_dir\"\n\
+                             kind = \"KIND\"\n\
+                             [[target]]\n\
+                             path = \"~/.gitconfig\"\n\
+                             file = \"cfg/{{cfg_dir}}/gitconfig\"\n\
+                             [[target]]\n\
+                             path = \"~/.zshrc\"\n\
+                             content = \"setopt\"\n";
+
+        for (kind, answer) in [
+            ("string", "/home/example/secret-machine-name"),
+            ("string", "~/secret-machine-name"),
+            ("email", "/home/example@host"),
+        ] {
+            let answered = resolved(
+                &LAYER.replace("KIND", kind),
+                Some(&format!("[values]\ncfg_dir = \"{answer}\"\n")),
+            )
+            .unwrap_or_else(|e| panic!("{kind} {answer}: an answer failed the load: {e}"));
+            let entry = blocked(&answered, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["cfg_dir".to_string()]
+                },
+                "{kind} {answer}"
+            );
+            for part in [
+                "target `~/.gitconfig`: `file` takes `cfg_dir`",
+                "relative to the config repo root",
+                "the answer to `cfg_dir` at local.toml:2",
+            ] {
+                assert!(
+                    entry.hint.contains(part),
+                    "{kind} {answer} {part}: {}",
+                    entry.hint
+                );
+            }
+            assert_eq!(ready(&answered, 1).path.as_str(), "~/.zshrc", "{kind}");
+        }
+
+        // A committed default with no answer in it is the repo's own defect.
+        let message = resolved(
+            &LAYER.replace(
+                "kind = \"KIND\"\n",
+                "kind = \"string\"\ndefault = \"/var/mnt/cfg\"\n",
+            ),
+            None,
+        )
+        .expect_err("a committed rooted default is a repo defect");
+        assert!(
+            message.contains("bx.toml:5: target `~/.gitconfig`: `file` takes `cfg_dir`"),
+            "{message}"
+        );
+
+        // The case `file` substitution exists for still resolves.
+        let ordinary = resolved(
+            &LAYER.replace("KIND", "string"),
+            Some("[values]\ncfg_dir = \"work\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::File(PathBuf::from("cfg/work/gitconfig"))
+        );
+    }
+
+    #[test]
     fn a_file_body_through_an_answered_value_whose_default_names_itself_resolves() {
         // An answer overrides its declaration's default, so that default is never
         // expanded and `Unresolved::Forward` never refuses it. The walk for a
@@ -1240,7 +1359,9 @@ mod tests {
                     message.ends_with(
                         "`file` references `cfg_dir`, a `path` value; a `path` value is always \
                          absolute and `file` is relative to the config repo root, so no answer \
-                         could make it name a file in the repo; reference a `string` value"
+                         could make it name a file in the repo; reference a `string` value, \
+                         with relative text: an absolute text is refused in `file` whatever \
+                         its kind"
                     ),
                     "{file} {local:?}: {message}"
                 );

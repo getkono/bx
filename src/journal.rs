@@ -1892,7 +1892,11 @@ impl Session {
         if let Some(meddle) = self.before_publish {
             meddle(filled.dest());
         }
-        filled.publish()?;
+        // Nothing is recorded yet, so a refused publish leaves no ledger entry
+        // to withdraw: the refusal's cause is all there is to hand on.
+        filled
+            .publish()
+            .map_err(crate::fs::Unpublished::into_error)?;
         // Only now is there something to own, or to stop owning. Told any
         // earlier, the ledger would describe a write whose publish then failed.
         match entry {
@@ -1982,8 +1986,10 @@ impl Session {
         // Pruned only once the session's `End` is durable: see
         // `Session::finish`.
         self.released.extend(created_dirs);
-        // As in `write`: the entry goes only once the file has.
-        self.ledger.forget(&target);
+        // As in `write`: the entry goes only once the file has. The entry is
+        // dropped deliberately: its claims are the `created_dirs` the Intent
+        // already carries into `self.released` above.
+        let _ = self.ledger.forget(&target);
         self.crash.reached(index, Phase::AfterPublish);
 
         self.journal.append(&Record::Done(Done { target }))?;
@@ -2714,9 +2720,17 @@ pub(crate) fn hand_off_claims<'a>(
             heir = %heir.path,
             "handed a directory bx created to an entry still beneath it",
         );
+        // `Absent` states no prior, and on a re-record `record` never lets an
+        // incoming `Absent` replace the stored one, so the heir keeps its own.
         ledger.record(
-            NewEntry::new(heir.path, heir.written, heir.mode, heir.mechanism)
-                .with_created_dirs(vec![claim]),
+            NewEntry::new(
+                heir.path,
+                heir.written,
+                heir.mode,
+                heir.mechanism,
+                PriorBytes::Absent,
+            )
+            .with_created_dirs(vec![claim]),
         )?;
     }
     Ok(())
@@ -6423,6 +6437,7 @@ pub(crate) mod tests {
                 ContentHash::of(b"x\n"),
                 Mode::DEFAULT_FILE,
                 Mechanism::Own,
+                PriorBytes::Absent,
             ))
             .expect("an entry beneath the claim");
         let unusable = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff"));
@@ -6462,6 +6477,7 @@ pub(crate) mod tests {
                         ContentHash::of(b"x\n"),
                         Mode::DEFAULT_FILE,
                         Mechanism::Own,
+                        PriorBytes::Absent,
                     )
                     .with_created_dirs(if holds {
                         vec![claim.clone()]

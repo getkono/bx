@@ -25,19 +25,33 @@
 //!
 //! # Who recovers, and who only reports
 //!
-//! A **writing** command — `apply`, `sync`, `init`, `add`, `rm` — calls
-//! [`lock_for_writing`] first, which recovers under the state directory's lock,
-//! refuses to go on if it cannot, and hands that same lock to the session it is
-//! about to open, so no second bx can win the directory in between. Nothing in
-//! the type system makes a writing command use it rather than [`recover`]
-//! followed by a fresh [`journal::Session::open`]; what makes it the obvious
-//! one is that `lock_for_writing` is the only call that produces the guard
-//! [`journal::Session::open_locked`] consumes, and the only one that turns a
-//! blocked recovery into a refusal. A
-//! **read-only** command — `plan`, `status`, `doctor` — calls [`pending`],
-//! reports every named target as [`Action::Conflict`], exits
-//! [`Exit::Pending`](crate::report::Exit::Pending), and writes nothing. That is
-//! what keeps `plan` usable from CI, a prompt segment or a login banner.
+//! A **writing** command that recovers and then writes in the same run — `rm`
+//! today — calls [`lock_for_writing`] first, which recovers under the state
+//! directory's lock, refuses to go on if it cannot, and hands that same lock to
+//! the session it is about to open, so no second bx can win the directory in
+//! between. Nothing in the type system makes such a command use it rather than
+//! [`recover`] followed by a fresh [`journal::Session::open`]; what makes it the
+//! obvious one is that `lock_for_writing` is the only call that produces the
+//! guard [`journal::Session::open_locked`] consumes, and the only one that
+//! turns a blocked recovery into a refusal.
+//!
+//! `apply` is the exception, because recovery is itself work `plan` must
+//! announce (Invariant 7). It reads the interruption with [`pending`], refuses
+//! before rolling anything back when a write cannot be accounted for, shows the
+//! rows recovery would make for approval, and once approved calls [`recover`] —
+//! turning an [`Outcome::Blocked`] it returns into [`Error::Blocked`] itself —
+//! and stops without opening a session. The next run decides the configured
+//! targets against the disk recovery left.
+//!
+//! A **read-only** command — `plan`, `status`, `doctor` — calls [`pending`] and
+//! writes nothing. It reports each write the session named as the row recovery
+//! would make of it: a write to roll back as an [`Action::Modify`] with its
+//! diff, one already holding what was there before as [`Action::Unchanged`]
+//! (or a modify naming the directories recovery removes where empty), every
+//! write of a session that finished as [`Action::Unchanged`], and a write
+//! recovery cannot account for as an [`Action::Conflict`] naming [`abandon`].
+//! It exits [`Exit::Pending`] whatever the rows are. That is what keeps `plan` usable from CI, a prompt segment or a login
+//! banner.
 //!
 //! # Why recovery is not itself journalled
 //!
@@ -392,6 +406,8 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
 /// error: nothing is going wrong, a human has to look.
 pub fn recover(state: &StateDir) -> Result<Outcome, Error> {
     let lock = ExclusiveLock::acquire(state)?;
+    #[cfg(test)]
+    tests::after_lock(state);
     resolve(state, &lock)
 }
 
@@ -457,6 +473,8 @@ pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
 /// over: this one takes the next free set-aside name.
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
     let lock = ExclusiveLock::acquire(state)?;
+    #[cfg(test)]
+    tests::after_lock(state);
     let path = state.journal();
     // Looked at without following a link: a dangling one at the journal's
     // path is refused by every read (`journal::Error::NotAJournal`), so it
@@ -668,7 +686,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         journal::hand_off_claims(ledger, home, &released)?;
     }
 
-    if let Some(ledger) = &ledger {
+    if let Some(ledger) = &mut ledger {
         ledger.save()?;
     }
     // Last of all, and only once every step has succeeded. This is the rule that
@@ -921,8 +939,7 @@ fn decide(
             Err(why) => return Ok((Step::Blocked, report(false, why))),
         },
     };
-    let entry = NewEntry::new(intent.target.clone(), digest, mode, mechanism)
-        .with_prior(prior)
+    let entry = NewEntry::new(intent.target.clone(), digest, mode, mechanism, prior)
         .with_created_dirs(
             intent
                 .created_dirs
@@ -1207,6 +1224,30 @@ mod tests {
         /// never see each other's.
         static BEFORE_ACT: std::cell::Cell<Option<fn(&Path)>> =
             const { std::cell::Cell::new(None) };
+
+        /// The mode a test narrows the state directory to once the lock is
+        /// held. Taking the lock sets the directory back to 0700 whatever it
+        /// was, so a narrower mode set before it would not survive to the
+        /// step under test. Per thread, like [`BEFORE_ACT`].
+        static AFTER_LOCK: std::cell::Cell<Option<Mode>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The seam [`recover`] and [`abandon`] call once they hold the lock.
+    pub(super) fn after_lock(state: &StateDir) {
+        if let Some(mode) = AFTER_LOCK.with(std::cell::Cell::get) {
+            fs::set_mode(state.root(), mode).expect("narrow the state directory");
+        }
+    }
+
+    /// Run `f` with the state directory narrowed to `mode` from the moment
+    /// the lock is taken, and put it back to 0700 afterwards.
+    fn narrowed_after_lock<T>(state: &StateDir, mode: Mode, f: impl FnOnce() -> T) -> T {
+        AFTER_LOCK.with(|cell| cell.set(Some(mode)));
+        let out = f();
+        AFTER_LOCK.with(|cell| cell.set(None));
+        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it usable again");
+        out
     }
 
     /// The seam [`resolve`] calls before an `Unlink` or a `Rewrite` acts.
@@ -2821,11 +2862,13 @@ mod tests {
         std::fs::remove_file(&blob).expect("remove the snapshot");
         std::fs::create_dir(&blob).expect("a directory where the snapshot was");
 
+        // The state layer refuses to read a snapshot that is not a regular
+        // file, and that refusal is neither of the two verdicts.
         let reported = pending(&state);
         assert!(
             matches!(
                 reported,
-                Err(Error::State(crate::state::Error::Read { .. }))
+                Err(Error::State(crate::state::Error::RestoreNotAFile { .. }))
             ),
             "got {reported:?}"
         );
@@ -2833,7 +2876,7 @@ mod tests {
         assert!(
             matches!(
                 recovered,
-                Err(Error::State(crate::state::Error::Read { .. }))
+                Err(Error::State(crate::state::Error::RestoreNotAFile { .. }))
             ),
             "got {recovered:?}"
         );
@@ -3061,19 +3104,18 @@ mod tests {
             vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
         );
 
-        // The session left its lock file, so taking the lock needs no write to
-        // the directory; the rename does. Narrower than 0700 rather than wider,
-        // so nothing tightens it back.
+        // Read-only once the lock is held, since taking it sets the directory
+        // back to 0700: the rename needs a write to the directory.
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
-        if !permissions_refuse(state.root()) {
-            fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+        let refuses = permissions_refuse(state.root());
+        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+        if !refuses {
             return cannot_build(
                 "abandoning_a_journal_that_cannot_be_moved_is_an_error_and_moves_nothing",
                 WRITES_THROUGH_PERMISSIONS,
             );
         }
-        let abandoned = abandon(&state);
-        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+        let abandoned = narrowed_after_lock(&state, Mode::from_bits(0o500), || abandon(&state));
 
         let err = abandoned.expect_err("a rename in a read-only directory fails");
         assert!(
@@ -3102,9 +3144,9 @@ mod tests {
             vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
         );
 
-        fs::set_mode(state.root(), Mode::from_bits(0o300)).expect("chmod");
-        let abandoned = abandon(&state);
-        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it readable again");
+        // Narrowed once the lock is held, since taking it sets the directory
+        // back to 0700.
+        let abandoned = narrowed_after_lock(&state, Mode::from_bits(0o300), || abandon(&state));
 
         match abandoned {
             Err(Error::Journal(journal::Error::Io { path, source })) => {
@@ -3448,6 +3490,7 @@ mod tests {
                     ContentHash::of(b"bx"),
                     Mode::DEFAULT_FILE,
                     Mechanism::Own,
+                    PriorBytes::Absent,
                 ))
                 .expect("record");
             ledger.save().expect("save");
@@ -3859,17 +3902,18 @@ mod tests {
         std::fs::write(state.journal(), &bytes).expect("tear the last frame");
 
         // The rollback writes in the home; only the set-aside renames in the
-        // state directory. Narrower than 0700, so nothing tightens it back.
+        // state directory. Read-only once the lock is held, since taking it
+        // sets the directory back to 0700.
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
-        if !permissions_refuse(state.root()) {
-            fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+        let refuses = permissions_refuse(state.root());
+        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+        if !refuses {
             return cannot_build(
                 "a_set_aside_that_fails_after_the_rollback_leaves_the_journal_in_place",
                 WRITES_THROUGH_PERMISSIONS,
             );
         }
-        let first = recover(&state);
-        fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
+        let first = narrowed_after_lock(&state, Mode::from_bits(0o500), || recover(&state));
 
         let err = first.expect_err("the journal cannot be moved aside");
         assert!(

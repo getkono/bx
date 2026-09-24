@@ -41,6 +41,22 @@ use serde::{Deserialize, Serialize};
 /// Without the split, the transparent `u32` codec the ledger needs would also
 /// be the config schema's, and `mode = 600` would deserialise silently into
 /// exactly that.
+///
+/// # Which of the two a user actually meets
+///
+/// The **not** human-readable half is live: `ledger.mpk` and the fingerprint
+/// cache go through it on every run.
+///
+/// The human-readable half is not reached from any production path today, and
+/// saying otherwise is how its refusal wording came to be repaired twice for a
+/// message nobody sees. `bx.toml` is read through `toml_edit`'s document API
+/// and `config::target::parse_mode`, which refuses a bare integer in its own
+/// words and then calls [`Mode::parse_octal`] directly — so it never
+/// constructs a `Deserializer` for a `Mode` at all. What the human-readable
+/// codec is for is the schema staying honest: a `Mode` field on any type that
+/// *is* deserialised from TOML gets this refusal rather than the `u32` one, and
+/// the tests hold it to that. Treat its message as a contract for the next
+/// serde-driven reader, not as text a user has seen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Mode(u32);
 
@@ -77,17 +93,22 @@ impl Mode {
     /// meets one. Only the quoted `mode = "0600"` parses — one spelling, and the
     /// one `chmod`, `ls -l` and every other tool already use. The
     /// [`Deserialize`] impl refuses an integer before it reaches here, naming
-    /// the decimal it would have meant. One to four octal digits, so the
-    /// setuid, setgid and sticky bits are expressible and a fifth digit is a
-    /// typo rather than a silently truncated mode.
+    /// the decimal it would have meant. Four octal digits at most, so the
+    /// setuid, setgid and sticky bits are
+    /// expressible and a fifth digit is a typo rather than a silently truncated
+    /// mode. There is no lower bound to enforce: `from_str_radix` refuses the
+    /// empty string on its own, and a bound that only restates what the call
+    /// below already does reads as load-bearing without being it.
     ///
     /// # Errors
     ///
     /// [`ModeError::Invalid`] for anything else.
     pub fn parse_octal(raw: &str) -> Result<Self, ModeError> {
         // `from_str_radix` alone is not enough: it accepts a leading `+`, and it
-        // has no opinion about how many digits a mode may have.
-        let usable = (1..=4).contains(&raw.len()) && raw.bytes().all(|b| matches!(b, b'0'..=b'7'));
+        // has no opinion about how many digits a mode may have. It does refuse
+        // the empty string, so this adds an upper bound and nothing else —
+        // every condition here decides an input the call below would accept.
+        let usable = raw.len() <= 4 && raw.bytes().all(|b| matches!(b, b'0'..=b'7'));
 
         u32::from_str_radix(raw, 8)
             .ok()
@@ -225,7 +246,9 @@ impl Serialize for Mode {
 
 impl<'de> Deserialize<'de> for Mode {
     /// A quoted octal string from a human-readable format, a bare `u32`
-    /// otherwise. See the type's documentation for why there are two.
+    /// otherwise. See the type's documentation for why there are two — and for
+    /// which of them a user's config actually goes through, which is not this
+    /// one.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
             deserializer.deserialize_any(DeclaredMode)
@@ -250,21 +273,47 @@ impl serde::de::Visitor<'_> for DeclaredMode {
     }
 
     fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Mode, E> {
-        Err(E::custom(unquoted(&value.to_string())))
+        Err(E::custom(unquoted(i128::from(value))))
     }
 
     fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Mode, E> {
-        Err(E::custom(unquoted(&value.to_string())))
+        Err(E::custom(unquoted(i128::from(value))))
     }
 }
 
-/// The message an unquoted mode gets: what it would have meant, and the fix.
-fn unquoted(digits: &str) -> String {
-    format!(
-        "a mode must be quoted: `mode = {digits}` is decimal {digits}, and TOML's own octal \
-         literal (0o{digits}) is not how a mode is written anywhere else. Write \
-         `mode = \"{digits}\"` if {digits} is the octal you meant"
-    )
+/// The message an unquoted mode gets: what it arrived as, and each fix that
+/// fits it.
+///
+/// The visitor sees only the integer, never how it was spelled, so `mode =
+/// 384` and `mode = 0o600` arrive the same. Each remedy is offered only when
+/// its reading is one [`Mode::parse_octal`] accepts: the integer's own decimal
+/// digits, if they are one to four octal digits — the author meant `"600"` and
+/// forgot the quotes — and its value in octal, if it is a mode at all — the
+/// author wrote TOML's `0o600`. Echoing the decimal digits as an octal literal
+/// or a quoted mode without that check told a `0o600` author about `0o384` and
+/// to write `mode = "384"`, which is refused in turn.
+fn unquoted(value: i128) -> String {
+    let mut message = format!(
+        "a mode must be quoted: this one is the bare integer {value} (decimal), and TOML's own \
+         octal literal is not how a mode is written anywhere else."
+    );
+    let digits = value.to_string();
+    let digits_are_a_mode = digits.len() <= 4 && digits.bytes().all(|b| (b'0'..=b'7').contains(&b));
+    let value_is_a_mode = (0..=0o7777).contains(&value);
+    if digits_are_a_mode {
+        message.push_str(&format!(
+            " Write `mode = \"{digits}\"` if {digits} is the octal you meant."
+        ));
+    }
+    if value_is_a_mode {
+        message.push_str(&format!(
+            " Write `mode = \"{value:04o}\"` if you wrote the octal literal 0o{value:o}."
+        ));
+    }
+    if !digits_are_a_mode && !value_is_a_mode {
+        message.push_str(" Write one to four octal digits in quotes, like `mode = \"0600\"`.");
+    }
+    message
 }
 
 /// A mode that could not be read.
@@ -355,6 +404,26 @@ mod tests {
         // 0o100644 is what `stat` reports for a regular file at 0644.
         assert_eq!(Mode::from_bits(0o100_644), Mode::DEFAULT_FILE);
         assert_eq!(Mode::DEFAULT_FILE.bits(), 0o644);
+
+        // All twelve, kept, and nothing above them. `0o4755` was the widest
+        // mode the suite carried, so a mask that dropped setgid alone — or
+        // sticky alone — survived everything.
+        assert_eq!(Mode::from_bits(0o7777).bits(), 0o7777);
+        assert_eq!(Mode::from_bits(0o7777).to_string(), "7777");
+        assert_eq!(
+            Mode::from_bits(0o40_7777).bits(),
+            0o7777,
+            "the file-type bits a stat returns are discarded, the rest are not",
+        );
+        for bit in [
+            0o4000, 0o2000, 0o1000, 0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
+        ] {
+            assert_eq!(
+                Mode::from_bits(bit).bits(),
+                bit,
+                "{bit:04o} is one of the twelve and must survive on its own",
+            );
+        }
     }
 
     #[test]
@@ -364,6 +433,13 @@ mod tests {
         assert_eq!(Mode::parse_octal("755").expect("parse").bits(), 0o755);
         assert_eq!(Mode::parse_octal("4755").expect("parse").bits(), 0o4755);
         assert_eq!(Mode::parse_octal("0").expect("parse").bits(), 0);
+        // All twelve bits, which is what four digits are for and what the
+        // widest input the suite gave — "4755" — left untested.
+        assert_eq!(Mode::parse_octal("7777").expect("parse").bits(), 0o7777);
+        assert_eq!(
+            Mode::parse_octal("7777").expect("parse").to_string(),
+            "7777"
+        );
     }
 
     #[test]
@@ -376,7 +452,7 @@ mod tests {
     #[test]
     fn a_mode_rejects_non_octal_and_out_of_range() {
         for raw in [
-            "8", "0688", "", "rwx", "+644", "00644", "0o600", " 644", "-1",
+            "8", "0688", "", "rwx", "+644", "00644", "0o600", " 644", "-1", "07777",
         ] {
             assert_eq!(
                 Mode::parse_octal(raw),
@@ -384,6 +460,55 @@ mod tests {
                 "{raw:?} must not parse",
             );
         }
+
+        // The whole message, not a substring of it. It is the user's only
+        // remedy, and the clause carrying the remedy — `in quotes, like
+        // "0600"` — and the echo of what they actually wrote were both
+        // unasserted, so either could be rewritten with the suite green. Held
+        // to the standard `DeclaredMode::expecting` is already held to below.
+        assert_eq!(
+            ModeError::Invalid("0688".to_string()).to_string(),
+            "a mode must be one to four octal digits in quotes, like \"0600\"; got \"0688\"",
+        );
+        assert_eq!(
+            ModeError::Invalid(String::new()).to_string(),
+            "a mode must be one to four octal digits in quotes, like \"0600\"; got \"\"",
+            "the echo shows an empty mode as empty rather than as nothing",
+        );
+    }
+
+    /// Every claim the refusal of an unquoted integer makes, asserted whole.
+    ///
+    /// One function rather than one per deserializer: `visit_i64` and
+    /// `visit_u64` are two doors to the same refusal, and the tests used to
+    /// hold them to two different standards — the `u64` one checked two of
+    /// these five and was named as though it checked all of them. They cannot
+    /// drift apart while both go through here.
+    fn assert_unquoted_refusal(message: &str, digits: &str) {
+        assert!(message.contains("must be quoted"), "{message}");
+        assert!(
+            message.contains(&format!("bare integer {digits} (decimal)")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("mode = \"{digits}\"")),
+            "{message}"
+        );
+        // Its value in octal is the literal a `0o` author wrote. The decimal
+        // digits read as one are not: `0o600` arrives as 384, and there is no
+        // `0o384`.
+        let octal = format!("0o{:o}", digits.parse::<u32>().expect("decimal digits"));
+        assert!(message.contains(&octal), "{message}");
+        // TOML has an octal literal; the message may not tell the user it does
+        // not (the base corrected the same claim in `config::target`).
+        assert!(!message.contains("no octal literal"), "{message}");
+        // The trailing clause is the remedy's condition, and nothing asserted
+        // it: `Write mode = "600"` alone tells a user to quote a number that
+        // may not be the one they meant.
+        assert!(
+            message.contains(&format!("if {digits} is the octal you meant")),
+            "{message}",
+        );
     }
 
     #[test]
@@ -413,6 +538,45 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&Mode::PRIVATE_FILE).expect("encode");
         let back: Mode = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(back, Mode::PRIVATE_FILE);
+    }
+
+    #[test]
+    fn a_decoded_mode_carries_only_the_permission_bits() {
+        // One flipped byte in `ledger.mpk` must not give a `Mode` that renders,
+        // converts and chmods as `0644` but compares unequal to the `0644` a
+        // `plan` reads off the disk — two values printed identically that
+        // never converge.
+        let wire = rmp_serde::to_vec_named(&0o100_644_u32).expect("encode");
+        let back: Mode = rmp_serde::from_slice(&wire).expect("decode");
+        assert_eq!(back, Mode::DEFAULT_FILE, "equal to the mode a stat gives");
+        assert_eq!(back.bits(), 0o644);
+        assert_eq!(back.to_string(), "0644");
+
+        // Every bit `from_bits` keeps survives the round trip, set-id and
+        // sticky included: `0o7777`, not `0o777`.
+        for bits in [0o4755, 0o2755, 0o1777, 0o7777] {
+            let mode = Mode::from_bits(bits);
+            let wire = rmp_serde::to_vec_named(&mode).expect("encode");
+            assert_eq!(
+                rmp_serde::from_slice::<Mode>(&wire).expect("decode"),
+                mode,
+                "{bits:04o}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_set_id_and_sticky_bits_reach_the_chmod() {
+        // `from_bits_truncate` dropping `0o7000` in the conversion `fchmod`
+        // uses would lose precisely the four bits the `0o7777` mask in
+        // `from_bits` exists to preserve.
+        for bits in [0o4755, 0o2755, 0o1777, 0o7777] {
+            assert_eq!(
+                RawMode::from(Mode::from_bits(bits)).bits(),
+                bits,
+                "{bits:04o}",
+            );
+        }
     }
 
     #[test]
@@ -455,14 +619,85 @@ mod tests {
         // group -wx, other -w-. The transparent `u32` codec the ledger needs
         // would have accepted it silently, which is why the codec is split.
         let err = toml_edit::de::from_str::<Declared>("mode = 600").expect_err("must be refused");
+        assert_unquoted_refusal(&err.to_string(), "600");
+
+        // And the whole of it, once, so no clause can be rewritten unnoticed.
+        assert_eq!(
+            unquoted(600),
+            "a mode must be quoted: this one is the bare integer 600 (decimal), and TOML's own \
+             octal literal is not how a mode is written anywhere else. Write `mode = \"600\"` \
+             if 600 is the octal you meant. Write `mode = \"1130\"` if you wrote the octal \
+             literal 0o1130.",
+        );
+    }
+
+    #[test]
+    fn a_toml_octal_literal_mode_is_told_the_quoted_form_of_that_literal() {
+        // `mode = 0o600` reaches the visitor as the integer 384, and nothing
+        // says how it was spelled. The refusal used to echo 384 back as
+        // `0o384`, which is not an octal literal, and as `mode = "384"`, which
+        // `parse_octal` refuses in turn — a remedy that is itself refused.
+        let err = toml_edit::de::from_str::<Declared>("mode = 0o600").expect_err("must be refused");
         let message = err.to_string();
         assert!(message.contains("must be quoted"), "{message}");
-        assert!(message.contains("decimal 600"), "{message}");
-        assert!(message.contains("mode = \"600\""), "{message}");
-        // TOML has an octal literal; the message may not tell the user it does
-        // not (the base corrected the same claim in `config::target`).
-        assert!(!message.contains("no octal literal"), "{message}");
-        assert!(message.contains("0o600"), "{message}");
+        assert!(
+            message.contains("Write `mode = \"0600\"` if you wrote the octal literal 0o600."),
+            "{message}",
+        );
+        assert!(!message.contains("0o384"), "{message}");
+        assert!(!message.contains("mode = \"384\""), "{message}");
+        assert_eq!(
+            Mode::parse_octal("0600"),
+            Ok(Mode::PRIVATE_FILE),
+            "the remedy the refusal offers is one the parser accepts",
+        );
+
+        // Whose decimal digits are octal too: both readings are offered, and
+        // each is a mode `parse_octal` accepts.
+        let err = toml_edit::de::from_str::<Declared>("mode = 0o644").expect_err("must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("Write `mode = \"0644\"` if you wrote the octal literal 0o644."),
+            "{message}",
+        );
+        assert!(
+            message.contains("Write `mode = \"420\"` if 420 is the octal you meant."),
+            "{message}",
+        );
+
+        // And the whole of the one with no decimal reading.
+        assert_eq!(
+            unquoted(0o600),
+            "a mode must be quoted: this one is the bare integer 384 (decimal), and TOML's own \
+             octal literal is not how a mode is written anywhere else. Write `mode = \"0600\"` \
+             if you wrote the octal literal 0o600.",
+        );
+    }
+
+    #[test]
+    fn an_integer_that_is_no_mode_either_way_is_told_the_form_to_write() {
+        // 99999 is five digits and above 0o7777, and -1 is below zero: neither
+        // reading is a mode, so no quoted form of either is suggested.
+        for value in [99_999_i128, -1, 0o10000] {
+            let message = unquoted(value);
+            assert!(message.contains("must be quoted"), "{message}");
+            assert!(
+                message
+                    .ends_with("Write one to four octal digits in quotes, like `mode = \"0600\"`."),
+                "{message}",
+            );
+            assert!(!message.contains("octal you meant"), "{message}");
+            assert!(!message.contains("octal literal 0o"), "{message}");
+        }
+        // 0o10000 is 4096: four decimal digits, but not octal ones.
+        assert!(!unquoted(0o10000).contains("mode = \"4096\""));
+        // Each boundary on the other side is offered.
+        assert!(
+            unquoted(0o7777).contains("mode = \"7777\"` if you wrote the octal literal 0o7777")
+        );
+        assert!(unquoted(7777).contains("mode = \"7777\"` if 7777 is the octal you meant"));
+        assert!(unquoted(0).contains("mode = \"0\"` if 0 is the octal you meant"));
+        assert!(unquoted(0).contains("mode = \"0000\"` if you wrote the octal literal 0o0"));
     }
 
     #[test]
@@ -474,11 +709,24 @@ mod tests {
         // format may hand an unsigned one to `visit_u64` — serde's own value
         // deserializers do — and it must get the same refusal, not serde's
         // generic "invalid type".
-        let deserializer: value::U64Deserializer<value::Error> = 600_u64.into_deserializer();
-        let err = Mode::deserialize(deserializer).expect_err("must be refused");
-        let message = err.to_string();
-        assert!(message.contains("must be quoted"), "{message}");
-        assert!(message.contains("decimal 600"), "{message}");
+        //
+        // "The same reason" is now checked rather than assumed: this asserts
+        // every claim its `i64` sibling asserts, through the same helper, and
+        // then that the two messages are equal character for character.
+        let unsigned: value::U64Deserializer<value::Error> = 600_u64.into_deserializer();
+        let from_u64 = Mode::deserialize(unsigned)
+            .expect_err("must be refused")
+            .to_string();
+        assert_unquoted_refusal(&from_u64, "600");
+
+        let signed: value::I64Deserializer<value::Error> = 600_i64.into_deserializer();
+        let from_i64 = Mode::deserialize(signed)
+            .expect_err("must be refused")
+            .to_string();
+        assert_eq!(
+            from_u64, from_i64,
+            "the two integer doors to this refusal may not word it differently",
+        );
     }
 
     #[test]

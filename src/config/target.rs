@@ -8,8 +8,10 @@
 //! file       = "files/starship.toml"            # body, repo-relative     )
 //! content    = "…"                              # body, verbatim literal  ) exactly
 //! generated  = "shell-init"                     # body, named generator   ) one of
+//! secret     = "secrets/npmrc.age"              # body, age ciphertext    )
 //! dir        = true                             # the target is a directory )
-//! mode       = "0600"                           # optional octal *string*
+//! mode       = "0600"                           # optional octal *string*;
+//!                                               #   required, and private, for a secret
 //! attach     = "own"                            # own | region | include; default own
 //! comment    = "#"                              # required iff attach = "region"
 //! include    = "Include ~/.ssh/config.d/*.conf" # required iff attach = "include"
@@ -45,11 +47,12 @@ use crate::paths::Portable;
 pub(crate) const SECTION: &str = "[[target]]";
 
 /// Every key a `[[target]]` entry may carry.
-const KEYS: [&str; 15] = [
+const KEYS: [&str; 16] = [
     "path",
     "file",
     "content",
     "generated",
+    "secret",
     "dir",
     "mode",
     "attach",
@@ -64,7 +67,7 @@ const KEYS: [&str; 15] = [
 ];
 
 /// The keys that declare a body. Exactly one, except for an `include` target.
-const BODY_KEYS: [&str; 4] = ["file", "content", "generated", "dir"];
+const BODY_KEYS: [&str; 5] = ["file", "content", "generated", "secret", "dir"];
 
 /// One path in the user's environment that bx has something to say about.
 ///
@@ -105,6 +108,9 @@ pub enum Body {
     Inline(String),
     /// Produced by a named generator.
     Generated(Gen),
+    /// An age-encrypted file in the config repo, named repo-relative, whose
+    /// plaintext is the content. Decrypted in-process by [`crate::secret`].
+    Secret(PathBuf),
     /// The target is a directory: it has a mode and no content.
     Dir,
 }
@@ -295,6 +301,10 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
         }
     }
 
+    if matches!(body, Body::Secret(_)) {
+        check_secret(&ctx, table, mode, &attach, &format, direction)?;
+    }
+
     if matches!(&format, Format::Jsonc { owns } if owns.is_empty()) {
         // `Jsonc { owns: [] }` says bx manages part of a file and names no part:
         // every run a silent no-op. Checked here rather than in `parse_format`
@@ -348,6 +358,76 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
     })
+}
+
+/// The rules a secret target is held to at load time.
+///
+/// **A private mode, written out.** A secret with no `mode` would be written at
+/// [`Mode::DEFAULT_FILE`], `0644`, which every account on the machine can read,
+/// and a default that silently publishes a secret is the one default this key
+/// may not have. So the mode is required, and it must deny group and other
+/// everything — and let its owner read, or the next `plan` could not compare
+/// what `apply` wrote.
+///
+/// **The whole file.** A region or an include line is part of a file the user
+/// also writes, at whatever mode the user gave it, and a structured format owns
+/// keys inside one; none of them can keep plaintext private. An include target
+/// already cannot carry a second body, so only a region and a format arrive
+/// here.
+///
+/// **Applied, never tracked.** A tracked target is one the tool writes and bx
+/// carries back, and the only place a secret may be carried back to is its
+/// ciphertext; carrying the plaintext would put a cleartext secret in the repo.
+fn check_secret(
+    ctx: &Ctx,
+    table: &Table,
+    mode: Option<Mode>,
+    attach: &Attach,
+    format: &Format,
+    direction: Direction,
+) -> Result<(), Error> {
+    if direction != Direction::Apply {
+        return Err(ctx.bad(
+            table,
+            "direction",
+            "a secret target is always applied: tracking it would carry the plaintext \
+             the tool writes back toward the config repo",
+        ));
+    }
+    let Some(mode) = mode else {
+        return Err(ctx.bad(
+            table,
+            "secret",
+            "a secret target needs an explicit private `mode`, such as mode = \"0600\"; \
+             without one it would be written readable by every account on the machine",
+        ));
+    };
+    if mode.is_shared() || mode.bits() & 0o400 == 0 {
+        return Err(ctx.bad(
+            table,
+            "mode",
+            format!(
+                "a secret target's mode must let its owner read it and deny group and other \
+                 everything, such as \"0600\" or \"0400\"; got \"{mode}\""
+            ),
+        ));
+    }
+    if *attach != Attach::Own {
+        return Err(ctx.bad(
+            table,
+            "attach",
+            "a secret target is always attached as `own`: a region is part of a file the \
+             user also writes, at a mode bx does not choose",
+        ));
+    }
+    if *format != Format::Opaque {
+        return Err(ctx.bad(
+            table,
+            "format",
+            "a secret target's plaintext is the whole file, so `format` has nothing to describe",
+        ));
+    }
+    Ok(())
 }
 
 /// `attach`, and the companion key its value requires.
@@ -500,7 +580,7 @@ fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> 
             _ => Err(Error::MissingKey {
                 origin: ctx.origin().clone(),
                 section: SECTION,
-                key: "file`, `content`, `generated` or `dir",
+                key: "file`, `content`, `generated`, `secret` or `dir",
             }),
         },
         [one] => body_from(ctx, table, one),
@@ -649,6 +729,10 @@ fn body_from(ctx: &Ctx, table: &Table, key: &str) -> Result<Body, Error> {
         "content" => Ok(Body::Inline(
             ctx.required_str(table, "content")?.to_string(),
         )),
+        "secret" => {
+            let raw = ctx.required_str(table, "secret")?;
+            Ok(Body::Secret(repo_relative(ctx, table, "secret", raw)?))
+        }
         "generated" => {
             let name = ctx.required_str(table, "generated")?;
             parse_generated(name).map(Body::Generated).ok_or_else(|| {
@@ -877,6 +961,95 @@ mod tests {
                 "{escaping} should be rejected"
             );
         }
+    }
+
+    /// A secret target, plus whatever else the test needs.
+    fn secret(extra: &str) -> String {
+        format!("[[target]]\npath = \"~/.npmrc\"\nsecret = \"secrets/./npmrc.age\"\n{extra}")
+    }
+
+    #[test]
+    fn a_secret_target_names_its_ciphertext_repo_relative() {
+        let target = parse(&secret("mode = \"0600\"\n")).expect("parses");
+        assert_eq!(
+            target.body,
+            Body::Secret(PathBuf::from("secrets/npmrc.age"))
+        );
+        assert_eq!(target.mode, Some(Mode::PRIVATE_FILE));
+
+        let target = parse(&secret("mode = \"0400\"\n")).expect("read-only is private");
+        assert_eq!(target.mode, Some(Mode::from_bits(0o400)));
+
+        for escaping in ["/etc/age/x.age", "~/x.age", "../x.age"] {
+            let text =
+                format!("[[target]]\npath = \"~/a\"\nsecret = \"{escaping}\"\nmode = \"0600\"\n");
+            let message = message(&text);
+            assert!(message.contains("`secret`"), "{escaping}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_secret_target_without_a_mode_is_a_load_error() {
+        let message = message(&secret(""));
+        assert!(
+            message.starts_with("bx.toml:3:"),
+            "at the secret key: {message}"
+        );
+        assert!(message.contains("explicit private `mode`"), "{message}");
+    }
+
+    #[test]
+    fn a_secret_target_with_a_shared_mode_is_a_load_error() {
+        for shared in [
+            "0640", "0604", "0644", "0660", "0610", "0601", "0200", "0000",
+        ] {
+            let message = message(&secret(&format!("mode = \"{shared}\"\n")));
+            assert!(
+                message.starts_with("bx.toml:4:"),
+                "at the mode key: {message}"
+            );
+            assert!(
+                message.contains(&format!("got \"{shared}\"")),
+                "{shared}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_secret_target_owns_its_whole_file() {
+        let region = message(&secret(
+            "mode = \"0600\"\nattach = \"region\"\ncomment = \"#\"\n",
+        ));
+        assert!(region.contains("always attached as `own`"), "{region}");
+
+        let format = message(&secret("mode = \"0600\"\nformat = \"env.d\"\n"));
+        assert!(
+            format.contains("`format` has nothing to describe"),
+            "{format}"
+        );
+
+        let include = message(
+            "[[target]]\npath = \"~/a\"\nsecret = \"s.age\"\nmode = \"0600\"\n\
+             attach = \"include\"\ninclude = \"x\"\n",
+        );
+        assert!(
+            include.contains("`secret` would never be read"),
+            "{include}"
+        );
+    }
+
+    #[test]
+    fn a_secret_target_is_never_tracked() {
+        let track = message(&secret("mode = \"0600\"\ndirection = \"track\"\n"));
+        assert!(track.contains("always applied"), "{track}");
+        assert!(parse(&secret("mode = \"0600\"\ndirection = \"apply\"\n")).is_ok());
+    }
+
+    #[test]
+    fn a_secret_is_one_body_among_the_others() {
+        let message = message(&with("secret = \"s.age\"\nmode = \"0600\"\n"));
+        assert!(message.contains("exactly one body"), "{message}");
+        assert!(message.contains("`secret`"), "{message}");
     }
 
     #[test]

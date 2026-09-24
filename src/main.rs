@@ -46,7 +46,10 @@ enum Command {
     /// Pull, apply, push
     Sync,
     /// Set, list, and rotate secrets
-    Secret,
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
     /// Drift, missing tools, broken seams, stale caches, shell cost
     Doctor,
     /// Print the one line for your shell rc
@@ -54,6 +57,12 @@ enum Command {
     /// Completion candidates for the current word (used by the shell)
     #[command(hide = true, name = "__complete")]
     Complete { args: Vec<String> },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Every declared secret, its ciphertext, and whether it decrypts here
+    List,
 }
 
 fn main() -> Result<()> {
@@ -72,6 +81,9 @@ fn main() -> Result<()> {
         Some(Command::Plan) => bx::command::plan(&env, &mut out)?,
         Some(Command::Apply { yes }) => bx::command::apply(&env, yes, &mut out)?,
         Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,
+        Some(Command::Secret {
+            action: SecretAction::List,
+        }) => bx::command::secret_list(&env, &mut out)?,
         Some(Command::Add { target }) => {
             bx::command::add(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
         }

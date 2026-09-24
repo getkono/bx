@@ -24,6 +24,7 @@ pub mod layers;
 pub mod merge;
 pub mod origin;
 pub mod resolve;
+pub mod secrets;
 pub mod target;
 pub mod values;
 
@@ -60,6 +61,10 @@ pub struct Config {
     pub values: Vec<ValueDecl>,
     /// `[values]`, in document order. Parsed, never resolved.
     pub value_assignments: Vec<ValueAssignment>,
+    /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
+    /// last layer that sets a key winning. See [`secrets`] for which layer may
+    /// set which key.
+    pub secrets: secrets::Secrets,
     /// List entries that restate only their natural key and `enabled`.
     ///
     /// A **toggle**: it flips the flag on an entry an earlier layer introduced
@@ -362,6 +367,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     found: item.type_name(),
                 })?;
                 config.value_assignments = values::parse_assignments(table, file, text)?;
+            }
+            "secrets" => {
+                let table = item.as_table().ok_or_else(|| Error::WrongType {
+                    origin: section_origin(root, name, file, text),
+                    key: name.to_string(),
+                    expected: "a table `[secrets]`",
+                    found: item.type_name(),
+                })?;
+                config.secrets = secrets::parse_secrets(table, file, text, home)?;
             }
             unknown => {
                 return Err(Error::UnknownSection {

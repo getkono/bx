@@ -24,6 +24,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
+pub(crate) use decide::read_repo_file;
 pub(crate) use diff::escape;
 pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
 
@@ -116,6 +117,10 @@ pub struct Inputs {
     home: PathBuf,
     repo: PathBuf,
     state: StateDir,
+    /// Every enabled target as the merged layers wrote it, before substitution:
+    /// one per entry of `resolved.targets`, in the same order, so a blocked
+    /// target's body is still known.
+    declared: Vec<Target>,
     resolved: Resolved,
     roots: RootSet,
     progress: bool,
@@ -145,10 +150,23 @@ impl Inputs {
             home,
             repo,
             state,
+            declared: merged.targets,
             resolved,
             roots,
             progress: env.stderr_tty,
         })
+    }
+
+    /// The resolved configuration.
+    #[must_use]
+    pub const fn resolved(&self) -> &Resolved {
+        &self.resolved
+    }
+
+    /// Every enabled target as written, paired with its resolution, in
+    /// configuration order.
+    pub fn declared_targets(&self) -> impl Iterator<Item = (&Target, &Resolution<Target>)> {
+        self.declared.iter().zip(&self.resolved.targets)
     }
 
     /// The account's home.
@@ -397,6 +415,7 @@ pub fn run(
         home: &inputs.home,
         repo: &inputs.repo,
         roots: &inputs.roots,
+        secrets: &inputs.resolved.secrets,
         declared: &decide::Declared::new(),
     };
     let decided = decide::decide_all(&inputs.resolved.targets, &ctx)?;
@@ -594,17 +613,35 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
     let mut rows = Vec::with_capacity(interrupted.unfinished.len());
     for unfinished in &interrupted.unfinished {
         let target = unfinished.target.as_str();
-        let origin = inputs
-            .resolved
-            .targets
-            .iter()
-            .find_map(|resolution| match resolution {
-                resolve::Resolution::Ready(ready) if ready.path.as_str() == target => {
-                    Some(ready.origin.clone())
-                }
-                _ => None,
+        // The target as written, found by where it resolved to or, when its
+        // resolution is blocked, by the path as written. Whether it is a
+        // secret is read from the declared body, which a blocked resolution
+        // still has.
+        let configured = inputs
+            .declared_targets()
+            .find(|(declared, resolution)| match resolution {
+                Resolution::Ready(ready) => ready.path.as_str() == target,
+                Resolution::Blocked(_) => declared.path.as_str() == target,
             })
-            .unwrap_or_else(|| Origin::unknown(&interrupted.journal));
+            .map(|(declared, _)| declared);
+        let origin = configured.map_or_else(
+            || Origin::unknown(&interrupted.journal),
+            |declared| declared.origin.clone(),
+        );
+        // A secret's plaintext is on one side of its roll back, or both, and
+        // is never shown here either. A write no declared target claims is
+        // concealed too: the journal does not say whether it was a secret, and
+        // a secret whose target was removed, whose path was edited, or whose
+        // path now resolves elsewhere or waits on a value leaves exactly such
+        // a write. Showing a secret's bytes is worse than hiding an ordinary
+        // file's.
+        let conceal = configured
+            .is_none_or(|declared| matches!(declared.body, crate::config::target::Body::Secret(_)));
+        let between = if conceal {
+            Diff::concealed
+        } else {
+            Diff::between
+        };
         let row = |action, diff, note: String| Change {
             target: target.to_string(),
             origin: origin.clone(),
@@ -665,14 +702,13 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
                     .filter(|mode| *mode != reference.mode)
                     .map(|mode| (mode, reference.mode));
                 (
-                    prior.and_then(|prior| {
-                        Diff::between(target, observed.bytes.as_deref(), &prior, mode)
-                    }),
+                    prior
+                        .and_then(|prior| between(target, observed.bytes.as_deref(), &prior, mode)),
                     "rolls back: puts back what was there before",
                 )
             }
             (true, Some(state::Prior::Absent)) => (
-                Diff::between(target, observed.bytes.as_deref(), b"", None),
+                between(target, observed.bytes.as_deref(), b"", None),
                 "rolls back: removes the file the session created",
             ),
             (true, None) => (None, "rolls back what the session wrote"),
@@ -1106,6 +1142,187 @@ pub(crate) mod tests {
 
         assert!(matches!(error, Error::Body { .. }), "{error:?}");
         assert!(error.to_string().contains("bx.toml:1"), "{error}");
+    }
+
+    /// A secret target for `~/.token`, its ciphertext at `secrets/token.age`.
+    const SECRET_TARGET: &str =
+        "[[target]]\npath = \"~/.token\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n";
+
+    /// Encrypt `plaintext` to `recipient` as the repo's `secrets/token.age`.
+    fn seal(home: &GuardedHome, recipient: &str, plaintext: &[u8]) {
+        let path = home.child(".config/bx/secrets/token.age");
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("secrets/");
+        std::fs::write(path, crate::secret::tests::encrypt_to(recipient, plaintext))
+            .expect("the ciphertext");
+    }
+
+    /// A fresh age identity, written where `local.toml` names it.
+    fn age_identity(home: &GuardedHome) -> String {
+        let key = age::x25519::Identity::generate();
+        home.write(
+            ".config/age/key.txt",
+            age::secrecy::ExposeSecret::expose_secret(&key.to_string()),
+        );
+        home.write(
+            ".local/state/bx/local.toml",
+            "[secrets]\nidentity = \"~/.config/age/key.txt\"\n",
+        );
+        key.to_public().to_string()
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("the file")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn d1_a_secret_is_decrypted_into_a_private_file_and_never_shown() {
+        let home = guarded_home();
+        let recipient = age_identity(&home);
+        seal(&home, &recipient, b"hunter2\n");
+        let inputs = inputs(&home, SECRET_TARGET);
+
+        let planned = plan(&inputs);
+        assert_eq!(planned.actions(), vec![Action::Create]);
+        let shown = render(&planned, View::Plan, Palette::PLAIN, home.path());
+        assert!(
+            !shown.contains("hunter2"),
+            "the plaintext was shown: {shown}"
+        );
+        assert!(
+            shown.contains("secret, not shown: no file -> 8 bytes"),
+            "{shown}"
+        );
+
+        let applied = apply(&inputs);
+        assert!(applied.executed);
+        assert_eq!(
+            std::fs::read(home.child(".token")).expect("written"),
+            b"hunter2\n"
+        );
+        assert_eq!(mode_of(&home.child(".token")), 0o600);
+    }
+
+    #[test]
+    fn d1_applying_an_unchanged_secret_twice_writes_nothing_the_second_time() {
+        let home = guarded_home();
+        let recipient = age_identity(&home);
+        seal(&home, &recipient, b"hunter2\n");
+        let inputs = inputs(&home, SECRET_TARGET);
+        apply(&inputs);
+
+        let after = plan(&inputs);
+        assert_eq!(after.actions(), vec![Action::Unchanged]);
+        let written = snapshot(home.path(), &[".local/state/bx/lock"]);
+        let second = run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve"))
+            .expect("the second apply");
+        assert!(!second.executed);
+        assert_eq!(second.actions(), vec![Action::Unchanged]);
+        assert_eq!(snapshot(home.path(), &[".local/state/bx/lock"]), written);
+
+        // A new ciphertext is a modify, and still never shown.
+        seal(&home, &recipient, b"hunter3\n");
+        let changed = plan(&inputs);
+        assert_eq!(changed.actions(), vec![Action::Modify]);
+        let shown = render(&changed, View::Plan, Palette::PLAIN, home.path());
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(
+            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn d1_a_locked_identity_blocks_its_secret_and_nothing_asks() {
+        let home = guarded_home();
+        // The default identity, locked: plan and apply may not ask for it.
+        home.write(".ssh/id_ed25519", crate::secret::tests::LOCKED_SSH_KEY);
+        seal(&home, crate::secret::tests::LOCKED_SSH_PUB, b"x\n");
+        let layer = [SECRET_TARGET, &inline("~/.a", "a\\n")].concat();
+        let inputs = inputs(&home, &layer);
+
+        let planned = plan(&inputs);
+        assert_eq!(planned.actions(), vec![Action::Blocked, Action::Create]);
+        let note = planned.changes[0].note.as_deref().expect("a note");
+        assert!(
+            note.contains("~/.ssh/id_ed25519 is locked by a passphrase"),
+            "{note}"
+        );
+        assert!(
+            note.contains("`identity` under [secrets] in local.toml"),
+            "names the fix"
+        );
+        assert_eq!(exit(&planned, Mode::Plan), Exit::Pending);
+
+        let applied = apply(&inputs);
+        assert!(applied.executed, "the rest of the plan stands");
+        assert!(!home.child(".token").exists());
+        assert!(home.child(".a").exists());
+    }
+
+    #[test]
+    fn d1_a_secret_no_identity_opens_is_blocked_naming_why() {
+        let home = guarded_home();
+        seal(&home, crate::secret::tests::SSH_PUB, b"x\n");
+        let inputs = inputs(&home, SECRET_TARGET);
+
+        let none = plan(&inputs);
+        assert_eq!(none.actions(), vec![Action::Blocked]);
+        assert!(
+            none.changes[0]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("no identity at ~/.ssh/id_ed25519")),
+            "{:?}",
+            none.changes[0].note
+        );
+
+        age_identity(&home);
+        let inputs = load(home.path());
+        let wrong = plan(&inputs);
+        assert_eq!(wrong.actions(), vec![Action::Blocked]);
+        assert!(
+            wrong.changes[0]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("~/.config/age/key.txt is not one")),
+            "{:?}",
+            wrong.changes[0].note
+        );
+    }
+
+    #[test]
+    fn d1_a_missing_ciphertext_is_an_error_naming_its_origin() {
+        let home = guarded_home();
+        let inputs = inputs(&home, SECRET_TARGET);
+
+        let error = run(&inputs, Mode::Plan, &mut |_| Ok(false)).expect_err("no ciphertext");
+        assert!(matches!(error, Error::Body { .. }), "{error:?}");
+        assert!(error.to_string().contains("token.age"), "{error}");
+    }
+
+    #[test]
+    fn d1_a_secret_over_a_file_bx_does_not_own_is_a_conflict_shown_by_size_only() {
+        let home = guarded_home();
+        home.write(".token", "mine\n");
+        let recipient = age_identity(&home);
+        seal(&home, &recipient, b"hunter2\n");
+        let inputs = inputs(&home, SECRET_TARGET);
+
+        let planned = plan(&inputs);
+        assert_eq!(planned.actions(), vec![Action::Conflict]);
+        let shown = render(&planned, View::Plan, Palette::PLAIN, home.path());
+        assert!(
+            !shown.contains("mine") && !shown.contains("hunter2"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("secret, not shown: 5 bytes -> 8 bytes"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -2218,6 +2435,152 @@ pub(crate) mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn d1_an_interrupted_secret_write_is_rolled_back_without_showing_either_side() {
+        let home = guarded_home();
+        let recipient = age_identity(&home);
+        seal(&home, &recipient, b"hunter3\n");
+        own(home.path(), ".token", b"hunter2\n", Mechanism::Own);
+        std::fs::set_permissions(home.child(".token"), std::fs::Permissions::from_mode(0o600))
+            .expect("private");
+        let inputs = inputs(&home, SECRET_TARGET);
+        let target = Portable::parse_in("~/.token", home.path()).expect("a portable target");
+        let dest = home.child(".token");
+        let mut session = Session::open(
+            inputs.state(),
+            SessionKind::Apply,
+            home.path(),
+            vec![target.clone()],
+        )
+        .expect("a session");
+        session
+            .apply(Request {
+                target,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"hunter3\n".to_vec(),
+                    planned: fs::observe(&dest).expect("observe"),
+                },
+                mode: FileMode::PRIVATE_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("the write");
+        drop(session);
+
+        let report = plan(&inputs);
+        assert_eq!(report.actions(), vec![Action::Modify]);
+        let shown = render(&report, View::Plan, Palette::PLAIN, home.path());
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(
+            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
+            "{shown}"
+        );
+    }
+
+    /// Leave an interrupted write of `hunter3` over `~/.token`'s `hunter2`,
+    /// then plan `layer` and render the plan.
+    fn render_an_interrupted_token_write(layer: &str) -> String {
+        let home = guarded_home();
+        age_identity(&home);
+        own(home.path(), ".token", b"hunter2\n", Mechanism::Own);
+        let inputs = inputs(&home, layer);
+        let target = Portable::parse_in("~/.token", home.path()).expect("a portable target");
+        let dest = home.child(".token");
+        let mut session = Session::open(
+            inputs.state(),
+            SessionKind::Apply,
+            home.path(),
+            vec![target.clone()],
+        )
+        .expect("a session");
+        session
+            .apply(Request {
+                target,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"hunter3\n".to_vec(),
+                    planned: fs::observe(&dest).expect("observe"),
+                },
+                mode: FileMode::PRIVATE_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("the write");
+        drop(session);
+
+        let report = plan(&inputs);
+        render(&report, View::Plan, Palette::PLAIN, home.path())
+    }
+
+    const WHO: &str = "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n";
+
+    #[test]
+    fn d1_an_interrupted_write_of_a_blocked_secret_is_rolled_back_without_showing_it() {
+        // The secret's body waits on an unanswered value, so its resolution is
+        // blocked; the declared body still says it is a secret.
+        let layer = format!(
+            "{WHO}[[target]]\npath = \"~/.token\"\nsecret = \"secrets/{{{{who}}}}.age\"\n\
+             mode = \"0600\"\n"
+        );
+        let shown = render_an_interrupted_token_write(&layer);
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(
+            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn d1_a_blocked_secret_path_conceals_a_write_no_target_claims() {
+        // The secret's path waits on the value, so the write cannot be matched
+        // to it; it is concealed rather than risk printing the secret.
+        let layer = format!(
+            "{WHO}[[target]]\npath = \"~/.{{{{who}}}}\"\nsecret = \"secrets/token.age\"\n\
+             mode = \"0600\"\n"
+        );
+        let shown = render_an_interrupted_token_write(&layer);
+        assert!(!shown.contains("hunter"), "{shown}");
+    }
+
+    #[test]
+    fn d1_an_interrupted_secret_write_whose_path_was_edited_is_concealed() {
+        // The secret now lives at `~/.other`, so no declared target claims the
+        // write it left at `~/.token`, and nothing is blocked.
+        let shown = render_an_interrupted_token_write(
+            "[[target]]\npath = \"~/.other\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n",
+        );
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(
+            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn d1_an_interrupted_secret_write_whose_path_resolves_elsewhere_is_concealed() {
+        // `{{who}}` is answered, by its default, with something else than the
+        // write was made under, so the ready target claims another path.
+        let shown = render_an_interrupted_token_write(
+            "[[value]]\nname = \"who\"\nkind = \"string\"\ndefault = \"other\"\n\
+             [[target]]\npath = \"~/.{{who}}\"\nsecret = \"secrets/token.age\"\n\
+             mode = \"0600\"\n",
+        );
+        assert!(!shown.contains("hunter"), "{shown}");
+    }
+
+    #[test]
+    fn an_interrupted_write_no_target_claims_is_concealed_and_a_claimed_file_is_shown() {
+        // The journal does not say whether an unclaimed write was a secret.
+        let shown = render_an_interrupted_token_write(WHO);
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(shown.contains("secret, not shown"), "{shown}");
+
+        // An ordinary target that claims the write still shows its diff.
+        let shown = render_an_interrupted_token_write(
+            "[[target]]\npath = \"~/.token\"\ncontent = \"hunter3\\n\"\n",
+        );
+        assert!(shown.contains("hunter"), "{shown}");
     }
 
     #[test]

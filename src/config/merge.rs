@@ -141,6 +141,7 @@ use std::path::Path;
 
 use toml_edit::Table;
 
+use super::secrets::Secrets;
 use super::target::Target;
 use super::values::{
     Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan, statements_named,
@@ -1032,6 +1033,7 @@ fn refuse_twice(earlier: &Said, spelling: &str, origin: &Origin) -> Error {
 pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut values: Merged<ValueDecl> = Merged::default();
     let mut assignments: Vec<ValueAssignment> = Vec::new();
+    let mut secrets = Secrets::default();
 
     // Values first, across every layer. A value never depends on a target, and
     // a target's key depends on the values — the final ones, because the file a
@@ -1039,6 +1041,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // not by the answers known when its own layer was read.
     for layer in layers {
         refuse_committed_answers(layer)?;
+        refuse_misplaced_secrets(layer)?;
+        secrets.absorb(&layer.config.secrets);
 
         values.absorb(layer.config.values.iter().cloned());
 
@@ -1082,6 +1086,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         targets: targets.into_enabled(),
         values,
         value_assignments: assignments,
+        secrets,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
         conflicts: clashes
@@ -1114,6 +1119,37 @@ fn refuse_committed_answers(layer: &Layer) -> Result<(), Error> {
             first.name
         ),
     })
+}
+
+/// Refuse a `[secrets]` key in the layer that may not hold it: an `identity`
+/// in a committed layer, or a `recipients` list in `local.toml`.
+///
+/// An identity names a private key on this machine, which is account content,
+/// and Invariant 5 keeps that out of a publishable tree. A recipient list is
+/// the repo's: an account that encrypted to a list only its own `local.toml`
+/// held would produce secrets no other account can be sure it can open.
+fn refuse_misplaced_secrets(layer: &Layer) -> Result<(), Error> {
+    let secrets = &layer.config.secrets;
+    match layer.kind {
+        LayerKind::Global => secrets.identity.as_ref().map_or(Ok(()), |identity| {
+            Err(Error::BadValue {
+                origin: identity.origin.clone(),
+                message: "a committed layer may not name an identity: it is a private key on \
+                          one machine, so `identity` belongs under [secrets] in local.toml in \
+                          the state directory. Nothing account-specific is ever committed"
+                    .to_string(),
+            })
+        }),
+        LayerKind::Local => secrets.recipients.as_ref().map_or(Ok(()), |recipients| {
+            Err(Error::BadValue {
+                origin: recipients.origin.clone(),
+                message: "local.toml may not list recipients: every account's secrets are \
+                          encrypted to the one list the config repo commits, so `recipients` \
+                          belongs under [secrets] in bx.toml or a module"
+                    .to_string(),
+            })
+        }),
+    }
 }
 
 /// Set one assignment, last layer winning.
@@ -1511,6 +1547,54 @@ mod tests {
     #[test]
     fn values_in_the_local_layer_are_fine() {
         assert!(merge(&[local("[values]\ngit_email = \"someone@example.invalid\"\n")]).is_ok());
+    }
+
+    const RECIPIENTS: &str = "[secrets]\nrecipients = [\"ssh-ed25519 AAAAC3Nz one\"]\n";
+
+    #[test]
+    fn an_identity_in_a_committed_layer_is_an_error() {
+        let message = failure(&[global("bx.toml", "[secrets]\nidentity = \"~/.ssh/id\"\n")]);
+        assert!(message.starts_with("bx.toml:2:"), "{message}");
+        assert!(message.contains("may not name an identity"), "{message}");
+        assert!(message.contains("local.toml"), "{message}");
+
+        let message = failure(&[
+            global("bx.toml", RECIPIENTS),
+            global("modules/k.toml", "[secrets]\nidentity = \"~/.ssh/id\"\n"),
+        ]);
+        assert!(message.starts_with("modules/k.toml:2:"), "{message}");
+    }
+
+    #[test]
+    fn recipients_in_the_local_layer_are_an_error() {
+        let message = failure(&[local(RECIPIENTS)]);
+        assert!(message.contains("may not list recipients"), "{message}");
+        assert!(message.contains("bx.toml or a module"), "{message}");
+    }
+
+    #[test]
+    fn each_secrets_key_merges_from_its_own_layer() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[secrets]\nrecipients = [\"ssh-ed25519 AAAAC3Nz old\"]\n",
+            ),
+            global("modules/k.toml", RECIPIENTS),
+            local("[secrets]\nidentity = \"~/.config/age/key.txt\"\n"),
+        ])
+        .expect("merges");
+
+        let recipients = merged.secrets.recipients.expect("recipients");
+        assert_eq!(
+            recipients.keys,
+            ["ssh-ed25519 AAAAC3Nz one"],
+            "the later layer wins"
+        );
+        assert_eq!(recipients.origin.file, Path::new("modules/k.toml"));
+        assert_eq!(
+            merged.secrets.identity.expect("an identity").path.as_str(),
+            "~/.config/age/key.txt"
+        );
     }
 
     #[test]

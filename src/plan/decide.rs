@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Change, Diff, Error};
 use crate::config::resolve::Resolution;
+use crate::config::secrets::Secrets;
 use crate::config::target::{Attach, Body, Direction, Format, Gen, Target};
 use crate::env_guard::{self, RootSet};
 use crate::fs::{self, Desired, Kind, Mode, Observed};
@@ -39,6 +40,9 @@ pub(super) struct Ctx<'a> {
     pub repo: &'a Path,
     /// The roots a generated environment fragment is judged against.
     pub roots: &'a RootSet,
+    /// The `[secrets]` table, which names the identity a secret is decrypted
+    /// with.
+    pub secrets: &'a Secrets,
     /// The directories decided so far that apply leaves at a declared mode.
     pub declared: &'a Declared,
 }
@@ -468,9 +472,17 @@ pub(super) fn decide(
         Action::Conflict => observed.kind == Kind::File,
         Action::Unchanged | Action::Blocked => false,
     };
+    // A secret's plaintext, and whatever is on disk where it goes, are never
+    // shown: the plan is printed, piped and pasted.
+    let secret = matches!(target.body, Body::Secret(_));
     let diff = shown
         .then(|| {
-            Diff::between(
+            let between = if secret {
+                Diff::concealed
+            } else {
+                Diff::between
+            };
+            between(
                 target.path.as_str(),
                 observed.bytes.as_deref(),
                 &bytes,
@@ -688,20 +700,22 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
     }
     let bytes = match &target.body {
         Body::Inline(content) => content.clone().into_bytes(),
-        Body::File(rel) => {
-            let path = ctx.repo.join(rel);
-            let body = |source| Error::Body {
-                origin: target.origin.clone(),
-                path: path.clone(),
-                source,
-            };
-            // Followed through a link, since a body the repo links to is the
-            // user's layout. Anything but a regular file at the end of it — a
-            // FIFO, a device — would block the read or never end it.
-            if std::fs::metadata(&path).is_ok_and(|meta| !meta.is_file()) {
-                return Err(body(std::io::Error::other("not a regular file")));
+        Body::File(rel) => read_repo_file(target, ctx.repo, rel)?,
+        // Decrypted here, in the one function `plan` and `apply` share, so the
+        // plaintext `apply` writes is the plaintext `plan` compared. Never with
+        // a prompt: a locked identity is a blocked row naming the fix.
+        Body::Secret(rel) => {
+            let ciphertext = read_repo_file(target, ctx.repo, rel)?;
+            let identity = ctx.secrets.identity_path(ctx.home);
+            match crate::secret::decrypt(
+                &ciphertext,
+                &identity,
+                ctx.secrets.identity_spelling(),
+                crate::secret::Unlock::Never,
+            ) {
+                Ok(plaintext) => plaintext,
+                Err(refusal) => return Ok(Wanted::Blocked(refusal.to_string())),
             }
-            std::fs::read(&path).map_err(body)?
         }
         Body::Generated(generator) => {
             let content = generate(generator);
@@ -715,6 +729,27 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
         Body::Dir => return Ok(Wanted::Dir),
     };
     Ok(Wanted::Bytes(bytes))
+}
+
+/// Read a file the config repo holds: a `file` body, or a secret's ciphertext.
+///
+/// # Errors
+///
+/// [`Error::Body`] naming the file when it cannot be read.
+pub(crate) fn read_repo_file(target: &Target, repo: &Path, rel: &Path) -> Result<Vec<u8>, Error> {
+    let path = repo.join(rel);
+    let body = |source| Error::Body {
+        origin: target.origin.clone(),
+        path: path.clone(),
+        source,
+    };
+    // Followed through a link, since a body the repo links to is the user's
+    // layout. Anything but a regular file at the end of it — a FIFO, a device —
+    // would block the read or never end it.
+    if std::fs::metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+        return Err(body(std::io::Error::other("not a regular file")));
+    }
+    std::fs::read(&path).map_err(body)
 }
 
 /// Why a target's attachment, direction or format cannot be written yet.
@@ -893,6 +928,7 @@ mod tests {
             home: home.path(),
             repo: &home.child(".config/bx"),
             roots: &roots,
+            secrets: &Secrets::default(),
             declared: &Declared::new(),
         };
         let shaped = |change: fn(&mut Target)| {
@@ -963,6 +999,7 @@ mod tests {
             home: home.path(),
             repo: &home.child(".config/bx"),
             roots: &roots,
+            secrets: &Secrets::default(),
             declared: &Declared::new(),
         };
 
@@ -1016,6 +1053,7 @@ mod tests {
                 home: home.path(),
                 repo: &home.child(".config/bx"),
                 roots: &roots,
+                secrets: &Secrets::default(),
                 declared: &Declared::new(),
             };
 
@@ -1658,6 +1696,7 @@ mod tests {
             home: home.path(),
             repo: &home.child(".config/bx"),
             roots: &roots,
+            secrets: &Secrets::default(),
             declared: &Declared::new(),
         };
         let mut target = a_target(home.path(), "/");

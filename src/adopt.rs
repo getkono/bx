@@ -540,7 +540,9 @@ fn decide_file(
                     let path = ctx.repo.join(rel);
                     std::fs::read(&path).map_err(|source| Error::Read { path, source })?
                 }
-                Body::Generated(_) | Body::Dir => {
+                // A secret's declared bytes are ciphertext; adopting would
+                // mean decrypting here, so it is refused like the others.
+                Body::Generated(_) | Body::Dir | Body::Secret(_) => {
                     return Ok(refused(format!(
                         "is already declared at {origin} with a body bx add does not adopt into"
                     )));
@@ -867,7 +869,12 @@ fn declarations(ctx: &Context, under: &Portable) -> Result<Vec<Declaration>, Err
                 found.push(Declaration {
                     layer: layer.file.clone(),
                     target,
-                    body: table.get("file").and_then(Item::as_str).map(PathBuf::from),
+                    // Both body keys that name a file in the repo: a secret's
+                    // ciphertext stays there as much as a `file` body does.
+                    body: ["file", "secret"]
+                        .into_iter()
+                        .find_map(|key| table.get(key).and_then(Item::as_str))
+                        .map(PathBuf::from),
                 });
             }
         }
@@ -1406,6 +1413,21 @@ mod tests {
     }
 
     #[test]
+    fn a_file_declared_as_a_secret_is_refused_and_nothing_is_copied() {
+        let declared =
+            "[[target]]\npath = \"~/.token\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n";
+        let home = repo(declared);
+        plant(&home, ".token", b"hunter2\n", 0o600);
+        let rows = add_rel(&home, ".token");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }] if note.contains("does not adopt into")),
+            "{rows:?}"
+        );
+        assert_eq!(layer(&home), declared);
+        assert!(!home.child(".config/bx/files/.token").exists());
+    }
+
+    #[test]
     fn a_switched_off_placeholder_pathed_declaration_is_found_by_the_path_it_resolves_to() {
         let values = "[[value]]\nname = \"profile\"\nkind = \"string\"\ndefault = \"work\"\n";
         let templated = inline("~/.config/{{profile}}/s", "s\\n");
@@ -1619,6 +1641,24 @@ mod tests {
         assert_eq!(layer(&home), "");
         assert_eq!(std::fs::read_to_string(&local).expect("local.toml"), "");
         assert!(rm_rel(&home, ".never").is_empty(), "a second rm is a no-op");
+    }
+
+    #[test]
+    fn rm_of_a_secret_target_reports_its_ciphertext_as_left_in_the_repo() {
+        let home = repo(
+            "[[target]]\npath = \"~/.token\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n",
+        );
+
+        let removals = rm_rel(&home, ".token");
+        assert!(
+            matches!(
+                removals.as_slice(),
+                [Removal { restored: Restored::Unmanaged { .. }, undeclared, bodies }]
+                    if undeclared.len() == 1 && bodies == &[PathBuf::from("secrets/token.age")]
+            ),
+            "{removals:?}"
+        );
+        assert_eq!(layer(&home), "");
     }
 
     #[test]

@@ -625,20 +625,14 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
             |declared| declared.origin.clone(),
         );
         // A secret's plaintext is on one side of its roll back, or both, and
-        // is never shown here either. A blocked secret whose path is itself
-        // blocked cannot be matched to this write, so any such secret conceals
-        // every write no declared target claims: showing a secret's bytes is
-        // worse than hiding an ordinary file's.
-        let is_secret =
-            |declared: &Target| matches!(declared.body, crate::config::target::Body::Secret(_));
-        let conceal = configured.map_or_else(
-            || {
-                inputs.declared_targets().any(|(declared, resolution)| {
-                    is_secret(declared) && matches!(resolution, Resolution::Blocked(_))
-                })
-            },
-            is_secret,
-        );
+        // is never shown here either. A write no declared target claims is
+        // concealed too: the journal does not say whether it was a secret, and
+        // a secret whose target was removed, whose path was edited, or whose
+        // path now resolves elsewhere or waits on a value leaves exactly such
+        // a write. Showing a secret's bytes is worse than hiding an ordinary
+        // file's.
+        let conceal = configured
+            .is_none_or(|declared| matches!(declared.body, crate::config::target::Body::Secret(_)));
         let between = if conceal {
             Diff::concealed
         } else {
@@ -2524,9 +2518,45 @@ pub(crate) mod tests {
         );
         let shown = render_an_interrupted_token_write(&layer);
         assert!(!shown.contains("hunter"), "{shown}");
+    }
 
-        // With no secret declared, an unclaimed write is shown as before.
+    #[test]
+    fn d1_an_interrupted_secret_write_whose_path_was_edited_is_concealed() {
+        // The secret now lives at `~/.other`, so no declared target claims the
+        // write it left at `~/.token`, and nothing is blocked.
+        let shown = render_an_interrupted_token_write(
+            "[[target]]\npath = \"~/.other\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n",
+        );
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(
+            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn d1_an_interrupted_secret_write_whose_path_resolves_elsewhere_is_concealed() {
+        // `{{who}}` is answered, by its default, with something else than the
+        // write was made under, so the ready target claims another path.
+        let shown = render_an_interrupted_token_write(
+            "[[value]]\nname = \"who\"\nkind = \"string\"\ndefault = \"other\"\n\
+             [[target]]\npath = \"~/.{{who}}\"\nsecret = \"secrets/token.age\"\n\
+             mode = \"0600\"\n",
+        );
+        assert!(!shown.contains("hunter"), "{shown}");
+    }
+
+    #[test]
+    fn an_interrupted_write_no_target_claims_is_concealed_and_a_claimed_file_is_shown() {
+        // The journal does not say whether an unclaimed write was a secret.
         let shown = render_an_interrupted_token_write(WHO);
+        assert!(!shown.contains("hunter"), "{shown}");
+        assert!(shown.contains("secret, not shown"), "{shown}");
+
+        // An ordinary target that claims the write still shows its diff.
+        let shown = render_an_interrupted_token_write(
+            "[[target]]\npath = \"~/.token\"\ncontent = \"hunter3\\n\"\n",
+        );
         assert!(shown.contains("hunter"), "{shown}");
     }
 

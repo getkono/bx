@@ -85,12 +85,22 @@
 //! # Invariant 2
 //!
 //! The `functions` phase is generated shell content that is not an
-//! environment fragment, so it carries no environment assignment. Defining a
-//! function runs nothing in its body. Registration assigns one thing, a hook
-//! array, which is a shell array zsh cannot export, and which says what runs
-//! at a hook rather than where any tool's files live.
-//! `rendering_functions_changes_only_the_hook_arrays` runs the rendered bytes
-//! in zsh and holds them to exactly that.
+//! environment fragment, so the bx-derived content in it — each `function
+//! NAME {` line, its closing `}`, and each registration line — carries no
+//! environment assignment. Defining a function runs nothing in its body.
+//! Registration assigns one thing, a hook array, which is a shell array zsh
+//! cannot export, and which says what runs at a hook rather than where any
+//! tool's files live. `rendering_functions_changes_only_the_hook_arrays` runs
+//! the rendered bytes in zsh and holds them to exactly that.
+//!
+//! The body is not bx-derived content. It is code the user wrote verbatim in
+//! their own config repo, and bx transports it byte for byte, deriving nothing
+//! from it, exactly as an owned `file` target may hold anything its author
+//! wrote. Invariant 2 governs what bx itself emits or relocates, so it does
+//! not judge a body, hooked or not — even though a hooked body runs at every
+//! firing of its hook without the user invoking it, and may set any variable
+//! the user chose to set there. Passing bodies through [`crate::env_guard`]
+//! would refuse ordinary user shell code.
 
 use std::path::Path;
 

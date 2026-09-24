@@ -20,7 +20,9 @@
 //!
 //! A machine-owned file that becomes an error the user cannot clear is a defect,
 //! so damaged *contents* are never fatal. A truncated, garbled or wrong-kind
-//! file is reported through `tracing::warn!` and replaced by the empty default. A holder of the [`ExclusiveLock`] also moves it aside, to
+//! file is reported through `tracing::warn!` and replaced by what survived it —
+//! the empty default, or the rows that check out when the damage is confined to
+//! rows and [`Damage::is_partial`] says so. A holder of the [`ExclusiveLock`] also moves it aside, to
 //! the quarantine number after the highest present — `<name>.corrupt`, then
 //! `<name>.corrupt.1`, … — never over an earlier quarantine, and not into a
 //! gap one left until the top number, `<name>.corrupt.<u64::MAX>`, is present,
@@ -54,9 +56,21 @@
 //! renamed. A newer fingerprint cache is still damage: losing it costs a
 //! recomputation.
 //!
+//! # `sudo bx` is refused, on purpose
+//!
+//! [`StateDir::ensure`] and the lock path compare the state directory's owner
+//! against the *effective* uid, so a `~/.local/state/bx` owned by the ordinary
+//! user is [`Error::ForeignOwner`] to a root process and `sudo bx` stops there.
+//! That is the intended consequence and not an oversight (r4 round 2, CL8): the
+//! directory holds verbatim copies of the user's private files, and a root run
+//! writing into a directory an unprivileged account controls is a directory
+//! that account can swap under it. The message says "run bx as the account that
+//! owns it", which is the supported way to run it.
+//!
 //! A file that **cannot be read** is a different thing and is handled the
-//! opposite way. `EACCES` left behind by a `sudo bx`, `EIO` from a failing
-//! disk, `EMFILE` from fd exhaustion — in none of those is anything known about
+//! opposite way. `EACCES` on a state file — left in a directory an earlier root
+//! run created — `EIO` from a failing
+//! disk, `EMFILE` from fd exhaustion: in none of those is anything known about
 //! the file's contents, and the bytes a quarantine would move aside may be a
 //! perfectly good ledger. So nothing is renamed, nothing is replaced, and
 //! [`Error::Read`] is returned: [`Ledger::open`], [`LedgerView::read`] and
@@ -97,9 +111,11 @@ pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use ledger::RestoreRef;
 pub(crate) use ledger::blob_len;
-pub use ledger::{Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes};
+pub use ledger::{
+    Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, Withdrawal,
+};
 pub use lock::{ExclusiveLock, Holder, SharedLock};
-pub use store::{Damage, Health, Loaded};
+pub use store::{Damage, Health, Loaded, MAX_STATE_FILE, Unlisted};
 
 /// Everything that can go wrong in the state directory.
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +125,31 @@ pub enum Error {
     NotADirectory {
         /// The offending path.
         path: PathBuf,
+    },
+    /// A directory could not be created because a directory above it cannot be
+    /// written in by this account.
+    ///
+    /// Usually a `umask` with owner bits in it — `0277`, `0377`, `0500` — met
+    /// on a home with no `~/.local/state` yet: the ancestors bx creates take
+    /// the process `umask`, and one at `0500` is a directory this account can
+    /// read and search and not write. Reported separately from
+    /// [`Error::CreateDir`] because "Permission denied" alone names neither the
+    /// directory in the way nor the `umask` that made it.
+    #[error(
+        "creating {}: {} is {mode}, and this account cannot write in it. If your umask strips \
+         the owner's write or execute bit, that is what made it. Run `chmod u+wx {}` and run bx \
+         again",
+        .path.display(),
+        .ancestor.display(),
+        .ancestor.display()
+    )]
+    UnwritableAncestor {
+        /// The directory bx was trying to create.
+        path: PathBuf,
+        /// The deepest directory above it that exists, and cannot be written.
+        ancestor: PathBuf,
+        /// That directory's mode.
+        mode: Mode,
     },
     /// A directory could not be created.
     #[error("creating {}: {source}", .path.display())]
@@ -302,6 +343,98 @@ pub enum Error {
         /// The state file.
         path: PathBuf,
     },
+    /// The ledger's path — itself, or through a symbolic link — names
+    /// something other than a regular file or a directory: a FIFO, a device or
+    /// a socket. A directory is [`Error::Read`], as it always was.
+    ///
+    /// Nothing is read from it: a FIFO would block until a writer appeared,
+    /// and a device such as `/dev/zero` would never end. Nothing is renamed
+    /// either, because nothing is known about what it holds. The same thing at
+    /// the fingerprint cache is [`Damage::NotAFile`], and degrades to
+    /// recomputation.
+    #[error(
+        "{} is not a regular file (a FIFO, a device or a socket, or a symbolic link to one); bx will not read it as the ledger. Put the ledger back, or move it aside",
+        .path.display()
+    )]
+    StateNotAFile {
+        /// The state file.
+        path: PathBuf,
+    },
+    /// The ledger is longer than [`MAX_STATE_FILE`], a length no ledger bx
+    /// writes comes near.
+    ///
+    /// At most one byte past the limit is read, so the refusal costs a bounded
+    /// allocation. Nothing is renamed. The same length at the fingerprint cache
+    /// is [`Damage::TooLarge`], and degrades to recomputation.
+    #[error(
+        "{} is longer than {MAX_STATE_FILE} bytes, which no ledger bx writes comes near; bx will \
+         not read it. If it is a symbolic link, check what it points at",
+        .path.display()
+    )]
+    StateTooLarge {
+        /// The state file.
+        path: PathBuf,
+    },
+    /// An entry handed to [`Ledger::record`] names a directory bx created that
+    /// is not an ancestor of the target.
+    ///
+    /// The stored list is ordered by depth, and depth alone orders it only
+    /// because every entry is an ancestor of one path. A directory that is not
+    /// would be sorted among them by a number that says nothing about it, and
+    /// `bx rm` would then try to remove, in that order, a directory it never
+    /// created for this target. Nothing is recorded and nothing is stored.
+    #[error(
+        "bx will not record {dir} as a directory it created for {target}: it is not an ancestor \
+         of it. Nothing was recorded"
+    )]
+    UnrelatedCreatedDir {
+        /// The target, as the entry names it.
+        target: String,
+        /// The directory that is not an ancestor of it.
+        dir: String,
+    },
+    /// The state directory, or its lock file, is owned by another account.
+    ///
+    /// The module validates file type, link-ness, `nlink` and mode precisely
+    /// to establish "this is ours"; owner is the component of that judgement
+    /// that can be established rather than guessed. A `~/.local/state/bx`
+    /// owned by another uid at `0700` would otherwise be accepted as bx's own,
+    /// and bx would write the user's displaced private bytes into a directory
+    /// that account controls — and lock against a file it can replace.
+    #[error(
+        "{} is owned by uid {owner}, and bx is running as uid {ours}; bx will not keep your \
+         files in a directory another account owns, nor lock against a file it owns. Move it \
+         aside, or run bx as the account that owns it",
+        .path.display()
+    )]
+    ForeignOwner {
+        /// The directory or lock file.
+        path: PathBuf,
+        /// The uid that owns it.
+        owner: u32,
+        /// This process's effective uid.
+        ours: u32,
+    },
+    /// A directory the state directory needs is a symbolic link that leads
+    /// nowhere: to nothing, round a loop of links (`ELOOP`), or through a file
+    /// (`ENOTDIR`).
+    ///
+    /// The state directory itself, `restore/` or `shell/`. `mkdir` returns
+    /// `EEXIST` for such a link, because the link occupies the name, so
+    /// without this the user was told the directory they can see cannot be
+    /// read. [`Error::DanglingLink`] is the same condition for a state *file*.
+    #[error(
+        "{} is a symbolic link to {}, which does not exist or cannot be followed (the links \
+         loop, or the path runs through a file). Restore what it points at, or remove the link",
+        .path.display(),
+        .target.display()
+    )]
+    DanglingStateDir {
+        /// The link.
+        path: PathBuf,
+        /// What it names, as the link spells it.
+        target: PathBuf,
+    },
     /// The state directory is a symbolic link to a directory that users other
     /// than its owner can read or write.
     ///
@@ -405,6 +538,27 @@ pub enum Error {
         /// The digest the ledger recorded.
         digest: ContentHash,
         /// Where the snapshot should have been.
+        path: PathBuf,
+    },
+    /// Something other than the plain file bx wrote occupies a restore
+    /// snapshot's name.
+    ///
+    /// A symlink, a directory, a FIFO or a device. Reading one of these would
+    /// block forever on a FIFO, or allocate without bound through a link to
+    /// `/dev/zero`, so the read side refuses anything but a regular file.
+    ///
+    /// A second hard link is **not** one of them: see
+    /// [`LedgerView::restore_bytes`] for why the write side's `nlink` test is
+    /// not repeated on the read side.
+    #[error(
+        "the restore snapshot {digest} is not the plain file bx wrote: {} is a symbolic link, a \
+         directory or a special file. Move it aside and run bx again",
+        .path.display()
+    )]
+    RestoreNotAFile {
+        /// The digest the ledger recorded.
+        digest: ContentHash,
+        /// The name it should have been at.
         path: PathBuf,
     },
     /// A restore snapshot's bytes do not hash to the digest that named them.

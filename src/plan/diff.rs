@@ -109,6 +109,13 @@ impl Diff {
 /// that had none is followed by `\ No newline at end of file`, and the target
 /// in the file headers is escaped as a row names it, so the text splits back
 /// into its lines on `\n` alone.
+///
+/// The file headers are written even when there is no hunk. `unified` is only
+/// asked about sides that differ, and two sides with no line between them
+/// differ only in whether a file is there — an empty body created where there
+/// was none, or rolled back to where there was none. `similar` has no hunk for
+/// that, and without the headers the diff was the empty string, which a row
+/// rendered as one blank indented line under nothing.
 fn unified(target: &str, old: &str, new: &str) -> String {
     let old: Vec<&str> = old.split_inclusive('\n').collect();
     let new: Vec<&str> = new.split_inclusive('\n').collect();
@@ -119,10 +126,8 @@ fn unified(target: &str, old: &str, new: &str) -> String {
     let mut unified = diff.unified_diff();
     unified.context_radius(CONTEXT);
     let mut out = String::new();
-    for (index, hunk) in unified.iter_hunks().enumerate() {
-        if index == 0 {
-            let _ = writeln!(out, "--- {target} (on disk)\n+++ {target} (bx)");
-        }
+    let _ = writeln!(out, "--- {target} (on disk)\n+++ {target} (bx)");
+    for hunk in unified.iter_hunks() {
         let _ = writeln!(out, "{}", hunk.header());
         for change in hunk.iter_changes() {
             let value = change.value();
@@ -387,6 +392,36 @@ mod tests {
                 "--- ~/.a (on disk)\n+++ ~/.a (bx)\n@@ -0,0 +1,2 @@\n+one\n+two\n".to_string()
             )
         );
+    }
+
+    #[test]
+    fn an_empty_body_where_there_was_no_file_is_the_headers_alone() {
+        // `similar` has no hunk between two sides with no line, so this used
+        // to be `Text("")`, rendered as one blank indented line and no header.
+        let diff = Diff::between("~/.a", None, b"", None).expect("a diff");
+        assert_eq!(
+            diff.kind,
+            DiffKind::Text("--- ~/.a (on disk)\n+++ ~/.a (bx)\n".to_string())
+        );
+
+        let mut create = change("~/.a", 1, Action::Create);
+        create.diff = Some(diff);
+        let shown = render(
+            &Report {
+                changes: vec![create],
+                ..Report::default()
+            },
+            View::Plan,
+            Palette::PLAIN,
+            Path::new(HOME),
+        );
+        let lines: Vec<&str> = shown.lines().collect();
+        assert_eq!(
+            lines[1..3],
+            ["    --- ~/.a (on disk)", "    +++ ~/.a (bx)"],
+            "{shown}"
+        );
+        assert!(!lines.iter().any(|line| line.trim().is_empty()), "{shown}");
     }
 
     #[test]

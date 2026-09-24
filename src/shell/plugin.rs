@@ -24,6 +24,13 @@
 //! `terminal = true` claims the single slot that loads after everything else.
 //! At most one enabled plugin may claim it: [`check_terminal`] refuses a second
 //! at load, naming both.
+//!
+//! A plugin takes no `when` key, unlike `[[env]]`: an unknown key is refused,
+//! so adding one later breaks no configuration written today. The readability
+//! test already gates each plugin on being installed, a `has:TOOL` gate is
+//! decided by the loader wiring this module does not yet have, and a
+//! conditional terminal claimant would need [`check_terminal`] to reason about
+//! which conditions can hold together.
 
 use std::path::Path;
 

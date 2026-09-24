@@ -3721,6 +3721,16 @@ mod tests {
             ),
             vec![(3, Reason::UnreadableReference)]
         );
+        // A removal changes what the list holds, so its value as one string,
+        // known before, is not after.
+        assert_eq!(
+            reasons(
+                "export PATH=/usr/bin:/opt/x/bin\npath=(${path:#/opt/x/bin})\n\
+                 export INFOPATH=$PATH\n",
+                &roots
+            ),
+            vec![(3, Reason::UnreadableReference)]
+        );
         // An entry a later line would add is judged after a removal too.
         assert_eq!(
             reasons(

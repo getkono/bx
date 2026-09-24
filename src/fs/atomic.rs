@@ -264,6 +264,48 @@ pub enum Error {
         /// The mode the temporary file actually has.
         landed: Mode,
     },
+    /// A setuid, setgid or sticky bit declared for a directory did not survive
+    /// its `chmod` — the directory form of [`Error::SetIdNotKept`].
+    ///
+    /// `chmod(2)` reports success when the kernel clears `S_ISGID` from a
+    /// directory whose group the caller is not in, which is the group a setgid
+    /// parent gives every directory made inside it, and a filesystem that
+    /// stores no special bits drops them the same way. Reporting the mode as
+    /// applied would make every later `plan` announce a `Modify` no `apply` can
+    /// close. So the mode is read back after the `chmod`, by [`ensure_dir`]
+    /// and by [`stage`] for a directory it creates, and a missing bit is
+    /// refused. Nothing is recorded. A directory whose mode a `Modify` changed
+    /// is set back to the mode `plan` saw and read back again; a directory bx
+    /// created is left in place at the mode that landed — as for an abandoned
+    /// write's parent — so the next `plan` announces the `Modify` that is still
+    /// owed.
+    ///
+    /// The kernel's own cause is refused before any `chmod`: [`ensure_dir`]
+    /// does not `chmod` an existing directory that has `S_ISGID`, or is
+    /// declared with it, when the process is neither root nor in the
+    /// directory's group. That `chmod` would strip the bit, and a set-back by
+    /// the same process would strip it again, so a bit the user had would be
+    /// lost for good. Then `chmod_left` is `None` and nothing was changed.
+    ///
+    /// The message is worded from `landed`, the mode on the directory when bx
+    /// returned, and says whether a set-back restored the mode `plan` saw.
+    #[error("{}", directory_set_id_not_kept(.path, *.declared, *.landed, *.chmod_left, *.set_back))]
+    DirectorySetIdNotKept {
+        /// The directory.
+        path: PathBuf,
+        /// The mode its target declares, or a directory target in this apply
+        /// declares for it.
+        declared: Mode,
+        /// The mode the directory has now: after bx's last `chmod` of it and
+        /// any set-back, or untouched when bx made none.
+        landed: Mode,
+        /// The mode bx's `chmod` left on the directory, before any set-back;
+        /// `None` when bx refused before making any `chmod`.
+        chmod_left: Option<Mode>,
+        /// The mode a refused `Modify` set the directory back to, which is the
+        /// mode `plan` saw; `None` when bx set nothing back.
+        set_back: Option<Mode>,
+    },
     /// The path has a `..` component.
     ///
     /// The kernel resolves `..` *after* following the component before it, so
@@ -328,11 +370,112 @@ pub enum Error {
         /// The mode its directory target declares.
         declared: Mode,
     },
+    /// A file target's declared mode denies the owner read, which bx needs to
+    /// read the file's bytes back and compare them.
+    ///
+    /// Applying such a mode would succeed once and leave every later `plan`
+    /// failing with a permission error, against Invariant 3. [`compare`]
+    /// announces it as an [`Action::Conflict`] whose note is this error's
+    /// words, less the path, so `apply` never reaches a target `plan` printed
+    /// that way. No writer in `fs` raises it: [`stage`] writes the mode it is
+    /// given, because a reversal restores a recorded prior mode through it. It
+    /// is the typed form of that verdict for a caller that refuses the
+    /// declaration itself.
+    ///
+    /// A directory target's mode is not held to it. Whether a directory mode
+    /// shuts bx out depends on the targets beneath the directory, which only
+    /// the plan layer knows.
+    #[error("{} {}. Nothing was changed", .path.display(), owner_locked_out(*.declared, *.needs))]
+    OwnerLockedOut {
+        /// The file target.
+        path: PathBuf,
+        /// The mode declared for it.
+        declared: Mode,
+        /// The owner bits bx needs: `0400`.
+        needs: Mode,
+    },
 }
 
-/// The message of [`Error::SetIdNotKept`]: which special bits were lost, and
-/// the causes that can lose them.
+/// What bx needs the owner of a file target to be granted: read, to observe
+/// its bytes.
+const FILE_OWNER_NEEDS: Mode = Mode::from_bits(0o400);
+
+/// The words [`Error::OwnerLockedOut`] and `plan`'s conflict note share: the
+/// owner bits of `needs` that `declared` lacks, and why bx needs them.
+fn owner_locked_out(declared: Mode, needs: Mode) -> String {
+    let missing = needs.bits() & !declared.bits();
+    let names: Vec<&str> = [(0o400, "read"), (0o200, "write"), (0o100, "search")]
+        .into_iter()
+        .filter(|(bit, _)| missing & bit != 0)
+        .map(|(_, name)| name)
+        .collect();
+    let named = match names.as_slice() {
+        [init @ .., last] if !init.is_empty() => format!("{} and {last}", init.join(", ")),
+        _ => names.concat(),
+    };
+    format!(
+        "declares {declared}, which denies its owner {named} ({missing:04o}): bx reads a file \
+         target's bytes to compare them with what it wants there, so its mode must grant the \
+         owner read ({needs})"
+    )
+}
+
+/// The message of [`Error::SetIdNotKept`].
 fn special_bits_not_kept(path: &Path, declared: Mode, landed: Mode) -> String {
+    format!(
+        "{} declares {declared}, and only {landed} is on the file: {}. Nothing was replaced",
+        path.display(),
+        bits_that_did_not_stick(declared, landed, "file")
+    )
+}
+
+/// The message of [`Error::DirectorySetIdNotKept`]: why bx made no `chmod`,
+/// or which special bits its `chmod` lost and what is on the directory now.
+fn directory_set_id_not_kept(
+    path: &Path,
+    declared: Mode,
+    landed: Mode,
+    chmod_left: Option<Mode>,
+    set_back: Option<Mode>,
+) -> String {
+    let Some(left) = chmod_left else {
+        let lost = if landed.bits() & SETGID == 0 {
+            "not keep the setgid bit it declares"
+        } else {
+            "lose the setgid bit it has"
+        };
+        return format!(
+            "{} declares {declared} and is {landed}: the kernel drops a directory's setgid bit \
+             on a chmod by a process that is neither root nor in the directory's group, and this \
+             one is neither, so the directory would {lost}. bx did not chmod it, and nothing was \
+             changed",
+            path.display()
+        );
+    };
+    let outcome = match set_back {
+        None => format!(
+            "Nothing was recorded, and the directory, which bx created in this apply, is left in \
+             place at {landed}"
+        ),
+        Some(prior) if prior == landed => {
+            format!("bx set it back to {prior}, the mode plan saw, and nothing was recorded")
+        }
+        Some(prior) => format!(
+            "bx set it back to {prior}, the mode plan saw, but {landed} is on it now, so the \
+             set-back did not restore it. Nothing was recorded"
+        ),
+    };
+    format!(
+        "{} declares {declared}, and only {left} was on the directory after its chmod: {}. \
+         {outcome}",
+        path.display(),
+        bits_that_did_not_stick(declared, left, "directory")
+    )
+}
+
+/// Which special bits `declared` has and `landed` lacks, and the causes that
+/// can lose them, for a `what` ("file" or "directory").
+fn bits_that_did_not_stick(declared: Mode, landed: Mode, what: &str) -> String {
     let lost = declared.bits() & SPECIAL & !landed.bits();
     let names: Vec<&str> = [(0o4000, "setuid"), (0o2000, "setgid"), (0o1000, "sticky")]
         .into_iter()
@@ -342,19 +485,26 @@ fn special_bits_not_kept(path: &Path, declared: Mode, landed: Mode) -> String {
     let (named, noun) = match names.as_slice() {
         [one] => ((*one).to_string(), "bit"),
         [init @ .., last] => (format!("{} and {last}", init.join(", ")), "bits"),
+        // Unreachable by construction: `bits_that_did_not_stick` is only
+        // called to word `Error::SetIdNotKept`, and
+        // `Error::DirectorySetIdNotKept` when a `chmod` was made, with the
+        // mode that `chmod` left; `verify_set_id_kept` and `set_dir_mode` only
+        // construct either error when `lost` — `declared`'s special bits
+        // minus that mode's — is non-empty, so `names` is never empty here.
+        // Kept so the match stays total rather than opening a panic path.
         [] => ("special".to_string(), "bits"),
     };
-    let group = if lost & 0o2000 != 0 {
-        "The kernel drops a setgid bit from a file whose group you are not in, such as the \
-         group a setgid parent directory gives it, and a"
+    let group = if lost & SETGID != 0 {
+        format!(
+            "The kernel drops a setgid bit from a {what} whose group you are not in, such as the \
+             group a setgid parent directory gives it, and a"
+        )
     } else {
-        "A"
+        "A".to_string()
     };
     format!(
-        "{} declares {declared}, and only {landed} is on the file: the {named} {noun} did not \
-         stick. {group} filesystem that stores no set-id or sticky bits, such as vfat or exfat \
-         mounted with `quiet`, drops them. Nothing was replaced",
-        path.display()
+        "the {named} {noun} did not stick. {group} filesystem that stores no set-id or sticky \
+         bits, such as vfat or exfat mounted with `quiet`, drops them"
     )
 }
 
@@ -372,9 +522,11 @@ impl Error {
             | Self::Changed { path, .. }
             | Self::NotPortable { path, .. }
             | Self::SetIdNotKept { path, .. }
+            | Self::DirectorySetIdNotKept { path, .. }
             | Self::ParentComponent(path)
             | Self::DirectoryTargetPending { path, .. }
-            | Self::UndeclaredDirectory { path, .. } => path,
+            | Self::UndeclaredDirectory { path, .. }
+            | Self::OwnerLockedOut { path, .. } => path,
         }
     }
 }
@@ -661,8 +813,10 @@ pub struct Outcome {
 
 /// Compare what is at a destination with what bx wants there.
 ///
-/// Reads nothing: it works entirely from an [`Observed`] captured earlier, so
-/// `plan` and `apply` reach the same verdict from the same bytes.
+/// Reads nothing the verdict depends on: it works entirely from an [`Observed`]
+/// captured earlier, so `plan` and `apply` reach the same verdict from the same
+/// bytes. The one read, the realpath of `home`, only names a directory in the
+/// parent note.
 ///
 /// * [`Action::Unchanged`] — kind, bytes and mode all match.
 /// * [`Action::Create`] — nothing is there.
@@ -676,14 +830,32 @@ pub struct Outcome {
 ///   `plan` is refused rather than overwritten. [`set_mode`] is not the apply
 ///   for it: it compares nothing with `plan`.
 /// * [`Action::Conflict`] — a directory, a symlink, or anything else that is
-///   not a regular file.
+///   not a regular file; and, whatever is there, a declared mode that does not
+///   grant the owner read (`0400`), because bx could not read the file back to
+///   compare it. The note is [`Error::OwnerLockedOut`]'s words, less the path.
+///   [`stage`] does not refuse such a mode: a reversal restores a recorded
+///   prior mode through it as recorded.
 ///
 /// `home` only names things: a directory the parent note mentions is written
 /// `~/…` when it is under `home`, through [`crate::paths::to_portable`],
-/// because `plan` prints the note and plan output names no absolute home. A
+/// because `plan` prints the note and plan output names no absolute home. The
+/// directory a symlinked parent resolves to is a realpath, so it is named
+/// against the realpath of `home` — the one read `compare` makes, and only for
+/// that note — falling back to `home` as given when it does not resolve. A
 /// directory outside it stays absolute. Nothing in the verdict depends on it.
 #[must_use]
 pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outcome {
+    // So does a declared mode bx could not read back: `stage` refuses it
+    // whatever is on disk.
+    if !desired.mode.includes(FILE_OWNER_NEEDS) {
+        return Outcome {
+            action: Action::Conflict,
+            content_drift: false,
+            mode_drift: None,
+            note: Some(owner_locked_out(desired.mode, FILE_OWNER_NEEDS)),
+            parent_note: None,
+        };
+    }
     // A parent that does not resolve settles the verdict on its own: there is
     // no directory to write into and none bx can create, so announcing
     // anything but a conflict would announce work `apply` cannot do.
@@ -706,7 +878,12 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
         if let Some(resolved) = &parent.resolved {
             // Declaring the link as a directory target would be refused, so
             // the report names the directory that can actually be narrowed.
-            let resolved = crate::paths::to_portable(resolved, home);
+            // It is a realpath, so it is named against the home's realpath: a
+            // home reached through a link (`/home -> var/home`) is never its
+            // lexical prefix. A home that does not resolve is used as given.
+            let real_home = std::fs::canonicalize(home);
+            let resolved =
+                crate::paths::to_portable(resolved, real_home.as_deref().unwrap_or(home));
             return Some(format!(
                 "{shown} is a symlink to {resolved}, which is {mode}, wider than the {} this \
                  file declares; bx will not chmod a directory through a link, so chmod \
@@ -859,12 +1036,17 @@ impl Pending {
 ///
 /// # Errors
 ///
+/// `mode` is written as given, one without owner read included: it may be a
+/// prior mode a reversal restores, and whether a declared mode may lack owner
+/// read is [`compare`]'s verdict.
 /// [`Error::Changed`] when the destination is no longer what `planned`
 /// observed, or `planned` observed a different path. [`Error::UnusableParent`],
 /// [`Error::Symlink`] or [`Error::NotAFile`] when `planned` or the second
 /// observation found a parent that does not resolve, a symlink, or a directory
 /// or device node. [`Error::DirectoryTargetPending`] when a directory `dest` is
 /// beneath is declared and still wider than declared.
+/// [`Error::DirectorySetIdNotKept`] when a missing parent it creates at a
+/// declared mode does not keep that mode's setuid, setgid or sticky bit.
 /// [`Error::ParentComponent`] when `dest` has a `..`
 /// component, [`Error::NoParent`] when it has no parent component, and
 /// [`Error::Write`] when the parent cannot be created or the temporary file
@@ -1207,7 +1389,9 @@ pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Err
 /// by [`ensure_dir`] for a directory target's `Modify`, after its own check
 /// that the directory is still what `plan` saw, and on a directory
 /// `create_dir_at` has just made, to make its declared mode authoritative over
-/// the `umask`.
+/// the `umask`. Both go through `set_dir_mode`, which reads the directory back
+/// and refuses a declared special bit that did not stick
+/// ([`Error::DirectorySetIdNotKept`]). This function reads nothing back.
 ///
 /// # Errors
 ///
@@ -1248,10 +1432,15 @@ pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
 /// * [`Action::Unchanged`] — a directory at `mode`.
 /// * [`Action::Create`] — nothing is there; `path` will be created at `mode`
 ///   and any missing ancestor at [`Mode::DEFAULT_DIR`].
-/// * [`Action::Modify`] — a directory at another mode, closed by [`set_mode`].
-///   The note reads exactly `mode 0755 -> 0700`, as for a file.
+/// * [`Action::Modify`] — a directory at another mode, closed by [`ensure_dir`]
+///   with a `chmod` and a read-back of the special bits that stuck. The note
+///   reads exactly `mode 0755 -> 0700`, as for a file.
 /// * [`Action::Conflict`] — anything that is not a directory, including a
 ///   symlink to one: bx does not chmod a directory through a link.
+///
+/// A declared mode that denies the owner access is applied like any other.
+/// Whether it leaves bx unable to list, write into or search a directory
+/// depends on what lies beneath it, which only the plan layer knows.
 #[must_use]
 pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
     if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
@@ -1306,7 +1495,9 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 ///
 /// On agreement it performs **exactly** that action: nothing for `Unchanged`;
 /// `mkdir` for `Create`, with `path` at `mode` and missing ancestors at the
-/// mode declared for them or [`Mode::DEFAULT_DIR`]; [`set_mode`] for `Modify`;
+/// mode declared for them or [`Mode::DEFAULT_DIR`]; [`set_mode`] for `Modify`,
+/// with the directory read back so a declared special bit the kernel dropped is
+/// refused rather than reported as applied;
 /// and nothing at all for
 /// `Conflict`, which is reported rather than raised because it is a verdict
 /// `plan` already printed. `plan` must use [`observe`] + [`compare_dir`], not
@@ -1341,7 +1532,13 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
 ///
 /// [`Error::Changed`] when the path is no longer what `plan` saw;
 /// [`Error::UndeclaredDirectory`] when an earlier call in this apply made the
-/// directory at another mode; [`Error::ParentComponent`] when it has a `..`
+/// directory at another mode; [`Error::DirectorySetIdNotKept`] when a declared
+/// setuid, setgid or sticky bit is not on the directory after its `chmod` — a
+/// refused `Modify` sets the directory back to the mode `plan` saw first, and
+/// reads it back — and, before any `chmod`, when the directory has `S_ISGID`
+/// or `mode` adds it and the process is neither root nor in the directory's
+/// group, so the kernel would strip the bit;
+/// [`Error::ParentComponent`] when it has a `..`
 /// component; [`Error::Read`]
 /// when the path or its parent cannot be stat'd; and [`Error::Write`] when a
 /// directory cannot be created or chmod'd.
@@ -1498,7 +1695,9 @@ fn act_on_dir(
         }
         // Normally a no-op; it also narrows the directory again if it was
         // chmod'd after bx made it, as a create at `mode` would have left it.
-        set_mode(path, mode)?;
+        // A directory always has a mode.
+        refuse_setgid_a_chmod_strips(path, fresh.mode.unwrap_or(mode), mode)?;
+        set_dir_mode(path, mode)?;
         tracing::debug!(
             path = %path.display(),
             %mode,
@@ -1541,7 +1740,17 @@ fn act_on_dir(
             created_dirs = created.record(made, Some(path));
             tracing::debug!(path = %path.display(), %mode, "created a directory");
         }
-        Action::Modify => set_mode(path, mode)?,
+        Action::Modify => {
+            // A `Modify` is only announced for a directory, which always has
+            // a mode.
+            let prior = fresh.mode.unwrap_or(mode);
+            // Before any chmod: one the kernel strips the setgid bit on would
+            // lose a bit no set-back by this process can restore.
+            refuse_setgid_a_chmod_strips(path, prior, mode)?;
+            if let Err(refused) = set_dir_mode(path, mode) {
+                return Err(set_back(path, prior, refused));
+            }
+        }
         _ => {}
     }
     Ok(EnsuredDir {
@@ -1888,12 +2097,16 @@ fn create_missing_dirs(
     // removed it would be deleting a directory another tool made — Invariant 1,
     // with no way to notice afterwards, because the wrong list is durable on
     // disk by the time `bx rm` reads it.
+    let modes: Vec<(&PathBuf, Mode)> = missing
+        .iter()
+        .rev()
+        .map(|path| match leaf_mode {
+            Some(mode) if path == dir => (path, mode),
+            _ => (path, created.declared(path).unwrap_or(Mode::DEFAULT_DIR)),
+        })
+        .collect();
     let mut made_here = Vec::with_capacity(missing.len());
-    for path in missing.iter().rev() {
-        let mode = match leaf_mode {
-            Some(mode) if path == dir => mode,
-            _ => created.declared(path).unwrap_or(Mode::DEFAULT_DIR),
-        };
+    for (path, mode) in modes {
         if let Some(made) = create_dir_at(path, mode)? {
             made_here.push((path.clone(), made));
         }
@@ -1937,19 +2150,156 @@ fn create_dir_at(path: &Path, mode: Mode) -> Result<Option<Made>, Error> {
             });
         }
     }
-    // `mkdir`'s mode argument is masked by the umask; `chmod` is not.
-    set_mode(path, mode)?;
-    // Which directory this is, so a later call can tell it from another one
-    // put at the same path after it.
-    let meta = std::fs::symlink_metadata(path).map_err(|source| Error::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    // `mkdir`'s mode argument is masked by the umask; `chmod` is not. The
+    // read-back also says which directory this is, so a later call can tell it
+    // from another one put at the same path after it.
+    let meta = set_dir_mode(path, mode)?;
     Ok(Some(Made {
         mode,
         dev: meta.dev(),
         ino: meta.ino(),
     }))
+}
+
+/// [`set_mode`] on a directory, then the directory read back, refusing when a
+/// declared setuid, setgid or sticky bit is not on it.
+///
+/// `chmod(2)` succeeds when the kernel silently clears `S_ISGID` — see
+/// [`Error::DirectorySetIdNotKept`] — so what stuck is read rather than
+/// assumed, exactly as [`Staged::fill`] reads a file's back. Returns the
+/// metadata it read.
+///
+/// # Errors
+///
+/// Whatever [`set_mode`] returns, [`Error::Read`] when the directory cannot be
+/// stat'd, and [`Error::DirectorySetIdNotKept`] when a declared special bit is
+/// missing.
+fn set_dir_mode(path: &Path, mode: Mode) -> Result<std::fs::Metadata, Error> {
+    set_mode(path, mode)?;
+    let meta = std::fs::symlink_metadata(path).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let landed = mode_of(&meta);
+    let declared = mode.bits() & SPECIAL;
+    if landed.bits() & declared != declared {
+        return Err(Error::DirectorySetIdNotKept {
+            path: path.to_path_buf(),
+            declared: mode,
+            landed,
+            chmod_left: Some(landed),
+            set_back: None,
+        });
+    }
+    Ok(meta)
+}
+
+/// Refuse to `chmod` the existing directory at `path`, which `plan` found at
+/// `found`, to `declared` when the kernel would strip its setgid bit: the
+/// directory has `S_ISGID` or `declared` adds it, and this process is neither
+/// root nor in the directory's group — see [`keeps_setgid`].
+///
+/// A `chmod` by such a process clears `S_ISGID` whatever mode it asks for, so
+/// a bit declared would not stick, and a bit the directory had would be lost
+/// for good: setting it back is another `chmod` by the same process. Refused
+/// before any `chmod`, nothing changes.
+///
+/// # Errors
+///
+/// [`Error::DirectorySetIdNotKept`] with no `chmod_left`, naming the mode
+/// the directory has, and [`Error::Read`] when it cannot be stat'd.
+fn refuse_setgid_a_chmod_strips(path: &Path, found: Mode, declared: Mode) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if (found.bits() | declared.bits()) & SETGID == 0 {
+        return Ok(());
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if process_keeps_setgid(meta.gid()) {
+        return Ok(());
+    }
+    Err(Error::DirectorySetIdNotKept {
+        path: path.to_path_buf(),
+        declared,
+        landed: mode_of(&meta),
+        chmod_left: None,
+        set_back: None,
+    })
+}
+
+/// Whether a `chmod` by this process keeps the setgid bit of a directory
+/// whose group is `gid` — [`keeps_setgid`] for the process's effective uid,
+/// effective gid and supplementary groups.
+fn process_keeps_setgid(gid: u32) -> bool {
+    // A process whose groups cannot be read is taken to be in none of them:
+    // the refusal that follows changes nothing, where a wrong guess the
+    // other way would strip a bit.
+    let groups: Vec<u32> = rustix::process::getgroups()
+        .unwrap_or_default()
+        .into_iter()
+        .map(rustix::process::Gid::as_raw)
+        .collect();
+    keeps_setgid(
+        gid,
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+        &groups,
+    )
+}
+
+/// Whether the kernel keeps a directory's setgid bit through a `chmod` by a
+/// process with effective uid `euid`, effective gid `egid` and supplementary
+/// groups `groups`, when the directory's group is `gid`.
+///
+/// `chmod(2)` clears `S_ISGID` unless the caller is in the file's group or
+/// has `CAP_FSETID`. Root stands for the capability here.
+fn keeps_setgid(gid: u32, euid: u32, egid: u32, groups: &[u32]) -> bool {
+    euid == 0 || egid == gid || groups.contains(&gid)
+}
+
+/// Set a directory whose `Modify` was `refused` back to `prior`, the mode
+/// `plan` saw, so a refused `Modify` leaves no change that nothing records —
+/// and read it back, so a [`Error::DirectorySetIdNotKept`] names the mode on
+/// the directory now and whether the set-back restored `prior`. Any other
+/// refusal is returned as it is.
+///
+/// A failing set-back is logged at warn; the read-back still names what is
+/// there. When the directory cannot be stat'd, what is there is unknown, and
+/// the refusal becomes [`Error::Read`].
+fn set_back(path: &Path, prior: Mode, refused: Error) -> Error {
+    if let Err(undo) = set_mode(path, prior) {
+        tracing::warn!(
+            path = %path.display(),
+            %prior,
+            error = %undo,
+            "could not set a refused directory back to its prior mode"
+        );
+    }
+    let Error::DirectorySetIdNotKept {
+        path: named,
+        declared,
+        chmod_left,
+        ..
+    } = refused
+    else {
+        return refused;
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Error::DirectorySetIdNotKept {
+            path: named,
+            declared,
+            landed: mode_of(&meta),
+            chmod_left,
+            set_back: Some(prior),
+        },
+        Err(source) => Error::Read {
+            path: path.to_path_buf(),
+            source,
+        },
+    }
 }
 
 /// The setuid and setgid bits.
@@ -1962,6 +2312,10 @@ fn create_dir_at(path: &Path, mode: Mode) -> Result<Option<Made>, Error> {
 /// keeps both promises: never wider than the declared mode while empty, and
 /// exactly the declared mode by the time anything can see the content.
 const SET_ID: u32 = 0o6000;
+
+/// The setgid bit: the one special bit the kernel strips from a directory on a
+/// `chmod` by a process outside its group — see [`keeps_setgid`].
+const SETGID: u32 = 0o2000;
 
 /// The setuid, setgid and sticky bits: the ones a filesystem may not store.
 ///
@@ -2283,6 +2637,11 @@ mod tests {
             panic!("expected a read error, got {err:?}");
         };
         assert_eq!(path, &dest);
+        assert_eq!(
+            err.path(),
+            dest,
+            "Error::path() names the file this read error is about"
+        );
         assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(&dest).expect("read"), b"theirs\n");
     }
@@ -2387,6 +2746,11 @@ mod tests {
             panic!("expected UnusableParent, got {err:?}");
         };
         assert_eq!(path, &home.child(".config"));
+        assert_eq!(
+            err.path(),
+            home.child(".config"),
+            "Error::path() names the parent, too"
+        );
         assert_eq!(err.to_string(), note);
         assert!(
             std::fs::symlink_metadata(home.child("nowhere")).is_err(),
@@ -2697,7 +3061,497 @@ mod tests {
             return;
         }
 
-        let skip = |why: &str| eprintln!("skipped {NAME}: {why}");
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_CHILD_DIR, |_| {});
+    }
+
+    /// Set only in the unprivileged child
+    /// `a_setgid_bit_the_kernel_drops_from_a_directory_is_refused` runs itself
+    /// as, naming the setgid directory the child creates directories in.
+    const SET_ID_DIR_CHILD_DIR: &str = "BX_TEST_SET_ID_DIR_CHILD_DIR";
+
+    #[test]
+    fn a_setgid_bit_the_kernel_drops_from_a_directory_is_refused() {
+        const NAME: &str =
+            "fs::atomic::tests::a_setgid_bit_the_kernel_drops_from_a_directory_is_refused";
+
+        if let Some(dir) = std::env::var_os(SET_ID_DIR_CHILD_DIR) {
+            // The child, as in the file test: uid 1, in a setgid directory
+            // owned by a group it is not in. A directory it creates there
+            // inherits that group, so the chmod adding S_ISGID succeeds while
+            // the kernel clears the bit.
+            println!("{SET_ID_CHILD_RAN}");
+            let dir = PathBuf::from(dir);
+            let mode = Mode::from_bits(0o2775);
+
+            // A directory target plan announces as a create.
+            let team = dir.join("team");
+            let planned = observe(&team).expect("observe");
+            assert_eq!(compare_dir(&planned, mode).action, Action::Create);
+            let err = ensure_dir(&team, mode, &planned, &mut CreatedDirs::new())
+                .expect_err("create: a setgid bit the kernel dropped is not an applied mode");
+            let landed = assert_directory_set_id_not_kept(&err, &team, mode);
+            assert_eq!(
+                mode_of_path(&team),
+                landed,
+                "the refusal names what is on disk"
+            );
+            let second = compare_dir(&observe(&team).expect("observe"), mode);
+            assert_eq!(
+                (second.action, second.mode_drift),
+                (Action::Modify, Some((landed, mode))),
+                "the second plan shows the bit that is still missing",
+            );
+
+            // A directory target plan announces as a modify: refused before
+            // any chmod, because the kernel would drop the bit it adds.
+            let team2 = dir.join("team2");
+            std::fs::create_dir(&team2).expect("mkdir");
+            set_mode(&team2, Mode::PRIVATE_DIR).expect("chmod");
+            let planned = observe(&team2).expect("observe");
+            assert_eq!(compare_dir(&planned, mode).action, Action::Modify);
+            let err = ensure_dir(&team2, mode, &planned, &mut CreatedDirs::new())
+                .expect_err("modify: a setgid bit the kernel would drop is not applied");
+            let message = err.to_string();
+            assert!(
+                matches!(
+                    &err,
+                    Error::DirectorySetIdNotKept {
+                        path,
+                        declared,
+                        landed,
+                        chmod_left: None,
+                        set_back: None,
+                    } if *path == team2 && *declared == mode && *landed == Mode::PRIVATE_DIR
+                ),
+                "{err:?}",
+            );
+            assert!(
+                message.ends_with(
+                    "so the directory would not keep the setgid bit it declares. bx did not \
+                     chmod it, and nothing was changed"
+                ),
+                "{message}"
+            );
+            let after = observe(&team2).expect("observe");
+            assert_eq!(
+                (after.mode, after.stamp),
+                (Some(Mode::PRIVATE_DIR), planned.stamp),
+                "a refused modify leaves the directory plan saw, untouched",
+            );
+            let second = compare_dir(&observe(&team2).expect("observe"), mode);
+            assert_eq!(
+                (second.action, second.mode_drift),
+                (Action::Modify, Some((Mode::PRIVATE_DIR, mode))),
+                "the second plan is the first plan again",
+            );
+
+            // A declared directory a write beneath it creates.
+            let crew = dir.join("crew");
+            let dest = crew.join("tool");
+            let mut created = CreatedDirs::new();
+            created.declare(&crew, mode);
+            let planned = observe(&dest).expect("observe");
+            let err = stage(&dest, Mode::DEFAULT_FILE, &planned, &mut created)
+                .expect_err("stage: a declared setgid bit the kernel dropped is refused");
+            assert_directory_set_id_not_kept(&err, &crew, mode);
+            assert_eq!(
+                names_in(&crew),
+                Vec::<OsString>::new(),
+                "nothing is written into it"
+            );
+            return;
+        }
+
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_DIR_CHILD_DIR, |_| {});
+    }
+
+    /// The variable the preflight test's child finds its setgid directory in.
+    const SET_ID_PREFLIGHT_CHILD_DIR: &str = "BX_TEST_SET_ID_PREFLIGHT_CHILD_DIR";
+
+    #[test]
+    fn a_setgid_bit_a_chmod_would_strip_is_refused_before_any_chmod() {
+        const NAME: &str =
+            "fs::atomic::tests::a_setgid_bit_a_chmod_would_strip_is_refused_before_any_chmod";
+
+        if let Some(dir) = std::env::var_os(SET_ID_PREFLIGHT_CHILD_DIR) {
+            // The child: uid 1, in a setgid directory owned by group 5, which
+            // it is not in. A directory it makes there inherits group 5 and
+            // S_ISGID, and any chmod it makes of that directory loses S_ISGID.
+            println!("{SET_ID_CHILD_RAN}");
+            let dir = PathBuf::from(dir);
+            // This child runs one test, so its umask is its own to set.
+            rustix::process::umask(Mode::from_bits(0o022).into());
+            let team = dir.join("team3");
+            rustix::fs::mkdir(&team, Mode::DEFAULT_DIR.into()).expect("mkdir");
+            let inherited = Mode::from_bits(0o2755);
+            assert_eq!(
+                mode_of_path(&team),
+                inherited,
+                "the setgid bit is inherited"
+            );
+
+            for declared in [Mode::from_bits(0o2775), Mode::from_bits(0o775)] {
+                let planned = observe(&team).expect("observe");
+                let first = compare_dir(&planned, declared);
+                assert_eq!(
+                    (first.action, first.mode_drift),
+                    (Action::Modify, Some((inherited, declared))),
+                );
+                let err = ensure_dir(&team, declared, &planned, &mut CreatedDirs::new())
+                    .expect_err("a chmod that would strip the setgid bit is refused");
+                let message = err.to_string();
+                assert!(
+                    matches!(
+                        &err,
+                        Error::DirectorySetIdNotKept { path, declared: said, landed, .. }
+                            if *path == team && *said == declared && *landed == inherited
+                    ),
+                    "{err:?}",
+                );
+                assert_eq!(
+                    message,
+                    format!(
+                        "{} declares {declared} and is {inherited}: the kernel drops a \
+                         directory's setgid bit on a chmod by a process that is neither root \
+                         nor in the directory's group, and this one is neither, so the \
+                         directory would lose the setgid bit it has. bx did not chmod it, and \
+                         nothing was changed",
+                        team.display()
+                    ),
+                );
+                let after = observe(&team).expect("observe");
+                assert_eq!(
+                    (after.mode, after.stamp),
+                    (planned.mode, planned.stamp),
+                    "{declared}: nothing changed, not even a chmod and back a ctime would show",
+                );
+                assert_eq!(
+                    compare_dir(&after, declared),
+                    first,
+                    "the second plan is the first"
+                );
+            }
+
+            // The set-back itself, where the kernel strips the prior's bit: a
+            // chmod that left 0775 is set back to the 2755 plan saw, and the
+            // read-back names the 0755 that is on the directory instead.
+            let left = Mode::from_bits(0o775);
+            set_mode(&team, left).expect("chmod");
+            let err = set_back(
+                &team,
+                inherited,
+                not_kept(&team, Mode::from_bits(0o2775), left),
+            );
+            assert!(
+                matches!(
+                    &err,
+                    Error::DirectorySetIdNotKept { landed, chmod_left, set_back, .. }
+                        if *landed == Mode::DEFAULT_DIR
+                            && *chmod_left == Some(left)
+                            && *set_back == Some(inherited)
+                ),
+                "{err:?}",
+            );
+            assert!(
+                err.to_string().ends_with(
+                    "bx set it back to 2755, the mode plan saw, but 0755 is on it now, so the \
+                     set-back did not restore it. Nothing was recorded"
+                ),
+                "{err}"
+            );
+            assert_eq!(mode_of_path(&team), Mode::DEFAULT_DIR);
+            return;
+        }
+
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, SET_ID_PREFLIGHT_CHILD_DIR, |_| {});
+    }
+
+    /// The refusal `set_dir_mode` returns for `dir`, declared `declared`, when
+    /// its chmod left `left`.
+    fn not_kept(dir: &Path, declared: Mode, left: Mode) -> Error {
+        Error::DirectorySetIdNotKept {
+            path: dir.to_path_buf(),
+            declared,
+            landed: left,
+            chmod_left: Some(left),
+            set_back: None,
+        }
+    }
+
+    #[test]
+    fn the_kernel_keeps_a_setgid_bit_for_root_and_the_directory_s_group_alone() {
+        const GID: u32 = 5;
+        assert!(keeps_setgid(GID, 0, 1, &[]), "root");
+        assert!(keeps_setgid(GID, 1, GID, &[]), "the effective group");
+        assert!(keeps_setgid(GID, 1, 1, &[3, GID]), "a supplementary group");
+        assert!(!keeps_setgid(GID, 1, 1, &[3, 4]), "other groups only");
+        assert!(!keeps_setgid(GID, 1, 1, &[]), "no groups");
+
+        // The same answer for this process, read through rustix.
+        let egid = rustix::process::getegid().as_raw();
+        assert!(process_keeps_setgid(egid), "this process's own group");
+        let groups: Vec<u32> = rustix::process::getgroups()
+            .expect("getgroups")
+            .into_iter()
+            .map(rustix::process::Gid::as_raw)
+            .collect();
+        for member in &groups {
+            assert!(
+                process_keeps_setgid(*member),
+                "supplementary group {member}"
+            );
+        }
+        let foreign = (1..)
+            .find(|gid| *gid != egid && !groups.contains(gid))
+            .expect("a group this process is not in");
+        assert_eq!(
+            process_keeps_setgid(foreign),
+            rustix::process::geteuid().is_root(),
+            "group {foreign}, which this process is not in",
+        );
+    }
+
+    #[test]
+    fn the_setgid_preflight_stats_only_a_setgid_directory_and_passes_its_own_group() {
+        let home = guarded_home();
+        let missing = home.child("missing");
+        assert!(
+            refuse_setgid_a_chmod_strips(&missing, Mode::DEFAULT_DIR, Mode::PRIVATE_DIR).is_ok(),
+            "no setgid bit on either side: nothing to look at",
+        );
+        for (found, declared) in [(0o2755, 0o755), (0o755, 0o2755)] {
+            let err = refuse_setgid_a_chmod_strips(
+                &missing,
+                Mode::from_bits(found),
+                Mode::from_bits(declared),
+            )
+            .expect_err("a setgid bit on either side is looked at");
+            assert!(
+                matches!(&err, Error::Read { path, .. } if *path == missing),
+                "{found:04o} -> {declared:04o}: {err:?}",
+            );
+        }
+
+        // A setgid directory in this process's own group keeps the bit, so
+        // its Modify is applied, and the second plan is empty.
+        let team = home.child("team");
+        std::fs::create_dir(&team).expect("mkdir");
+        set_mode(&team, Mode::from_bits(0o2755)).expect("chmod");
+        assert_eq!(mode_of_path(&team), Mode::from_bits(0o2755), "own group");
+        let declared = Mode::from_bits(0o2775);
+        let planned = observe(&team).expect("observe");
+        let applied = ensure_dir(&team, declared, &planned, &mut CreatedDirs::new())
+            .expect("a member's chmod keeps the bit");
+        assert_eq!(applied.action, Action::Modify);
+        assert_eq!(mode_of_path(&team), declared);
+        let second = observe(&team).expect("observe");
+        assert_eq!(compare_dir(&second, declared).action, Action::Unchanged);
+    }
+
+    #[test]
+    fn a_refused_directory_modify_is_set_back_and_worded_from_what_is_there_after() {
+        let home = guarded_home();
+        let dir = home.child("d");
+        std::fs::create_dir(&dir).expect("mkdir");
+        // As a chmod that dropped a declared sticky bit would leave it.
+        set_mode(&dir, Mode::DEFAULT_DIR).expect("chmod");
+        let declared = Mode::from_bits(0o1755);
+        let err = set_back(
+            &dir,
+            Mode::PRIVATE_DIR,
+            not_kept(&dir, declared, Mode::DEFAULT_DIR),
+        );
+        assert!(
+            matches!(
+                &err,
+                Error::DirectorySetIdNotKept { path, declared: said, landed, chmod_left, set_back }
+                    if *path == dir
+                        && *said == declared
+                        && *landed == Mode::PRIVATE_DIR
+                        && *chmod_left == Some(Mode::DEFAULT_DIR)
+                        && *set_back == Some(Mode::PRIVATE_DIR)
+            ),
+            "{err:?}",
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} declares 1755, and only 0755 was on the directory after its chmod: the \
+                 sticky bit did not stick. A filesystem that stores no set-id or sticky bits, \
+                 such as vfat or exfat mounted with `quiet`, drops them. bx set it back to 0700, \
+                 the mode plan saw, and nothing was recorded",
+                dir.display()
+            ),
+        );
+        assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR, "set back");
+
+        // Any other refusal is returned as it was, after the same set-back.
+        set_mode(&dir, Mode::DEFAULT_DIR).expect("chmod");
+        let other = Error::Write {
+            path: dir.clone(),
+            source: std::io::Error::from_raw_os_error(libc_eperm()),
+        };
+        let err = set_back(&dir, Mode::PRIVATE_DIR, other);
+        assert!(
+            matches!(&err, Error::Write { path, source } if *path == dir && source.raw_os_error() == Some(libc_eperm())),
+            "{err:?}",
+        );
+        assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR, "set back");
+
+        // A directory that is gone cannot be read back: what is there is
+        // unknown, so the refusal says that instead.
+        let gone = home.child("gone");
+        let err = set_back(
+            &gone,
+            Mode::PRIVATE_DIR,
+            not_kept(&gone, declared, Mode::DEFAULT_DIR),
+        );
+        assert!(
+            matches!(&err, Error::Read { path, .. } if *path == gone),
+            "{err:?}"
+        );
+    }
+
+    /// The variable the foreign-file test's child finds its directory in.
+    const FOREIGN_FILE_CHILD_DIR: &str = "BX_TEST_FOREIGN_FILE_CHILD_DIR";
+
+    #[test]
+    fn a_foreign_file_s_prior_mode_without_owner_read_is_restored_as_recorded() {
+        const NAME: &str = "fs::atomic::tests::\
+             a_foreign_file_s_prior_mode_without_owner_read_is_restored_as_recorded";
+        let theirs = b"theirs\n";
+        let recorded = Mode::from_bits(0o004);
+
+        if let Some(dir) = std::env::var_os(FOREIGN_FILE_CHILD_DIR) {
+            // The child, uid 1: the file is somebody else's, at 0004, so it
+            // reads the bytes through the other bits alone.
+            println!("{SET_ID_CHILD_RAN}");
+            let foreign = PathBuf::from(dir).join("foreign");
+            let planned = observe(&foreign).expect("observe");
+            assert_eq!(
+                (planned.kind, planned.mode, planned.bytes.as_deref()),
+                (Kind::File, Some(recorded), Some(&theirs[..])),
+            );
+
+            // apply records the prior, then replaces the file.
+            let staged = stage(
+                &foreign,
+                Mode::DEFAULT_FILE,
+                &planned,
+                &mut CreatedDirs::new(),
+            )
+            .expect("stage");
+            let prior = staged.prior().clone();
+            staged.commit(b"managed\n").expect("commit");
+            assert_eq!(prior.mode, Some(recorded), "the prior mode is recorded");
+
+            // rm restores the recorded bytes at the recorded mode.
+            let now = observe(&foreign).expect("observe");
+            stage(&foreign, recorded, &now, &mut CreatedDirs::new())
+                .expect("a recorded prior mode is staged as recorded")
+                .commit(prior.bytes.as_deref().expect("prior bytes"))
+                .expect("commit");
+            assert_eq!(mode_of_path(&foreign), recorded, "restored exactly");
+            return;
+        }
+
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, FOREIGN_FILE_CHILD_DIR, |dir| {
+            seed(&dir.join("foreign"), theirs, recorded);
+        });
+    }
+
+    #[test]
+    fn a_restore_of_a_recorded_mode_without_owner_read_is_written_as_recorded() {
+        let home = guarded_home();
+        let dest = home.child("restored");
+        seed(&dest, b"managed\n", Mode::DEFAULT_FILE);
+        let recorded = Mode::from_bits(0o004);
+        let now = observe(&dest).expect("observe");
+
+        // Declared, the mode is still plan's conflict: bx could not read the
+        // file back to compare it.
+        assert_eq!(
+            compare(&now, &desired(b"prior\n", recorded), home.path()).action,
+            Action::Conflict,
+        );
+        // Restored, it is what was there, and stage writes it as recorded.
+        stage(&dest, recorded, &now, &mut CreatedDirs::new())
+            .expect("a recorded prior mode is staged as recorded")
+            .commit(b"prior\n")
+            .expect("commit");
+        assert_eq!(mode_of_path(&dest), recorded);
+        set_mode(&dest, Mode::DEFAULT_FILE).expect("unlock for the assertion");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"prior\n");
+    }
+
+    /// `EPERM`, the errno a refused `chmod` reports.
+    fn libc_eperm() -> i32 {
+        Errno::PERM.raw_os_error()
+    }
+
+    /// The refusal a directory whose declared special bit did not stick gets,
+    /// naming `dir`; returns the mode it reports on disk.
+    fn assert_directory_set_id_not_kept(err: &Error, dir: &Path, declared: Mode) -> Mode {
+        let message = err.to_string();
+        let Error::DirectorySetIdNotKept {
+            path,
+            declared: said,
+            landed,
+            chmod_left,
+            set_back,
+        } = err
+        else {
+            panic!("expected DirectorySetIdNotKept, got {err:?}");
+        };
+        assert_eq!(path, dir, "{message}");
+        assert_eq!(*said, declared);
+        assert_eq!(landed.bits() & 0o2000, 0, "the bit really was dropped");
+        assert_eq!(
+            (*chmod_left, *set_back),
+            (Some(*landed), None),
+            "a directory bx created is left as its chmod left it",
+        );
+        assert_eq!(err.path(), dir, "{message}");
+        assert!(
+            message.contains(&format!(
+                "only {landed} was on the directory after its chmod"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("a directory whose group you are not in"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&format!(
+                "Nothing was recorded, and the directory, which bx created in this apply, is \
+                 left in place at {landed}"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("declares {declared}, and only")),
+            "{message}"
+        );
+        assert!(
+            message.contains("the setgid bit did not stick"),
+            "{message}"
+        );
+        *landed
+    }
+
+    /// Run the test `name` again as uid 1 with no supplementary groups, inside
+    /// a user namespace, with `child_env` naming a world-writable setgid
+    /// directory owned by a group that uid is not in.
+    ///
+    /// Skips, with a message on stderr, wherever the scenario cannot be
+    /// constructed; fails only when the child ran and failed.
+    fn run_unprivileged_in_a_foreign_setgid_directory(
+        name: &str,
+        child_env: &str,
+        seed: impl FnOnce(&Path),
+    ) {
+        let skip = |why: &str| eprintln!("skipped {name}: {why}");
         let home = guarded_home();
         // Another uid has to reach the directory and run this test binary,
         // whose own directory it may not be able to read.
@@ -2712,6 +3566,9 @@ mod tests {
         set_mode(&exe, Mode::from_bits(0o755)).expect("chmod the copy");
         let dir = home.child("shared");
         std::fs::create_dir(&dir).expect("mkdir");
+        // Anything the child should find there owned by this user, which is
+        // somebody else to uid 1.
+        seed(&dir);
 
         // Each step in a user namespace mapping this user to root and its
         // subordinate ids above that: give the directory group 5, make it
@@ -2720,7 +3577,7 @@ mod tests {
             std::process::Command::new("unshare")
                 .args(["--map-auto", "--map-root-user", "--"])
                 .args(args)
-                .env(SET_ID_CHILD_DIR, &dir)
+                .env(child_env, &dir)
                 .output()
         };
         for step in [
@@ -2755,7 +3612,7 @@ mod tests {
             "--".as_ref(),
             exe.as_os_str(),
             "--exact".as_ref(),
-            NAME.as_ref(),
+            name.as_ref(),
             "--nocapture".as_ref(),
         ]);
         let out = match child {
@@ -3719,6 +4576,134 @@ mod tests {
             "plan saw nothing, and it is now a directory at 0777"
         );
         assert_eq!(mode_of_path(&dir), Mode::from_bits(0o777));
+    }
+
+    #[test]
+    fn ensure_dir_refuses_a_parent_that_stopped_resolving_after_plan_observed() {
+        let home = guarded_home();
+        let parent = home.child("dotfiles");
+        std::fs::create_dir(&parent).expect("mkdir parent");
+        set_mode(&parent, Mode::DEFAULT_DIR).expect("chmod parent");
+        let dir = parent.join("sub");
+        std::fs::create_dir(&dir).expect("mkdir");
+        set_mode(&dir, Mode::PRIVATE_DIR).expect("chmod");
+        let planned = observe(&dir).expect("plan observes");
+        assert_eq!(
+            compare_dir(&planned, Mode::PRIVATE_DIR).action,
+            Action::Unchanged,
+        );
+
+        // Somebody replaces the parent with a dangling symlink between `plan`
+        // and `apply`: the same race `seen()` names for a file target's
+        // parent, here on a directory target's own second observation.
+        std::fs::remove_dir_all(&parent).expect("remove parent");
+        std::os::unix::fs::symlink("nowhere", &parent).expect("symlink");
+
+        let err = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned, &mut CreatedDirs::new())
+            .expect_err("plan announced unchanged through a parent that no longer resolves");
+        let Error::Changed { detail, .. } = &err else {
+            panic!("expected Changed, got {err:?}");
+        };
+        assert!(
+            detail.contains("a parent that does not resolve"),
+            "{detail}",
+        );
+        assert!(
+            detail.contains(&parent.display().to_string()),
+            "the detail must name the parent that does not resolve: {detail}",
+        );
+    }
+
+    /// The refusal a declared file mode that locks its owner out gets, naming
+    /// `path` and the note `plan` printed for it.
+    fn assert_owner_locked_out(err: &Error, path: &Path, note: &str) {
+        let message = err.to_string();
+        assert!(
+            matches!(err, Error::OwnerLockedOut { path: named, .. } if named == path),
+            "expected OwnerLockedOut naming {}, got {err:?}",
+            path.display(),
+        );
+        assert_eq!(err.path(), path, "{message}");
+        assert_eq!(
+            message,
+            format!("{} {note}. Nothing was changed", path.display()),
+        );
+    }
+
+    #[test]
+    fn a_file_target_that_denies_its_owner_read_is_a_conflict_at_plan_time() {
+        let home = guarded_home();
+        let dir = home.child("d");
+        let declared = Mode::from_bits(0o200);
+        let note = "declares 0200, which denies its owner read (0400): bx reads a file target's \
+                    bytes to compare them with what it wants there, so its mode must grant the \
+                    owner read (0400)";
+        let conflict = Outcome {
+            action: Action::Conflict,
+            content_drift: false,
+            mode_drift: None,
+            note: Some(note.to_string()),
+            parent_note: None,
+        };
+
+        // An existing file declared 0200: its bytes could never be compared.
+        let existing = dir.join("existing");
+        seed(&existing, b"before", Mode::DEFAULT_FILE);
+        let planned = observe(&existing).expect("plan observes");
+        assert_eq!(
+            compare(&planned, &desired(b"after", declared), home.path()),
+            conflict,
+            "plan announces the conflict",
+        );
+
+        // An absent file declared 0200: the same conflict.
+        let fresh = dir.join("fresh");
+        let planned = observe(&fresh).expect("plan observes");
+        assert_eq!(
+            compare(&planned, &desired(b"x", declared), home.path()),
+            conflict
+        );
+
+        // The error a caller raises for it says the same words, with the path.
+        let err = Error::OwnerLockedOut {
+            path: existing.clone(),
+            declared,
+            needs: FILE_OWNER_NEEDS,
+        };
+        assert_owner_locked_out(&err, &existing, note);
+    }
+
+    #[test]
+    fn a_directory_target_that_denies_its_owner_access_is_applied_as_declared() {
+        let home = guarded_home();
+        // Nothing beneath either is declared, so bx never lists, writes into
+        // or searches them: whether a mode is too narrow for what lies beneath
+        // is the plan layer's to judge.
+        for (name, before, declared, action) in [
+            ("ro", Some(Mode::DEFAULT_DIR), 0o555, Action::Modify),
+            (".aws", None, 0o500, Action::Create),
+        ] {
+            let path = home.child(name);
+            if let Some(mode) = before {
+                std::fs::create_dir(&path).expect("mkdir");
+                set_mode(&path, mode).expect("chmod");
+            }
+            let declared = Mode::from_bits(declared);
+            let planned = observe(&path).expect("plan observes");
+            let first = compare_dir(&planned, declared);
+            assert_eq!(
+                (first.action, first.mode_drift),
+                (action, before.map(|mode| (mode, declared))),
+                "{name}: the first plan",
+            );
+            let applied = ensure_dir(&path, declared, &planned, &mut CreatedDirs::new())
+                .expect("a childless directory target applies");
+            assert_eq!(applied.action, action, "{name}");
+            assert_eq!(mode_of_path(&path), declared, "{name}");
+            let second = compare_dir(&observe(&path).expect("plan observes"), declared);
+            assert_eq!(second.action, Action::Unchanged, "{name}: the second plan");
+            set_mode(&path, Mode::DEFAULT_DIR).expect("unlock for cleanup");
+        }
     }
 
     #[test]
@@ -5211,10 +6196,12 @@ mod tests {
 
     #[test]
     fn a_directory_that_opens_but_refuses_the_temporary_file_fails_the_write_naming_it() {
-        // Integration of #7 @b70d40e (r3), porting ec3a544: every other
-        // permission failure here is either before the directory opens or
-        // after the temporary file exists, so the temporary file's own
-        // creation failing was never otherwise reached.
+        // Integration of #7 @b70d40e (r3), porting ec3a544. In this writer
+        // `stage` creates the temporary file, and only `Filled::publish`, later,
+        // opens the directory to sync the rename. So the temporary file's own
+        // creation failing is the first thing a directory without write
+        // permission refuses: this write stops in `stage`, and the directory is
+        // never opened at all.
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so the condition cannot be staged.
             return;
@@ -5223,8 +6210,8 @@ mod tests {
         let dir = home.child("d");
         let dest = dir.join("f");
         seed(&dest, b"before", Mode::DEFAULT_FILE);
-        // Read and search, no write: the directory opens `O_RDONLY |
-        // O_DIRECTORY`, and no temporary file can be created in it.
+        // Read and search, no write: the destination can be observed, and no
+        // temporary file can be created beside it.
         set_mode(&dir, Mode::from_bits(0o500)).expect("chmod");
 
         let result = write_atomically(&dest, b"after", Mode::DEFAULT_FILE);
@@ -5300,5 +6287,30 @@ mod tests {
             "the note names the directory the link resolves to, portably: {note}",
         );
         assert!(note.contains("chmod"), "{note}");
+    }
+
+    #[test]
+    fn a_symlinked_parent_is_named_portably_under_a_home_reached_through_a_symlink() {
+        let guard = guarded_home();
+        // The home as `/home/u` is on a system where `/home -> var/home`: a
+        // link, so the realpath of anything under it is not under it lexically.
+        std::fs::create_dir(guard.child("real")).expect("mkdir");
+        std::os::unix::fs::symlink("real", guard.child("home")).expect("symlink");
+        let home = guard.child("home");
+        std::fs::create_dir_all(home.join("dotfiles/dot_ssh")).expect("mkdir");
+        set_mode(&home.join("dotfiles/dot_ssh"), Mode::DEFAULT_DIR).expect("chmod");
+        std::os::unix::fs::symlink("dotfiles/dot_ssh", home.join(".ssh")).expect("symlink");
+
+        let observed = observe(&home.join(".ssh/config")).expect("observe");
+        let outcome = compare(&observed, &desired(b"Host *\n", Mode::PRIVATE_FILE), &home);
+        assert_eq!(
+            outcome.parent_note.as_deref(),
+            Some(
+                "~/.ssh is a symlink to ~/dotfiles/dot_ssh, which is 0755, wider than the 0600 \
+                 this file declares; bx will not chmod a directory through a link, so chmod \
+                 ~/dotfiles/dot_ssh itself"
+            ),
+            "`bx plan` prints this note, so it names no absolute home",
+        );
     }
 }

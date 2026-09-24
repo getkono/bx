@@ -234,6 +234,26 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// What stands at the journal's path is not a regular file: a FIFO, a
+    /// device, a socket, a directory, or a symlink, dangling or not.
+    ///
+    /// Refused before anything opens it. Reading a FIFO blocks until
+    /// something writes to it, and a device such as `/dev/zero` never ends,
+    /// so every command that looks for an interrupted session would hang —
+    /// and no session writes one: [`Journal::create`] renames a regular file
+    /// into place. It is left exactly where it is, never set aside by a
+    /// recovery, and [`crate::recover::abandon`] moves it aside.
+    #[error(
+        "the write-ahead journal {} is {kind}; bx reads a journal only from a regular file, \
+         so it did not open it, and will not write until it is moved",
+        .path.display()
+    )]
+    NotAJournal {
+        /// The journal's path.
+        path: PathBuf,
+        /// What is there instead.
+        kind: crate::fs::Kind,
+    },
     /// A session was asked to start while an unresolved interruption stands.
     ///
     /// The escape is [`crate::recover::recover`], which every writing command
@@ -363,11 +383,18 @@ pub struct Begin {
     pub home: PathBuf,
     /// What the session may touch.
     ///
-    /// **Advisory and reporting-only.** Recovery never consults it: the
-    /// [`Intent`] records alone decide what is undone. A caller may pass the
-    /// announced pending set or the whole resolved target list as a superset,
-    /// and recovery behaves identically either way — an under-set is a reporting
-    /// inaccuracy, not a safety defect.
+    /// **Reporting-only, but load-bearing.** Recovery never consults it to
+    /// decide what is undone — the [`Intent`] records alone do that — so a
+    /// caller may pass the announced pending set or the whole resolved target
+    /// list as a superset and recovery behaves identically either way. An
+    /// under-set is a reporting inaccuracy, not a safety defect.
+    ///
+    /// What it is *not* is free-form. [`refusal`] puts every entry through
+    /// [`Portable::check_against`] with the header's home, and one entry that
+    /// fails makes the whole journal unreadable — so a session that wrote an
+    /// unportable scope entry could never be rolled back.
+    /// [`Session::open_locked`] therefore refuses the same entries the loader
+    /// refuses, before the journal exists: see `r3 round 3` decision R3R3-1.
     pub scope: Vec<Portable>,
 }
 
@@ -606,6 +633,8 @@ impl Loaded {
 /// [`Error::Io`] when the file exists and cannot be read at all. Damage is a
 /// value, not an error; only a failure to look is. [`Error::FutureVersion`]
 /// for a journal a newer bx wrote, which is not damage and is never set aside.
+/// [`Error::NotAJournal`] for a path that is not a regular file, which is
+/// never opened.
 pub fn load(path: &Path) -> Result<Loaded, Error> {
     Ok(match inspect(path)? {
         Ok(loaded) => loaded,
@@ -648,6 +677,26 @@ pub fn load_exclusive(path: &Path, lock: &ExclusiveLock) -> Result<Loaded, Error
 /// Classify the bytes at `path`: what a session, or a crash of one, left there,
 /// or why it is neither.
 fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
+    // Looked at before it is opened, following no link. See
+    // `Error::NotAJournal`.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(Error::NotAJournal {
+                path: path.to_path_buf(),
+                kind: fs::Kind::from(meta.file_type()),
+            });
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Ok(Loaded::Absent)),
+        Err(source) => {
+            return Err(Error::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    // A journal unlinked since that look — `pending` takes no lock, and a
+    // session may just have finished — is as absent as one never there.
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Ok(Loaded::Absent)),
@@ -878,10 +927,19 @@ fn frame(bytes: &[u8], at: usize, nonce: &[u8; NONCE]) -> Result<(Record, usize)
     // Past the bound is garbage however many bytes follow, and is what stops four
     // bytes of garbage asking for a gigabyte.
     //
-    // A zero length has no test of its own. An empty body's checksum is not four
-    // NUL bytes, and an empty slice never decodes, so a run of NUL bytes is
-    // `Invalid` twice over, which `a_run_of_nul_bytes_is_not_a_valid_frame` pins.
-    if len > MAX_FRAME {
+    // Zero is refused here rather than left to the checksum, and that is a cost
+    // rule, not a correctness one: an empty body's checksum is not four NUL
+    // bytes and an empty slice never decodes, so a zero length was already
+    // `Invalid` twice over. But both of those refusals come *after*
+    // `checksum`, and a zero length is the one length every offset of a
+    // zero-filled tail carries, so `whole_frame_after` would hash once per
+    // byte — a SHA-256 per byte of a power-loss tail, on the lock-free path
+    // every read-only command takes. A record body is never empty: every
+    // `Record` variant encodes at least a MessagePack tag.
+    // `a_run_of_nul_bytes_is_not_a_valid_frame` pins the verdict and
+    // `a_zero_length_frame_is_refused_before_its_checksum_is_taken` pins that
+    // it is reached without hashing.
+    if len == 0 || len > MAX_FRAME {
         return Err(Damage::Invalid);
     }
     let end = body_start.checked_add(len).ok_or(Damage::Invalid)?;
@@ -897,10 +955,14 @@ fn frame(bytes: &[u8], at: usize, nonce: &[u8; NONCE]) -> Result<(Record, usize)
 /// decoding both good — starts anywhere after `at`.
 ///
 /// Every offset is tried, because the damaged frame's own length cannot be
-/// trusted to say where the next one starts. Each try is a bounds check for
-/// all but a length that fits in the file, so a zero-filled or random tail
-/// costs a few comparisons per byte; only bytes crafted to be all plausible
-/// lengths hash much, and a journal is not a file anyone else writes.
+/// trusted to say where the next one starts. An offset hashes only when its
+/// four length bytes read as a non-zero length that is both within
+/// [`MAX_FRAME`] and inside the file — every other offset is refused by
+/// [`frame`]'s comparisons alone. A zero-filled tail therefore hashes not at
+/// all (zero is refused), and a random tail hashes at about one offset in 256
+/// for a journal large enough for the length to fit; only bytes crafted to be
+/// all plausible lengths hash much, and a journal is not a file anyone else
+/// writes.
 ///
 /// A whole frame an earlier journal left in reused blocks fails here, because
 /// its checksum was taken under that journal's nonce.
@@ -908,9 +970,20 @@ fn whole_frame_after(bytes: &[u8], at: usize, nonce: &[u8; NONCE]) -> bool {
     (at + 1..bytes.len()).any(|start| frame(bytes, start, nonce).is_ok())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has taken a frame [`checksum`], so a test
+    /// can pin that scanning a zero-filled tail does not hash once per byte.
+    /// Thread-local rather than global so that a parallel suite cannot make
+    /// one test's count another's.
+    pub(crate) static CHECKSUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The checksum a frame carries: the first [`CHECK`] bytes of the SHA-256 of
 /// the session's nonce, the frame's length prefix, and its body.
 fn checksum(nonce: &[u8; NONCE], prefix: [u8; 4], body: &[u8]) -> [u8; CHECK] {
+    #[cfg(test)]
+    CHECKSUMS.with(|taken| taken.set(taken.get() + 1));
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     hasher.update(nonce);
@@ -1138,11 +1211,14 @@ pub struct Session {
     /// session, because [`crate::fs::ensure_dir`] reads it to tell a directory
     /// an earlier write made from one somebody else made since plan.
     created: fs::CreatedDirs,
-    /// Every directory a target this session removed claimed. Pruned again, as
-    /// one union, and handed on when the session finishes.
+    /// Every directory a target this session removed claimed. Pruned, as one
+    /// union, once the session's `End` is durable, and handed on.
     released: std::collections::BTreeSet<PathBuf>,
-    /// Every directory a target [`Session::forget`] dropped claimed. Handed on
-    /// when the session finishes, and never pruned: no removal was announced.
+    /// Every directory claimed by a target this session dropped from the ledger
+    /// without announcing a removal: one [`Session::forget`] dropped, and one a
+    /// [`Ownership::Released`] write handed back. Handed on when the session
+    /// finishes, and never pruned — no removal was announced, so there is
+    /// nothing `plan` promised to remove.
     forgotten: std::collections::BTreeSet<PathBuf>,
     crash: Crash,
     /// Called with the destination just before a write is published, so a test
@@ -1155,6 +1231,12 @@ pub struct Session {
     /// would.
     #[cfg(test)]
     before_unlink: Option<fn(&Path)>,
+    /// Called with the directory [`Session::write`] just made for the home,
+    /// before [`crate::fs::stage`] looks, so a test can produce the one
+    /// trigger the claim filter has left: that directory going away in
+    /// between. See `r3 round 7` decision R3R7-2.
+    #[cfg(test)]
+    before_stage: Option<fn(&Path)>,
     /// Held, never read: dropping it releases the state directory.
     _lock: ExclusiveLock,
 }
@@ -1191,14 +1273,14 @@ pub enum Content {
     },
     /// No file at all.
     ///
-    /// The destination is unlinked and `created_dirs` are removed, deepest
-    /// first, while they are empty directories and no entry the ledger still
-    /// holds names them; one that is no longer a directory is left. Absence is
-    /// not emptiness: a file bx created is removed, never
-    /// truncated. The target is always dropped from the ledger — there is
-    /// nothing left for bx to own. A claimed directory something else still
-    /// holds is tried again when the session finishes, and handed to a
-    /// surviving entry beneath it if it still stands: see [`Session::finish`].
+    /// The destination is unlinked, and when the session finishes, after its
+    /// `End` frame, `created_dirs` are removed, deepest first, while they are
+    /// empty directories and no entry the ledger still holds names them; one
+    /// that is no longer a directory is left. Absence is not emptiness: a file
+    /// bx created is removed, never truncated. The target is always dropped
+    /// from the ledger — there is nothing left for bx to own. A claimed
+    /// directory that still stands then is handed to a surviving entry beneath
+    /// it: see [`Session::finish`].
     Absent {
         /// Directories bx created for the target, deepest first.
         created_dirs: Vec<PathBuf>,
@@ -1219,7 +1301,9 @@ pub enum Ownership {
     Owned(Mechanism),
     /// bx is handing the target back — the restore half of `bx rm`. The prior
     /// bytes are still copied into `restore/`, because that is what an
-    /// interrupted restore is rolled back from; only the ledger entry goes.
+    /// interrupted restore is rolled back from; only the ledger entry goes,
+    /// and the directories that entry claimed are handed to a surviving entry
+    /// beneath them when the session finishes rather than dropped.
     Released,
 }
 
@@ -1231,9 +1315,13 @@ impl Session {
     ///
     /// [`Error::InProgress`] when a journal already stands — recover first.
     /// [`Error::FutureVersion`] when the journal that stands was written by a
-    /// newer bx: nothing is set aside. [`Error::CannotSetAside`] when the
+    /// newer bx: nothing is set aside. [`Error::NotAJournal`] when what stands
+    /// at the journal's path is not a regular file: it is never opened.
+    /// [`Error::CannotSetAside`] when the
     /// journal that stands cannot be believed and cannot be moved aside: it is
-    /// left in place, never replaced. [`Error::State`] when the directory
+    /// left in place, never replaced. [`Error::State`] with
+    /// [`crate::state::Error::ForeignRecord`] when a scope entry is one the
+    /// loader would refuse. [`Error::State`] when the directory
     /// cannot be made or locked, and [`Error::Io`] when the journal cannot be
     /// written.
     pub fn open(
@@ -1243,8 +1331,52 @@ impl Session {
         scope: Vec<Portable>,
     ) -> Result<Self, Error> {
         state.ensure()?;
-        // The lock first, so the check below cannot race a second bx.
+        // The lock first, so the check inside cannot race a second bx.
         let lock = ExclusiveLock::acquire(state)?;
+        Self::open_locked(state, kind, home, scope, lock)
+    }
+
+    /// Open a session under a lock the caller already holds.
+    ///
+    /// The one-lock form: a writing command takes the lock, resolves any
+    /// interruption under it, and hands the same guard here, so no second bx
+    /// can win the directory in between and be reported as an interruption.
+    /// [`crate::recover::lock_for_writing`] hands out that guard.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::open`], minus the acquisition of the lock.
+    pub fn open_locked(
+        state: &StateDir,
+        kind: SessionKind,
+        home: &Path,
+        scope: Vec<Portable>,
+        lock: ExclusiveLock,
+    ) -> Result<Self, Error> {
+        state.ensure()?;
+        // Before the journal exists, because the loader refuses the *whole*
+        // journal over one unportable scope entry: a session that wrote one
+        // could never be rolled back. The same rule `admit` applies to a
+        // request's target; `Session::write` applies it to a write's created
+        // directories and drops what fails. Those are the places a path enters
+        // a journal, with `Intent.dest` following its target and `Intent.temp`
+        // a `.bx-` name beside it by construction.
+        //
+        // `home` itself needs no check here: `Ledger::open` below applies the
+        // loader's own rule to it — absolute, and UTF-8 — and it runs before
+        // `Journal::create`, so no `Begin` naming a home the loader would
+        // refuse is ever written.
+        // `a_home_the_loader_would_refuse_never_reaches_a_begin_frame` pins
+        // that ordering.
+        for entry in &scope {
+            entry
+                .check_against(home)
+                .map_err(|source| crate::state::Error::ForeignRecord {
+                    home: home.to_path_buf(),
+                    stored: entry.as_str().to_string(),
+                    source: Box::new(source),
+                })?;
+        }
         let path = state.journal();
         if load_exclusive(&path, &lock)?.is_interrupted() {
             return Err(Error::InProgress { path });
@@ -1277,6 +1409,8 @@ impl Session {
             before_publish: None,
             #[cfg(test)]
             before_unlink: None,
+            #[cfg(test)]
+            before_stage: None,
             _lock: lock,
         })
     }
@@ -1370,6 +1504,13 @@ impl Session {
             mode,
             ownership,
         } = request;
+        // A removal names the directories it claims up front, so `admit`
+        // checks them before anything is touched, and a removal that named one
+        // the loader refuses is an error: `plan` announced a prune bx must not
+        // make. A write does not have them yet — `fs::stage` invents them — so
+        // `Session::write` applies the same rule the moment they exist and
+        // *drops* what fails it, because there nothing was announced and the
+        // directory had to be made to reach the destination at all.
         let claimed: &[PathBuf] = match &content {
             Content::Bytes { .. } => &[],
             Content::Absent { created_dirs, .. } => created_dirs,
@@ -1415,7 +1556,13 @@ impl Session {
     /// A removal's `created_dirs` are what it prunes and what its Intent
     /// records, so each must be a strict parent of the destination below the
     /// home — the loader's rule — or the removal is [`Error::StrayCreatedDir`],
-    /// before anything is observed, stored or touched.
+    /// before anything is observed, stored or touched. A **write's** claims do
+    /// not exist yet: [`crate::fs::stage`] invents them. They go through the
+    /// same rule in [`Session::write`], at the first point they exist and
+    /// still before the Intent that records them, and one that fails it is
+    /// dropped from the claim rather than refused — so neither entry point can
+    /// write a `created_dirs` the loader refuses, and no account is refused a
+    /// write for a directory bx had to make to reach the destination.
     fn admit(
         &mut self,
         target: &Portable,
@@ -1463,6 +1610,11 @@ impl Session {
     /// Staged against `planned`, the observation plan compared, and with the
     /// session's one set of created directories, so every later write in the
     /// session knows a directory an earlier one made.
+    ///
+    /// A directory this write invents that the loader would refuse — the home,
+    /// or above it — is made and left unclaimed, by the Intent and by the
+    /// ledger entry alike. [`Session::admit`] *refuses* a removal's declared
+    /// claim instead, because that one `plan` announced.
     fn write(
         &mut self,
         target: Portable,
@@ -1475,6 +1627,58 @@ impl Session {
         // `written` moves only once a write has succeeded, so it is this
         // write's index.
         let index = self.written;
+        // Plan's verdict **before** anything is made. `fs::stage` takes the
+        // same verdict and says why it takes it where it does — "before
+        // creating anything, so a refusal leaves nothing behind" — and the
+        // `create_dir_all` below has to run before `stage` does, which would
+        // put a directory ahead of that guarantee: a write refused because the
+        // destination changed since plan would leave the home created.
+        // `Session::remove` already opens with this pair for the same reason,
+        // so the two write paths now share one preamble rather than one of
+        // them having none.
+        //
+        // `stage` remains the authority and takes the verdict again. What is
+        // *not* taken here is its `refuse_unwritable` — which depends on the
+        // kind `refuse_moved` has just pinned to plan's, and which plan itself
+        // must already have passed to announce a write — and its
+        // `refuse_wider_than_declared`, which no target in this tree can
+        // trigger because nothing declares a directory. If either ever refuses
+        // where this does not, the cost is the directory this used to make
+        // unconditionally: the behaviour before `r3 round 7`, not worse.
+        // See decision R3R7-1.
+        refuse_unplanned(&dest, planned)?;
+        // The home, and anything above it, that this destination needs and
+        // that is not there. `fs::stage` would invent them like any other
+        // ancestor: `mkdir` at [`Mode::DEFAULT_DIR`] and then a `chmod`, which
+        // is deliberately *not* masked, so the result is `0755` whatever the
+        // account's `umask` says. That is the right rule for a directory bx
+        // owns and will remove again. These are not that. bx neither claims
+        // nor ever removes them — see the loop below — so they are the shared
+        // ancestors `crate::state::dir::ensure_dir` describes: "created with
+        // the process `umask` … not bx's to tighten". Leaving one wider than
+        // the account's own `umask` would have made it is bx deciding
+        // something that is not its to decide, and nothing later narrows it,
+        // because nothing later touches it.
+        //
+        // `create_dir_all` is the same call, with the same rule, that the
+        // state directory's own ancestors get: `mkdir(0o777)` masked by the
+        // `umask`, and no `chmod`. Made before `stage`, so the directory never
+        // exists at `0755` for an instant — a window a descriptor opened
+        // inside would outlive. See `r3 round 6` decision R3R6-1.
+        if let Some(shared) = shared_ancestor(&dest, &self.home) {
+            std::fs::create_dir_all(&shared).map_err(|source| fs::Error::Write {
+                path: shared.clone(),
+                source,
+            })?;
+            tracing::debug!(
+                dir = %shared.display(),
+                "made a directory bx shares with every other tool, at the process umask",
+            );
+            #[cfg(test)]
+            if let Some(meddle) = self.before_stage {
+                meddle(&shared);
+            }
+        }
         let staged = fs::stage(&dest, mode, planned, &mut self.created)?;
         let temp = staged.temp_path().to_path_buf();
         self.crash.reached(index, Phase::AfterStage);
@@ -1482,14 +1686,72 @@ impl Session {
         let filled = staged.fill(bytes)?;
         self.crash.reached(index, Phase::AfterFill);
 
-        let created_dirs = filled.created_dirs().to_vec();
+        // What this write may *claim* of what it made. `refusal` puts an
+        // Intent's `created_dirs` through `stray_created_dir` exactly as it
+        // does a removal's, and one entry that fails makes the whole journal
+        // unreadable — so a session that announced one could never be rolled
+        // back. `admit` cannot make this check: a write's claims do not exist
+        // until `fs::stage` has made the parents.
+        //
+        // The one rule a made directory can break here is being the home or
+        // above it, which happens when the home does not exist and the state
+        // directory is somewhere else (`$XDG_STATE_HOME`), so nothing made the
+        // home on the way past. Such a directory is **made and not claimed**,
+        // never refused: refusing would fail every first write on such an
+        // account with nothing the user could do about it, and claiming it
+        // would both make the journal unreadable and put the home itself in
+        // reach of a rollback's `prune_dirs` and a later `rm`'s
+        // `prune_claims`. Unclaimed, it is left standing — the orphan
+        // decision 11 already keeps. See `r3 round 5` decision R3R5-1.
+        //
+        // Since `r3 round 6` the `create_dir_all` above makes those same
+        // directories before `stage` runs, so `stage` no longer finds them
+        // missing and this loop drops nothing in the ordinary sequence. Its one
+        // live trigger is the race that fix created: the directory going away
+        // between the two calls, which `before_stage` produces on purpose and
+        // `a_claim_that_appears_after_the_directory_is_lost_is_still_dropped`
+        // pins.
+        //
+        // It is kept because that trigger is a branch that can be taken, not a
+        // branch that cannot. `r3 round 6` claimed instead that this is "the
+        // only place the property is checked rather than argued"; that was a
+        // true statement about the code and a false one about the tests, which
+        // constrained it nowhere until the seam above existed (`r3 round 7`,
+        // CL1).
+        let mut created_dirs = Vec::with_capacity(filled.created_dirs().len());
+        for dir in filled.created_dirs() {
+            if stray_created_dir(&dest, &self.home, std::slice::from_ref(dir)).is_some() {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    dest = %dest.display(),
+                    "bx made a directory on the way to a destination and claims none of it",
+                );
+                continue;
+            }
+            created_dirs.push(dir.clone());
+        }
         // Assembled now, while the writer still holds the prior, and handed to
         // the ledger only once the write has landed. `None` is the restore half
         // of `bx rm`: bx is handing the target back, so there is nothing left for
         // it to own.
         let (entry, mechanism) = match ownership {
             Ownership::Owned(mechanism) => (
-                Some(filled.new_entry(&self.home, mechanism.clone())?),
+                Some({
+                    // `new_entry` claims everything the write made. The entry
+                    // and the Intent have to claim the same set, or a rollback
+                    // and an `rm` would disagree about the home: `prune_claims`
+                    // would reach a directory the Intent deliberately left out.
+                    //
+                    // Two statements, not one expression: `portable_dirs`'
+                    // `Err` is unreachable *because* `new_entry` has already
+                    // made the same conversion and would have failed first,
+                    // and in one expression that reason would rest on the
+                    // receiver being evaluated before the argument — true of
+                    // Rust, and not something this file should need a reader
+                    // to know (`r3 round 7`, CL3).
+                    let entry = filled.new_entry(&self.home, mechanism.clone())?;
+                    entry.with_created_dirs(portable_dirs(&created_dirs, &self.home)?)
+                }),
                 Some(mechanism.clone()),
             ),
             Ownership::Released => (None, None),
@@ -1533,8 +1795,23 @@ impl Session {
             Some(entry) => {
                 self.ledger.record(entry)?;
             }
+            // The restore half of `bx rm`. The entry goes, but the directories
+            // it claimed still stand and bx still made them, so its claims are
+            // handed to a surviving entry beneath them when the session
+            // finishes — exactly as `Session::forget` and `Session::remove`
+            // hand theirs on. Dropped here instead, no entry would claim them
+            // and no later `rm` could remove them: see `r3 round 3` decision 2.
+            // `self.forgotten`, not `self.released`, because this write
+            // announced no removal and so prunes nothing.
             None => {
-                self.ledger.forget(&target);
+                if let Some(dropped) = self.ledger.forget(&target) {
+                    self.forgotten.extend(
+                        dropped
+                            .created_dirs
+                            .iter()
+                            .map(|dir| dir.render(&self.home)),
+                    );
+                }
             }
         }
         self.crash.reached(index, Phase::AfterPublish);
@@ -1544,8 +1821,8 @@ impl Session {
         Ok(())
     }
 
-    /// The removal path: check, record, journal, check again, unlink, prune,
-    /// done.
+    /// The removal path: check, record, journal, check again, unlink, done. The
+    /// directories the target claimed are pruned when the session finishes.
     ///
     /// Checked against `planned`, the observation plan decided on, twice. First
     /// before the prior is stored or the Intent announced, so a destination
@@ -1564,8 +1841,7 @@ impl Session {
         created_dirs: Vec<PathBuf>,
         planned: &Observed,
     ) -> Result<(), Error> {
-        let observed = fs::observe(&dest)?;
-        refuse_moved(planned, &observed)?;
+        let observed = refuse_unplanned(&dest, planned)?;
         if !observed.kind.is_writable_destination() {
             return Err(fs::Error::NotAFile {
                 path: dest,
@@ -1598,7 +1874,8 @@ impl Session {
         // took two `fsync`s, and an editor may have saved in between.
         refuse_moved(planned, &fs::observe(&dest)?)?;
         unlink(&dest)?;
-        prune_claims(&self.ledger, &self.home, &created_dirs)?;
+        // Pruned only once the session's `End` is durable: see
+        // `Session::finish`.
         self.released.extend(created_dirs);
         // As in `write`: the entry goes only once the file has.
         self.ledger.forget(&target);
@@ -1612,13 +1889,18 @@ impl Session {
     /// Prune the union of the directories released targets claimed, and hand
     /// what still stands to the entries beneath it.
     ///
-    /// A removal prunes its own claims at once, but only the first write under
-    /// a new directory claims it, and another target's file may still hold it
-    /// then. By the time the session finishes every removal has run, so each
-    /// claimed directory is tried again, deepest first. Nothing is assumed
+    /// A removal prunes nothing itself: a directory removed before the
+    /// session's `End` would have to be re-created by a rollback, which cannot
+    /// know the mode it had. Deferring the prune costs no later target in the
+    /// session anything, because a directory an entry the ledger still holds
+    /// names is never pruned, so no later target can need a claimed directory
+    /// gone. By the time the session finishes every removal has run, so each
+    /// claimed directory is tried once, deepest first. Nothing is assumed
     /// about which entry claimed it: it is removed when it is empty and no
     /// entry the ledger still holds names it. A claim still standing — a
-    /// released one, or one of a target [`Session::forget`] dropped — is
+    /// released one, or one of a target this session dropped from the ledger
+    /// without announcing a removal ([`Session::forget`], or a
+    /// [`Ownership::Released`] write) — is
     /// given to a surviving entry beneath it, so the `rm` that removes that
     /// entry removes the directory too.
     fn settle_claims(&mut self) -> Result<(), Error> {
@@ -1632,12 +1914,18 @@ impl Session {
         )
     }
 
-    /// End the session: [`End`], save the ledger, and unlink the journal last.
+    /// End the session: [`End`], settle the claimed directories, save the
+    /// ledger, and unlink the journal last.
     ///
-    /// The directories released targets claimed are settled first, before the
-    /// `End` frame: see [`Session::settle_claims`]. A crash before `End` rolls
-    /// the whole session back, which puts every removed file back with the
-    /// parents it needs.
+    /// The directories released targets claimed are settled only after the
+    /// `End` frame is durable: see [`Session::settle_claims`]. Until then no
+    /// directory a removal claimed is removed, so a crash before `End` rolls
+    /// the session back into the very directories it found, at the modes they
+    /// had — never into one re-created at the default mode. A crash between
+    /// `End` and the prune leaves those directories standing, empty, and
+    /// claimed by no entry once recovery has recorded the session: the same
+    /// kind of orphan decision 11 keeps, which recovery leaves where it is and
+    /// [`crate::recover::pending`] names.
     ///
     /// The order is the ordering rule that makes recovery idempotent. The `End`
     /// frame goes down first, so a crash before the save is a *terminated*
@@ -1657,10 +1945,10 @@ impl Session {
         if self.poisoned {
             return Err(self.poisoned_error());
         }
-        self.settle_claims()?;
         let written = self.written;
         self.journal.append(&Record::End(End { written }))?;
         self.crash.reached(written, Phase::AfterEnd);
+        self.settle_claims()?;
         self.ledger.save()?;
         self.crash.reached(written, Phase::AfterSave);
         unlink(self.journal.path())?;
@@ -1677,8 +1965,9 @@ impl Session {
 /// its final mode but holds nothing; after its content is `fsync`ed but the
 /// destination is untouched; after the intent is durable; after the destination
 /// is replaced; after the completion is durable. Two in `finish`, where every
-/// write has landed: after the `End` frame is durable, and after the ledger is
-/// saved. A `finish` boundary is reached with the number of writes as its index.
+/// write has landed: after the `End` frame is durable and before the claimed
+/// directories are pruned, and after the ledger is saved. A `finish` boundary
+/// is reached with the number of writes as its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     BeforeStage,
@@ -1819,6 +2108,76 @@ fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
         fs::write_atomically(&path, &bytes, Mode::PRIVATE_FILE)?;
     }
     Ok(Prior::Existed(reference))
+}
+
+/// Look at `dest`, and refuse it unless it is still what `planned` observed.
+///
+/// The opening move of both write paths: [`Session::write`] before it makes
+/// any directory, and [`Session::remove`] before it stores a prior or
+/// announces an Intent. A destination that changed since `plan` is refused
+/// with nothing made, stored, announced or touched.
+///
+/// # Errors
+///
+/// [`Error::Read`] when the destination cannot be looked at — a parent that
+/// does not resolve, or one this process may not search — and [`Error::Write`]
+/// with [`crate::fs::Error::Changed`] when it is no longer what plan saw.
+fn refuse_unplanned(dest: &Path, planned: &Observed) -> Result<Observed, Error> {
+    let observed = fs::observe(dest)?;
+    refuse_moved(planned, &observed)?;
+    Ok(observed)
+}
+
+/// The deepest ancestor of `dest` that is `home` or above it and is not
+/// there, or `None` when every one of them already is.
+///
+/// Creating that one creates every ancestor of it too, so it is the whole
+/// answer. It is exactly the set [`stray_created_dir`] refuses a claim for:
+/// a directory bx must make to reach the destination and must never remove,
+/// because the home lives under it.
+fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
+    // "Cannot look" is not "not there". An `EACCES` on the way up is a
+    // directory that exists and that this process may not examine, and
+    // treating it as missing would try to create it and report the failure as
+    // a write — where [`crate::fs::observe`], which has already looked at the
+    // destination through the same chain, reports it as a read (`r3 round 7`,
+    // D2).
+    let missing = |dir: &Path| {
+        std::fs::symlink_metadata(dir)
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    };
+    dest.ancestors()
+        .skip(1)
+        .find(|dir| home.starts_with(dir) && missing(dir))
+        .map(Path::to_path_buf)
+}
+
+/// Every directory in `dirs`, made portable against `home`.
+///
+/// # Errors
+///
+/// [`Error::Write`] with [`crate::fs::Error::NotPortable`] for one that cannot
+/// be, which a ledger would refuse to store. Unreachable from the one caller,
+/// which calls [`crate::fs::Filled::new_entry`] in the statement before: that
+/// makes the same conversion, for a superset of the same paths and against the
+/// same home, and returns its failure first. The order is a statement
+/// boundary, not an evaluation rule (`r3 round 7`, CL3). Kept rather than unwrapped — a panic in a writer's durability
+/// path is worse than a returned error nothing produces — and named here so it
+/// reads as a gap on purpose (`r3 round 6`, COV3), like `plan_restore`'s own
+/// unreachable `Err` arm.
+fn portable_dirs(dirs: &[PathBuf], home: &Path) -> Result<Vec<Portable>, Error> {
+    dirs.iter()
+        .map(|dir| {
+            Portable::from_path(dir, home).map_err(|source| {
+                fs::Error::NotPortable {
+                    path: dir.clone(),
+                    source,
+                }
+                .into()
+            })
+        })
+        .collect()
 }
 
 /// Remove `path` if it is there, and `fsync` the directory it was in.
@@ -2074,10 +2433,13 @@ pub(crate) fn hand_off_claims<'a>(
 /// Refuse unless `now` is still what `planned` observed: the same path, the
 /// same kind and the same stamp, or still nothing at all.
 ///
+/// Shared with [`crate::recover`], whose rollback of a create checks the
+/// destination it judged the same way before unlinking it.
+///
 /// # Errors
 ///
 /// [`Error::Write`] with [`crate::fs::Error::Changed`] naming what moved.
-fn refuse_moved(planned: &Observed, now: &Observed) -> Result<(), Error> {
+pub(crate) fn refuse_moved(planned: &Observed, now: &Observed) -> Result<(), Error> {
     if planned.path != now.path {
         return Err(fs::Error::Changed {
             path: now.path.clone(),
@@ -2336,6 +2698,37 @@ pub(crate) mod tests {
             load(&path).expect("load"),
             Loaded::Unreadable { .. }
         ));
+    }
+
+    #[test]
+    fn a_zero_length_frame_is_refused_before_its_checksum_is_taken() {
+        // r3 round 3, D3. A zero length passes the `MAX_FRAME` bound, and an
+        // empty body is always inside the file, so without the `len == 0`
+        // refusal `frame` reaches `checksum` at every offset of a zero-filled
+        // tail: one SHA-256 per byte, on the lock-free path every read-only
+        // command takes. The verdict is the same either way, so only the cost
+        // can be pinned.
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(FORMAT);
+        let nonce = fresh_nonce();
+        bytes.extend_from_slice(&nonce);
+        bytes.extend(encode(&Record::Begin(some_begin()), &nonce).expect("encode"));
+        let tail = 64 * 1024;
+        bytes.extend(std::iter::repeat_n(0_u8, tail));
+
+        let before = CHECKSUMS.with(std::cell::Cell::get);
+        assert!(
+            !whole_frame_after(&bytes, HEADER, &nonce),
+            "a zero-filled tail holds no whole frame",
+        );
+        let taken = CHECKSUMS.with(std::cell::Cell::get) - before;
+        // Scanning the tail must not hash per byte. The header and the one
+        // whole Begin frame are the only offsets that can carry a plausible
+        // length here, so the bound is generous and still far below `tail`.
+        assert!(
+            taken < tail / 64,
+            "scanning {tail} zero bytes took {taken} checksums",
+        );
     }
 
     #[test]
@@ -3605,6 +3998,89 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_named_temp_recovery_cannot_unlink_is_left_and_the_rollback_goes_on() {
+        // r3 round 2, P9R4-D3. The directory lost write permission between
+        // the Intent and the publish, so the publish failed and left the
+        // temporary file the Intent names. Recovery could not unlink it and
+        // returned an Io error on every writing run, while `pending` called
+        // the write resolvable.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn lose_write(dest: &Path) {
+            let dir = dest.parent().expect("a parent");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+                .expect("chmod 0555");
+        }
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dir = home.child(".ro");
+        let dest = home.child(".ro/x.conf");
+        plant_file(&dest, "user\n", Mode::DEFAULT_FILE);
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session.before_publish = Some(lose_write);
+        let applied = session.apply(write_to(
+            home.path(),
+            ".ro/x.conf",
+            "bx\n",
+            Mode::DEFAULT_FILE,
+        ));
+        drop(session);
+        let writable = |dir: &Path| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+        };
+        if !permissions_refuse(&dir) {
+            writable(&dir);
+            return cannot_build(
+                "a_named_temp_recovery_cannot_unlink_is_left_and_the_rollback_goes_on",
+                WRITES_THROUGH_PERMISSIONS,
+            );
+        }
+        let temp = load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .expect("the Intent")
+            .temp
+            .clone()
+            .expect("a staged temporary file");
+
+        let report = crate::recover::pending(&state);
+        let recovered = crate::recover::recover(&state);
+        let temp_left = temp.is_file();
+        writable(&dir);
+
+        assert!(
+            applied.is_err(),
+            "the publish fails in a read-only directory"
+        );
+        assert_eq!(
+            recovered.expect("the rollback goes on"),
+            crate::recover::Outcome::RolledBack { undone: 1 },
+        );
+        assert!(temp_left, "the temporary file is left where it is");
+        let report = report.expect("pending").expect("interrupted");
+        assert!(report.blocked().next().is_none(), "{report:?}");
+        let note = &report.unfinished[0].note;
+        assert!(note.contains("rolls it back"), "{note}");
+        let name = temp.file_name().expect("a name").to_string_lossy();
+        assert!(
+            note.contains(&format!(
+                "its temporary file {name} cannot be removed, and is left for bx doctor"
+            )),
+            "{note}"
+        );
+        assert!(!state.journal().exists(), "and the session is resolved");
+        assert_eq!(peek(&dest).expect("untouched").0, b"user\n");
+        assert_eq!(
+            crate::recover::recover(&state).expect("again"),
+            crate::recover::Outcome::Nothing,
+        );
+    }
+
+    #[test]
     fn a_prior_conflict_poisons_the_session_before_anything_is_published() {
         // Stack integration of #7's round 3: `Ledger::record` refuses a changed
         // file bx shares through a region with `PriorConflict`. The session
@@ -3849,6 +4325,522 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_scope_entry_the_loader_would_refuse_is_refused_before_the_journal_exists() {
+        // r3 round 3, D1. `refusal` puts every `Begin.scope` entry through
+        // `check_against(home)` and refuses the *whole* journal when one
+        // fails, so a session that wrote one could never be rolled back: the
+        // next load reads `Unreadable`, `recover::resolve` returns `Nothing`,
+        // and half-applied writes survive with nothing undone. `restore`
+        // forwards its caller's target list verbatim as the scope, and
+        // `Portable::try_from` accepts `/<home>/.gitconfig`, so the caller
+        // needed no mistake beyond spelling a target absolutely.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let absolute = Portable::try_from(
+            home.child(".gitconfig")
+                .to_str()
+                .expect("utf-8")
+                .to_string(),
+        )
+        .expect("a well-formed absolute path");
+        assert!(
+            absolute.check_against(home.path()).is_err(),
+            "the fixture is a scope entry the loader refuses",
+        );
+
+        let err = Session::open(
+            &state,
+            SessionKind::Apply,
+            home.path(),
+            vec![target(home.path(), ".vimrc").0, absolute.clone()],
+        )
+        .expect_err("a scope entry the loader refuses");
+        assert!(
+            matches!(err, Error::State(crate::state::Error::ForeignRecord { .. })),
+            "got {err}"
+        );
+        assert!(
+            !state.journal().exists(),
+            "and no journal was written for it to refuse",
+        );
+
+        // The same scope, written past the refusal, is what the refusal buys:
+        // the loader disbelieves the whole file, so nothing in it is undone.
+        let mut session = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
+            .expect("a well-formed scope opens");
+        session
+            .apply(write_to(home.path(), ".vimrc", "bx\n", Mode::DEFAULT_FILE))
+            .expect("apply");
+        let path = state.journal();
+        let believed = std::fs::read(&path).expect("read");
+        drop(session);
+        assert!(
+            matches!(
+                load(&path).expect("load"),
+                Loaded::Unterminated(_) | Loaded::Torn { .. }
+            ),
+            "the well-formed session's journal is believed",
+        );
+        raw_journal(
+            &path,
+            &[
+                Record::Begin(Begin {
+                    kind: SessionKind::Apply,
+                    home: home.path().to_path_buf(),
+                    scope: vec![absolute],
+                }),
+                Record::Intent(Intent {
+                    target: target(home.path(), ".vimrc").0,
+                    dest: home.child(".vimrc"),
+                    temp: None,
+                    before: Prior::Absent,
+                    after: Written::Absent,
+                    created_dirs: Vec::new(),
+                    mechanism: None,
+                    ledger_written: None,
+                }),
+            ],
+        );
+        assert!(
+            matches!(load(&path).expect("load"), Loaded::Unreadable { .. }),
+            "one unportable scope entry makes the whole journal unreadable",
+        );
+        assert_ne!(believed, std::fs::read(&path).expect("read"));
+    }
+
+    /// The directory the umask child does its two writes under.
+    const UMASK_CHILD_DIR: &str = "BX_TEST_UMASK_DIR";
+
+    #[test]
+    #[ignore = "spawned by a_directory_bx_will_not_remove_is_made_at_the_accounts_umask"]
+    fn umask_child() {
+        // As `skips_allowed_child`: no instructions, nothing to do.
+        let Some(under) = std::env::var_os(UMASK_CHILD_DIR) else {
+            return;
+        };
+        let under = PathBuf::from(under);
+        let mode = |path: &Path| {
+            Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::symlink_metadata(path).expect("stat").permissions(),
+            ))
+        };
+        // `umask 077` is what the parent's shell set, so a directory made
+        // under it and never chmod'd is 0o777 & !0o077.
+        let shared = Mode::from_bits(0o700);
+
+        // In the home: `~` itself is the directory bx must make and will not
+        // remove. The two under it are bx's own, and keep bx's own mode.
+        let home = under.join("in-home/home");
+        let state = StateDir::resolve_in(&home, Some(under.join("in-home/state").as_os_str()));
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        session
+            .apply(write_to(
+                &home,
+                ".config/app/x.conf",
+                "bx\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        session.finish().expect("finish");
+        assert_eq!(mode(&home), shared, "the home was made past the umask");
+        for rel in [".config", ".config/app"] {
+            assert_eq!(
+                mode(&home.join(rel)),
+                Mode::DEFAULT_DIR,
+                "{rel} is bx's own"
+            );
+        }
+        assert_eq!(
+            entry_created_dirs(&state, &home, &target(&home, ".config/app/x.conf").0),
+            vec![home.join(".config/app"), home.join(".config")],
+            "bx claims what it made for its own target, and nothing above it",
+        );
+
+        // Beside the home: the directory bx must make is *above* the home,
+        // and the home itself is never made, because nothing needs it.
+        let beside_home = under.join("beside/home");
+        let beside_state =
+            StateDir::resolve_in(&beside_home, Some(under.join("beside-state").as_os_str()));
+        let dest = under.join("beside/x.conf");
+        let portable = Portable::try_from(dest.to_str().expect("utf-8").to_string())
+            .expect("a well-formed absolute path");
+        let mut session =
+            Session::open(&beside_state, SessionKind::Apply, &beside_home, Vec::new())
+                .expect("open");
+        session
+            .apply(Request {
+                target: portable,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"bx\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("apply");
+        session.finish().expect("finish");
+        assert_eq!(
+            mode(&under.join("beside")),
+            shared,
+            "a directory above the home was made past the umask",
+        );
+        assert!(!beside_home.exists(), "and the home itself was not made");
+    }
+
+    #[test]
+    fn a_directory_bx_will_not_remove_is_made_at_the_accounts_umask() {
+        // r3 round 6, D1/COV4/CL1/CL2. The path r3 round 5 made succeed
+        // created the user's own home through `fs::stage`, which `chmod`s past
+        // the `umask` on purpose — the right rule for a directory bx owns and
+        // will remove again, and the wrong one for a directory bx neither
+        // claims nor ever removes. `crate::state::dir::ensure_dir` already
+        // documents the opposite rule for exactly this category of directory,
+        // so bx's two ancestor-making paths disagreed.
+        //
+        // `umask(2)` is process-global and this suite runs in parallel, so the
+        // umask is set for a child rather than here: `sh -c 'umask 077; exec …'`,
+        // which needs no `unsafe` and no shared lock.
+        let guard = guarded_home();
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"umask 077; exec "$1" --exact --ignored journal::tests::umask_child"#)
+            .arg("sh")
+            .arg(&exe)
+            .env(UMASK_CHILD_DIR, guard.child("under"))
+            .output()
+            .expect("spawn the umask child");
+        assert!(
+            out.status.success(),
+            "the umask child failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    #[test]
+    fn a_claim_that_appears_after_the_directory_is_lost_is_still_dropped() {
+        // r3 round 7, CL1/COV1. The `r3 round 6` fix makes the home before
+        // `fs::stage` looks, so `stage` stops inventing it and the claim
+        // filter stops firing — and nothing constrained the filter at all:
+        // mutating it left the suite green at 1064 passed, and the "pair"
+        // witness only showed that deleting the fix *and* the filter together
+        // fails, which deleting the fix alone already does.
+        //
+        // The filter's one live trigger is the race the fix created: the
+        // directory going away between the two calls. `before_stage` produces
+        // it, so the branch a race would take is taken here on purpose.
+        let guard = guarded_home();
+        let home = guard.child("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        let (portable, dest) = target(&home, ".bashrc");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        session.before_stage = Some(|dir| {
+            std::fs::remove_dir(dir).expect("lose the directory before stage looks");
+        });
+        session
+            .apply(Request {
+                target: portable.clone(),
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"bx\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect("stage makes the directory again");
+        assert!(home.is_dir(), "`stage` made it the second time");
+
+        // `stage` invented the home this time, so the filter is the only thing
+        // between that and an Intent the loader refuses.
+        let intent = load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .cloned()
+            .expect("the Intent");
+        assert!(
+            intent.created_dirs.is_empty(),
+            "the claim on the home was dropped, not recorded: {:?}",
+            intent.created_dirs,
+        );
+        assert!(
+            !matches!(
+                load(&state.journal()).expect("load"),
+                Loaded::Unreadable { .. }
+            ),
+            "so the journal is still one the loader believes",
+        );
+        session.finish().expect("finish");
+        assert!(
+            entry_created_dirs(&state, &home, &portable).is_empty(),
+            "and the entry claims none of it either",
+        );
+    }
+
+    #[test]
+    fn a_refused_write_makes_no_directory_at_all() {
+        // r3 round 7, D1/COV3. The `create_dir_all` sat ahead of `fs::stage`'s
+        // plan-verdict refusals, whose own comment is "before creating
+        // anything, so a refusal leaves nothing behind" — so a write refused
+        // because the destination changed since plan left the user's home
+        // created. Nothing pinned what a refused write leaves on disk.
+        let guard = guarded_home();
+        let home = guard.child("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        let (portable, dest) = target(&home, ".bashrc");
+        std::fs::create_dir_all(&home).expect("the home, for now");
+        plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+        let planned = fs::observe(&dest).expect("plan's observation");
+        // Everything plan looked at is gone by the time apply runs.
+        std::fs::remove_dir_all(guard.child("account")).expect("the user removes the tree");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let err = session
+            .apply(Request {
+                target: portable,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"bx\n".to_vec(),
+                    planned,
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect_err("the destination is not what plan observed");
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Changed { detail, .. })
+                if detail == "it has been removed"),
+            "got {err}"
+        );
+        assert!(
+            !guard.child("account").exists(),
+            "a refusal leaves nothing behind — not the home, and not its parent",
+        );
+        drop(session);
+        assert_eq!(
+            load(&state.journal()).expect("load").intents().count(),
+            0,
+            "and nothing was announced",
+        );
+    }
+
+    #[test]
+    fn a_shared_directory_that_cannot_be_made_is_the_write_that_names_it() {
+        // r3 round 7, COV2. `create_dir_all`'s error mapping had no test.
+        let guard = guarded_home();
+        let under = guard.child("locked");
+        std::fs::create_dir(&under).expect("mkdir");
+        let home = under.join("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        let (portable, dest) = target(&home, ".bashrc");
+        fs::set_mode(&under, Mode::from_bits(0o555)).expect("make it read-only");
+        if !permissions_refuse(&under) {
+            fs::set_mode(&under, Mode::DEFAULT_DIR).expect("make it writable again");
+            return cannot_build(
+                "a_shared_directory_that_cannot_be_made_is_the_write_that_names_it",
+                WRITES_THROUGH_PERMISSIONS,
+            );
+        }
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let applied = session.apply(Request {
+            target: portable,
+            dest: dest.clone(),
+            content: Content::Bytes {
+                bytes: b"bx\n".to_vec(),
+                planned: fs::observe(&dest).expect("plan's observation"),
+            },
+            mode: Mode::DEFAULT_FILE,
+            ownership: Ownership::Owned(Mechanism::Own),
+        });
+        // Before any assertion, so the tempdir can be removed whatever happens.
+        fs::set_mode(&under, Mode::DEFAULT_DIR).expect("make it writable again");
+
+        let err = applied.expect_err("the shared directory cannot be made");
+        // The path named is the one bx asked for, not the component that
+        // refused: `create_dir_all` does not say which that was, and
+        // `state::dir::ensure_dir` maps its own the same way.
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Write { path, .. }) if *path == home),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_destination_behind_a_directory_bx_cannot_search_is_a_read_not_a_write() {
+        // r3 round 7, D2. `shared_ancestor` read "cannot look" as "not there",
+        // so an `EACCES` on the way up became a failed `create_dir_all` and
+        // surfaced as `Error::Write` — where looking at the destination
+        // surfaces the same permission as `Error::Read`. Since the verdict now
+        // comes first, `fs::observe` walks that chain before anything is made,
+        // so the read error is what a caller sees; the refined predicate keeps
+        // that true if the order ever moves.
+        let guard = guarded_home();
+        let under = guard.child("sealed");
+        std::fs::create_dir(&under).expect("mkdir");
+        let home = under.join("account/home");
+        let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+        let (portable, dest) = target(&home, ".bashrc");
+        // No search bit, so nothing under it can be looked at at all.
+        fs::set_mode(&under, Mode::from_bits(0o600)).expect("seal it");
+        if std::fs::symlink_metadata(under.join("account"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            fs::set_mode(&under, Mode::DEFAULT_DIR).expect("unseal");
+            return cannot_build(
+                "a_destination_behind_a_directory_bx_cannot_search_is_a_read_not_a_write",
+                WRITES_THROUGH_PERMISSIONS,
+            );
+        }
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let applied = session.apply(Request {
+            target: portable,
+            dest: dest.clone(),
+            content: Content::Bytes {
+                bytes: b"bx\n".to_vec(),
+                planned: fs::Observed {
+                    path: dest.clone(),
+                    ..fs::observe(&guard.child("elsewhere")).expect("some observation")
+                },
+            },
+            mode: Mode::DEFAULT_FILE,
+            ownership: Ownership::Owned(Mechanism::Own),
+        });
+        // Before any assertion, so the tempdir can be removed whatever happens.
+        fs::set_mode(&under, Mode::DEFAULT_DIR).expect("unseal");
+
+        let err = applied.expect_err("bx cannot look at the destination");
+        // `observe` reports the path it could not read, which is the deepest
+        // one the walk reached — the home here, not the destination beyond it.
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Read { path, .. }) if *path == home),
+            "a permission bx cannot pass is a read, not a write: got {err}"
+        );
+    }
+
+    #[test]
+    fn a_write_makes_the_home_it_needs_and_claims_none_of_it() {
+        // r3 round 4 D2, repaired again in r3 round 5 (D1, COV3, CL4).
+        //
+        // `admit` sees `&[]` for a `Content::Bytes` request — a write's claims
+        // do not exist until `fs::stage` has made the parents — so an Intent's
+        // `created_dirs` never went through the `stray_created_dir` rule the
+        // loader applies to it. At 8e0abc3 the write landed and left an
+        // `Unreadable` journal. Round 4 refused it instead, which turned
+        // silent corruption into a permanent refusal naming the user's own
+        // home: the in-home case below is a *first write to `~/.bashrc`*, and
+        // there is nothing the user could do about it.
+        //
+        // Neither is right. The directory is made — it has to be, to reach the
+        // destination — and claimed by nobody: not by the Intent, so the
+        // journal stays readable and a rollback's `prune_dirs` cannot reach
+        // the home; not by the ledger entry, so a later `rm`'s `prune_claims`
+        // cannot either.
+        //
+        // Both arms need the home absent when the write runs, which needs the
+        // state directory elsewhere — `$XDG_STATE_HOME`, as a service account
+        // with state under `/var/lib` would have it — since otherwise
+        // `state.ensure()` makes the home on its way past.
+        for (case, made) in [
+            ("in the home", "account/home"),
+            ("beside the home", "account"),
+        ] {
+            let guard = guarded_home();
+            let home = guard.child("account/home");
+            let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
+            assert!(!home.exists(), "{case}: the home is not there yet");
+            // In the home the target is `~`-rooted, which is the only spelling
+            // the ledger's home check admits; beside it, it is absolute.
+            let (portable, dest) = if case == "in the home" {
+                target(&home, ".bashrc")
+            } else {
+                let dest = guard.child("account/beside.conf");
+                (
+                    Portable::try_from(dest.to_str().expect("utf-8").to_string())
+                        .expect("a well-formed absolute path"),
+                    dest,
+                )
+            };
+            let made = guard.child(made);
+
+            let mut session =
+                Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+            assert!(!made.exists(), "{case}: the write makes {}", made.display());
+            session
+                .apply(Request {
+                    target: portable.clone(),
+                    dest: dest.clone(),
+                    content: Content::Bytes {
+                        bytes: b"bx\n".to_vec(),
+                        planned: fs::observe(&dest).expect("plan's observation"),
+                    },
+                    mode: Mode::DEFAULT_FILE,
+                    ownership: Ownership::Owned(Mechanism::Own),
+                })
+                .unwrap_or_else(|e| panic!("{case}: a write bx can make: {e}"));
+            assert!(made.is_dir(), "{case}: and it made it");
+            assert_eq!(peek(&dest).expect("published").0, b"bx\n", "{case}");
+
+            // The Intent claims none of it, so the journal is one bx believes
+            // and a rollback prunes nothing.
+            let intent = load(&state.journal())
+                .expect("load")
+                .intents()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| panic!("{case}: the Intent"));
+            assert!(
+                intent.created_dirs.is_empty(),
+                "{case}: claimed {:?}",
+                intent.created_dirs,
+            );
+            assert!(
+                !matches!(
+                    load(&state.journal()).expect("load"),
+                    Loaded::Unreadable { .. }
+                ),
+                "{case}: the journal is one the loader believes",
+            );
+            session.finish().unwrap_or_else(|e| panic!("{case}: {e}"));
+
+            // And neither does the ledger entry, so `rm` leaves the home.
+            let claimed = entry_created_dirs(&state, &home, &portable);
+            assert!(claimed.is_empty(), "{case}: the entry claimed {claimed:?}");
+            let done = crate::restore::restore(&state, &home, std::slice::from_ref(&portable))
+                .unwrap_or_else(|e| panic!("{case}: rm: {e}"));
+            assert_eq!(done.len(), 1, "{case}: {done:?}");
+            assert!(peek(&dest).is_none(), "{case}: bx's file is gone");
+            assert!(made.is_dir(), "{case}: and {} still stands", made.display());
+        }
+    }
+
+    /// What the saved ledger says `portable` claims, rendered.
+    fn entry_created_dirs(state: &StateDir, home: &Path, portable: &Portable) -> Vec<PathBuf> {
+        crate::state::LedgerView::read(state, home)
+            .expect("read the ledger")
+            .value
+            .get(portable)
+            .map(|entry| {
+                entry
+                    .created_dirs
+                    .iter()
+                    .map(|dir| dir.render(home))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
     fn a_target_spelled_absolutely_under_the_home_is_refused_before_anything_is_touched() {
         // Stack integration of #7's round 4: a caller holding a `Ledger` gets
         // its home check. `new_entry` folds the destination into `~/…`, so the
@@ -3983,7 +4975,10 @@ pub(crate) mod tests {
         fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make the directory read-only");
         if !permissions_refuse(&locked) {
             fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
-            return;
+            return cannot_build(
+                "a_failed_removal_keeps_the_ledger_entry_and_poisons_the_session",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let mut session =
             Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
@@ -4036,7 +5031,10 @@ pub(crate) mod tests {
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
         if !permissions_refuse(state.root()) {
             fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
-            return;
+            return cannot_build(
+                "a_journal_that_cannot_be_moved_aside_is_an_error_and_stays_in_place",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let loaded = load_exclusive(&state.journal(), &lock);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
@@ -4084,7 +5082,7 @@ pub(crate) mod tests {
             "got {opened:?}"
         );
 
-        let recovered = crate::recover::before_writing(&state);
+        let recovered = crate::recover::recover(&state);
         assert!(
             matches!(
                 recovered,
@@ -4150,19 +5148,90 @@ pub(crate) mod tests {
 
     /// Whether a directory without write permission refuses this process.
     ///
-    /// It does not refuse root, so a test that needs a refused rename or unlink
-    /// cannot produce one there. Such a test skips and says so, rather than
-    /// failing for a reason that has nothing to do with bx.
+    /// It does not refuse root, so a test that needs a refused rename or
+    /// unlink cannot produce one there. A caller that finds `false` restores
+    /// whatever it broke and then calls [`cannot_build`], which fails unless
+    /// the skip was opted into.
     pub(crate) fn permissions_refuse(dir: &Path) -> bool {
         let probe = dir.join("permission-probe");
         if std::fs::write(&probe, b"").is_err() {
             return true;
         }
         std::fs::remove_file(&probe).expect("remove the probe");
-        eprintln!(
-            "skipped: this process writes through directory permissions, so the failure cannot be produced"
-        );
         false
+    }
+
+    /// Why a test that needs a refused write cannot run as this user.
+    pub(crate) const WRITES_THROUGH_PERMISSIONS: &str = "this process writes through file or directory permissions, so the \
+         failure cannot be produced";
+
+    /// The variable that turns a scenario this machine cannot build from a
+    /// failure into a skip.
+    ///
+    /// r3 round 3, COV1. A test that prints a line and passes when it could
+    /// not run is not a test: the arms it is the only cover for go unverified
+    /// while the suite reports green, and nobody reads the line. So an
+    /// unbuildable scenario **fails**, and the only way to have it skip is to
+    /// say so in the environment — which is a decision a human takes, and
+    /// which the gate report then has to carry.
+    ///
+    /// It is read, never written: `Cargo.toml` forbids `unsafe`, so no test in
+    /// this crate can set an environment variable. [`report_unbuildable`]
+    /// takes the answer as an argument so that both of its paths can be
+    /// tested without one.
+    pub(crate) const ALLOW_SKIPS: &str = "BX_ALLOW_UNBUILDABLE_SCENARIOS";
+
+    /// Whether this run opted out of failing on a scenario it cannot build.
+    pub(crate) fn skips_allowed() -> bool {
+        allows_skips(std::env::var_os(ALLOW_SKIPS).as_deref())
+    }
+
+    /// Whether `value`, as [`ALLOW_SKIPS`] holds it, opts out.
+    ///
+    /// Exactly `1` opts out. Any other value is not a spelling of "yes" — it
+    /// is a mistake, and a mistake must not be a silent opt-out. Pure, so a
+    /// test can drive every spelling in a process that cannot set a variable.
+    pub(crate) fn allows_skips(value: Option<&std::ffi::OsStr>) -> bool {
+        value.is_some_and(|allow| allow == "1")
+    }
+
+    /// Fail because `name`'s scenario cannot be built here, or skip loudly if
+    /// [`ALLOW_SKIPS`] says to.
+    pub(crate) fn cannot_build(name: &str, why: &str) {
+        report_unbuildable(name, why, skips_allowed());
+    }
+
+    /// [`cannot_build`] with the opt-out supplied, so a test can drive both
+    /// paths in a process that cannot change its own environment.
+    pub(crate) fn report_unbuildable(name: &str, why: &str, allowed: bool) {
+        assert!(
+            allowed,
+            "{name} could not be run on this machine: {why}.\n\
+             That is a failure, not a skip: everything this test is the only \
+             cover for is now unverified. Run the suite as an unprivileged \
+             user, on a kernel with unprivileged user namespaces and with \
+             util-linux present; or set {ALLOW_SKIPS}=1 to accept the gap, \
+             which leaves it unverified and makes the suite say so.",
+        );
+        say_out_loud(&format!(
+            "INCOMPLETE RUN, opted out with {ALLOW_SKIPS}=1 — {name} did not \
+             run: {why}",
+        ));
+    }
+
+    /// Put `line` in the test binary's output whether or not it is a failing
+    /// test's.
+    ///
+    /// r3 round 4, COV1. `eprintln!` goes through `std::io::_eprint`, which
+    /// honours libtest's per-thread output capture, so a line printed that way
+    /// by a *passing* test is printed nowhere at all — which is precisely the
+    /// case the opt-out exists for. The `Stderr` handle does not consult the
+    /// capture, so this reaches the report the gate reads.
+    pub(crate) fn say_out_loud(line: &str) {
+        use std::io::Write as _;
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "{line}");
+        let _ = err.flush();
     }
 
     /// A state directory, not yet created, whose files' paths fit Linux's
@@ -4441,7 +5510,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_removal_names_how_its_destination_moved_since_plan() {
-        // r3 coverage C2. Only "modified or replaced" was ever produced.
+        // r3 coverage C2, extended for r3 coverage COV5: the third detail and
+        // the `planned.path != now.path` branch had no case. That branch is
+        // the one that stops a removal running against an observation of a
+        // different file.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let (gone, gone_dest) = target(home.path(), ".gone");
@@ -4451,6 +5523,19 @@ pub(crate) mod tests {
         let (appeared, appeared_dest) = target(home.path(), ".appeared");
         let nothing = fs::observe(&appeared_dest).expect("plan's observation");
         plant_file(&appeared_dest, "the user's\n", Mode::DEFAULT_FILE);
+        let (edited, edited_dest) = target(home.path(), ".edited");
+        plant_file(&edited_dest, "bx created\n", Mode::DEFAULT_FILE);
+        let as_written = fs::observe(&edited_dest).expect("plan's observation");
+        plant_file(&edited_dest, "the user's edit\n", Mode::DEFAULT_FILE);
+        // An observation of another file entirely, handed to a removal of
+        // this one: the same shape a caller pairing the wrong plan with the
+        // wrong target would produce.
+        let (_elsewhere, elsewhere_dest) = target(home.path(), ".elsewhere");
+        plant_file(&elsewhere_dest, "somebody else's\n", Mode::DEFAULT_FILE);
+        let (mixed_up, mixed_up_dest) = target(home.path(), ".mixed-up");
+        plant_file(&mixed_up_dest, "bx created\n", Mode::DEFAULT_FILE);
+        let another_file = fs::observe(&elsewhere_dest).expect("plan's observation");
+        let wrong_path = format!("plan observed {}, not this path", elsewhere_dest.display());
 
         for (portable, dest, planned, detail) in [
             (gone, gone_dest, was_there, "it has been removed"),
@@ -4459,6 +5544,18 @@ pub(crate) mod tests {
                 appeared_dest.clone(),
                 nothing,
                 "nothing was there, and something is now",
+            ),
+            (
+                edited,
+                edited_dest.clone(),
+                as_written,
+                "it has been modified or replaced",
+            ),
+            (
+                mixed_up,
+                mixed_up_dest.clone(),
+                another_file,
+                wrong_path.as_str(),
             ),
         ] {
             let mut session =
@@ -4488,6 +5585,13 @@ pub(crate) mod tests {
             crate::recover::recover(&state).expect("clear the refused session");
         }
         assert_eq!(peek(&appeared_dest).expect("kept").0, b"the user's\n");
+        assert_eq!(peek(&edited_dest).expect("kept").0, b"the user's edit\n");
+        assert_eq!(peek(&mixed_up_dest).expect("kept").0, b"bx created\n");
+        assert_eq!(
+            peek(&elsewhere_dest).expect("kept").0,
+            b"somebody else's\n",
+            "and the file the wrong observation named is untouched",
+        );
     }
 
     /// An Intent that says bx created `dest` holding `bytes`.
@@ -4572,6 +5676,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_journal_path_that_cannot_be_looked_at_is_an_error_not_an_absent_journal() {
+        // r3 round 2, restricted mutants on P42R1-D5. The look before the read
+        // treats only NotFound as "no journal": any other failure — here
+        // ENOTDIR, a state directory that is a file, which no permission
+        // setting can bypass — is an error, as the read's was before it.
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let file = dir.path().join("not-a-directory");
+        plant_file(
+            &file,
+            "a file where the state directory should be\n",
+            Mode::DEFAULT_FILE,
+        );
+        let path = file.join("journal.mpk");
+
+        let err = load(&path).expect_err("a path that cannot be looked at is not absent");
+        assert!(
+            matches!(&err, Error::Io { path: at, .. } if *at == path),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn a_journal_that_cannot_be_read_is_an_error_and_a_session_does_not_replace_it() {
         // Coverage review round 5, item 4. Read as absent, it would be replaced
         // by the next session's journal without ever being examined.
@@ -4584,10 +5710,10 @@ pub(crate) mod tests {
         if std::fs::read(&path).is_ok() {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod back");
-            eprintln!(
-                "skipped: this process reads through file permissions, so the failure cannot be produced"
+            return cannot_build(
+                "a_journal_that_cannot_be_read_is_an_error_and_a_session_does_not_replace_it",
+                WRITES_THROUGH_PERMISSIONS,
             );
-            return;
         }
 
         let loaded = load(&path).expect_err("an unreadable journal is not an absent one");
@@ -4602,6 +5728,180 @@ pub(crate) mod tests {
             bytes,
             "and it was not replaced"
         );
+    }
+
+    /// The home a journal-read child finds its state directory under.
+    const READ_CHILD_HOME: &str = "BX_JOURNAL_READ_HOME";
+
+    /// Which read a journal-read child makes: `load`, `open` or `recover`.
+    const READ_CHILD_CALL: &str = "BX_JOURNAL_READ_CALL";
+
+    /// The reading half of
+    /// [`a_journal_that_is_not_a_regular_file_is_refused_without_being_read`].
+    ///
+    /// Run in a child so a read that never returns can be killed, and with its
+    /// address space capped, so a read of `/dev/zero` aborts on its first
+    /// gigabyte instead of taking the host's memory with it.
+    #[test]
+    #[ignore = "spawned by a_journal_that_is_not_a_regular_file_is_refused_without_being_read"]
+    fn journal_read_child() {
+        let (Some(home), Ok(call)) = (
+            std::env::var_os(READ_CHILD_HOME),
+            std::env::var(READ_CHILD_CALL),
+        ) else {
+            return;
+        };
+        rustix::process::setrlimit(
+            rustix::process::Resource::As,
+            rustix::process::Rlimit {
+                current: Some(1 << 30),
+                maximum: None,
+            },
+        )
+        .expect("cap the address space");
+        let home = PathBuf::from(home);
+        let state = StateDir::resolve(&home);
+        let path = state.journal();
+        let named = |e: &Error| matches!(e, Error::NotAJournal { path: at, .. } if *at == path);
+        let refusal = match call.as_str() {
+            "load" => load(&path)
+                .map(|_| ())
+                .map_err(|e| (named(&e), e.to_string())),
+            "open" => Session::open(&state, SessionKind::Apply, &home, Vec::new())
+                .map(|_| ())
+                .map_err(|e| (named(&e), e.to_string())),
+            "recover" => crate::recover::recover(&state).map(|_| ()).map_err(|e| {
+                let refused = matches!(&e, crate::recover::Error::Journal(inner) if named(inner));
+                (refused, e.to_string())
+            }),
+            other => panic!("no such read: {other}"),
+        };
+        println!("{call}: {refusal:?}");
+        let (refused, message) =
+            refusal.expect_err("a journal that is not a regular file is refused");
+        assert!(refused, "refused as NotAJournal: {message}");
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the refusal names the journal: {message}"
+        );
+        assert!(message.contains("only from a regular file"), "{message}");
+    }
+
+    #[test]
+    fn a_journal_that_is_not_a_regular_file_is_refused_without_being_read() {
+        // P42R1-D5 (journal part). The journal was read whole with a blocking
+        // read and no look at its type, so a FIFO at `journal.mpk` blocked
+        // load, Session::open and recovery forever, and a link to /dev/zero
+        // read without end.
+        fn fifo(path: &Path) {
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            )
+            .expect("mkfifo");
+        }
+        fn device_link(path: &Path) {
+            std::os::unix::fs::symlink("/dev/zero", path).expect("link to /dev/zero");
+        }
+        fn dangling_link(path: &Path) {
+            std::os::unix::fs::symlink(path.with_file_name("nowhere"), path)
+                .expect("a link to nothing");
+        }
+
+        let guard = guarded_home();
+        // Every case is run before any is judged, so one read that hangs
+        // does not hide what the others do.
+        let mut failures = Vec::new();
+        for (name, plant, kind) in [
+            ("fifo", fifo as fn(&Path), fs::Kind::Other),
+            ("device-link", device_link as fn(&Path), fs::Kind::Symlink),
+            (
+                "dangling-link",
+                dangling_link as fn(&Path),
+                fs::Kind::Symlink,
+            ),
+        ] {
+            for call in ["load", "open", "recover"] {
+                let case = format!("{name} read by {call}");
+                let home = guard.child(format!("{name}-{call}"));
+                let state = StateDir::resolve(&home);
+                state.ensure().expect("the state directory");
+                plant(&state.journal());
+
+                let mut child =
+                    std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                        .args([
+                            "--exact",
+                            "--ignored",
+                            "--nocapture",
+                            "journal::tests::journal_read_child",
+                        ])
+                        .env(READ_CHILD_HOME, &home)
+                        .env(READ_CHILD_CALL, call)
+                        // Inherited, unlike the crash harness's: this child
+                        // exits normally and writes a profile, which belongs
+                        // where coverage put the parent's, not in the working
+                        // directory under a default name.
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .expect("spawn the reading child");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let finished = loop {
+                    if child.try_wait().expect("wait").is_some() {
+                        break true;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        child.kill().expect("kill the reading child");
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                };
+                let out = child.wait_with_output().expect("the child's output");
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if !finished {
+                    failures.push(format!("{case}: still reading after 60 s: {said}"));
+                    continue;
+                }
+                if !out.status.success() {
+                    failures.push(format!("{case}: {} {said}", out.status));
+                    continue;
+                }
+
+                let meta = std::fs::symlink_metadata(state.journal()).expect("left in place");
+                assert_eq!(
+                    fs::Kind::from(meta.file_type()),
+                    kind,
+                    "{case}: never replaced"
+                );
+                assert!(
+                    std::fs::symlink_metadata(StateDir::quarantine(&state.journal())).is_err(),
+                    "{case}: never set aside"
+                );
+
+                // The way out: `abandon` moves it aside without opening it,
+                // and bx writes again.
+                let aside = crate::recover::abandon(&state)
+                    .expect("abandon")
+                    .expect("something stood at the journal's path");
+                assert_eq!(
+                    fs::Kind::from(std::fs::symlink_metadata(&aside).expect("kept").file_type()),
+                    kind,
+                    "{case}: moved, not replaced"
+                );
+                assert_eq!(
+                    crate::recover::recover(&state).expect("bx writes again"),
+                    crate::recover::Outcome::Nothing,
+                    "{case}"
+                );
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
@@ -4667,7 +5967,10 @@ pub(crate) mod tests {
         if !permissions_refuse(&parent) {
             std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
                 .expect("chmod back");
-            return;
+            return cannot_build(
+                "a_directory_that_cannot_be_removed_for_another_reason_is_an_error",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let err = prune_dirs(std::slice::from_ref(&child));
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
@@ -4834,6 +6137,502 @@ pub(crate) mod tests {
             matches!(&err, Error::Write(fs::Error::NotPortable { path, .. }) if *path == dir),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn a_claim_the_heir_holds_is_not_recorded_again_and_a_refused_record_is_an_error() {
+        // r3 round 2, P9R4-CV2. Neither the skip for a claim the heir already
+        // holds nor a `record` the ledger refuses was reached. The ledger's
+        // lock file is replaced, so every `record` through it is refused with
+        // WrongLock: the skip is the only way the first case can succeed, and
+        // the second must say so rather than drop the claim.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let dir = home.child(".config/app");
+        std::fs::create_dir_all(&dir).expect("the claimed directory");
+        let claim = Portable::from_path(&dir, home.path()).expect("portable");
+        let heir = Portable::from_path(&dir.join("a.toml"), home.path()).expect("portable");
+        for holds in [true, false] {
+            let case = format!("the heir already holds the claim: {holds}");
+            let lock = ExclusiveLock::acquire(&state).expect("lock");
+            let mut ledger = Ledger::open(&state, &lock, home.path())
+                .expect("open the ledger")
+                .value;
+            ledger
+                .record(
+                    NewEntry::new(
+                        heir.clone(),
+                        ContentHash::of(b"x\n"),
+                        Mode::DEFAULT_FILE,
+                        Mechanism::Own,
+                    )
+                    .with_created_dirs(if holds {
+                        vec![claim.clone()]
+                    } else {
+                        Vec::new()
+                    }),
+                )
+                .expect("the heir");
+            let before = ledger.get(&heir).cloned().expect("recorded");
+            std::fs::rename(state.lock(), home.child(format!("moved-lock-{holds}")))
+                .expect("an outside mv of the lock file");
+            let second = ExclusiveLock::acquire(&state).expect("a second writer");
+
+            let handed = hand_off_claims(&mut ledger, home.path(), [&dir]);
+            let after = ledger.get(&heir).cloned();
+            drop(second);
+
+            if holds {
+                handed.expect("a claim the heir holds is not recorded again");
+            } else {
+                let err = handed.expect_err("a refused record is an error");
+                assert!(
+                    matches!(err, Error::State(crate::state::Error::WrongLock { .. })),
+                    "{case}: got {err}"
+                );
+            }
+            assert_eq!(after, Some(before), "{case}: nothing half-recorded");
+        }
+    }
+
+    /// The ledger as it stands on disk under `state`.
+    fn saved_ledger(state: &StateDir, home: &Path) -> Ledger {
+        let lock = ExclusiveLock::acquire(state).expect("lock");
+        Ledger::open(state, &lock, home)
+            .expect("open the ledger")
+            .value
+    }
+
+    #[test]
+    fn a_released_write_hands_on_the_directories_its_entry_claimed() {
+        // r3 round 3, D2 and CL2. `Session::write`'s released arm dropped the
+        // entry `forget` returns, and with it the entry's `created_dirs`, while
+        // `Session::remove` and `Session::forget` both carry theirs on. A
+        // directory bx made then had no claimant at all: no later `rm` could
+        // remove it, and recovery's rebuild could not either.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dir = home.child(".config/app");
+        let claims: Vec<PathBuf> = vec![dir.clone(), home.child(".config")];
+
+        // bx makes both directories for a.conf, which claims them.
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(write_to(
+                home.path(),
+                ".config/app/a.conf",
+                "bx a\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        session.finish().expect("finish");
+        // An entry beneath the same directories that survives the hand-back.
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(write_to(
+                home.path(),
+                ".config/app/heir.conf",
+                "bx heir\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply");
+        session.finish().expect("finish");
+
+        let (a, a_dest) = target(home.path(), ".config/app/a.conf");
+        let (heir, _) = target(home.path(), ".config/app/heir.conf");
+        let ledger = saved_ledger(&state, home.path());
+        assert_eq!(
+            ledger
+                .get(&a)
+                .expect("a.conf")
+                .created_dirs
+                .iter()
+                .map(|dir| dir.render(home.path()))
+                .collect::<Vec<_>>(),
+            claims,
+            "a.conf claims both directories bx made",
+        );
+        assert!(ledger.get(&heir).expect("heir").created_dirs.is_empty());
+        drop(ledger);
+
+        // `rm` hands a.conf back: the entry goes, the file stays as the
+        // user's. Both claims must reach the surviving entry beneath them.
+        let mut session = Session::open(&state, SessionKind::Restore, home.path(), vec![a.clone()])
+            .expect("open");
+        session
+            .apply(Request {
+                target: a.clone(),
+                dest: a_dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"theirs\n".to_vec(),
+                    planned: fs::observe(&a_dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Released,
+            })
+            .expect("hand it back");
+        session.finish().expect("finish");
+
+        let ledger = saved_ledger(&state, home.path());
+        assert!(ledger.get(&a).is_none(), "the entry was handed back");
+        assert_eq!(
+            ledger
+                .get(&heir)
+                .expect("heir")
+                .created_dirs
+                .iter()
+                .map(|dir| dir.render(home.path()))
+                .collect::<Vec<_>>(),
+            claims,
+            "and its claims reached the entry still beneath them",
+        );
+        drop(ledger);
+        assert_eq!(peek(&a_dest).expect("handed back").0, b"theirs\n");
+        assert!(dir.is_dir(), "nothing was pruned: no removal was announced");
+    }
+
+    #[test]
+    fn a_prior_already_in_the_restore_store_is_not_written_again() {
+        // r3 coverage COV2. The skip arm keeps a repeat write from replacing a
+        // blob another entry's prior or superseded snapshot already points at,
+        // and keeps every `apply` from churning `restore/`. Only the rewrite
+        // side was pinned; a mutant that always wrote passed the suite.
+        use std::os::unix::fs::MetadataExt as _;
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("ensure");
+        let dest = home.child(".conf");
+        plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+        let observed = fs::observe(&dest).expect("observe");
+
+        let Prior::Existed(reference) = store_prior(&state, &observed).expect("store") else {
+            panic!("a file that is there has an `Existed` prior");
+        };
+        let blob = state.restore().join(reference.blob_name());
+        let first = std::fs::symlink_metadata(&blob).expect("the blob");
+
+        assert_eq!(
+            store_prior(&state, &observed).expect("store again"),
+            Prior::Existed(reference),
+        );
+        let second = std::fs::symlink_metadata(&blob).expect("the blob");
+        assert_eq!(
+            (first.dev(), first.ino()),
+            (second.dev(), second.ino()),
+            "the second store wrote nothing: `write_atomically` renames a new \
+             inode into place, so a rewrite cannot keep this one",
+        );
+        assert_eq!(std::fs::read(&blob).expect("read"), b"theirs\n");
+
+        // And the arm is a length test, not a presence test: a blob of the
+        // wrong length is replaced.
+        std::fs::write(&blob, b"short\n").expect("truncate the blob");
+        store_prior(&state, &observed).expect("store over a wrong-length blob");
+        assert_eq!(std::fs::read(&blob).expect("read"), b"theirs\n");
+    }
+
+    #[test]
+    fn a_ledger_that_refuses_after_a_publish_poisons_the_session_and_is_rolled_back() {
+        // r3 coverage COV8. The sharpest of `Session::write`'s error paths past
+        // the point of no return: the destination is published, the Intent is
+        // durable, no `Done` follows, and the ledger refuses. Recovery must
+        // roll a landed write back from a journal with no `Done`, and the
+        // ledger must hold nothing for the target.
+        // `Ledger::record` checks the lock file it was opened under and
+        // `check_record` does not, so replacing the lock file mid-session fails
+        // exactly the call after the publish.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".conf");
+        plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        std::fs::rename(state.lock(), home.child("moved-lock")).expect("an outside mv of the lock");
+        let second = ExclusiveLock::acquire(&state).expect("a second writer takes the new lock");
+
+        let err = session
+            .apply(write_to(home.path(), ".conf", "bx\n", Mode::DEFAULT_FILE))
+            .expect_err("the ledger refuses after the publish");
+        assert!(
+            matches!(err, Error::State(crate::state::Error::WrongLock { .. })),
+            "got {err}"
+        );
+        assert_eq!(
+            peek(&dest).expect("published").0,
+            b"bx\n",
+            "the write landed before the ledger refused",
+        );
+        let finished = session
+            .finish()
+            .expect_err("a poisoned session cannot finish");
+        assert!(matches!(finished, Error::Poisoned { .. }), "got {finished}");
+        drop(second);
+
+        let loaded = load(&state.journal()).expect("load");
+        assert_eq!(loaded.intents().count(), 1, "the Intent is durable");
+        assert!(
+            !matches!(loaded, Loaded::Terminated(_)),
+            "and no End followed it",
+        );
+        assert!(
+            !frame_starts(&std::fs::read(state.journal()).expect("read")).is_empty(),
+            "the journal holds whole frames",
+        );
+
+        let outcome = crate::recover::recover(&state).expect("the next writing run");
+        assert!(
+            matches!(outcome, crate::recover::Outcome::RolledBack { undone: 1 }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            peek(&dest).expect("rolled back").0,
+            b"theirs\n",
+            "the landed write was undone",
+        );
+        assert!(
+            saved_ledger(&state, home.path()).get(&portable).is_none(),
+            "and the ledger holds nothing for the target",
+        );
+    }
+
+    /// What the parent tells the opt-out child to expect of its environment.
+    const EXPECT_SKIPS: &str = "BX_TEST_EXPECT_SKIPS";
+
+    #[test]
+    #[ignore = "spawned by the_opt_out_is_read_from_the_environment_not_assumed"]
+    fn skips_allowed_child() {
+        // Returns rather than panics when it was not spawned by its parent, so
+        // a bare `cargo test -- --ignored` finds no instructions and does
+        // nothing — the shape the other children already had (`r3 round 7`,
+        // D3).
+        let Some(expected) = std::env::var_os(EXPECT_SKIPS) else {
+            return;
+        };
+        let expected = expected == "yes";
+        assert_eq!(
+            skips_allowed(),
+            expected,
+            "with {ALLOW_SKIPS}={:?}",
+            std::env::var_os(ALLOW_SKIPS),
+        );
+        let live = std::panic::catch_unwind(|| cannot_build("live_probe", "a probe"));
+        assert_eq!(
+            live.is_ok(),
+            expected,
+            "cannot_build must follow the environment, not its own opinion",
+        );
+    }
+
+    #[test]
+    fn the_opt_out_is_read_from_the_environment_not_assumed() {
+        // r3 round 6, COV1. `skips_allowed() -> true` survived the whole
+        // suite: the in-process assertion beside it compared the function with
+        // an expression that moves with it, and every reported run leaves the
+        // variable unset, so no test ever saw the other state. A child can be
+        // given any state, which is the tool this lane built for the capture
+        // pin, pointed at the thing it was built to reach.
+        for (set, expect) in [(None, "no"), (Some("1"), "yes"), (Some("0"), "no")] {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("the test binary"));
+            child
+                .args([
+                    "--exact",
+                    "--ignored",
+                    "journal::tests::skips_allowed_child",
+                ])
+                .env(EXPECT_SKIPS, expect);
+            match set {
+                Some(value) => child.env(ALLOW_SKIPS, value),
+                None => child.env_remove(ALLOW_SKIPS),
+            };
+            let out = child.output().expect("spawn the opt-out child");
+            assert!(
+                out.status.success(),
+                "{ALLOW_SKIPS}={set:?} should read as {expect}:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+
+        // r3 round 6, COV2. The "unset, or exactly 1" assertion is not
+        // vacuous, but no run the gates table reports ever executes it: every
+        // one of them leaves the variable unset. A child with `=0` does, and
+        // must fail with the sentence that tells the reader what to do — the
+        // whole point of refusing a value that looks like an answer.
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "journal::tests::a_scenario_this_machine_cannot_build_fails_unless_the_run_opted_out",
+            ])
+            .env(ALLOW_SKIPS, "0")
+            .output()
+            .expect("spawn the mis-set child");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            !out.status.success(),
+            "{ALLOW_SKIPS}=0 must not pass for an opt-out:\n{said}",
+        );
+        assert!(
+            said.contains("is not a spelling of the opt-out"),
+            "and must say why:\n{said}",
+        );
+    }
+
+    #[test]
+    fn a_scenario_this_machine_cannot_build_fails_unless_the_run_opted_out() {
+        // r3 round 4, COV1. Nothing pinned the policy itself: that the default
+        // is a failure naming the test and the environment, that only the
+        // exact string "1" opts out, and that the opted-in path still puts a
+        // line in the report. `Cargo.toml` forbids `unsafe`, so no test here
+        // can set an environment variable; `report_unbuildable` takes the
+        // answer as an argument so both paths are reachable.
+        let refused = std::panic::catch_unwind(|| {
+            report_unbuildable("some_test", "there is no way to make it", false);
+        })
+        .expect_err("the default is a failure, not a skip");
+        let said = refused
+            .downcast_ref::<String>()
+            .expect("a panic message")
+            .clone();
+        assert!(said.contains("some_test"), "{said}");
+        assert!(said.contains("there is no way to make it"), "{said}");
+        assert!(said.contains(ALLOW_SKIPS), "names the way out: {said}");
+        assert!(
+            said.contains("unprivileged"),
+            "names the environment: {said}"
+        );
+
+        // Opted in, it returns — and says so where the report can see it.
+        report_unbuildable("some_test", "there is no way to make it", true);
+
+        // Exactly "1" opts out. Nothing else is a spelling of "yes": an empty
+        // value, a "0" or a "true" left over from another tool's convention
+        // must not turn the suite's own failures off.
+        assert!(allows_skips(Some(std::ffi::OsStr::new("1"))));
+        for not_yes in ["", "0", "true", "yes", "1 ", " 1"] {
+            assert!(
+                !allows_skips(Some(std::ffi::OsStr::new(not_yes))),
+                "{not_yes:?} is not an opt-out",
+            );
+        }
+        assert!(!allows_skips(None), "unset is not an opt-out");
+
+        // The environment is in one of the two states the policy recognises.
+        // r3 round 5, COV2: the assertion that stood here was `f(x) == f(x)` —
+        // it re-spelled `skips_allowed`'s own body and constrained nothing.
+        // This one can fail: a `0` or a `false` set in the belief that it
+        // turns the opt-out *off* leaves every unbuildable scenario failing
+        // while the person who set it thinks otherwise, and that is worth a
+        // red suite.
+        if let Some(value) = std::env::var_os(ALLOW_SKIPS) {
+            assert!(
+                value == "1",
+                "{ALLOW_SKIPS} is set to {value:?}, which is not a spelling of the \
+                 opt-out. Unset it, or set it to exactly 1.",
+            );
+            say_out_loud(&format!(
+                "INCOMPLETE RUN: {ALLOW_SKIPS}=1 is set, so every scenario this \
+                 machine cannot build was skipped rather than failed",
+            ));
+        }
+
+        // What `cannot_build` does with the *live* environment is pinned by
+        // `the_opt_out_is_read_from_the_environment_not_assumed`, which gives
+        // a child each state in turn. Asserting it here as well would only
+        // re-read this run's one state through the same function, which is
+        // how `skips_allowed() -> true` survived (r3 round 6, COV1).
+    }
+
+    /// What the say-out-loud child writes through the handle.
+    const LOUD_MARKER: &str = "bx-say-out-loud-reaches-the-report";
+
+    /// What it writes with `eprintln!`, which libtest captures.
+    const CAPTURED_MARKER: &str = "bx-eprintln-is-swallowed";
+
+    #[test]
+    #[ignore = "spawned by an_opted_in_skip_reaches_the_report_and_eprintln_does_not"]
+    fn say_out_loud_child() {
+        say_out_loud(LOUD_MARKER);
+        eprintln!("{CAPTURED_MARKER}");
+    }
+
+    #[test]
+    fn an_opted_in_skip_reaches_the_report_and_eprintln_does_not() {
+        // r3 round 5, COV1. The round-4 repair swapped `eprintln!` for a
+        // `Stderr` handle so that an opted-in skip is visible, and nothing
+        // pinned it: reverting the one line left the suite green, which is how
+        // a repair gets undone by the next edit.
+        //
+        // The difference is only observable in a process libtest is capturing,
+        // and a test cannot turn its own capture on. So the binary is
+        // re-invoked for one `#[ignore]`d test, *without* `--nocapture`: the
+        // handle write reaches the child's stderr, and the `eprintln!` from
+        // the same passing test reaches nowhere.
+        let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", "--ignored", "journal::tests::say_out_loud_child"])
+            // r3 round 6, D2. The child inherits this process's environment,
+            // and `RUST_TEST_NOCAPTURE=1` — which `cargo test` sets from
+            // `--nocapture` — turns the child's capture off, so the
+            // `eprintln!` would reach its stderr and this test would fail on
+            // its own premise rather than on the property. Removed rather than
+            // tolerated: the premise is that the child *is* capturing.
+            .env_remove("RUST_TEST_NOCAPTURE")
+            .output()
+            .expect("spawn the say-out-loud child");
+        let (out, err) = (
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        assert!(child.status.success(), "the child failed:\n{out}\n{err}");
+        assert!(
+            err.contains(LOUD_MARKER),
+            "`say_out_loud` did not reach the report:\nstdout:\n{out}\nstderr:\n{err}",
+        );
+        assert!(
+            !out.contains(CAPTURED_MARKER) && !err.contains(CAPTURED_MARKER),
+            "`eprintln!` from a passing test was expected to be swallowed, and was \
+             not — the premise of the repair is wrong:\nstdout:\n{out}\nstderr:\n{err}",
+        );
+    }
+
+    #[test]
+    fn a_home_the_loader_would_refuse_never_reaches_a_begin_frame() {
+        // r3 round 4. The round-1 panel noted that `Session::open_locked`
+        // checks `Begin.scope` against the home but never checks the home
+        // itself, and declined to report it. It is not merely inert: the
+        // session never opens. `Ledger::open` applies the same rule the loader
+        // applies to `Begin.home` — absolute, and UTF-8 — and it runs *before*
+        // `Journal::create`, so no header naming such a home is ever written.
+        // Pinned here because that guarantee is an ordering, and an ordering
+        // can be changed by accident.
+        let guard = guarded_home();
+        let unusable = {
+            use std::os::unix::ffi::OsStrExt as _;
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff"))
+        };
+        for (name, home) in [
+            ("relative", PathBuf::from("relative/home")),
+            ("tilde", PathBuf::from("~/tilde")),
+            ("not utf-8", unusable),
+        ] {
+            let state = StateDir::new(guard.child(format!("state-{name}")));
+            let err = Session::open(&state, SessionKind::Apply, &home, Vec::new())
+                .expect_err("a home the loader would refuse");
+            assert!(matches!(err, Error::State(_)), "{name}: got {err}");
+            assert!(
+                !state.journal().exists(),
+                "{name}: no header was written for it to refuse",
+            );
+        }
     }
 
     #[test]

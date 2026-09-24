@@ -26,7 +26,14 @@
 //! # Who recovers, and who only reports
 //!
 //! A **writing** command — `apply`, `sync`, `init`, `add`, `rm` — calls
-//! [`before_writing`] first, which recovers and refuses to go on if it cannot. A
+//! [`lock_for_writing`] first, which recovers under the state directory's lock,
+//! refuses to go on if it cannot, and hands that same lock to the session it is
+//! about to open, so no second bx can win the directory in between. Nothing in
+//! the type system makes a writing command use it rather than [`recover`]
+//! followed by a fresh [`journal::Session::open`]; what makes it the obvious
+//! one is that `lock_for_writing` is the only call that produces the guard
+//! [`journal::Session::open_locked`] consumes, and the only one that turns a
+//! blocked recovery into a refusal. A
 //! **read-only** command — `plan`, `status`, `doctor` — calls [`pending`],
 //! reports every named target as [`Action::Conflict`], exits
 //! [`Exit::Pending`](crate::report::Exit::Pending), and writes nothing. That is
@@ -55,6 +62,10 @@
 //! unlinked, so every writing command keeps refusing until it is resolved, and
 //! the message names the file, both digests it could legitimately hold, and
 //! [`abandon`] as the way out.
+//!
+//! A destination whose parent no longer resolves to a directory blocks
+//! recovery the same way: bx can neither confirm what is there nor write the
+//! undo through it, and the message names the parent and [`abandon`].
 
 use std::path::{Path, PathBuf};
 
@@ -119,6 +130,10 @@ pub enum Standing {
     Diverged,
     /// Not a regular file at all.
     Foreign,
+    /// Out of reach: its parent is on the filesystem but does not resolve to
+    /// a directory — a dangling symlink, a loop, or a file — so bx cannot
+    /// tell what is at the destination, and cannot write there.
+    Unreachable,
 }
 
 impl Standing {
@@ -137,6 +152,7 @@ impl std::fmt::Display for Standing {
             Self::Vanished => "is gone",
             Self::Diverged => "was edited after the interruption",
             Self::Foreign => "is not a regular file",
+            Self::Unreachable => "cannot be reached",
         })
     }
 }
@@ -379,19 +395,49 @@ pub fn recover(state: &StateDir) -> Result<Outcome, Error> {
     resolve(state, &lock)
 }
 
-/// Recover, and refuse to continue if recovery is blocked.
+/// [`lock_for_writing`]'s verdict, with the lock already held.
 ///
-/// The call every writing command makes before it writes anything.
+/// [`Outcome::Blocked`] becomes [`Error::Blocked`] here and nowhere else: a
+/// command that is about to write must stop, while [`recover`] hands the same
+/// verdict back as a value for a caller that only reports it.
+fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
+    match resolve(state, lock)? {
+        Outcome::Blocked { conflicts } => Err(Error::Blocked { conflicts }),
+        resolved => Ok(resolved),
+    }
+}
+
+/// Recover, refuse if it is blocked, and **keep the lock**.
+///
+/// The call every writing command makes. [`recover`] followed by
+/// [`journal::Session::open`] releases the state directory between the two, so
+/// a second bx can win it in between and this one's session then refuses with
+/// [`journal::Error::InProgress`] naming a journal that belongs to a live run
+/// rather than to an interruption. Handing the guard to
+/// [`journal::Session::open_locked`] makes that error mean what it says: there
+/// was an interruption this run could not resolve. See `r3 round 3`
+/// decision 3.
+///
+/// Only the guard comes back. The recovery's [`Outcome`] is logged by
+/// [`resolve`] and not returned: no writing command has a channel to report it
+/// on yet, and a value every caller binds to `_` is a value the next reader has
+/// to work out the point of. A command layer that grows such a channel adds it
+/// back with a caller that reads it. Until then [`recover`] is the form that
+/// answers "what did recovery do", for a caller that opens no session.
+///
+/// The caller opens the session itself, so a session's failure stays a
+/// session's failure rather than becoming a recovery's.
 ///
 /// # Errors
 ///
 /// As [`recover`], plus [`Error::Blocked`] when a destination cannot be
-/// accounted for. The escape from that is [`abandon`].
-pub fn before_writing(state: &StateDir) -> Result<Outcome, Error> {
-    match recover(state)? {
-        Outcome::Blocked { conflicts } => Err(Error::Blocked { conflicts }),
-        resolved => Ok(resolved),
-    }
+/// accounted for — a command that is about to write must stop. The escape from
+/// that is [`abandon`].
+pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
+    state.ensure()?;
+    let lock = ExclusiveLock::acquire(state)?;
+    resolved_or_blocked(state, &lock)?;
+    Ok(lock)
 }
 
 /// Move an unresolvable journal aside without touching any destination.
@@ -412,7 +458,10 @@ pub fn before_writing(state: &StateDir) -> Result<Outcome, Error> {
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
     let lock = ExclusiveLock::acquire(state)?;
     let path = state.journal();
-    if !path.exists() {
+    // Looked at without following a link: a dangling one at the journal's
+    // path is refused by every read (`journal::Error::NotAJournal`), so it
+    // has to be something this can move aside.
+    if std::fs::symlink_metadata(&path).is_err() {
         return Ok(None);
     }
     // Refused here as everywhere else it is read: abandoning a newer bx's
@@ -457,10 +506,17 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     };
     let mut conflicts = Vec::new();
     let mut resolved = 0_usize;
-    // The directories the terminated session's removals claimed. The session
-    // pruned them before its `End` frame; handing on what still stands is
-    // bookkeeping its save may not have reached.
-    let mut released = Vec::new();
+    // Every directory a target the terminated session dropped from the ledger
+    // claimed. The session prunes a removal's after its `End` frame, so a crash
+    // between the two leaves them standing. Handing on what still stands is
+    // bookkeeping its save may not have reached; recovery removes none of them,
+    // because a terminated session is never rolled back or finished on its
+    // behalf, and one no entry is beneath is left for `bx doctor`, as
+    // decision 11 keeps an orphaned temporary file.
+    //
+    // Owned rather than borrowed from the intents, because a dropped entry's
+    // own claims are rendered here and belong to nobody else.
+    let mut released: Vec<PathBuf> = Vec::new();
 
     let mut intents = loaded.landed();
     if !complete {
@@ -483,11 +539,25 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         // already refused a journal whose temporary file is not a `.bx-` file
         // beside its destination, and one the journal does not name is never
         // touched.
+        //
+        // One that cannot be removed — its directory has since stopped
+        // letting this process write — is left, with a warning, and the
+        // rollback goes on. Recovery never needs it: it holds bytes no
+        // destination was ever given, which makes it the same kind of orphan
+        // decision 11 keeps for `bx doctor`, and stopping every writing
+        // command over it would make a leftover bx does not need a reason to
+        // write nothing. `pending` names it in the write's note.
         if !complete
             && !matches!(step, Step::Blocked)
             && let Some(temp) = &intent.temp
+            && let Err(error) = journal::unlink(temp)
         {
-            journal::unlink(temp)?;
+            tracing::warn!(
+                temp = %temp.display(),
+                %error,
+                "an interrupted write's temporary file could not be removed; \
+                 it is left for bx doctor, and the rollback goes on",
+            );
         }
         match step {
             Step::Blocked => {
@@ -500,11 +570,31 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                     journal::prune_dirs(&intent.created_dirs)?;
                 }
             }
-            Step::Unlink => {
+            // Both act against the observation `decide` judged, never a fresh
+            // one: a destination the user edited after that look holds
+            // neither recorded state, and is refused with
+            // [`fs::Error::Changed`] rather than removed or overwritten. The
+            // journal is kept, so the next run judges the edit as `decide`
+            // judges any other, and blocks on it. What stays open is the
+            // window between the last look and the `unlink` or `rename`
+            // itself, as for `Session::remove` and [`fs::Filled::publish`].
+            Step::Unlink { observed } => {
+                #[cfg(test)]
+                tests::before_act(&intent.dest);
+                journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
                 journal::unlink(&intent.dest)?;
                 journal::prune_dirs(&intent.created_dirs)?;
             }
-            Step::Rewrite { bytes, mode } => fs::write_atomically(&intent.dest, &bytes, mode)?,
+            Step::Rewrite {
+                bytes,
+                mode,
+                observed,
+            } => {
+                #[cfg(test)]
+                tests::before_act(&intent.dest);
+                fs::stage(&intent.dest, mode, &observed, &mut fs::CreatedDirs::new())?
+                    .commit(&bytes)?;
+            }
             // Rebuilding the bookkeeping touches no destination, so it is not
             // work `plan` failed to announce: the ledger is machine state, not
             // the user's.
@@ -514,22 +604,34 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 }
             }
             Step::Forget => {
-                if let Some(ledger) = ledger.as_mut() {
-                    ledger.forget(&intent.target);
-                }
+                let dropped = ledger
+                    .as_mut()
+                    .and_then(|ledger| ledger.forget(&intent.target));
                 if intent.after == Written::Absent {
-                    released.extend(&intent.created_dirs);
+                    released.extend(intent.created_dirs.iter().cloned());
+                }
+                // The entry's *own* claims, which are not always the Intent's.
+                // A removal's Intent carries them, because `plan_restore` takes
+                // them from the entry; a released write's does not — it records
+                // only the directories that write invented, which is none. The
+                // replay path drops the same entry `Session::write` drops, so
+                // it has to carry the same claim on, or a crash turns a
+                // hand-off into a loss. See `r3 round 4` decision R3R4-1.
+                if let (Some(dropped), Some(home)) = (dropped, home) {
+                    released.extend(dropped.created_dirs.iter().map(|dir| dir.render(home)));
                 }
             }
         }
         resolved += 1;
     }
-    if conflicts.is_empty()
-        && let (Some(ledger), Some(home)) = (ledger.as_mut(), home)
-    {
-        journal::hand_off_claims(ledger, home, released)?;
-    }
-
+    // Blocked first, and *before* the hand-off. r3 coverage COV4: the
+    // hand-off used to stand ahead of this return behind a
+    // `conflicts.is_empty()` guard, and deleting that guard changed no
+    // assertion — a blocked run saves no ledger, so the mutation it protected
+    // against was invisible and the arm's correctness rested on the drop.
+    // Returning first is the same behaviour with the ordering as the
+    // guarantee: past this point there are no conflicts, so nothing has to say
+    // so a second time.
     if !conflicts.is_empty() {
         tracing::error!(
             blocked = conflicts.len(),
@@ -537,6 +639,10 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             "recovery is blocked; the journal is kept and bx will not write until it is resolved",
         );
         return Ok(Outcome::Blocked { conflicts });
+    }
+
+    if let (Some(ledger), Some(home)) = (ledger.as_mut(), home) {
+        journal::hand_off_claims(ledger, home, &released)?;
     }
 
     if let Some(ledger) = &ledger {
@@ -576,13 +682,23 @@ enum Step {
     /// Only the directories a create invented are left to prune.
     Keep,
     /// Rolling back a create whose file is there: unlink it, then prune.
-    Unlink,
+    Unlink {
+        /// The destination [`decide`] judged to be the write's own. It is
+        /// looked at again immediately before the unlink, as
+        /// `Session::remove` does, so a file edited since is refused rather
+        /// than removed.
+        observed: fs::Observed,
+    },
     /// Rolling back over a file that existed: put these bytes back at this mode.
     Rewrite {
         /// The prior bytes, digest-verified.
         bytes: Vec<u8>,
         /// The mode they had.
         mode: Mode,
+        /// The destination [`decide`] judged to be the write's own, handed to
+        /// [`fs::stage`] so a file edited since is refused rather than
+        /// overwritten.
+        observed: fs::Observed,
     },
     /// Bringing the ledger up to date for a write that landed.
     Record(NewEntry),
@@ -639,7 +755,8 @@ fn decide(
     landed: bool,
     spelling: Spelling<'_>,
 ) -> Result<(Step, Unfinished), Error> {
-    let standing = standing(intent, &look(&intent.dest)?);
+    let (found, observed) = look(&intent.dest)?;
+    let standing = standing(intent, &found);
     let report = |resolvable: bool, note: String| Unfinished {
         target: intent.target.clone(),
         dest: intent.dest.clone(),
@@ -649,17 +766,28 @@ fn decide(
     };
 
     let Some(home) = home else {
-        let rolls_back =
-            || format!("interrupted, and {standing}; the next writing bx run rolls it back");
+        let rolls_back = || {
+            let mut note =
+                format!("interrupted, and {standing}; the next writing bx run rolls it back");
+            if let Some(name) = stuck_temp(intent) {
+                note.push_str(&format!(
+                    "; its temporary file {name} cannot be removed, and is left for bx doctor"
+                ));
+            }
+            note
+        };
         return Ok(match (standing, &intent.before) {
             (Standing::Prior, _) => (Step::Keep, report(true, rolls_back())),
-            (Standing::Written, Prior::Absent) => (Step::Unlink, report(true, rolls_back())),
+            (Standing::Written, Prior::Absent) => {
+                (Step::Unlink { observed }, report(true, rolls_back()))
+            }
             (Standing::Written, Prior::Existed(reference)) => {
                 match snapshot(state, reference, spelling)? {
                     Ok(bytes) => (
                         Step::Rewrite {
                             bytes,
                             mode: reference.mode,
+                            observed,
                         },
                         report(true, rolls_back()),
                     ),
@@ -669,6 +797,10 @@ fn decide(
             (Standing::Vanished | Standing::Diverged | Standing::Foreign, _) => {
                 (Step::Blocked, report(false, note(intent, standing)))
             }
+            // Neither state can be confirmed, and no undo can be written
+            // through the parent: a human has to look, as for a file edited
+            // since.
+            (Standing::Unreachable, _) => (Step::Blocked, report(false, unreachable(intent))),
         });
     };
 
@@ -696,7 +828,18 @@ fn decide(
         (intent.after, intent.mechanism.clone())
     else {
         // A removal, or a target the session released: nothing for bx to own.
-        return Ok((Step::Forget, report(true, recorded())));
+        let mut note = recorded();
+        if intent.after == Written::Absent {
+            let orphans = empty_claims(&intent.created_dirs, home);
+            if !orphans.is_empty() {
+                note.push_str(&format!(
+                    "; the session ended before it removed {}, which stand empty and are \
+                     left for bx doctor",
+                    orphans.join(", "),
+                ));
+            }
+        }
+        return Ok((Step::Forget, report(true, note)));
     };
     if let Some(stored) = ledger.and_then(|ledger| ledger.get(&intent.target))
         && stored.written == digest
@@ -765,6 +908,44 @@ impl Spelling<'_> {
     }
 }
 
+/// The name of the temporary file `intent` names, when it is still there and
+/// its directory will not let this process remove it.
+///
+/// A prediction, for the report: [`resolve`] tries the unlink and leaves the
+/// file with a warning when it fails. Write and search permission on the
+/// directory is what an unlink needs, and `access(2)` is asked for exactly
+/// that, so a read-only filesystem is caught too.
+fn stuck_temp(intent: &Intent) -> Option<String> {
+    let temp = intent.temp.as_ref()?;
+    let dir = temp.parent()?;
+    std::fs::symlink_metadata(temp).ok()?;
+    rustix::fs::access(
+        dir,
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+    )
+    .is_err()
+    .then(|| {
+        temp.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+/// The directories in `dirs` that are still empty directories, `~`-relative.
+///
+/// What a removal whose session died between its `End` frame and its prune
+/// leaves behind. Recovery removes none of them — see [`resolve`] — so the
+/// report names them. A path that is not a directory, or that holds anything,
+/// is not one: it is not what the prune would have removed.
+fn empty_claims(dirs: &[PathBuf], home: &Path) -> Vec<String> {
+    dirs.iter()
+        .filter(|dir| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()))
+        .filter(|dir| std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none()))
+        .map(|dir| crate::paths::to_portable(dir, home))
+        .collect()
+}
+
 /// The bytes a [`RestoreRef`] names, digest-verified, or why they cannot be had.
 ///
 /// A missing or corrupt snapshot is a verdict — recovery will not guess at the
@@ -823,18 +1004,33 @@ fn rebuild_home<'a>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Found {
     Absent,
-    File { digest: ContentHash, mode: Mode },
+    File {
+        digest: ContentHash,
+        mode: Mode,
+    },
     Foreign,
+    /// Its parent does not resolve to a directory. [`fs::observe`] reports
+    /// such a destination as absent, which it may not be.
+    Unreachable,
 }
 
-/// Read a destination.
-fn look(dest: &Path) -> Result<Found, Error> {
+/// Read a destination: what recovery compares, and the observation it was
+/// reduced from, which a rollback acts against.
+fn look(dest: &Path) -> Result<(Found, fs::Observed), Error> {
     let observed = fs::observe(dest)?;
-    Ok(match (observed.kind, observed.digest(), observed.mode) {
+    if observed
+        .parent
+        .as_ref()
+        .is_some_and(|parent| parent.unusable().is_some())
+    {
+        return Ok((Found::Unreachable, observed));
+    }
+    let found = match (observed.kind, observed.digest(), observed.mode) {
         (Kind::Absent, _, _) => Found::Absent,
         (Kind::File, Some(digest), Some(mode)) => Found::File { digest, mode },
         _ => Found::Foreign,
-    })
+    };
+    Ok((found, observed))
 }
 
 /// Classify a destination against the two states its intent permits.
@@ -871,7 +1067,28 @@ fn standing(intent: &Intent, found: &Found) -> Standing {
             }
         }
         Found::Foreign => Standing::Foreign,
+        Found::Unreachable => Standing::Unreachable,
     }
+}
+
+/// The message a write whose destination cannot be reached carries: the
+/// parent, `~`-relative, and the way out.
+///
+/// The parent is the target's own, spelled as the journal stores it, because
+/// a rollback has no home to fold an absolute path against.
+fn unreachable(intent: &Intent) -> String {
+    let parent = intent
+        .target
+        .as_str()
+        .rsplit_once('/')
+        .map_or("its parent", |(parent, _)| parent);
+    format!(
+        "{}: {parent} does not resolve to a directory, so bx cannot tell what is \
+         there and will not roll it back. Make {parent} a directory again, or \
+         abandon the interrupted session to have bx report it as a conflict \
+         instead.",
+        Standing::Unreachable,
+    )
 }
 
 /// The digest and mode a [`Prior`] names, or `None` for "there was no file".
@@ -908,12 +1125,102 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        crash_phases, finish_crash_phases, frame_starts, names_in, peek, permissions_refuse,
-        plant_file, raw_journal, seal, state_beyond_set_aside_names, target, write_to,
+        WRITES_THROUGH_PERMISSIONS, cannot_build, crash_phases, finish_crash_phases, frame_starts,
+        names_in, peek, permissions_refuse, plant_file, raw_journal, seal,
+        state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
     use crate::testing::guarded_home;
+
+    thread_local! {
+        /// What a test does to a destination between `decide`'s look and the
+        /// rollback acting on it. Per thread, so tests running in parallel
+        /// never see each other's.
+        static BEFORE_ACT: std::cell::Cell<Option<fn(&Path)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The seam [`resolve`] calls before an `Unlink` or a `Rewrite` acts.
+    pub(super) fn before_act(dest: &Path) {
+        if let Some(meddle) = BEFORE_ACT.with(std::cell::Cell::get) {
+            meddle(dest);
+        }
+    }
+
+    /// Recover with `meddle` run on each destination a rollback is about to
+    /// unlink or rewrite, after `decide` has judged it.
+    fn recover_meddled(state: &StateDir, meddle: fn(&Path)) -> Result<Outcome, Error> {
+        BEFORE_ACT.with(|cell| cell.set(Some(meddle)));
+        let outcome = recover(state);
+        BEFORE_ACT.with(|cell| cell.set(None));
+        outcome
+    }
+
+    /// An editor's save: a sibling renamed over the destination.
+    fn editors_save(dest: &Path) {
+        let sibling = dest.with_file_name(".bx-test-edit~");
+        std::fs::write(&sibling, "the user's edit\n").expect("write the sibling");
+        std::fs::rename(&sibling, dest).expect("rename it over");
+    }
+
+    #[test]
+    fn an_edit_after_recovery_judged_a_create_is_not_unlinked() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".made");
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".made", "made\n", Mode::DEFAULT_FILE)],
+        );
+
+        let err = recover_meddled(&state, editors_save).expect_err("the edit is refused");
+        assert!(
+            matches!(
+                err,
+                Error::Journal(journal::Error::Write(fs::Error::Changed { .. }))
+            ),
+            "got {err}",
+        );
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's edit\n");
+        // The journal stands, and the next run blocks on the edit.
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::Blocked { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's edit\n");
+    }
+
+    #[test]
+    fn an_edit_after_recovery_judged_a_modify_is_not_overwritten() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "before\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(
+                home.path(),
+                ".conf",
+                "after\n",
+                Mode::DEFAULT_FILE,
+            )],
+        );
+
+        let err = recover_meddled(&state, editors_save).expect_err("the edit is refused");
+        assert!(
+            matches!(err, Error::Write(fs::Error::Changed { .. })),
+            "got {err}"
+        );
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's edit\n");
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::Blocked { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's edit\n");
+    }
 
     /// Run a session and abandon it without finishing, which is exactly the
     /// state a crash leaves: a journal that stands, and a ledger that does not
@@ -955,7 +1262,8 @@ mod tests {
 
     /// The four requests the crash child makes, in the order it makes them: a
     /// modify at a non-default mode, a create in a directory bx must invent, a
-    /// plain modify, and a removal of a private file.
+    /// plain modify, and a removal of a private file from a private directory
+    /// the removal claims as one bx created.
     fn crash_requests(home: &Path) -> Vec<Request> {
         vec![
             write_to(home, ".bxrc", "after bx\n", Mode::PRIVATE_FILE),
@@ -972,14 +1280,14 @@ mod tests {
                 Mode::DEFAULT_FILE,
             ),
             {
-                let (target, dest) = target(home, ".gone.conf");
+                let (target, dest) = target(home, ".vault/gone.conf");
                 // Observed when the request is built, as `write_to` observes.
                 let planned = fs::observe(&dest).expect("plan's observation");
                 Request {
                     target,
                     dest,
                     content: Content::Absent {
-                        created_dirs: Vec::new(),
+                        created_dirs: vec![home.join(".vault")],
                         planned,
                     },
                     mode: Mode::PRIVATE_FILE,
@@ -999,24 +1307,71 @@ mod tests {
             Mode::DEFAULT_FILE,
         );
         plant_file(
-            &home.join(".gone.conf"),
+            &home.join(".vault/gone.conf"),
             "bx made this\n",
             Mode::PRIVATE_FILE,
         );
+        // A directory the user made private after bx created it: a rollback
+        // that re-created it would do so at the default mode.
+        fs::set_mode(&home.join(".vault"), Mode::PRIVATE_DIR).expect("chmod ~/.vault");
         // `~/.config` deliberately does not exist: the middle write has to
         // invent two directories, and a rollback has to remove both.
     }
 
-    /// One destination and what is at it: the unit of the before-and-after
-    /// comparison the crash harness makes.
-    type Snapshot = Vec<(PathBuf, Option<(Vec<u8>, Mode)>)>;
+    /// The bytes and mode at one destination, or `None` where nothing is.
+    type FileState = Option<(Vec<u8>, Mode)>;
 
-    /// Bytes and mode at each destination, for the before-and-after comparison.
+    /// What the crash harness compares before and after: bytes and mode at
+    /// each destination, and the mode of each directory between a
+    /// destination and the home — the ones a write invents and the ones a
+    /// removal claims — or `None` where there is none.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Snapshot {
+        files: Vec<(PathBuf, FileState)>,
+        dirs: Vec<(PathBuf, Option<Mode>)>,
+    }
+
+    /// The mode of the directory at `path`, following no link, or `None`
+    /// when no directory is there.
+    fn dir_mode(path: &Path) -> Option<Mode> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_dir)
+            .map(|meta| Mode::from_bits(meta.permissions().mode() & 0o7777))
+    }
+
+    /// The crash harness's snapshot of `home`.
     fn crash_snapshot(home: &Path) -> Snapshot {
-        crash_requests(home)
-            .into_iter()
-            .map(|request| (request.dest.clone(), peek(&request.dest)))
-            .collect()
+        let requests = crash_requests(home);
+        let mut dirs: Vec<PathBuf> = requests
+            .iter()
+            .flat_map(|request| {
+                request
+                    .dest
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|dir| *dir != home)
+                    .map(Path::to_path_buf)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        Snapshot {
+            files: requests
+                .into_iter()
+                .map(|request| (request.dest.clone(), peek(&request.dest)))
+                .collect(),
+            dirs: dirs
+                .into_iter()
+                .map(|dir| {
+                    let mode = dir_mode(&dir);
+                    (dir, mode)
+                })
+                .collect(),
+        }
     }
 
     /// Every path under `root`, files and directories alike.
@@ -1053,14 +1408,15 @@ mod tests {
 
     /// Re-invoke this test binary, crashing at `phase` of write `index`.
     fn spawn_crash_child(home: &Path, index: usize, phase: &str) -> Output {
+        spawn_child("recover::tests::crash_child", home, index, phase)
+    }
+
+    /// Re-invoke this test binary to run the ignored test `child`, crashing
+    /// at `phase` of write `index`.
+    fn spawn_child(child: &str, home: &Path, index: usize, phase: &str) -> Output {
         let exe = std::env::current_exe().expect("the test binary");
         Command::new(exe)
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "recover::tests::crash_child",
-            ])
+            .args(["--exact", "--ignored", "--nocapture", child])
             .env(CRASH_AT, format!("{index}:{phase}"))
             .env(CRASH_HOME, home)
             // cargo-llvm-cov points this at a pattern the parent owns. The child
@@ -1091,6 +1447,121 @@ mod tests {
             session.apply(request).expect("apply");
         }
         session.finish().expect("finish");
+    }
+
+    /// The crashing half of [`a_killed_rm_rolls_back_into_the_directory_it_found`]:
+    /// `rm` of `~/.vault/key.conf`, which bx created with `~/.vault`.
+    #[test]
+    #[ignore = "spawned by a crash test; it aborts on purpose"]
+    fn rm_crash_child() {
+        let Some(home) = std::env::var_os(CRASH_HOME) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let state = StateDir::resolve(&home);
+        let key = Portable::from_path(&home.join(".vault/key.conf"), &home).expect("portable");
+        // Its outcome is the parent's to judge, from what the crash left.
+        let _ = crate::restore::restore(&state, &home, &[key]);
+    }
+
+    #[test]
+    fn a_killed_rm_rolls_back_into_the_directory_it_found() {
+        // r3 round 2, P9R4-D2. A removal pruned the directories it claimed
+        // before its session's `End`, so a rollback re-created `~/.vault` at
+        // the default mode after the user had made it `0700`. Pruning now
+        // waits for `End`; a crash between the two leaves the directory,
+        // empty, for `bx doctor`.
+        let guard = guarded_home();
+        for (index, phase) in [
+            (0, "after-intent"),
+            (0, "after-publish"),
+            (0, "after-done"),
+            (1, "after-end"),
+            (1, "after-save"),
+        ] {
+            let case = format!("{index}:{phase}");
+            let home = guard.child(format!("rm-{index}-{phase}"));
+            let state = StateDir::resolve(&home);
+            let vault = home.join(".vault");
+            let mut session =
+                Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+            let request = write_to(&home, ".vault/key.conf", "secret\n", Mode::PRIVATE_FILE);
+            let key = request.target.clone();
+            session
+                .apply(request)
+                .expect("bx creates ~/.vault/key.conf");
+            session.finish().expect("finish");
+            fs::set_mode(&vault, Mode::PRIVATE_DIR).expect("the user makes ~/.vault private");
+
+            let out = spawn_child("recover::tests::rm_crash_child", &home, index, phase);
+            assert!(
+                !out.status.success(),
+                "{case}: the child was supposed to die; it said {}",
+                String::from_utf8_lossy(&out.stdout),
+            );
+            let after_kill = dir_mode(&vault);
+            let report = pending(&state).expect("pending").expect("a journal stands");
+            assert!(report.blocked().next().is_none(), "{case}");
+            let note = report.unfinished[0].note.clone();
+            let outcome = recover(&state).expect("the next writing run");
+            assert!(!state.journal().exists(), "{case}");
+            let entry = LedgerView::read(&state, &home)
+                .expect("read the ledger")
+                .value
+                .get(&key)
+                .cloned();
+
+            if index == 0 {
+                assert_eq!(outcome, Outcome::RolledBack { undone: 1 }, "{case}");
+                assert_eq!(
+                    peek(&home.join(".vault/key.conf")),
+                    Some((b"secret\n".to_vec(), Mode::PRIVATE_FILE)),
+                    "{case}"
+                );
+                assert_eq!(
+                    dir_mode(&vault),
+                    Some(Mode::PRIVATE_DIR),
+                    "{case}: rolled back into the directory the rm found, at its mode"
+                );
+                assert_eq!(
+                    after_kill,
+                    Some(Mode::PRIVATE_DIR),
+                    "{case}: nothing is pruned before End"
+                );
+                assert!(entry.is_some(), "{case}: bx still manages it");
+                assert!(!note.contains("bx doctor"), "{case}: {note}");
+            } else if phase == "after-end" {
+                assert_eq!(outcome, Outcome::Recorded { entries: 1 }, "{case}");
+                assert_eq!(after_kill, Some(Mode::PRIVATE_DIR), "{case}");
+                assert!(
+                    note.contains(
+                        "before it removed ~/.vault, which stand empty and are left for bx doctor"
+                    ),
+                    "{case}: {note}"
+                );
+                assert_eq!(
+                    dir_mode(&vault),
+                    Some(Mode::PRIVATE_DIR),
+                    "{case}: recovery removes no directory"
+                );
+                assert_eq!(names_in(&vault), Vec::<String>::new(), "{case}");
+                assert!(entry.is_none(), "{case}: the removal is recorded");
+                assert!(
+                    LedgerView::read(&state, &home)
+                        .expect("read the ledger")
+                        .value
+                        .iter()
+                        .all(|(_, entry)| entry.created_dirs.is_empty()),
+                    "{case}: no entry claims the orphan"
+                );
+            } else {
+                assert_eq!(outcome, Outcome::Recorded { entries: 1 }, "{case}");
+                assert_eq!(after_kill, None, "{case}: pruned before the save");
+                assert!(!note.contains("bx doctor"), "{case}: {note}");
+                assert!(entry.is_none(), "{case}");
+            }
+            assert_eq!(recover(&state).expect("again"), Outcome::Nothing);
+        }
     }
 
     #[test]
@@ -1138,7 +1609,7 @@ mod tests {
         let state = StateDir::resolve(home.path());
         assert!(pending(&state).expect("pending").is_none());
         assert_eq!(recover(&state).expect("recover"), Outcome::Nothing);
-        assert_eq!(before_writing(&state).expect("before"), Outcome::Nothing);
+        assert_eq!(recover(&state).expect("before"), Outcome::Nothing);
         assert_eq!(abandon(&state).expect("abandon"), None);
     }
 
@@ -1376,7 +1847,10 @@ mod tests {
             }],
         );
         assert!(!dest.exists(), "the removal completed");
-        assert!(!home.child(".config").exists());
+        assert!(
+            home.child(".config/deep").is_dir(),
+            "nothing a removal claims is pruned before its session's End",
+        );
 
         recover(&state).expect("recover");
         assert_eq!(
@@ -1403,6 +1877,16 @@ mod tests {
             .clone()
             .expect("a staged temp file");
         assert!(temp.is_file(), "the crash left it behind");
+        let note = pending(&state)
+            .expect("pending")
+            .expect("interrupted")
+            .unfinished[0]
+            .note
+            .clone();
+        assert!(
+            !note.contains("temporary file"),
+            "it can be removed: {note}"
+        );
 
         recover(&state).expect("recover");
         assert!(!temp.exists(), "and recovery removed exactly it");
@@ -1581,7 +2065,7 @@ mod tests {
         ));
         assert!(state.journal().exists(), "the interruption still stands");
 
-        let err = before_writing(&state).expect_err("a writing command must refuse");
+        let err = lock_for_writing(&state).expect_err("a writing command must refuse");
         let Error::Blocked { conflicts } = &err else {
             panic!("got {err}")
         };
@@ -1798,6 +2282,433 @@ mod tests {
                 .value
                 .get(&portable)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_writing_command_holds_one_lock_across_its_recovery_and_its_session() {
+        // r3 round 3, CL3. A recovery followed by `Session::open` drops
+        // the state directory between the two, so a second bx could win it and
+        // this one's session would refuse with `InProgress` naming a journal
+        // that belongs to a live run rather than to an interruption.
+        //
+        // The one-lock property itself is the type's: `lock_for_writing`
+        // returns the guard by value and `Session::open_locked` consumes it,
+        // so there is no point at which a caller of the pair can be without
+        // it. What this pins is the contract around that — the recovery runs
+        // and reports, the returned guard is held, the session takes it over
+        // rather than acquiring a second one, a finished session gives it
+        // back, and a session refused for its scope gives it back too. It is
+        // the last that would otherwise be unreached: `open_locked` owns the
+        // guard, so an early return has to drop it.
+        //
+        // What it does *not* establish is that a writing command uses the
+        // pair: nothing in the type system says so, and `restore` being the
+        // only writing command at this revision is what makes it true today.
+        // What narrows it is that `lock_for_writing` is now the only call that
+        // refuses a blocked recovery — `before_writing`, which did the same
+        // and released the lock, had no caller but a test and is gone
+        // (`r3 round 5`, CL1).
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".conf");
+        plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+        interrupted(
+            &state,
+            home.path(),
+            vec![write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)],
+        );
+
+        let lock = lock_for_writing(&state).expect("recover and keep the lock");
+        assert_eq!(
+            peek(&dest).expect("rolled back").0,
+            b"old\n",
+            "the recovery ran under the guard that came back",
+        );
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_none(),
+            "the recovery did not release the lock",
+        );
+
+        let session =
+            Session::open_locked(&state, SessionKind::Restore, home.path(), Vec::new(), lock)
+                .expect("the session takes the guard");
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_none(),
+            "and the session holds the same one",
+        );
+        assert_eq!(session.finish().expect("finish"), 0);
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_some(),
+            "only the finished session releases it",
+        );
+
+        // A scope the loader would refuse is refused under the caller's lock
+        // too, and releases it: `open_locked` owns the guard either way.
+        let lock = lock_for_writing(&state).expect("nothing to recover");
+        let absolute = Portable::try_from(dest.to_str().expect("utf-8").to_string())
+            .expect("a well-formed absolute path");
+        let err = Session::open_locked(
+            &state,
+            SessionKind::Restore,
+            home.path(),
+            vec![absolute],
+            lock,
+        )
+        .expect_err("a scope entry the loader refuses");
+        assert!(
+            matches!(
+                err,
+                journal::Error::State(crate::state::Error::ForeignRecord { .. })
+            ),
+            "got {err}"
+        );
+        assert!(
+            ExclusiveLock::try_acquire(&state).expect("try").is_some(),
+            "the refused session released the lock",
+        );
+    }
+
+    #[test]
+    fn replaying_a_released_write_hands_on_the_directories_its_entry_claimed() {
+        // r3 round 4, D1 and COV2. `Session::write` was repaired in round 3 to
+        // stop discarding the entry `ledger.forget` returns; `resolve`'s
+        // `Step::Forget` still discarded it, so the same `rm`, crashed between
+        // its `End` frame and its save, lost the claims the live path keeps.
+        // `hand_off_claims` documents the replay as running "the same hand-off
+        // … so a crash between the `End` frame and the save loses no claim",
+        // and nothing reached `Step::Forget` for a released write at all.
+        //
+        // A released write's Intent cannot stand in for the entry: it records
+        // the directories *that write* invented, which for a write over a file
+        // that is already there is none.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dir = home.child(".config/app");
+        let claims = vec![home.child(".config"), home.child(".config/app")];
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        for rel in [".config/app/a.conf", ".config/app/heir.conf"] {
+            session
+                .apply(write_to(home.path(), rel, "bx\n", Mode::DEFAULT_FILE))
+                .expect("apply");
+        }
+        session.finish().expect("finish");
+        let (a, a_dest) = target(home.path(), ".config/app/a.conf");
+        let (heir, _) = target(home.path(), ".config/app/heir.conf");
+        let saved_claims = |what: &Portable| -> Vec<PathBuf> {
+            let mut dirs = LedgerView::read(&state, home.path())
+                .expect("read the ledger")
+                .value
+                .get(what)
+                .map(|entry| {
+                    entry
+                        .created_dirs
+                        .iter()
+                        .map(|d| d.render(home.path()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            dirs.sort();
+            dirs
+        };
+        assert_eq!(saved_claims(&a), claims, "a.conf claims both directories");
+        assert!(saved_claims(&heir).is_empty());
+
+        // `rm a.conf` hands the file back and then dies between its `End`
+        // frame and its ledger save: a terminated journal over a ledger that
+        // still holds the entry.
+        interrupted(
+            &state,
+            home.path(),
+            vec![Request {
+                target: a.clone(),
+                dest: a_dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"theirs\n".to_vec(),
+                    planned: fs::observe(&a_dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Released,
+            }],
+        );
+        seal(&state.journal(), 1);
+        let intent = journal::load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .cloned()
+            .expect("the released write's Intent");
+        assert!(
+            intent.created_dirs.is_empty(),
+            "the Intent carries no claim of its own: {:?}",
+            intent.created_dirs,
+        );
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 },
+        );
+        assert!(saved_claims(&a).is_empty(), "the entry was handed back");
+        assert_eq!(
+            saved_claims(&heir),
+            claims,
+            "and its claims reached the entry still beneath them, as the live \
+             path's do",
+        );
+        assert_eq!(peek(&a_dest).expect("handed back").0, b"theirs\n");
+        assert!(dir.is_dir(), "nothing was pruned: no removal was announced");
+    }
+
+    #[test]
+    fn a_blocked_recovery_hands_no_claim_on_and_leaves_the_saved_ledger_alone() {
+        // r3 coverage COV4. One terminated journal holding both a blocked
+        // intent and a released removal: the removal's claims must not reach
+        // the entry beneath them while the run returns `Blocked`, and the
+        // saved ledger must be exactly what it was. Once the conflict is
+        // cleared, the same journal hands them on, which is what says the
+        // first half is "not yet" rather than "never".
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let theirs = "theirs\n";
+        plant_file(&home.child(".blocked"), theirs, Mode::DEFAULT_FILE);
+
+        // bx makes ~/.config/app for gone.conf, which claims it and ~/.config;
+        // heir.conf goes in beside it and claims nothing.
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        for rel in [".config/app/gone.conf", ".config/app/heir.conf"] {
+            session
+                .apply(write_to(home.path(), rel, "bx\n", Mode::DEFAULT_FILE))
+                .expect("apply");
+        }
+        session.finish().expect("finish");
+        let (gone, gone_dest) = target(home.path(), ".config/app/gone.conf");
+        let (heir, _) = target(home.path(), ".config/app/heir.conf");
+        let claims = vec![home.child(".config"), home.child(".config/app")];
+        let saved_claims = |what: &Portable| -> Vec<PathBuf> {
+            let mut dirs = LedgerView::read(&state, home.path())
+                .expect("read the ledger")
+                .value
+                .get(what)
+                .map(|entry| {
+                    entry
+                        .created_dirs
+                        .iter()
+                        .map(|dir| dir.render(home.path()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            dirs.sort();
+            dirs
+        };
+        assert_eq!(saved_claims(&gone), claims, "gone.conf claims both");
+        assert!(saved_claims(&heir).is_empty(), "heir.conf claims neither");
+
+        // The interrupted session removes gone.conf, releasing both claims,
+        // and rewrites ~/.blocked, whose prior snapshot then goes missing.
+        interrupted(
+            &state,
+            home.path(),
+            vec![
+                Request {
+                    target: gone.clone(),
+                    dest: gone_dest.clone(),
+                    content: Content::Absent {
+                        created_dirs: claims.iter().rev().cloned().collect(),
+                        planned: fs::observe(&gone_dest).expect("plan's observation"),
+                    },
+                    mode: Mode::DEFAULT_FILE,
+                    ownership: Ownership::Released,
+                },
+                write_to(home.path(), ".blocked", "bx\n", Mode::DEFAULT_FILE),
+            ],
+        );
+        seal(&state.journal(), 2);
+        let blob = state
+            .restore()
+            .join(ContentHash::of(theirs.as_bytes()).to_hex());
+        std::fs::remove_file(&blob).expect("delete the snapshot");
+
+        let outcome = recover(&state).expect("recover");
+        assert!(
+            matches!(&outcome, Outcome::Blocked { conflicts } if conflicts.len() == 1),
+            "{outcome:?}"
+        );
+        assert!(state.journal().exists(), "the journal is kept");
+        assert_eq!(
+            saved_claims(&gone),
+            claims,
+            "a blocked run saves no ledger, so the removal's entry stands",
+        );
+        assert!(
+            saved_claims(&heir).is_empty(),
+            "and no claim was handed to the entry beneath them",
+        );
+
+        // Clear the conflict and run again: now the hand-off happens.
+        std::fs::write(&blob, theirs).expect("put the snapshot back");
+        let outcome = recover(&state).expect("recover again");
+        assert!(
+            matches!(outcome, Outcome::Recorded { entries: 2 }),
+            "{outcome:?}"
+        );
+        assert!(saved_claims(&gone).is_empty(), "the removal is recorded");
+        assert_eq!(
+            saved_claims(&heir),
+            claims,
+            "and both claims reached the entry still beneath them",
+        );
+    }
+
+    #[test]
+    fn a_rebuild_over_a_ledger_at_the_same_digest_and_another_mode_records_the_mode() {
+        // r3 coverage COV6. `decide`'s already-saved skip is "the stored entry
+        // is at the intent's `after` digest *and mode*". No fixture differed
+        // in mode alone, so deleting the mode conjunct passed: a terminated
+        // journal whose write changed only the mode, over a ledger at that
+        // digest at the old mode, would be skipped and the mode change lost.
+        //
+        // A ledger and a journal can disagree this way whenever the ledger is
+        // not the one the session opened — an older ledger put back beside a
+        // newer journal, or one rebuilt after a quarantine — so the journal is
+        // built here rather than crashed out of a session.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let bytes = "bx\n";
+        let digest = ContentHash::of(bytes.as_bytes());
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(write_to(home.path(), ".conf", bytes, Mode::DEFAULT_FILE))
+            .expect("apply");
+        session.finish().expect("finish");
+        let (portable, dest) = target(home.path(), ".conf");
+        let stored = |state: &StateDir| {
+            LedgerView::read(state, home.path())
+                .expect("read the ledger")
+                .value
+                .get(&portable)
+                .cloned()
+                .expect("the entry")
+        };
+        assert_eq!(
+            (stored(&state).written, stored(&state).mode),
+            (digest, Mode::DEFAULT_FILE),
+        );
+
+        // The same bytes at a narrower mode, landed, with the ledger the
+        // session opened holding nothing for the target.
+        raw_journal(
+            &state.journal(),
+            &[
+                Record::Begin(Begin {
+                    kind: SessionKind::Apply,
+                    home: home.path().to_path_buf(),
+                    scope: Vec::new(),
+                }),
+                Record::Intent(Intent {
+                    target: portable.clone(),
+                    dest: dest.clone(),
+                    temp: None,
+                    before: Prior::Absent,
+                    after: Written::Present {
+                        digest,
+                        mode: Mode::PRIVATE_FILE,
+                    },
+                    created_dirs: Vec::new(),
+                    mechanism: Some(Mechanism::Own),
+                    ledger_written: None,
+                }),
+                Record::Done(Done {
+                    target: portable.clone(),
+                }),
+                Record::End(End { written: 1 }),
+            ],
+        );
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 },
+        );
+        assert_eq!(
+            (stored(&state).written, stored(&state).mode),
+            (digest, Mode::PRIVATE_FILE),
+            "the mode the journal records is the mode the ledger ends at",
+        );
+    }
+
+    #[test]
+    fn a_blocked_targets_note_names_both_states_it_could_legitimately_hold() {
+        // r3 coverage COV7. `note`'s "held {digest}" and "was to be removed"
+        // arms were never asserted, and they are the whole operator-facing
+        // surface of a blocked recovery: the file, both legitimate digests,
+        // and `abandon` as the way out.
+        let home = guarded_home();
+        let (portable, dest) = target(home.path(), ".conf");
+        let old = ContentHash::of(b"old\n");
+        let new = ContentHash::of(b"new\n");
+        let base = Intent {
+            target: portable,
+            dest,
+            temp: None,
+            before: Prior::Absent,
+            after: Written::Absent,
+            created_dirs: Vec::new(),
+            mechanism: Some(Mechanism::Own),
+            ledger_written: None,
+        };
+        let tail = "bx will not overwrite it. Put back either of those two states, \
+                    or abandon the interrupted session to have bx report it as a \
+                    conflict instead.";
+
+        let created = Intent {
+            after: Written::Present {
+                digest: new,
+                mode: Mode::DEFAULT_FILE,
+            },
+            ..base.clone()
+        };
+        assert_eq!(
+            note(&created, Standing::Diverged),
+            format!(
+                "was edited after the interruption; before the interruption it \
+                 did not exist, and it was being given {new}. {tail}"
+            ),
+        );
+
+        let modified = Intent {
+            before: Prior::Existed(RestoreRef {
+                digest: old,
+                mode: Mode::DEFAULT_FILE,
+                len: 4,
+            }),
+            ..created
+        };
+        assert_eq!(
+            note(&modified, Standing::Diverged),
+            format!(
+                "was edited after the interruption; before the interruption it \
+                 held {old}, and it was being given {new}. {tail}"
+            ),
+        );
+
+        let removal = Intent {
+            before: Prior::Existed(RestoreRef {
+                digest: old,
+                mode: Mode::DEFAULT_FILE,
+                len: 4,
+            }),
+            mechanism: None,
+            ..base
+        };
+        assert_eq!(
+            note(&removal, Standing::Foreign),
+            format!(
+                "is not a regular file; before the interruption it held {old}, \
+                 and it was to be removed. {tail}"
+            ),
         );
     }
 
@@ -2084,7 +2995,10 @@ mod tests {
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
         if !permissions_refuse(state.root()) {
             fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
-            return;
+            return cannot_build(
+                "abandoning_a_journal_that_cannot_be_moved_is_an_error_and_moves_nothing",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let abandoned = abandon(&state);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
@@ -2155,7 +3069,7 @@ mod tests {
                 .all(|intent| intent.after != Written::Absent),
             "no removal had been announced yet",
         );
-        assert!(early.join(".gone.conf").is_file());
+        assert!(early.join(".vault/gone.conf").is_file());
 
         // One boundary after it: the intent is durable and the file is *still*
         // there. Unlinking first would leave a window in which a crash removes a
@@ -2170,10 +3084,10 @@ mod tests {
         let loaded = crate::journal::load(&StateDir::resolve(&late).journal()).expect("load");
         let intent = loaded.intents().last().expect("the removal's intent");
         assert_eq!(intent.after, Written::Absent);
-        assert_eq!(intent.dest, late.join(".gone.conf"));
+        assert_eq!(intent.dest, late.join(".vault/gone.conf"));
         assert_eq!(intent.temp, None);
         assert_eq!(
-            peek(&late.join(".gone.conf")).expect("still there"),
+            peek(&late.join(".vault/gone.conf")).expect("still there"),
             (b"bx made this\n".to_vec(), Mode::PRIVATE_FILE),
             "and the destination is still what it was",
         );
@@ -2242,14 +3156,22 @@ mod tests {
 
     #[test]
     fn every_standing_renders_a_sentence() {
-        for standing in [
-            Standing::Prior,
-            Standing::Written,
-            Standing::Vanished,
-            Standing::Diverged,
-            Standing::Foreign,
+        // r3 coverage COV7. Non-empty was all this asserted, so any of the six
+        // could have been swapped for another and the suite stayed green.
+        // Each reads as the predicate of a sentence whose subject is the path,
+        // which is how `note` and `unreachable` both use it.
+        for (standing, sentence) in [
+            (Standing::Prior, "holds the bytes that were there before"),
+            (
+                Standing::Written,
+                "holds the bytes the interrupted session wrote",
+            ),
+            (Standing::Vanished, "is gone"),
+            (Standing::Diverged, "was edited after the interruption"),
+            (Standing::Foreign, "is not a regular file"),
+            (Standing::Unreachable, "cannot be reached"),
         ] {
-            assert!(!standing.to_string().is_empty());
+            assert_eq!(standing.to_string(), sentence);
         }
         assert_eq!(SessionKind::Apply.to_string(), "apply");
         assert_eq!(SessionKind::Restore.to_string(), "restore");
@@ -2467,7 +3389,7 @@ mod tests {
         assert!(foreign(&err), "got {err}");
         let err = recover(&state).expect_err("a mis-spelled home stops the run");
         assert!(foreign(&err), "got {err}");
-        let err = before_writing(&state).expect_err("and every writing command");
+        let err = lock_for_writing(&state).expect_err("and every writing command");
         assert!(foreign(&err), "got {err}");
 
         assert_eq!(std::fs::read(state.ledger()).expect("in place"), ledger);
@@ -2588,7 +3510,7 @@ mod tests {
         assert!(future(&err), "got {err}");
         let err = recover(&state).expect_err("the recovery stops");
         assert!(future(&err), "got {err}");
-        let err = before_writing(&state).expect_err("and every writing command");
+        let err = lock_for_writing(&state).expect_err("and every writing command");
         assert!(future(&err), "got {err}");
 
         assert_eq!(std::fs::read(state.ledger()).expect("in place"), newer);
@@ -2867,7 +3789,10 @@ mod tests {
         fs::set_mode(state.root(), Mode::from_bits(0o500)).expect("make it read-only");
         if !permissions_refuse(state.root()) {
             fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
-            return;
+            return cannot_build(
+                "a_set_aside_that_fails_after_the_rollback_leaves_the_journal_in_place",
+                WRITES_THROUGH_PERMISSIONS,
+            );
         }
         let first = recover(&state);
         fs::set_mode(state.root(), Mode::PRIVATE_DIR).expect("make it writable again");
@@ -3259,6 +4184,29 @@ mod tests {
                 let interrupted = pending(&state).expect("pending").expect("a journal stands");
                 assert!(interrupted.complete, "{case}");
                 assert!(interrupted.blocked().next().is_none(), "{case}");
+                let removal_note = interrupted
+                    .unfinished
+                    .iter()
+                    .find(|write| write.dest.ends_with(".vault/gone.conf"))
+                    .expect("the removal is reported")
+                    .note
+                    .clone();
+                // The claimed directory is pruned after `End`: a crash between
+                // the two leaves it, empty and at its mode, as decision 11's
+                // kind of orphan, and recovery removes it no more than it
+                // removes an orphaned temporary file.
+                let vault = home.join(".vault");
+                let orphaned = phase == "after-end";
+                assert_eq!(
+                    dir_mode(&vault),
+                    orphaned.then_some(Mode::PRIVATE_DIR),
+                    "{case}"
+                );
+                assert_eq!(
+                    removal_note.contains("~/.vault, which stand empty and are left for bx doctor"),
+                    orphaned,
+                    "{case}: {removal_note}"
+                );
                 let outcome = recover(&state).expect("recover");
                 assert!(
                     matches!(outcome, Outcome::Recorded { .. }),
@@ -3266,14 +4214,30 @@ mod tests {
                 );
                 assert!(!state.journal().exists(), "{case}");
                 assert_eq!(recover(&state).expect("again"), Outcome::Nothing, "{case}");
+                assert_eq!(
+                    dir_mode(&vault),
+                    orphaned.then_some(Mode::PRIVATE_DIR),
+                    "{case}: recovery leaves the orphan"
+                );
+                assert!(
+                    LedgerView::read(&state, &home)
+                        .expect("read the ledger")
+                        .value
+                        .iter()
+                        .all(|(_, entry)| !entry
+                            .created_dirs
+                            .iter()
+                            .any(|dir| dir.as_str() == "~/.vault")),
+                    "{case}: no entry claims ~/.vault"
+                );
 
                 let restored = crate::restore::restore(&state, &home, &owned).expect("rm");
                 assert!(
                     restored.iter().all(|done| !done.is_conflict()),
                     "{case}: {restored:?}"
                 );
-                for ((dest, was), (_, is)) in before.iter().zip(crash_snapshot(&home)) {
-                    if dest.ends_with(".gone.conf") {
+                for ((dest, was), (_, is)) in before.files.iter().zip(crash_snapshot(&home).files) {
+                    if dest.ends_with(".vault/gone.conf") {
                         assert_eq!(is, None, "{case}: the session released and removed it");
                     } else {
                         assert_eq!(&is, was, "{case}: rm did not restore {}", dest.display());
@@ -3311,12 +4275,13 @@ mod tests {
 
                 // 1. Old or new, never torn. This is what A5's atomic write
                 //    buys, and this assertion is what proves it.
-                for (dest, found) in crash_snapshot(&home) {
+                for (dest, found) in crash_snapshot(&home).files {
                     let request = crash_requests(&home)
                         .into_iter()
                         .find(|candidate| candidate.dest == dest)
                         .expect("a fixture destination");
                     let was = before
+                        .files
                         .iter()
                         .find(|(path, _)| *path == dest)
                         .and_then(|(_, state)| state.clone());
@@ -3352,9 +4317,29 @@ mod tests {
                     "got {outcome:?} at {index}:{phase}",
                 );
 
-                // 4. Byte- and mode-identical to the pre-run snapshot.
+                // 4. Byte- and mode-identical to the pre-run snapshot, the
+                //    directories included. At the two boundaries that can
+                //    orphan a staged file (step 5), the directories stage
+                //    invented for it may stand too — and only those: a
+                //    directory that existed before is at its mode either way.
+                let orphan_possible = matches!(phase, "after-stage" | "after-fill");
+                let orphan_dest = crash_requests(&home)[index].dest.clone();
+                let beside_orphans = |mut snapshot: Snapshot| {
+                    if orphan_possible {
+                        for (dir, mode) in &mut snapshot.dirs {
+                            let invented = before
+                                .dirs
+                                .iter()
+                                .any(|(was, prior)| was == dir && prior.is_none());
+                            if invented && orphan_dest.starts_with(&*dir) {
+                                *mode = None;
+                            }
+                        }
+                    }
+                    snapshot
+                };
                 assert_eq!(
-                    crash_snapshot(&home),
+                    beside_orphans(crash_snapshot(&home)),
                     before,
                     "rollback at {index}:{phase} did not restore the fixture",
                 );
@@ -3367,7 +4352,6 @@ mod tests {
                 //    deletion bx cannot prove it is entitled to make. Such an
                 //    orphan is empty or unpublished, is attributable by its
                 //    `.bx-` prefix, and is `bx doctor`'s to report.
-                let orphan_possible = matches!(phase, "after-stage" | "after-fill");
                 let temps = leftover_temps(&home);
                 if orphan_possible {
                     assert!(
@@ -3398,7 +4382,7 @@ mod tests {
 
                 // 7. Recovery is idempotent.
                 assert_eq!(recover(&state).expect("recover twice"), Outcome::Nothing);
-                assert_eq!(crash_snapshot(&home), before);
+                assert_eq!(beside_orphans(crash_snapshot(&home)), before);
             }
         }
     }
@@ -3491,7 +4475,7 @@ mod tests {
         assert!(refused(pending(&state).expect_err("pending refuses")));
         assert!(refused(recover(&state).expect_err("recover refuses")));
         assert!(refused(
-            before_writing(&state).expect_err("a writing command refuses")
+            lock_for_writing(&state).expect_err("a writing command refuses")
         ));
         let opened = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
             .expect_err("a session refuses");
@@ -3562,7 +4546,7 @@ mod tests {
         std::os::unix::fs::symlink(home.child("real"), home.child("d")).expect("link it back");
 
         assert_eq!(
-            before_writing(&state).expect("recover"),
+            recover(&state).expect("recover"),
             Outcome::RolledBack { undone: 1 },
         );
         assert!(!state.journal().exists());
@@ -3573,7 +4557,7 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(before_writing(&state).expect("again"), Outcome::Nothing);
+        assert_eq!(recover(&state).expect("again"), Outcome::Nothing);
     }
 
     #[test]
@@ -3607,6 +4591,143 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_removal_whose_parent_no_longer_resolves_is_blocked_not_an_error() {
+        // r3 round 2, P9R4-D4. The destination under a dangling link read as
+        // absent, so `pending` called the removal's rollback resolvable, and
+        // every recovery then failed writing through the link with
+        // UnusableParent, never naming `abandon`.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let request = write_to(home.path(), ".made/f.conf", "bx\n", Mode::DEFAULT_FILE);
+        let key = request.target.clone();
+        session.apply(request).expect("bx creates ~/.made/f.conf");
+        session.finish().expect("finish");
+
+        // rm's removal lands, and the process dies before its session ends.
+        let entry = LedgerView::read(&state, home.path())
+            .expect("read the ledger")
+            .value
+            .get(&key)
+            .cloned()
+            .expect("managed");
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), vec![key.clone()])
+                .expect("open");
+        let crate::restore::Restoration::Remove {
+            dest,
+            created_dirs,
+            planned,
+        } = crate::restore::plan_restore(&entry, home.path()).expect("plan")
+        else {
+            panic!("bx created it, so rm removes it");
+        };
+        session
+            .apply(Request {
+                target: key,
+                dest,
+                content: Content::Absent {
+                    created_dirs,
+                    planned: *planned,
+                },
+                mode: entry.mode,
+                ownership: Ownership::Released,
+            })
+            .expect("the removal");
+        drop(session);
+
+        // `~/.made` becomes a link to nowhere.
+        let made = home.child(".made");
+        if made.is_dir() {
+            std::fs::remove_dir(&made).expect("rm the empty directory");
+        }
+        std::os::unix::fs::symlink(home.child("nowhere"), &made).expect("link");
+
+        let report = pending(&state).expect("pending").expect("interrupted");
+        let outcome = recover(&state);
+
+        let Ok(Outcome::Blocked { conflicts }) = outcome else {
+            panic!("recovery is blocked, not an error: {outcome:?}");
+        };
+        assert_eq!(
+            conflicts, report.unfinished,
+            "the report and the recovery agree"
+        );
+        let write = &report.unfinished[0];
+        assert_eq!(write.standing, Standing::Unreachable);
+        assert!(!write.resolvable, "{write:?}");
+        assert!(
+            write
+                .note
+                .starts_with("cannot be reached: ~/.made does not resolve to a directory"),
+            "{}",
+            write.note
+        );
+        assert!(report.blocked().next().is_some());
+        assert!(write.note.contains("~/.made"), "{}", write.note);
+        assert!(write.note.contains("abandon"), "{}", write.note);
+        assert!(state.journal().exists(), "the journal is kept");
+        assert!(matches!(
+            lock_for_writing(&state),
+            Err(Error::Blocked { .. })
+        ));
+        assert!(
+            std::fs::symlink_metadata(&made)
+                .expect("the link stays")
+                .file_type()
+                .is_symlink()
+        );
+
+        assert!(abandon(&state).expect("abandon").is_some());
+        assert_eq!(recover(&state).expect("after abandon"), Outcome::Nothing);
+    }
+
+    #[test]
+    fn a_created_file_changed_after_the_crash_is_blocked_saying_it_did_not_exist() {
+        // r3 round 2, P9R4-CV3. `note`'s wording for a write that created its
+        // file was never reached. A created file that is gone again reads as
+        // `Prior`, so only an edit and a replacement block such a write.
+        fn edited(dest: &Path) {
+            plant_file(dest, "edited after the crash\n", Mode::DEFAULT_FILE);
+        }
+        fn replaced(dest: &Path) {
+            std::fs::remove_file(dest).expect("rm");
+            std::fs::create_dir(dest).expect("a directory in its place");
+        }
+
+        let guard = guarded_home();
+        for (name, change, standing) in [
+            ("edited", edited as fn(&Path), Standing::Diverged),
+            ("replaced", replaced as fn(&Path), Standing::Foreign),
+        ] {
+            let home = guard.child(name);
+            std::fs::create_dir_all(&home).expect("the home");
+            let state = StateDir::resolve(&home);
+            interrupted(
+                &state,
+                &home,
+                vec![write_to(&home, ".new.conf", "bx\n", Mode::DEFAULT_FILE)],
+            );
+            change(&home.join(".new.conf"));
+
+            let report = pending(&state).expect("pending").expect("interrupted");
+            let Outcome::Blocked { conflicts } = recover(&state).expect("recover") else {
+                panic!("{name}: recovery is blocked");
+            };
+            assert_eq!(conflicts, report.unfinished, "{name}");
+            assert_eq!(conflicts[0].standing, standing, "{name}");
+            assert!(
+                conflicts[0]
+                    .note
+                    .contains("before the interruption it did not exist, and it was being given"),
+                "{name}: {}",
+                conflicts[0].note
+            );
+        }
+    }
+
+    #[test]
     fn only_a_destination_in_a_recorded_state_is_resolvable() {
         for (standing, resolvable) in [
             (Standing::Prior, true),
@@ -3614,6 +4735,7 @@ mod tests {
             (Standing::Vanished, false),
             (Standing::Diverged, false),
             (Standing::Foreign, false),
+            (Standing::Unreachable, false),
         ] {
             assert_eq!(standing.is_resolvable(), resolvable, "{standing:?}");
         }

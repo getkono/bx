@@ -25,19 +25,33 @@
 //!
 //! # Who recovers, and who only reports
 //!
-//! A **writing** command — `apply`, `sync`, `init`, `add`, `rm` — calls
-//! [`lock_for_writing`] first, which recovers under the state directory's lock,
-//! refuses to go on if it cannot, and hands that same lock to the session it is
-//! about to open, so no second bx can win the directory in between. Nothing in
-//! the type system makes a writing command use it rather than [`recover`]
-//! followed by a fresh [`journal::Session::open`]; what makes it the obvious
-//! one is that `lock_for_writing` is the only call that produces the guard
-//! [`journal::Session::open_locked`] consumes, and the only one that turns a
-//! blocked recovery into a refusal. A
-//! **read-only** command — `plan`, `status`, `doctor` — calls [`pending`],
-//! reports every named target as [`Action::Conflict`], exits
-//! [`Exit::Pending`](crate::report::Exit::Pending), and writes nothing. That is
-//! what keeps `plan` usable from CI, a prompt segment or a login banner.
+//! A **writing** command that recovers and then writes in the same run — `rm`
+//! today — calls [`lock_for_writing`] first, which recovers under the state
+//! directory's lock, refuses to go on if it cannot, and hands that same lock to
+//! the session it is about to open, so no second bx can win the directory in
+//! between. Nothing in the type system makes such a command use it rather than
+//! [`recover`] followed by a fresh [`journal::Session::open`]; what makes it the
+//! obvious one is that `lock_for_writing` is the only call that produces the
+//! guard [`journal::Session::open_locked`] consumes, and the only one that
+//! turns a blocked recovery into a refusal.
+//!
+//! `apply` is the exception, because recovery is itself work `plan` must
+//! announce (Invariant 7). It reads the interruption with [`pending`], refuses
+//! before rolling anything back when a write cannot be accounted for, shows the
+//! rows recovery would make for approval, and once approved calls [`recover`] —
+//! turning an [`Outcome::Blocked`] it returns into [`Error::Blocked`] itself —
+//! and stops without opening a session. The next run decides the configured
+//! targets against the disk recovery left.
+//!
+//! A **read-only** command — `plan`, `status`, `doctor` — calls [`pending`] and
+//! writes nothing. It reports each write the session named as the row recovery
+//! would make of it: a write to roll back as an [`Action::Modify`] with its
+//! diff, one already holding what was there before as [`Action::Unchanged`]
+//! (or a modify naming the directories recovery removes where empty), every
+//! write of a session that finished as [`Action::Unchanged`], and a write
+//! recovery cannot account for as an [`Action::Conflict`] naming [`abandon`].
+//! It exits [`Exit::Pending`] whatever the rows are. That is what keeps `plan` usable from CI, a prompt segment or a login
+//! banner.
 //!
 //! # Why recovery is not itself journalled
 //!

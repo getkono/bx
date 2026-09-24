@@ -596,6 +596,14 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             // judges any other, and blocks on it. What stays open is the
             // window between the last look and the `unlink` or `rename`
             // itself, as for `Session::remove` and [`fs::Filled::publish`].
+            // A directory the session created goes only while it is empty,
+            // and its parents after it: bx never removes what is inside one,
+            // so an edit inside it since `decide` looked is never lost.
+            Step::Unlink { .. } if intent.dir => journal::prune_dirs(
+                &std::iter::once(intent.dest.clone())
+                    .chain(intent.created_dirs.iter().cloned())
+                    .collect::<Vec<_>>(),
+            )?,
             Step::Unlink { observed } => {
                 #[cfg(test)]
                 tests::before_act(&intent.dest);
@@ -613,6 +621,16 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 fs::stage(&intent.dest, mode, &observed, &mut fs::CreatedDirs::new())?
                     .commit(&bytes)?;
             }
+            // A directory's rollback acts against the observation `decide`
+            // judged too: one whose mode or presence changed since is refused
+            // with [`fs::Error::Changed`] rather than chmod'd or made over it.
+            Step::Chmod { mode, observed } => {
+                journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
+                fs::set_mode(&intent.dest, mode)?;
+            }
+            Step::MakeDir { mode, observed } => {
+                fs::ensure_dir(&intent.dest, mode, &observed, &mut fs::CreatedDirs::new())?;
+            }
             // Rebuilding the bookkeeping touches no destination, so it is not
             // work `plan` failed to announce: the ledger is machine state, not
             // the user's.
@@ -627,6 +645,11 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                     .and_then(|ledger| ledger.forget(&intent.target));
                 if intent.after == Written::Absent {
                     released.extend(intent.created_dirs.iter().cloned());
+                    // A directory target's removal released the directory
+                    // itself too.
+                    if intent.dir {
+                        released.push(intent.dest.clone());
+                    }
                 }
                 // The entry's *own* claims, which are not always the Intent's.
                 // A removal's Intent carries them, because `plan_restore` takes
@@ -718,6 +741,22 @@ enum Step {
         /// overwritten.
         observed: fs::Observed,
     },
+    /// Rolling back a directory's mode change: set it back to this mode.
+    Chmod {
+        /// The mode it had.
+        mode: Mode,
+        /// The directory [`decide`] judged to be the write's own, looked at
+        /// again before the chmod so one changed since is refused.
+        observed: fs::Observed,
+    },
+    /// Rolling back the removal of a directory: make it again at this mode.
+    MakeDir {
+        /// The mode it had.
+        mode: Mode,
+        /// The absence [`decide`] judged, handed to [`fs::ensure_dir`] so a
+        /// path filled since is refused rather than made over.
+        observed: fs::Observed,
+    },
     /// Bringing the ledger up to date for a write that landed.
     Record(NewEntry),
     /// Bringing the ledger up to date for a write that left nothing to own.
@@ -799,6 +838,16 @@ fn decide(
             (Standing::Written, Prior::Absent) => {
                 (Step::Unlink { observed }, report(true, rolls_back()))
             }
+            // A directory's earlier state is a mode, and needs no snapshot:
+            // one bx removed is made again at it, one bx changed is set back.
+            (Standing::Written, Prior::Existed(reference)) if intent.dir => {
+                let mode = reference.mode;
+                let step = match intent.after {
+                    Written::Absent => Step::MakeDir { mode, observed },
+                    Written::Present { .. } => Step::Chmod { mode, observed },
+                };
+                (step, report(true, rolls_back()))
+            }
             (Standing::Written, Prior::Existed(reference)) => {
                 match snapshot(state, reference, spelling)? {
                     Ok(bytes) => (
@@ -876,6 +925,12 @@ fn decide(
     }
     let prior = match &intent.before {
         Prior::Absent => PriorBytes::Absent,
+        // A directory's earlier state is its mode alone; there is no snapshot
+        // to read.
+        Prior::Existed(reference) if intent.dir => PriorBytes::Bytes {
+            bytes: journal::DIR_BYTES.to_vec(),
+            mode: reference.mode,
+        },
         Prior::Existed(reference) => match snapshot(state, reference, spelling)? {
             Ok(bytes) => PriorBytes::Bytes {
                 bytes,
@@ -1025,6 +1080,9 @@ enum Found {
         digest: ContentHash,
         mode: Mode,
     },
+    Dir {
+        mode: Mode,
+    },
     Foreign,
     /// Its parent does not resolve to a directory. [`fs::observe`] reports
     /// such a destination as absent, which it may not be.
@@ -1045,6 +1103,7 @@ fn look(dest: &Path) -> Result<(Found, fs::Observed), Error> {
     let found = match (observed.kind, observed.digest(), observed.mode) {
         (Kind::Absent, _, _) => Found::Absent,
         (Kind::File, Some(digest), Some(mode)) => Found::File { digest, mode },
+        (Kind::Dir, _, Some(mode)) => Found::Dir { mode },
         _ => Found::Foreign,
     };
     Ok((found, observed))
@@ -1063,8 +1122,20 @@ fn standing(intent: &Intent, found: &Found) -> Standing {
         Written::Absent => None,
         Written::Present { digest, mode } => Some((digest, mode)),
     };
-    match *found {
-        Found::Absent => {
+    // A directory is compared by its mode, under the digest a directory is
+    // recorded with; a directory where a file was written, or a file where a
+    // directory was, is neither state.
+    let here = match (*found, intent.dir) {
+        (Found::Absent, _) => None,
+        (Found::File { digest, mode }, false) => Some((digest, mode)),
+        (Found::Dir { mode }, true) => Some((journal::dir_digest(), mode)),
+        (Found::File { .. }, true) | (Found::Dir { .. }, false) | (Found::Foreign, _) => {
+            return Standing::Foreign;
+        }
+        (Found::Unreachable, _) => return Standing::Unreachable,
+    };
+    match here {
+        None => {
             if before.is_none() {
                 Standing::Prior
             } else if after.is_none() {
@@ -1073,8 +1144,7 @@ fn standing(intent: &Intent, found: &Found) -> Standing {
                 Standing::Vanished
             }
         }
-        Found::File { digest, mode } => {
-            let here = Some((digest, mode));
+        Some(_) => {
             if before == here {
                 Standing::Prior
             } else if after == here {
@@ -1083,8 +1153,6 @@ fn standing(intent: &Intent, found: &Found) -> Standing {
                 Standing::Diverged
             }
         }
-        Found::Foreign => Standing::Foreign,
-        Found::Unreachable => Standing::Unreachable,
     }
 }
 
@@ -2661,6 +2729,7 @@ mod tests {
                     created_dirs: Vec::new(),
                     mechanism: Some(Mechanism::Own),
                     ledger_written: None,
+                    dir: false,
                 }),
                 Record::Done(Done {
                     target: portable.clone(),
@@ -2699,6 +2768,7 @@ mod tests {
             created_dirs: Vec::new(),
             mechanism: Some(Mechanism::Own),
             ledger_written: None,
+            dir: false,
         };
         let tail = "bx will not overwrite it. Put back either of those two states, \
                     or abandon the interrupted session to have bx report it as a \
@@ -2833,6 +2903,7 @@ mod tests {
                     created_dirs: Vec::new(),
                     mechanism: Some(Mechanism::Own),
                     ledger_written: None,
+                    dir: false,
                 }),
                 Record::Done(Done { target: portable }),
                 Record::End(End { written: 1 }),
@@ -2945,6 +3016,7 @@ mod tests {
                     created_dirs: Vec::new(),
                     mechanism: Some(Mechanism::Own),
                     ledger_written: None,
+                    dir: false,
                 }),
                 Record::End(End { written: 0 }),
             ],
@@ -3234,6 +3306,7 @@ mod tests {
             created_dirs: Vec::new(),
             mechanism: Some(Mechanism::Own),
             ledger_written: None,
+            dir: false,
         }
     }
 
@@ -3730,6 +3803,7 @@ mod tests {
                     created_dirs: Vec::new(),
                     mechanism: Some(region),
                     ledger_written: Some(ContentHash::of(bx1.as_bytes())),
+                    dir: false,
                 }),
                 Record::Done(Done {
                     target: portable.clone(),
@@ -4222,6 +4296,9 @@ mod tests {
                             assert_eq!(found, Some((wanted.clone(), request.mode)), "{case}");
                         }
                         Content::Absent { .. } => assert_eq!(found, None, "{case}"),
+                        Content::Dir { .. } | Content::DirAbsent { .. } => {
+                            unreachable!("{case}: the crash fixture writes files only")
+                        }
                     }
                 }
 
@@ -4334,6 +4411,9 @@ mod tests {
                             .as_ref()
                             .is_some_and(|(bytes, mode)| bytes == wanted && *mode == request.mode),
                         Content::Absent { .. } => found.is_none(),
+                        Content::Dir { .. } | Content::DirAbsent { .. } => {
+                            unreachable!("the crash fixture writes files only")
+                        }
                     };
                     assert!(
                         found == was || is_new,

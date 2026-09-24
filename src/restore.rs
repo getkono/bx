@@ -30,6 +30,12 @@
 //!   nothing. This is Invariant 1, and it does not lapse because the command is
 //!   called `rm`.
 //!
+//! A directory target is held to the same rules with a mode in place of bytes:
+//! only the directory is bx's, never what is inside it. One bx created is
+//! removed while it is empty — one still holding anything is left, and handed
+//! to a surviving entry beneath it — one bx narrowed gets its earlier mode
+//! back, and one whose mode changed since bx set it is a conflict.
+//!
 //! A restore is a [`Session`] like any other write, so an interrupted `rm` is
 //! detected and rolled back by the same machinery as an interrupted `apply`.
 //!
@@ -42,11 +48,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::fs::{self, Kind};
+use crate::fs::{self, Kind, Mode};
 use crate::journal::{self, Content, Ownership, Request, Session, SessionKind};
 use crate::paths::Portable;
 use crate::recover;
-use crate::state::{LedgerEntry, Prior, RestoreRef, StateDir};
+use crate::state::{LedgerEntry, Mechanism, Prior, RestoreRef, StateDir};
 
 /// Everything that can go wrong restoring.
 #[derive(Debug, thiserror::Error)]
@@ -92,7 +98,38 @@ pub enum Restoration {
         /// variants hold a path.
         planned: Box<fs::Observed>,
     },
-    /// bx created the file and it is already gone. Only the ledger entry goes.
+    /// bx created the directory; it is removed if it is empty, and so are the
+    /// directories bx created for it. One still holding anything is left, and
+    /// handed to a surviving entry beneath it if there is one.
+    RemoveDir {
+        /// The directory to remove.
+        dest: PathBuf,
+        /// Directories bx created on the way to it, deepest first.
+        created_dirs: Vec<PathBuf>,
+        /// What this plan observed at `dest`. The removal is checked against
+        /// it, so a directory that changed since is refused.
+        planned: Box<fs::Observed>,
+    },
+    /// bx changed the mode of a directory that was already there; the mode
+    /// it had goes back. Nothing inside it is touched.
+    RevertMode {
+        /// The directory.
+        dest: PathBuf,
+        /// The mode it had before bx changed it.
+        mode: Mode,
+        /// What this plan observed at `dest`. The change is checked against
+        /// it, so a directory that changed since is refused.
+        planned: Box<fs::Observed>,
+    },
+    /// bx changed a directory's mode and it is back at the mode it had before:
+    /// there is nothing to put back. Only the ledger entry goes.
+    Release {
+        /// The directory.
+        dest: PathBuf,
+    },
+    /// bx created the file or directory and it is already gone, or it is a
+    /// directory whose mode bx changed and somebody has removed. Only the
+    /// ledger entry goes: bx does not make a directory again to give it back.
     AlreadyGone {
         /// The file that is not there.
         dest: PathBuf,
@@ -221,6 +258,9 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
             dest,
         });
     }
+    if entry.mechanism == Mechanism::Dir {
+        return Ok(plan_restore_dir(entry, home, dest, observed));
+    }
 
     match (observed.kind, observed.digest()) {
         (Kind::Absent, _) => Ok(match &entry.prior {
@@ -264,6 +304,62 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
             note: format!("is {kind}, not the file bx wrote"),
             dest,
         }),
+    }
+}
+
+/// [`plan_restore`] for a directory target, from what was observed at `dest`.
+///
+/// Only the directory is bx's, never what is inside it, so the undo is a mode
+/// or an empty directory's removal:
+///
+/// * Nothing there, whoever removed it, is [`Restoration::AlreadyGone`].
+/// * A directory at the mode bx set is bx's: one bx created is
+///   [`Restoration::RemoveDir`], and one that was already there gets its
+///   earlier mode back — [`Restoration::RevertMode`], or
+///   [`Restoration::Release`] when that is the mode it has.
+/// * A directory at any other mode was changed since bx set it, and putting
+///   the earlier mode back would undo that change; anything that is not a
+///   directory is not what bx made. Both are a [`Restoration::Conflict`], and
+///   nothing is forgotten.
+fn plan_restore_dir(
+    entry: &LedgerEntry,
+    home: &Path,
+    dest: PathBuf,
+    observed: fs::Observed,
+) -> Restoration {
+    match (observed.kind, observed.mode) {
+        (Kind::Absent, _) => Restoration::AlreadyGone { dest },
+        (Kind::Dir, Some(mode)) if mode == entry.mode => match &entry.prior {
+            Prior::Absent => Restoration::RemoveDir {
+                created_dirs: entry
+                    .created_dirs
+                    .iter()
+                    .map(|dir| dir.render(home))
+                    .collect(),
+                dest,
+                planned: Box::new(observed),
+            },
+            Prior::Existed(reference) if reference.mode == mode => Restoration::Release { dest },
+            Prior::Existed(reference) => Restoration::RevertMode {
+                dest,
+                mode: reference.mode,
+                planned: Box::new(observed),
+            },
+        },
+        (Kind::Dir, Some(mode)) => Restoration::Conflict {
+            note: format!(
+                "is a directory at {mode}, and bx left it at {}; putting back its earlier mode \
+                 would undo that change, so bx is leaving it and forgetting nothing",
+                entry.mode,
+            ),
+            dest,
+        },
+        (kind, _) => Restoration::Conflict {
+            note: format!(
+                "is {kind}, not the directory bx made; bx is leaving it and forgetting nothing"
+            ),
+            dest,
+        },
     }
 }
 
@@ -333,6 +429,50 @@ fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Err
             dest,
             note,
         }),
+        Restoration::Release { dest } => {
+            session.forget(target);
+            Ok(Restored::Reverted {
+                target: target.clone(),
+                dest,
+            })
+        }
+        Restoration::RemoveDir {
+            dest,
+            created_dirs,
+            planned,
+        } => {
+            session.apply(Request {
+                target: target.clone(),
+                dest: dest.clone(),
+                content: Content::DirAbsent {
+                    created_dirs,
+                    planned: *planned,
+                },
+                mode: entry.mode,
+                ownership: Ownership::Released,
+            })?;
+            Ok(Restored::Removed {
+                target: target.clone(),
+                dest,
+            })
+        }
+        Restoration::RevertMode {
+            dest,
+            mode,
+            planned,
+        } => {
+            session.apply(Request {
+                target: target.clone(),
+                dest: dest.clone(),
+                content: Content::Dir { planned: *planned },
+                mode,
+                ownership: Ownership::Released,
+            })?;
+            Ok(Restored::Reverted {
+                target: target.clone(),
+                dest,
+            })
+        }
         Restoration::Remove {
             dest,
             created_dirs,
@@ -1786,6 +1926,230 @@ mod tests {
                 "{sharing:?}"
             );
         }
+    }
+
+    /// Let bx make the directory `rel` at `mode`, and return its target.
+    fn managed_dir(state: &StateDir, home: &Path, rel: &str, mode: Mode) -> Portable {
+        let request = crate::journal::tests::dir_to(home, rel, mode);
+        let portable = request.target.clone();
+        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
+        session.apply(request).expect("apply");
+        session.finish().expect("finish");
+        portable
+    }
+
+    use crate::journal::tests::mode_at;
+
+    #[test]
+    fn rm_removes_a_directory_bx_created_and_the_parents_it_invented() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let portable = managed_dir(&state, home.path(), ".a/b", Mode::PRIVATE_DIR);
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+
+        assert!(
+            matches!(restored.as_slice(), [Restored::Removed { .. }]),
+            "{restored:?}"
+        );
+        assert!(!home.child(".a").exists(), "nothing bx made is left");
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+    }
+
+    #[test]
+    fn rm_puts_back_the_mode_of_a_directory_bx_narrowed_and_nothing_else() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir(home.child(".d")).expect("the user's directory");
+        home.write(".d/theirs", "kept\n");
+        fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
+        let portable = managed_dir(&state, home.path(), ".d", Mode::PRIVATE_DIR);
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+
+        assert!(
+            matches!(restored.as_slice(), [Restored::Reverted { .. }]),
+            "{restored:?}"
+        );
+        assert_eq!(mode_at(&home.child(".d")), Some(Mode::DEFAULT_DIR));
+        assert_eq!(
+            std::fs::read(home.child(".d/theirs")).expect("kept"),
+            b"kept\n"
+        );
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+    }
+
+    #[test]
+    fn rm_leaves_a_directory_bx_created_that_now_holds_the_users_files() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let portable = managed_dir(&state, home.path(), ".d", Mode::PRIVATE_DIR);
+        home.write(".d/theirs", "kept\n");
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+
+        assert!(
+            matches!(restored.as_slice(), [Restored::Removed { .. }]),
+            "{restored:?}"
+        );
+        assert_eq!(
+            std::fs::read(home.child(".d/theirs")).expect("kept"),
+            b"kept\n"
+        );
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+    }
+
+    #[test]
+    fn rm_of_a_directory_and_a_file_bx_put_inside_it_removes_both_in_either_order() {
+        for directory_first in [true, false] {
+            let home = guarded_home();
+            let state = StateDir::resolve(home.path());
+            let dir = managed_dir(&state, home.path(), ".d", Mode::PRIVATE_DIR);
+            let file = managed(&state, home.path(), ".d/f", "x\n", Mode::PRIVATE_FILE);
+            let order = if directory_first {
+                vec![dir.clone(), file.clone()]
+            } else {
+                vec![file.clone(), dir.clone()]
+            };
+
+            restore(&state, home.path(), &order).expect("rm");
+
+            assert!(
+                !home.child(".d").exists(),
+                "directory first: {directory_first}"
+            );
+            assert!(
+                LedgerView::read(&state, home.path())
+                    .expect("ledger")
+                    .value
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn rm_of_a_directory_before_the_file_inside_it_in_separate_runs_still_removes_both() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dir = managed_dir(&state, home.path(), ".d", Mode::PRIVATE_DIR);
+        let file = managed(&state, home.path(), ".d/f", "x\n", Mode::PRIVATE_FILE);
+
+        restore(&state, home.path(), std::slice::from_ref(&dir)).expect("rm the directory");
+        assert!(
+            home.child(".d/f").exists(),
+            "the file bx still manages stays"
+        );
+        restore(&state, home.path(), std::slice::from_ref(&file)).expect("rm the file");
+
+        assert!(
+            !home.child(".d").exists(),
+            "the file's entry inherited the directory"
+        );
+    }
+
+    #[test]
+    fn rm_refuses_a_directory_whose_mode_changed_since_bx_set_it_and_forgets_nothing() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let portable = managed_dir(&state, home.path(), ".d", Mode::PRIVATE_DIR);
+        fs::set_mode(&home.child(".d"), Mode::from_bits(0o750)).expect("the user's chmod");
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+
+        let [Restored::Conflict { note, .. }] = restored.as_slice() else {
+            panic!("{restored:?}");
+        };
+        assert!(note.contains("0750") && note.contains("0700"), "{note}");
+        assert!(home.child(".d").is_dir());
+        assert!(entry_for(&state, home.path(), &portable).is_some());
+    }
+
+    #[test]
+    fn rm_of_a_directory_somebody_removed_or_replaced() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let gone = managed_dir(&state, home.path(), ".gone", Mode::PRIVATE_DIR);
+        let file = managed_dir(&state, home.path(), ".file", Mode::PRIVATE_DIR);
+        std::fs::remove_dir(home.child(".gone")).expect("rmdir");
+        std::fs::remove_dir(home.child(".file")).expect("rmdir");
+        home.write(".file", "a file now\n");
+
+        let restored = restore(&state, home.path(), &[gone.clone(), file.clone()]).expect("rm");
+
+        assert!(
+            matches!(
+                restored.as_slice(),
+                [Restored::AlreadyGone { .. }, Restored::Conflict { .. }]
+            ),
+            "{restored:?}"
+        );
+        assert!(!home.child(".gone").exists(), "bx does not make it again");
+        assert!(entry_for(&state, home.path(), &gone).is_none());
+        assert!(entry_for(&state, home.path(), &file).is_some());
+    }
+
+    #[test]
+    fn rm_of_a_directory_back_at_the_mode_it_had_only_forgets_it() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir(home.child(".d")).expect("the user's directory");
+        fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
+        // Narrowed, then the declaration changed back to the mode it had: the
+        // re-record keeps the first prior, which is now the mode on disk.
+        managed_dir(&state, home.path(), ".d", Mode::PRIVATE_DIR);
+        let portable = managed_dir(&state, home.path(), ".d", Mode::DEFAULT_DIR);
+        let entry = entry_for(&state, home.path(), &portable).expect("managed");
+        assert_eq!(
+            plan_restore(&entry, home.path()).expect("plan"),
+            Restoration::Release {
+                dest: home.child(".d")
+            }
+        );
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+
+        assert!(
+            matches!(restored.as_slice(), [Restored::Reverted { .. }]),
+            "{restored:?}"
+        );
+        assert_eq!(mode_at(&home.child(".d")), Some(Mode::DEFAULT_DIR));
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+    }
+
+    #[test]
+    fn an_interrupted_rm_of_a_directory_makes_it_again() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let portable = managed_dir(&state, home.path(), ".d", Mode::PRIVATE_DIR);
+        let entry = entry_for(&state, home.path(), &portable).expect("managed");
+        let Restoration::RemoveDir {
+            dest,
+            created_dirs,
+            planned,
+        } = plan_restore(&entry, home.path()).expect("plan")
+        else {
+            panic!("bx created it");
+        };
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+        session
+            .apply(Request {
+                target: portable.clone(),
+                dest,
+                content: Content::DirAbsent {
+                    created_dirs,
+                    planned: *planned,
+                },
+                mode: entry.mode,
+                ownership: Ownership::Released,
+            })
+            .expect("apply");
+        drop(session);
+        assert!(!home.child(".d").exists());
+
+        assert!(crate::recover::recover(&state).expect("recover").is_clear());
+        assert_eq!(mode_at(&home.child(".d")), Some(Mode::PRIVATE_DIR));
+        assert!(entry_for(&state, home.path(), &portable).is_some());
     }
 
     /// The variable the foreign-prior child finds its directory in.

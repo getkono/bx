@@ -186,6 +186,12 @@ fn init_with(
     for row in &prepared.adopted {
         text.push_str(&adoption_row(row));
     }
+    if prepared.adoption_deferred {
+        text.push_str(
+            "Offered nothing to adopt: an interrupted session must be recovered first, \
+             as the plan shows. Run `bx init` again once it is.\n",
+        );
+    }
     out.write_all(text.as_bytes())
         .map_err(init::Error::Output)?;
     Ok(apply_with(env, yes, out, confirm)?)
@@ -773,6 +779,34 @@ mod tests {
         )
         .expect("init");
         assert_eq!(exit, Exit::Converged);
+    }
+
+    #[test]
+    fn init_says_it_left_adoption_for_later_while_a_session_is_interrupted() {
+        use crate::init::tests::Silent;
+        use crate::journal::{Session, SessionKind};
+
+        let home = guarded_home();
+        seed(home.path(), "");
+        home.write(".zshrc", "z\n");
+        let state = crate::state::StateDir::resolve(home.path());
+        drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+
+        let mut out = Vec::new();
+        init_with(&tty, &[], false, &mut out, &mut Silent, &mut || Ok(true)).expect("init");
+
+        assert!(
+            text(&out).starts_with(
+                "Offered nothing to adopt: an interrupted session must be recovered first, \
+                 as the plan shows. Run `bx init` again once it is.\n"
+            ),
+            "{}",
+            text(&out)
+        );
     }
 
     #[test]

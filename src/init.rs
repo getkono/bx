@@ -20,6 +20,10 @@
 //! 4. **Discovery**, interactive runs only: the tool config already on the
 //!    machine that [`adopt::discover`] finds, offered with nothing selected,
 //!    and each selection adopted through [`adopt::add`] — `bx add` itself.
+//!    Adopting takes the state directory as `bx add` does, which recovers an
+//!    interrupted session, and recovery is `apply`'s to announce (Invariant
+//!    7). So while one stands, nothing is offered or adopted: the plan shows
+//!    the recovery, and the next `init` offers what this one did not.
 //!
 //! Planning and applying are `bx apply`'s, with its approval rule, and are
 //! called by [`crate::command::init`] once this has run. So a second `init` on
@@ -36,6 +40,7 @@ use crate::config::{self, Layer, LayerKind, layers, merge};
 use crate::fs::{self, Mode};
 use crate::paths::{self, Portable};
 use crate::plan::Env;
+use crate::recover;
 use crate::state::{self, ExclusiveLock, StateDir};
 
 /// The `bx.toml` a new config repo starts with.
@@ -118,6 +123,9 @@ pub enum Error {
     /// Adopting a selection failed.
     #[error(transparent)]
     Adopt(#[from] adopt::Error),
+    /// An interrupted session could not be looked for.
+    #[error(transparent)]
+    Recover(#[from] recover::Error),
     /// Planning or applying failed.
     #[error(transparent)]
     Plan(#[from] crate::plan::Error),
@@ -193,6 +201,11 @@ pub struct Prepared {
     pub saved: Option<PathBuf>,
     /// What adopting each selection did, in the order selected.
     pub adopted: Vec<Adoption>,
+    /// Whether discovery, or the rest of the adoptions, was left for the next
+    /// `init` because an interrupted session stands. Adopting takes the
+    /// state directory the way `bx add` does, which recovers that session,
+    /// and recovery is work the plan must announce first.
+    pub adoption_deferred: bool,
 }
 
 /// Everything `init` does before it plans; see the [module documentation](self).
@@ -224,13 +237,24 @@ pub fn prepare(
         created: create_repo(&repo)?.then(|| repo.clone()),
         saved: answers.save(&state)?,
         adopted: Vec::new(),
+        adoption_deferred: false,
     };
 
     if interactive {
+        if recover::pending(&state)?.is_some() {
+            prepared.adoption_deferred = true;
+            return Ok(prepared);
+        }
         let config_home = paths::xdg_base(env.xdg_config_home.as_deref(), home, ".config");
         let offered = adopt::discover(&adopt::Context::load(env)?, &config_home)?;
         if !offered.is_empty() {
             for target in ask.adopt(&offered)? {
+                // Looked for again before each, because the prompt waited on a
+                // person while another bx could have been interrupted.
+                if recover::pending(&state)?.is_some() {
+                    prepared.adoption_deferred = true;
+                    break;
+                }
                 // Reloaded for each, so each adoption sees what the one before
                 // it declared.
                 let ctx = adopt::Context::load(env)?;
@@ -865,6 +889,63 @@ pub(crate) mod tests {
             again.offered,
             [["~/.config/starship.toml", "~/.gitconfig"]],
             "what was adopted is managed now, and is not offered again"
+        );
+    }
+
+    /// Leave the journal a session stands in, as a crash does.
+    fn interrupt(home: &GuardedHome) {
+        use crate::journal::{Session, SessionKind};
+
+        let state = StateDir::resolve(home.path());
+        drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+    }
+
+    /// Picks everything offered, and a session is interrupted while it asks.
+    struct InterruptedWhileAsking<'a>(&'a GuardedHome);
+
+    impl Ask for InterruptedWhileAsking<'_> {
+        fn value(&mut self, decl: &ValueDecl, _: Option<&str>) -> Result<String, Error> {
+            panic!("asked for {}", decl.name)
+        }
+
+        fn adopt(&mut self, offered: &[Portable]) -> Result<Vec<Portable>, Error> {
+            interrupt(self.0);
+            Ok(offered.to_vec())
+        }
+    }
+
+    #[test]
+    fn an_interrupted_session_leaves_discovery_and_adoption_to_a_later_init() {
+        let home = guarded_home();
+        seed(home.path(), "");
+        home.write(".zshrc", "z\n");
+        interrupt(&home);
+        let journal = StateDir::resolve(home.path()).journal();
+
+        let prepared = prepare(&env(home.path()), &[], true, &mut Silent).expect("init");
+
+        assert!(prepared.adoption_deferred && prepared.adopted.is_empty());
+        assert!(journal.exists(), "the session is left for apply to recover");
+
+        let fresh = guarded_home();
+        seed(fresh.path(), "");
+        fresh.write(".zshrc", "z\n");
+        let prepared = prepare(
+            &env(fresh.path()),
+            &[],
+            true,
+            &mut InterruptedWhileAsking(&fresh),
+        )
+        .expect("init");
+        assert!(prepared.adoption_deferred && prepared.adopted.is_empty());
+        assert!(
+            StateDir::resolve(fresh.path()).journal().exists(),
+            "an interruption during the prompt is not recovered by adopting either"
+        );
+        assert!(
+            !std::fs::read_to_string(fresh.child(".config/bx/bx.toml"))
+                .expect("bx.toml")
+                .contains(".zshrc")
         );
     }
 

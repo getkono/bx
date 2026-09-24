@@ -1414,6 +1414,35 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_directory_that_cannot_be_examined_is_an_error_naming_the_link() {
+        // r5 (V1): `tighten`'s `metadata` failure that is not a link to
+        // nowhere was never reached. A link into a directory nobody can
+        // search can itself be examined, and what it names cannot.
+        if rustix::process::geteuid().is_root() {
+            // Mode bits deny nothing to root, so the condition cannot be staged.
+            return;
+        }
+        let home = guarded_home();
+        let sealed = home.child("sealed");
+        std::fs::create_dir_all(sealed.join("state")).expect("sealed");
+        let link = home.child("state");
+        std::os::unix::fs::symlink(sealed.join("state"), &link).expect("symlink");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        let result = tighten(&link, Mode::PRIVATE_DIR);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        let err = result.expect_err("what the link names cannot be examined");
+        assert!(
+            matches!(
+                &err,
+                Error::Read { path, source }
+                    if *path == link
+                        && source.kind() == std::io::ErrorKind::PermissionDenied
+            ),
+            "got {err}",
+        );
+    }
+
+    #[test]
     fn a_linked_local_toml_whose_real_path_cannot_be_resolved_is_an_error_naming_it() {
         // r3 round 2b (P7R4-COV2): resolving a linked `local.toml` to find the
         // directory that holds it failing was never reached. A link the kernel

@@ -22,7 +22,10 @@
 //! wrote and the bytes it displaced — the record `bx rm` restores from and the
 //! one `bx plan` decides against — the fingerprint cache, and the advisory lock
 //! that keeps two mutating `bx` processes from interleaving. [`fs`] holds the
-//! one atomic write every one of those files goes through.
+//! one atomic write every one of those files but the lock goes through. The
+//! lock file's body — a best-effort line naming the holder — is truncated and
+//! written in place through the locked descriptor, because an atomic write
+//! renames a new inode over the name, and the lock is held on the old one.
 //!
 //! # How one repo serves many accounts
 //!

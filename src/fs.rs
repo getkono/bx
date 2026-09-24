@@ -1,6 +1,11 @@
 //! Filesystem primitives: file modes, and the one atomic write in the crate.
 //!
-//! Every byte bx puts on disk goes through [`write_atomically`]. A write that
+//! Every byte bx puts on disk goes through [`write_atomically`], but one: the
+//! advisory lock file's body, a best-effort line naming the holder, which
+//! `state::lock` truncates and writes in place through the descriptor the lock
+//! is held on. Renaming a new file over it would move the name to an inode
+//! nobody holds the lock on, and the body is only ever a diagnostic, so a torn
+//! one costs a vaguer "already running" message and nothing else. A write that
 //! is interrupted — by a crash, a full disk, or a `SIGKILL` — must leave the
 //! previous file exactly as it was, because an additive tool that half-rewrites
 //! a file the user wrote has destroyed something. The sequence is the one

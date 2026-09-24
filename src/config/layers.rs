@@ -26,28 +26,35 @@
 //! `enabled = false`. Making the last layer a full layer is what covers them,
 //! and it is why this file exists rather than a `values.toml` reader.
 //!
-//! # Inside the repo is decided lexically, not on disk
+//! # Inside the repo is decided by spelling, then by identity on disk
 //!
-//! Whether a path is inside the config repo is decided by comparing spellings
-//! after [`paths::normalize`], which reads no filesystem. That is the same rule
-//! every other path comparison in the crate uses, and it is what lets the whole
-//! of layer resolution stay a pure function of its arguments: Invariant 3 asks
-//! for two `plan` runs a week apart to be byte-identical, which a check that
-//! resolved symlinks could not promise, and Invariant 6 keeps I/O off paths
-//! that do not need it.
+//! Whether the state directory is inside the config repo is decided twice, and
+//! either answer refuses it.
 //!
-//! **Its limit, stated rather than discovered.** A symlinked alias of the repo
-//! is a different spelling, so a state directory reached through one is *not*
-//! refused, and `bx` will write a `local.toml` that is inside the repo on disk
-//! — the hole the check exists to close.
-//! `a_state_directory_reached_through_a_symlinked_alias_of_the_repo_is_not_refused`
-//! pins that, so changing it is a deliberate edit to a named test rather than a
-//! quiet change of behaviour. Closing it needs a decision this module does not
-//! take on its own: layer resolution would have to read the filesystem, by
-//! `canonicalize` or by comparing device and inode, and every caller would
-//! inherit the I/O and the failure modes of a path that may not exist yet. The
-//! `local.toml` writer entry A8 adds inherits the same limit, and must not take
-//! this check as proof that the file it writes is outside the repo.
+//! - **By spelling**, after [`paths::normalize`], which reads no filesystem.
+//!   That is the rule every other path comparison in the crate uses, and it
+//!   catches a state directory that does not exist yet and whose repo does not
+//!   either.
+//! - **By identity.** A symlinked alias of the repo is a different spelling of
+//!   the same directory, so spelling alone would accept `alias/state` — inside
+//!   the repo on disk — and `bx` would write a `local.toml` into the
+//!   publishable tree, which is the hole the check exists to close. So the
+//!   deepest part of the state directory that exists, and each directory
+//!   physically above it, is compared with the repo by device and inode. Two
+//!   paths that name one directory are one directory, whatever they are
+//!   written as, and that includes a bind mount of the repo.
+//!
+//! The cost is paid here on purpose: layer resolution reads the filesystem for
+//! this check. It already does — [`super::layer_files`] lists the repo and
+//! `local.toml` is `lstat`ed — so the check adds one `stat` of the repo and one
+//! `stat` per directory from the state directory up to `/`. It reads no link
+//! and resolves no path, and its failures are the ones examining `local.toml`
+//! already had: a path that cannot be examined is an [`Error::Io`] naming it. It is not on the
+//! shell-start path, so Invariant 6 is untouched, and Invariant 3 is unchanged:
+//! the answer depends on the filesystem, as the layer list already did, not on
+//! the time or the order of anything. The `local.toml` writer entry A8 adds may
+//! take a clean answer from [`layer_paths`] as the state directory being
+//! outside the repo at the moment it was checked.
 //!
 //! # Nothing here reads the environment
 //!
@@ -100,11 +107,11 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 /// `XDG_STATE_HOME` equal to `XDG_CONFIG_HOME` makes it the repo — is
 /// [`Error::LocalInRepo`], whether or not a `local.toml` is there yet: loading
 /// it would be the hole above, and skipping it would silently drop the
-/// account's layer. Compared lexically after [`paths::normalize`], like every
-/// other path rule in the crate, so a symlinked alias of the repo is not caught;
-/// see *Inside the repo is decided lexically, not on disk* in the [module
-/// documentation](self) for that rule, its limit, and what closing the limit
-/// would cost.
+/// account's layer. Compared by spelling after [`paths::normalize`] and then by
+/// device and inode, so a state directory reached through a symlinked alias of
+/// the repo is refused too; see *Inside the repo is decided by spelling, then by
+/// identity on disk* in the [module documentation](self) for the rule and what
+/// it costs.
 ///
 /// # Only a clean answer skips the local layer
 ///
@@ -120,7 +127,8 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 ///
 /// Whatever [`super::layer_files`] returns, [`Error::LocalInRepo`] when the
 /// state directory lies inside the repo, and [`Error::Io`] naming `local.toml`
-/// when it cannot be examined.
+/// when it cannot be examined, or naming the repo or a directory on the way to
+/// the state directory when that cannot be examined for the identity check.
 pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut paths: Vec<PathBuf> = super::layer_files(repo)?
         .into_iter()
@@ -128,7 +136,9 @@ pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error>
         .collect();
 
     let local = local_layer_path(state_dir);
-    if paths::normalize(&local).starts_with(paths::normalize(repo)) {
+    if paths::normalize(&local).starts_with(paths::normalize(repo))
+        || inside_on_disk(state_dir, repo)?
+    {
         return Err(Error::LocalInRepo {
             local,
             repo: repo.to_path_buf(),
@@ -139,6 +149,108 @@ pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error>
     }
 
     Ok(paths)
+}
+
+/// Whether `dir` is `repo`, or beneath it, on disk rather than as spelled.
+///
+/// The deepest part of `dir` that exists is found — the rest of it can only be
+/// created beneath that — and it and every directory physically above it, up
+/// to `/`, is compared with `repo` by device and inode. No link is read or
+/// walked: the kernel answers each step, which is what catches a link that
+/// points *into* the repo rather than at it — `link/state` with
+/// `link -> repo/sub` has no lexical ancestor that is the repo, but `link/..`
+/// is the repo.
+///
+/// The first step up is the lexical parent unless the deepest existing part is
+/// itself a symlink. A path's last component that is not a link lives in the
+/// directory its parent spelling resolves to, so that step needs no search
+/// permission on the state directory itself — one at mode 0644 is still
+/// examined, and reported for what it is by [`layer_paths`]. Every later step
+/// is `..`, which the kernel resolves physically.
+///
+/// A repo that does not exist has nothing inside it on disk, and a `dir` none of
+/// whose ancestors exist is not inside anything; both are `false`, and the
+/// lexical check is what refuses them.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming the path that could not be examined.
+fn inside_on_disk(dir: &Path, repo: &Path) -> Result<bool, Error> {
+    let Some(repo_id) = identity(repo)? else {
+        return Ok(false);
+    };
+    let mut existing = paths::normalize(dir);
+    let mut previous = loop {
+        if let Some(id) = identity(&existing)? {
+            break id;
+        }
+        if !existing.pop() {
+            return Ok(false);
+        }
+    };
+    if previous == repo_id {
+        return Ok(true);
+    }
+
+    let is_link = std::fs::symlink_metadata(&existing)
+        .map_err(|source| Error::Io {
+            path: existing.clone(),
+            source,
+        })?
+        .is_symlink();
+    let mut at = if is_link {
+        existing.join("..")
+    } else {
+        match existing.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => return Ok(false),
+        }
+    };
+    loop {
+        let Some(id) = identity(&at)? else {
+            return Ok(false);
+        };
+        if id == repo_id {
+            return Ok(true);
+        }
+        if id == previous {
+            // `/..` is `/`: the walk has reached the root.
+            return Ok(false);
+        }
+        previous = id;
+        at.push("..");
+    }
+}
+
+/// The device and inode `path` names, following symlinks, or `None` when
+/// nothing is there.
+///
+/// `ENOENT` and `ENOTDIR` are absence: a path beneath a regular file names
+/// nothing. Anything else is an error, because an answer of "not the repo"
+/// about a path that could not be examined is the silent pass this check exists
+/// to prevent.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming `path` for anything but a clean answer.
+fn identity(path: &Path) -> Result<Option<(u64, u64)>, Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some((meta.dev(), meta.ino()))),
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(source) => Err(Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Read and parse the whole layer set, **unmerged**, in merge order.
@@ -360,14 +472,14 @@ mod tests {
         );
     }
 
-    /// The limit of the lexical check, pinned. `alias` is the repo under
+    /// The hole the lexical check left, closed. `alias` is the repo under
     /// another spelling, so `alias/state` is inside it on disk but not as
-    /// written, and it is accepted. Resolving symlinks here is a deliberate
-    /// change to this test, not a quiet change of behaviour; the module
-    /// documentation states the rule and this limit under *Inside the repo is
-    /// decided lexically, not on disk*.
+    /// written; it is refused with the message the lexical case produces. This
+    /// test used to assert the opposite; the module documentation states the
+    /// rule under *Inside the repo is decided by spelling, then by identity on
+    /// disk*.
     #[test]
-    fn a_state_directory_reached_through_a_symlinked_alias_of_the_repo_is_not_refused() {
+    fn a_state_directory_reached_through_a_symlinked_alias_of_the_repo_is_refused() {
         let home = guarded_home();
         let (repo, _) = repo_and_state(&home);
         home.write(".config/bx/bx.toml", "");
@@ -379,11 +491,90 @@ mod tests {
             "the fixture must really be one directory under two spellings"
         );
         home.write(".config/bx/state/local.toml", "");
+        let state = alias.join("state");
 
-        let paths = layer_paths(&repo, &alias.join("state"))
-            .expect("not refused: the check compares spellings");
+        match layer_paths(&repo, &state) {
+            Err(err @ Error::LocalInRepo { .. }) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains(&format!("inside the config repo {}", repo.display())),
+                    "{message}"
+                );
+                assert!(
+                    message.starts_with(&state.join(LOCAL_FILE).display().to_string()),
+                    "{message}"
+                );
+            }
+            other => panic!("expected LocalInRepo, got {other:?}"),
+        }
+        load_layer_set(&repo, &state, home.path()).expect_err("nor through the loader");
 
-        assert_eq!(paths.last(), Some(&alias.join("state").join(LOCAL_FILE)));
+        // Refused before anything is there: the first write would land in the
+        // publishable tree however the state directory is spelled.
+        std::fs::remove_file(repo.join("state").join(LOCAL_FILE)).expect("rm");
+        std::fs::remove_dir(repo.join("state")).expect("rmdir");
+        layer_paths(&repo, &state).expect_err("refused with no state directory yet");
+        layer_paths(&repo, &alias).expect_err("the alias itself is the repo");
+        layer_paths(&repo, &alias.join("a/b/../c")).expect_err("however deep, however spelled");
+    }
+
+    /// A link that points *into* the repo, not at it, has no lexical ancestor
+    /// that is the repo; the resolved state directory does.
+    #[test]
+    fn a_state_directory_reached_through_a_link_into_the_repo_is_refused() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        std::fs::create_dir_all(repo.join("modules")).expect("mkdir");
+        let link = home.child("link");
+        std::os::unix::fs::symlink(repo.join("modules"), &link).expect("symlink");
+
+        assert!(matches!(
+            layer_paths(&repo, &link.join("state")),
+            Err(Error::LocalInRepo { .. })
+        ));
+    }
+
+    /// Guards against over-reach on disk: a state directory that is a symlink to
+    /// a directory outside the repo is not inside it, and nor is one beside a
+    /// repo that does not exist yet.
+    #[test]
+    fn a_state_directory_linked_outside_the_repo_is_not_refused() {
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        home.write("elsewhere/local.toml", "");
+        std::fs::create_dir_all(state.parent().expect("a parent")).expect("mkdir");
+        std::os::unix::fs::symlink(home.child("elsewhere"), &state).expect("symlink");
+
+        assert_eq!(
+            layer_paths(&repo, &state).unwrap(),
+            [repo.join("bx.toml"), state.join(LOCAL_FILE)]
+        );
+        assert!(
+            !inside_on_disk(&state, &home.child("absent-repo")).unwrap(),
+            "a repo that does not exist has nothing inside it on disk"
+        );
+        assert!(
+            !inside_on_disk(&home.child("absent/state"), &repo).unwrap(),
+            "and a state directory that does not exist is judged by what does"
+        );
+        assert!(!inside_on_disk(Path::new("/"), &repo).unwrap());
+    }
+
+    /// A state directory that cannot be examined for the identity check is an
+    /// error naming it, not a pass: a symlink loop answers `ELOOP`, and "not
+    /// the repo" about a path nobody could look at is the silent hole.
+    #[test]
+    fn a_state_directory_that_cannot_be_examined_is_an_error_naming_it() {
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        std::fs::create_dir_all(state.parent().expect("a parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&state, &state).expect("a symlink to itself");
+
+        let source = io_error_naming(layer_paths(&repo, &state), &state);
+        assert_ne!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
     }
 
     #[test]

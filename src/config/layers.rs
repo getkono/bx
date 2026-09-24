@@ -56,8 +56,9 @@
 //! this check. It already does — [`super::layer_files`] lists the repo and
 //! `local.toml` is `lstat`ed — so the check adds one `stat` of the repo, one
 //! per component of the state directory's spelling, and one per directory from
-//! the state directory up to `/`. It reads no link and resolves no path, and its failures are the ones examining `local.toml`
-//! already had: a path that cannot be examined is an [`Error::Io`] naming it. It is not on the
+//! the state directory up to `/`. It reads no link and resolves no path, and
+//! its failures are the ones examining `local.toml` already had: a path that
+//! cannot be examined is an [`Error::Io`] naming it. It is not on the
 //! shell-start path, so Invariant 6 is untouched, and Invariant 3 is unchanged:
 //! the answer depends on the filesystem, as the layer list already did, not on
 //! the time or the order of anything. The `local.toml` writer entry A8 adds may
@@ -174,10 +175,9 @@ pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error>
 /// The first step up is the lexical parent unless the deepest existing part is
 /// itself a symlink or ends in `..`. A path's last component that is not a
 /// link lives in the directory its parent spelling resolves to, so that step
-/// needs no search
-/// permission on the state directory itself — one at mode 0644 is still
-/// examined, and reported for what it is by [`layer_paths`]. Every later step
-/// is `..`, which the kernel resolves physically.
+/// needs no search permission on the state directory itself — one at mode
+/// 0644 is still examined, and reported for what it is by [`layer_paths`].
+/// Every later step is `..`, which the kernel resolves physically.
 ///
 /// A repo that does not exist has nothing inside it on disk, and a `dir` none of
 /// whose ancestors exist is not inside anything; both are `false`, and the

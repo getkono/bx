@@ -222,7 +222,7 @@ pub fn prepare(
 
     let mut prepared = Prepared {
         created: create_repo(&repo)?.then(|| repo.clone()),
-        saved: answers.save(&repo, &state)?,
+        saved: answers.save(&state)?,
         adopted: Vec::new(),
     };
 
@@ -285,6 +285,9 @@ struct Answers {
     doc: DocumentMut,
     /// The file's text when `init` read it; `None` when there was none.
     original: Option<String>,
+    /// Every answer set on `doc`, in the order it was set, so [`Self::save`]
+    /// can set them again on the file as it stands when the lock is held.
+    given: Vec<(String, String)>,
 }
 
 impl Answers {
@@ -300,25 +303,23 @@ impl Answers {
             Err(other) => return Err(other.into()),
         };
         let path = state.local_toml();
-        let original = match std::fs::read_to_string(&path) {
-            Ok(text) => Some(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => return Err(Error::ReadLocal { path, source }),
-        };
-        let doc = match &original {
-            Some(text) => text.parse::<DocumentMut>().map_err(|e| Error::Local {
-                path: path.clone(),
-                why: e.to_string(),
-            })?,
-            None => local::empty(),
-        };
+        let original = read_local(&path)?;
+        let doc = parse_local(&path, original.as_deref())?;
         Ok(Self {
             home: home.to_path_buf(),
             globals,
             path,
             doc,
             original,
+            given: Vec::new(),
         })
+    }
+
+    /// Set `answer` for `name` on the document, and remember it for
+    /// [`Self::save`].
+    fn give(&mut self, name: &str, answer: &str) {
+        local::set(&mut self.doc, name, answer);
+        self.given.push((name.to_string(), answer.to_string()));
     }
 
     /// The declared values, resolved against the answers as they stand now.
@@ -363,7 +364,7 @@ impl Answers {
                     name: name.clone(),
                     source,
                 })?;
-            local::set(&mut self.doc, &name, &answer);
+            self.give(&name, &answer);
         }
         Ok(())
     }
@@ -399,28 +400,65 @@ impl Answers {
                     Err(refused) => problem = Some(refused.to_string()),
                 }
             };
-            local::set(&mut self.doc, &decl.name, &answer);
+            self.give(&decl.name, &answer);
         }
     }
 
     /// Write `local.toml` at `0600` when an answer changed it, reporting where.
     ///
-    /// Refused when the state directory lies inside the repo, by the loader's
-    /// own rule: an answer written there could be committed.
-    fn save(&self, repo: &Path, state: &StateDir) -> Result<Option<PathBuf>, Error> {
-        let text = self.doc.to_string();
+    /// The answers are set again on the file as it stands once the lock is
+    /// held, not on the copy read before the prompts, so an edit made while
+    /// `init` was asking — by hand, or by another `bx init` — survives, and
+    /// only the names answered here change.
+    ///
+    /// A state directory inside the repo never reaches this: [`Self::load`]
+    /// runs the loader's own [`layers::layer_paths`], which refuses it, and
+    /// no answer can be given without the repo that load reads.
+    fn save(&self, state: &StateDir) -> Result<Option<PathBuf>, Error> {
         let unchanged = match &self.original {
-            Some(original) => *original == text,
-            None => text == local::empty().to_string(),
+            Some(original) => *original == self.doc.to_string(),
+            None => self.doc.to_string() == local::empty().to_string(),
         };
         if unchanged {
             return Ok(None);
         }
-        layers::layer_paths(repo, state.root())?;
         state.ensure()?;
         let _lock = ExclusiveLock::acquire(state)?;
+        let current = read_local(&self.path)?;
+        let mut doc = parse_local(&self.path, current.as_deref())?;
+        for (name, answer) in &self.given {
+            local::set(&mut doc, name, answer);
+        }
+        let text = doc.to_string();
+        if current.as_deref() == Some(text.as_str()) {
+            return Ok(None);
+        }
         fs::write_atomically(&self.path, text.as_bytes(), Mode::PRIVATE_FILE)?;
         Ok(Some(self.path.clone()))
+    }
+}
+
+/// `local.toml`'s text, or `None` when there is none.
+fn read_local(path: &Path) -> Result<Option<String>, Error> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::ReadLocal {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// `local.toml`'s text as a document to edit; [`local::empty`] when there is
+/// none.
+fn parse_local(path: &Path, text: Option<&str>) -> Result<DocumentMut, Error> {
+    match text {
+        Some(text) => text.parse::<DocumentMut>().map_err(|e| Error::Local {
+            path: path.to_path_buf(),
+            why: e.to_string(),
+        }),
+        None => Ok(local::empty()),
     }
 }
 
@@ -631,6 +669,86 @@ pub(crate) mod tests {
              cache = \"{{root}}/c\"\nemail = \"a@b.invalid\"\n"
         );
         assert_eq!(mode_of(&local(&home)), 0o600, "written at 0600");
+    }
+
+    /// Answers `root` and `email`, and edits `local.toml` while asking, as a
+    /// person in another terminal, or another `bx init`, would.
+    struct EditsWhileAsking {
+        local: PathBuf,
+    }
+
+    impl Ask for EditsWhileAsking {
+        fn value(&mut self, decl: &ValueDecl, _: Option<&str>) -> Result<String, Error> {
+            std::fs::write(
+                &self.local,
+                "# theirs\n[values]\nnote = \"theirs\"\nemail = \"old@b.invalid\"\n",
+            )
+            .expect("edit local.toml");
+            Ok(match decl.name.as_str() {
+                "root" => "~/s",
+                _ => "a@b.invalid",
+            }
+            .to_string())
+        }
+
+        fn adopt(&mut self, offered: &[Portable]) -> Result<Vec<Portable>, Error> {
+            panic!("offered {offered:?}")
+        }
+    }
+
+    #[test]
+    fn an_edit_to_local_toml_during_the_prompts_survives_the_save() {
+        let home = guarded_home();
+        seed(home.path(), VALUES);
+        home.write(".local/state/bx/local.toml", "# mine\n");
+        let mut ask = EditsWhileAsking {
+            local: local(&home),
+        };
+
+        let prepared = prepare(&env(home.path()), &[], true, &mut ask).expect("init");
+
+        assert_eq!(prepared.saved.as_deref(), Some(local(&home).as_path()));
+        assert_eq!(
+            std::fs::read_to_string(local(&home)).expect("local.toml"),
+            "# theirs\n[values]\nnote = \"theirs\"\nemail = \"a@b.invalid\"\nroot = \"~/s\"\n",
+            "the edit is kept, and only the names answered here change"
+        );
+        assert_eq!(mode_of(&local(&home)), 0o600);
+    }
+
+    #[test]
+    fn a_save_that_finds_its_answers_already_written_writes_nothing() {
+        let home = guarded_home();
+        seed(home.path(), VALUES);
+        let state = StateDir::resolve(home.path());
+        let mut answers =
+            Answers::load(&home.child(".config/bx"), &state, home.path()).expect("load");
+        answers.give("root", "~/s");
+        home.write(".local/state/bx/local.toml", "[values]\nroot = \"~/s\"\n");
+        std::fs::set_permissions(local(&home), std::fs::Permissions::from_mode(0o644))
+            .expect("chmod");
+
+        assert!(answers.save(&state).expect("save").is_none());
+        assert_eq!(mode_of(&local(&home)), 0o644, "not rewritten");
+    }
+
+    #[test]
+    fn a_state_directory_inside_the_repo_is_refused_before_anything_is_asked_or_written() {
+        let home = guarded_home();
+        seed(home.path(), VALUES);
+        let inside = Env {
+            xdg_state_home: Some(home.child(".config/bx/state").into_os_string()),
+            ..env(home.path())
+        };
+
+        let error =
+            prepare(&inside, &["root=~/s".to_string()], true, &mut Silent).expect_err("refused");
+
+        assert!(
+            matches!(error, Error::Config(config::Error::LocalInRepo { .. })),
+            "{error:?}"
+        );
+        assert!(!home.child(".config/bx/state").exists(), "nothing written");
     }
 
     #[test]

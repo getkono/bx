@@ -461,6 +461,7 @@ const fn attached_as(mechanism: &Mechanism) -> &'static str {
         Mechanism::Own => "the whole file",
         Mechanism::Region { .. } => "a managed region",
         Mechanism::Include { .. } => "an include line",
+        Mechanism::Dir => "a directory",
     }
 }
 
@@ -631,7 +632,7 @@ mod tests {
                 assert_eq!(bytes, b"x\n");
                 assert_eq!(planned.kind, Kind::Absent);
             }
-            Content::Absent { .. } => panic!("a create is bytes"),
+            _ => panic!("a create is bytes"),
         }
 
         let (change, op) =

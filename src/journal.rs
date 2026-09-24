@@ -430,6 +430,18 @@ pub struct Intent {
     /// because re-recording the first hands the ledger bx's own earlier output
     /// as if a third party had written it. See [`crate::recover`].
     pub ledger_written: Option<ContentHash>,
+    /// Whether the destination is a directory rather than a file.
+    ///
+    /// A directory has no bytes, so its two states are told apart by mode
+    /// alone: [`Intent::before`] and [`Intent::after`] name it with the digest
+    /// of [`DIR_BYTES`], and recovery compares a directory found there by its
+    /// mode. A directory intent has no temporary file, and its
+    /// [`Intent::created_dirs`] are the parents it invented, never the
+    /// directory itself: [`Intent::creates`] says whether that was invented
+    /// too. `false` for every intent a journal written before directory
+    /// targets holds.
+    #[serde(default)]
+    pub dir: bool,
 }
 
 impl Intent {
@@ -438,6 +450,34 @@ impl Intent {
     pub const fn creates(&self) -> bool {
         matches!(self.before, Prior::Absent)
     }
+}
+
+/// The bytes a directory stands for in a record: none.
+///
+/// A directory target's ledger entry and journal intents name it by the digest
+/// of these bytes and by its mode, so the shapes that describe a file describe
+/// a directory without a second vocabulary. The [`Mechanism`] or
+/// [`Intent::dir`] beside them says which is meant.
+pub const DIR_BYTES: &[u8] = b"";
+
+/// The digest a directory is recorded under: that of [`DIR_BYTES`].
+#[must_use]
+pub fn dir_digest() -> ContentHash {
+    ContentHash::of(DIR_BYTES)
+}
+
+/// A directory's earlier state at `mode`, in the shape a [`Prior`] takes.
+///
+/// No blob is stored for it: a directory's rollback is a `chmod` or a
+/// `mkdir`, which reads no bytes. [`crate::state::Ledger::record`] stores the
+/// empty blob itself when the ledger adopts this as an entry's prior.
+#[must_use]
+pub fn dir_prior(mode: Mode) -> Prior {
+    Prior::Existed(RestoreRef {
+        digest: dir_digest(),
+        mode,
+        len: 0,
+    })
 }
 
 /// A write that was published.
@@ -822,6 +862,9 @@ fn misplaced(intent: &Intent, home: &Path) -> Option<&'static str> {
         return Some("an intent's destination is not where its target renders");
     }
     if let Some(temp) = &intent.temp {
+        if intent.dir {
+            return Some("a directory intent names a temporary file");
+        }
         let staged = temp != dest
             && temp.parent() == dest.parent()
             && temp
@@ -851,6 +894,28 @@ fn misplaced(intent: &Intent, home: &Path) -> Option<&'static str> {
 fn stray_created_dir<'a>(dest: &Path, home: &Path, dirs: &'a [PathBuf]) -> Option<&'a PathBuf> {
     dirs.iter()
         .find(|dir| *dir == dest || !dest.starts_with(dir) || home.starts_with(dir))
+}
+
+/// The parents of `dest` that are not there, deepest first, strictly below
+/// `home`, less any `created` declares for a directory target of its own.
+///
+/// What [`crate::fs::ensure_dir`] will invent on the way to `dest`, read the
+/// way it reads it, and what a directory intent names before it is made. A
+/// declared parent is its own target's to claim, exactly as
+/// [`crate::fs::CreatedDirs`] leaves it out of every other claim.
+fn missing_parents(dest: &Path, home: &Path, created: &fs::CreatedDirs) -> Vec<PathBuf> {
+    dest.ancestors()
+        .skip(1)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .take_while(|dir| {
+            matches!(
+                std::fs::symlink_metadata(dir),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+        .filter(|dir| !home.starts_with(dir) && created.declared(dir).is_none())
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 /// Why there is no whole record at an offset.
@@ -1210,6 +1275,37 @@ pub enum Content {
         /// the session with nothing unlinked.
         planned: fs::Observed,
     },
+    /// A directory at [`Request::mode`]: created where plan saw nothing, or
+    /// set to that mode where plan saw a directory at another.
+    ///
+    /// Made through [`crate::fs::ensure_dir`] with the session's one set of
+    /// created directories, after the Intent naming it is durable. The
+    /// directory is checked against `planned` before anything is announced —
+    /// the check `ensure_dir` makes again before it acts — so a directory that
+    /// changed since plan poisons the session with nothing announced. Only the
+    /// directory itself is made or changed, never what it holds.
+    Dir {
+        /// What plan observed at the destination when it compared the
+        /// directory with it, from [`crate::fs::observe`].
+        planned: fs::Observed,
+    },
+    /// No directory any more: the one bx created for a directory target.
+    ///
+    /// The directory and `created_dirs` are removed where they are empty and
+    /// no entry the ledger still holds names them, and the target is dropped
+    /// from the ledger. A directory something else still holds is left where
+    /// it is, tried again when the session finishes, and handed to a surviving
+    /// entry beneath it if it still stands — the rule a removed file's claimed
+    /// directories follow. bx never removes what is inside a directory.
+    DirAbsent {
+        /// Directories bx created on the way to the directory, deepest first.
+        created_dirs: Vec<PathBuf>,
+        /// What plan observed at the destination when it decided on the
+        /// removal. A directory whose path, kind or stamp is no longer this is
+        /// refused with [`crate::fs::Error::Changed`], before anything is
+        /// announced and again immediately before the removal.
+        planned: fs::Observed,
+    },
 }
 
 /// Whether bx owns what the write leaves behind.
@@ -1371,8 +1467,10 @@ impl Session {
             ownership,
         } = request;
         let claimed: &[PathBuf] = match &content {
-            Content::Bytes { .. } => &[],
-            Content::Absent { created_dirs, .. } => created_dirs,
+            Content::Bytes { .. } | Content::Dir { .. } => &[],
+            Content::Absent { created_dirs, .. } | Content::DirAbsent { created_dirs, .. } => {
+                created_dirs
+            }
         };
         if let Err(e) = self.admit(&target, &dest, claimed) {
             self.poisoned = true;
@@ -1387,6 +1485,11 @@ impl Session {
                 created_dirs,
                 planned,
             } => self.remove(index, target, dest, created_dirs, &planned),
+            Content::Dir { planned } => self.write_dir(target, dest, &planned, mode, &ownership),
+            Content::DirAbsent {
+                created_dirs,
+                planned,
+            } => self.remove_dir(index, target, dest, created_dirs, &planned),
         };
         if let Err(e) = applied {
             self.poisoned = true;
@@ -1519,6 +1622,7 @@ impl Session {
             created_dirs,
             mechanism,
             ledger_written,
+            dir: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -1587,6 +1691,7 @@ impl Session {
             created_dirs: created_dirs.clone(),
             mechanism: None,
             ledger_written: self.ledger.get(&target).map(|entry| entry.written),
+            dir: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -1607,6 +1712,193 @@ impl Session {
         self.journal.append(&Record::Done(Done { target }))?;
         self.crash.reached(index, Phase::AfterDone);
         Ok(())
+    }
+
+    /// The directory path: check, record, journal, make, done.
+    ///
+    /// Checked against `planned` before anything is recorded or announced, by
+    /// the verdict [`crate::fs::compare_dir`] reaches from it and from a fresh
+    /// look — the comparison [`crate::fs::ensure_dir`] makes again before it
+    /// acts. A directory an earlier write in this session made where plan saw
+    /// nothing is still the create plan announced, as `ensure_dir` treats it.
+    ///
+    /// The Intent names the parents the create will invent, read from disk as
+    /// `ensure_dir` reads them, less a directory another directory target
+    /// declares. The ledger records the ones `ensure_dir` reports it made.
+    fn write_dir(
+        &mut self,
+        target: Portable,
+        dest: PathBuf,
+        planned: &Observed,
+        mode: Mode,
+        ownership: &Ownership,
+    ) -> Result<(), Error> {
+        let index = self.written;
+        let announced = fs::compare_dir(planned, mode);
+        if !matches!(
+            announced.action,
+            crate::report::Action::Create | crate::report::Action::Modify
+        ) {
+            return Err(fs::Error::Changed {
+                path: dest,
+                detail: "plan announced nothing for bx to make here".to_string(),
+            }
+            .into());
+        }
+        let fresh = fs::observe(&dest)?;
+        let made_here = planned.kind == fs::Kind::Absent
+            && fresh.kind == fs::Kind::Dir
+            && self.created.contains(&dest);
+        if !made_here && fs::compare_dir(&fresh, mode) != announced {
+            return Err(fs::Error::Changed {
+                path: dest,
+                detail: "it is no longer what plan compared".to_string(),
+            }
+            .into());
+        }
+
+        let found = planned.mode.filter(|_| planned.kind == fs::Kind::Dir);
+        let before = found.map_or(Prior::Absent, dir_prior);
+        let invented = if found.is_none() && !made_here {
+            missing_parents(&dest, &self.home, &self.created)
+        } else {
+            Vec::new()
+        };
+        let (entry, mechanism) = match ownership {
+            Ownership::Owned(mechanism) => {
+                let prior = found.map_or(PriorBytes::Absent, |mode| PriorBytes::Bytes {
+                    bytes: DIR_BYTES.to_vec(),
+                    mode,
+                });
+                (
+                    Some(
+                        NewEntry::new(target.clone(), dir_digest(), mode, mechanism.clone())
+                            .with_prior(prior),
+                    ),
+                    Some(mechanism.clone()),
+                )
+            }
+            Ownership::Released => (None, None),
+        };
+        // As in `write`: the ledger's refusal is asked before anything is
+        // announced or made.
+        if let Some(entry) = &entry {
+            self.ledger.check_record(entry)?;
+        }
+
+        let ledger_written = self.ledger.get(&target).map(|entry| entry.written);
+        self.journal.append(&Record::Intent(Intent {
+            target: target.clone(),
+            dest: dest.clone(),
+            temp: None,
+            before,
+            after: Written::Present {
+                digest: dir_digest(),
+                mode,
+            },
+            created_dirs: invented,
+            mechanism,
+            ledger_written,
+            dir: true,
+        }))?;
+        self.crash.reached(index, Phase::AfterIntent);
+
+        let ensured = fs::ensure_dir(&dest, mode, planned, &mut self.created)?;
+        match entry {
+            Some(entry) => {
+                let claimed = ensured
+                    .created_dirs
+                    .iter()
+                    .filter(|dir| **dir != dest)
+                    .map(|dir| {
+                        Portable::from_path(dir, &self.home).map_err(|source| {
+                            fs::Error::NotPortable {
+                                path: dir.clone(),
+                                source,
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.ledger.record(entry.with_created_dirs(claimed))?;
+            }
+            None => {
+                self.ledger.forget(&target);
+            }
+        }
+        self.crash.reached(index, Phase::AfterPublish);
+
+        self.journal.append(&Record::Done(Done { target }))?;
+        self.crash.reached(index, Phase::AfterDone);
+        Ok(())
+    }
+
+    /// The directory removal path: check, journal, check again, remove where
+    /// empty, done.
+    ///
+    /// Checked against `planned` twice, as [`Session::remove`] checks a file.
+    /// The directory and the parents it claims are released rather than
+    /// forced: each goes where it is empty and no surviving entry names it,
+    /// and [`Session::finish`] tries again and hands what still stands to an
+    /// entry beneath it.
+    fn remove_dir(
+        &mut self,
+        index: usize,
+        target: Portable,
+        dest: PathBuf,
+        created_dirs: Vec<PathBuf>,
+        planned: &Observed,
+    ) -> Result<(), Error> {
+        let observed = fs::observe(&dest)?;
+        refuse_moved(planned, &observed)?;
+        let Some(mode) = observed.mode.filter(|_| observed.kind == fs::Kind::Dir) else {
+            return Err(fs::Error::Changed {
+                path: dest,
+                detail: "plan saw no directory here".to_string(),
+            }
+            .into());
+        };
+
+        self.journal.append(&Record::Intent(Intent {
+            target: target.clone(),
+            dest: dest.clone(),
+            temp: None,
+            before: dir_prior(mode),
+            after: Written::Absent,
+            created_dirs: created_dirs.clone(),
+            mechanism: None,
+            ledger_written: self.ledger.get(&target).map(|entry| entry.written),
+            dir: true,
+        }))?;
+        self.crash.reached(index, Phase::AfterIntent);
+
+        #[cfg(test)]
+        if let Some(meddle) = self.before_unlink {
+            meddle(&dest);
+        }
+        refuse_moved(planned, &fs::observe(&dest)?)?;
+        // The entry goes first here: `prune_claims` never removes a directory
+        // an entry still names, and this one names the directory itself.
+        self.ledger.forget(&target);
+        let mut claims = Vec::with_capacity(created_dirs.len() + 1);
+        claims.push(dest);
+        claims.extend(created_dirs);
+        prune_claims(&self.ledger, &self.home, &claims)?;
+        self.released.extend(claims);
+        self.crash.reached(index, Phase::AfterPublish);
+
+        self.journal.append(&Record::Done(Done { target }))?;
+        self.crash.reached(index, Phase::AfterDone);
+        Ok(())
+    }
+
+    /// Declare that a directory target in this session wants `path` at `mode`.
+    ///
+    /// Call it for every directory target the session will make, before the
+    /// first [`Session::apply`]: see [`crate::fs::CreatedDirs::declare`]. A
+    /// file staged beneath a declared directory that is still wider than
+    /// declared is then refused rather than published into it.
+    pub fn declare_dir(&mut self, path: &Path, mode: Mode) {
+        self.created.declare(path, mode);
     }
 
     /// Prune the union of the directories released targets claimed, and hand
@@ -3107,6 +3399,7 @@ pub(crate) mod tests {
                     created_dirs: Vec::new(),
                     mechanism: Some(Mechanism::Own),
                     ledger_written: None,
+                    dir: false,
                 }),
             ],
         );
@@ -3230,6 +3523,7 @@ pub(crate) mod tests {
             created_dirs: Vec::new(),
             mechanism: None,
             ledger_written: None,
+            dir: false,
         };
         let once = vec![
             Record::Begin(Begin {
@@ -4504,6 +4798,7 @@ pub(crate) mod tests {
             created_dirs: Vec::new(),
             mechanism: Some(Mechanism::Own),
             ledger_written: None,
+            dir: false,
         })
     }
 
@@ -4850,5 +5145,294 @@ pub(crate) mod tests {
         }
         assert_eq!(session.written(), 3);
         assert_eq!(session.finish().expect("finish"), 3);
+    }
+
+    /// A directory request for `rel` under `home` at `mode`, carrying what is
+    /// there now as plan's observation.
+    pub(crate) fn dir_to(home: &Path, rel: &str, mode: Mode) -> Request {
+        let (target, dest) = target(home, rel);
+        let planned = fs::observe(&dest).expect("plan's observation");
+        Request {
+            target,
+            dest,
+            content: Content::Dir { planned },
+            mode,
+            ownership: Ownership::Owned(Mechanism::Dir),
+        }
+    }
+
+    /// The mode of whatever is at `path`, or `None` when nothing is.
+    pub(crate) fn mode_at(path: &Path) -> Option<Mode> {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| Mode::from_bits(meta.permissions().mode()))
+    }
+
+    /// Apply `requests` in one session and finish it.
+    fn applied(state: &StateDir, home: &Path, requests: Vec<Request>) {
+        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
+        for request in requests {
+            session.apply(request).expect("apply");
+        }
+        session.finish().expect("finish");
+    }
+
+    #[test]
+    fn a_directory_request_creates_the_directory_and_records_the_parents_it_invented() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+
+        applied(
+            &state,
+            home.path(),
+            vec![dir_to(home.path(), ".a/b", Mode::PRIVATE_DIR)],
+        );
+
+        assert_eq!(mode_at(&home.child(".a/b")), Some(Mode::PRIVATE_DIR));
+        assert_eq!(mode_at(&home.child(".a")), Some(Mode::DEFAULT_DIR));
+        let ledger = LedgerView::read(&state, home.path()).expect("ledger").value;
+        let entry = ledger
+            .get(&target(home.path(), ".a/b").0)
+            .expect("the directory is recorded");
+        assert_eq!(entry.mechanism, Mechanism::Dir);
+        assert_eq!(entry.written, dir_digest());
+        assert_eq!(entry.mode, Mode::PRIVATE_DIR);
+        assert_eq!(entry.prior, Prior::Absent);
+        assert_eq!(
+            entry
+                .created_dirs
+                .iter()
+                .map(Portable::as_str)
+                .collect::<Vec<_>>(),
+            ["~/.a"],
+            "the parent it invented, and never the directory itself",
+        );
+    }
+
+    #[test]
+    fn a_directory_request_narrows_an_existing_directory_and_records_the_mode_it_had() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir(home.child(".d")).expect("the user's directory");
+        home.write(".d/theirs", "kept\n");
+        fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
+
+        applied(
+            &state,
+            home.path(),
+            vec![dir_to(home.path(), ".d", Mode::PRIVATE_DIR)],
+        );
+
+        assert_eq!(mode_at(&home.child(".d")), Some(Mode::PRIVATE_DIR));
+        assert_eq!(
+            std::fs::read(home.child(".d/theirs")).expect("untouched"),
+            b"kept\n"
+        );
+        let ledger = LedgerView::read(&state, home.path()).expect("ledger").value;
+        let entry = ledger.get(&target(home.path(), ".d").0).expect("recorded");
+        assert_eq!(entry.prior, dir_prior(Mode::DEFAULT_DIR));
+        assert!(entry.created_dirs.is_empty());
+        // The prior's blob is the empty one, so every reference the ledger
+        // holds still names bytes on disk.
+        let Prior::Existed(reference) = &entry.prior else {
+            panic!("a prior mode");
+        };
+        assert_eq!(
+            ledger
+                .restore_bytes(&state, reference)
+                .expect("the empty blob"),
+            DIR_BYTES
+        );
+    }
+
+    #[test]
+    fn a_directory_changed_since_plan_poisons_the_session_with_nothing_announced() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir(home.child(".d")).expect("the directory");
+        fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
+        let request = dir_to(home.path(), ".d", Mode::PRIVATE_DIR);
+        fs::set_mode(&home.child(".d"), Mode::from_bits(0o711)).expect("chmod after plan");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let err = session.apply(request).expect_err("the directory moved");
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Changed { .. })),
+            "{err}"
+        );
+        assert_eq!(mode_at(&home.child(".d")), Some(Mode::from_bits(0o711)));
+        let journal = session.journal().to_path_buf();
+        drop(session);
+        assert_eq!(load(&journal).expect("load").intents().count(), 0);
+    }
+
+    #[test]
+    fn a_directory_request_plan_saw_as_unchanged_is_refused() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir(home.child(".d")).expect("the directory");
+        fs::set_mode(&home.child(".d"), Mode::PRIVATE_DIR).expect("chmod");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let err = session
+            .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
+            .expect_err("nothing was announced");
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Changed { detail, .. })
+                if detail.contains("announced nothing")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_directory_create_is_rolled_back_with_the_parents_it_invented() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(dir_to(home.path(), ".a/b", Mode::PRIVATE_DIR))
+            .expect("apply");
+        drop(session);
+
+        assert_eq!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::RolledBack { undone: 1 }
+        );
+        assert!(!home.child(".a").exists(), "nothing bx made is left");
+        assert!(
+            LedgerView::read(&state, home.path())
+                .expect("ledger")
+                .value
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_interrupted_directory_create_leaves_a_directory_that_now_holds_something() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
+            .expect("apply");
+        drop(session);
+        home.write(".d/theirs", "kept\n");
+
+        assert!(crate::recover::recover(&state).expect("recover").is_clear());
+        assert_eq!(
+            std::fs::read(home.child(".d/theirs")).expect("kept"),
+            b"kept\n"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_directory_mode_change_is_set_back() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir(home.child(".d")).expect("the directory");
+        fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
+            .expect("apply");
+        drop(session);
+
+        let interrupted = crate::recover::pending(&state)
+            .expect("pending")
+            .expect("a journal stands");
+        assert_eq!(
+            interrupted.unfinished[0].standing,
+            crate::recover::Standing::Written
+        );
+        assert_eq!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::RolledBack { undone: 1 }
+        );
+        assert_eq!(mode_at(&home.child(".d")), Some(Mode::DEFAULT_DIR));
+    }
+
+    #[test]
+    fn a_file_where_a_directory_was_written_blocks_its_rollback() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
+            .expect("apply");
+        drop(session);
+        std::fs::remove_dir(home.child(".d")).expect("rmdir");
+        home.write(".d", "a file now\n");
+
+        let outcome = crate::recover::recover(&state).expect("recover");
+        let crate::recover::Outcome::Blocked { conflicts } = outcome else {
+            panic!("a file is neither state: {outcome:?}");
+        };
+        assert_eq!(conflicts[0].standing, crate::recover::Standing::Foreign);
+    }
+
+    #[test]
+    fn a_terminated_directory_session_is_recorded_with_the_mode_it_displaced() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir(home.child(".d")).expect("the directory");
+        fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
+            .expect("apply");
+        let journal = session.journal().to_path_buf();
+        drop(session);
+        seal(&journal, 1);
+
+        assert_eq!(
+            crate::recover::recover(&state).expect("recover"),
+            crate::recover::Outcome::Recorded { entries: 1 }
+        );
+        let ledger = LedgerView::read(&state, home.path()).expect("ledger").value;
+        let entry = ledger.get(&target(home.path(), ".d").0).expect("recorded");
+        assert_eq!(entry.mechanism, Mechanism::Dir);
+        assert_eq!(entry.prior, dir_prior(Mode::DEFAULT_DIR));
+        assert_eq!(mode_at(&home.child(".d")), Some(Mode::PRIVATE_DIR));
+    }
+
+    #[test]
+    fn a_journal_whose_directory_intent_names_a_temporary_file_is_unreadable() {
+        let home = guarded_home();
+        let (target, dest) = target(home.path(), ".d");
+        let intent = Intent {
+            target: target.clone(),
+            dest: dest.clone(),
+            temp: Some(home.child(format!("{}x", fs::TEMP_PREFIX))),
+            before: Prior::Absent,
+            after: Written::Present {
+                digest: dir_digest(),
+                mode: Mode::PRIVATE_DIR,
+            },
+            created_dirs: Vec::new(),
+            mechanism: Some(Mechanism::Dir),
+            ledger_written: None,
+            dir: true,
+        };
+        assert_eq!(
+            misplaced(&intent, home.path()),
+            Some("a directory intent names a temporary file")
+        );
+        assert_eq!(
+            misplaced(
+                &Intent {
+                    temp: None,
+                    ..intent
+                },
+                home.path()
+            ),
+            None
+        );
     }
 }

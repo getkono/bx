@@ -85,6 +85,14 @@ impl<'de> Deserialize<'de> for Fingerprint {
 }
 
 /// Accepts any run of bytes: a fingerprint's length is its writer's business.
+///
+/// No `visit_byte_buf` override. rmp-serde hands this visitor a borrowed slice
+/// whether it decodes from a slice or from a stream, so the override was
+/// reachable through no decode path in the crate and pinnable by no test: a
+/// mutant returning an empty fingerprint from it survived the whole suite
+/// (r4 round 1, COV5). Serde's default forwards to
+/// [`Visitor::visit_bytes`] and behaves identically if a decoder ever does
+/// hand over an owned buffer.
 struct FingerprintVisitor;
 
 impl Visitor<'_> for FingerprintVisitor {
@@ -96,10 +104,6 @@ impl Visitor<'_> for FingerprintVisitor {
 
     fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
         Ok(Fingerprint(value.to_vec()))
-    }
-
-    fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
-        Ok(Fingerprint(value))
     }
 }
 
@@ -237,6 +241,44 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_written_before_entries_existed_still_loads() {
+        // r4 round 1 (COV5): `#[serde(default)]` on `entries` was pinned by no
+        // test — nothing decoded an envelope whose payload map lacks the field
+        // — so removing the attribute would turn such a file from
+        // `Health::Loaded` into `Health::Reset(Malformed)` with the suite
+        // still green, defeating the forward-compatibility argument that
+        // justifies the named encoding in `store::save`.
+        // `Deserialize` too, because `store::save` decodes its own bytes and
+        // re-encodes them to establish the payload iterates deterministically.
+        #[derive(Serialize, Deserialize)]
+        struct NoEntries {}
+
+        let home = guarded_home();
+        let dir = StateDir::resolve(home.path());
+        dir.ensure().expect("ensure");
+        store::save(&dir.fingerprints(), KIND, VERSION, &NoEntries {}).expect("an older bx");
+
+        let loaded = Fingerprints::read(&dir).expect("read");
+        assert_eq!(loaded.health, crate::state::Health::Loaded, "not damage");
+        assert!(loaded.value.is_empty());
+    }
+
+    #[test]
+    fn a_fingerprint_decodes_from_a_stream_as_well_as_a_slice() {
+        // r4 round 1 (COV5): the crate decodes only from slices, so nothing
+        // pinned what a stream does. It reaches `visit_bytes` too, which is
+        // why the `visit_byte_buf` override this visitor used to carry was
+        // unreachable and has gone.
+        let encoded = rmp_serde::to_vec_named(&Fingerprint::raw(vec![1, 2, 3])).expect("encode");
+        assert_eq!(
+            rmp_serde::from_read::<_, Fingerprint>(encoded.as_slice())
+                .expect("decode")
+                .as_bytes(),
+            &[1, 2, 3],
+        );
+    }
+
+    #[test]
     fn a_hashed_fingerprint_is_the_digest_of_its_input() {
         let fingerprint = Fingerprint::hashed(b"rustc 1.90.0");
         assert_eq!(
@@ -315,6 +357,23 @@ mod tests {
         let first = std::fs::read(dir.fingerprints()).expect("read");
         fingerprints.save(&dir, &lock).expect("second");
         assert_eq!(std::fs::read(dir.fingerprints()).expect("read"), first);
+
+        // And the obligation `store::save` states on every payload type, so a
+        // later field that iterates in hash order fails here.
+        //
+        // The closure *builds* a cache rather than cloning one. A clone carries
+        // the original's hasher and its table layout, so two clones of one
+        // `HashMap` iterate identically and a hash-ordered payload passed the
+        // assertion this call exists to fail (r4 round 2, D1/COV2). Sixty-four
+        // keys, not two, because two independently built hash maps of two keys
+        // agree half the time.
+        store::assert_saves_identically(KIND, VERSION, || {
+            let mut built = Fingerprints::default();
+            for n in 0..64_u8 {
+                built.set(format!("k{n}"), Fingerprint::raw(vec![n]));
+            }
+            built
+        });
     }
 
     #[test]

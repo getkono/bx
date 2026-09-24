@@ -24,10 +24,13 @@
 //! that keeps two mutating `bx` processes from interleaving.
 //!
 //! [`fs`] is the single place a byte reaches the filesystem, for every one of
-//! those files and every target: the one atomic write in the crate — temporary
-//! file in the destination directory, the mode set before any content, `fsync`,
-//! `rename`, `fsync` the directory — the one comparison `plan` and `apply`
-//! share, and the one type that carries a file mode.
+//! those files but the lock and for every target: the one atomic write in the
+//! crate — temporary file in the destination directory, the mode set before any
+//! content, `fsync`, `rename`, `fsync` the directory — the one comparison
+//! `plan` and `apply` share, and the one type that carries a file mode. The
+//! lock file's body — a best-effort line naming the holder — is truncated and
+//! written in place through the locked descriptor, because an atomic write
+//! renames a new inode over the name, and the lock is held on the old one.
 //!
 //! [`journal`] is the durability layer between the two: the write-ahead log and
 //! the session every byte bx writes passes through, which records each write

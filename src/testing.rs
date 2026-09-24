@@ -156,6 +156,70 @@ impl GuardedHome {
     }
 }
 
+/// The variable that opts a run into skipping a case this process cannot build.
+///
+/// Some tests need an `EACCES` that a process holding `CAP_DAC_READ_SEARCH` —
+/// root, or a user namespace from `unshare -r` — never sees. No CI job runs
+/// that way, so a silent skip there would be a branch nothing exercises and a
+/// suite that goes green with the assertions never run. Instead such a run
+/// fails, unless this variable is set to `1` by name.
+pub const ALLOW_UNCONSTRUCTIBLE_CASES: &str = "BX_ALLOW_UNCONSTRUCTIBLE_CASES";
+
+/// What to do about a case this process cannot construct, given the opt-in.
+///
+/// `Ok` carries the announcement to write before skipping; `Err` carries the
+/// message to fail with. Only the exact value `1` opts in, so an empty or a
+/// `0` setting cannot be mistaken for consent.
+fn unconstructible_verdict(
+    opt_in: Option<&std::ffi::OsStr>,
+    reason: &str,
+) -> Result<String, String> {
+    if opt_in.is_some_and(|v| v == "1") {
+        Ok(format!(
+            "skipped ({ALLOW_UNCONSTRUCTIBLE_CASES}=1): {reason}"
+        ))
+    } else {
+        Err(format!(
+            "{reason}; the assertions of this test cannot run in this process. \
+             Run it without CAP_DAC_READ_SEARCH, or set {ALLOW_UNCONSTRUCTIBLE_CASES}=1 \
+             to skip it deliberately"
+        ))
+    }
+}
+
+/// Skip a case this process cannot construct, but only if asked to by name.
+///
+/// Call it where the test is about to return early, after any cleanup. It
+/// returns only when [`ALLOW_UNCONSTRUCTIBLE_CASES`] is `1`, and then it has
+/// announced the skip through the stderr handle rather than `eprintln!`:
+/// libtest captures the print macros and discards the capture for a test that
+/// passes, so a macro would tell nobody. A direct write survives that capture.
+///
+/// Reads the environment, never writes it.
+///
+/// # Panics
+///
+/// When the opt-in is not set to `1`, so an ordinary run that cannot build
+/// the case fails loudly instead of passing with nothing checked.
+pub fn skip_unconstructible(reason: &str) {
+    let opt_in = std::env::var_os(ALLOW_UNCONSTRUCTIBLE_CASES);
+    skip_unconstructible_to(opt_in.as_deref(), reason, &mut std::io::stderr());
+}
+
+/// [`skip_unconstructible`] with the opt-in and the stderr handle passed in.
+fn skip_unconstructible_to(
+    opt_in: Option<&std::ffi::OsStr>,
+    reason: &str,
+    stderr: &mut impl std::io::Write,
+) {
+    match unconstructible_verdict(opt_in, reason) {
+        Ok(announcement) => {
+            let _ = writeln!(stderr, "{announcement}");
+        }
+        Err(message) => panic!("{message}"),
+    }
+}
+
 impl std::fmt::Debug for GuardedHome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardedHome")
@@ -255,6 +319,53 @@ mod tests {
         assert_eq!(written, home.child(".config/bx/bx.toml"));
         assert_eq!(std::fs::read_to_string(&written).unwrap(), "# empty\n");
         assert!(home.child(".config/bx").is_dir());
+    }
+
+    #[test]
+    fn an_unconstructible_case_fails_unless_the_skip_is_asked_for_by_name() {
+        use std::ffi::OsStr;
+
+        for opt_in in [None, Some(OsStr::new("")), Some(OsStr::new("0"))] {
+            let message = unconstructible_verdict(opt_in, "no EACCES here")
+                .expect_err("an ordinary run must fail, not skip");
+            assert!(message.starts_with("no EACCES here"), "{message}");
+            assert!(
+                message.contains("BX_ALLOW_UNCONSTRUCTIBLE_CASES=1"),
+                "the failure names the opt-in: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unconstructible_case_is_skipped_and_announced_when_opted_into() {
+        let announcement =
+            unconstructible_verdict(Some(std::ffi::OsStr::new("1")), "no EACCES here")
+                .expect("the opt-in skips");
+        assert_eq!(
+            announcement,
+            "skipped (BX_ALLOW_UNCONSTRUCTIBLE_CASES=1): no EACCES here"
+        );
+    }
+
+    #[test]
+    fn an_opted_in_skip_writes_its_announcement_to_the_handle() {
+        let mut stderr = Vec::new();
+        skip_unconstructible_to(
+            Some(std::ffi::OsStr::new("1")),
+            "no EACCES here",
+            &mut stderr,
+        );
+        assert_eq!(
+            String::from_utf8(stderr).expect("utf-8"),
+            "skipped (BX_ALLOW_UNCONSTRUCTIBLE_CASES=1): no EACCES here\n"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "set BX_ALLOW_UNCONSTRUCTIBLE_CASES=1 to skip it deliberately")]
+    fn a_skip_that_was_not_asked_for_panics() {
+        let mut stderr = Vec::new();
+        skip_unconstructible_to(None, "no EACCES here", &mut stderr);
     }
 
     #[test]

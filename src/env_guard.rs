@@ -6791,7 +6791,13 @@ mod tests {
         // reads no fragment and writes no bytes. `config/when.rs` imports it
         // for the same reason, to check the name a `when = "env:NAME"` tests,
         // and `config/path.rs` for the references a `[path]` entry holds.
-        const KNOWN: [(&str, &str); 11] = [
+        //
+        // `shell/activation.rs` judges a tool's activation output, which is
+        // not an environment fragment and cannot be read by `scan_with`'s
+        // grammar: it finds every assignment the output makes and passes each
+        // through `check`, the function `scan_with` calls per assignment, and
+        // an output with any refusal is never written.
+        const KNOWN: [(&str, &str); 13] = [
             ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
             ("config/env.rs", "use crate::env_guard::is_variable_name;"),
             ("config/when.rs", "use crate::env_guard::is_variable_name;"),
@@ -6814,6 +6820,14 @@ mod tests {
             (
                 "plan/mod.rs",
                 "let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();",
+            ),
+            (
+                "shell/activation.rs",
+                "use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};",
+            ),
+            (
+                "shell/activation.rs",
+                "if let Verdict::Violation(mut refused) = env_guard::check(name, value, self.roots) {",
             ),
         ];
         let live = "A generated body reaches bytes through the plan's judgement of it, and a \

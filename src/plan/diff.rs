@@ -68,6 +68,15 @@ pub enum Why {
 }
 
 impl Diff {
+    /// The diff of a directory whose mode alone changes: it has no bytes, so
+    /// a mode line is all there is to show.
+    #[must_use]
+    pub(super) const fn mode(from: Mode, to: Mode) -> Self {
+        Self {
+            kind: DiffKind::Mode { from, to },
+        }
+    }
+
     /// The diff from `before` — the regular file on disk, or `None` when there
     /// is none — to `after`, for the target spelled `target`.
     ///

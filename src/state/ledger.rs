@@ -56,6 +56,14 @@ pub enum Mechanism {
         /// The exact line bx added.
         line: String,
     },
+    /// bx owns a directory: its mode, and the directory itself when bx
+    /// created it. Never its contents.
+    ///
+    /// A directory has no bytes, so an entry attached this way records the
+    /// digest of the empty string as [`LedgerEntry::written`], and a
+    /// [`Prior::Existed`] names the directory's earlier mode against the empty
+    /// blob. [`crate::journal::DIR_BYTES`] is that convention's one spelling.
+    Dir,
 }
 
 /// A pointer to the bytes that were at a target before bx wrote it.

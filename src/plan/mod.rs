@@ -416,13 +416,11 @@ pub fn run(
         repo: &inputs.repo,
         roots: &inputs.roots,
         secrets: &inputs.resolved.secrets,
+        declared: &decide::Declared::new(),
     };
-    let mut ops = Vec::new();
-    for resolution in &inputs.resolved.targets {
-        let (change, op) = decide::decide(resolution, &ctx)?;
-        report.changes.push(change);
-        ops.extend(op);
-    }
+    let decided = decide::decide_all(&inputs.resolved.targets, &ctx)?;
+    report.changes = decided.changes;
+    let ops = decided.ops;
 
     match mode {
         Mode::Plan => Ok(report),
@@ -431,7 +429,13 @@ pub fn run(
                 return Ok(report);
             }
             let scope = ops.iter().map(|op| op.target().clone()).collect();
-            let session = Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;
+            let mut session =
+                Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;
+            // Before the first write, so a file staged beneath a declared
+            // directory is held to the directory's declared mode.
+            for (dir, mode) in &decided.declared {
+                session.declare_dir(dir, *mode);
+            }
             let progress = execute::progress(ops.len(), inputs.progress);
             execute::execute(ops, session, &progress)?;
             report.executed = true;
@@ -669,7 +673,26 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
             .find(|intent| intent.target == unfinished.target);
         let observed = crate::fs::observe(&unfinished.dest)?;
         let written = unfinished.standing == recover::Standing::Written;
+        let dir = intent.is_some_and(|intent| intent.dir);
         let (diff, what) = match (written, intent.map(|intent| &intent.before)) {
+            // A directory has no bytes to diff: its row says what recovery
+            // does to it, and a mode it puts back is shown as one.
+            (true, Some(state::Prior::Existed(reference))) if dir => {
+                match (observed.mode, intent.map(|intent| intent.after)) {
+                    (Some(found), Some(journal::Written::Present { .. })) => (
+                        Some(Diff::mode(found, reference.mode)),
+                        "rolls back: puts back the mode it had",
+                    ),
+                    _ => (
+                        None,
+                        "rolls back: makes the directory the session removed again",
+                    ),
+                }
+            }
+            (true, Some(state::Prior::Absent)) if dir => (
+                None,
+                "rolls back: removes the directory the session created where empty",
+            ),
             (true, Some(state::Prior::Existed(reference))) => {
                 let prior = LedgerView::default()
                     .restore_bytes(&inputs.state, reference)

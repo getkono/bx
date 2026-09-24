@@ -84,6 +84,12 @@ fn main() -> Result<()> {
         Some(Command::Secret {
             action: SecretAction::List,
         }) => bx::command::secret_list(&env, &mut out)?,
+        Some(Command::Add { target }) => {
+            bx::command::add(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
+        }
+        Some(Command::Rm { target }) => {
+            bx::command::rm(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
+        }
         Some(_) => todo!("command dispatch"),
     };
     out.flush()?;

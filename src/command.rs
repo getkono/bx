@@ -1,18 +1,23 @@
-//! The bodies of `bx`, `bx plan`, `bx apply`, `bx doctor` and `bx secret list`.
+//! The bodies of `bx`, `bx plan`, `bx apply`, `bx doctor`, `bx add`, `bx rm`
+//! and `bx secret list`.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
-//! or, for `doctor`, the read-only checks in [`crate::doctor`] — writes the
-//! rendering to the output it is handed, and returns the exit status. `main`
-//! does nothing but call one of them.
+//! or, for `doctor`, the read-only checks in [`crate::doctor`], and for `add`
+//! and `rm`, [`crate::adopt`] — writes the rendering to the output it is
+//! handed, and returns the exit status. `main` does nothing but call one of
+//! them.
 
 use std::io::Write;
+use std::path::Path;
 
+use crate::adopt::{self, Adoption, Removal};
 use crate::config::resolve::Resolution;
 use crate::config::target::Body;
 use crate::doctor::{self, Probes, systemd};
 use crate::paths;
 use crate::plan::{self, Env, Error, Inputs, Mode, Palette, Report, View};
 use crate::report::Exit;
+use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
 
 /// `bx doctor`: what a human should look at, changing nothing.
@@ -244,6 +249,145 @@ fn secret_list_with(
     }
     out.write_all(text.as_bytes()).map_err(Error::Output)?;
     Ok(if all { Exit::Converged } else { Exit::Pending })
+}
+
+/// `bx add PATH`: adopt a file, or every regular file under a directory, byte
+/// for byte.
+///
+/// Prints one row per path: `+` adopted, `=` already managed, `~` already
+/// declared and now owned, `-` passed over inside a directory, `!` refused.
+/// Exits 0 when everything named was adopted or already managed, and 2 when
+/// something was refused.
+///
+/// # Errors
+///
+/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading
+/// or adopting returns.
+pub fn add(
+    env: &Env,
+    cwd: &Path,
+    path: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<Exit, adopt::Error> {
+    let path = path.ok_or(adopt::Error::NoPath("add"))?;
+    let target = adopt::locate(path, cwd, &env.home)?;
+    let ctx = adopt::Context::load(env)?;
+    let rows = adopt::add(&ctx, &target)?;
+    let mut text = String::new();
+    for row in &rows {
+        text.push_str(&adoption_row(row));
+    }
+    let adopted = rows
+        .iter()
+        .filter(|row| matches!(row, Adoption::Adopt { .. }))
+        .count();
+    text.push_str(&format!(
+        "Adopted {adopted} file(s); run `bx plan` to see the machine against the repo.\n"
+    ));
+    out.write_all(text.as_bytes())
+        .map_err(adopt::Error::Output)?;
+    Ok(if rows.iter().any(Adoption::needs_attention) {
+        Exit::Pending
+    } else {
+        Exit::Converged
+    })
+}
+
+/// One `add` row, with its note and any warning on the lines below it.
+fn adoption_row(row: &Adoption) -> String {
+    let target = row.target();
+    match row {
+        Adoption::Adopt {
+            body,
+            reuse,
+            warnings,
+            ..
+        } => {
+            let how = if *reuse {
+                "declared, reusing"
+            } else {
+                "copied to"
+            };
+            let mut line = format!("  + {target}  ({how} {})\n", body.display());
+            for warning in warnings {
+                line.push_str(&format!(
+                    "    warning: {warning}; adopted as written, and bx will write it back as is\n"
+                ));
+            }
+            line
+        }
+        Adoption::Own { .. } => format!("  ~ {target}  already declared; bx now owns it\n"),
+        Adoption::Unchanged { .. } => format!("  = {target}  already managed\n"),
+        Adoption::Skipped { note, .. } => format!("  - {target}  skipped: {note}\n"),
+        Adoption::Refused { note, .. } => format!("  ! {target}  {note}\n"),
+    }
+}
+
+/// `bx rm PATH`: stop managing a target, or every target beneath a directory,
+/// restoring what bx displaced.
+///
+/// Exits 0 when everything was handed back, or nothing was managed there, and
+/// 2 when a conflict left something as it was.
+///
+/// # Errors
+///
+/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading
+/// or restoring returns.
+pub fn rm(
+    env: &Env,
+    cwd: &Path,
+    path: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<Exit, adopt::Error> {
+    let path = path.ok_or(adopt::Error::NoPath("rm"))?;
+    let target = adopt::locate(path, cwd, &env.home)?;
+    let ctx = adopt::Context::load(env)?;
+    let removals = adopt::rm(&ctx, &target)?;
+    let mut text = String::new();
+    if removals.is_empty() {
+        text.push_str(&format!("{target} is not managed by bx; nothing to do.\n"));
+    }
+    for removal in &removals {
+        text.push_str(&removal_row(removal, ctx.home()));
+    }
+    out.write_all(text.as_bytes())
+        .map_err(adopt::Error::Output)?;
+    Ok(
+        if removals
+            .iter()
+            .any(|removal| removal.restored.is_conflict())
+        {
+            Exit::Pending
+        } else {
+            Exit::Converged
+        },
+    )
+}
+
+/// One `rm` row.
+fn removal_row(removal: &Removal, home: &Path) -> String {
+    let target = removal.restored.target();
+    let did = match &removal.restored {
+        Restored::Reverted { .. } => "put back the file bx replaced".to_string(),
+        Restored::Removed { .. } => "removed the file bx created".to_string(),
+        Restored::AlreadyGone { .. } => "was already gone".to_string(),
+        Restored::Unmanaged { .. } => "left as it is; bx never wrote it".to_string(),
+        Restored::Conflict { note, .. } => {
+            return format!("  ! {target}  {note}; still managed\n");
+        }
+    };
+    let mut line = format!("  - {target}  {did}");
+    for layer in &removal.undeclared {
+        line.push_str(&format!(
+            "; no longer declared in {}",
+            crate::paths::to_portable(layer, home)
+        ));
+    }
+    for body in &removal.bodies {
+        line.push_str(&format!("; {} stays in the repo", body.display()));
+    }
+    line.push('\n');
+    line
 }
 
 /// Load, decide read-only, and show.

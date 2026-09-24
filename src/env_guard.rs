@@ -6119,7 +6119,14 @@ mod tests {
         // prose this test must not fire on — `src/config/values.rs` quotes
         // "the env_guard root set" inside a user-facing diagnostic, and a
         // bare-name search reports it as a caller.
-        const KNOWN: [(&str, &str); 4] = [
+        //
+        // `adopt.rs` scans a file the *user* wrote, at `bx add`, and only to
+        // print a warning: the file is adopted verbatim whatever the verdict,
+        // and the scan's text is never generated. So it leaves both facts
+        // standing — no generated fragment reaches the guard through it.
+        const KNOWN: [(&str, &str); 6] = [
+            ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
+            ("adopt.rs", "env_guard::scan_with(text, roots)"),
             ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
             ("plan/decide.rs", "env_guard::scan_with(content, roots)"),
             ("plan/mod.rs", "use crate::env_guard::RootSet;"),

@@ -1,5 +1,5 @@
-//! The binary's surface for `bx`, `bx plan` and `bx apply`: exit codes, what
-//! reaches standard output, and what is written.
+//! The binary's surface for `bx`, `bx plan`, `bx apply`, `bx add` and `bx rm`:
+//! exit codes, what reaches standard output, and what is written.
 //!
 //! Every invocation gets its home per command, from a guarded tempdir; nothing
 //! here sets a variable in this process.
@@ -578,6 +578,42 @@ fn d1_a_secret_is_listed_planned_without_its_plaintext_and_applied_private() {
 
     let again = bx(home.path(), &["plan"]);
     assert_eq!(again.status.code(), Some(0), "{}", stdout(&again));
+}
+
+#[test]
+fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
+    let home = guarded_home();
+    seed(home.path(), "# mine\n");
+    std::fs::write(home.child(".tool.rc"), b"one\r\ntwo").expect("the file");
+
+    let added = bx(home.path(), &["add", "~/.tool.rc"]);
+    assert_eq!(added.status.code(), Some(0), "{}", stderr(&added));
+    assert!(
+        stdout(&added).starts_with("  + ~/.tool.rc  (copied to files/.tool.rc)\n"),
+        "{}",
+        stdout(&added)
+    );
+    assert_eq!(
+        std::fs::read(home.child(".config/bx/files/.tool.rc")).expect("the copy"),
+        b"one\r\ntwo"
+    );
+    let planned = bx(home.path(), &["plan"]);
+    assert_eq!(planned.status.code(), Some(0), "{}", stdout(&planned));
+
+    let removed = bx(home.path(), &["rm", "~/.tool.rc"]);
+    assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    assert_eq!(
+        std::fs::read(home.child(".tool.rc")).expect("still there"),
+        b"one\r\ntwo"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.child(".config/bx/bx.toml")).expect("bx.toml"),
+        "# mine\n"
+    );
+
+    let unnamed = bx(home.path(), &["add"]);
+    assert_eq!(unnamed.status.code(), Some(1));
+    assert!(stderr(&unnamed).contains("name the file or directory to add"));
 }
 
 #[test]

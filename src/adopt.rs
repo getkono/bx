@@ -869,7 +869,12 @@ fn declarations(ctx: &Context, under: &Portable) -> Result<Vec<Declaration>, Err
                 found.push(Declaration {
                     layer: layer.file.clone(),
                     target,
-                    body: table.get("file").and_then(Item::as_str).map(PathBuf::from),
+                    // Both body keys that name a file in the repo: a secret's
+                    // ciphertext stays there as much as a `file` body does.
+                    body: ["file", "secret"]
+                        .into_iter()
+                        .find_map(|key| table.get(key).and_then(Item::as_str))
+                        .map(PathBuf::from),
                 });
             }
         }
@@ -1636,6 +1641,24 @@ mod tests {
         assert_eq!(layer(&home), "");
         assert_eq!(std::fs::read_to_string(&local).expect("local.toml"), "");
         assert!(rm_rel(&home, ".never").is_empty(), "a second rm is a no-op");
+    }
+
+    #[test]
+    fn rm_of_a_secret_target_reports_its_ciphertext_as_left_in_the_repo() {
+        let home = repo(
+            "[[target]]\npath = \"~/.token\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n",
+        );
+
+        let removals = rm_rel(&home, ".token");
+        assert!(
+            matches!(
+                removals.as_slice(),
+                [Removal { restored: Restored::Unmanaged { .. }, undeclared, bodies }]
+                    if undeclared.len() == 1 && bodies == &[PathBuf::from("secrets/token.age")]
+            ),
+            "{removals:?}"
+        );
+        assert_eq!(layer(&home), "");
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! The binary's surface for `bx`, `bx init`, `bx plan`, `bx apply`, `bx add`
-//! and `bx rm`:
+//! The binary's surface for `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
+//! `bx add` and `bx rm`:
 //! exit codes, what reaches standard output, and what is written.
 //!
 //! Every invocation gets its home per command, from a guarded tempdir; nothing
@@ -21,6 +21,9 @@ fn bx(home: &Path, args: &[&str]) -> Output {
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_STATE_HOME")
         .env_remove("NO_COLOR")
+        // Only `bx sync` runs git; this keeps the system's git configuration
+        // out of what it sees.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .expect("run bx")
 }
@@ -754,6 +757,98 @@ fn init_with_pending_work_and_no_yes_or_terminal_refuses_as_apply_does() {
         stderr(&output)
     );
     assert!(!home.child(".a").exists());
+}
+
+/// `git args` in `dir`, against `home`'s configuration only.
+fn git(home: &Path, dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=bx test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn sync_fast_forwards_applies_and_exits_zero_and_refuses_a_diverged_branch_with_one() {
+    let home = guarded_home();
+    let remote = home.child("remote.git");
+    std::fs::create_dir_all(&remote).expect("remote");
+    git(
+        home.path(),
+        &remote,
+        &["init", "--quiet", "--bare", "-b", "master"],
+    );
+    seed(home.path(), "");
+    let repo = home.child(".config/bx");
+    git(home.path(), &repo, &["init", "--quiet", "-b", "master"]);
+    git(home.path(), &repo, &["add", "-A"]);
+    git(home.path(), &repo, &["commit", "--quiet", "-m", "seed"]);
+    let url = remote.to_str().expect("UTF-8");
+    git(home.path(), &repo, &["remote", "add", "origin", url]);
+    git(
+        home.path(),
+        &repo,
+        &["push", "--quiet", "-u", "origin", "master"],
+    );
+
+    let other = home.child("other");
+    let other_s = other.to_str().expect("UTF-8");
+    git(
+        home.path(),
+        home.path(),
+        &["clone", "--quiet", url, other_s],
+    );
+    std::fs::write(other.join("bx.toml"), A_TARGET).expect("bx.toml");
+    git(home.path(), &other, &["commit", "--quiet", "-am", "a"]);
+    git(home.path(), &other, &["push", "--quiet"]);
+
+    let synced = bx(home.path(), &["sync", "--yes"]);
+    assert_eq!(synced.status.code(), Some(0), "{}", stderr(&synced));
+    assert!(
+        stdout(&synced).starts_with("Fast-forwarded master by 1 commit(s) from origin/master.\n"),
+        "{}",
+        stdout(&synced)
+    );
+    assert_eq!(std::fs::read(home.child(".a")).expect("written"), b"a\n");
+
+    std::fs::write(other.join("theirs.toml"), "").expect("theirs");
+    git(home.path(), &other, &["add", "-A"]);
+    git(home.path(), &other, &["commit", "--quiet", "-m", "theirs"]);
+    git(home.path(), &other, &["push", "--quiet"]);
+    std::fs::write(repo.join("mine.toml"), "").expect("mine");
+    git(home.path(), &repo, &["add", "-A"]);
+    git(home.path(), &repo, &["commit", "--quiet", "-m", "mine"]);
+    let mine = git(home.path(), &repo, &["rev-parse", "HEAD"]);
+
+    let diverged = bx(home.path(), &["sync", "--yes"]);
+    assert_eq!(diverged.status.code(), Some(1), "{}", stdout(&diverged));
+    assert!(
+        stderr(&diverged).contains("have diverged"),
+        "{}",
+        stderr(&diverged)
+    );
+    assert_eq!(git(home.path(), &repo, &["rev-parse", "HEAD"]), mine);
 }
 
 #[test]

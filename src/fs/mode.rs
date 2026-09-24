@@ -71,6 +71,10 @@ impl Mode {
     pub const PRIVATE_FILE: Self = Self(0o600);
     /// `0700` — owner-only. The state directory and everything under it.
     pub const PRIVATE_DIR: Self = Self(0o700);
+    /// `0777` — the mode Linux gives every symlink, and ignores. Recorded for
+    /// a link bx makes so its ledger entry and journal intents have the shape
+    /// a file's have; never set, since no call sets a link's mode.
+    pub const LINK: Self = Self(0o777);
 
     /// A mode from raw bits. Anything above the twelve permission bits is
     /// discarded, so a `stat` result can be handed over directly.

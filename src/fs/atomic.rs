@@ -228,6 +228,16 @@ pub enum Error {
         .0.display()
     )]
     Symlink(PathBuf),
+    /// A link would replace something that is not a link: a regular file, a
+    /// directory, a socket or a device node. A symlink target replaces only a
+    /// link, and only one `plan` showed it — see [`crate::fs::link`].
+    #[error("{path} is {kind}, not a symlink bx can replace", path = .path.display())]
+    NotALink {
+        /// The destination.
+        path: PathBuf,
+        /// What is actually there.
+        kind: Kind,
+    },
     /// The destination's parent is on the filesystem but does not resolve to a
     /// directory: a dangling symlink, a symlink loop, or a non-directory.
     ///
@@ -607,6 +617,7 @@ impl Error {
             | Self::MissingParent(path)
             | Self::Symlink(path)
             | Self::NotAFile { path, .. }
+            | Self::NotALink { path, .. }
             | Self::UnusableParent { path, .. }
             | Self::Read { path, .. }
             | Self::Write { path, .. }
@@ -638,6 +649,9 @@ pub struct Observed {
     pub mode: Option<Mode>,
     /// Its bytes, for a regular file only.
     pub bytes: Option<Vec<u8>>,
+    /// What the link says, for a symlink only: its text, read with
+    /// `readlink(2)` and never resolved.
+    pub link: Option<PathBuf>,
     /// The destination's immediate parent directory.
     pub parent: Option<Parent>,
     /// Which file this was and when it last changed, or `None` when nothing is
@@ -679,6 +693,14 @@ impl Observed {
     #[must_use]
     pub fn digest(&self) -> Option<ContentHash> {
         self.bytes.as_deref().map(ContentHash::of)
+    }
+
+    /// The digest of the link's text, for a symlink: the one a symlink
+    /// target's ledger entry and journal intents record it under. See
+    /// [`crate::fs::link`].
+    #[must_use]
+    pub fn link_digest(&self) -> Option<ContentHash> {
+        self.link.as_deref().map(crate::fs::link::digest)
     }
 }
 
@@ -834,6 +856,7 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
             kind: Kind::Absent,
             mode: None,
             bytes: None,
+            link: None,
             parent: Some(observed_parent),
             stamp: None,
         });
@@ -846,17 +869,26 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
             kind: Kind::Absent,
             mode: None,
             bytes: None,
+            link: None,
             parent,
             stamp: None,
         });
     };
 
     let kind = Kind::from(meta.file_type());
+    let read = |source| Error::Read {
+        path: dest.to_path_buf(),
+        source,
+    };
     let bytes = if kind == Kind::File {
-        Some(std::fs::read(dest).map_err(|source| Error::Read {
-            path: dest.to_path_buf(),
-            source,
-        })?)
+        Some(std::fs::read(dest).map_err(read)?)
+    } else {
+        None
+    };
+    // The link's own text, never what it resolves to: `readlink` reads the
+    // link and follows nothing.
+    let link = if kind == Kind::Symlink {
+        Some(std::fs::read_link(dest).map_err(read)?)
     } else {
         None
     };
@@ -866,6 +898,7 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
         kind,
         mode: Some(mode_of(&meta)),
         bytes,
+        link,
         parent,
         // From the `lstat` taken before the read, so a change that lands
         // between the two makes the stamp older than the bytes, and the check
@@ -1215,29 +1248,9 @@ pub fn stage(
     created: &mut CreatedDirs,
 ) -> Result<Staged, Error> {
     // Spelled as `observe` spells it, so `link/` is the link.
-    let dest = lexical(dest)?;
+    let (dest, prior, created_dirs) = prepare(dest, planned, created, refuse_unwritable)?;
     let dest = dest.as_path();
-    if planned.path != dest {
-        return Err(Error::Changed {
-            path: dest.to_path_buf(),
-            detail: format!("plan observed {}, not this path", planned.path.display()),
-        });
-    }
-    // Plan's verdict first: a conflict plan printed stays refused whatever is
-    // there now, so `apply` never writes where `plan` said it would not.
-    refuse_unwritable(planned)?;
-    let prior = observe(dest)?;
-    // Then plan's look against this one. Equal stamps are the same file,
-    // unchanged, so this observation's bytes are the ones plan's diff was about.
-    refuse_changed(planned, prior.stamp.map(|stamp| (prior.kind, stamp)))?;
-    // The destination is unchanged; a parent above it may not be.
-    refuse_unwritable(&prior)?;
-
     let dir = parent_of(dest)?;
-    // Before creating anything, so a refusal leaves nothing behind.
-    refuse_wider_than_declared(dest, dir, created)?;
-    let made = create_missing_dirs(dir, created)?;
-    let created_dirs = created.record(made, None);
 
     let temp = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
@@ -2160,6 +2173,55 @@ fn seen(observed: &Observed) -> String {
     }
 }
 
+/// Everything a write does before it makes its temporary entry: spell `dest`
+/// as [`observe`] does, refuse what `plan` refused, look again and refuse a
+/// destination that changed since `planned`, then make the missing parents.
+///
+/// Shared by [`stage`], which writes a file, and
+/// [`crate::fs::link::stage_link`], which writes a link: the two differ only
+/// in what they may replace, which `refuse` says.
+///
+/// Returns the destination as spelled, the fresh observation — the prior a
+/// reversal restores, which the check has just shown to be what `plan` saw —
+/// and the directories made on the way that this write claims.
+///
+/// # Errors
+///
+/// [`Error::Changed`] when the destination is no longer what `planned`
+/// observed, or `planned` observed a different path; whatever `refuse`
+/// returns for `planned` or the fresh look; and what [`stage`] documents for
+/// the parents.
+pub(super) fn prepare(
+    dest: &Path,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+    refuse: fn(&Observed) -> Result<(), Error>,
+) -> Result<(PathBuf, Observed, Vec<PathBuf>), Error> {
+    let dest = lexical(dest)?;
+    if planned.path != dest {
+        return Err(Error::Changed {
+            path: dest,
+            detail: format!("plan observed {}, not this path", planned.path.display()),
+        });
+    }
+    // Plan's verdict first: a conflict plan printed stays refused whatever is
+    // there now, so `apply` never writes where `plan` said it would not.
+    refuse(planned)?;
+    let prior = observe(&dest)?;
+    // Then plan's look against this one. Equal stamps are the same file,
+    // unchanged, so this observation's bytes are the ones plan's diff was about.
+    refuse_changed(planned, prior.stamp.map(|stamp| (prior.kind, stamp)))?;
+    // The destination is unchanged; a parent above it may not be.
+    refuse(&prior)?;
+
+    let dir = parent_of(&dest)?;
+    // Before creating anything, so a refusal leaves nothing behind.
+    refuse_wider_than_declared(&dest, dir, created)?;
+    let made = create_missing_dirs(dir, created)?;
+    let created_dirs = created.record(made, None);
+    Ok((dest, prior, created_dirs))
+}
+
 /// Refuse unless `prior.path` is still what [`observe`] found there: the same
 /// file with the same [`Stamp`], or still nothing at all.
 ///
@@ -2167,7 +2229,7 @@ fn seen(observed: &Observed) -> String {
 ///
 /// [`Error::Changed`] naming what moved, and [`Error::Read`] when the path can
 /// no longer be stat'd.
-fn verify_unchanged(prior: &Observed) -> Result<(), Error> {
+pub(super) fn verify_unchanged(prior: &Observed) -> Result<(), Error> {
     let now = optional_metadata(&prior.path)?
         .map(|meta| (Kind::from(meta.file_type()), Stamp::of(&meta)));
     refuse_changed(prior, now)
@@ -2293,7 +2355,7 @@ fn lexical(path: &Path) -> Result<PathBuf, Error> {
 }
 
 /// The directory `path` will be written into.
-fn parent_of(path: &Path) -> Result<&Path, Error> {
+pub(super) fn parent_of(path: &Path) -> Result<&Path, Error> {
     match path.parent() {
         // A bare file name has an empty parent, which names the working
         // directory; `NamedTempFile::new_in("")` would fail on it.

@@ -1855,6 +1855,7 @@ mod tests {
             kind,
             mode: Some(Mode::DEFAULT_DIR),
             bytes: None,
+            link: None,
             parent: None,
             stamp: None,
         };

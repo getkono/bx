@@ -112,13 +112,20 @@ impl Dir {
 
 /// `rename` a temporary file onto `dest`, replacing whatever is there.
 ///
+/// Generic over what the temporary entry is, because a symlink target's is a
+/// link rather than an open file: see [`crate::fs::link`]. The rename is the
+/// same syscall either way.
+///
 /// # Errors
 ///
 /// The failed `rename`. The temporary file is dropped with the error — see
 /// [`crate::fs::atomic::Staged`] for what that is worth, because the unlink
 /// needs a permission on the destination directory that a failing rename may
 /// mean it no longer grants.
-pub(crate) fn rename(temp: NamedTempFile, dest: &Path) -> Result<(), tempfile::PersistError> {
+pub(crate) fn rename<F>(
+    temp: NamedTempFile<F>,
+    dest: &Path,
+) -> Result<(), tempfile::PersistError<F>> {
     #[cfg(test)]
     let from = temp.path().to_path_buf();
     temp.persist(dest)?;

@@ -72,6 +72,12 @@ fn main() -> Result<()> {
         Some(Command::Plan) => bx::command::plan(&env, &mut out)?,
         Some(Command::Apply { yes }) => bx::command::apply(&env, yes, &mut out)?,
         Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,
+        Some(Command::Add { target }) => {
+            bx::command::add(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
+        }
+        Some(Command::Rm { target }) => {
+            bx::command::rm(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
+        }
         Some(_) => todo!("command dispatch"),
     };
     out.flush()?;

@@ -817,46 +817,21 @@ mod tests {
             .expect("chmod 000");
 
         // A process that can read a 0000 directory -- root, or one holding
-        // CAP_DAC_READ_SEARCH -- cannot construct this case at all. Say so
-        // rather than assert something else and call it covered.
-        //
-        // The skip below is reached by no gate this repository runs, and that is
-        // recorded rather than fixed here. Every job in `.github/workflows/ci.yml`
-        // is a plain `runs-on: ubuntu-latest` with no `container:` and no `user:`,
-        // and `mise run test` runs as the invoking user, so `constructible` is
-        // true under all of them and the assertions below always run. The branch
-        // exists so the test does not *fail* for the privileged reader, which is
-        // what issue #13 item 3 asked for; covering it would need a test that
-        // re-execs under `unshare`, which this repository does not do for the
-        // two sibling skips it already carries on `master` -- the one below in
-        // `a_modules_directory_that_cannot_be_searched_names_the_entry`, and the
-        // one in `layers.rs`. Both are cited from `master` on purpose: a
-        // precedent a reader cannot open from the default branch is not one, and
-        // grounding this argument off the default branch is the fault issue #56
-        // was corrected in place for.
+        // CAP_DAC_READ_SEARCH -- cannot construct this case at all. Every job in
+        // `.github/workflows/ci.yml` is a plain `runs-on: ubuntu-latest` with no
+        // `container:` and no `user:`, and `mise run test` runs as the invoking
+        // user, so no gate takes the branch below. Rather than a silent skip
+        // nothing exercises, such a run fails unless the skip is asked for by
+        // name, and the opted-in skip is announced through the stderr handle.
         let constructible = std::fs::read_dir(&modules).is_err();
         let result = layer_files(dir.path());
         std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
             .expect("restore, so the tempdir can be removed");
 
         if !constructible {
-            // Through the stderr handle, not `eprintln!`: libtest captures the
-            // print macros and discards the capture for a test that passes, so
-            // an `eprintln!` here would reach nobody on the one kind of machine
-            // that takes this branch -- the suite would go green with the
-            // assertions below never run and nothing said. A direct write
-            // survives that capture. The two sibling skip sites carry the same
-            // defect and this pull request deliberately does not modify them:
-            // they are `master` code tracked by issue #56, whose acceptance asks
-            // for a broader remedy -- make the branch reachable, or make an
-            // ordinary run fail loudly and a skip be opted into by name -- and
-            // changing only their print channel here would pre-empt that with a
-            // half-measure.
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr(),
-                "skipped: this process can read a 0000 directory, so the io error cannot be \
-                 constructed here"
+            crate::testing::skip_unconstructible(
+                "this process can read a 0000 directory, so the io error cannot be \
+                 constructed here",
             );
             return;
         }
@@ -1110,16 +1085,18 @@ mod tests {
             .expect("chmod 644");
 
         // A process that can stat inside an unsearchable directory -- root, or
-        // one holding CAP_DAC_READ_SEARCH -- cannot construct this case.
+        // one holding CAP_DAC_READ_SEARCH -- cannot construct this case. No CI
+        // job runs that way, so a silent skip would be a branch nothing
+        // exercises: such a run fails unless the skip is asked for by name.
         let constructible = std::fs::metadata(&module).is_err();
         let result = layer_files(dir.path());
         std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755))
             .expect("restore, so the tempdir can be removed");
 
         if !constructible {
-            eprintln!(
-                "skipped: this process can stat inside a 0644 directory, so EACCES cannot be \
-                 constructed here"
+            crate::testing::skip_unconstructible(
+                "this process can stat inside a 0644 directory, so EACCES cannot be \
+                 constructed here",
             );
             return;
         }

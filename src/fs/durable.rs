@@ -15,6 +15,11 @@
 //! That is `cfg(test)`, not a feature gate — no configuration of the binary
 //! differs from another.
 //!
+//! Every note is made **after** its syscall returns successfully, so the list a
+//! test reads back is what the kernel was asked to do and agreed to, never what
+//! it was about to be asked. Two of the four used to note first, which made a
+//! failed `fsync` indistinguishable from one that worked.
+//!
 //! What this establishes and what it does not: it pins that the calls are
 //! **made**, on which path, and in what order. It does not observe the kernel,
 //! so each function's own one-line body — `sync_all`, `fsync`, `rename` — is
@@ -41,11 +46,15 @@ use tempfile::NamedTempFile;
 ///
 /// `path` names the file for the recorder only; the call itself uses `file`.
 pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    probe::note(Event::SyncFile(path.to_path_buf()));
     #[cfg(not(test))]
     let _ = path;
-    file.sync_all()
+    // After the call, never before: a note made first records a syscall that
+    // may not have happened, and the recorder's whole claim is that what it
+    // lists is what the kernel was asked to do and agreed to.
+    file.sync_all()?;
+    #[cfg(test)]
+    probe::note(Event::SyncFile(path.to_path_buf()));
+    Ok(())
 }
 
 /// A directory opened so that a rename or unlink inside it can be made durable.
@@ -66,6 +75,16 @@ pub(crate) struct Dir {
 
 impl Dir {
     /// Open `path` read-only as a directory.
+    ///
+    /// Both `|` here are surviving mutants under `cargo mutants`, and both are
+    /// equivalent by arithmetic rather than by anything a test could arrange.
+    /// `RDONLY` is `0`, the identity element of `|` and of `^` alike, so
+    /// `RDONLY | x` and `RDONLY ^ x` are the same value for every `x`;
+    /// `DIRECTORY` and `CLOEXEC` are distinct single-bit flags sharing no bit,
+    /// so `|` and `^` agree on them too. Every mutant hands `open` the same
+    /// bitmask. There is no behaviour to distinguish, and the flags themselves
+    /// *are* pinned — dropping either fails
+    /// `the_destination_directory_is_opened_as_a_directory_and_closed_on_exec`.
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let fd = rustix::fs::open(
             path,
@@ -84,9 +103,10 @@ impl Dir {
     /// `fsync` the directory, so the entries changed inside it survive a power
     /// loss.
     pub(crate) fn sync(&self) -> io::Result<()> {
+        rustix::fs::fsync(&self.fd).map_err(io::Error::from)?;
         #[cfg(test)]
         probe::note(Event::SyncDir(self.path.clone()));
-        rustix::fs::fsync(&self.fd).map_err(io::Error::from)
+        Ok(())
     }
 }
 
@@ -94,8 +114,10 @@ impl Dir {
 ///
 /// # Errors
 ///
-/// The failed `rename`. The temporary file is removed when the error is
-/// dropped.
+/// The failed `rename`. The temporary file is dropped with the error — see
+/// [`crate::fs::atomic::Staged`] for what that is worth, because the unlink
+/// needs a permission on the destination directory that a failing rename may
+/// mean it no longer grants.
 pub(crate) fn rename(temp: NamedTempFile, dest: &Path) -> Result<(), tempfile::PersistError> {
     #[cfg(test)]
     let from = temp.path().to_path_buf();
@@ -193,6 +215,15 @@ mod probe {
     pub(super) fn stop() -> Vec<Event> {
         EVENTS.with_borrow_mut(Option::take).unwrap_or_default()
     }
+
+    /// Whether this thread is recording.
+    ///
+    /// The one thing that tells a guard which stopped on unwind from one which
+    /// did not: [`super::recording`] calls [`start`], which replaces the
+    /// buffer, so a later recording comes back empty either way.
+    pub(super) fn recording() -> bool {
+        EVENTS.with_borrow(Option::is_some)
+    }
 }
 
 #[cfg(test)]
@@ -265,18 +296,37 @@ mod tests {
     #[test]
     fn a_failed_call_records_no_success() {
         let dir = tempfile::tempdir().expect("tempdir");
+        // `fsync` on a procfs file is EINVAL: the filesystem has nothing to
+        // write back. It is the one failing sync reachable without a fault
+        // injector, and it covers the arm the other three tests cannot —
+        // `sync_file` and `Dir::sync` used to note before their syscall, so a
+        // failed sync was recorded as a success.
+        let unsyncable = File::open("/proc/self/status").expect("procfs");
         let (result, events) = recording(|| {
             let missing = Dir::open(&dir.path().join("missing")).map(|_| ());
             let temp = NamedTempFile::new_in(dir.path()).expect("temp");
             let onto_a_dir = rename(temp, dir.path()).map_err(|e| e.error);
-            (missing, onto_a_dir)
+            let no_sync = sync_file(&unsyncable, Path::new("/proc/self/status"));
+            // The same for a directory: `fsync` on a procfs directory is
+            // EINVAL too, and the open itself succeeds, so this reaches
+            // `Dir::sync`'s own failure rather than `Dir::open`'s.
+            let no_dir_sync = Dir::open(Path::new("/proc/self"))
+                .expect("procfs opens")
+                .sync();
+            (missing, onto_a_dir, no_sync, no_dir_sync)
         });
-        assert!(result.0.is_err());
-        assert!(result.1.is_err());
+        assert!(result.0.is_err(), "the open failed");
+        assert!(result.1.is_err(), "the rename failed");
+        assert!(result.2.is_err(), "the file sync failed: {:?}", result.2);
+        assert!(
+            result.3.is_err(),
+            "the directory sync failed: {:?}",
+            result.3
+        );
         assert_eq!(
             events,
-            [],
-            "neither an open nor a rename that failed happened"
+            [Event::OpenDir(PathBuf::from("/proc/self"))],
+            "only the open that succeeded is recorded; no failed call is",
         );
     }
 
@@ -303,14 +353,27 @@ mod tests {
 
     #[test]
     fn a_panic_inside_a_recording_leaves_the_thread_clean() {
+        assert!(!probe::recording(), "this thread starts clean");
         let caught = std::panic::catch_unwind(|| {
-            recording(|| panic!("inside"));
+            recording(|| {
+                assert!(probe::recording(), "and is recording inside");
+                panic!("inside");
+            });
         });
         assert!(caught.is_err());
+
+        // Asserted on the thread's own state, not on a later recording: the
+        // later one calls `start`, which replaces the buffer, so it comes back
+        // empty whether or not the guard ran. Deleting the `Drop` impl fails
+        // this line and nothing else.
+        assert!(
+            !probe::recording(),
+            "the guard stopped recording as the panic unwound past it",
+        );
 
         let dir = tempfile::tempdir().expect("tempdir");
         Dir::open(dir.path()).expect("open").sync().expect("sync");
         let ((), events) = recording(|| {});
-        assert_eq!(events, []);
+        assert_eq!(events, [], "and the call made in between was discarded");
     }
 }

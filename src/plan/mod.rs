@@ -387,7 +387,15 @@ pub fn run(
             return Err(recover::Error::Blocked { conflicts: blocked }.into());
         }
         if approve(&report)? {
-            report.recovered = Some(recover::before_writing(&inputs.state)?);
+            // A session that became blocked between `pending` and here is
+            // still refused: this run is a writing one, and `recover` hands
+            // that verdict back as a value only for a caller that reports it.
+            report.recovered = Some(match recover::recover(&inputs.state)? {
+                recover::Outcome::Blocked { conflicts } => {
+                    return Err(recover::Error::Blocked { conflicts }.into());
+                }
+                outcome => outcome,
+            });
         }
         return Ok(report);
     }
@@ -509,8 +517,22 @@ pub fn exit(report: &Report, mode: Mode) -> Exit {
 /// elsewhere still works. An absent state directory is fine — there is nothing
 /// to read — and so is an entry `lstat` cannot see, which the read then reports
 /// itself.
+///
+/// # Decision 38: `<state>/local.toml` is the user's, and is not walked
+///
+/// The walk's premise — everything under the state root is bx's own and is
+/// only ever left by rename — is false for exactly one path: the local layer,
+/// `<state>/local.toml`, which the user writes and which the base supports as a
+/// symbolic link ([`layers::layer_paths`], `state::dir`'s `check_local_layer`).
+/// Refusing it there made `bx`, `bx plan` and `bx apply` exit 1 for every
+/// account whose `local.toml` is linked. So that one path is skipped here,
+/// neither judged nor descended into, and is left to the judgement that already
+/// governs it: [`layers::layer_paths`] follows the link, loads it only when it
+/// ends at a regular file, and skips anything else unread, so a FIFO or a link
+/// to a device there is never opened. It was judged before this ran, by
+/// [`Inputs::load`].
 fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
-    fn walk(dir: &Path) -> Result<(), Error> {
+    fn walk(dir: &Path, local: &Path) -> Result<(), Error> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             // Unreadable or absent: there is nothing bx can enumerate here, and
             // whichever reader wants a file beneath it reports its own failure.
@@ -523,6 +545,9 @@ fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
         let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
         paths.sort();
         for path in paths {
+            if path == local {
+                continue;
+            }
             // `symlink_metadata`, so a symlink is judged as a symlink rather
             // than as whatever it points at. `entry.file_type()` would do on
             // Linux, but it is documented as possibly needing a stat, and this
@@ -531,14 +556,14 @@ fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
                 continue;
             };
             if meta.is_dir() {
-                walk(&path)?;
+                walk(&path, local)?;
             } else if !meta.file_type().is_file() {
                 return Err(Error::NotARegularFile { path });
             }
         }
         Ok(())
     }
-    walk(state.root())
+    walk(state.root(), &layers::local_layer_path(state.root()))
 }
 
 /// What a read-only run learns from the state directory before deciding.
@@ -2022,7 +2047,10 @@ pub(crate) mod tests {
             assert!(inputs.state().journal().exists(), "the journal went");
 
             // Recovery's own error keeps the absolute path.
-            let recovery = recover::before_writing(inputs.state()).expect_err("blocked");
+            let recovery = match recover::recover(inputs.state()).expect("recover") {
+                recover::Outcome::Blocked { conflicts } => recover::Error::Blocked { conflicts },
+                outcome => panic!("recovered: {outcome:?}"),
+            };
             assert!(
                 recovery.to_string().contains(&blob.display().to_string()),
                 "{recovery}"
@@ -2278,6 +2306,42 @@ pub(crate) mod tests {
         std::fs::create_dir_all(fresh.root()).expect("the state directory");
         std::fs::write(fresh.ledger(), b"a ledger's bytes").expect("a regular ledger");
         assert!(refuse_irregular_state_files(&fresh).is_ok());
+    }
+
+    #[test]
+    fn decision_38_a_linked_local_toml_is_the_users_layer_and_plan_and_apply_run() {
+        // The walk refused every link under the state root, and the local
+        // layer is the one file there the user writes and may link, so any
+        // account with a linked `local.toml` could not run `bx` at all.
+        let home = guarded_home();
+        seed(home.path(), &inline("~/.a", "a\\n"));
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir_all(state.root()).expect("the state directory");
+        std::fs::set_permissions(state.root(), std::fs::Permissions::from_mode(0o700))
+            .expect("a private state directory");
+        let real = home.write("dotfiles/local.toml", "[values]\n");
+        let local = layers::local_layer_path(state.root());
+        std::os::unix::fs::symlink(&real, &local).expect("the link");
+        let inputs = load(home.path());
+
+        assert!(refuse_irregular_state_files(inputs.state()).is_ok());
+        assert_eq!(plan(&inputs).actions(), [Action::Create]);
+        assert_eq!(apply(&inputs).actions(), [Action::Create]);
+        assert_eq!(plan(&inputs).actions(), [Action::Unchanged]);
+        assert_eq!(std::fs::read(home.child(".a")).expect("written"), b"a\n");
+        assert!(
+            std::fs::symlink_metadata(&local).is_ok_and(|meta| meta.file_type().is_symlink()),
+            "the user's link is left as it was"
+        );
+
+        // Only that one name is exempt: a link anywhere else under the state
+        // root is still refused.
+        std::os::unix::fs::symlink(&real, state.ledger().with_file_name("other.toml"))
+            .expect("a second link");
+        assert!(matches!(
+            refuse_irregular_state_files(inputs.state()),
+            Err(Error::NotARegularFile { .. })
+        ));
     }
 
     #[test]

@@ -72,14 +72,16 @@
 //!
 //! The guard **fails closed by shape** as well. It does not model shell syntax
 //! and approve whatever it does not recognise: it reads a fragment against a
-//! small grammar — blank lines, comments, and `NAME=VALUE` or
-//! `export NAME=VALUE` with a restricted value, plus two zsh forms `[path]`
-//! needs, a search-list assignment gated on `[[ -d WORD ]] && ` and
+//! small grammar — blank lines, comments, `NAME=VALUE` or
+//! `export NAME=VALUE` with a restricted value, the `if TEST; then` / `fi`
+//! pair a runtime `when` condition renders, and two one-line zsh forms
+//! `[path]` needs, a search-list assignment gated on `[[ -d WORD ]] && ` and
 //! `path=(${path:#WORD})` — and refuses **every** line that
 //! is not one of those, whatever the line mentions and whether or not it
-//! relocates anything. A multi-line construct is refused at its first line,
-//! because no line the grammar accepts can leave a quote, a continuation or a
-//! heredoc open. [`scan_with`] states the grammar.
+//! relocates anything. Every multi-line construct but that block is refused at
+//! its first line, because no line the grammar accepts can leave a quote, a
+//! continuation or a heredoc open; the block's assignments are judged as if
+//! the condition were not there. [`scan_with`] states the grammar.
 //!
 //! This module is that rule as code. Every environment fragment bx generates is
 //! run through [`scan_with`] before it is written, and the check is covered by
@@ -1205,7 +1207,17 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///
 ///   A reference is `${NAME}`, or `$NAME` followed by `/` or by the end of the
 ///   value's text. zsh reads on past an unbraced name — `$NAME:h` is a
-///   modifier and `$NAME[1]` a subscript — so nothing else may follow one.
+///   modifier and `$NAME[1]` a subscript — so nothing else may follow one;
+/// * **a guarded block's opener** — optional blanks, then `if TEST; then`
+///   where `TEST` is byte for byte one a runtime `when` condition renders
+///   ([`crate::config::when::is_opener`]): a fixed option or `SSH_CONNECTION`
+///   test, or a set-or-equals test on one variable name against a
+///   double-quoted literal with no `$`, `` ` ``, `\`, `"` or `!`. It reads a
+///   variable and assigns none. Not in an `environment.d` fragment, which
+///   runs no test, and not inside another block;
+/// * **a guarded block's close** — optional blanks, then `fi`, closing the one
+///   open block. A `fi` with no block open is refused, and so is a block left
+///   open at the end, at the line that opened it;
 /// * **a gated assignment** — optional blanks, `[[ -d WORD ]] && `, then an
 ///   assignment as above to a name the emit table records as a **search
 ///   list**. `WORD` is one bare word with no `~`. The shell makes the
@@ -1225,9 +1237,15 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// them only into a fragment zsh sources, and an `environment.d` fragment,
 /// read by [`scan_exported`], refuses both as [`Reason::Unreadable`].
 ///
+/// An assignment inside a block is judged exactly as one outside it, so a
+/// condition hides nothing from the guard. After the block closes, every name
+/// it assigned may hold its old value or its new one, so a later reference to
+/// one is [`Reason::UnreadableReference`].
+///
 /// **Everything else is refused**, as [`Reason::Unreadable`] or
 /// [`Reason::MultipleAssignments`], whatever it mentions and whether or not it
-/// relocates anything. That includes every keyword but `export` (`declare`,
+/// relocates anything. That includes every keyword but `export` and the
+/// block's own `if … then` and `fi` (`declare`,
 /// `typeset`, `local`, `readonly`, `unset`, `set`, `alias`, `eval`, `source`,
 /// `.`, `for`, `read`, `printf`), `export` itself quoted or escaped, `export`
 /// with no value, a backslash, a quote that does not close on its line, mixed
@@ -1239,7 +1257,8 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// but where listed (so zsh's `=cmd` and a `~` after `:` never occur), and any
 /// control character. Because no accepted line can leave a quote, a
 /// continuation or a heredoc open, every accepted line begins where a shell
-/// begins a statement, and a multi-line construct is refused at its first line.
+/// begins a statement, and every multi-line construct but a guarded block is
+/// refused at its first line.
 ///
 /// A name the shell manages itself — `HOME`, `RANDOM`, `LINENO`, zsh's `path`
 /// and the rest of `SHELL_NAMES` — or acts on when it is assigned —
@@ -1353,6 +1372,9 @@ pub fn scan(content: &str) -> Vec<Violation> {
 fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>, Scope) {
     let mut scope = Scope::default();
     let mut found = Vec::new();
+    // The open guarded block: the line that opened it, and every name
+    // assigned inside it.
+    let mut block: Option<(usize, Vec<String>)> = None;
     for (idx, line) in content.split('\n').enumerate() {
         let violation = |name: &str, value: &str, reason| Violation {
             line: idx + 1,
@@ -1360,12 +1382,22 @@ fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>
             value: value.to_string(),
             reason,
         };
+        let mut refuse = |scope: &mut Scope| {
+            found.push(violation("", line.trim_matches(BLANKS), Reason::Unreadable));
+            scope.forget_everything();
+        };
         match readable(statement(line), every_exported) {
             Statement::Nothing => {}
-            Statement::Refused => {
-                found.push(violation("", line.trim_matches(BLANKS), Reason::Unreadable));
-                scope.forget_everything();
-            }
+            // `environment.d` runs no test, and a block does not nest.
+            Statement::Open if every_exported || block.is_some() => refuse(&mut scope),
+            Statement::Open => block = Some((idx, Vec::new())),
+            Statement::Close => match block.take() {
+                // After the block a name it assigned holds either value, so a
+                // later reference to it cannot be judged.
+                Some((_, assigned)) => scope.forget_conditional(&assigned),
+                None => refuse(&mut scope),
+            },
+            Statement::Refused => refuse(&mut scope),
             Statement::Assign {
                 name,
                 value,
@@ -1376,6 +1408,9 @@ fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>
                     found.push(violation(name, value, reason));
                 }
                 scope.learn(name, judged);
+                if let Some((_, assigned)) = block.as_mut() {
+                    assigned.push(name.to_string());
+                }
             }
             Statement::Gated {
                 name,
@@ -1389,6 +1424,9 @@ fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>
                 }
                 scope.learn(name, judged);
                 scope.perhaps(name);
+                if let Some((_, assigned)) = block.as_mut() {
+                    assigned.push(name.to_string());
+                }
             }
             Statement::Removal { word } => {
                 // Only an entry the guard can name is taken out: a reference
@@ -1398,8 +1436,23 @@ fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>
                     found.push(violation(SEARCH_PATH, word.text, reason));
                 }
                 scope.narrowed(SEARCH_PATH);
+                if let Some((_, assigned)) = block.as_mut() {
+                    assigned.push(SEARCH_PATH.to_string());
+                }
             }
         }
+    }
+    // A block left open swallows the rest of the file into its condition,
+    // and is refused at the line that opened it.
+    if let Some((opened, _)) = block {
+        let line = content.split('\n').nth(opened).unwrap_or_default();
+        found.push(Violation {
+            line: opened + 1,
+            name: String::new(),
+            value: line.trim_matches(BLANKS).to_string(),
+            reason: Reason::Unreadable,
+        });
+        scope.forget_everything();
     }
     (found, scope)
 }
@@ -1829,6 +1882,19 @@ impl Scope {
             .insert(name.to_string(), Err(Reason::UnreadableReference));
     }
 
+    /// After a guarded block closes, know nothing about what it assigned: the
+    /// shell may or may not have run it, so each name holds either its value
+    /// from before the block or the one inside it. A later reference to one is
+    /// [`Reason::UnreadableReference`], and a search list extends nothing the
+    /// guard can name.
+    fn forget_conditional(&mut self, assigned: &[String]) {
+        for name in assigned {
+            self.learned
+                .insert(name.clone(), Err(Reason::UnreadableReference));
+            self.extended.remove(name);
+        }
+    }
+
     /// After a line the guard did not read, know nothing.
     fn forget_everything(&mut self) {
         self.learned.clear();
@@ -1882,6 +1948,11 @@ enum Statement<'a> {
     /// `WORD` taken out, and nothing else changed. `word` is the bare word
     /// removed, already read.
     Removal { word: Word<'a> },
+    /// `if TEST; then`, where `TEST` is exactly one a runtime `when` condition
+    /// renders ([`crate::config::when::is_opener`]).
+    Open,
+    /// `fi`, closing the block an [`Statement::Open`] opened.
+    Close,
     /// Not a statement the grammar reads.
     Refused,
 }
@@ -1909,6 +1980,12 @@ fn statement(line: &str) -> Statement<'_> {
         } else {
             Statement::Nothing
         };
+    }
+    if text == crate::config::when::CLOSER {
+        return Statement::Close;
+    }
+    if crate::config::when::is_opener(text) {
+        return Statement::Open;
     }
     if let Some(gated) = text.strip_prefix(GATE.0) {
         return gated
@@ -1971,9 +2048,9 @@ fn exact_word(text: &str) -> Option<Word<'_>> {
     }
 }
 
-/// `statement` as a fragment of this syntax reads it: every form but a blank,
-/// a comment and an assignment is zsh's own, and an `environment.d` fragment,
-/// where `every_exported`, reads none of them.
+/// `statement` as a fragment of this syntax reads it: a gated assignment and a
+/// removal are zsh's own, and an `environment.d` fragment, where
+/// `every_exported`, reads neither.
 fn readable(statement: Statement<'_>, every_exported: bool) -> Statement<'_> {
     match statement {
         Statement::Gated { .. } | Statement::Removal { .. } if every_exported => Statement::Refused,
@@ -3342,6 +3419,93 @@ mod tests {
     }
 
     #[test]
+    fn a_guarded_block_is_read_and_what_it_hides_is_still_judged() {
+        // Every runtime `when` renders an opener the grammar reads, and the
+        // assignment inside is judged like any other.
+        for test in [
+            "[[ -o interactive ]]",
+            "[[ -o login ]]",
+            "[[ -n ${SSH_CONNECTION-} ]]",
+            "[[ -n ${TMUX+x} ]]",
+            "[[ ${TERM_PROGRAM-} == \"WezTerm\" ]]",
+        ] {
+            let ok = format!("if {test}; then\n  export CARGO_HOME={ROOT}/cargo\nfi\n");
+            assert_eq!(scan_with(&ok, &rooted()), vec![], "{ok}");
+            // A relocating export behind a condition is refused at its line.
+            let hidden = format!("if {test}; then\n  export CARGO_HOME=/var/cache/elsewhere\nfi\n");
+            assert_eq!(
+                reasons(&hidden, &rooted()),
+                vec![(2, Reason::OutsideDeclaredRoots)],
+                "{hidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_that_is_not_one_a_when_renders_is_refused() {
+        let body = format!("  export CARGO_HOME={ROOT}/cargo\n");
+        for (content, line) in [
+            // Inlined beside the assignment rather than guarding a block.
+            (
+                format!("[[ -o interactive ]] && export CARGO_HOME={ROOT}/cargo\n"),
+                1,
+            ),
+            // A runtime tool lookup, which a `has:` never renders.
+            (format!("if command -v sccache; then\n{body}fi\n"), 1),
+            (format!("if [[ -o monitor ]]; then\n{body}fi\n"), 1),
+            // A stray `fi`.
+            (format!("{body}fi\n"), 2),
+            // A nested opener.
+            (
+                format!("if [[ -o login ]]; then\nif [[ -o login ]]; then\n{body}fi\nfi\n"),
+                2,
+            ),
+            // A block never closed, refused where it opened.
+            (format!("if [[ -o login ]]; then\n{body}"), 1),
+        ] {
+            let found = reasons(&content, &rooted());
+            assert!(
+                found.contains(&(line, Reason::Unreadable)),
+                "{content}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_d_reads_no_block() {
+        let content = format!("if [[ -o login ]]; then\nCARGO_HOME={ROOT}/cargo\nfi\n");
+        let found = scan_exported(&content, &rooted());
+        assert_eq!(found[0].line, 1);
+        assert_eq!(found[0].reason, Reason::Unreadable);
+    }
+
+    #[test]
+    fn a_name_a_block_assigned_is_unknown_after_it() {
+        // The shell may or may not have run the block, so the name holds one
+        // of two values and a later reference to it cannot be judged. Inside
+        // the block it is known.
+        let content = format!(
+            "SCRATCH_HOME={ROOT}\n\
+             if [[ -o login ]]; then\n  SCRATCH_HOME=/etc\n  export GOPATH=$SCRATCH_HOME/go\nfi\n\
+             export CARGO_HOME=$SCRATCH_HOME/cargo\n"
+        );
+        assert_eq!(
+            reasons(&content, &rooted()),
+            vec![
+                (3, Reason::OutsideDeclaredRoots),
+                (4, Reason::OutsideDeclaredRoots),
+                (6, Reason::UnreadableReference)
+            ]
+        );
+        // A name the block did not assign is still known after it.
+        let content = format!(
+            "SCRATCH_HOME={ROOT}\nif [[ -o login ]]; then\nfi\n\
+             export CARGO_HOME=$SCRATCH_HOME/cargo\n"
+        );
+        assert_eq!(scan_with(&content, &rooted()), vec![]);
+    }
+
+    #[test]
     fn whitespace_in_a_value_is_not_a_second_assignment() {
         // The refusal is for another `NAME=`, not for a space: a quoted path
         // with a space in it, and a trailing comment, both still resolve.
@@ -3731,6 +3895,19 @@ mod tests {
             ),
             vec![(3, Reason::UnreadableReference)]
         );
+        // Inside a `when` block, either form assigns PATH as an assignment
+        // there does, and the list extends nothing the guard can name after
+        // the block closes.
+        for line in ["[[ -d /a ]] && export PATH=/a:$PATH", "path=(${path:#/a})"] {
+            assert_eq!(
+                reasons(
+                    &format!("if [[ -o login ]]; then\n  {line}\nfi\nexport PATH=/b:$PATH\n"),
+                    &roots
+                ),
+                vec![(4, Reason::UnreadableReference)],
+                "{line:?}"
+            );
+        }
         // An entry a later line would add is judged after a removal too.
         assert_eq!(
             reasons(
@@ -6611,11 +6788,13 @@ mod tests {
         //
         // `config/env.rs` imports only the name predicate, so the `[[env]]`
         // parser and the guard agree on what a variable name is; a predicate
-        // reads no fragment and writes no bytes. `config/path.rs` imports the
-        // same predicate for the references a `[path]` entry holds.
-        const KNOWN: [(&str, &str); 10] = [
+        // reads no fragment and writes no bytes. `config/when.rs` imports it
+        // for the same reason, to check the name a `when = "env:NAME"` tests,
+        // and `config/path.rs` for the references a `[path]` entry holds.
+        const KNOWN: [(&str, &str); 11] = [
             ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
             ("config/env.rs", "use crate::env_guard::is_variable_name;"),
+            ("config/when.rs", "use crate::env_guard::is_variable_name;"),
             ("config/path.rs", "use crate::env_guard::is_variable_name;"),
             ("adopt.rs", "env_guard::scan_with(text, roots)"),
             ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
@@ -8572,7 +8751,7 @@ mod tests {
 
     #[test]
     fn the_path_lines_bx_writes_are_approved_and_give_zsh_the_declared_order() {
-        use crate::config::env::{Fragment, Syntax};
+        use crate::config::env::{Fragment, Syntax, Var};
         use crate::config::path::{PathEntry, Position, shell_spelling};
         let shells = Shells::found();
         let Some((shell, program, _)) = shells
@@ -8598,7 +8777,7 @@ mod tests {
         let cargo = root.join("cargo");
         let fragment = Fragment {
             syntax: Syntax::Zsh,
-            vars: vec![("CARGO_HOME".to_string(), cargo.display().to_string())],
+            vars: vec![Var::always("CARGO_HOME", cargo.display().to_string())],
             path: vec![
                 entry("/opt/tool/bin", Position::Append, false),
                 entry("~/bin", Position::Prepend, false),
@@ -8608,7 +8787,7 @@ mod tests {
                 entry("~/.cargo/bin", Position::Remove, false),
             ],
         }
-        .render();
+        .render(&|_| unreachable!("nothing is gated on a tool"));
         assert_eq!(scan_with(&fragment, &shells.rooted()), vec![]);
 
         // An inherited PATH holding the stale install and a declared entry

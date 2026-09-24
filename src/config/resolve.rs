@@ -58,7 +58,7 @@
 
 use std::path::Path;
 
-use super::env::{EnvDecl, Fragment, Place, Syntax};
+use super::env::{EnvDecl, Fragment, Place, Syntax, Var};
 use super::merge::Conflict;
 use super::path::PathEntry;
 use super::target::{Attach, Body, Direction, Format, Gen, KeyPath, Target};
@@ -242,7 +242,7 @@ fn place_envs(
 
     let mut placed = Vec::new();
     for place in Place::ALL {
-        let here: Vec<&(&EnvDecl, Resolution<(String, String)>)> = resolved
+        let here: Vec<&(&EnvDecl, Resolution<Var>)> = resolved
             .iter()
             .filter(|(decl, _)| decl.kind.places().contains(&place))
             .collect();
@@ -307,7 +307,7 @@ fn place_envs(
 fn fragment_target(
     place: Place,
     path: Portable,
-    vars: Vec<(String, String)>,
+    vars: Vec<Var>,
     entries: Vec<PathEntry>,
     origin: &Origin,
 ) -> Target {
@@ -406,10 +406,7 @@ fn placed_target(
 /// # Errors
 ///
 /// [`Error::BadValue`] for a repo defect, as [`place_envs`] lists.
-fn resolve_env(
-    decl: &EnvDecl,
-    values: &ResolvedValues,
-) -> Result<Resolution<(String, String)>, Error> {
+fn resolve_env(decl: &EnvDecl, values: &ResolvedValues) -> Result<Resolution<Var>, Error> {
     let block = |reason, hint| {
         Ok(Resolution::Blocked(BlockedEntry {
             key: decl.name.clone(),
@@ -422,7 +419,11 @@ fn resolve_env(
     match values.substitute(&decl.value) {
         Ok(value) => {
             let Some(problem) = super::env::unwritable(&value) else {
-                return Ok(Resolution::Ready((decl.name.clone(), value)));
+                return Ok(Resolution::Ready(Var {
+                    name: decl.name.clone(),
+                    value,
+                    when: decl.when.clone(),
+                }));
             };
             // Checked as written at parse, so the character came in through a
             // value: an account's answer, whose line the hint names, or a
@@ -1567,7 +1568,7 @@ mod tests {
             zshrc_fragment.body,
             Body::Generated(Gen::Env(Fragment {
                 syntax: Syntax::Zsh,
-                vars: vec![("EDITOR".to_string(), "x".to_string())],
+                vars: vec![Var::always("EDITOR", "x")],
                 path: Vec::new(),
             }))
         );

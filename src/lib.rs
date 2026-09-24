@@ -52,7 +52,9 @@
 //! this account's unset values asked for and saved to `local.toml`, and the
 //! config already on the machine offered to `bx add`. [`command`]
 //! holds the commands' bodies, `bx doctor`'s among them, so the binary only
-//! parses its arguments and dispatches.
+//! parses its arguments and dispatches. [`sync`] is the git on either side of
+//! `bx sync`'s apply: a fast-forward-only pull before it, and a push after it
+//! that never carries a state file.
 //!
 //! [`doctor`] reads the same resolved targets without deciding them, and asks
 //! read-only questions about what is on disk — whether systemd has reloaded,
@@ -100,6 +102,7 @@ pub mod report;
 pub mod restore;
 pub mod secret;
 pub mod state;
+pub mod sync;
 #[doc(hidden)]
 pub mod testing;
 

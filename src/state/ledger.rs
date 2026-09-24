@@ -257,6 +257,21 @@ impl NewEntry {
     }
 }
 
+/// A target's entry as it was before a [`Ledger::record`], kept so that a
+/// record whose write never landed can be undone with [`Ledger::withdraw`].
+///
+/// Taken by [`LedgerView::withdrawal`]. A record is made before the write it
+/// describes is published, and the publish can still be refused; on a
+/// re-record the entry it replaced holds the prior `bx rm` restores, so
+/// undoing the record means putting that entry back, not dropping the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawal {
+    /// The target the record is keyed on.
+    path: crate::paths::Portable,
+    /// Its entry before the record, or `None` when it had none.
+    before: Option<LedgerEntry>,
+}
+
 /// The ledger, read-only.
 ///
 /// Takes no lock. Every state file is replaced by `rename`, so the worst a
@@ -527,6 +542,16 @@ impl LedgerView {
     #[must_use]
     pub fn get(&self, path: &crate::paths::Portable) -> Option<&LedgerEntry> {
         self.entries.get(path)
+    }
+
+    /// What [`Ledger::withdraw`] needs to undo the next record of `path`: the
+    /// entry as it is now, or that there is none.
+    #[must_use]
+    pub fn withdrawal(&self, path: &crate::paths::Portable) -> Withdrawal {
+        Withdrawal {
+            path: path.clone(),
+            before: self.entries.get(path).cloned(),
+        }
     }
 
     /// Every entry, in ascending path order.
@@ -1048,9 +1073,34 @@ impl Ledger {
     /// The restore blob is deliberately left in place: it may be shared with
     /// another entry, and content-addressed bytes cost far less than a wrong
     /// deletion. Reclaiming unreferenced blobs is not implemented.
+    ///
+    /// It is **not** how a record whose write was then refused is undone:
+    /// on any apply after the first there was an entry before that record, and
+    /// dropping it loses the prior the user had before bx, which is Invariant 4
+    /// inverted. [`Ledger::withdraw`] puts back exactly what was there.
     #[must_use = "the entry removed is the only record of what was there; drop it deliberately"]
     pub fn forget(&mut self, path: &crate::paths::Portable) -> Option<LedgerEntry> {
         self.view.entries.remove(path)
+    }
+
+    /// Undo a [`Ledger::record`] whose write never landed, by putting back the
+    /// entry `withdrawal` captured before it — or no entry, when there was none.
+    ///
+    /// Take the [`Withdrawal`] with [`LedgerView::withdrawal`] **before** the
+    /// `record`, keep it across the publish, and hand it here when the publish
+    /// is refused. The entry comes back exactly as it was: its prior, its
+    /// history and its created directories, not only its key. Returns the
+    /// entry the refused record had left, if any.
+    ///
+    /// Any blob that `record` stored in `restore/` stays there: blobs are
+    /// content-addressed and may be shared, as [`Ledger::forget`] says.
+    #[must_use = "the entry withdrawn describes a write that never landed; drop it deliberately"]
+    pub fn withdraw(&mut self, withdrawal: Withdrawal) -> Option<LedgerEntry> {
+        let Withdrawal { path, before } = withdrawal;
+        match before {
+            Some(entry) => self.view.entries.insert(path, entry),
+            None => self.view.entries.remove(&path),
+        }
     }
 
     /// Accept a target as it is now as the version `bx rm` restores — the way

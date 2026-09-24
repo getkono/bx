@@ -19,8 +19,8 @@
 //!    [`crate::state::Ledger::record`] makes it durable — **before** the
 //!    rename, so a crash after the rename still has a recoverable prior state.
 //!    Steps 6 and 7 can still refuse or fail, so this record can outlive a
-//!    write that never lands; [`Unpublished`] names the write so its entry can
-//!    be withdrawn, and [`Filled::new_entry`] says when it must be.
+//!    write that never lands; [`Unpublished`] names the write so its record
+//!    can be withdrawn, and [`Filled::new_entry`] says when and how.
 //! 6. the destination `lstat`ed again and compared with what step 1 saw, and
 //!    the write refused if it changed.
 //! 7. `rename`.
@@ -1431,15 +1431,22 @@ impl Filled {
     /// opened, a `rename` out of space.
     ///
     /// So a caller that records an entry **must withdraw it when the publish is
-    /// refused**, with [`crate::state::Ledger::forget`], before it saves the
-    /// ledger. [`Unpublished`] exists so that it can: `publish` consumes the
-    /// `Filled`, and the refusal hands back the destination this entry is keyed
-    /// on. A durable entry for a write that never landed makes `bx rm` restore
-    /// the recorded prior over content bx never replaced, which is Invariant 4
-    /// inverted.
+    /// refused**, before it saves the ledger: take
+    /// [`crate::state::LedgerView::withdrawal`] for the entry's path before the
+    /// `record`, and hand it to [`crate::state::Ledger::withdraw`] on refusal.
+    /// That puts back the entry as it was before the record — on a re-record,
+    /// with the prior the user had before bx — rather than dropping the key,
+    /// which [`crate::state::Ledger::forget`] would do and which loses that
+    /// prior. [`Unpublished`] names the destination the entry is keyed on,
+    /// because `publish` consumes the `Filled`. A durable entry for a write
+    /// that never landed makes `bx rm` restore the recorded prior over content
+    /// bx never replaced, which is Invariant 4 inverted.
     ///
     /// Pinned by
-    /// `a_ledger_entry_for_a_refused_publish_is_withdrawn_through_what_the_refusal_names`.
+    /// `a_ledger_entry_for_a_refused_publish_is_withdrawn_through_what_the_refusal_names`
+    /// for a first record, and by
+    /// `a_refused_re_record_is_withdrawn_to_the_entry_it_replaced` for a
+    /// re-record.
     ///
     /// # Errors
     ///
@@ -1568,9 +1575,9 @@ impl Filled {
 /// `publish`, because the bytes a rename displaces have to be durable before
 /// anything displaces them — so by the time a publish is refused, a caller with
 /// a ledger has already recorded an entry for a write that did not happen. That
-/// entry has to be withdrawn with [`crate::state::Ledger::forget`] before the
-/// ledger is saved, or `bx rm` will restore the recorded prior over content bx
-/// never replaced.
+/// record has to be withdrawn with [`crate::state::Ledger::withdraw`] before
+/// the ledger is saved, or `bx rm` will restore the recorded prior over content
+/// bx never replaced; see [`Filled::new_entry`].
 ///
 /// `publish` consumes the [`Filled`], so nothing the caller still holds names
 /// the write afterwards. This does: [`Unpublished::dest`] is the path
@@ -7230,6 +7237,8 @@ mod tests {
             .expect("stage")
             .fill(b"Host new\n")
             .expect("fill");
+        let key = Portable::from_path(&dest, home.path()).expect("portable");
+        let withdrawal = ledger.withdrawal(&key);
         let recorded = ledger
             .record(
                 filled
@@ -7269,9 +7278,16 @@ mod tests {
             "the snapshot is durable, and it is not what is on disk now",
         );
 
-        // The withdrawal, keyed on nothing but what the refusal handed back.
-        let key = Portable::from_path(&refused.dest, home.path()).expect("portable");
-        let withdrawn = ledger.forget(&key).expect("the entry is there to withdraw");
+        // The withdrawal: the refusal names the entry's key, and the entry
+        // before the record was none, so none is put back.
+        assert_eq!(
+            Portable::from_path(&refused.dest, home.path()).expect("portable"),
+            key,
+            "the refusal names the key the withdrawal was taken for",
+        );
+        let withdrawn = ledger
+            .withdraw(withdrawal)
+            .expect("the entry is there to withdraw");
         assert_eq!(withdrawn.written, ContentHash::of(b"Host new\n"));
         assert!(ledger.is_empty(), "nothing claims the target now");
         ledger.save().expect("save");
@@ -7281,6 +7297,93 @@ mod tests {
         // content-addressed and reused rather than owned by one entry.
         let reread = LedgerView::read(&dir, home.path()).expect("read").value;
         assert!(reread.is_empty(), "the durable ledger claims nothing");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"Host theirs\n");
+    }
+
+    #[test]
+    fn a_refused_re_record_is_withdrawn_to_the_entry_it_replaced() {
+        // Every apply after the first re-records a target bx already has an
+        // entry for, and that entry holds the prior the user had before bx.
+        // Withdrawing a refused re-record by dropping the key — `forget` —
+        // loses that prior for good. The withdrawal puts back the whole entry
+        // as it was before the record: prior, history and all.
+        let home = guarded_home();
+        let (dir, _lock, mut ledger) = ledger_for(&home);
+        let dest = home.child(".ssh/config");
+        seed(&dest, b"Host old\n", Mode::from_bits(0o640));
+        let key = Portable::from_path(&dest, home.path()).expect("portable");
+
+        // The first apply lands, and the ledger is saved.
+        let first = stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host v1\n")
+            .expect("fill");
+        ledger
+            .record(
+                first
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry"),
+            )
+            .expect("record");
+        first.publish().expect("publish");
+        ledger.save().expect("save");
+        let before = ledger.get(&key).expect("recorded").clone();
+        let Prior::Existed(original) = &before.prior else {
+            panic!("the prior state must be Existed, got {:?}", before.prior);
+        };
+
+        // The user edits the result, so the second apply's record adopts the
+        // edit as the prior and moves the original to the history — the
+        // re-record that changes the most.
+        std::fs::write(&dest, b"Host edited\n").expect("the user edits");
+        let withdrawal = ledger.withdrawal(&key);
+        let second = stage_now(&dest, Mode::PRIVATE_FILE)
+            .expect("stage")
+            .fill(b"Host v2\n")
+            .expect("fill");
+        let recorded = ledger
+            .record(
+                second
+                    .new_entry(home.path(), Mechanism::Own)
+                    .expect("a portable entry"),
+            )
+            .expect("record")
+            .clone();
+        assert_ne!(recorded, before, "the re-record changed the entry");
+        assert_eq!(recorded.superseded, vec![original.clone()]);
+
+        // The user saves again between the record and the rename.
+        std::fs::write(&dest, b"Host theirs\n").expect("the user saves");
+        let refused = second.publish().expect_err("the destination changed");
+        assert!(
+            matches!(refused.error, Error::Changed { .. }),
+            "{:?}",
+            refused.error,
+        );
+        assert_eq!(
+            Portable::from_path(&refused.dest, home.path()).expect("portable"),
+            key,
+        );
+
+        let withdrawn = ledger.withdraw(withdrawal).expect("the refused record");
+        assert_eq!(withdrawn, recorded, "the refused record is handed back");
+        assert_eq!(
+            ledger.get(&key),
+            Some(&before),
+            "the entry is exactly what it was before the record",
+        );
+        ledger.save().expect("save");
+
+        // Durably: `bx rm` still restores the file the user had before bx.
+        let reread = LedgerView::read(&dir, home.path()).expect("read").value;
+        let entry = reread.get(&key).expect("the entry survives the withdrawal");
+        assert_eq!(entry, &before);
+        assert_eq!(
+            reread
+                .restore_bytes(&dir, original)
+                .expect("the original prior"),
+            b"Host old\n",
+        );
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host theirs\n");
     }
 

@@ -152,6 +152,7 @@ use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
+use crate::shell::plugin::{self, PluginDecl};
 
 /// A list entry that merges by a natural key.
 ///
@@ -251,6 +252,21 @@ impl Keyed for FunctionDecl {
     }
 }
 
+impl Keyed for PluginDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 impl Keyed for PathEntry {
     /// The directory as zsh is given it, so two spellings of one directory
     /// are one entry.
@@ -291,6 +307,8 @@ pub enum Section {
     Alias,
     /// `[[function]]`, keyed by `name`.
     Function,
+    /// `[[plugin]]`, keyed by `name`.
+    Plugin,
 }
 
 impl Section {
@@ -303,6 +321,7 @@ impl Section {
             Self::Env => "env",
             Self::Alias => "alias",
             Self::Function => "function",
+            Self::Plugin => "plugin",
         }
     }
 
@@ -315,6 +334,7 @@ impl Section {
             Self::Env => super::env::SECTION,
             Self::Alias => crate::shell::alias::SECTION,
             Self::Function => crate::shell::function::SECTION,
+            Self::Plugin => plugin::SECTION,
         }
     }
 
@@ -323,7 +343,7 @@ impl Section {
     pub fn natural_key(self) -> &'static str {
         match self {
             Self::Target => "path",
-            Self::Value | Self::Env | Self::Alias | Self::Function => "name",
+            Self::Value | Self::Env | Self::Alias | Self::Function | Self::Plugin => "name",
         }
     }
 
@@ -339,6 +359,7 @@ impl Section {
             Self::Env => "a `value` and a `kind`",
             Self::Alias => "a `command`",
             Self::Function => "a `body`",
+            Self::Plugin => "a `source`",
         }
     }
 }
@@ -715,7 +736,11 @@ impl Merged<Target, TargetKey> {
                         fragile,
                     });
                 }
-                Section::Value | Section::Env | Section::Alias | Section::Function => {}
+                Section::Value
+                | Section::Env
+                | Section::Alias
+                | Section::Function
+                | Section::Plugin => {}
             }
         }
 
@@ -1112,8 +1137,9 @@ fn refuse_twice(earlier: &Said, spelling: &str, origin: &Origin) -> Error {
 ///
 /// [`Error::BadValue`] when a committed layer carries a `[values]` table, when a
 /// toggle names a key no earlier layer introduced, when one layer names one
-/// file twice with no account answer in either spelling, or for any defect
-/// [`ResolvedValues::resolve`] reports. The same collision with an answer in it
+/// file twice with no account answer in either spelling, when two enabled
+/// plugins claim the terminal slot ([`plugin::check_terminal`]), or for any
+/// defect [`ResolvedValues::resolve`] reports. The same collision with an answer in it
 /// is not an error; it is carried to [`super::resolve`] as a [`Conflict`].
 pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut values: Merged<ValueDecl> = Merged::default();
@@ -1122,6 +1148,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut path: Merged<PathEntry> = Merged::default();
     let mut aliases: Merged<AliasDecl> = Merged::default();
     let mut functions: Merged<FunctionDecl> = Merged::default();
+    let mut plugins: Merged<PluginDecl> = Merged::default();
     let mut secrets = Secrets::default();
 
     // Values first, across every layer. A value never depends on a target, and
@@ -1134,7 +1161,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // keyed by its directory, which holds no placeholder; and so does an
     // alias, keyed by its name, whichever of its two tables it is written in;
     // and so does a function, keyed by its name, whose body's placeholders are
-    // substituted only once the values are final.
+    // substituted only once the values are final; and so does a plugin, keyed
+    // by its name, which holds no placeholder.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1145,6 +1173,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         path.absorb(layer.config.path.iter().cloned());
         aliases.absorb(layer.config.aliases.iter().cloned());
         functions.absorb(layer.config.functions.iter().cloned());
+        plugins.absorb(layer.config.plugins.iter().cloned());
 
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
@@ -1154,6 +1183,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Env => envs.toggle(toggle)?,
                 Section::Alias => aliases.toggle(toggle)?,
                 Section::Function => functions.toggle(toggle)?,
+                Section::Plugin => plugins.toggle(toggle)?,
                 Section::Target => {}
             }
         }
@@ -1171,6 +1201,12 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // `{{git_email}}` reads as a repo typo, which is fatal, and the three-line
     // toggle an account is invited to write stops the whole load with a message
     // naming a committed file it cannot edit.
+    // Over the plugins the layers left enabled, so a claim a later layer
+    // switched off does not count, and before anything else is resolved: two
+    // terminal claimants are a defect in the configuration as a whole.
+    let plugins = plugins.into_enabled();
+    plugin::check_terminal(&plugins)?;
+
     let values = values.into_entries();
     let resolved = ResolvedValues::resolve(values.clone(), &assignments, home)?;
 
@@ -1198,6 +1234,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         aliases: aliases.into_enabled(),
         // Nor to a function.
         functions: functions.into_enabled(),
+        // Nor to a plugin.
+        plugins,
         secrets,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
@@ -1468,6 +1506,89 @@ mod tests {
     }
 
     #[test]
+    fn plugins_merge_by_name_and_a_toggle_flips_one() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[[plugin]]\nname = \"a\"\nsource = \"~/a.zsh\"\n\
+                 [[plugin]]\nname = \"b\"\nsource = \"~/b.zsh\"\n\
+                 [[plugin]]\nname = \"c\"\nsource = \"~/c.zsh\"\nenabled = false\n",
+            ),
+            global(
+                "modules/m.toml",
+                "[[plugin]]\nname = \"a\"\nsource = \"/usr/share/a.zsh\"\nterminal = true\n",
+            ),
+            local(
+                "[[plugin]]\nname = \"b\"\nenabled = false\n\
+                 [[plugin]]\nname = \"c\"\nenabled = true\n",
+            ),
+        ])
+        .unwrap();
+        let plugins: Vec<(&str, &str, bool, &Path)> = merged
+            .plugins
+            .iter()
+            .map(|p| {
+                (
+                    p.name.as_str(),
+                    p.source.as_str(),
+                    p.terminal,
+                    p.origin.file.as_path(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            plugins,
+            vec![
+                ("a", "/usr/share/a.zsh", true, Path::new("modules/m.toml")),
+                ("c", "~/c.zsh", false, Path::new("bx.toml")),
+            ]
+        );
+
+        let message = failure(&[
+            global(
+                "bx.toml",
+                "[[plugin]]\nname = \"a\"\nsource = \"~/a.zsh\"\n",
+            ),
+            local("[[plugin]]\nname = \"z\"\nenabled = true\n"),
+        ]);
+        assert!(message.contains("`z`"), "{message}");
+        assert!(message.contains("a `source`"), "{message}");
+    }
+
+    #[test]
+    fn a_second_terminal_claimant_fails_the_merge_unless_a_layer_switches_one_off() {
+        let claimants = "[[plugin]]\nname = \"zsh-syntax-highlighting\"\n\
+                         source = \"~/zsh/zsh-syntax-highlighting.zsh\"\nterminal = true\n";
+        let second = "[[plugin]]\nname = \"fast-syntax-highlighting\"\n\
+                      source = \"~/zsh/fast-syntax-highlighting.zsh\"\nterminal = true\n";
+
+        // Across two layers, and named by both with the first one's origin.
+        let message = failure(&[
+            global("bx.toml", claimants),
+            global("modules/m.toml", second),
+        ]);
+        assert!(message.starts_with("modules/m.toml:1: "), "{message}");
+        assert!(
+            message.contains("plugin `fast-syntax-highlighting` claims the terminal slot"),
+            "{message}"
+        );
+        assert!(
+            message.contains("plugin `zsh-syntax-highlighting` already claims at bx.toml:1"),
+            "{message}"
+        );
+
+        // A later layer switching either claim off settles it.
+        let merged = merge(&[
+            global("bx.toml", claimants),
+            global("modules/m.toml", second),
+            local("[[plugin]]\nname = \"zsh-syntax-highlighting\"\nenabled = false\n"),
+        ])
+        .expect("one claimant is left");
+        assert_eq!(merged.plugins.len(), 1);
+        assert_eq!(merged.plugins[0].name, "fast-syntax-highlighting");
+    }
+
+    #[test]
     fn a_later_layer_replaces_an_entry_in_place() {
         let merged = merge(&[
             global("bx.toml", &target_toml("~/.gitconfig", "global")),
@@ -1672,6 +1793,7 @@ mod tests {
             (Section::Env, "env", "[[env]]", "name"),
             (Section::Alias, "alias", "[[alias]]", "name"),
             (Section::Function, "function", "[[function]]", "name"),
+            (Section::Plugin, "plugin", "[[plugin]]", "name"),
         ] {
             assert_eq!(section.key(), key);
             assert_eq!(section.header(), header);

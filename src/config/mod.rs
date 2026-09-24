@@ -34,7 +34,7 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::{alias, function};
+use crate::shell::{alias, function, plugin};
 use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
@@ -78,6 +78,9 @@ pub struct Config {
     /// `[[function]]`'s entries, keyed by `name`, in the order written. See
     /// [`crate::shell::function`].
     pub functions: Vec<crate::shell::function::FunctionDecl>,
+    /// `[[plugin]]`'s entries, keyed by `name`, in the order written. See
+    /// [`crate::shell::plugin`].
+    pub plugins: Vec<crate::shell::plugin::PluginDecl>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
@@ -440,6 +443,16 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     }
                 }
             }
+            "plugin" => {
+                for table in entries(root, name, item, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Plugin, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config
+                            .plugins
+                            .push(plugin::parse_plugin(table, file, text)?),
+                    }
+                }
+            }
             unknown => {
                 return Err(Error::UnknownSection {
                     origin: section_origin(root, unknown, file, text),
@@ -504,6 +517,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|f| (f.name.as_str(), &f.origin))
             .chain(toggles_in(&config, merge::Section::Function))
+            .collect(),
+    )?;
+    check_unique(
+        "plugin",
+        config
+            .plugins
+            .iter()
+            .map(|p| (p.name.as_str(), &p.origin))
+            .chain(toggles_in(&config, merge::Section::Plugin))
             .collect(),
     )?;
 
@@ -1372,6 +1394,34 @@ mod tests {
             "{entry}[[env]]\nname = \"LANG\"\nenabled = false\n"
         ));
         assert!(toggled.contains("duplicate env `LANG`"), "{toggled}");
+    }
+
+    #[test]
+    fn a_plugin_section_parses_and_a_duplicate_name_is_rejected() {
+        let entry = "[[plugin]]\nname = \"autosuggest\"\nsource = \"~/a.zsh\"\n";
+        let config = parse_str(
+            &format!("{entry}[[plugin]]\nname = \"other\"\nenabled = false\n"),
+            Path::new("/repo/bx.toml"),
+            home(),
+        )
+        .expect("parses");
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].name, "autosuggest");
+        assert_eq!(config.toggles.len(), 1);
+        assert_eq!(config.toggles[0].section, merge::Section::Plugin);
+
+        let twice = message(&format!("{entry}{entry}"));
+        assert!(twice.contains("duplicate plugin `autosuggest`"), "{twice}");
+        let toggled = message(&format!(
+            "{entry}[[plugin]]\nname = \"autosuggest\"\nenabled = false\n"
+        ));
+        assert!(
+            toggled.contains("duplicate plugin `autosuggest`"),
+            "{toggled}"
+        );
+        // The entry's own parser runs: a malformed source is refused here.
+        let bad = message("[[plugin]]\nname = \"a\"\nsource = \"a.zsh\"\n");
+        assert!(bad.contains("must open with"), "{bad}");
     }
 
     #[test]

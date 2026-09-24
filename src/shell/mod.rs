@@ -47,9 +47,14 @@
 //! nothing, and the plugin lines [`plugin`] renders only test a file and source
 //! it; the tests below establish both of the bytes actually emitted. The
 //! alias lines [`alias`] renders define an alias and nothing else, and its
-//! tests run them in zsh to establish that too.
+//! tests run them in zsh to establish that too. The `functions` phase
+//! [`function`] renders defines functions and appends to zsh's hook arrays —
+//! shell arrays zsh cannot export, which name what runs at a hook and relocate
+//! nothing — and its tests run it in zsh to establish that those arrays are
+//! the only parameters it changes.
 
 pub mod alias;
+pub mod function;
 pub mod plugin;
 
 /// One named section of the generated interactive shell file.

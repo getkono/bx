@@ -151,6 +151,7 @@ use super::values::{
 use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
 use crate::shell::alias::AliasDecl;
+use crate::shell::function::FunctionDecl;
 
 /// A list entry that merges by a natural key.
 ///
@@ -235,6 +236,21 @@ impl Keyed for AliasDecl {
     }
 }
 
+impl Keyed for FunctionDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 impl Keyed for PathEntry {
     /// The directory as zsh is given it, so two spellings of one directory
     /// are one entry.
@@ -273,6 +289,8 @@ pub enum Section {
     /// `[[alias]]`, keyed by `name`. The flat `[aliases]` table holds no
     /// toggle, since its entries have no `enabled` key to hold.
     Alias,
+    /// `[[function]]`, keyed by `name`.
+    Function,
 }
 
 impl Section {
@@ -284,6 +302,7 @@ impl Section {
             Self::Value => "value",
             Self::Env => "env",
             Self::Alias => "alias",
+            Self::Function => "function",
         }
     }
 
@@ -295,6 +314,7 @@ impl Section {
             Self::Value => super::values::DECL_SECTION,
             Self::Env => super::env::SECTION,
             Self::Alias => crate::shell::alias::SECTION,
+            Self::Function => crate::shell::function::SECTION,
         }
     }
 
@@ -303,7 +323,7 @@ impl Section {
     pub fn natural_key(self) -> &'static str {
         match self {
             Self::Target => "path",
-            Self::Value | Self::Env | Self::Alias => "name",
+            Self::Value | Self::Env | Self::Alias | Self::Function => "name",
         }
     }
 
@@ -318,6 +338,7 @@ impl Section {
             Self::Value => "a `kind`",
             Self::Env => "a `value` and a `kind`",
             Self::Alias => "a `command`",
+            Self::Function => "a `body`",
         }
     }
 }
@@ -694,7 +715,7 @@ impl Merged<Target, TargetKey> {
                         fragile,
                     });
                 }
-                Section::Value | Section::Env | Section::Alias => {}
+                Section::Value | Section::Env | Section::Alias | Section::Function => {}
             }
         }
 
@@ -1100,6 +1121,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut envs: Merged<EnvDecl> = Merged::default();
     let mut path: Merged<PathEntry> = Merged::default();
     let mut aliases: Merged<AliasDecl> = Merged::default();
+    let mut functions: Merged<FunctionDecl> = Merged::default();
     let mut secrets = Secrets::default();
 
     // Values first, across every layer. A value never depends on a target, and
@@ -1110,7 +1132,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // An `[[env]]` entry is keyed by its name as written, which no answer can
     // change, so it folds here beside the values; so does a `[path]` entry,
     // keyed by its directory, which holds no placeholder; and so does an
-    // alias, keyed by its name, whichever of its two tables it is written in.
+    // alias, keyed by its name, whichever of its two tables it is written in;
+    // and so does a function, keyed by its name, whose body's placeholders are
+    // substituted only once the values are final.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1120,6 +1144,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         envs.absorb(layer.config.envs.iter().cloned());
         path.absorb(layer.config.path.iter().cloned());
         aliases.absorb(layer.config.aliases.iter().cloned());
+        functions.absorb(layer.config.functions.iter().cloned());
 
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
@@ -1128,6 +1153,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Value => values.toggle(toggle)?,
                 Section::Env => envs.toggle(toggle)?,
                 Section::Alias => aliases.toggle(toggle)?,
+                Section::Function => functions.toggle(toggle)?,
                 Section::Target => {}
             }
         }
@@ -1170,6 +1196,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         path: path.into_enabled(),
         // Nor to an alias.
         aliases: aliases.into_enabled(),
+        // Nor to a function.
+        functions: functions.into_enabled(),
         secrets,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
@@ -1603,6 +1631,7 @@ mod tests {
             (Section::Value, "value", "[[value]]", "name"),
             (Section::Env, "env", "[[env]]", "name"),
             (Section::Alias, "alias", "[[alias]]", "name"),
+            (Section::Function, "function", "[[function]]", "name"),
         ] {
             assert_eq!(section.key(), key);
             assert_eq!(section.header(), header);

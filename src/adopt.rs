@@ -392,7 +392,7 @@ fn visit(
         Kind::Symlink => rows.push(pass(
             "is a symbolic link; bx adopts files, not what a link points at".to_string(),
         )),
-        Kind::Dir if !named && dest.file_name().is_some_and(|name| name == ".git") => {
+        Kind::Dir if dest.file_name().is_some_and(|name| name == ".git") => {
             rows.push(pass(
                 "is a git repository's own directory, which the config repo cannot hold"
                     .to_string(),
@@ -1174,6 +1174,11 @@ mod tests {
             "path = \"~/.config/app/a\"\nfile = \"files/.config/app/a\"\nmode = \"0755\"\n"
         ));
         assert!(!body(&home, ".config/app/.git").exists());
+        let rows = add_rel(&home, ".config/app/.git");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }] if note.contains("git repository")),
+            "named, it is refused rather than walked: {rows:?}"
+        );
         assert_eq!(plan_exit(&home).0, Exit::Converged);
     }
 

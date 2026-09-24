@@ -142,6 +142,7 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::env::EnvDecl;
+use super::external::External;
 use super::history::History;
 use super::path::PathEntry;
 use super::secrets::Secrets;
@@ -269,6 +270,23 @@ impl Keyed for PluginDecl {
     }
 }
 
+impl Keyed for External {
+    /// The checkout's directory, as its one normalised spelling. Nothing in
+    /// an external is substituted, so the path written is the directory.
+    fn key(&self) -> &str {
+        self.path.as_str()
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 impl Keyed for PathEntry {
     /// The directory as zsh is given it, so two spellings of one directory
     /// are one entry.
@@ -311,6 +329,8 @@ pub enum Section {
     Function,
     /// `[[plugin]]`, keyed by `name`.
     Plugin,
+    /// `[[external]]`, keyed by `path`.
+    External,
 }
 
 impl Section {
@@ -324,6 +344,7 @@ impl Section {
             Self::Alias => "alias",
             Self::Function => "function",
             Self::Plugin => "plugin",
+            Self::External => "external",
         }
     }
 
@@ -337,6 +358,7 @@ impl Section {
             Self::Alias => crate::shell::alias::SECTION,
             Self::Function => crate::shell::function::SECTION,
             Self::Plugin => plugin::SECTION,
+            Self::External => super::external::SECTION,
         }
     }
 
@@ -344,7 +366,7 @@ impl Section {
     #[must_use]
     pub fn natural_key(self) -> &'static str {
         match self {
-            Self::Target => "path",
+            Self::Target | Self::External => "path",
             Self::Value | Self::Env | Self::Alias | Self::Function | Self::Plugin => "name",
         }
     }
@@ -362,6 +384,7 @@ impl Section {
             Self::Alias => "a `command`",
             Self::Function => "a `body`",
             Self::Plugin => "a `source`",
+            Self::External => "a `url` and a `rev`",
         }
     }
 }
@@ -742,7 +765,8 @@ impl Merged<Target, TargetKey> {
                 | Section::Env
                 | Section::Alias
                 | Section::Function
-                | Section::Plugin => {}
+                | Section::Plugin
+                | Section::External => {}
             }
         }
 
@@ -1151,6 +1175,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut aliases: Merged<AliasDecl> = Merged::default();
     let mut functions: Merged<FunctionDecl> = Merged::default();
     let mut plugins: Merged<PluginDecl> = Merged::default();
+    let mut externals: Merged<External> = Merged::default();
     let mut secrets = Secrets::default();
     let mut history = History::default();
     let mut shell_options = ShellOptions::default();
@@ -1166,7 +1191,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // alias, keyed by its name, whichever of its two tables it is written in;
     // and so does a function, keyed by its name, whose body's placeholders are
     // substituted only once the values are final; and so does a plugin, keyed
-    // by its name, which holds no placeholder.
+    // by its name, which holds no placeholder; and so does an external, keyed
+    // by its path, which holds no placeholder either.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1181,6 +1207,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         aliases.absorb(layer.config.aliases.iter().cloned());
         functions.absorb(layer.config.functions.iter().cloned());
         plugins.absorb(layer.config.plugins.iter().cloned());
+        externals.absorb(layer.config.externals.iter().cloned());
 
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
@@ -1191,6 +1218,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Alias => aliases.toggle(toggle)?,
                 Section::Function => functions.toggle(toggle)?,
                 Section::Plugin => plugins.toggle(toggle)?,
+                Section::External => externals.toggle(toggle)?,
                 Section::Target => {}
             }
         }
@@ -1230,6 +1258,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
 
     Ok(Config {
         targets: targets.into_enabled(),
+        // Nothing refers to an external by its path, so a disabled one is
+        // simply not checked out, as a disabled target is not written.
+        externals: externals.into_enabled(),
         values,
         value_assignments: assignments,
         // Nothing refers to a variable by name, so a disabled one is simply
@@ -1564,6 +1595,92 @@ mod tests {
         assert!(message.contains("a `source`"), "{message}");
     }
 
+    /// One `[[external]]` entry, as TOML.
+    fn external(path: &str, url: &str, rev: char) -> String {
+        format!(
+            "[[external]]\npath = \"{path}\"\nurl = \"{url}\"\nrev = \"{}\"\n",
+            rev.to_string().repeat(40)
+        )
+    }
+
+    #[test]
+    fn externals_merge_by_path_and_a_toggle_flips_one() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                &format!(
+                    "{}{}{}enabled = false\n",
+                    external("~/a", "https://h/o/a", 'a'),
+                    external("~/b", "https://h/o/b", 'b'),
+                    external("~/c", "https://h/o/c", 'c'),
+                ),
+            ),
+            // Replaced wholesale and in place, by another spelling of the path.
+            global("modules/m.toml", &external("~/./a", "git@h:o/fork", 'f')),
+            local(
+                "[[external]]\npath = \"~/b/\"\nenabled = false\n\
+                 [[external]]\npath = \"~/c\"\nenabled = true\n",
+            ),
+        ])
+        .unwrap();
+        let externals: Vec<(&str, &str, &str, &Path)> = merged
+            .externals
+            .iter()
+            .map(|e| {
+                (
+                    e.path.as_str(),
+                    e.url.as_str(),
+                    &e.rev[..1],
+                    e.origin.file.as_path(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            externals,
+            vec![
+                ("~/a", "git@h:o/fork", "f", Path::new("modules/m.toml")),
+                ("~/c", "https://h/o/c", "c", Path::new("bx.toml")),
+            ]
+        );
+
+        let message = failure(&[
+            global("bx.toml", &external("~/a", "https://h/o/a", 'a')),
+            local("[[external]]\npath = \"~/z\"\nenabled = true\n"),
+        ]);
+        assert!(message.contains("`~/z`"), "{message}");
+        assert!(message.contains("a `url` and a `rev`"), "{message}");
+    }
+
+    #[test]
+    fn one_layer_may_not_name_an_external_twice_even_as_a_toggle() {
+        for text in [
+            format!(
+                "{}{}",
+                external("~/a", "https://h/o/a", 'a'),
+                external("~/a/.", "https://h/o/b", 'b')
+            ),
+            format!(
+                "{}[[external]]\npath = \"~/a\"\nenabled = false\n",
+                external("~/a", "https://h/o/a", 'a')
+            ),
+        ] {
+            let err = parse_str(&text, Path::new("bx.toml"), &home())
+                .expect_err("one directory, twice")
+                .to_string();
+            assert!(err.contains("duplicate external `~/a`"), "{err}");
+        }
+
+        let err = parse_str(
+            "[[external]]\npath = \"/opt/a\"\nenabled = false\n",
+            Path::new("local.toml"),
+            &home(),
+        )
+        .expect_err("a toggle's path is held to the entry's rule")
+        .to_string();
+        assert!(err.starts_with("local.toml:1: "), "{err}");
+        assert!(err.contains("beneath the home"), "{err}");
+    }
+
     #[test]
     fn a_second_terminal_claimant_fails_the_merge_unless_a_layer_switches_one_off() {
         let claimants = "[[plugin]]\nname = \"zsh-syntax-highlighting\"\n\
@@ -1803,6 +1920,7 @@ mod tests {
             (Section::Alias, "alias", "[[alias]]", "name"),
             (Section::Function, "function", "[[function]]", "name"),
             (Section::Plugin, "plugin", "[[plugin]]", "name"),
+            (Section::External, "external", "[[external]]", "path"),
         ] {
             assert_eq!(section.key(), key);
             assert_eq!(section.header(), header);

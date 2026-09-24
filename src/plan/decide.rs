@@ -919,10 +919,30 @@ fn guard_generated(
             let before = content
                 .find(&env)
                 .map_or(0, |at| content[..at].matches('\n').count());
-            guard_fragment_after(&env, roots, before)
+            join([
+                guard_fragment_after(&env, roots, before),
+                guard_history_file(file.history().zsh_file.as_ref(), roots),
+            ])
         }
         Gen::Source(_) => None,
     }
+}
+
+/// Judge a declared zsh history file against Invariant 2: the one path the
+/// interactive file's `options` phase names.
+///
+/// zsh keeps no history file unless one is named, so naming one moves nothing
+/// and needs no root; but zsh writes every command line typed into it, so it
+/// may not lie inside a directory bx owns, nor inside the config repo, where
+/// it would be committed. Rendered against the set's home, the same home
+/// `${HOME}` is at shell start.
+fn guard_history_file(file: Option<&Portable>, roots: &RootSet) -> Option<String> {
+    let file = file?;
+    let path = roots
+        .home()
+        .map_or_else(|| PathBuf::from(file.as_str()), |home| file.render(home));
+    env_guard::refuses_bx_location(&path, roots)
+        .map(|reason| format!("[history] zsh file {file} {reason}"))
 }
 
 /// Judge a generated environment fragment against Invariant 2.
@@ -2399,6 +2419,116 @@ mod tests {
             crate::restore::restore(&state, home.path(), &targets).expect("rm");
             assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
             assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+        }
+
+        /// The source configuration's history and shell options.
+        const HISTORY: &str = "[history]\nsize = 10000\nduplicates = \"all\"\nshare = true\n\
+             [history.file]\nzsh = \"~/.zsh_history\"\n\
+             [shell-options]\nhistappend = true\ncheckwinsize = true\n";
+
+        #[test]
+        fn declared_history_reaches_the_interactive_file_twice_alike_and_rm_restores_it() {
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            let first = apply(&home, HISTORY);
+            assert_eq!(
+                rows(&first),
+                vec![
+                    ("~/.local/share/bx/zshrc.zsh", Action::Create),
+                    ("~/.zshrc", Action::Modify),
+                ]
+            );
+            let written = read(&home, ".local/share/bx/zshrc.zsh");
+            assert_eq!(
+                written,
+                format!(
+                    "{}\n# bx phase: options\n\
+                     HISTFILE=\"${{HOME}}/.zsh_history\"\n\
+                     HISTSIZE=10000\nSAVEHIST=10000\n\
+                     setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n",
+                    interactive("")
+                )
+            );
+            // The interactive file, which every interactive zsh sources —
+            // not the login-only one, which bx does not write here at all.
+            assert!(!home.child(".local/share/bx/zprofile.zsh").exists());
+            assert!(!home.child(".zprofile").exists());
+            // bash's option is bash's alone, and reaches no zsh file.
+            assert!(!written.contains("histappend"), "{written}");
+
+            // Idempotent: an empty second plan, and nothing rewritten.
+            let second = plan(&home, HISTORY);
+            assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&second)
+            );
+            assert!(!apply(&home, HISTORY).executed);
+            assert_eq!(read(&home, ".local/share/bx/zshrc.zsh"), written);
+
+            // Reversible: `rm` puts back the bytes each file held before bx.
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
+                .iter()
+                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+                .collect();
+            crate::restore::restore(&state, home.path(), &targets).expect("rm");
+            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
+            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+        }
+
+        #[test]
+        fn declaring_no_history_zsh_reads_places_nothing() {
+            let home = guarded_home();
+            for layer in [
+                "[history]\n[shell-options]\n",
+                "[history.file]\nbash = \"~/.bash_history\"\n[shell-options]\nhistappend = true\n",
+            ] {
+                assert_eq!(rows(&plan(&home, layer)), vec![], "{layer}");
+            }
+        }
+
+        #[test]
+        fn a_zsh_history_file_bx_owns_or_would_commit_blocks_the_file() {
+            let home = guarded_home();
+            for (file, reason) in [
+                (
+                    "~/.local/state/bx/history",
+                    "points inside a directory bx owns",
+                ),
+                (
+                    "~/.local/share/bx/history",
+                    "points inside a directory bx owns",
+                ),
+                ("~/.config/bx/history", "points inside bx's config repo"),
+            ] {
+                let layer = format!("[history.file]\nzsh = \"{file}\"\n");
+                let report = plan(&home, &layer);
+                let row = row(&report, "~/.local/share/bx/zshrc.zsh");
+                assert_eq!(row.action, Action::Blocked, "{file}");
+                let note = row.note.as_deref().expect("a note");
+                assert!(
+                    note.contains(&format!("[history] zsh file {file} {reason}")),
+                    "{note}"
+                );
+            }
+            // Anywhere else in the home, or outside it, is the user's choice.
+            for file in [
+                "~/.zsh_history",
+                "~/.local/state/zsh/history",
+                "/srv/history",
+            ] {
+                let layer = format!("[history.file]\nzsh = \"{file}\"\n");
+                let report = plan(&home, &layer);
+                assert_eq!(
+                    row(&report, "~/.local/share/bx/zshrc.zsh").action,
+                    Action::Create,
+                    "{file}"
+                );
+            }
         }
 
         #[test]

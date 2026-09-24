@@ -59,6 +59,7 @@
 use std::path::Path;
 
 use super::env::{EnvDecl, Fragment, Place, Syntax, Var};
+use super::history::History;
 use super::merge::Conflict;
 use super::path::PathEntry;
 use super::target::{Attach, Body, Direction, Format, Gen, Interactive, KeyPath, Target};
@@ -187,6 +188,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         &merged.envs,
         &merged.path,
         &merged.plugins,
+        &merged.history,
         &values,
     )?);
 
@@ -238,6 +240,11 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// plugin never holds the file back; a variable that holds it back holds its
 /// plugins back with it.
 ///
+/// The `[history]` declaration lands in the same file's `options` phase, in
+/// zsh's names, and a history that says anything zsh reads places the file on
+/// its own too. It holds no placeholder either, so it never holds the file
+/// back, and a variable that does holds the history back with it.
+///
 /// # Errors
 ///
 /// [`Error::BadValue`] for a variable whose value is a repo defect: a
@@ -248,8 +255,15 @@ fn place_envs(
     envs: &[EnvDecl],
     path: &[PathEntry],
     plugins: &[PluginDecl],
+    history: &History,
     values: &ResolvedValues,
 ) -> Result<Vec<Resolution<Target>>, Error> {
+    // The history's origin, when it says anything zsh reads: what places the
+    // interactive file when nothing else does.
+    let zsh_history = history
+        .origin
+        .as_ref()
+        .filter(|_| !history.render_zsh().is_empty());
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
@@ -264,11 +278,13 @@ fn place_envs(
         let entries = if place == Place::Zshenv { path } else { &[] };
         let interactive = if place == Place::Zshrc { plugins } else { &[] };
         let plugin = interactive.iter().find(|p| p.enabled);
-        let origin = match (here.first(), entries.first(), plugin) {
-            (Some((first, _)), _, _) => first.origin.clone(),
-            (None, Some(entry), _) => entry.origin.clone(),
-            (None, None, Some(plugin)) => plugin.origin.clone(),
-            (None, None, None) => continue,
+        let history_origin = zsh_history.filter(|_| place == Place::Zshrc);
+        let origin = match (here.first(), entries.first(), plugin, history_origin) {
+            (Some((first, _)), _, _, _) => first.origin.clone(),
+            (None, Some(entry), _, _) => entry.origin.clone(),
+            (None, None, Some(plugin), _) => plugin.origin.clone(),
+            (None, None, None, Some(history)) => history.clone(),
+            (None, None, None, None) => continue,
         };
         let portable = |raw: &str| {
             Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
@@ -293,7 +309,10 @@ fn place_envs(
                 })
                 .collect();
             let generator = match fragment_gen(place, vars, entries.to_vec()) {
-                Gen::Interactive(file) => Gen::Interactive(file.with_plugins(interactive)?),
+                Gen::Interactive(file) => Gen::Interactive(
+                    file.with_plugins(interactive)?
+                        .with_history(history.clone()),
+                ),
                 other => other,
             };
             Resolution::Ready(fragment_target(place, fragment.clone(), generator, &origin))

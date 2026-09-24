@@ -142,8 +142,10 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::env::EnvDecl;
+use super::history::History;
 use super::path::PathEntry;
 use super::secrets::Secrets;
+use super::shell_options::ShellOptions;
 use super::target::Target;
 use super::values::{
     Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan, statements_named,
@@ -1150,6 +1152,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut functions: Merged<FunctionDecl> = Merged::default();
     let mut plugins: Merged<PluginDecl> = Merged::default();
     let mut secrets = Secrets::default();
+    let mut history = History::default();
+    let mut shell_options = ShellOptions::default();
 
     // Values first, across every layer. A value never depends on a target, and
     // a target's key depends on the values — the final ones, because the file a
@@ -1167,6 +1171,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
         secrets.absorb(&layer.config.secrets);
+        // Both tables hold no placeholder, so they fold here too, key by key.
+        history.absorb(&layer.config.history);
+        shell_options.absorb(&layer.config.shell_options);
 
         values.absorb(layer.config.values.iter().cloned());
         envs.absorb(layer.config.envs.iter().cloned());
@@ -1237,6 +1244,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         // Nor to a plugin.
         plugins,
         secrets,
+        history,
+        shell_options,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
         conflicts: clashes

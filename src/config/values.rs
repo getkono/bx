@@ -823,8 +823,8 @@ fn expand<'a>(text: &str, lookup: &impl Fn(&str) -> Lookup<'a>) -> Result<String
 /// The one place in the codebase that spells the `bx init` invocation.
 ///
 /// Every message that tells a user how to answer goes through here, so there is
-/// one string to change rather than one per call site. Entry A8 sharpens this
-/// single function when `bx init --set <name>=<value>` lands.
+/// one string to change rather than one per call site. The flag that answers
+/// one value without a prompt is spelled by [`set_flag`].
 #[must_use]
 pub fn init_hint(names: &[&str]) -> String {
     if names.is_empty() {
@@ -832,6 +832,16 @@ pub fn init_hint(names: &[&str]) -> String {
     } else {
         format!("run `bx init` to set {}", names.join(", "))
     }
+}
+
+/// The `bx init` flag that answers `name` without a prompt:
+/// `--set name=VALUE`.
+///
+/// The one spelling of it, for the message a non-interactive `bx init` stops
+/// with and for the help beside each prompt, so the two cannot drift apart.
+#[must_use]
+pub fn set_flag(name: &str) -> String {
+    format!("--set {name}=VALUE")
 }
 
 /// What to do about an entry blocked by a declaration a layer switched off.
@@ -3422,6 +3432,7 @@ mod tests {
             "run `bx init` to set scratch_root, git_email"
         );
         assert!(init_hint(&[]).contains("bx init"));
+        assert_eq!(set_flag("scratch_root"), "--set scratch_root=VALUE");
     }
 
     // --- the two validation paths are one behaviour -------------------------

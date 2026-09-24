@@ -30,7 +30,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Guided setup — first machine or fifth, same command
-    Init,
+    Init {
+        /// Answer a declared value without its prompt; repeatable
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+        /// Ask nothing: fail on a value no --set answers, adopt nothing, and
+        /// write the plan without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Begin managing a tool, a config file, or a secret
     Add { target: Option<String> },
     /// Stop managing it, and restore the original
@@ -78,6 +86,7 @@ fn main() -> Result<()> {
     let exit = match command {
         // No subcommand is the status view.
         None => bx::command::status(&env, &mut out)?,
+        Some(Command::Init { set, yes }) => bx::command::init(&env, &set, yes, &mut out)?,
         Some(Command::Plan) => bx::command::plan(&env, &mut out)?,
         Some(Command::Apply { yes }) => bx::command::apply(&env, yes, &mut out)?,
         Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,

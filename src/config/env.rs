@@ -8,7 +8,14 @@
 //! value   = "{{scratch_root}}/sccache"     # required; placeholders substitute
 //! kind    = "environment"                  # environment | gui | login | interactive
 //! enabled = true                           # default true
+//! when    = "has:sccache"                  # optional; see below
 //! ```
+//!
+//! `when` gates the variable on one condition from the closed set
+//! [`super::when`] defines. A runtime condition wraps the variable's line in a
+//! guarded block; `has:TOOL` is decided while `plan` renders the fragment. A
+//! variable that lands in `environment.d` — `kind = "environment"` or `"gui"` —
+//! may be gated only on `has:TOOL`, since `environment.d` runs no test.
 //!
 //! # Placement is derived from when a variable must be visible
 //!
@@ -39,6 +46,7 @@ use std::path::Path;
 
 use toml_edit::Table;
 
+use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
 use crate::env_guard::is_variable_name;
 use crate::paths::Portable;
@@ -47,7 +55,7 @@ use crate::paths::Portable;
 pub(crate) const SECTION: &str = "[[env]]";
 
 /// Every key an `[[env]]` entry may carry.
-const KEYS: [&str; 4] = ["name", "value", "kind", "enabled"];
+const KEYS: [&str; 5] = ["name", "value", "kind", "enabled", "when"];
 
 /// The directory bx's generated shell fragments live in.
 pub const FRAGMENT_DIR: &str = "~/.local/share/bx";
@@ -109,6 +117,8 @@ pub struct EnvDecl {
     pub value: String,
     /// When it has to be visible.
     pub kind: EnvKind,
+    /// The one condition it is gated on, if any.
+    pub when: Option<When>,
     /// `false` in any layer removes the variable from the resolved
     /// configuration.
     pub enabled: bool,
@@ -160,10 +170,30 @@ pub fn parse_env(table: &Table, file: &Path, text: &str) -> Result<EnvDecl, Erro
         )
     })?;
 
+    let when = match ctx.str_at(table, "when")? {
+        None => None,
+        Some(raw) => {
+            let when = When::parse(raw).map_err(|problem| ctx.bad(table, "when", problem))?;
+            if when.is_runtime() && kind.places().contains(&Place::EnvironmentD) {
+                return Err(ctx.bad(
+                    table,
+                    "when",
+                    format!(
+                        "`{name}`: `when = {raw:?}` is a test the shell runs, and a variable of \
+                         `kind = {raw_kind:?}` lands in `environment.d`, which runs none; gate it \
+                         on `has:TOOL`, or give it `kind = \"login\"` or `\"interactive\"`"
+                    ),
+                ));
+            }
+            Some(when)
+        }
+    };
+
     Ok(EnvDecl {
         name,
         value,
         kind,
+        when,
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
     })
@@ -258,14 +288,37 @@ pub enum Syntax {
     EnvironmentD,
 }
 
+/// One variable a fragment holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Var {
+    /// The variable's name.
+    pub name: String,
+    /// Its value, already substituted.
+    pub value: String,
+    /// The condition it is gated on, if any.
+    pub when: Option<When>,
+}
+
+impl Var {
+    /// A variable written unconditionally.
+    #[must_use]
+    pub fn always(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            when: None,
+        }
+    }
+}
+
 /// An environment fragment: the variables one place holds, substituted and in
 /// declaration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fragment {
     /// The syntax it is written in.
     pub syntax: Syntax,
-    /// `(name, value)`, each value already substituted.
-    pub vars: Vec<(String, String)>,
+    /// Each variable, value already substituted.
+    pub vars: Vec<Var>,
 }
 
 /// The line every fragment opens with. Fixed, so the fragment's bytes are a
@@ -279,19 +332,37 @@ impl Fragment {
     /// `~` spelled `$HOME` instead, since `environment.d` expands no `~` and a
     /// shell expands one only at the start of a word, and bare when every
     /// character is one a bare word holds, double-quoted otherwise.
+    ///
+    /// A gated variable is decided through [`When::gate`]: `present` answers
+    /// whether a `has:TOOL` tool is usable, so the line is written plainly or
+    /// left out, and a runtime condition writes the line alone inside a block
+    /// its test guards — never inlined beside the assignment, so the guard
+    /// reads the assignment as the statement it is. The bytes are a function
+    /// of the variables and `present`'s answers alone.
     #[must_use]
-    pub fn render(&self) -> String {
+    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
         let export = match self.syntax {
             Syntax::Zsh => "export ",
             Syntax::EnvironmentD => "",
         };
         let mut out = String::from(HEADER);
-        for (name, value) in &self.vars {
-            out.push_str(export);
-            out.push_str(name);
-            out.push('=');
-            out.push_str(&quoted(&home_spelled(value)));
-            out.push('\n');
+        for var in &self.vars {
+            let line = format!(
+                "{export}{}={}\n",
+                var.name,
+                quoted(&home_spelled(&var.value))
+            );
+            match var.when.as_ref().map(|when| when.gate(present)) {
+                None | Some(Gate::Always) => out.push_str(&line),
+                Some(Gate::Never) => {}
+                Some(Gate::Test(test)) => {
+                    out.push_str(&when::opener(&test));
+                    out.push_str("\n  ");
+                    out.push_str(&line);
+                    out.push_str(when::CLOSER);
+                    out.push('\n');
+                }
+            }
         }
         out
     }
@@ -362,6 +433,7 @@ mod tests {
                 name: "SCCACHE_DIR".to_string(),
                 value: "{{scratch}}/sccache".to_string(),
                 kind: EnvKind::Environment,
+                when: None,
                 enabled: false,
                 origin: Origin {
                     file: PathBuf::from("/repo/bx.toml"),
@@ -446,19 +518,20 @@ mod tests {
     #[test]
     fn a_fragment_renders_each_syntax_deterministically() {
         let vars = vec![
-            ("CARGO_HOME".to_string(), "~/.cargo".to_string()),
-            ("PATH".to_string(), "~/bin:~:$PATH:/x~/y".to_string()),
-            ("LANG".to_string(), "en_US.UTF-8".to_string()),
-            ("EDITOR".to_string(), "code --wait".to_string()),
-            ("EMPTY".to_string(), String::new()),
-            ("USER_ISH".to_string(), "~other".to_string()),
+            Var::always("CARGO_HOME", "~/.cargo"),
+            Var::always("PATH", "~/bin:~:$PATH:/x~/y"),
+            Var::always("LANG", "en_US.UTF-8"),
+            Var::always("EDITOR", "code --wait"),
+            Var::always("EMPTY", ""),
+            Var::always("USER_ISH", "~other"),
         ];
         let zsh = Fragment {
             syntax: Syntax::Zsh,
             vars: vars.clone(),
         };
+        let render = |fragment: &Fragment| fragment.render(&|_| unreachable!("nothing is gated"));
         assert_eq!(
-            zsh.render(),
+            render(&zsh),
             format!(
                 "{HEADER}export CARGO_HOME=$HOME/.cargo\n\
                  export PATH=\"$HOME/bin:$HOME:$PATH:/x~/y\"\n\
@@ -472,9 +545,107 @@ mod tests {
             syntax: Syntax::EnvironmentD,
             vars,
         };
-        assert!(env_d.render().contains("\nCARGO_HOME=$HOME/.cargo\n"));
-        assert!(!env_d.render().contains("export"));
-        assert_eq!(zsh.render(), zsh.render());
+        assert!(render(&env_d).contains("\nCARGO_HOME=$HOME/.cargo\n"));
+        assert!(!render(&env_d).contains("export"));
+        assert_eq!(render(&zsh), render(&zsh));
+    }
+
+    fn gated(name: &str, value: &str, when: &str) -> Var {
+        Var {
+            name: name.to_string(),
+            value: value.to_string(),
+            when: Some(When::parse(when).expect(when)),
+        }
+    }
+
+    #[test]
+    fn a_gated_variable_renders_as_a_guarded_block_or_by_what_bx_found() {
+        let zsh = Fragment {
+            syntax: Syntax::Zsh,
+            vars: vec![
+                Var::always("LANG", "C.UTF-8"),
+                gated("EDITOR", "nvim", "interactive"),
+                gated("PAGER", "less", "login"),
+                gated("BROWSER", "w3m", "ssh"),
+                gated("COLORTERM", "truecolor", "env:TMUX"),
+                gated("TERM", "xterm-256color", "env:TERM_PROGRAM=WezTerm"),
+                gated("RUSTC_WRAPPER", "sccache", "has:sccache"),
+                gated("VISUAL", "hx", "has:hx"),
+            ],
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let present = |tool: &str| {
+            asked.borrow_mut().push(tool.to_string());
+            tool == "sccache"
+        };
+        assert_eq!(
+            zsh.render(&present),
+            format!(
+                "{HEADER}export LANG=C.UTF-8\n\
+                 if [[ -o interactive ]]; then\n  export EDITOR=nvim\nfi\n\
+                 if [[ -o login ]]; then\n  export PAGER=less\nfi\n\
+                 if [[ -n ${{SSH_CONNECTION-}} ]]; then\n  export BROWSER=w3m\nfi\n\
+                 if [[ -n ${{TMUX+x}} ]]; then\n  export COLORTERM=truecolor\nfi\n\
+                 if [[ ${{TERM_PROGRAM-}} == \"WezTerm\" ]]; then\n  \
+                 export TERM=xterm-256color\nfi\n\
+                 export RUSTC_WRAPPER=sccache\n"
+            )
+        );
+        // Each tool is asked about once per render, and only a `has:` asks.
+        assert_eq!(*asked.borrow(), ["sccache", "hx"]);
+        let rendered = zsh.render(&present);
+        assert!(!rendered.contains("command -v"), "{rendered}");
+        assert_eq!(rendered, zsh.render(&present), "byte-identical");
+    }
+
+    #[test]
+    fn a_when_parses_and_an_unknown_spelling_fails_the_load() {
+        let envs = parse(
+            "[[env]]\nname = \"EDITOR\"\nvalue = \"nvim\"\nkind = \"interactive\"\n\
+             when = \"ssh\"\n\
+             [[env]]\nname = \"RUSTC_WRAPPER\"\nvalue = \"sccache\"\nkind = \"gui\"\n\
+             when = \"has:sccache\"\n",
+        )
+        .expect("parses");
+        assert_eq!(envs[0].when, Some(When::Ssh));
+        assert_eq!(envs[1].when, Some(When::Has("sccache".to_string())));
+
+        for (when, needle) in [
+            ("\"tty\"", "`when` must be one of"),
+            ("\"env:1X\"", "not an environment variable name"),
+            ("true", "a string"),
+        ] {
+            let body =
+                format!("[[env]]\nname = \"X\"\nvalue = \"x\"\nkind = \"login\"\nwhen = {when}\n");
+            let err = parse(&body).expect_err(&body);
+            assert!(err.contains(needle), "{body}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_runtime_when_on_a_variable_environment_d_holds_fails_the_load() {
+        for kind in ["environment", "gui"] {
+            for when in [
+                "interactive",
+                "login",
+                "ssh",
+                "env:TMUX",
+                "env:TERM_PROGRAM=WezTerm",
+            ] {
+                let body = format!(
+                    "[[env]]\nname = \"X\"\nvalue = \"x\"\nkind = \"{kind}\"\nwhen = \"{when}\"\n"
+                );
+                let err = parse(&body).expect_err(&body);
+                assert!(err.contains("`environment.d`"), "{body}: {err}");
+                assert!(err.contains("has:TOOL"), "{body}: {err}");
+            }
+        }
+        for kind in ["login", "interactive"] {
+            let body = format!(
+                "[[env]]\nname = \"X\"\nvalue = \"x\"\nkind = \"{kind}\"\nwhen = \"ssh\"\n"
+            );
+            parse(&body).expect(&body);
+        }
     }
 
     #[test]

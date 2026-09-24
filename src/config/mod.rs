@@ -21,12 +21,14 @@
 //! together, and a silent no-op is the failure mode this tool exists to end.
 
 pub mod env;
+pub mod history;
 pub mod layers;
 pub mod merge;
 pub mod origin;
 pub mod path;
 pub mod resolve;
 pub mod secrets;
+pub mod shell_options;
 pub mod target;
 pub mod values;
 pub mod when;
@@ -85,6 +87,11 @@ pub struct Config {
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
     pub secrets: secrets::Secrets,
+    /// `[history]`: a table, merged key by key like `[secrets]`. See
+    /// [`history`].
+    pub history: history::History,
+    /// `[shell-options]`: a table, merged key by key. See [`shell_options`].
+    pub shell_options: shell_options::ShellOptions,
     /// List entries that restate only their natural key and `enabled`.
     ///
     /// A **toggle**: it flips the flag on an entry an earlier layer introduced
@@ -413,6 +420,24 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     found: item.type_name(),
                 })?;
                 config.path = path::parse_path(table, file, text)?;
+            }
+            "history" => {
+                let table = item.as_table().ok_or_else(|| Error::WrongType {
+                    origin: section_origin(root, name, file, text),
+                    key: name.to_string(),
+                    expected: "a table `[history]`",
+                    found: item.type_name(),
+                })?;
+                config.history = history::parse_history(table, file, text, home)?;
+            }
+            "shell-options" => {
+                let table = item.as_table().ok_or_else(|| Error::WrongType {
+                    origin: section_origin(root, name, file, text),
+                    key: name.to_string(),
+                    expected: "a table `[shell-options]`",
+                    found: item.type_name(),
+                })?;
+                config.shell_options = shell_options::parse_shell_options(table, file, text)?;
             }
             "aliases" => {
                 let table = item.as_table().ok_or_else(|| Error::WrongType {

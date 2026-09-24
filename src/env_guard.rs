@@ -1861,6 +1861,18 @@ fn refuses_unanchored(text: &str, separator: Option<char>, roots: &RootSet) -> O
     }
     // Before the root test, and therefore ahead of any declaration: a root the
     // user declared widens where tools may live, never who owns bx's own state.
+    refuses_bx_location(path, roots)
+}
+
+/// Why `path` may never be where a tool keeps a file, whatever roots are
+/// declared: it lies inside a directory bx owns, or inside bx's config repo.
+///
+/// The part of the location rule that holds for a path bx writes outside an
+/// environment fragment too — a declared shell history file, which the shell
+/// keeps and no root need permit, is judged by this alone. Lexical, like every
+/// containment test here.
+#[must_use]
+pub fn refuses_bx_location(path: &Path, roots: &RootSet) -> Option<Reason> {
     if roots.owns(path) {
         return Some(Reason::BxOwnedDirectory);
     }
@@ -6950,7 +6962,7 @@ mod tests {
         // knows, passes each readable assignment of one through `check`, the
         // function `scan_with` calls per assignment, refuses every other
         // assigning form, and never writes an output with any refusal.
-        const KNOWN: [(&str, &str); 14] = [
+        const KNOWN: [(&str, &str); 15] = [
             ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
             ("config/env.rs", "use crate::env_guard::is_variable_name;"),
             ("config/when.rs", "use crate::env_guard::is_variable_name;"),
@@ -6968,6 +6980,12 @@ mod tests {
             (
                 "plan/decide.rs",
                 "fn violations(found: &[env_guard::Violation], before: usize) -> Option<String> {",
+            ),
+            // The interactive file's history path, judged beside its `env`
+            // phase, which still goes through `scan_with` above.
+            (
+                "plan/decide.rs",
+                "env_guard::refuses_bx_location(&path, roots)",
             ),
             ("plan/mod.rs", "use crate::env_guard::RootSet;"),
             (

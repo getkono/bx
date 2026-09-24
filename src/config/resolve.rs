@@ -59,6 +59,7 @@
 use std::path::Path;
 
 use super::env::{EnvDecl, Fragment, Place, Syntax, Var};
+use super::history::History;
 use super::merge::Conflict;
 use super::path::PathEntry;
 use super::target::{Attach, Body, Direction, Format, Gen, Interactive, KeyPath, Target};
@@ -191,6 +192,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         &merged.envs,
         &merged.path,
         &merged.plugins,
+        &merged.history,
         &merged.aliases,
         &merged.functions,
         &values,
@@ -244,6 +246,11 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// plugin never holds the file back; a variable that holds it back holds its
 /// plugins back with it.
 ///
+/// The `[history]` declaration lands in the same file's `options` phase, in
+/// zsh's names, and a history that says anything zsh reads places the file on
+/// its own too. It holds no placeholder either, so it never holds the file
+/// back, and a variable that does holds the history back with it.
+///
 /// The enabled `[aliases]` and `[[alias]]` entries land in that file's
 /// `aliases` phase, and an enabled alias places the file on its own as a
 /// plugin does. Its `when = "has:TOOL"` is decided when the file is rendered,
@@ -271,10 +278,17 @@ fn place_envs(
     envs: &[EnvDecl],
     path: &[PathEntry],
     plugins: &[PluginDecl],
+    history: &History,
     aliases: &[AliasDecl],
     functions: &[FunctionDecl],
     values: &ResolvedValues,
 ) -> Result<Vec<Resolution<Target>>, Error> {
+    // The history's origin, when it says anything zsh reads: what places the
+    // interactive file when nothing else does.
+    let zsh_history = history
+        .origin
+        .as_ref()
+        .filter(|_| !history.render_zsh().is_empty());
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
@@ -296,13 +310,22 @@ fn place_envs(
         let plugin = interactive.iter().find(|p| p.enabled);
         let alias = declared.iter().find(|a| a.enabled);
         let function = defined.iter().find(|f| f.enabled);
-        let origin = match (here.first(), entries.first(), plugin, alias, function) {
+        let history_origin = zsh_history.filter(|_| place == Place::Zshrc);
+        let origin = match (
+            here.first(),
+            entries.first(),
+            plugin,
+            alias,
+            function,
+            history_origin,
+        ) {
             (Some((first, _)), ..) => first.origin.clone(),
             (None, Some(entry), ..) => entry.origin.clone(),
             (None, None, Some(plugin), ..) => plugin.origin.clone(),
-            (None, None, None, Some(alias), _) => alias.origin.clone(),
-            (None, None, None, None, Some(function)) => function.origin.clone(),
-            (None, None, None, None, None) => continue,
+            (None, None, None, Some(alias), ..) => alias.origin.clone(),
+            (None, None, None, None, Some(function), _) => function.origin.clone(),
+            (None, None, None, None, None, Some(history)) => history.clone(),
+            (None, None, None, None, None, None) => continue,
         };
         let portable = |raw: &str| {
             Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
@@ -329,6 +352,7 @@ fn place_envs(
             let generator = match fragment_gen(place, vars, entries.to_vec()) {
                 Gen::Interactive(file) => Gen::Interactive(
                     file.with_plugins(interactive)?
+                        .with_history(history.clone())
                         .with_aliases(declared)
                         .with_functions(bodies.clone()),
                 ),

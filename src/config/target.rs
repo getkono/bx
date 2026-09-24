@@ -45,6 +45,7 @@ use crate::shell::{Assembly, Phase};
 
 use toml_edit::Table;
 
+use super::history::History;
 use super::resolve::{BlockedEntry, Resolution};
 use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
@@ -184,13 +185,16 @@ impl Gen {
 /// The interactive `[[env]]` fragment lands in the `env` phase, whole, and is
 /// the one part of the file [`crate::env_guard`] judges; every enabled
 /// `[[plugin]]` lands in the `plugins` phase, or in the `terminal` slot when it
-/// claims it, as the one guarded line [`PluginDecl::line`] renders; and every
-/// enabled alias lands in the `aliases` phase, as the line
-/// [`crate::shell::alias::AliasDecl::render`] renders for it; and every
-/// enabled `[[function]]` whose body resolved lands in the `functions` phase,
-/// as [`Function::render`] renders it. No phase but `env` holds an
-/// environment assignment (Invariant 2); the `functions` phase assigns only
-/// zsh's hook arrays, which no process inherits.
+/// claims it, as the one guarded line [`PluginDecl::line`] renders; the
+/// declared `[history]` lands in the `options` phase in zsh's names, as
+/// [`History::render_zsh`] renders it; every enabled alias lands in the
+/// `aliases` phase, as the line [`crate::shell::alias::AliasDecl::render`]
+/// renders for it; and every enabled `[[function]]` whose body resolved lands
+/// in the `functions` phase, as [`Function::render`] renders it. No phase but
+/// `env` holds an environment assignment (Invariant 2): the `options` phase
+/// assigns only zsh's own unexported history parameters, which
+/// [`super::history`]'s tests hold it to, and the `functions` phase assigns
+/// only zsh's hook arrays, which no process inherits.
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what
@@ -201,6 +205,9 @@ pub struct Interactive {
     env: super::env::Fragment,
     /// The enabled plugins, in declaration order.
     plugins: Vec<PluginDecl>,
+    /// The declared history, rendered in zsh's names into the `options`
+    /// phase.
+    history: History,
     /// The enabled aliases, in the merged configuration's order.
     aliases: Vec<AliasDecl>,
     /// The enabled functions, each resolved or held back in its own
@@ -209,15 +216,29 @@ pub struct Interactive {
 }
 
 impl Interactive {
-    /// The file holding `env` and no plugin, alias or function.
+    /// The file holding `env`, and no plugin, history, alias or function.
     #[must_use]
-    pub const fn new(env: super::env::Fragment) -> Self {
+    pub fn new(env: super::env::Fragment) -> Self {
         Self {
             env,
             plugins: Vec::new(),
+            history: History::default(),
             aliases: Vec::new(),
             functions: Vec::new(),
         }
+    }
+
+    /// The file with `history` in its `options` phase.
+    #[must_use]
+    pub fn with_history(mut self, history: History) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// The declared history, whose zsh file the plan judges.
+    #[must_use]
+    pub const fn history(&self) -> &History {
+        &self.history
     }
 
     /// The file with `functions` added: the enabled functions as
@@ -297,10 +318,11 @@ impl Interactive {
     /// The file's bytes.
     ///
     /// The fragment is contributed only when it holds a variable, so a file
-    /// with plugins alone has no `env` phase, and a file whose every alias is
-    /// gated on a missing tool has no `aliases` phase, and a file whose every
-    /// function is held back has no `functions` phase. The bytes are a
-    /// function of the variables, the plugins, the aliases, the functions and
+    /// with plugins alone has no `env` phase, a history declaring nothing zsh
+    /// reads adds no `options` phase, a file whose every alias is gated on a
+    /// missing tool has no `aliases` phase, and a file whose every function is
+    /// held back has no `functions` phase. The bytes are a function of the
+    /// variables, the plugins, the history, the aliases, the functions and
     /// `present`'s answers alone.
     ///
     /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
@@ -316,7 +338,14 @@ impl Interactive {
         } else {
             assembly.contribute(Phase::Env, super::env::SECTION, self.env.render(present))
         }
-        .and_then(|()| crate::shell::plugin::contribute(&mut assembly, &self.plugins));
+        .and_then(|()| crate::shell::plugin::contribute(&mut assembly, &self.plugins))
+        .and_then(|()| {
+            assembly.contribute(
+                Phase::Options,
+                super::history::SECTION,
+                self.history.render_zsh(),
+            )
+        });
         // Only the terminal slot refuses a contribution, and `with_plugins`
         // admitted at most one claimant.
         contributed.expect("an `Interactive` holds at most one terminal claimant");
@@ -2228,6 +2257,85 @@ mod tests {
             let got = String::from_utf8(run(&zsh, &["-f"], &script)).expect("utf-8");
             let parts: Vec<&str> = got.split("---\n").collect();
             assert_ne!(parts[2], parts[0]);
+        }
+
+        /// The source configuration's zsh history, parsed as a layer would.
+        fn history() -> History {
+            crate::config::parse_str(
+                "[history]\nsize = 10000\nduplicates = \"all\"\nshare = true\n\
+                 [history.file]\nzsh = \"~/.zsh_history\"\nbash = \"~/.bash_history\"\n",
+                std::path::Path::new("/repo/bx.toml"),
+                std::path::Path::new("/home/u"),
+            )
+            .expect("parses")
+            .history
+        }
+
+        #[test]
+        fn declared_history_lands_in_the_options_phase_in_zshs_names_only() {
+            let file = Interactive::new(fragment(Vec::new()))
+                .with_plugins(&[
+                    plugin("t", "~/t.zsh", true, 1),
+                    plugin("p", "~/p.zsh", false, 2),
+                ])
+                .expect("one claimant")
+                .with_history(history());
+            assert_eq!(file.history(), &history());
+            let rendered = render(&file);
+            assert_eq!(
+                rendered,
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: plugins\n\
+                 [[ -r ~/p.zsh ]] && source ~/p.zsh\n\
+                 \n# bx phase: options\n\
+                 HISTFILE=\"${HOME}/.zsh_history\"\n\
+                 HISTSIZE=10000\n\
+                 SAVEHIST=10000\n\
+                 typeset -g +x HISTFILE HISTSIZE SAVEHIST\n\
+                 setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n\
+                 \n# bx phase: terminal\n\
+                 [[ -r ~/t.zsh ]] && source ~/t.zsh\n\
+                 \n# bx: done, whichever plugins were found\ntrue\n"
+            );
+            // bash's file and bash's names never reach zsh's file.
+            assert!(!rendered.contains("bash_history"), "{rendered}");
+            assert!(!rendered.contains("HISTFILESIZE"), "{rendered}");
+
+            // A history alone is a file of its own, and one declaring nothing
+            // zsh reads adds nothing.
+            let alone = render(&Interactive::new(fragment(Vec::new())).with_history(history()));
+            assert!(
+                alone.ends_with("setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n"),
+                "{alone}"
+            );
+            let bash_only = History {
+                bash_file: history().bash_file,
+                ..History::default()
+            };
+            assert_eq!(
+                render(&Interactive::new(fragment(Vec::new())).with_history(bash_only)),
+                "# Generated by bx. Edit the config repo, not this file.\n"
+            );
+        }
+
+        #[test]
+        fn an_interactive_zsh_reads_the_declared_history() {
+            let Some(zsh) = installed("zsh") else {
+                return;
+            };
+            let rendered = render(&Interactive::new(fragment(Vec::new())).with_history(history()));
+            let got = run(
+                &zsh,
+                &["-f", "-e"],
+                &format!(
+                    "{rendered}print -r -- \"${{HISTFILE#$HOME}} $HISTSIZE $SAVEHIST\"\n\
+                     [[ -o histignorealldups && -o sharehistory ]] && print -r -- options-on\n"
+                ),
+            );
+            assert_eq!(
+                String::from_utf8(got).expect("utf-8"),
+                "/.zsh_history 10000 10000\noptions-on\n"
+            );
         }
     }
 }

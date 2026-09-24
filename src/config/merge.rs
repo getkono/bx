@@ -66,10 +66,22 @@
 //!
 //! **What does not hold.** The form does not recognise every pair that names
 //! one file for every answer. When it misses one, a layer that spells the same
-//! file twice loads `Ok` and the file is blocked as a [`Conflict`], whose
-//! "change that answer" hint no answer satisfies. **No general rule is claimed
-//! for which pairs are missed.** Several rounds of review each proposed one and
-//! each was found unsound or too narrow.
+//! file twice loads `Ok` and the file is blocked as a [`Conflict`] rather than
+//! refused as the layer's own defect. **No general rule is claimed for which
+//! pairs are missed.** Several rounds of review each proposed one and each was
+//! found unsound or too narrow.
+//!
+//! **What the account is told all the same.** Not "change that answer", which
+//! no answer satisfies for such a pair. A registered pair reaches a
+//! [`Conflict`] only as toggles, and neither toggle is one path as written
+//! with any full entry: every registered spelling's form opens with a
+//! placeholder or keeps a `..`, and a full entry's stored `path` does neither.
+//! So [`anchored`] holds for neither, and the conflict carries the removal
+//! hint, keep one toggle and remove the rest, which every registered pair
+//! loads under. `every_registered_pair_as_toggles_gets_a_removal_hint_that_loads`
+//! executes that over every entry in `UNDECIDED`. So a miss costs the account
+//! a block it can clear where a refusal would have been exact, and the
+//! comparison stays as it is.
 //!
 //! **A miss is reached as a toggle, not as a full entry.** A `[[target]]`'s
 //! `path` is a [`Portable`](crate::paths::Portable) parsed by
@@ -2019,7 +2031,8 @@ mod tests {
     /// [`answer_sets_at`] draws keys the two spellings as one file, and the two
     /// written forms differ anyway. Per home, and not over the union of them:
     /// one entry below is one file for every answer only under a home of `/`,
-    /// and an account under that home has the unclearable block just the same.
+    /// and an account under that home has a block no answer clears just the
+    /// same.
     /// That is the criterion
     /// `every_pair_the_written_form_is_known_to_miss_is_still_missed`
     /// executes — stated here in the words it executes, because a header
@@ -2034,7 +2047,10 @@ mod tests {
     ///
     /// Every entry is an **open defect**, registered rather than repaired, and
     /// that is a decision: the pair loads `Ok` and the file it names is blocked
-    /// as a [`Conflict`] whose hint no answer satisfies. Deciding one means
+    /// as a [`Conflict`] rather than refused, though the hint it gets is the
+    /// removal hint, which the account can follow
+    /// (`every_registered_pair_as_toggles_gets_a_removal_hint_that_loads`),
+    /// and not an answer to change, which it cannot. Deciding one means
     /// widening the reduction, and every rule proposed for these shapes so far
     /// has been refuted — `REFUTED` holds each with the answers that killed it,
     /// which is why no general rule is claimed and why adding a pair here is a
@@ -2099,8 +2115,8 @@ mod tests {
         // home, every answer keys it as one file and the two written forms
         // differ anyway — which is exactly the account that gets a `Conflict`
         // no answer clears. Judged per home rather than over the union,
-        // because a pair one home parts is still an unclearable block for an
-        // account under the home that does not.
+        // because a pair one home parts is still a block no answer clears for
+        // an account under the home that does not.
         //
         // The list is therefore a measurement at this head, not a claim carried
         // forward from an earlier one. A pair a repair to `written_form`
@@ -2295,7 +2311,8 @@ mod tests {
         // toggle names a key by the spelling it reaches and is held to neither
         // that rule nor the one refusing a spelling that opens with a
         // placeholder, so it is the route by which a miss becomes a `Conflict`
-        // whose "change that answer" hint no answer satisfies.
+        // — one whose hint names the toggles to remove, since no declared
+        // spelling anchors either.
         const VALUES: &str = "[[value]]\nname = \"r\"\nkind = \"path\"\n";
         let (first, second) = ("/opt/{{r}}x/../../conf", "/opt/{{r}}/../../conf");
 
@@ -3751,6 +3768,196 @@ mod tests {
         assert!(
             message.contains("which no earlier layer declares"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn every_registered_pair_as_toggles_gets_a_removal_hint_that_loads() {
+        // Issue #49's acceptance, executed over **every** entry in `UNDECIDED`
+        // rather than the one worked pair above. The register's pairs reach a
+        // `Conflict` only as toggles (see
+        // `no_registered_pair_reaches_the_comparison_as_full_entries`), so for
+        // each one the two spellings are written as toggles in `local.toml`,
+        // against a target `bx.toml` declares at the file they name under
+        // this account's answers. Neither toggle is one path as written with a
+        // declared spelling — that is what being undecided leaves them — so
+        // the hint must be the keep-one removal hint, never "change that
+        // answer", which no answer satisfies for these pairs. Keeping either
+        // toggle must then load. The comparison itself is untouched: this
+        // measures what the account is told, not how the pair is keyed.
+        //
+        // The answers are searched for, per home, rather than written per
+        // entry, so a pair added to the register is held to this too: it needs
+        // only one candidate under which both spellings name one declarable
+        // file.
+        const DECLS: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"q\"\nkind = \"string\"\n\
+                             [[value]]\nname = \"f\"\nkind = \"bool\"\n\
+                             [[value]]\nname = \"r\"\nkind = \"path\"\n";
+        let candidates = [
+            ("a", "/srv/d/e"),
+            ("~/a", "/srv/d/e"),
+            ("/a", "/srv/d/e"),
+            ("a/b", "/srv/d"),
+        ];
+
+        let parsed = |file: &str, kind: LayerKind, text: &str, at: &Path| {
+            parse_str(text, Path::new(file), at).map(|config| Layer {
+                file: PathBuf::from(file),
+                kind,
+                config,
+            })
+        };
+        let toggles_toml = |toggles: &[&str]| {
+            toggles
+                .iter()
+                .map(|path| toggle_toml(path))
+                .collect::<String>()
+        };
+
+        // Why the removal hint is the only one these pairs can get, whatever
+        // else a layer set declares, and not only in the layer set built
+        // below: every registered spelling's form opens with a placeholder or
+        // keeps a `..`. A full entry's stored `path` has neither — it is
+        // normalised, so it holds no `..`, and a spelling opening with a
+        // placeholder, bare or glued to a `~`, is refused as an entry — so no
+        // full entry in any layer is one path as written with either toggle,
+        // and `anchored` holds for neither.
+        let declared = classifier_values();
+        let mut failed: Vec<String> = Vec::new();
+        for (first, second, why) in UNDECIDED {
+            for spelling in [first, second] {
+                let form = form_of(spelling, &declared);
+                if !(matches!(form.root, Root::Opening { .. })
+                    || form.segments.contains(&Segment::Up))
+                {
+                    failed.push(format!(
+                        "{spelling:?} ({why}): its form {form:?} is one a full entry may \
+                         have, so a declared spelling may anchor it"
+                    ));
+                }
+            }
+        }
+
+        'pairs: for (first, second, why) in UNDECIDED {
+            for at in homes() {
+                for (p, r) in candidates {
+                    let answers =
+                        format!("[values]\np = \"{p}\"\nq = \"b\"\nf = true\nr = \"{r}\"\n");
+                    let answering = |toggles: &[&str]| {
+                        parsed(
+                            "local.toml",
+                            LayerKind::Local,
+                            &format!("{answers}{}", toggles_toml(toggles)),
+                            &at,
+                        )
+                        .unwrap_or_else(|e| panic!("{first:?}: local.toml: {e}"))
+                    };
+                    let values = match ResolvedValues::resolve(
+                        parsed("bx.toml", LayerKind::Global, DECLS, &at)
+                            .expect("the declarations parse")
+                            .config
+                            .values,
+                        &answering(&[]).config.value_assignments,
+                        &at,
+                    ) {
+                        Ok(values) => values,
+                        Err(_) => continue,
+                    };
+                    let TargetKey::File(file) = TargetKey::of(first, &values) else {
+                        continue;
+                    };
+                    if TargetKey::of(second, &values) != TargetKey::File(file.clone()) {
+                        continue;
+                    }
+                    let Ok(declaring) = parsed(
+                        "bx.toml",
+                        LayerKind::Global,
+                        &format!(
+                            "{DECLS}{}{}",
+                            target_toml(&file, "F"),
+                            target_toml("~/.zshrc", "setopt")
+                        ),
+                        &at,
+                    ) else {
+                        continue;
+                    };
+                    let setting = format!("home={} p={p:?} r={r:?}", at.display());
+
+                    // Both toggles: the removal hint, and not an answer to change.
+                    let config = match super::merge(
+                        &[declaring.clone(), answering(&[first, second])],
+                        &at,
+                    ) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            failed.push(format!(
+                                "{first:?} and {second:?} ({why}), {setting}: \
+                                 refused as {e}; a pair the merge refuses is decided, and \
+                                 belongs in the fuzz's generators rather than here"
+                            ));
+                            continue 'pairs;
+                        }
+                    };
+                    let hints: Vec<&str> = config
+                        .conflicts
+                        .iter()
+                        .map(|conflict| conflict.hint.as_str())
+                        .collect();
+                    if hints.len() != 1 || !hints[0].ends_with(CANNOT_SHOW_ANY) {
+                        failed.push(format!(
+                            "{first:?} and {second:?} ({why}), {setting}: {hints:?}"
+                        ));
+                        continue 'pairs;
+                    }
+
+                    // The hint followed, either way round, loads.
+                    for kept in [first, second] {
+                        let outcome = super::merge(&[declaring.clone(), answering(&[kept])], &at)
+                            .map_err(|e| e.to_string())
+                            .and_then(|config| {
+                                if config.conflicts.is_empty() {
+                                    Ok(config)
+                                } else {
+                                    Err(format!("{:?}", config.conflicts))
+                                }
+                            })
+                            .and_then(|config| {
+                                crate::config::resolve::resolve(&config, &at)
+                                    .map_err(|e| e.to_string())
+                            });
+                        match outcome {
+                            Ok(resolved) => {
+                                use crate::config::resolve::Resolution;
+                                for resolution in resolved.targets {
+                                    if let Resolution::Blocked(entry) = resolution {
+                                        failed.push(format!(
+                                            "{first:?} and {second:?} ({why}), {setting}: \
+                                             keeping {kept:?} blocks: {}",
+                                            entry.hint
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => failed.push(format!(
+                                "{first:?} and {second:?} ({why}), {setting}: \
+                                 keeping {kept:?} does not load: {e}"
+                            )),
+                        }
+                    }
+                    continue 'pairs;
+                }
+            }
+            failed.push(format!(
+                "{first:?} and {second:?} ({why}): no candidate answer names one \
+                 declarable file for both, so the pair was not exercised"
+            ));
+        }
+        assert!(
+            failed.is_empty(),
+            "{} registered pairs are not told a followable act:\n{}",
+            failed.len(),
+            failed.join("\n")
         );
     }
 

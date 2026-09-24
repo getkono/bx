@@ -71,6 +71,7 @@ fn main() -> Result<()> {
         None => bx::command::status(&env, &mut out)?,
         Some(Command::Plan) => bx::command::plan(&env, &mut out)?,
         Some(Command::Apply { yes }) => bx::command::apply(&env, yes, &mut out)?,
+        Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,
         Some(_) => todo!("command dispatch"),
     };
     out.flush()?;

@@ -46,9 +46,12 @@
 //! scaffolding this module adds — the header and one comment per phase — sets
 //! nothing, and the plugin lines [`plugin`] renders only test a file and source
 //! it; the tests below establish both of the bytes actually emitted. The
-//! activations [`activation`] renders are each one `eval` of a single-quoted
-//! literal holding a tool's own output, or a guarded `eval "$(…)"`; that
-//! module states why neither is an assignment of bx's and tests the bytes.
+//! `activations` and `completions` phases are the exception, and fall under
+//! the guard: a tool's activation output assigns variables, so
+//! [`activation::plan`] judges every assignment in it with
+//! [`crate::env_guard::check`] and writes none of an output the guard refuses.
+//! What it does write is one `eval` of a single-quoted literal holding the
+//! output, so bx's own bytes there set nothing.
 //!
 //! # Activations
 //!
@@ -56,7 +59,8 @@
 //! `starship init zsh` — is run by [`activation::plan`] rather than at every
 //! shell start, trusted once two runs agree, and cached against the content
 //! of the tool's binary, so the `activations` and `completions` phases hold
-//! text and start no process.
+//! text and start no process. There is no form that runs a tool at shell
+//! start.
 
 pub mod activation;
 pub mod plugin;

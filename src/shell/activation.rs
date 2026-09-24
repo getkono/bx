@@ -9,14 +9,16 @@
 //! name    = "starship"                        # required; the natural key
 //! command = ["starship", "init", "zsh"]       # required; argv, run without a shell
 //! phase   = "completions"                     # activations | completions; default activations
-//! cache   = true                              # default true; false = never cacheable
 //! enabled = true                              # default true
 //! ```
 //!
 //! `command[0]` is the tool: a bare program name looked up on `PATH`, or an
-//! absolute path. Either way it holds only characters a bare shell word holds,
-//! so the guard a never-cacheable activation renders can name it unquoted. The
-//! rest of `command` is quoted wherever a word needs it.
+//! absolute path. Either way it holds only characters a bare shell word holds.
+//!
+//! There is no never-cacheable form. A shell start spawns no process
+//! (invariant 6), so an activation that must be fresh in every shell is not an
+//! `eval "$(tool …)"` at all: it is a guarded, optional source of a file the
+//! tool maintains itself, such as keychain's `~/.keychain/<host>-sh`.
 //!
 //! `phase` is the load-order phase the output lands in: `activations` for a
 //! tool that puts itself on `PATH` or `fpath` (brew, mise), `completions` for
@@ -35,16 +37,12 @@
 //!
 //! A command bx has not cached for these inputs runs **twice**, and its output
 //! is trusted only if both runs agree byte for byte. Output that differs is
-//! omitted with a note and never cached, so the next `plan` tries again. A
-//! tool whose output depends on something other than its own binary — its own
-//! config, the time, the working directory — is declared `cache = false`
-//! instead: it is rendered as a guarded, quoted `eval "$(…)"` every time,
-//! which is the one case that still spawns at shell start, because the author
-//! said so.
+//! omitted with a note and never cached, so the next `plan` tries again.
 //!
 //! An activation whose tool is absent, not executable, unreadable, fails, runs
-//! past [`TIMEOUT`], prints more than [`LIMIT`] bytes or prints something that
-//! is not text is **omitted** — the step says why — and every other
+//! past [`TIMEOUT`], prints more than [`LIMIT`] bytes, prints something that
+//! is not text, or prints an assignment the environment guard refuses is
+//! **omitted** — the step says why — and every other
 //! activation, and every other phase, still renders. Its cache entry is
 //! dropped, so a later `plan` starts from nothing rather than reusing output a
 //! different binary produced.
@@ -55,8 +53,8 @@
 //! # Plan and apply
 //!
 //! [`plan`] is the one function: it decides every activation, runs whatever
-//! has to run, and returns [`Step`]s that say which were reused, captured,
-//! rendered plain or omitted. `apply` does not decide again. It hands the same
+//! has to run, and returns [`Step`]s that say which were reused, captured or
+//! omitted. `apply` does not decide again. It hands the same
 //! [`Plan`] to [`Plan::contribute`], which renders the file, and to
 //! [`Plan::record`], which writes the captures into the cache it then saves. A
 //! second `plan` against an unchanged machine therefore reuses every entry,
@@ -64,19 +62,35 @@
 //!
 //! # Invariant 2
 //!
-//! The activations and completions phases are generated shell content that is
-//! not an environment fragment, so bx's own bytes there set nothing. A cached
-//! activation is rendered as **one `eval` statement whose single argument is a
-//! single-quoted literal** holding the tool's output: the file's own grammar
-//! holds a command and a string, never an assignment, exactly as the
-//! uncached `eval "$(tool init zsh)"` line it replaces does. What that string
-//! sets when it runs is the tool's own documented activation — the same text
-//! the uncached line would have evaluated at the same moment — relayed byte
-//! for byte and never composed, edited or added to by bx. The single quotes
-//! also keep a malformed output from reaching the rest of the file: it fails
-//! inside its own `eval`, as it would have uncached.
+//! A tool's activation output assigns environment variables, so the phases it
+//! lands in fall under the environment guard: **every assignment in the
+//! output is judged by [`env_guard::check`] before it is written**, against
+//! the same [`RootSet`] every environment fragment is judged against, and an
+//! output with one the guard refuses is omitted as a blocked step naming the
+//! variable. Nothing it would have set reaches the file.
+//!
+//! [`refusals`] is that judgement. It reads the output as shell — quotes,
+//! escapes, substitutions, comments, command position — and judges each
+//! `NAME=VALUE` it finds: a bare assignment in command position, a prefix
+//! assignment to a command, and every operand of `export`, `typeset`,
+//! `declare`, `readonly`, `local`, `integer` and `float`, at any depth of the
+//! output's own functions and blocks. It **fails closed**: an assignment it
+//! can find but not value — an append, a subscript, an array, a loop
+//! variable, an operand of a command whose name is itself a substitution —
+//! and a construct that can assign what it cannot see — `eval`, `source`,
+//! `.`, `read`, `vared`, `getopts`, `zparseopts`, `print -v`, `set -A`,
+//! `${NAME=…}`, an arithmetic assignment, a heredoc, a quote that does not
+//! close — are refused as [`Reason::Unreadable`]. Only a command
+//! substitution's own assignments are not judged, because it runs in a
+//! subshell and cannot change the shell the file is sourced into.
+//!
+//! What passes is rendered as **one `eval` statement whose single argument is
+//! a single-quoted literal** holding the tool's output byte for byte, so bx's
+//! own bytes set nothing and a malformed output fails inside its own `eval`
+//! rather than swallowing the rest of the file.
 //! `a_rendered_activation_is_one_eval_of_a_literal_and_sets_nothing_itself`
-//! holds the rendered bytes to that.
+//! holds the rendered bytes to that, and
+//! `every_assignment_in_an_output_is_judged_by_the_guard` holds the reader.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -92,6 +106,7 @@ use toml_edit::Table;
 use super::{Assembly, Phase};
 use crate::config::{Ctx, Error, Origin};
 use crate::detect::{self, Presence};
+use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
 use crate::report::Action;
 use crate::state::{ContentHash, Fingerprint, Fingerprints};
 
@@ -99,7 +114,7 @@ use crate::state::{ContentHash, Fingerprint, Fingerprints};
 pub(crate) const SECTION: &str = "[[activation]]";
 
 /// Every key an `[[activation]]` entry may carry.
-const KEYS: [&str; 5] = ["name", "command", "phase", "cache", "enabled"];
+const KEYS: [&str; 4] = ["name", "command", "phase", "enabled"];
 
 /// The prefix of every cache key this module owns.
 pub const KEY_PREFIX: &str = "activation:";
@@ -131,8 +146,6 @@ pub struct ActivationDecl {
     pub command: Vec<String>,
     /// The phase its output lands in.
     pub phase: Phase,
-    /// `false` renders the plain invocation every time, never cached.
-    pub cache: bool,
     /// `false` in any layer removes the activation from the resolved
     /// configuration.
     pub enabled: bool,
@@ -151,30 +164,6 @@ impl ActivationDecl {
     #[must_use]
     pub fn program(&self) -> &str {
         &self.command[0]
-    }
-
-    /// The never-cacheable rendering: `eval` of the command's output, run only
-    /// when the tool is there at shell start.
-    #[must_use]
-    pub fn invocation(&self) -> String {
-        let program = self.program();
-        let guard = if program.starts_with('/') {
-            format!("[[ -x {program} ]]")
-        } else {
-            format!("(( $+commands[{program}] ))")
-        };
-        let words: Vec<String> = self.command.iter().map(|w| quote(w)).collect();
-        format!("{guard} && eval \"$({})\"\n", words.join(" "))
-    }
-}
-
-/// `word`, bare where every character is one a bare shell word holds, and
-/// single-quoted otherwise.
-fn quote(word: &str) -> String {
-    if !word.is_empty() && word.chars().all(is_bare) {
-        word.to_string()
-    } else {
-        literal(word)
     }
 }
 
@@ -241,7 +230,6 @@ pub fn parse_activation(table: &Table, file: &Path, text: &str) -> Result<Activa
         name,
         command,
         phase,
-        cache: ctx.bool_at(table, "cache")?.unwrap_or(true),
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
     })
@@ -264,8 +252,7 @@ fn unrunnable(command: &[String]) -> Option<String> {
     if !shape {
         return Some(format!(
             "`command[0] = {program:?}` must be a program name of ASCII letters, digits and \
-             `_.+-`, or an absolute path of those and `/,:@%`, so it can be looked up and \
-             named unquoted"
+             `_.+-`, or an absolute path of those and `/,:@%`, so it can be looked up"
         ));
     }
     command.iter().find(|word| word.contains('\0')).map(|word| {
@@ -466,6 +453,13 @@ pub enum Omission {
     NotText,
     /// Two consecutive runs printed different output.
     Unstable,
+    /// The environment guard refuses an assignment the output makes.
+    Refused {
+        /// The first refusal, its line counted within the output.
+        first: Violation,
+        /// How many more the output holds.
+        more: usize,
+    },
 }
 
 impl fmt::Display for Omission {
@@ -480,8 +474,22 @@ impl fmt::Display for Omission {
             Self::NotText => f.write_str("it printed something that is not text"),
             Self::Unstable => f.write_str(
                 "two consecutive runs printed different output, so it is not cached; \
-                 the next plan runs it again, or declare it `cache = false`",
+                 the next plan runs it again",
             ),
+            Self::Refused { first, more } => {
+                f.write_str("the environment guard refuses its output: ")?;
+                if first.name.is_empty() {
+                    write!(f, "line {}, `{}`,", first.line, first.value)?;
+                } else {
+                    write!(f, "`{}` at line {}", first.name, first.line)?;
+                }
+                write!(f, " {}", first.reason)?;
+                match more {
+                    0 => Ok(()),
+                    1 => f.write_str("; 1 more assignment is refused"),
+                    n => write!(f, "; {n} more assignments are refused"),
+                }
+            }
         }
     }
 }
@@ -505,8 +513,6 @@ pub enum Outcome {
         /// Whether it replaces an entry a different binary or command produced.
         replaces: bool,
     },
-    /// Declared never cacheable: rendered as the plain invocation.
-    Plain,
     /// Left out, for the reason given.
     Omitted(Omission),
 }
@@ -522,13 +528,12 @@ pub struct Step {
 
 impl Step {
     /// What the step is, in the vocabulary `plan` and `apply` share: a reuse
-    /// or a plain invocation is converged, a first capture creates a cache
-    /// entry and a re-capture modifies one, and an omission is blocked until
-    /// the tool behaves.
+    /// is converged, a first capture creates a cache entry and a re-capture
+    /// modifies one, and an omission is blocked until the tool behaves.
     #[must_use]
     pub const fn action(&self) -> Action {
         match &self.outcome {
-            Outcome::Reused { .. } | Outcome::Plain => Action::Unchanged,
+            Outcome::Reused { .. } => Action::Unchanged,
             Outcome::Captured {
                 replaces: false, ..
             } => Action::Create,
@@ -548,7 +553,6 @@ impl Step {
             Outcome::Captured { replaces: true, .. } => {
                 "binary or command changed; run twice, output agreed; cache replaced".to_string()
             }
-            Outcome::Plain => "never cached; runs at every shell start".to_string(),
             Outcome::Omitted(why) => format!("omitted: {why}"),
         };
         format!(
@@ -566,7 +570,6 @@ impl Step {
             Outcome::Reused { output } | Outcome::Captured { output, .. } => {
                 Some(format!("{comment}eval {}\n", literal(output)))
             }
-            Outcome::Plain => Some(format!("{comment}{}", self.decl.invocation())),
             Outcome::Omitted(_) => None,
         }
     }
@@ -604,8 +607,7 @@ impl Plan {
 
     /// Bring `cache` up to date with the plan: record every capture, and
     /// forget every activation entry nothing reused or captured — an omitted
-    /// one, a never-cacheable one, and one no enabled declaration names any
-    /// more — so an omission is retried from nothing. Entries this module
+    /// one, a refused one, and one no enabled declaration names any more — so an omission is retried from nothing. Entries this module
     /// does not own are left alone.
     pub fn record(&self, cache: &mut Fingerprints) {
         let mut kept = Vec::new();
@@ -617,7 +619,7 @@ impl Plan {
                     cache.set(key.clone(), entry.clone());
                     kept.push(key);
                 }
-                Outcome::Plain | Outcome::Omitted(_) => {}
+                Outcome::Omitted(_) => {}
             }
         }
         let stale: Vec<String> = cache
@@ -673,28 +675,50 @@ fn inputs(content: &ContentHash, binary: &Path, command: &[String]) -> ContentHa
 }
 
 /// Decide every enabled activation in `decls`, in declaration order, against
-/// `cache`, running on `host` only what the cache cannot answer.
+/// `cache`, running on `host` only what the cache cannot answer, and judging
+/// every output — reused or captured — against `roots`.
 ///
 /// `cache` is read, never written: [`Plan::record`] is what applies the
 /// decisions to it.
 #[must_use]
-pub fn plan(decls: &[ActivationDecl], cache: &Fingerprints, host: &impl Host) -> Plan {
+pub fn plan(
+    decls: &[ActivationDecl],
+    cache: &Fingerprints,
+    roots: &RootSet,
+    host: &impl Host,
+) -> Plan {
     let steps = decls
         .iter()
         .filter(|decl| decl.enabled)
-        .map(|decl| Step {
-            decl: decl.clone(),
-            outcome: decide(decl, cache, host),
+        .map(|decl| {
+            let outcome = decide(decl, cache, host);
+            let refused = match &outcome {
+                Outcome::Reused { output } | Outcome::Captured { output, .. } => {
+                    judged(output, roots)
+                }
+                Outcome::Omitted(_) => None,
+            };
+            Step {
+                decl: decl.clone(),
+                outcome: refused.map_or(outcome, Outcome::Omitted),
+            }
         })
         .collect();
     Plan { steps }
 }
 
-/// Decide one activation.
+/// Why the guard keeps `output` out of the file, or `None` when it refuses
+/// none of its assignments.
+fn judged(output: &str, roots: &RootSet) -> Option<Omission> {
+    let mut refused = refusals(output, roots).into_iter();
+    refused.next().map(|first| Omission::Refused {
+        first,
+        more: refused.len(),
+    })
+}
+
+/// Decide one activation, before the guard judges its output.
 fn decide(decl: &ActivationDecl, cache: &Fingerprints, host: &impl Host) -> Outcome {
-    if !decl.cache {
-        return Outcome::Plain;
-    }
     let binary = match host.locate(decl.program()) {
         Presence::Present { path } => path,
         Presence::NotExecutable { path } => {
@@ -749,6 +773,586 @@ fn decide(decl: &ActivationDecl, cache: &Fingerprints, host: &impl Host) -> Outc
     }
 }
 
+/// How deep one substitution may nest inside another before the reader
+/// refuses the output rather than follow it.
+const MAX_NESTING: usize = 64;
+
+/// Commands every `NAME=VALUE` operand of which is an assignment.
+const DECLARERS: [&str; 7] = [
+    "export", "typeset", "declare", "readonly", "local", "integer", "float",
+];
+
+/// Commands that can assign what the reader cannot see.
+const INDIRECT: [&str; 7] = [
+    "eval",
+    "source",
+    ".",
+    "read",
+    "vared",
+    "getopts",
+    "zparseopts",
+];
+
+/// Words after which the next word is still in command position.
+const PREFIXES: [&str; 22] = [
+    "!",
+    "{",
+    "}",
+    "if",
+    "then",
+    "elif",
+    "else",
+    "fi",
+    "while",
+    "until",
+    "do",
+    "done",
+    "esac",
+    "always",
+    "time",
+    "coproc",
+    "builtin",
+    "command",
+    "exec",
+    "noglob",
+    "nocorrect",
+    "-",
+];
+
+/// Keywords whose next word is a loop variable.
+const LOOPS: [&str; 3] = ["for", "select", "foreach"];
+
+/// Every environment assignment `output` makes that [`env_guard::check`]
+/// refuses under `roots`, in the order the output makes them, each numbered by
+/// its line within the output. An output is written only when this is empty.
+///
+/// The output is read as shell, as the module docs set out, and judged
+/// assignment by assignment: a construct that can assign but that the reader
+/// cannot value is refused as [`Reason::Unreadable`], naming the variable
+/// where there is one to name and quoting the line otherwise. A construct the
+/// reader cannot follow at all — a heredoc, a quote or a substitution that
+/// does not close, one nested past its bound — ends the reading with that one
+/// refusal, since nothing after it can be told apart from what it holds.
+#[must_use]
+pub fn refusals(output: &str, roots: &RootSet) -> Vec<Violation> {
+    let chars: Vec<char> = output.chars().collect();
+    let lexer = Lexer {
+        c: &chars,
+        i: 0,
+        word: String::new(),
+        start: 0,
+        depth: 0,
+        out: Vec::new(),
+    };
+    let mut reader = Reader {
+        chars: &chars,
+        roots,
+        found: Vec::new(),
+    };
+    match lexer.run() {
+        Ok(tokens) => reader.read(&tokens),
+        Err(at) => reader.unreadable(at, ""),
+    }
+    reader.found
+}
+
+/// One token of an output.
+enum Tok {
+    /// A word, as written: quotes, escapes and substitutions kept.
+    Word(String),
+    /// A newline, `;`, `&` or `|`: the next word begins a command.
+    Sep,
+    /// `(`.
+    Open,
+    /// `)`.
+    Close,
+}
+
+/// A token, and the characters it spans.
+struct Token {
+    /// The token.
+    tok: Tok,
+    /// Its first character.
+    at: usize,
+    /// One past its last character.
+    end: usize,
+}
+
+/// Splits an output into [`Token`]s, refusing — by returning where it
+/// begins — a construct that can assign unseen or that it cannot follow.
+struct Lexer<'a> {
+    /// The output.
+    c: &'a [char],
+    /// The next character.
+    i: usize,
+    /// The word being read.
+    word: String,
+    /// Where it began.
+    start: usize,
+    /// How deep the substitution being read is nested.
+    depth: usize,
+    /// The tokens read so far.
+    out: Vec<Token>,
+}
+
+impl Lexer<'_> {
+    /// Every token, or where the construct it refuses begins.
+    fn run(mut self) -> Result<Vec<Token>, usize> {
+        while let Some(&ch) = self.c.get(self.i) {
+            let at = self.i;
+            match ch {
+                ' ' | '\t' | '\r' => {
+                    self.end_word();
+                    self.i += 1;
+                }
+                '\n' | ';' | '&' | '|' => self.mark(Tok::Sep),
+                // `(( … ))`, an arithmetic command.
+                '(' if self.word.is_empty() && self.c.get(at + 1) == Some(&'(') => {
+                    let end = self.group(at, '(', ')')?;
+                    if arithmetic_assigns(&self.c[at + 2..end - 2]) {
+                        return Err(at);
+                    }
+                    self.take_to(end);
+                }
+                '(' => self.mark(Tok::Open),
+                ')' => self.mark(Tok::Close),
+                '<' | '>' => self.redirection()?,
+                // A line continuation joins what it splits.
+                '\\' if self.c.get(at + 1) == Some(&'\n') => self.i += 2,
+                '\\' => self.take_to((at + 2).min(self.c.len())),
+                '#' if self.word.is_empty() => {
+                    while self.c.get(self.i).is_some_and(|c| *c != '\n') {
+                        self.i += 1;
+                    }
+                }
+                '\'' => {
+                    let end = self.single(at)?;
+                    self.take_to(end);
+                }
+                '"' => {
+                    let end = self.double(at)?;
+                    self.take_to(end);
+                }
+                '`' => {
+                    let end = self.backtick(at)?;
+                    self.take_to(end);
+                }
+                '$' => {
+                    let end = self.dollar(at)?;
+                    self.take_to(end);
+                }
+                _ => self.take_to(at + 1),
+            }
+        }
+        self.end_word();
+        Ok(self.out)
+    }
+
+    /// Add the characters up to `end` to the word being read.
+    fn take_to(&mut self, end: usize) {
+        if self.word.is_empty() {
+            self.start = self.i;
+        }
+        self.word.extend(&self.c[self.i..end]);
+        self.i = end;
+    }
+
+    /// End the word being read, if there is one.
+    fn end_word(&mut self) {
+        if !self.word.is_empty() {
+            self.out.push(Token {
+                tok: Tok::Word(std::mem::take(&mut self.word)),
+                at: self.start,
+                end: self.i,
+            });
+        }
+    }
+
+    /// End the word being read, and add the one-character `tok` after it.
+    fn mark(&mut self, tok: Tok) {
+        self.end_word();
+        self.out.push(Token {
+            tok,
+            at: self.i,
+            end: self.i + 1,
+        });
+        self.i += 1;
+    }
+
+    /// Step over a redirection operator. A heredoc is refused: its body is
+    /// not shell, and the reader cannot tell where it ends without running
+    /// the command that reads it.
+    fn redirection(&mut self) -> Result<(), usize> {
+        let at = self.i;
+        self.end_word();
+        if self.c[at] == '<' && self.c.get(at + 1) == Some(&'<') {
+            if self.c.get(at + 2) == Some(&'<') {
+                self.i = at + 3;
+                return Ok(());
+            }
+            return Err(at);
+        }
+        if self.c.get(at + 1) == Some(&'(') {
+            // A process substitution runs in a subshell of its own.
+            self.i = self.group(at + 1, '(', ')')?;
+            return Ok(());
+        }
+        self.i = at + 1;
+        while self
+            .c
+            .get(self.i)
+            .is_some_and(|c| matches!(c, '<' | '>' | '&' | '|'))
+        {
+            self.i += 1;
+        }
+        Ok(())
+    }
+
+    /// One past the `'` that closes the one at `at`.
+    fn single(&self, at: usize) -> Result<usize, usize> {
+        self.c[at + 1..]
+            .iter()
+            .position(|c| *c == '\'')
+            .map(|p| at + p + 2)
+            .ok_or(at)
+    }
+
+    /// One past the `"` that closes the one at `at`.
+    fn double(&mut self, at: usize) -> Result<usize, usize> {
+        let mut j = at + 1;
+        loop {
+            match self.c.get(j) {
+                None => return Err(at),
+                Some('\\') => j += 2,
+                Some('"') => return Ok(j + 1),
+                Some('$') => j = self.dollar(j)?,
+                Some('`') => j = self.backtick(j)?,
+                Some(_) => j += 1,
+            }
+        }
+    }
+
+    /// One past the `` ` `` that closes the one at `at`. What it runs, it
+    /// runs in a subshell.
+    fn backtick(&self, at: usize) -> Result<usize, usize> {
+        let mut j = at + 1;
+        loop {
+            match self.c.get(j) {
+                None => return Err(at),
+                Some('\\') => j += 2,
+                Some('`') => return Ok(j + 1),
+                Some(_) => j += 1,
+            }
+        }
+    }
+
+    /// One past the expansion the `$` at `at` begins. A command substitution
+    /// runs in a subshell, so what it assigns is not judged; a parameter
+    /// expansion or an arithmetic expansion that assigns is refused.
+    fn dollar(&mut self, at: usize) -> Result<usize, usize> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            return Err(at);
+        }
+        let end = match self.c.get(at + 1) {
+            Some('(') if self.c.get(at + 2) == Some(&'(') => {
+                let end = self.group(at + 1, '(', ')')?;
+                if arithmetic_assigns(&self.c[at + 3..end - 2]) {
+                    return Err(at);
+                }
+                end
+            }
+            Some('(') => self.group(at + 1, '(', ')')?,
+            Some('{') => {
+                let end = self.group(at + 1, '{', '}')?;
+                if parameter_assigns(&self.c[at + 2..end - 1]) {
+                    return Err(at);
+                }
+                end
+            }
+            Some('\'') => {
+                let mut j = at + 2;
+                loop {
+                    match self.c.get(j) {
+                        None => return Err(at),
+                        Some('\\') => j += 2,
+                        Some('\'') => break j + 1,
+                        Some(_) => j += 1,
+                    }
+                }
+            }
+            _ => at + 1,
+        };
+        self.depth -= 1;
+        Ok(end)
+    }
+
+    /// One past the `close` that balances the `open` at `at`, stepping over
+    /// quotes, escapes, expansions and — between parentheses — comments.
+    fn group(&mut self, at: usize, open: char, close: char) -> Result<usize, usize> {
+        let mut depth = 0usize;
+        let mut j = at;
+        loop {
+            match self.c.get(j) {
+                None => return Err(at),
+                Some('\\') => j += 2,
+                Some('\'') => j = self.single(j)?,
+                Some('"') => j = self.double(j)?,
+                Some('`') => j = self.backtick(j)?,
+                Some('$') => j = self.dollar(j)?,
+                Some('#') if open == '(' && self.c[j - 1].is_ascii_whitespace() => {
+                    while self.c.get(j).is_some_and(|c| *c != '\n') {
+                        j += 1;
+                    }
+                }
+                Some(c) if *c == open => {
+                    depth += 1;
+                    j += 1;
+                }
+                Some(c) if *c == close => {
+                    depth -= 1;
+                    j += 1;
+                    if depth == 0 {
+                        return Ok(j);
+                    }
+                }
+                Some(_) => j += 1,
+            }
+        }
+    }
+}
+
+/// Whether an arithmetic expression assigns: any `=` that is not part of
+/// `==`, `!=`, `<=` or `>=`, and any `++` or `--`.
+fn arithmetic_assigns(c: &[char]) -> bool {
+    c.iter().enumerate().any(|(k, &x)| match x {
+        '=' => {
+            let doubled = |b: char| k >= 2 && c[k - 2] == b;
+            c.get(k + 1) != Some(&'=')
+                && match k.checked_sub(1).map(|p| c[p]) {
+                    Some('=' | '!') => false,
+                    Some(b @ ('<' | '>')) => doubled(b),
+                    _ => true,
+                }
+        }
+        '+' | '-' => c.get(k + 1) == Some(&x),
+        _ => false,
+    })
+}
+
+/// Whether the inside of a `${…}` assigns: `${NAME=…}`, `${NAME:=…}` or
+/// `${NAME::=…}`, flags and a subscript allowed before the operator.
+fn parameter_assigns(c: &[char]) -> bool {
+    let mut j = 0;
+    if c.first() == Some(&'(') {
+        match c.iter().position(|x| *x == ')') {
+            Some(p) => j = p + 1,
+            None => return true,
+        }
+    }
+    while matches!(c.get(j), Some('^' | '=' | '~' | '#' | '!' | '+')) {
+        j += 1;
+    }
+    let name = j;
+    while c
+        .get(j)
+        .is_some_and(|x| x.is_ascii_alphanumeric() || *x == '_')
+    {
+        j += 1;
+    }
+    if j == name && c.get(j).is_some_and(|x| "@*#?$!-".contains(*x)) {
+        j += 1;
+    }
+    if c.get(j) == Some(&'[') {
+        match c[j..].iter().position(|x| *x == ']') {
+            Some(p) => j += p + 1,
+            None => return true,
+        }
+    }
+    let rest = &c[j..];
+    rest.starts_with(&['=']) || rest.starts_with(&[':', '=']) || rest.starts_with(&[':', ':', '='])
+}
+
+/// `raw` as an assignment: its name, and its value where the reader can
+/// judge one — `None` for an append or a subscript.
+fn assignment(raw: &str) -> Option<(&str, Option<&str>)> {
+    let len = raw
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(raw.len());
+    let (name, rest) = raw.split_at(len);
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(value) = rest.strip_prefix('=') {
+        Some((name, Some(value)))
+    } else if rest.starts_with("+=") || (rest.starts_with('[') && rest.contains('=')) {
+        Some((name, None))
+    } else {
+        None
+    }
+}
+
+/// `raw` with its quotes and escapes removed, or `None` when it expands to
+/// something the reader cannot know.
+fn plain(raw: &str) -> Option<String> {
+    (!raw.contains(['$', '`'])).then(|| {
+        raw.chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect()
+    })
+}
+
+/// Where the reader stands in a command.
+#[derive(Clone, Copy)]
+enum State {
+    /// At a command's first word, or after a prefix assignment.
+    Start,
+    /// In the operands of a [`DECLARERS`] command.
+    Declaring,
+    /// In the operands of a command whose name is an expansion.
+    Dynamic,
+    /// At a loop variable.
+    Loop,
+    /// At the name `function` defines.
+    Named,
+    /// In the operands of a command a flag holding this letter makes assign.
+    Flags(char),
+    /// In operands that assign nothing.
+    Other,
+}
+
+/// Judges the assignments in a token stream.
+struct Reader<'a> {
+    /// The output, to number lines and quote them.
+    chars: &'a [char],
+    /// The roots every value is judged against.
+    roots: &'a RootSet,
+    /// Every refusal, in order.
+    found: Vec<Violation>,
+}
+
+impl Reader<'_> {
+    /// Judge every assignment in `tokens`.
+    fn read(&mut self, tokens: &[Token]) {
+        let mut state = State::Start;
+        for (k, token) in tokens.iter().enumerate() {
+            let Tok::Word(raw) = &token.tok else {
+                state = State::Start;
+                continue;
+            };
+            // `NAME=(`, with nothing between: an array.
+            let array = tokens
+                .get(k + 1)
+                .is_some_and(|next| matches!(next.tok, Tok::Open) && next.at == token.end);
+            state = match state {
+                State::Start => self.command(raw, token.at, array),
+                State::Declaring | State::Dynamic => {
+                    self.operand(raw, token.at, array);
+                    state
+                }
+                State::Loop if raw.starts_with("((") => State::Other,
+                State::Loop => {
+                    self.unreadable(token.at, raw);
+                    State::Other
+                }
+                State::Named => State::Start,
+                State::Flags(letter) => {
+                    if raw.starts_with(['-', '+']) && raw.contains(letter) {
+                        self.unreadable(token.at, "");
+                    }
+                    state
+                }
+                State::Other => State::Other,
+            };
+        }
+    }
+
+    /// Read `raw` in command position.
+    fn command(&mut self, raw: &str, at: usize, array: bool) -> State {
+        if let Some((name, value)) = assignment(raw) {
+            self.assignment(name, value, at, array);
+            return State::Start;
+        }
+        let Some(name) = plain(raw) else {
+            return State::Dynamic;
+        };
+        match name.as_str() {
+            n if PREFIXES.contains(&n) => State::Start,
+            n if DECLARERS.contains(&n) => State::Declaring,
+            n if LOOPS.contains(&n) => State::Loop,
+            n if INDIRECT.contains(&n) => {
+                self.unreadable(at, "");
+                State::Other
+            }
+            "function" => State::Named,
+            "print" | "printf" => State::Flags('v'),
+            "set" => State::Flags('A'),
+            _ => State::Other,
+        }
+    }
+
+    /// Read `raw` as an operand that may assign: judged where it is an
+    /// assignment, refused where quoting or an expansion hides whether it is.
+    fn operand(&mut self, raw: &str, at: usize, array: bool) {
+        if let Some((name, value)) = assignment(raw) {
+            self.assignment(name, value, at, array);
+            return;
+        }
+        match plain(raw) {
+            None => self.unreadable(at, ""),
+            Some(text) if text.contains('=') && !text.starts_with(['-', '+']) => {
+                let name = text.split('=').next().unwrap_or_default().to_string();
+                self.unreadable(at, &name);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Judge the assignment of `value` to `name`; `None` is one the reader
+    /// cannot value.
+    fn assignment(&mut self, name: &str, value: Option<&str>, at: usize, array: bool) {
+        match value {
+            Some(value) if !(array && value.is_empty()) => {
+                if let Verdict::Violation(mut refused) = env_guard::check(name, value, self.roots) {
+                    refused.line = self.line(at);
+                    self.found.push(refused);
+                }
+            }
+            _ => self.unreadable(at, name),
+        }
+    }
+
+    /// Refuse what begins at `at` as unreadable, naming `name` or, where there
+    /// is none, quoting the line.
+    fn unreadable(&mut self, at: usize, name: &str) {
+        let at = at.min(self.chars.len());
+        let start = self.chars[..at]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map_or(0, |p| p + 1);
+        let end = self.chars[at..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map_or(self.chars.len(), |p| at + p);
+        let text: String = self.chars[start..end].iter().collect();
+        self.found.push(Violation {
+            line: self.line(at),
+            name: name.to_string(),
+            value: text.trim().to_string(),
+            reason: Reason::Unreadable,
+        });
+    }
+
+    /// The 1-based line `at` is on.
+    fn line(&self, at: usize) -> usize {
+        self.chars[..at.min(self.chars.len())]
+            .iter()
+            .filter(|c| **c == '\n')
+            .count()
+            + 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,7 +1379,6 @@ mod tests {
             name: name.to_string(),
             command: command.iter().map(ToString::to_string).collect(),
             phase: Phase::Activations,
-            cache: true,
             enabled: true,
             origin: Origin {
                 file: PathBuf::from("/repo/bx.toml"),
@@ -879,7 +1482,7 @@ mod tests {
 
     /// Plan, render and record, as `apply` does; the rendered file.
     fn apply(decls: &[ActivationDecl], cache: &mut Fingerprints, host: &Fake) -> (Plan, String) {
-        let plan = plan(decls, cache, host);
+        let plan = plan(decls, cache, &RootSet::strict(), host);
         let mut assembly = Assembly::new();
         plan.contribute(&mut assembly)
             .expect("activations never claim the terminal slot");
@@ -891,7 +1494,7 @@ mod tests {
     fn an_activation_entry_parses_every_key() {
         let decls = parse(
             "[[activation]]\nname = \"starship\"\ncommand = [\"starship\", \"init\", \"zsh\"]\n\
-             phase = \"completions\"\ncache = false\nenabled = false\n\
+             phase = \"completions\"\nenabled = false\n\
              [[activation]]\nname = \"brew\"\n\
              command = [\"/home/linuxbrew/.linuxbrew/bin/brew\", \"shellenv\"]\n",
         )
@@ -903,7 +1506,6 @@ mod tests {
                     name: "starship".to_string(),
                     command: vec!["starship".into(), "init".into(), "zsh".into()],
                     phase: Phase::Completions,
-                    cache: false,
                     enabled: false,
                     origin: Origin {
                         file: PathBuf::from("/repo/bx.toml"),
@@ -917,11 +1519,10 @@ mod tests {
                         "shellenv".into()
                     ],
                     phase: Phase::Activations,
-                    cache: true,
                     enabled: true,
                     origin: Origin {
                         file: PathBuf::from("/repo/bx.toml"),
-                        line: 7,
+                        line: 6,
                     },
                 },
             ]
@@ -974,8 +1575,13 @@ mod tests {
             ),
             ("name = \"a\"\ncommand = [\"a\"]\nphase = 1\n", "a string"),
             (
-                "name = \"a\"\ncommand = [\"a\"]\ncache = \"no\"\n",
+                "name = \"a\"\ncommand = [\"a\"]\nenabled = \"no\"\n",
                 "a boolean",
+            ),
+            // The never-cacheable form is gone, and saying so is refused.
+            (
+                "name = \"a\"\ncommand = [\"a\"]\ncache = false\n",
+                "unknown key `cache`",
             ),
             (
                 "name = \"a\"\ncommand = [\"a\"]\nwhen = \"ssh\"\n",
@@ -988,62 +1594,203 @@ mod tests {
     }
 
     #[test]
-    fn a_never_cacheable_activation_is_a_guarded_quoted_invocation() {
-        let mut plain = decl("fzf", &["fzf", "--zsh"]);
-        plain.cache = false;
-        assert_eq!(
-            plain.invocation(),
-            "(( $+commands[fzf] )) && eval \"$(fzf --zsh)\"\n"
-        );
-        let absolute = decl(
-            "brew",
-            &[
-                "/opt/brew/bin/brew",
-                "shell env",
-                "it's",
-                "",
-                "{a,b}",
-                "x=1",
-            ],
-        );
-        assert_eq!(
-            absolute.invocation(),
-            "[[ -x /opt/brew/bin/brew ]] && eval \"$(/opt/brew/bin/brew 'shell env' \
-             'it'\\''s' '' '{a,b}' 'x=1')\"\n"
-        );
-        // Every character a bare word may not hold is quoted.
-        for c in "= \t\n;&|'\"$`[](){}<>\\*?!#~^".chars() {
-            assert_ne!(quote(&format!("a{c}b")), format!("a{c}b"), "{c:?}");
-        }
-        assert_eq!(quote("--init=zsh"), "'--init=zsh'");
-        assert_eq!(quote("a_./,:@%+-b"), "a_./,:@%+-b");
-
-        // Rendered every time, and never cached, even with nothing installed.
-        let host = Fake::default();
-        let mut cache = Fingerprints::default();
-        cache.set("activation:fzf", Fingerprint::raw(vec![1]));
-        let (plan, file) = apply(&[plain.clone()], &mut cache, &host);
-        assert_eq!(plan.steps()[0].outcome, Outcome::Plain);
-        assert_eq!(plan.steps()[0].action(), Action::Unchanged);
-        assert!(
-            file.ends_with(
-                "\n# bx phase: activations\n# bx activation: fzf\n\
-                 (( $+commands[fzf] )) && eval \"$(fzf --zsh)\"\n"
+    fn every_assignment_in_an_output_is_judged_by_the_guard() {
+        use Reason::{NoRootsDeclared, NotEmittable, Unreadable};
+        /// One refusal: its line, the variable it names, and why.
+        type Refusal = (usize, &'static str, Reason);
+        let strict = RootSet::strict();
+        // (output, every refusal it holds).
+        let cases: &[(&str, &[Refusal])] = &[
+            // Emittable and allowed, or no assignment at all.
+            ("export EDITOR=nvim\n", &[]),
+            ("EDITOR=vi; export PAGER='less'\n", &[]),
+            ("z() { :; }\nalias zi='z -i'\n", &[]),
+            ("echo X=1 'Y=2' \"Z=3\" # W=4\n", &[]),
+            ("export EDITOR\nlocal x\ntypeset -f z\nunset X\n", &[]),
+            (
+                "x() { echo \"$(( a == 1 ))\" ${X:-d} ${#Y} ${(j: :)Z}; }\n",
+                &[],
             ),
+            ("(( a <= 1 && b >= 2 && c != 3 ))\n", &[]),
+            ("cat <<< X=1 2>&1 >/dev/null | cat\n", &[]),
+            // A command substitution's own assignment is a subshell's; the
+            // value it gives `x` is still judged, and cannot be read.
+            ("x=$(Y=1 cmd)\n", &[(1, "x", Unreadable)]),
+            ("echo `Y=1 cmd` <(Y=1 cmd) $'it\\'s'\n", &[]),
+            ("export \\\n  EDITOR=vi\n", &[]),
+            // Each form of assignment, wherever it is.
+            (
+                "export STARSHIP_SHELL=zsh\n",
+                &[(1, "STARSHIP_SHELL", NotEmittable)],
+            ),
+            (
+                "STARSHIP_SHELL=zsh\n",
+                &[(1, "STARSHIP_SHELL", NotEmittable)],
+            ),
+            ("\\builtin export X=1\n", &[(1, "X", NotEmittable)]),
+            ("command 'export' X=1\n", &[(1, "X", NotEmittable)]),
+            ("typeset -gx X=1\n", &[(1, "X", NotEmittable)]),
+            ("declare -x X=1\n", &[(1, "X", NotEmittable)]),
+            ("readonly X=1\n", &[(1, "X", NotEmittable)]),
+            ("local X=1\n", &[(1, "X", NotEmittable)]),
+            ("X=1 cmd\n", &[(1, "X", NotEmittable)]),
+            ("f() {\n  X=1\n}\n", &[(2, "X", NotEmittable)]),
+            ("function f {\n  X=1\n}\n", &[(2, "X", NotEmittable)]),
+            (
+                "if true; then X=1; else Y=2; fi\n",
+                &[(1, "X", NotEmittable), (1, "Y", NotEmittable)],
+            ),
+            ("{ :; } always { X=1; }\n", &[(1, "X", NotEmittable)]),
+            ("case $a in\n  b) X=1 ;;\nesac\n", &[(2, "X", NotEmittable)]),
+            (
+                "true && ! X=1 || (Y=2)\n",
+                &[(1, "X", NotEmittable), (1, "Y", NotEmittable)],
+            ),
+            // The value is judged, not only the name.
+            (
+                "export CARGO_HOME=/tmp/cargo\n",
+                &[(1, "CARGO_HOME", NoRootsDeclared)],
+            ),
+            // Assignments the reader can find but not value.
+            ("X+=1\n", &[(1, "X", Unreadable)]),
+            ("X[1]=a\n", &[(1, "X", Unreadable)]),
+            ("X=(a b)\n", &[(1, "X", Unreadable)]),
+            ("typeset -a X=(a b)\n", &[(1, "X", Unreadable)]),
+            ("for X in a b; do :; done\n", &[(1, "X", Unreadable)]),
+            ("export 'X=1'\n", &[(1, "X", Unreadable)]),
+            ("export \"$n=1\"\n", &[(1, "", Unreadable)]),
+            ("$cmd X=1\n", &[(1, "X", NotEmittable)]),
+            ("$cmd \"$@\"\n", &[(1, "", Unreadable)]),
+            // Constructs that can assign what the reader cannot see.
+            ("eval \"$(mise hook-env)\"\n", &[(1, "", Unreadable)]),
+            (
+                "source ./x\n. ./y\n",
+                &[(1, "", Unreadable), (2, "", Unreadable)],
+            ),
+            ("read X\n", &[(1, "", Unreadable)]),
+            ("print -rv X hi\n", &[(1, "", Unreadable)]),
+            ("set -A X a b\n", &[(1, "", Unreadable)]),
+            ("echo ${X:=1}\n", &[(1, "", Unreadable)]),
+            ("echo ${(L)X=1}\n", &[(1, "", Unreadable)]),
+            ("echo \"${X::=1}\"\n", &[(1, "", Unreadable)]),
+            ("(( X = 1 ))\n", &[(1, "", Unreadable)]),
+            ("echo $(( X++ ))\n", &[(1, "", Unreadable)]),
+            ("(( X <<= 1 ))\n", &[(1, "", Unreadable)]),
+            (
+                "for (( i = 0; i < 2; i++ )); do :; done\n",
+                &[(1, "", Unreadable)],
+            ),
+            // Shell the reader cannot follow ends the reading.
+            ("cat <<EOF\nX=1\nEOF\n", &[(1, "", Unreadable)]),
+            ("echo 'unclosed\nX=1\n", &[(1, "", Unreadable)]),
+            ("echo \"unclosed\n", &[(1, "", Unreadable)]),
+            ("echo `unclosed\n", &[(1, "", Unreadable)]),
+            ("echo $'unclosed\n", &[(1, "", Unreadable)]),
+            ("echo $(unclosed\n", &[(1, "", Unreadable)]),
+            ("echo ${unclosed\n", &[(1, "", Unreadable)]),
+        ];
+        for (output, expected) in cases {
+            let found: Vec<(usize, String, Reason)> = refusals(output, &strict)
+                .into_iter()
+                .map(|v| (v.line, v.name, v.reason))
+                .collect();
+            let expected: Vec<(usize, String, Reason)> = expected
+                .iter()
+                .map(|(line, name, reason)| (*line, (*name).to_string(), *reason))
+                .collect();
+            assert_eq!(found, expected, "{output:?}");
+        }
+
+        // A refusal with no name quotes its line.
+        let quoted = refusals("true\n  eval x\n", &strict);
+        assert_eq!(quoted[0].value, "eval x");
+        // Nesting past the bound is refused rather than followed.
+        let deep = format!(
+            "echo {}{}\n",
+            "$(".repeat(MAX_NESTING + 1),
+            ")".repeat(MAX_NESTING + 1)
+        );
+        assert_eq!(refusals(&deep, &strict)[0].reason, Unreadable);
+        let shallow = format!(
+            "echo {}{}\n",
+            "$(".repeat(MAX_NESTING),
+            ")".repeat(MAX_NESTING)
+        );
+        assert!(refusals(&shallow, &strict).is_empty());
+        // What a declared root allows, the guard allows here too.
+        let rooted = RootSet::new(Path::new("/home/u"), &[PathBuf::from("/scratch")]);
+        assert!(refusals("export CARGO_HOME=/scratch/cargo\n", &rooted).is_empty());
+    }
+
+    #[test]
+    fn an_output_the_guard_refuses_is_blocked_named_and_never_written() {
+        let host = Fake::default()
+            .tool(
+                "starship",
+                b"starship",
+                &["export STARSHIP_SHELL=zsh\nexport STARSHIP_SESSION_KEY=1\nX=2\n"],
+            )
+            .tool("vi", b"vi", &["export EDITOR=vi\n"]);
+        let decls = [decl("starship", &["starship"]), decl("vi", &["vi"])];
+        let mut cache = Fingerprints::default();
+        let (blocked, file) = apply(&decls, &mut cache, &host);
+        let step = &blocked.steps()[0];
+        assert_eq!(step.action(), Action::Blocked);
+        assert_eq!(
+            step.line(),
+            "? activation `starship`: omitted: the environment guard refuses its output: \
+             `STARSHIP_SHELL` at line 1 assigns a variable no bx generator declares, so bx \
+             cannot judge the value — a defect in bx, not in your configuration; 2 more \
+             assignments are refused"
+        );
+        assert!(!file.contains("STARSHIP"), "{file}");
+        assert!(
+            file.contains("# bx activation: vi\neval 'export EDITOR=vi\n'\n"),
             "{file}"
         );
-        assert_eq!(host.runs(), 0);
-        assert!(cache.get("activation:fzf").is_none(), "never cached");
+        let keys: Vec<&String> = cache.iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["activation:vi"], "a refused output is never cached");
+
+        // One more refusal, and a refusal with no name, read as sentences.
+        let one = Omission::Refused {
+            first: refusals("eval x\n", &RootSet::strict()).remove(0),
+            more: 1,
+        };
+        assert_eq!(
+            one.to_string(),
+            "the environment guard refuses its output: line 1, `eval x`, is shell the guard \
+             cannot read, so it is not approved; 1 more assignment is refused"
+        );
+
+        // A cached output is judged again at every plan: one the roots allowed
+        // when it was captured is blocked, and forgotten, once they do not.
+        let host = Fake::default().tool("cargo", b"cargo", &["export CARGO_HOME=/scratch/c\n"]);
+        let decls = [decl("cargo", &["cargo"])];
+        let rooted = RootSet::new(Path::new("/home/u"), &[PathBuf::from("/scratch")]);
+        let mut cache = Fingerprints::default();
+        plan(&decls, &cache, &rooted, &host).record(&mut cache);
+        assert!(
+            matches!(
+                plan(&decls, &cache, &rooted, &host).steps()[0].outcome,
+                Outcome::Reused { .. }
+            ),
+            "reused while the roots allow it"
+        );
+        let strict = plan(&decls, &cache, &RootSet::strict(), &host);
+        assert!(matches!(
+            &strict.steps()[0].outcome,
+            Outcome::Omitted(Omission::Refused { first, more: 0 })
+                if first.name == "CARGO_HOME" && first.reason == Reason::NoRootsDeclared
+        ));
+        assert_eq!(host.runs(), 2, "judging a cached output runs nothing");
+        strict.record(&mut cache);
+        assert!(cache.is_empty());
     }
 
     #[test]
     fn a_second_apply_on_an_unchanged_machine_runs_nothing_and_renders_the_same_bytes() {
         let host = Fake::default()
-            .tool(
-                "starship",
-                b"starship 1.0",
-                &["export STARSHIP_SHELL=zsh\n"],
-            )
+            .tool("starship", b"starship 1.0", &["export EDITOR=nvim\n"])
             .tool("zoxide", b"zoxide 0.9", &["z() { :; }\n"]);
         let mut completions = decl("starship", &["starship", "init", "zsh"]);
         completions.phase = Phase::Completions;
@@ -1056,10 +1803,7 @@ mod tests {
             assert_eq!(step.action(), Action::Create, "{step:?}");
         }
         assert_eq!(cache.len(), 2);
-        assert!(
-            file.contains("eval 'export STARSHIP_SHELL=zsh\n'\n"),
-            "{file}"
-        );
+        assert!(file.contains("eval 'export EDITOR=nvim\n'\n"), "{file}");
         assert!(
             file.find("# bx phase: activations").unwrap()
                 < file.find("# bx phase: completions").unwrap()
@@ -1273,20 +2017,6 @@ mod tests {
         assert_eq!(rest.replace(r"'\''", "'"), output);
         assert!(!rest.replace(r"'\''", "").contains('\''), "{rest}");
 
-        let mut plain = decl("p", &["p", "--x=1"]);
-        plain.cache = false;
-        let plain = Step {
-            decl: plain,
-            outcome: Outcome::Plain,
-        }
-        .body()
-        .expect("renders");
-        for line in plain.lines() {
-            // Outside quotes, nothing assigns: the only `=` is quoted.
-            let unquoted: String = line.split('\'').step_by(2).collect();
-            assert!(!unquoted.contains('='), "{line}");
-        }
-
         assert_eq!(
             Step {
                 decl: decl("o", &["o"]),
@@ -1372,15 +2102,19 @@ mod tests {
     #[test]
     fn the_system_runs_the_resolved_binary_and_caches_what_it_printed() {
         let (dir, system) = linked_sh();
-        let decls = [decl("tool", &["tool", "-c", "printf 'export X=1\\n'"])];
+        let decls = [decl(
+            "tool",
+            &["tool", "-c", "printf 'export EDITOR=vi\\n'"],
+        )];
         let mut cache = Fingerprints::default();
-        let plan_one = plan(&decls, &cache, &system);
+        let roots = RootSet::strict();
+        let plan_one = plan(&decls, &cache, &roots, &system);
         assert_eq!(
             plan_one.steps()[0].body().expect("captured"),
-            "# bx activation: tool\neval 'export X=1\n'\n"
+            "# bx activation: tool\neval 'export EDITOR=vi\n'\n"
         );
         plan_one.record(&mut cache);
-        let plan_two = plan(&decls, &cache, &system);
+        let plan_two = plan(&decls, &cache, &roots, &system);
         assert!(matches!(
             plan_two.steps()[0].outcome,
             Outcome::Reused { .. }

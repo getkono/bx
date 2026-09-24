@@ -39,23 +39,51 @@
 //!
 //! # Invariant 2
 //!
-//! Only the `env` and `path` phases may hold an environment assignment, and
-//! what lands in them must be an environment fragment the plan judges through
-//! [`crate::env_guard`]. Every other phase is generated shell content that is
-//! not an environment fragment, and the bx-derived content in it must carry no
-//! assignment at all. A declared function's body is a template the user wrote.
-//! bx only substitutes declared values into it and does not judge it, because
-//! the invariant governs what bx itself emits or relocates. The
-//! scaffolding this module adds — the header and one comment per phase — sets
-//! nothing, and the plugin lines [`plugin`] renders only test a file and source
-//! it; the tests below establish both of the bytes actually emitted. The
-//! alias lines [`alias`] renders define an alias and nothing else, and its
-//! tests run them in zsh to establish that too. The `functions` phase
-//! [`function`] renders defines functions and appends to zsh's hook arrays —
-//! shell arrays zsh cannot export, which name what runs at a hook and relocate
-//! nothing — and its tests run it in zsh to establish that those arrays are
-//! the only parameters it changes.
+//! Invariant 2 is about relocation: nothing bx writes may move a tool's config,
+//! data or cache outside a root the configuration declares. How each phase is
+//! held to it depends on who wrote its bytes.
+//!
+//! The `env` and `path` phases hold bx's own environment assignments, and what
+//! lands in them must be an environment fragment the plan judges through
+//! [`crate::env_guard`]. The `activations` and `completions` phases hold a
+//! tool's cached activation output, judged as the next paragraph says. Every
+//! other phase is generated shell content that is not an environment fragment,
+//! and the bx-derived content in it must carry no assignment at all. A
+//! declared function's body is a template the user wrote. bx only substitutes
+//! declared values into it and does not judge it, because the invariant
+//! governs what bx itself emits or relocates. The scaffolding this module adds
+//! — the header and one comment per phase — sets nothing, and the plugin lines
+//! [`plugin`] renders only test a file and source it; the tests below establish
+//! both of the bytes actually emitted. The alias lines [`alias`] renders define
+//! an alias and nothing else, and its tests run them in zsh to establish that
+//! too. The `functions` phase [`function`] renders defines functions and
+//! appends to zsh's hook arrays — shell arrays zsh cannot export, which name
+//! what runs at a hook and relocate nothing — and its tests run it in zsh to
+//! establish that those arrays are the only parameters it changes.
+//!
+//! A tool's activation output assigns variables of its own — `MISE_SHELL`,
+//! `STARSHIP_SHELL`, a function's locals, ZLE's `BUFFER` — and none of those
+//! moves a file, so it is held to the relocation rule rather than to "no
+//! assignment": [`activation::relocations`] searches the whole output for
+//! every name [`crate::env_guard::is_relocating`] knows, judges each
+//! occurrence in an assigning position through [`crate::env_guard::check`]
+//! when its value is a readable literal, and refuses it when it is not, and
+//! [`activation::plan`] writes none of an output with a refusal. Every other
+//! line passes untouched. bx's own bytes there are one `eval` of a
+//! single-quoted literal holding the output, which set nothing. What the
+//! output's code runs later — `eval "$(mise hook-env)"` — is the tool's own
+//! behaviour at runtime, outside what bx emits.
+//!
+//! # Activations
+//!
+//! A tool's own shell integration — `brew shellenv`, `mise activate zsh`,
+//! `starship init zsh` — is run by [`activation::plan`] rather than at every
+//! shell start, trusted once two runs agree, and cached against the content
+//! of the tool's binary, so the `activations` and `completions` phases hold
+//! text and start no process. There is no form that runs a tool at shell
+//! start.
 
+pub mod activation;
 pub mod alias;
 pub mod function;
 pub mod plugin;

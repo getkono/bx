@@ -100,12 +100,20 @@ pub enum BlockReason {
     /// written — or a `file` that reaches a `path` value through an answer.
     ///
     /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
-    /// unanswered: the answer that needs changing is already written, and the
-    /// hint names its line. Every case is cleared by the same act, changing
-    /// that answer, which is why they share one variant.
+    /// unanswered: every answer the entry needs is written, and one of them is
+    /// the account's to change. They share one variant because they share that
+    /// cause, not because one act clears them all: which answer to change, and
+    /// whether changing one is the whole act, is [`BlockedEntry::hint`]'s to
+    /// say. A clash holding a toggle bx cannot show names a declared target is
+    /// cleared by removing that toggle first, and by an answer only for the
+    /// statements the removal leaves — so the hint may name one of these
+    /// values, or none of them.
     InvalidValue {
-        /// The values to change, in declaration order: the declarations whose
-        /// text is invalid, or the answers that went into the invalid field.
+        /// The answers this block was made of, in declaration order: the
+        /// declarations whose text is invalid, the answers that went into the
+        /// invalid field, or every answer that made a layer's clashing
+        /// spellings meet. The cause, which a report may name as the entry's;
+        /// the instruction is the hint.
         names: Vec<String>,
     },
 }
@@ -120,8 +128,9 @@ pub struct BlockedEntry {
     /// Why it is blocked.
     pub reason: BlockReason,
     /// What the user should do. Spelled in `values` — `init_hint`,
-    /// `disabled_hint`, `path_answer_hint`, `ResolvedValues::invalid_hint` or
-    /// `ResolvedValues::answers_hint` — never at a call site.
+    /// `disabled_hint`, `path_answer_hint`, `ResolvedValues::invalid_hint`,
+    /// `ResolvedValues::answers_hint` or `ResolvedValues::removal_hint` — never
+    /// at a call site.
     pub hint: String,
 }
 

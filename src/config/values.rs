@@ -840,6 +840,28 @@ pub fn disabled_hint(names: &[&str]) -> String {
     )
 }
 
+/// The statements of one clash, named as every hint about it spells them.
+///
+/// Each spelling quoted with the line it was written on, joined with "and" in
+/// the order read. One spelling of the phrase, so the problem a conflict states
+/// and the hint that follows it cannot render one clash two ways; the reason
+/// [`ResolvedValues::answers_hint`] and [`ResolvedValues::removal_hint`] share
+/// `answers_named`.
+///
+/// Takes the triples a clash holds its statements in. The flag saying whether
+/// bx can show a statement names a declared target decides which statements a
+/// caller passes, never how one of them is spelled.
+#[must_use]
+pub(crate) fn statements_named<'a>(
+    statements: impl IntoIterator<Item = &'a (String, Origin, bool)>,
+) -> String {
+    statements
+        .into_iter()
+        .map(|(spelling, origin, _)| format!("`{spelling}` at {origin}"))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// Why an answer the account wrote has no usable text.
 ///
 /// Names the line, which is in the file the account can edit. Blocking rather
@@ -1297,14 +1319,26 @@ impl ResolvedValues {
     /// pins that the route to a value never changes its count.
     #[must_use]
     pub(crate) fn answers_hint(&self, problem: &str, texts: &[&str], names: &[String]) -> String {
-        let answers = names
-            .iter()
-            .filter_map(|name| {
-                self.get(name)
-                    .map(|value| format!("the answer to `{name}` at {}", value.origin))
-            })
-            .collect::<Vec<_>>()
-            .join(" and ");
+        let (cause, direct) = self.answer_route(texts, names);
+        if direct.is_empty() {
+            return format!("{problem}, because of {cause}; change that answer");
+        }
+        format!("{problem}, because of {cause}; change that answer, or answer {direct} directly")
+    }
+
+    /// The cause an answer route names, and the values it offers to answer.
+    ///
+    /// The cause is [`ResolvedValues::answers_named`], and where a value some
+    /// of `texts` reach through a committed `default` could part them, that
+    /// phrase followed by ", carried in by the default of `x` at …". The
+    /// second is those values, for the "or answer `x` directly" offer, and is
+    /// empty where there are none.
+    ///
+    /// One computation, so the hint that gives this route on its own and the
+    /// hint that adds it to another act cannot come to disagree about which
+    /// values carry an answer in, or about which of them can part `texts`.
+    fn answer_route(&self, texts: &[&str], names: &[String]) -> (String, String) {
+        let answers = self.answers_named(names);
 
         let carried: Vec<Vec<(String, usize)>> = texts
             .iter()
@@ -1332,7 +1366,7 @@ impl ResolvedValues {
         }
         // Both halves of the sentence are read off **one** list of
         // declarations, so they cannot disagree about how many values there
-        // are. Every name here reached `answers_hint` through a successful
+        // are. Every name here reached this route through a successful
         // `index_of` inside `derived_between`, so no lookup fails today; the
         // shape is what keeps a future one from naming N declarations and N + 1
         // values to answer, or from printing "carried in by ;" with nothing in
@@ -1340,7 +1374,7 @@ impl ResolvedValues {
         let ordered = self.in_declaration_order(between);
         let between: Vec<&ValueDecl> = ordered.iter().filter_map(|name| self.decl(name)).collect();
         if between.is_empty() {
-            return format!("{problem}, because of {answers}; change that answer");
+            return (answers, String::new());
         }
         let defaults = between
             .iter()
@@ -1352,10 +1386,140 @@ impl ResolvedValues {
             .map(|decl| format!("`{}`", decl.name))
             .collect::<Vec<_>>()
             .join(" or ");
+        (format!("{answers}, carried in by {defaults}"), direct)
+    }
+
+    /// What to do about a file one layer names more than once because of this
+    /// account's answers, when a toggle among the statements cannot be shown to
+    /// name a declared target whatever is answered.
+    ///
+    /// Changing the answer is not offered *for such a toggle*. Under another
+    /// answer it may name a file no earlier layer declares, which fails the
+    /// whole load, so the answer that made the clash can be the only one that
+    /// loads. Removing it can always be followed: a toggle creates no entry, so
+    /// removing one leaves nothing unknown, and every statement that stays
+    /// already names the file. Nor, for that act, is a value carried in by a
+    /// `default` named, as [`ResolvedValues::answers_hint`] names one:
+    /// answering it directly is changing an answer too. The clause that closes
+    /// the hint does name one — see `still_one_file`, which says why the same
+    /// reason does not reach it.
+    ///
+    /// The removals alone clear the clash only while one statement stays. Two
+    /// or more still name one file once the flagged toggles are gone, and none
+    /// of those is a toggle an answer could strand — that is what being
+    /// unflagged says — so the hint ends by naming the answers that went into
+    /// them, the act that parts them. The whole hint is then what the layer
+    /// needs, rather than a first step leaving a second block for the account
+    /// to find by re-running. That closing answer change is followable exactly
+    /// as far as `answers_hint`'s is, and no further.
+    ///
+    /// `problem` and `names` are as `answers_hint` takes them. `statements` are
+    /// the spellings in the order read, each with its line, and flagged when it
+    /// is such a toggle. Each flagged one is named; when every statement is
+    /// flagged, none is the one to keep, so the hint says to keep any one, and
+    /// nothing stays to answer for. Which one is kept is not indifferent — the
+    /// toggles in a clash need not agree on `enabled`, and the one kept is the
+    /// one that decides — so the keep-one wording says so rather than leaving
+    /// an account to find the target off when it read "keep any".
+    #[must_use]
+    pub(crate) fn removal_hint(
+        &self,
+        problem: &str,
+        names: &[String],
+        statements: &[(String, Origin, bool)],
+    ) -> String {
+        let answers = self.answers_named(names);
+        let unshown: Vec<&(String, Origin, bool)> = statements
+            .iter()
+            .filter(|(_, _, unshown)| *unshown)
+            .collect();
+        if unshown.len() == statements.len() {
+            return format!(
+                "{problem}, because of {answers}; keep one of these toggles and remove the \
+                 rest: bx cannot show that any of them names a declared target for every \
+                 answer, so another answer may leave one toggling a file no earlier layer \
+                 declares; the one kept decides whether that file's target is enabled"
+            );
+        }
+        let named = statements_named(unshown.iter().copied());
+        let still = self.still_one_file(statements, unshown.len() == 1);
+        if unshown.len() == 1 {
+            return format!(
+                "{problem}, because of {answers}; remove the toggle {named}: bx cannot show \
+                 that it names a declared target for every answer, so another answer may \
+                 leave it toggling a file no earlier layer declares{still}"
+            );
+        }
         format!(
-            "{problem}, because of {answers}, carried in by {defaults}; change that answer, \
-             or answer {direct} directly"
+            "{problem}, because of {answers}; remove the toggles {named}: bx cannot show that \
+             they name declared targets for every answer, so another answer may leave them \
+             toggling files no earlier layer declares{still}"
         )
+    }
+
+    /// What is left to do once the flagged toggles are gone, or nothing.
+    ///
+    /// Empty while fewer than two statements stay: one statement names the file
+    /// once, which is what a layer is allowed. Two or more still name it twice,
+    /// so the clause names them and the answers that went into them. `one_gone`
+    /// is whether one toggle was named for removal rather than several.
+    ///
+    /// Only the answers those statements carry are named, not every answer the
+    /// clash was made of: one that only a removed toggle carried parts nothing
+    /// that is left. Any two statements have an answer between them — a pair
+    /// with none in either spelling is refused as the repo's own defect — so
+    /// the phrase is never empty.
+    ///
+    /// This clause takes the whole [`ResolvedValues::answer_route`], the offer
+    /// to answer a value a committed `default` carries an answer in included,
+    /// where the removal advice above it withholds that offer. The two are not
+    /// the same act on the same statements: the removal is withheld an answer
+    /// because a flagged toggle may name nothing under another one, and no
+    /// statement here is flagged. Withholding it anyway would leave a clash
+    /// that only answering the derived value parts — two spellings that differ
+    /// only in reaching one value through another's `default` — with a closing
+    /// act that does not clear it, which is the defect this clause exists to
+    /// close, one level down.
+    fn still_one_file(&self, statements: &[(String, Origin, bool)], one_gone: bool) -> String {
+        let kept: Vec<&(String, Origin, bool)> = statements
+            .iter()
+            .filter(|(_, _, unshown)| !*unshown)
+            .collect();
+        if kept.len() < 2 {
+            return String::new();
+        }
+        let texts: Vec<&str> = kept.iter().map(|statement| statement.0.as_str()).collect();
+        let names = self.in_declaration_order(
+            texts
+                .iter()
+                .flat_map(|text| self.account_inputs(text))
+                .collect(),
+        );
+        let (cause, direct) = self.answer_route(&texts, &names);
+        let directly = if direct.is_empty() {
+            String::new()
+        } else {
+            format!(", or answer {direct} directly")
+        };
+        format!(
+            "; {} still name one file once {} gone, because of {cause}; change that answer \
+             too{directly}",
+            statements_named(kept.iter().copied()),
+            if one_gone { "it is" } else { "they are" }
+        )
+    }
+
+    /// Each of `names` as the answer the account wrote and its line, joined
+    /// with "and": the phrase every answer hint gives its cause in.
+    fn answers_named(&self, names: &[String]) -> String {
+        names
+            .iter()
+            .filter_map(|name| {
+                self.get(name)
+                    .map(|value| format!("the answer to `{name}` at {}", value.origin))
+            })
+            .collect::<Vec<_>>()
+            .join(" and ")
     }
 
     /// Collect into `into` every value `text` reaches that carries an account

@@ -931,6 +931,11 @@ enum Answer {
         /// values its references reached. Empty for text built from committed
         /// defaults alone.
         from_account: Vec<String>,
+        /// The values the text that answered it references, in written order:
+        /// the account's answer when there is one, otherwise the `default`. An
+        /// overridden default's references are not here, because its text
+        /// never reached this value.
+        built_from: Vec<String>,
     },
     /// Unanswered, and these are the names that actually need answering.
     ///
@@ -1056,12 +1061,18 @@ impl ResolvedValues {
                                         from_account.push(input);
                                     }
                                 }
+                                let built_from = placeholders(&raw)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(str::to_string)
+                                    .collect();
                                 Answer::Given {
                                     value: Value {
                                         text: canonical,
                                         origin,
                                     },
                                     from_account,
+                                    built_from,
                                 }
                             }
                             // An earlier value is unanswered, so this one is too
@@ -1211,6 +1222,18 @@ impl ResolvedValues {
             Answer::Unset(causes) => Lookup::Unset(causes),
             Answer::Disabled(causes) => Lookup::Disabled(causes),
             Answer::Invalid { names, .. } => Lookup::Invalid(names),
+        }
+    }
+
+    /// The values `name`'s answered text was built from, in written order.
+    ///
+    /// The references of whichever text answered it — the account's answer, or
+    /// the `default` when there is none — and nothing else. Empty for a value
+    /// with no answer, or one whose text references nothing.
+    pub(crate) fn built_from(&self, name: &str) -> &[String] {
+        match self.index_of(name).map(|index| &self.answers[index]) {
+            Some(Answer::Given { built_from, .. }) => built_from,
+            _ => &[],
         }
     }
 

@@ -1410,6 +1410,181 @@ mod tests {
         }
     }
 
+    /// One `[[env]]` entry, as TOML.
+    fn env(name: &str, value: &str, kind: &str) -> String {
+        format!("[[env]]\nname = \"{name}\"\nvalue = \"{value}\"\nkind = \"{kind}\"\n")
+    }
+
+    /// Three string values: `a` answered, `b` unanswered, `c` switched off.
+    const ABC: &str = "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\"\n\
+                       [[value]]\nname = \"b\"\nkind = \"string\"\n\
+                       [[value]]\nname = \"c\"\nkind = \"string\"\ndefault = \"z\"\n\
+                       enabled = false\n";
+
+    #[test]
+    fn no_env_entry_places_nothing() {
+        let resolved = resolved("", None).unwrap();
+        assert!(resolved.targets.is_empty());
+    }
+
+    #[test]
+    fn the_placement_graph_emits_each_fragment_before_its_region_after_the_targets() {
+        let global = format!(
+            "{}{}{}",
+            "[[target]]\npath = \"~/.a\"\ncontent = \"x\"\n",
+            env("EDITOR", "{{a}}", "interactive"),
+            env("LANG", "C", "gui"),
+        );
+        let resolved = resolved(&format!("{ABC}{global}"), None).unwrap();
+        assert_eq!(
+            keys(&resolved),
+            vec![
+                "~/.a",
+                "~/.config/environment.d/50-bx.conf",
+                "~/.local/share/bx/zshrc.zsh",
+                "~/.zshrc",
+            ]
+        );
+        let env_d = ready(&resolved, 1);
+        assert_eq!(env_d.format, Format::EnvD);
+        assert_eq!(env_d.attach, Attach::Own);
+        let zshrc_fragment = ready(&resolved, 2);
+        assert_eq!(
+            zshrc_fragment.body,
+            Body::Generated(Gen::Env(Fragment {
+                syntax: Syntax::Zsh,
+                vars: vec![("EDITOR".to_string(), "x".to_string())],
+            }))
+        );
+        assert_eq!(zshrc_fragment.format, Format::Opaque);
+        // Attributed to the variable that put it there.
+        assert_eq!(
+            zshrc_fragment.origin.line,
+            ready(&resolved, 0).origin.line + 3
+        );
+        let region = ready(&resolved, 3);
+        assert_eq!(region.attach, Attach::Region { comment: '#' });
+        assert_eq!(
+            region.body,
+            Body::Generated(Gen::Source(zshrc_fragment.path.clone()))
+        );
+    }
+
+    #[test]
+    fn a_fragment_held_back_names_its_most_specific_reason_across_its_variables() {
+        // Unanswered alone: the values to answer, and `bx init`.
+        let unset = resolved(&format!("{ABC}{}", env("X", "{{b}}", "gui")), None).unwrap();
+        let entry = blocked(&unset, 0);
+        assert_eq!(entry.key, "~/.config/environment.d/50-bx.conf");
+        assert_eq!(
+            entry.reason,
+            BlockReason::UnsetValue {
+                names: vec!["b".to_string()]
+            }
+        );
+        assert!(entry.hint.contains("bx init"), "{}", entry.hint);
+
+        // Switched off outranks unanswered, across two variables.
+        let both = resolved(
+            &format!(
+                "{ABC}{}{}{}",
+                env("X", "{{b}}", "gui"),
+                env("Y", "{{c}}", "environment"),
+                env("Z", "{{a}}", "gui"),
+            ),
+            None,
+        )
+        .unwrap();
+        // zshenv holds only Y; environment.d holds X, Y and Z.
+        assert_eq!(
+            keys(&both),
+            vec![
+                "~/.local/share/bx/zshenv.zsh",
+                "~/.zshenv",
+                "~/.config/environment.d/50-bx.conf",
+            ]
+        );
+        assert_eq!(
+            blocked(&both, 2).reason,
+            BlockReason::DisabledValue {
+                names: vec!["c".to_string()]
+            }
+        );
+        // The region is never held back.
+        ready(&both, 1);
+
+        // An unusable answer outranks unanswered too, and names its line.
+        let invalid = resolved(
+            &format!(
+                "{ABC}{}{}",
+                env("X", "{{b}}", "gui"),
+                env("Y", "{{a}}", "gui")
+            ),
+            Some("[values]\na = \"say \\\"hi\\\"\"\n"),
+        )
+        .unwrap();
+        let entry = blocked(&invalid, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["a".to_string()]
+            }
+        );
+        assert!(entry.hint.contains("control character"), "{}", entry.hint);
+        assert!(entry.hint.contains("local.toml"), "{}", entry.hint);
+    }
+
+    #[test]
+    fn a_value_invalid_for_its_kind_holds_back_its_fragment() {
+        let resolved = resolved(
+            &format!(
+                "{SCRATCH}{}",
+                env("SCCACHE_DIR", "{{scratch_root}}/sccache", "login")
+            ),
+            Some("[values]\nscratch_root = \"relative\"\n"),
+        )
+        .unwrap();
+        let entry = blocked(&resolved, 0);
+        assert_eq!(entry.key, "~/.local/share/bx/zprofile.zsh");
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["scratch_root".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_repo_defect_in_an_env_value_fails_the_load() {
+        for (global, needle) in [
+            (env("X", "{{nobody}}", "gui"), "nobody"),
+            (env("X", "{{a", "gui"), "env `X`"),
+            (
+                format!(
+                    "[[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"a`b\"\n{}",
+                    env("X", "{{q}}", "gui")
+                ),
+                "control character",
+            ),
+        ] {
+            let err = resolved(&global, None).expect_err(&global);
+            assert!(err.contains(needle), "{global}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_declared_target_may_not_claim_a_file_the_placement_graph_writes() {
+        let err = resolved(
+            &format!(
+                "[[target]]\npath = \"~/.zshrc\"\ncontent = \"mine\"\n{}",
+                env("EDITOR", "vi", "interactive")
+            ),
+            None,
+        )
+        .expect_err("one file, two targets");
+        assert!(err.contains("`~/.zshrc` is the same file"), "{err}");
+    }
+
     /// A declaration and a target that uses it.
     const SCRATCH: &str = "[[value]]\n\
                            name = \"scratch_root\"\n\

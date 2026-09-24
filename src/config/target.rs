@@ -212,8 +212,9 @@ pub enum Gen {
     Source(Portable),
     /// The interactive shell file, assembled phase by phase. Only its `env`
     /// phase is an environment fragment, and only that phase is judged as
-    /// one; see [`Interactive`].
-    Interactive(Interactive),
+    /// one; see [`Interactive`]. Boxed, because it carries every interactive
+    /// declaration and would otherwise size every target's body to it.
+    Interactive(Box<Interactive>),
 }
 
 impl Gen {
@@ -2399,7 +2400,7 @@ mod tests {
                 Some("function `goproj` held back: run `bx init` to set proj")
             );
             assert_eq!(
-                Gen::Interactive(file.clone()).note(),
+                Gen::Interactive(Box::new(file.clone())).note(),
                 file.note(),
                 "the generator's note is the file's"
             );

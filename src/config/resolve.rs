@@ -191,16 +191,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    targets.extend(place_envs(
-        &merged.envs,
-        &merged.path,
-        &merged.plugins,
-        &merged.history,
-        &merged.aliases,
-        &merged.functions,
-        &merged.sources,
-        &values,
-    )?);
+    targets.extend(place_envs(merged, &values)?);
 
     refuse_shared_files(&targets)?;
 
@@ -283,16 +274,11 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// layer declares, or a committed `default` that puts a character no fragment
 /// line, function body or source path can hold into it; and for a second
 /// enabled plugin claiming the terminal slot.
-fn place_envs(
-    envs: &[EnvDecl],
-    path: &[PathEntry],
-    plugins: &[PluginDecl],
-    history: &History,
-    aliases: &[AliasDecl],
-    functions: &[FunctionDecl],
-    sources: &[SourceDecl],
-    values: &ResolvedValues,
-) -> Result<Vec<Resolution<Target>>, Error> {
+fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
+    let (envs, path, plugins, history): (&[EnvDecl], &[PathEntry], &[PluginDecl], &History) =
+        (&merged.envs, &merged.path, &merged.plugins, &merged.history);
+    let (aliases, functions, sources): (&[AliasDecl], &[FunctionDecl], &[SourceDecl]) =
+        (&merged.aliases, &merged.functions, &merged.sources);
     // The history's origin, when it says anything zsh reads: what places the
     // interactive file when nothing else does.
     let zsh_history = history
@@ -364,13 +350,13 @@ fn place_envs(
                 })
                 .collect();
             let generator = match fragment_gen(place, vars, entries.to_vec()) {
-                Gen::Interactive(file) => Gen::Interactive(
+                Gen::Interactive(file) => Gen::Interactive(Box::new(
                     file.with_plugins(interactive)?
                         .with_history(history.clone())
                         .with_aliases(declared)
                         .with_functions(bodies.clone())
                         .with_sources(sourced.clone()),
-                ),
+                )),
                 other => other,
             };
             Resolution::Ready(fragment_target(place, fragment.clone(), generator, &origin))
@@ -406,7 +392,7 @@ fn fragment_gen(place: Place, vars: Vec<Var>, entries: Vec<PathEntry>) -> Gen {
         path: entries,
     };
     match place {
-        Place::Zshrc => Gen::Interactive(Interactive::new(fragment)),
+        Place::Zshrc => Gen::Interactive(Box::new(Interactive::new(fragment))),
         Place::Zshenv | Place::EnvironmentD | Place::Zprofile => Gen::Env(fragment),
     }
 }
@@ -1664,11 +1650,11 @@ mod tests {
         let zshrc_fragment = ready(&resolved, 2);
         assert_eq!(
             zshrc_fragment.body,
-            Body::Generated(Gen::Interactive(Interactive::new(Fragment {
+            Body::Generated(Gen::Interactive(Box::new(Interactive::new(Fragment {
                 syntax: Syntax::Zsh,
                 vars: vec![Var::always("EDITOR", "x")],
                 path: Vec::new(),
-            })))
+            }))))
         );
         assert_eq!(zshrc_fragment.format, Format::Opaque);
         // Attributed to the variable that put it there.
@@ -1788,11 +1774,11 @@ mod tests {
         assert_eq!(file.path.to_string(), "~/.local/share/bx/zshrc.zsh");
         assert_eq!(
             file.body,
-            Body::Generated(Gen::Interactive(Interactive::new(Fragment {
+            Body::Generated(Gen::Interactive(Box::new(Interactive::new(Fragment {
                 syntax: Syntax::Zsh,
                 vars: Vec::new(),
                 path: Vec::new(),
-            })))
+            }))))
         );
     }
 

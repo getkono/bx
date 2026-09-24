@@ -974,6 +974,7 @@ const fn attached_as(mechanism: &Mechanism) -> &'static str {
         Mechanism::Region { .. } => "a managed region",
         Mechanism::Include { .. } => "an include line",
         Mechanism::Dir => "a directory",
+        Mechanism::Link => "a symlink",
     }
 }
 

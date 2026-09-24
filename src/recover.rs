@@ -621,6 +621,13 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 fs::stage(&intent.dest, mode, &observed, &mut fs::CreatedDirs::new())?
                     .commit(&bytes)?;
             }
+            Step::Relink { text, observed } => {
+                #[cfg(test)]
+                tests::before_act(&intent.dest);
+                fs::stage_link(&intent.dest, &text, &observed, &mut fs::CreatedDirs::new())?
+                    .publish()
+                    .map_err(fs::Unpublished::into_error)?;
+            }
             // A directory's rollback acts against the observation `decide`
             // judged too: one whose mode or presence changed since is refused
             // with [`fs::Error::Changed`] rather than chmod'd or made over it.
@@ -741,6 +748,15 @@ enum Step {
         /// overwritten.
         observed: fs::Observed,
     },
+    /// Rolling back over a link that existed: make it hold this text again.
+    Relink {
+        /// The link's earlier text, digest-verified.
+        text: PathBuf,
+        /// The destination [`decide`] judged to be the write's own, handed to
+        /// [`fs::stage_link`] so a link retargeted since is refused rather
+        /// than replaced.
+        observed: fs::Observed,
+    },
     /// Rolling back a directory's mode change: set it back to this mode.
     Chmod {
         /// The mode it had.
@@ -847,6 +863,25 @@ fn decide(
                     Written::Present { .. } => Step::Chmod { mode, observed },
                 };
                 (step, report(true, rolls_back()))
+            }
+            // A link's earlier state is its text, stored as a file's bytes
+            // are, and is put back as a link: whether the session retargeted
+            // it or `rm` removed it.
+            (Standing::Written, Prior::Existed(reference)) if intent.link => {
+                match snapshot(state, reference, spelling)? {
+                    Ok(bytes) => (
+                        Step::Relink {
+                            text: PathBuf::from(
+                                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(
+                                    bytes,
+                                ),
+                            ),
+                            observed,
+                        },
+                        report(true, rolls_back()),
+                    ),
+                    Err(why) => (Step::Blocked, report(false, why)),
+                }
             }
             (Standing::Written, Prior::Existed(reference)) => {
                 match snapshot(state, reference, spelling)? {
@@ -1083,6 +1118,11 @@ enum Found {
     Dir {
         mode: Mode,
     },
+    /// A symlink, by the digest of its text.
+    Link {
+        digest: ContentHash,
+        mode: Mode,
+    },
     Foreign,
     /// Its parent does not resolve to a directory. [`fs::observe`] reports
     /// such a destination as absent, which it may not be.
@@ -1104,6 +1144,10 @@ fn look(dest: &Path) -> Result<(Found, fs::Observed), Error> {
         (Kind::Absent, _, _) => Found::Absent,
         (Kind::File, Some(digest), Some(mode)) => Found::File { digest, mode },
         (Kind::Dir, _, Some(mode)) => Found::Dir { mode },
+        (Kind::Symlink, _, Some(mode)) => match observed.link_digest() {
+            Some(digest) => Found::Link { digest, mode },
+            None => Found::Foreign,
+        },
         _ => Found::Foreign,
     };
     Ok((found, observed))
@@ -1123,16 +1167,18 @@ fn standing(intent: &Intent, found: &Found) -> Standing {
         Written::Present { digest, mode } => Some((digest, mode)),
     };
     // A directory is compared by its mode, under the digest a directory is
-    // recorded with; a directory where a file was written, or a file where a
-    // directory was, is neither state.
-    let here = match (*found, intent.dir) {
-        (Found::Absent, _) => None,
-        (Found::File { digest, mode }, false) => Some((digest, mode)),
-        (Found::Dir { mode }, true) => Some((journal::dir_digest(), mode)),
-        (Found::File { .. }, true) | (Found::Dir { .. }, false) | (Found::Foreign, _) => {
+    // recorded with, and a link by its text; a directory where a file was
+    // written, a file where a link was, or any other pairing of the three is
+    // neither state.
+    let here = match (*found, intent.dir, intent.link) {
+        (Found::Absent, _, _) => None,
+        (Found::File { digest, mode }, false, false)
+        | (Found::Link { digest, mode }, false, true) => Some((digest, mode)),
+        (Found::Dir { mode }, true, false) => Some((journal::dir_digest(), mode)),
+        (Found::File { .. } | Found::Dir { .. } | Found::Link { .. } | Found::Foreign, _, _) => {
             return Standing::Foreign;
         }
-        (Found::Unreachable, _) => return Standing::Unreachable,
+        (Found::Unreachable, _, _) => return Standing::Unreachable,
     };
     match here {
         None => {
@@ -1211,7 +1257,7 @@ mod tests {
 
     use crate::journal::tests::{
         WRITES_THROUGH_PERMISSIONS, cannot_build, crash_phases, finish_crash_phases, frame_starts,
-        names_in, peek, permissions_refuse, plant_file, raw_journal, seal,
+        link_at, link_to, names_in, peek, permissions_refuse, plant_file, raw_journal, seal,
         state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
@@ -1556,6 +1602,194 @@ mod tests {
             session.apply(request).expect("apply");
         }
         session.finish().expect("finish");
+    }
+
+    /// The three link requests the link crash child makes, in order: a
+    /// retarget of a link bx made, a create in directories bx must invent, and
+    /// the removal `rm` makes of a link bx made.
+    fn link_requests(home: &Path) -> Vec<Request> {
+        vec![
+            link_to(home, ".local/bin/tool", "/opt/tool/bin/tool"),
+            link_to(home, ".config/bx-links/made", "../../nowhere/made"),
+            {
+                let (target, dest) = target(home, ".gone");
+                let planned = fs::observe(&dest).expect("plan's observation");
+                Request {
+                    target,
+                    dest,
+                    content: Content::LinkAbsent {
+                        created_dirs: Vec::new(),
+                        planned,
+                    },
+                    mode: Mode::LINK,
+                    ownership: Ownership::Released,
+                }
+            },
+        ]
+    }
+
+    /// What exists before the crashing link session runs: the two links bx
+    /// made earlier, and no `~/.config`.
+    fn plant_link_fixture(home: &Path) {
+        std::fs::create_dir_all(home.join(".local/bin")).expect("the link fixture's parents");
+        std::os::unix::fs::symlink("../src/tool", home.join(".local/bin/tool")).expect("a link");
+        std::os::unix::fs::symlink("bx made this", home.join(".gone")).expect("a link");
+    }
+
+    /// What the link crash harness compares: the text at each destination, or
+    /// `None` where no link is, and whether `~/.config` is there.
+    fn link_snapshot(home: &Path) -> (Vec<Option<PathBuf>>, bool) {
+        (
+            link_requests(home)
+                .iter()
+                .map(|request| link_at(&request.dest))
+                .collect(),
+            home.join(".config").exists(),
+        )
+    }
+
+    /// The crashing half of [`a_crash_at_every_link_boundary_is_recoverable`].
+    #[test]
+    #[ignore = "spawned by the link crash harness; it aborts on purpose"]
+    fn link_crash_child() {
+        let Some(home) = std::env::var_os(CRASH_HOME) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        let state = StateDir::resolve(&home);
+        let mut session =
+            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        for request in link_requests(&home) {
+            session.apply(request).expect("apply");
+        }
+        session.finish().expect("finish");
+    }
+
+    #[test]
+    fn a_crash_at_every_link_boundary_is_recoverable() {
+        let guard = guarded_home();
+        for index in 0..link_requests(guard.path()).len() {
+            for phase in crash_phases() {
+                let removal = matches!(
+                    link_requests(guard.path())[index].content,
+                    Content::LinkAbsent { .. }
+                );
+                if removal && matches!(phase, "after-stage" | "after-fill") {
+                    continue;
+                }
+                let case = format!("{index}:{phase}");
+                let home = guard.child(format!("link-crash-{index}-{phase}"));
+                plant_link_fixture(&home);
+                let before = link_snapshot(&home);
+
+                let out = spawn_child("recover::tests::link_crash_child", &home, index, phase);
+                assert!(
+                    !out.status.success(),
+                    "{case}: the child was supposed to die; it said {}",
+                    String::from_utf8_lossy(&out.stdout),
+                );
+
+                // The old link or the new one, never anything else.
+                for (request, (found, was)) in link_requests(&home)
+                    .iter()
+                    .zip(link_snapshot(&home).0.into_iter().zip(before.0.clone()))
+                {
+                    let new = match &request.content {
+                        Content::Link { text, .. } => Some(text.clone()),
+                        _ => None,
+                    };
+                    assert!(found == was || found == new, "{case}: {found:?}");
+                }
+
+                let state = StateDir::resolve(&home);
+                let interrupted = pending(&state)
+                    .expect("pending")
+                    .expect("a crash leaves an interrupted session");
+                assert!(interrupted.blocked().next().is_none(), "{case}");
+                assert!(
+                    matches!(
+                        recover(&state).expect("recover"),
+                        Outcome::RolledBack { .. }
+                    ),
+                    "{case}"
+                );
+                // As for a file: a link staged before its Intent was durable
+                // is not the journal's to name, so it and the directories
+                // made for it can be left, beside its destination.
+                let orphan_possible = matches!(phase, "after-stage" | "after-fill");
+                let (links, config) = link_snapshot(&home);
+                assert_eq!(links, before.0, "{case}: not rolled back");
+                assert!(
+                    config == before.1 || orphan_possible,
+                    "{case}: ~/.config stands"
+                );
+                let temps = leftover_temps(&home);
+                if orphan_possible {
+                    assert!(temps.len() <= 1, "{case}: {temps:?}");
+                    for temp in &temps {
+                        assert_eq!(
+                            temp.parent(),
+                            link_requests(&home)[index].dest.parent(),
+                            "{case}"
+                        );
+                    }
+                } else {
+                    assert!(temps.is_empty(), "{case}: {temps:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_retargeted_after_the_crash_is_blocked_not_replaced() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".tool");
+        interrupted(
+            &state,
+            home.path(),
+            vec![link_to(home.path(), ".tool", "ours")],
+        );
+        std::fs::remove_file(&dest).expect("unlink");
+        std::os::unix::fs::symlink("theirs", &dest).expect("the user's link");
+
+        let Outcome::Blocked { conflicts } = recover(&state).expect("recover") else {
+            panic!("a link neither state names is not recovery's to touch");
+        };
+        assert_eq!(conflicts[0].standing, Standing::Diverged);
+        assert_eq!(link_at(&dest).as_deref(), Some(Path::new("theirs")));
+
+        // A file where the link was is neither state either.
+        std::fs::remove_file(&dest).expect("unlink");
+        plant_file(&dest, "a file\n", Mode::DEFAULT_FILE);
+        let Outcome::Blocked { conflicts } = recover(&state).expect("recover") else {
+            panic!("a file where a link was is foreign");
+        };
+        assert_eq!(conflicts[0].standing, Standing::Foreign);
+    }
+
+    #[test]
+    fn a_terminated_link_session_is_recorded_as_a_link() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let request = link_to(home.path(), ".tool", "/opt/tool");
+        let portable = request.target.clone();
+        interrupted(&state, home.path(), vec![request]);
+        seal(&state.journal(), 1);
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 }
+        );
+        let entry = LedgerView::read(&state, home.path())
+            .expect("ledger")
+            .value
+            .get(&portable)
+            .cloned()
+            .expect("recorded");
+        assert_eq!(entry.mechanism, Mechanism::Link);
+        assert_eq!(entry.written, fs::link::digest(Path::new("/opt/tool")));
+        assert_eq!(entry.mode, Mode::LINK);
     }
 
     /// The crashing half of [`a_killed_rm_rolls_back_into_the_directory_it_found`]:
@@ -2730,6 +2964,7 @@ mod tests {
                     mechanism: Some(Mechanism::Own),
                     ledger_written: None,
                     dir: false,
+                    link: false,
                 }),
                 Record::Done(Done {
                     target: portable.clone(),
@@ -2769,6 +3004,7 @@ mod tests {
             mechanism: Some(Mechanism::Own),
             ledger_written: None,
             dir: false,
+            link: false,
         };
         let tail = "bx will not overwrite it. Put back either of those two states, \
                     or abandon the interrupted session to have bx report it as a \
@@ -2904,6 +3140,7 @@ mod tests {
                     mechanism: Some(Mechanism::Own),
                     ledger_written: None,
                     dir: false,
+                    link: false,
                 }),
                 Record::Done(Done { target: portable }),
                 Record::End(End { written: 1 }),
@@ -3017,6 +3254,7 @@ mod tests {
                     mechanism: Some(Mechanism::Own),
                     ledger_written: None,
                     dir: false,
+                    link: false,
                 }),
                 Record::End(End { written: 0 }),
             ],
@@ -3307,6 +3545,7 @@ mod tests {
             mechanism: Some(Mechanism::Own),
             ledger_written: None,
             dir: false,
+            link: false,
         }
     }
 
@@ -3804,6 +4043,7 @@ mod tests {
                     mechanism: Some(region),
                     ledger_written: Some(ContentHash::of(bx1.as_bytes())),
                     dir: false,
+                    link: false,
                 }),
                 Record::Done(Done {
                     target: portable.clone(),
@@ -4296,7 +4536,10 @@ mod tests {
                             assert_eq!(found, Some((wanted.clone(), request.mode)), "{case}");
                         }
                         Content::Absent { .. } => assert_eq!(found, None, "{case}"),
-                        Content::Dir { .. } | Content::DirAbsent { .. } => {
+                        Content::Dir { .. }
+                        | Content::DirAbsent { .. }
+                        | Content::Link { .. }
+                        | Content::LinkAbsent { .. } => {
                             unreachable!("{case}: the crash fixture writes files only")
                         }
                     }
@@ -4411,7 +4654,10 @@ mod tests {
                             .as_ref()
                             .is_some_and(|(bytes, mode)| bytes == wanted && *mode == request.mode),
                         Content::Absent { .. } => found.is_none(),
-                        Content::Dir { .. } | Content::DirAbsent { .. } => {
+                        Content::Dir { .. }
+                        | Content::DirAbsent { .. }
+                        | Content::Link { .. }
+                        | Content::LinkAbsent { .. } => {
                             unreachable!("the crash fixture writes files only")
                         }
                     };

@@ -74,13 +74,15 @@
 //! `NAME=VALUE` it finds: a bare assignment in command position, a prefix
 //! assignment to a command, and every operand of `export`, `typeset`,
 //! `declare`, `readonly`, `local`, `integer` and `float`, at any depth of the
-//! output's own functions and blocks. It **fails closed**: an assignment it
-//! can find but not value — an append, a subscript, an array, a loop
-//! variable, an operand of a command whose name is itself a substitution —
-//! and a construct that can assign what it cannot see — `eval`, `source`,
-//! `.`, `read`, `vared`, `getopts`, `zparseopts`, `print -v`, `set -A`,
-//! `${NAME=…}`, an arithmetic assignment, a heredoc, a quote that does not
-//! close — are refused as [`Reason::Unreadable`]. Only a command
+//! output's own functions and blocks, and inside the body of every `alias` it
+//! defines. It **fails closed**: an assignment it can find but not value — an
+//! append, a subscript, an array, a loop variable, an operand of a command
+//! whose name is itself a substitution — and a construct that can assign what
+//! it cannot see — `eval`, `source`, `.`, `read`, `vared`, `getopts`,
+//! `zparseopts`, `let`, `trap`, `emulate -c`, `print -v`, `set -A`,
+//! `${NAME=…}`, an arithmetic assignment, an alias body it cannot unquote, a
+//! heredoc, a quote that does not close — are refused as
+//! [`Reason::Unreadable`]. Only a command
 //! substitution's own assignments are not judged, because it runs in a
 //! subshell and cannot change the shell the file is sourced into.
 //!
@@ -783,7 +785,7 @@ const DECLARERS: [&str; 7] = [
 ];
 
 /// Commands that can assign what the reader cannot see.
-const INDIRECT: [&str; 7] = [
+const INDIRECT: [&str; 9] = [
     "eval",
     "source",
     ".",
@@ -791,6 +793,8 @@ const INDIRECT: [&str; 7] = [
     "vared",
     "getopts",
     "zparseopts",
+    "let",
+    "trap",
 ];
 
 /// Words after which the next word is still in command position.
@@ -1217,6 +1221,8 @@ enum State {
     Named,
     /// In the operands of a command a flag holding this letter makes assign.
     Flags(char),
+    /// In the operands of `alias`.
+    Alias,
     /// In operands that assign nothing.
     Other,
 }
@@ -1262,6 +1268,10 @@ impl Reader<'_> {
                     }
                     state
                 }
+                State::Alias => {
+                    self.alias(raw, token.at);
+                    state
+                }
                 State::Other => State::Other,
             };
         }
@@ -1287,7 +1297,44 @@ impl Reader<'_> {
             "function" => State::Named,
             "print" | "printf" => State::Flags('v'),
             "set" => State::Flags('A'),
+            "emulate" => State::Flags('c'),
+            "alias" => State::Alias,
             _ => State::Other,
+        }
+    }
+
+    /// Read `raw` as an operand of `alias`: a body is shell that runs in this
+    /// shell wherever the alias is used, so what it assigns is judged as if it
+    /// were written there. A body quoted any way but one plain single-quoted
+    /// string is refused.
+    fn alias(&mut self, raw: &str, at: usize) {
+        const HIDING: [char; 5] = ['\'', '"', '\\', '$', '`'];
+        let Some((name, value)) = raw.split_once('=') else {
+            // An expansion may yet expand to a definition.
+            if raw.contains(HIDING) {
+                self.unreadable(at, "");
+            }
+            return;
+        };
+        if name.contains(HIDING) {
+            self.unreadable(at, "");
+            return;
+        }
+        let quoted = value.len() >= 2
+            && value.starts_with('\'')
+            && value.ends_with('\'')
+            && value.matches('\'').count() == 2;
+        let body = if quoted {
+            &value[1..value.len() - 1]
+        } else if value.contains(HIDING) {
+            self.unreadable(at, "");
+            return;
+        } else {
+            value
+        };
+        for mut refused in refusals(body, self.roots) {
+            refused.line = self.line(at);
+            self.found.push(refused);
         }
     }
 
@@ -1604,7 +1651,7 @@ mod tests {
             // Emittable and allowed, or no assignment at all.
             ("export EDITOR=nvim\n", &[]),
             ("EDITOR=vi; export PAGER='less'\n", &[]),
-            ("z() { :; }\nalias zi='z -i'\n", &[]),
+            ("z() { :; }\nalias zi='z -i' ll=ls -g\n", &[]),
             ("echo X=1 'Y=2' \"Z=3\" # W=4\n", &[]),
             ("export EDITOR\nlocal x\ntypeset -f z\nunset X\n", &[]),
             (
@@ -1670,6 +1717,14 @@ mod tests {
             ("read X\n", &[(1, "", Unreadable)]),
             ("print -rv X hi\n", &[(1, "", Unreadable)]),
             ("set -A X a b\n", &[(1, "", Unreadable)]),
+            ("let X=1\n", &[(1, "", Unreadable)]),
+            ("trap 'X=1' EXIT\n", &[(1, "", Unreadable)]),
+            ("emulate zsh -c 'X=1'\n", &[(1, "", Unreadable)]),
+            // An alias body is judged where it is defined.
+            ("f\nalias s='X=1 cmd'\n", &[(2, "X", NotEmittable)]),
+            ("alias s=\"X=1\"\n", &[(1, "", Unreadable)]),
+            ("alias \"$n\"=x\n", &[(1, "", Unreadable)]),
+            ("alias $def\n", &[(1, "", Unreadable)]),
             ("echo ${X:=1}\n", &[(1, "", Unreadable)]),
             ("echo ${(L)X=1}\n", &[(1, "", Unreadable)]),
             ("echo \"${X::=1}\"\n", &[(1, "", Unreadable)]),

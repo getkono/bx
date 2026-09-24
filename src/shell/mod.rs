@@ -45,8 +45,11 @@
 //! not an environment fragment, and must carry no assignment at all. The
 //! scaffolding this module adds — the header and one comment per phase — sets
 //! nothing, and the plugin lines [`plugin`] renders only test a file and source
-//! it; the tests below establish both of the bytes actually emitted.
+//! it; the tests below establish both of the bytes actually emitted. The
+//! alias lines [`alias`] renders define an alias and nothing else, and its
+//! tests run them in zsh to establish that too.
 
+pub mod alias;
 pub mod plugin;
 
 /// One named section of the generated interactive shell file.

@@ -58,8 +58,9 @@
 
 use std::path::Path;
 
+use super::env::{EnvDecl, Fragment, Place, Syntax};
 use super::merge::Conflict;
-use super::target::{Attach, Body, Format, KeyPath, Target};
+use super::target::{Attach, Body, Direction, Format, Gen, KeyPath, Target};
 use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
@@ -167,7 +168,7 @@ pub struct Resolved {
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
-    let targets = merged
+    let mut targets = merged
         .targets
         .iter()
         .map(|target| {
@@ -179,6 +180,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;
+    targets.extend(place_envs(&merged.envs, &values)?);
 
     refuse_shared_files(&targets)?;
 
@@ -200,6 +202,278 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
         Body::File(path) => Some(("file", path.to_string_lossy())),
         Body::Secret(path) => Some(("secret", path.to_string_lossy())),
         Body::Inline(_) | Body::Generated(_) | Body::Dir => None,
+    }
+}
+
+/// The targets the `[[env]]` placement graph derives, after every declared
+/// target.
+///
+/// For each [`Place`] at least one variable lands in, in [`Place::ALL`]'s
+/// order: the fragment bx owns whole, and for a shell place the fixed region
+/// in the user's startup file that sources it. A fragment is held back when
+/// any variable it holds is — naming every value it waits on — and that costs
+/// that fragment alone: every other fragment, every region and every declared
+/// target still resolve. A region is never held back: its bytes name the
+/// fragment and nothing else, and it sources the fragment only once one is
+/// there to read. A place no variable lands in emits nothing here; a fragment
+/// bx wrote there earlier is planned empty by [`vacated_fragments`].
+///
+/// # Errors
+///
+/// [`Error::BadValue`] for a variable whose value is a repo defect: a
+/// malformed placeholder, a reference to a value no layer declares, or a
+/// committed `default` that puts a character no fragment line can hold into
+/// it.
+fn place_envs(envs: &[EnvDecl], values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
+    let resolved = envs
+        .iter()
+        .map(|decl| Ok((decl, resolve_env(decl, values)?)))
+        .collect::<Result<Vec<_>, Error>>()?;
+
+    let mut placed = Vec::new();
+    for place in Place::ALL {
+        let here: Vec<&(&EnvDecl, Resolution<(String, String)>)> = resolved
+            .iter()
+            .filter(|(decl, _)| decl.kind.places().contains(&place))
+            .collect();
+        let Some((first, _)) = here.first() else {
+            continue;
+        };
+        let origin = first.origin.clone();
+        let portable = |raw: &str| {
+            Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
+                origin: origin.clone(),
+                message: format!("`{raw}` cannot be placed under this home: {source}"),
+            })
+        };
+        let fragment = portable(place.fragment())?;
+        let held: Vec<&BlockedEntry> = here
+            .iter()
+            .filter_map(|(_, resolution)| match resolution {
+                Resolution::Blocked(entry) => Some(entry),
+                Resolution::Ready(_) => None,
+            })
+            .collect();
+        placed.push(if held.is_empty() {
+            let vars = here
+                .iter()
+                .filter_map(|(_, resolution)| match resolution {
+                    Resolution::Ready(var) => Some(var.clone()),
+                    Resolution::Blocked(_) => None,
+                })
+                .collect();
+            Resolution::Ready(fragment_target(place, fragment.clone(), vars, &origin))
+        } else {
+            let (reason, hint) = held_together(&held, values);
+            Resolution::Blocked(BlockedEntry {
+                key: fragment.to_string(),
+                origin: origin.clone(),
+                reason,
+                hint,
+            })
+        });
+        if let Some(file) = place.startup_file() {
+            placed.push(Resolution::Ready(placed_target(
+                portable(file)?,
+                Gen::Source(fragment),
+                Attach::Region { comment: '#' },
+                Format::Opaque,
+                &origin,
+            )));
+        }
+    }
+    Ok(placed)
+}
+
+/// The fragment bx owns whole at `place`, holding `vars`.
+fn fragment_target(
+    place: Place,
+    path: Portable,
+    vars: Vec<(String, String)>,
+    origin: &Origin,
+) -> Target {
+    let format = match place.syntax() {
+        Syntax::EnvironmentD => Format::EnvD,
+        Syntax::Zsh => Format::Opaque,
+    };
+    placed_target(
+        path,
+        Gen::Env(Fragment {
+            syntax: place.syntax(),
+            vars,
+        }),
+        Attach::Own,
+        format,
+        origin,
+    )
+}
+
+/// A header-only fragment for each place the placement graph no longer puts a
+/// variable in, but whose fragment bx wrote earlier.
+///
+/// [`place_envs`] emits nothing for a place no enabled variable lands in, so a
+/// variable switched off, removed, or moved to another `kind` would otherwise
+/// leave the fragment bx wrote for it in place — `export EDITOR=…` still
+/// sourced by every shell, with no plan row saying so. `recorded` answers
+/// whether bx has written a path as a file it owns whole, which only the
+/// ledger knows; resolution itself stays a pure function of the layers and the
+/// home. While it is recorded, the fragment is planned with no variable in it,
+/// so the change shows as a `modify` row and `apply` writes the empty
+/// fragment; the startup file's region is left as it is, sourcing a fragment
+/// that sets nothing, and `bx rm` restores both from the ledger.
+///
+/// A place `placed` already names — ready, or held back under the fragment's
+/// path — is left to it. Each vacated fragment is attributed to `ledger`, the
+/// record that put it in the plan.
+#[must_use]
+pub fn vacated_fragments(
+    placed: &[Resolution<Target>],
+    recorded: impl Fn(&Portable) -> bool,
+    home: &Path,
+    ledger: &Path,
+) -> Vec<Resolution<Target>> {
+    let origin = Origin {
+        file: ledger.to_path_buf(),
+        line: 0,
+    };
+    Place::ALL
+        .into_iter()
+        .filter_map(|place| {
+            let path = Portable::parse_in(place.fragment(), home).ok()?;
+            let named = placed.iter().any(|resolution| match resolution {
+                Resolution::Ready(target) => target.path == path,
+                Resolution::Blocked(entry) => entry.key == path.to_string(),
+            });
+            (!named && recorded(&path))
+                .then(|| Resolution::Ready(fragment_target(place, path, Vec::new(), &origin)))
+        })
+        .collect()
+}
+
+/// A target the placement graph derives, attributed to the first variable
+/// that put it there.
+fn placed_target(
+    path: Portable,
+    generator: Gen,
+    attach: Attach,
+    format: Format,
+    origin: &Origin,
+) -> Target {
+    Target {
+        path,
+        body: Body::Generated(generator),
+        mode: None,
+        attach,
+        direction: Direction::Apply,
+        format,
+        requires: Vec::new(),
+        references: Vec::new(),
+        enabled: true,
+        origin: origin.clone(),
+    }
+}
+
+/// Substitute one variable's value, or explain why it cannot be — in the
+/// vocabulary a target is held back in, keyed by the variable's name.
+///
+/// # Errors
+///
+/// [`Error::BadValue`] for a repo defect, as [`place_envs`] lists.
+fn resolve_env(
+    decl: &EnvDecl,
+    values: &ResolvedValues,
+) -> Result<Resolution<(String, String)>, Error> {
+    let block = |reason, hint| {
+        Ok(Resolution::Blocked(BlockedEntry {
+            key: decl.name.clone(),
+            origin: decl.origin.clone(),
+            reason,
+            hint,
+        }))
+    };
+    let names_of = |names: Vec<String>| in_declaration_order(values, names);
+    match values.substitute(&decl.value) {
+        Ok(value) => {
+            let Some(problem) = super::env::unwritable(&value) else {
+                return Ok(Resolution::Ready((decl.name.clone(), value)));
+            };
+            // Checked as written at parse, so the character came in through a
+            // value: an account's answer, whose line the hint names, or a
+            // committed `default` alone, which no answer can clear.
+            let problem = format!("env `{}`: {problem}", decl.name);
+            let causes = values.account_inputs(&decl.value);
+            if causes.is_empty() {
+                return Err(Error::BadValue {
+                    origin: decl.origin.clone(),
+                    message: problem,
+                });
+            }
+            let names = names_of(causes);
+            let hint = values.answers_hint(&problem, &[decl.value.as_str()], &names);
+            block(BlockReason::InvalidValue { names }, hint)
+        }
+        Err(Unresolved::Disabled { names }) => {
+            let names = names_of(names);
+            let hint =
+                super::values::disabled_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            block(BlockReason::DisabledValue { names }, hint)
+        }
+        Err(Unresolved::Invalid { names }) => {
+            let names = names_of(names);
+            let hint = values.invalid_hint(&names);
+            block(BlockReason::InvalidValue { names }, hint)
+        }
+        Err(Unresolved::Unset { names }) => {
+            let names = names_of(names);
+            let hint =
+                super::values::init_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            block(BlockReason::UnsetValue { names }, hint)
+        }
+        Err(defect) => Err(Error::BadValue {
+            origin: decl.origin.clone(),
+            message: format!("env `{}`: {defect}", decl.name),
+        }),
+    }
+}
+
+/// One reason and one hint for a fragment several held-back variables share,
+/// ranked as [`resolve_target`] ranks one target's: a switched-off declaration
+/// first, then an unusable answer, then an unanswered value. Every name of the
+/// winning class is named, in declaration order.
+fn held_together(held: &[&BlockedEntry], values: &ResolvedValues) -> (BlockReason, String) {
+    let mut disabled = Vec::new();
+    let mut invalid = Vec::new();
+    let mut invalid_hints: Vec<&str> = Vec::new();
+    let mut unset = Vec::new();
+    for entry in held {
+        match &entry.reason {
+            BlockReason::DisabledValue { names } => disabled.extend(names.iter().cloned()),
+            BlockReason::InvalidValue { names } => {
+                invalid.extend(names.iter().cloned());
+                if !invalid_hints.contains(&entry.hint.as_str()) {
+                    invalid_hints.push(&entry.hint);
+                }
+            }
+            BlockReason::UnsetValue { names } => unset.extend(names.iter().cloned()),
+        }
+    }
+    fn spelled(names: &[String]) -> Vec<&str> {
+        names.iter().map(String::as_str).collect()
+    }
+    if !disabled.is_empty() {
+        let names = in_declaration_order(values, disabled);
+        let hint = super::values::disabled_hint(&spelled(&names));
+        (BlockReason::DisabledValue { names }, hint)
+    } else if !invalid.is_empty() {
+        let names = in_declaration_order(values, invalid);
+        (
+            BlockReason::InvalidValue { names },
+            invalid_hints.join("; "),
+        )
+    } else {
+        let names = in_declaration_order(values, unset);
+        let hint = super::values::init_hint(&spelled(&names));
+        (BlockReason::UnsetValue { names }, hint)
     }
 }
 
@@ -1221,6 +1495,224 @@ mod tests {
             Resolution::Blocked(entry) => entry,
             Resolution::Ready(target) => panic!("unexpectedly ready: {}", target.path),
         }
+    }
+
+    /// One `[[env]]` entry, as TOML.
+    fn env(name: &str, value: &str, kind: &str) -> String {
+        format!("[[env]]\nname = \"{name}\"\nvalue = \"{value}\"\nkind = \"{kind}\"\n")
+    }
+
+    /// Three string values: `a` answered, `b` unanswered, `c` switched off.
+    const ABC: &str = "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\"\n\
+                       [[value]]\nname = \"b\"\nkind = \"string\"\n\
+                       [[value]]\nname = \"c\"\nkind = \"string\"\ndefault = \"z\"\n\
+                       enabled = false\n";
+
+    #[test]
+    fn no_env_entry_places_nothing() {
+        let resolved = resolved("", None).unwrap();
+        assert!(resolved.targets.is_empty());
+    }
+
+    #[test]
+    fn the_placement_graph_emits_each_fragment_before_its_region_after_the_targets() {
+        let global = format!(
+            "{}{}{}",
+            "[[target]]\npath = \"~/.a\"\ncontent = \"x\"\n",
+            env("EDITOR", "{{a}}", "interactive"),
+            env("LANG", "C", "gui"),
+        );
+        let resolved = resolved(&format!("{ABC}{global}"), None).unwrap();
+        assert_eq!(
+            keys(&resolved),
+            vec![
+                "~/.a",
+                "~/.config/environment.d/50-bx.conf",
+                "~/.local/share/bx/zshrc.zsh",
+                "~/.zshrc",
+            ]
+        );
+        let env_d = ready(&resolved, 1);
+        assert_eq!(env_d.format, Format::EnvD);
+        assert_eq!(env_d.attach, Attach::Own);
+        let zshrc_fragment = ready(&resolved, 2);
+        assert_eq!(
+            zshrc_fragment.body,
+            Body::Generated(Gen::Env(Fragment {
+                syntax: Syntax::Zsh,
+                vars: vec![("EDITOR".to_string(), "x".to_string())],
+            }))
+        );
+        assert_eq!(zshrc_fragment.format, Format::Opaque);
+        // Attributed to the variable that put it there.
+        assert_eq!(
+            zshrc_fragment.origin.line,
+            ready(&resolved, 0).origin.line + 3
+        );
+        let region = ready(&resolved, 3);
+        assert_eq!(region.attach, Attach::Region { comment: '#' });
+        assert_eq!(
+            region.body,
+            Body::Generated(Gen::Source(zshrc_fragment.path.clone()))
+        );
+    }
+
+    #[test]
+    fn a_recorded_fragment_no_place_names_is_planned_empty_and_no_other() {
+        // environment.d is held back on `b`, zshrc.zsh is placed, and the
+        // other two fragments are named by nothing.
+        let placed = resolved(
+            &format!(
+                "{ABC}{}{}",
+                env("X", "{{b}}", "gui"),
+                env("EDITOR", "nvim", "interactive")
+            ),
+            None,
+        )
+        .unwrap();
+        let ledger = Path::new("/var/home/example/.local/state/bx/ledger");
+        let every = vacated_fragments(&placed.targets, |_| true, &home(), ledger);
+        let paths: Vec<String> = every
+            .iter()
+            .map(|resolution| match resolution {
+                Resolution::Ready(target) => {
+                    assert_eq!(
+                        target.body,
+                        Body::Generated(Gen::Env(Fragment {
+                            syntax: Syntax::Zsh,
+                            vars: Vec::new(),
+                        }))
+                    );
+                    assert_eq!(target.origin.file, ledger);
+                    target.path.to_string()
+                }
+                Resolution::Blocked(entry) => panic!("{entry:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "~/.local/share/bx/zshenv.zsh",
+                "~/.local/share/bx/zprofile.zsh"
+            ]
+        );
+        // Nothing bx has not written is planned.
+        assert!(vacated_fragments(&placed.targets, |_| false, &home(), ledger).is_empty());
+    }
+
+    #[test]
+    fn a_fragment_held_back_names_its_most_specific_reason_across_its_variables() {
+        // Unanswered alone: the values to answer, and `bx init`.
+        let unset = resolved(&format!("{ABC}{}", env("X", "{{b}}", "gui")), None).unwrap();
+        let entry = blocked(&unset, 0);
+        assert_eq!(entry.key, "~/.config/environment.d/50-bx.conf");
+        assert_eq!(
+            entry.reason,
+            BlockReason::UnsetValue {
+                names: vec!["b".to_string()]
+            }
+        );
+        assert!(entry.hint.contains("bx init"), "{}", entry.hint);
+
+        // Switched off outranks unanswered, across two variables.
+        let both = resolved(
+            &format!(
+                "{ABC}{}{}{}",
+                env("X", "{{b}}", "gui"),
+                env("Y", "{{c}}", "environment"),
+                env("Z", "{{a}}", "gui"),
+            ),
+            None,
+        )
+        .unwrap();
+        // zshenv holds only Y; environment.d holds X, Y and Z.
+        assert_eq!(
+            keys(&both),
+            vec![
+                "~/.local/share/bx/zshenv.zsh",
+                "~/.zshenv",
+                "~/.config/environment.d/50-bx.conf",
+            ]
+        );
+        assert_eq!(
+            blocked(&both, 2).reason,
+            BlockReason::DisabledValue {
+                names: vec!["c".to_string()]
+            }
+        );
+        // The region is never held back.
+        ready(&both, 1);
+
+        // An unusable answer outranks unanswered too, and names its line.
+        let invalid = resolved(
+            &format!(
+                "{ABC}{}{}",
+                env("X", "{{b}}", "gui"),
+                env("Y", "{{a}}", "gui")
+            ),
+            Some("[values]\na = \"say \\\"hi\\\"\"\n"),
+        )
+        .unwrap();
+        let entry = blocked(&invalid, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["a".to_string()]
+            }
+        );
+        assert!(entry.hint.contains("control character"), "{}", entry.hint);
+        assert!(entry.hint.contains("local.toml"), "{}", entry.hint);
+    }
+
+    #[test]
+    fn a_value_invalid_for_its_kind_holds_back_its_fragment() {
+        let resolved = resolved(
+            &format!(
+                "{SCRATCH}{}",
+                env("SCCACHE_DIR", "{{scratch_root}}/sccache", "login")
+            ),
+            Some("[values]\nscratch_root = \"relative\"\n"),
+        )
+        .unwrap();
+        let entry = blocked(&resolved, 0);
+        assert_eq!(entry.key, "~/.local/share/bx/zprofile.zsh");
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["scratch_root".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_repo_defect_in_an_env_value_fails_the_load() {
+        for (global, needle) in [
+            (env("X", "{{nobody}}", "gui"), "nobody"),
+            (env("X", "{{a", "gui"), "env `X`"),
+            (
+                format!(
+                    "[[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"a`b\"\n{}",
+                    env("X", "{{q}}", "gui")
+                ),
+                "control character",
+            ),
+        ] {
+            let err = resolved(&global, None).expect_err(&global);
+            assert!(err.contains(needle), "{global}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_declared_target_may_not_claim_a_file_the_placement_graph_writes() {
+        let err = resolved(
+            &format!(
+                "[[target]]\npath = \"~/.zshrc\"\ncontent = \"mine\"\n{}",
+                env("EDITOR", "vi", "interactive")
+            ),
+            None,
+        )
+        .expect_err("one file, two targets");
+        assert!(err.contains("`~/.zshrc` is the same file"), "{err}");
     }
 
     /// A declaration and a target that uses it.

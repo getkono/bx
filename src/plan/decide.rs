@@ -18,7 +18,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{Change, Diff, Error};
+use super::{Change, Diff, Error, region};
+use crate::config::env::Syntax;
 use crate::config::resolve::Resolution;
 use crate::config::secrets::Secrets;
 use crate::config::target::{Attach, Body, Direction, Format, Gen, Target};
@@ -347,6 +348,9 @@ pub(super) struct Op {
 enum Made {
     /// A file holding these bytes, owned whole.
     Bytes(Vec<u8>),
+    /// A file holding these bytes, whole, of which bx owns the one region
+    /// delimited with this comment character.
+    Region(Vec<u8>, char),
     /// A directory, created or set to the op's mode.
     Dir,
 }
@@ -358,7 +362,10 @@ impl Op {
     }
 
     /// The journal request that makes this write: bx owning the whole file,
-    /// or the directory.
+    /// a region of it, or the directory.
+    ///
+    /// A region is written as the whole file it sits in, so the journal holds
+    /// the bytes it displaces whole and a roll back restores every one of them.
     pub(super) fn into_request(self) -> Request {
         let (content, mechanism) = match self.made {
             Made::Bytes(bytes) => (
@@ -367,6 +374,13 @@ impl Op {
                     planned: self.planned,
                 },
                 Mechanism::Own,
+            ),
+            Made::Region(bytes, comment) => (
+                Content::Bytes {
+                    bytes,
+                    planned: self.planned,
+                },
+                Mechanism::Region { comment },
             ),
             Made::Dir => (
                 Content::Dir {
@@ -425,7 +439,19 @@ pub(super) fn decide(
 
     let dest = target.path.render(ctx.home);
     let observed = fs::observe(&dest)?;
-    let mode = Mode::resolve(target.mode, Kind::File);
+    let (bytes, mode) = match target.attach {
+        Attach::Region { comment } => match placed_in_region(&observed, comment, &bytes, target) {
+            Ok(placed) => placed,
+            Err(why) => {
+                let note = format!(
+                    "bx's region in this file is damaged: {why}. Leave one `{comment} >>> bx \
+                     >>>` line and one `{comment} <<< bx <<<` line after it, or none"
+                );
+                return Ok((row(Action::Conflict, None, Some(note)), None));
+            }
+        },
+        _ => (bytes, Mode::resolve(target.mode, Kind::File)),
+    };
     let outcome = fs::compare(
         &observed,
         &Desired {
@@ -444,15 +470,17 @@ pub(super) fn decide(
             Some(portable_reason(&parent.path, reason, ctx.home))
         })
         .or(outcome.note);
-    let (action, note) = ownership(
-        outcome.action,
-        &observed,
-        ctx.ledger.get(&target.path),
-        join([
-            note,
-            parent_note(&observed, mode, ctx).unwrap_or(outcome.parent_note),
-        ]),
-    );
+    let note = join([
+        note,
+        parent_note(&observed, mode, ctx).unwrap_or(outcome.parent_note),
+    ]);
+    let entry = ctx.ledger.get(&target.path);
+    let (action, note) = match target.attach {
+        Attach::Region { comment } => {
+            region_ownership(outcome.action, &observed, entry, comment, note)
+        }
+        _ => ownership(outcome.action, &observed, entry, note),
+    };
 
     // A write into a directory its owner cannot write or search is refused
     // here, so `apply` never reaches `stage` for it. A row with no write is
@@ -500,11 +528,95 @@ pub(super) fn decide(
     let op = action.is_pending().then(|| Op {
         target: target.path.clone(),
         dest,
-        made: Made::Bytes(bytes),
+        made: match target.attach {
+            Attach::Region { comment } => Made::Region(bytes, comment),
+            _ => Made::Bytes(bytes),
+        },
         planned: observed,
         mode,
     });
     Ok((change, op))
+}
+
+/// The whole file a region target leaves, and the mode it leaves it at.
+///
+/// Every byte outside the region is the file's own, carried through. The mode
+/// is the target's when it declares one, and otherwise the file's own, so
+/// attaching to a file the user keeps at `0600` never widens it; a file bx
+/// creates gets the default.
+///
+/// # Errors
+///
+/// Why the file's delimiters do not make one region.
+fn placed_in_region(
+    observed: &Observed,
+    comment: char,
+    body: &[u8],
+    target: &Target,
+) -> Result<(Vec<u8>, Mode), &'static str> {
+    let file = observed
+        .bytes
+        .as_deref()
+        .filter(|_| observed.kind == Kind::File);
+    let whole = region::splice(file, comment, body)?;
+    let mode = match (target.mode, file.and(observed.mode)) {
+        (Some(declared), _) => declared,
+        (None, Some(own)) => own,
+        (None, None) => Mode::resolve(None, Kind::File),
+    };
+    Ok((whole, mode))
+}
+
+/// Settle what the comparison found for a region target against the ledger.
+///
+/// The region is bx's and the rest of the file is the user's, so an edit
+/// outside the region is never a conflict: while the region holds what bx
+/// wants the comparison finds nothing to do, and a region appended to a file
+/// the user wrote is additive. What is refused is a rewrite that would undo
+/// the user's own act on bx's lines:
+///
+/// * the ledger says bx attached to this file some other way;
+/// * bx wrote a region here and it is gone — the user removed it;
+/// * a region is there that bx has no record of writing;
+/// * the region differs from what bx wants and the file is not as bx last
+///   left it. Whether the edit was inside the region or beside it cannot be
+///   told from a whole-file record, so the region is left as it is.
+///
+/// A rewrite of a region bx wrote, in a file nobody else has touched since, is
+/// a modify, as a file bx owns whole is.
+fn region_ownership(
+    action: Action,
+    observed: &Observed,
+    entry: Option<&LedgerEntry>,
+    comment: char,
+    note: Option<String>,
+) -> (Action, Option<String>) {
+    let conflict = |why: &str| {
+        (
+            Action::Conflict,
+            join([Some(why.to_string()), note.clone()]),
+        )
+    };
+    if let (Action::Create | Action::Modify, Some(entry)) = (action, entry)
+        && entry.mechanism != (Mechanism::Region { comment })
+    {
+        return conflict(&format!(
+            "bx attached to this file as {}",
+            attached_as(&entry.mechanism)
+        ));
+    }
+    let (Action::Modify, Some(bytes)) = (action, observed.bytes.as_deref()) else {
+        return (action, note);
+    };
+    match (region::find(bytes, comment), entry) {
+        (region::Found::Absent, None) => (action, note),
+        (region::Found::Absent, Some(_)) => conflict("bx's region was removed since bx wrote it"),
+        (_, None) => conflict("it holds a bx region bx has no record of writing"),
+        (_, Some(entry)) if observed.digest() != Some(entry.written) => {
+            conflict("edited since bx last wrote it, and bx's region differs from what bx wants")
+        }
+        _ => (action, note),
+    }
 }
 
 /// Decide a directory target: create it, set its mode, leave it, or refuse.
@@ -718,8 +830,8 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
             }
         }
         Body::Generated(generator) => {
-            let content = generate(generator);
-            if let Some(note) = guard_fragment(&content, ctx.roots) {
+            let content = generator.render();
+            if let Some(note) = guard_generated(generator, &content, ctx.roots) {
                 return Ok(Wanted::Blocked(note));
             }
             content.into_bytes()
@@ -753,32 +865,40 @@ pub(crate) fn read_repo_file(target: &Target, repo: &Path, rel: &Path) -> Result
 }
 
 /// Why a target's attachment, direction or format cannot be written yet.
+///
+/// A region is written for a generated body only. The placement graph's
+/// regions hold fixed text, so a rewrite of one is never a question of whose
+/// edit wins; a region a config author fills with a body of their own changes
+/// whenever the body does, and deciding that against an edit beside it is
+/// entry C1's.
 fn unsupported(target: &Target) -> Option<&'static str> {
     match (&target.attach, target.direction, &target.format) {
-        (Attach::Region { .. }, _, _) => Some("a managed region is not supported until entry C1"),
+        (Attach::Region { .. }, _, _) if !matches!(target.body, Body::Generated(_)) => {
+            Some("a managed region is not supported until entry C1")
+        }
         (Attach::Include { .. }, _, _) => Some("an include line is not supported until entry C1"),
         (_, Direction::Track, _) => Some("track mode is not supported until entry C4"),
         (_, _, Format::Jsonc { .. }) => Some("owning JSONC keys is not supported until entry C3"),
-        (_, _, Format::EnvD) => Some("an env.d fragment is not supported until entry B1"),
-        (Attach::Own, Direction::Apply, Format::Opaque) => None,
+        (Attach::Own | Attach::Region { .. }, Direction::Apply, Format::Opaque | Format::EnvD) => {
+            None
+        }
     }
 }
 
-/// The content a generator produces.
+/// Judge a generated body against Invariant 2, as what it is.
 ///
-/// [`Gen`] has no variants yet, so this cannot be called. It exists so the one
-/// route from a generated body to bytes already passes through
-/// [`guard_fragment`]: the first generator adds its arm here.
-///
-/// # Decision 36: `generate -> String::new()` is an equivalent mutant
-///
-/// `cargo mutants` reports that mutant as missed, and no test can kill it:
-/// `Gen` is uninhabited, so no `Body::Generated` value exists and this function
-/// is unreachable. The entry that adds the first `Gen` variant makes the arm
-/// reachable, and must test its generated body end to end through
-/// [`guard_fragment`]; the mutant becomes killable by that entry's tests.
-const fn generate(generator: &Gen) -> String {
-    match *generator {}
+/// An environment fragment goes through the guard in its own syntax. The line
+/// a region sources a fragment with sets nothing, so it is not a fragment:
+/// the guard's grammar would refuse it as unreadable, and `env_guard`'s tests
+/// hold its bytes to carrying no assignment instead.
+fn guard_generated(generator: &Gen, content: &str, roots: &RootSet) -> Option<String> {
+    match generator {
+        Gen::Env(fragment) => match fragment.syntax {
+            Syntax::Zsh => guard_fragment(content, roots),
+            Syntax::EnvironmentD => guard_environment_d(content, roots),
+        },
+        Gen::Source(_) => None,
+    }
 }
 
 /// Judge a generated environment fragment against Invariant 2.
@@ -788,8 +908,19 @@ const fn generate(generator: &Gen) -> String {
 /// the guard's grammar admits nothing but assignments, and a file the user
 /// wrote is not bx's output to judge.
 pub(super) fn guard_fragment(content: &str, roots: &RootSet) -> Option<String> {
+    violations(&env_guard::scan_with(content, roots))
+}
+
+/// [`guard_fragment`] for an `environment.d` fragment, where every line is
+/// exported although none says `export`.
+fn guard_environment_d(content: &str, roots: &RootSet) -> Option<String> {
+    violations(&env_guard::scan_exported(content, roots))
+}
+
+/// One note naming each violation as `line N: NAME <reason>`.
+fn violations(found: &[env_guard::Violation]) -> Option<String> {
     join(
-        env_guard::scan_with(content, roots)
+        found
             .iter()
             .map(|v| Some(format!("line {}: {} {}", v.line, v.name, v.reason))),
     )
@@ -938,7 +1069,9 @@ mod tests {
             change(&mut target);
             target
         };
-        let cases: [(Target, &str); 6] = [
+        // An env.d fragment is written since entry B1, and a region around a
+        // generated body; a region around a body a config author wrote is not.
+        let cases: [(Target, &str); 5] = [
             (
                 shaped(|t| t.attach = Attach::Region { comment: '#' }),
                 "entry C1",
@@ -960,7 +1093,6 @@ mod tests {
                 }),
                 "entry C3",
             ),
-            (shaped(|t| t.format = Format::EnvD), "entry B1"),
             // A directory is blocked by its shape like a file, before the
             // destination is looked at.
             (
@@ -1981,5 +2113,487 @@ mod tests {
             }),
             "an include line"
         );
+    }
+
+    mod env_placement {
+        //! The `[[env]]` placement graph, decided and applied end to end.
+
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use super::super::super::{Mode as RunMode, Report, run};
+        use super::*;
+        use crate::plan::tests::{inputs, own};
+        use crate::testing::GuardedHome;
+
+        /// One `[[env]]` entry, as TOML.
+        fn env(name: &str, value: &str, kind: &str) -> String {
+            format!("[[env]]\nname = \"{name}\"\nvalue = \"{value}\"\nkind = \"{kind}\"\n")
+        }
+
+        /// One variable of each kind, none of which needs a root.
+        fn every_kind() -> String {
+            [
+                env("LANG", "C.UTF-8", "environment"),
+                env("BROWSER", "firefox", "gui"),
+                env("PAGER", "less", "login"),
+                env("EDITOR", "nvim", "interactive"),
+            ]
+            .concat()
+        }
+
+        const ZSHRC_REGION: &str = "# >>> bx >>>\n\
+             [[ -r ~/.local/share/bx/zshrc.zsh ]] && source ~/.local/share/bx/zshrc.zsh\n\
+             # <<< bx <<<\n";
+
+        fn plan(home: &GuardedHome, layer: &str) -> Report {
+            run(&inputs(home, layer), RunMode::Plan, &mut |_| {
+                panic!("plan never asks")
+            })
+            .expect("plan runs")
+        }
+
+        fn apply(home: &GuardedHome, layer: &str) -> Report {
+            run(&inputs(home, layer), RunMode::Apply, &mut |_| Ok(true)).expect("apply runs")
+        }
+
+        /// Each row as `(target, action)`.
+        fn rows(report: &Report) -> Vec<(&str, Action)> {
+            report
+                .changes
+                .iter()
+                .map(|change| (change.target.as_str(), change.action))
+                .collect()
+        }
+
+        /// The row for `target`.
+        fn row<'a>(report: &'a Report, target: &str) -> &'a Change {
+            report
+                .changes
+                .iter()
+                .find(|change| change.target == target)
+                .unwrap_or_else(|| panic!("no row for {target}: {:?}", rows(report)))
+        }
+
+        fn read(home: &GuardedHome, rel: &str) -> String {
+            std::fs::read_to_string(home.child(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        }
+
+        #[test]
+        fn a_variable_switched_off_or_moved_leaves_its_old_fragment_empty() {
+            // PR #75 note D1: a place no variable lands in any more emits no
+            // target, so the fragment bx wrote for it stayed sourced with no
+            // plan row. While the ledger records it, it is planned empty.
+            let home = guarded_home();
+            let before = [
+                env("PAGER", "less", "login"),
+                env("EDITOR", "nvim", "interactive"),
+            ]
+            .concat();
+            apply(&home, &before);
+
+            // PAGER moves to `interactive`, and EDITOR is switched off.
+            let after = format!(
+                "{}[[env]]\nname = \"EDITOR\"\nvalue = \"nvim\"\nkind = \"interactive\"\n\
+                 enabled = false\n",
+                env("PAGER", "less", "interactive")
+            );
+            let moved = plan(&home, &after);
+            assert_eq!(
+                row(&moved, "~/.local/share/bx/zprofile.zsh").action,
+                Action::Modify
+            );
+            assert_eq!(
+                row(&moved, "~/.local/share/bx/zshrc.zsh").action,
+                Action::Modify
+            );
+            apply(&home, &after);
+            let header = "# Generated by bx from [[env]]. Edit the config repo, not this file.\n";
+            assert_eq!(read(&home, ".local/share/bx/zprofile.zsh"), header);
+            assert_eq!(
+                read(&home, ".local/share/bx/zshrc.zsh"),
+                format!("{header}export PAGER=less\n")
+            );
+            let second = plan(&home, &after);
+            assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&second)
+            );
+
+            // Every variable gone: both fragments are left empty, and the
+            // regions stay, sourcing them.
+            let none = "";
+            apply(&home, none);
+            assert_eq!(read(&home, ".local/share/bx/zshrc.zsh"), header);
+            assert_eq!(read(&home, ".local/share/bx/zprofile.zsh"), header);
+            assert_eq!(read(&home, ".zshrc"), ZSHRC_REGION);
+            let settled = plan(&home, none);
+            assert_eq!(
+                rows(&settled),
+                vec![
+                    ("~/.local/share/bx/zprofile.zsh", Action::Unchanged),
+                    ("~/.local/share/bx/zshrc.zsh", Action::Unchanged),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_fragment_bx_never_wrote_is_not_planned_empty() {
+            let home = guarded_home();
+            let report = plan(&home, &env("EDITOR", "nvim", "interactive"));
+            assert_eq!(
+                rows(&report),
+                vec![
+                    ("~/.local/share/bx/zshrc.zsh", Action::Create),
+                    ("~/.zshrc", Action::Create),
+                ]
+            );
+        }
+
+        #[test]
+        fn each_kind_lands_only_in_its_native_files_and_a_second_plan_is_empty() {
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            let layer = every_kind();
+
+            let first = apply(&home, &layer);
+            assert!(first.executed);
+            assert_eq!(
+                rows(&first),
+                vec![
+                    ("~/.local/share/bx/zshenv.zsh", Action::Create),
+                    ("~/.zshenv", Action::Create),
+                    ("~/.config/environment.d/50-bx.conf", Action::Create),
+                    ("~/.local/share/bx/zprofile.zsh", Action::Create),
+                    ("~/.zprofile", Action::Create),
+                    ("~/.local/share/bx/zshrc.zsh", Action::Create),
+                    ("~/.zshrc", Action::Modify),
+                ]
+            );
+
+            let header = "# Generated by bx from [[env]]. Edit the config repo, not this file.\n";
+            assert_eq!(
+                read(&home, ".local/share/bx/zshenv.zsh"),
+                format!("{header}export LANG=C.UTF-8\n")
+            );
+            assert_eq!(
+                read(&home, ".config/environment.d/50-bx.conf"),
+                format!("{header}LANG=C.UTF-8\nBROWSER=firefox\n")
+            );
+            assert_eq!(
+                read(&home, ".local/share/bx/zprofile.zsh"),
+                format!("{header}export PAGER=less\n")
+            );
+            assert_eq!(
+                read(&home, ".local/share/bx/zshrc.zsh"),
+                format!("{header}export EDITOR=nvim\n")
+            );
+            // The user's own lines come first, byte for byte, then the region.
+            assert_eq!(
+                read(&home, ".zshrc"),
+                format!("alias ll='ls -l'\n{ZSHRC_REGION}")
+            );
+            for (file, fragment) in [(".zshenv", "zshenv"), (".zprofile", "zprofile")] {
+                assert_eq!(
+                    read(&home, file),
+                    format!(
+                        "# >>> bx >>>\n[[ -r ~/.local/share/bx/{fragment}.zsh ]] && source \
+                         ~/.local/share/bx/{fragment}.zsh\n# <<< bx <<<\n"
+                    )
+                );
+            }
+
+            let written: Vec<String> = [
+                ".local/share/bx/zshenv.zsh",
+                ".config/environment.d/50-bx.conf",
+                ".local/share/bx/zprofile.zsh",
+                ".local/share/bx/zshrc.zsh",
+                ".zshenv",
+                ".zprofile",
+                ".zshrc",
+            ]
+            .iter()
+            .map(|rel| read(&home, rel))
+            .collect();
+            let second = plan(&home, &layer);
+            assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&second)
+            );
+            let again = apply(&home, &layer);
+            assert!(!again.executed);
+            let rewritten: Vec<String> = [
+                ".local/share/bx/zshenv.zsh",
+                ".config/environment.d/50-bx.conf",
+                ".local/share/bx/zprofile.zsh",
+                ".local/share/bx/zshrc.zsh",
+                ".zshenv",
+                ".zprofile",
+                ".zshrc",
+            ]
+            .iter()
+            .map(|rel| read(&home, rel))
+            .collect();
+            assert_eq!(rewritten, written);
+        }
+
+        #[test]
+        fn an_edit_outside_the_region_is_never_a_conflict() {
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            apply(&home, &every_kind());
+
+            // Above the region, below it, and the file's own mode.
+            home.write(
+                ".zshrc",
+                &format!("export FOO=1\nalias ll='ls -l'\n{ZSHRC_REGION}bindkey -v\n"),
+            );
+            let edited = plan(&home, &every_kind());
+            assert_eq!(row(&edited, "~/.zshrc").action, Action::Unchanged);
+
+            // A change of declaration rewrites bx's fragment, and the region's
+            // bytes, which never vary, stay as they are.
+            let more = format!("{}{}", every_kind(), env("VISUAL", "nvim", "interactive"));
+            let changed = apply(&home, &more);
+            assert_eq!(
+                row(&changed, "~/.local/share/bx/zshrc.zsh").action,
+                Action::Modify
+            );
+            assert_eq!(row(&changed, "~/.zshrc").action, Action::Unchanged);
+            assert!(read(&home, ".local/share/bx/zshrc.zsh").ends_with("export VISUAL=nvim\n"));
+            assert_eq!(
+                read(&home, ".zshrc"),
+                format!("export FOO=1\nalias ll='ls -l'\n{ZSHRC_REGION}bindkey -v\n")
+            );
+        }
+
+        #[test]
+        fn an_unset_value_holds_back_only_the_fragment_it_would_join() {
+            let home = guarded_home();
+            let layer = format!(
+                "[[value]]\nname = \"editor\"\nkind = \"string\"\n\n{}{}{}",
+                env("LANG", "C.UTF-8", "environment"),
+                env("EDITOR", "{{editor}}", "interactive"),
+                crate::plan::tests::inline("~/.other", "x\\n"),
+            );
+            let report = plan(&home, &layer);
+            assert_eq!(
+                rows(&report),
+                vec![
+                    ("~/.other", Action::Create),
+                    ("~/.local/share/bx/zshenv.zsh", Action::Create),
+                    ("~/.zshenv", Action::Create),
+                    ("~/.config/environment.d/50-bx.conf", Action::Create),
+                    ("~/.local/share/bx/zshrc.zsh", Action::Blocked),
+                    ("~/.zshrc", Action::Create),
+                ]
+            );
+            let note = row(&report, "~/.local/share/bx/zshrc.zsh")
+                .note
+                .as_deref()
+                .expect("a hint");
+            assert!(note.contains("editor"), "{note}");
+            assert!(note.contains("bx init"), "{note}");
+        }
+
+        #[test]
+        fn a_fragment_the_guard_refuses_is_held_back_naming_the_line() {
+            let home = guarded_home();
+            let layer = [
+                env("LANG", "C.UTF-8", "environment"),
+                env("CARGO_HOME", "/elsewhere/cargo", "environment"),
+                env("EDITOR", "nvim", "interactive"),
+            ]
+            .concat();
+            let report = plan(&home, &layer);
+            for fragment in [
+                "~/.local/share/bx/zshenv.zsh",
+                "~/.config/environment.d/50-bx.conf",
+            ] {
+                let change = row(&report, fragment);
+                assert_eq!(change.action, Action::Blocked, "{fragment}");
+                let note = change.note.as_deref().expect("a note");
+                assert!(note.starts_with("line 3: CARGO_HOME "), "{note}");
+            }
+            // Nothing else is held back by it.
+            assert_eq!(
+                row(&report, "~/.local/share/bx/zshrc.zsh").action,
+                Action::Create
+            );
+            assert_eq!(row(&report, "~/.zshenv").action, Action::Create);
+        }
+
+        #[test]
+        fn an_environment_d_line_is_judged_as_exported() {
+            // environment.d says no `export`, and every line of it reaches the
+            // environment: an anchor there is held to what an exported one is.
+            // Judged as a line of shell that does not say `export`, it would
+            // pass.
+            let home = guarded_home();
+            let layer = format!(
+                "[[value]]\nname = \"home_root\"\nkind = \"path\"\nis_root = true\n\
+                 default = \"~\"\n\n{}",
+                env("SCRATCH_HOME", "{{home_root}}", "gui")
+            );
+            let report = plan(&home, &layer);
+            let change = row(&report, "~/.config/environment.d/50-bx.conf");
+            assert_eq!(change.action, Action::Blocked, "{change:?}");
+            let note = change.note.as_deref().expect("a note");
+            assert!(note.starts_with("line 2: SCRATCH_HOME "), "{note}");
+            // The same line, read as shell that keeps it out of the
+            // environment, is allowed: the syntax is what refused it.
+            let roots = RootSet::new(home.path(), &[PathBuf::from("~")]);
+            let line = format!("SCRATCH_HOME={}\n", home.path().display());
+            assert_eq!(guard_fragment(&line, &roots), None);
+            assert!(guard_environment_d(&line, &roots).is_some());
+        }
+
+        /// The `~/.zshrc` row an interactive declaration gets over `bytes`,
+        /// with bx having left `recorded` there as a region when it is given.
+        fn zshrc_row(bytes: Option<&str>, recorded: Option<&[u8]>) -> Change {
+            let home = guarded_home();
+            if let Some(recorded) = recorded {
+                own(
+                    home.path(),
+                    ".zshrc",
+                    recorded,
+                    Mechanism::Region { comment: '#' },
+                );
+            }
+            if let Some(bytes) = bytes {
+                home.write(".zshrc", bytes);
+            }
+            let report = plan(&home, &env("EDITOR", "nvim", "interactive"));
+            row(&report, "~/.zshrc").clone()
+        }
+
+        #[test]
+        fn a_region_is_rewritten_only_while_the_file_is_as_bx_left_it() {
+            let old = "top\n# >>> bx >>>\nsource ~/.old\n# <<< bx <<<\n";
+            // bx's own older region, in a file nobody has touched since.
+            let change = zshrc_row(None, Some(old.as_bytes()));
+            assert_eq!(change.action, Action::Modify, "{change:?}");
+            // The same, after the user edited the file.
+            let change = zshrc_row(Some(&format!("{old}more\n")), Some(old.as_bytes()));
+            assert_eq!(change.action, Action::Conflict, "{change:?}");
+            assert!(
+                change
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("edited since")),
+                "{change:?}"
+            );
+        }
+
+        #[test]
+        fn a_region_the_user_removed_or_bx_never_recorded_is_left_alone() {
+            let recorded = format!("top\n{ZSHRC_REGION}");
+            let removed = zshrc_row(Some("top\n"), Some(recorded.as_bytes()));
+            assert_eq!(removed.action, Action::Conflict);
+            assert!(
+                removed
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("was removed")),
+                "{removed:?}"
+            );
+
+            let foreign = zshrc_row(
+                Some("# >>> bx >>>\nsource ~/.elsewhere\n# <<< bx <<<\n"),
+                None,
+            );
+            assert_eq!(foreign.action, Action::Conflict);
+            assert!(
+                foreign
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("no record")),
+                "{foreign:?}"
+            );
+
+            // A region already holding what bx wants is unchanged either way.
+            assert_eq!(
+                zshrc_row(Some(&format!("mine\n{ZSHRC_REGION}")), None).action,
+                Action::Unchanged
+            );
+        }
+
+        #[test]
+        fn a_region_in_a_file_bx_owns_another_way_or_with_damaged_delimiters_is_a_conflict() {
+            let home = guarded_home();
+            own(home.path(), ".zshrc", b"whole\n", Mechanism::Own);
+            let report = plan(&home, &env("EDITOR", "nvim", "interactive"));
+            let change = row(&report, "~/.zshrc");
+            assert_eq!(change.action, Action::Conflict);
+            assert!(
+                change
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("the whole file")),
+                "{change:?}"
+            );
+
+            let damaged = zshrc_row(Some("# >>> bx >>>\nno end\n"), None);
+            assert_eq!(damaged.action, Action::Conflict);
+            assert_eq!(damaged.diff, None);
+            let note = damaged.note.expect("a note");
+            assert!(note.contains("damaged"), "{note}");
+            assert!(note.contains("no closing one"), "{note}");
+        }
+
+        #[test]
+        fn a_region_keeps_the_mode_of_the_file_it_joins() {
+            let home = guarded_home();
+            let rc = home.write(".zshrc", "mine\n");
+            std::fs::set_permissions(&rc, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+            let applied = apply(&home, &env("EDITOR", "nvim", "interactive"));
+            assert_eq!(row(&applied, "~/.zshrc").action, Action::Modify);
+            let mode = std::fs::metadata(&rc).expect("stat").permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o600);
+            // A file bx creates for a region gets the default.
+            let zshenv = apply(&home, &env("LANG", "C", "environment"));
+            assert_eq!(row(&zshenv, "~/.zshenv").action, Action::Create);
+            let mode = std::fs::metadata(home.child(".zshenv"))
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, Mode::DEFAULT_FILE.bits());
+        }
+
+        #[test]
+        fn rm_puts_every_file_the_placement_graph_wrote_back_exactly() {
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            let applied = apply(&home, &every_kind());
+            assert!(applied.executed);
+
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = LedgerView::read(&state, home.path())
+                .expect("the ledger")
+                .value
+                .iter()
+                .map(|(target, _)| target.clone())
+                .collect();
+            assert_eq!(targets.len(), 7);
+            crate::restore::restore(&state, home.path(), &targets).expect("restore");
+
+            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+            for rel in [
+                ".zshenv",
+                ".zprofile",
+                ".config/environment.d",
+                ".local/share/bx",
+            ] {
+                assert!(!home.child(rel).exists(), "{rel} is left behind");
+            }
+        }
     }
 }

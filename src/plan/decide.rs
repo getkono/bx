@@ -842,6 +842,11 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
         // A declared directory mode reaches disk before any file beneath it
         // is written, which [`locked_parent`] reads as a declaration.
         Body::Dir => return Ok(Wanted::Dir),
+        Body::Symlink(_) => {
+            return Ok(Wanted::Blocked(
+                "a symlink target is not written yet".to_string(),
+            ));
+        }
     };
     Ok(Wanted::Bytes(bytes))
 }

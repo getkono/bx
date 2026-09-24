@@ -684,7 +684,7 @@ fn decide_file(
                 }
                 // A secret's declared bytes are ciphertext; adopting would
                 // mean decrypting here, so it is refused like the others.
-                Body::Generated(_) | Body::Dir | Body::Secret(_) => {
+                Body::Generated(_) | Body::Dir | Body::Secret(_) | Body::Symlink(_) => {
                     return Ok(refused(format!(
                         "is already declared at {origin} with a body bx add does not adopt into"
                     )));

@@ -796,16 +796,18 @@ mod tests {
             .expect("chmod 644");
 
         // A process that can stat inside an unsearchable directory -- root, or
-        // one holding CAP_DAC_READ_SEARCH -- cannot construct this case.
+        // one holding CAP_DAC_READ_SEARCH -- cannot construct this case. No CI
+        // job runs that way, so a silent skip would be a branch nothing
+        // exercises: such a run fails unless the skip is asked for by name.
         let constructible = std::fs::metadata(&local).is_err();
         let result = layer_paths(&repo, &state);
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755))
             .expect("restore, so the tempdir can be removed");
 
         if !constructible {
-            eprintln!(
-                "skipped: this process can stat inside a 0644 directory, so EACCES cannot be \
-                 constructed here"
+            crate::testing::skip_unconstructible(
+                "this process can stat inside a 0644 directory, so EACCES cannot be \
+                 constructed here",
             );
             return;
         }

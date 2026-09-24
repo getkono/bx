@@ -846,6 +846,10 @@ const COMMAND_EDGES: [char; 7] = ['\n', ';', '&', '|', '{', '}', '`'];
 ///   keyword that assigns its operands — `export NAME`, `read NAME`,
 ///   `print -v NAME`, `for NAME in`, `eval "NAME…"`, `alias`, `trap` and the
 ///   rest of `ASSIGNERS`;
+/// * a relocating name spelled in quoted or escaped pieces — `'CARGO'_HOME`,
+///   `CARGO\_HOME`, `CARGO""_HOME` — is refused as [`Reason::Unreadable`]
+///   wherever it stands, because quote removal hands whatever command it
+///   reaches the whole name;
 /// * anything else — the name in a string, a pattern or another command's
 ///   operand — passes.
 ///
@@ -885,17 +889,87 @@ pub fn relocations(output: &str, roots: &RootSet) -> Vec<Violation> {
                 reason: Reason::Unreadable,
             }),
         };
-        if let Some(mut refused) = refused {
-            refused.line = chars[..start].iter().filter(|c| **c == '\n').count() + 1;
-            found.push(refused);
+        if let Some(refused) = refused {
+            found.push((start, refused));
         }
     }
+    for (start, name) in assembled(&chars) {
+        found.push((
+            start,
+            Violation {
+                line: 0,
+                name,
+                value: line_of(&chars, start).trim().to_string(),
+                reason: Reason::Unreadable,
+            },
+        ));
+    }
+    found.sort_by_key(|(start, _)| *start);
     found
+        .into_iter()
+        .map(|(start, mut refused)| {
+            refused.line = chars[..start].iter().filter(|c| **c == '\n').count() + 1;
+            refused
+        })
+        .collect()
 }
 
 /// Whether `c` can be part of a variable name.
 fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Every relocating name `chars` spells only once quotes and escapes are
+/// removed — `'CARGO'_HOME`, `CARGO\_HOME`, `CARGO""_HOME`, `$'CARGO'_HOME` —
+/// with where the word it is spelled by starts.
+///
+/// The word is read as the shell's quote removal would leave it: a run of
+/// name characters, quotes, and backslashes that escape a name character.
+/// It is a relocating name split by quoting when what remains is exactly
+/// that name and a quote or escape stands between two of its characters. A
+/// word whose quotes only surround the name is left to the search for the
+/// unbroken name, and a word that begins as `$NAME` is an expansion, not a
+/// name. Such a word is refused wherever it stands, since `export`,
+/// `typeset` and every other assigning command see the name it spells.
+fn assembled(chars: &[char]) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    let mut k = 0;
+    while k < chars.len() {
+        let start = k;
+        let mut name = String::new();
+        // Whether a quote or escape stands since the last name character.
+        let mut quoted = false;
+        let mut split = false;
+        while let Some(&c) = chars.get(k) {
+            if is_name_char(c) {
+                split |= quoted && !name.is_empty();
+                quoted = false;
+                name.push(c);
+            } else if c == '\''
+                || c == '"'
+                || (c == '\\' && chars.get(k + 1).is_some_and(|n| is_name_char(*n)))
+            {
+                quoted = true;
+            } else {
+                break;
+            }
+            k += 1;
+        }
+        if k == start {
+            k += 1;
+            continue;
+        }
+        let expands = start > 0 && chars[start - 1] == '$' && is_name_char(chars[start]);
+        let comment = line_of(chars, start).trim_start().starts_with('#');
+        if !split || expands || comment {
+            continue;
+        }
+        if name.starts_with(|c: char| c.is_ascii_digit()) || !env_guard::is_relocating(&name) {
+            continue;
+        }
+        found.push((start, name));
+    }
+    found
 }
 
 /// What one occurrence of a relocating name does.
@@ -1516,6 +1590,32 @@ mod tests {
                 &[(1, "CARGO_HOME", Unreadable)],
             ),
             ("(( ++CARGO_HOME ))\n", &[(1, "CARGO_HOME", Unreadable)]),
+            // Review item D7: a relocating name assembled from quoted or
+            // escaped pieces is the name once quotes are removed, so it is
+            // refused wherever it stands.
+            ("export 'CARGO'_HOME=/x\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("export CARGO\\_HOME=/x\n", &[(1, "CARGO_HOME", Unreadable)]),
+            (
+                "typeset -gx CARGO\"\"_HOME=/x\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "export $'CARGO'_HOME=/x\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "x=1\nC\"ARGO_HO\"ME=/x; echo 'XDG'\"_CONFIG_HOME\"\n",
+                &[
+                    (2, "CARGO_HOME", Unreadable),
+                    (2, "XDG_CONFIG_HOME", Unreadable),
+                ],
+            ),
+            // Quotes that only surround the name, an expansion joined to
+            // text, a comment, and pieces that spell no relocating name pass.
+            ("echo \"CARGO_HOME\" 'CARGO_HOME'\n", &[]),
+            ("echo \"$CARGO\"_HOME ${CARGO}'_HOME'\n", &[]),
+            ("# export 'CARGO'_HOME=/x\n", &[]),
+            ("echo 'MY'_CARGO_HOME CARGO\\_HOMES '1'CARGO_HOME\n", &[]),
         ];
         for (output, expected) in cases {
             let found: Vec<(usize, String, Reason)> = relocations(output, &strict)

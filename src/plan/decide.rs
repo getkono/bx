@@ -354,6 +354,8 @@ enum Made {
     Region(Vec<u8>, char),
     /// A directory, created or set to the op's mode.
     Dir,
+    /// A symlink holding this text, made or retargeted.
+    Link(PathBuf),
 }
 
 impl Op {
@@ -388,6 +390,13 @@ impl Op {
                     planned: self.planned,
                 },
                 Mechanism::Dir,
+            ),
+            Made::Link(text) => (
+                Content::Link {
+                    text,
+                    planned: self.planned,
+                },
+                Mechanism::Link,
             ),
         };
         Request {
@@ -435,6 +444,7 @@ pub(super) fn decide(
     let bytes = match wanted(target, ctx)? {
         Wanted::Bytes(bytes) => bytes,
         Wanted::Dir => return decide_dir(target, ctx, row),
+        Wanted::Link(text) => return decide_link(target, text, ctx, row),
         Wanted::Blocked(note) => return Ok((row(Action::Blocked, None, Some(note)), None)),
     };
 
@@ -733,6 +743,119 @@ fn dir_ownership(
     }
 }
 
+/// Decide a symlink target: make the link, retarget one bx made, leave it, or
+/// refuse.
+///
+/// A link is compared by its text alone, read with `readlink` and never
+/// resolved, so whether anything is at the far end changes nothing: a
+/// dangling link is created and kept like any other. What is at the
+/// destination decides the rest:
+///
+/// * nothing is a create, and a link already holding the text is unchanged —
+///   adopted as it stands, with nothing written or recorded, as a file already
+///   holding a file target's bytes is;
+/// * a link holding other text is a modify only when bx made it and it still
+///   holds what bx left there, settled by [`link_ownership`];
+/// * a regular file, a directory or anything else is never replaced by a link.
+///
+/// A modify is shown as the old and new text, never as a content diff.
+fn decide_link(
+    target: &Target,
+    text: PathBuf,
+    ctx: &Ctx<'_>,
+    row: impl Fn(Action, Option<Diff>, Option<String>) -> Change,
+) -> Result<(Change, Option<Op>), Error> {
+    let dest = target.path.render(ctx.home);
+    let observed = fs::observe(&dest)?;
+    let (action, note) = match (
+        observed.parent.as_ref().and_then(|p| p.unusable()),
+        observed.kind,
+    ) {
+        (Some(reason), _) => {
+            let parent = observed.parent.as_ref().map_or(dest.as_path(), |p| &p.path);
+            (
+                Action::Conflict,
+                Some(portable_reason(parent, reason, ctx.home)),
+            )
+        }
+        (None, Kind::Absent) => (Action::Create, None),
+        (None, Kind::Symlink) if observed.link.as_deref() == Some(text.as_path()) => {
+            (Action::Unchanged, None)
+        }
+        (None, Kind::Symlink) => (Action::Modify, None),
+        (None, Kind::File) => (
+            Action::Conflict,
+            Some("a regular file, where the target declares a symlink".to_string()),
+        ),
+        (None, Kind::Dir) => (
+            Action::Conflict,
+            Some("a directory, where the target declares a symlink".to_string()),
+        ),
+        (None, Kind::Other) => (Action::Conflict, Some("not a symlink".to_string())),
+    };
+    let (action, note) = link_ownership(action, &observed, ctx.ledger.get(&target.path), note);
+    // Making a link writes an entry in its parent, as a file's write does.
+    let (action, note) = match (
+        action.is_pending(),
+        locked_parent(&observed, ctx.home, ctx.declared, Write::File),
+    ) {
+        (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
+        _ => (action, note),
+    };
+    // A link on either side has text to show; anything else is explained by
+    // the note alone.
+    let diff = match action {
+        Action::Create | Action::Modify => Some(Diff::link(observed.link.as_deref(), Some(&text))),
+        Action::Conflict if observed.kind == Kind::Symlink => {
+            Some(Diff::link(observed.link.as_deref(), Some(&text)))
+        }
+        Action::Conflict | Action::Unchanged | Action::Blocked => None,
+    };
+    let note = match action {
+        Action::Create => join([created_dirs(&observed, ctx.home, ctx.declared), note]),
+        _ => note,
+    };
+    let change = row(action, diff, note);
+    let op = action.is_pending().then(|| Op {
+        target: target.path.clone(),
+        dest,
+        made: Made::Link(text),
+        planned: observed,
+        mode: Mode::LINK,
+    });
+    Ok((change, op))
+}
+
+/// Settle what [`decide_link`] found against what the ledger says bx owns.
+///
+/// Only a link bx made, still holding the text bx left in it, is retargeted:
+/// a link bx did not make is the user's, and one bx made that holds other text
+/// now was retargeted by somebody else, whose change a write would undo. A
+/// path the ledger says bx attached to some other way is refused as well.
+fn link_ownership(
+    action: Action,
+    observed: &Observed,
+    entry: Option<&LedgerEntry>,
+    note: Option<String>,
+) -> (Action, Option<String>) {
+    let conflict = |why: String| (Action::Conflict, join([Some(why), note.clone()]));
+    match (action, entry) {
+        (Action::Create | Action::Modify, Some(entry)) if entry.mechanism != Mechanism::Link => {
+            conflict(format!(
+                "bx attached to this path as {}",
+                attached_as(&entry.mechanism)
+            ))
+        }
+        (Action::Modify, None) => {
+            conflict("a symlink bx did not make; bx will not retarget a link you created".into())
+        }
+        (Action::Modify, Some(entry)) if observed.link_digest() != Some(entry.written) => {
+            conflict("retargeted since bx made it".to_string())
+        }
+        _ => (action, note),
+    }
+}
+
 /// The parent note a file gets when its parent is a declared directory: the
 /// declared mode is the one the file will sit in, whatever is on disk now.
 ///
@@ -798,6 +921,8 @@ enum Wanted {
     Bytes(Vec<u8>),
     /// A directory, which has none.
     Dir,
+    /// A symlink holding this text, already rendered against the home.
+    Link(PathBuf),
     /// The note a blocked row carries.
     Blocked(String),
 }
@@ -842,10 +967,12 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
         // A declared directory mode reaches disk before any file beneath it
         // is written, which [`locked_parent`] reads as a declaration.
         Body::Dir => return Ok(Wanted::Dir),
-        Body::Symlink(_) => {
-            return Ok(Wanted::Blocked(
-                "a symlink target is not written yet".to_string(),
-            ));
+        // The text as the link will hold it: only a leading `~` is rendered,
+        // and nothing is resolved.
+        Body::Symlink(text) => {
+            return Ok(Wanted::Link(crate::config::target::link_text(
+                text, ctx.home,
+            )));
         }
     };
     Ok(Wanted::Bytes(bytes))

@@ -45,6 +45,15 @@ pub enum DiffKind {
         /// The mode bx would set.
         to: Mode,
     },
+    /// A symlink's text: the link on disk and the one bx would leave, either
+    /// `None` where there is no link. A link has no content to diff, so its
+    /// text is the whole of what changes.
+    Link {
+        /// The text of the link on disk.
+        from: Option<String>,
+        /// The text of the link bx would leave.
+        to: Option<String>,
+    },
     /// The content differs and is not shown line by line.
     Summary {
         /// How many bytes are on disk, or `None` when there is no file.
@@ -74,6 +83,20 @@ impl Diff {
     pub(super) const fn mode(from: Mode, to: Mode) -> Self {
         Self {
             kind: DiffKind::Mode { from, to },
+        }
+    }
+
+    /// The diff of a symlink target: the text of the link on disk, and the
+    /// text of the one bx would leave, `None` on either side where there is
+    /// no link.
+    #[must_use]
+    pub(super) fn link(from: Option<&Path>, to: Option<&Path>) -> Self {
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        Self {
+            kind: DiffKind::Link {
+                from: from.map(text),
+                to: to.map(text),
+            },
         }
     }
 
@@ -397,6 +420,16 @@ fn row(out: &mut String, change: &Change, palette: Palette, home: &Path) {
         DiffKind::Mode { from, to } => {
             let _ = writeln!(out, "{DIFF_INDENT}mode {from} -> {to}");
         }
+        // One line per side, each escaped like any other text a row shows, so
+        // a link's text cannot move the cursor or start a line of its own.
+        DiffKind::Link { from, to } => {
+            for (sign, style, text) in [('-', REMOVED, from), ('+', ADDED, to)] {
+                if let Some(text) = text {
+                    let line = format!("{sign} symlink {}", escape(text));
+                    let _ = writeln!(out, "{DIFF_INDENT}{}", palette.paint(style, &line));
+                }
+            }
+        }
         DiffKind::Summary { before, after, why } => {
             let before = before.map_or_else(|| "no file".to_string(), |len| format!("{len} bytes"));
             let why = match why {
@@ -656,6 +689,49 @@ mod tests {
         assert!(rendered.contains("  ~ ~/.a  (~/.config/bx/bx.toml:1)\n    mode 0644 -> 0600\n"));
         assert!(rendered.contains("    binary content: no file -> 2 bytes\n"));
         assert!(rendered.contains("    too large to show: 4 bytes -> 262145 bytes\n"));
+    }
+
+    #[test]
+    fn a_link_renders_its_text_on_each_side_escaped_and_coloured() {
+        let mut retarget = change("~/.tool", 1, Action::Modify);
+        retarget.diff = Some(Diff::link(
+            Some(Path::new("/opt/one")),
+            Some(Path::new("/opt/two\x1b[2J")),
+        ));
+        let mut create = change("~/.new", 2, Action::Create);
+        create.diff = Some(Diff::link(None, Some(Path::new("../x"))));
+        let report = Report {
+            changes: vec![retarget, create],
+            ..Report::default()
+        };
+
+        let plain = render(&report, View::Plan, Palette::PLAIN, Path::new(HOME));
+        assert!(
+            plain.contains(
+                "  ~ ~/.tool  (~/.config/bx/bx.toml:1)\n    - symlink /opt/one\n    \
+                 + symlink /opt/two\\x1b[2J\n"
+            ),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("  + ~/.new  (~/.config/bx/bx.toml:2)\n    + symlink ../x\n"),
+            "{plain}"
+        );
+
+        let coloured = render(
+            &report,
+            View::Plan,
+            Palette::resolve(false, true),
+            Path::new(HOME),
+        );
+        let red = format!(
+            "{}- symlink /opt/one{}",
+            REMOVED.render(),
+            REMOVED.render_reset()
+        );
+        let green = format!("{}+ symlink ../x{}", ADDED.render(), ADDED.render_reset());
+        assert!(coloured.contains(&red), "{coloured:?}");
+        assert!(coloured.contains(&green), "{coloured:?}");
     }
 
     #[test]

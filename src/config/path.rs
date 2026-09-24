@@ -329,6 +329,13 @@ fn spelled(text: &str) -> Result<String, String> {
 /// up first, and each added entry is taken out of `PATH` just before it is
 /// put back where it is declared. Removals come after every entry has been
 /// added.
+///
+/// The block never ends on a gated line. A gated line whose directory is
+/// missing returns 1, and a file sourced at startup returns the status of its
+/// last command, so a `zshenv` fragment ending on one would stop a shell
+/// running under `ERR_EXIT` (`zsh -e`) before its prompt. When the last line
+/// written is gated, the block closes with [`SETTLE`], which assigns `PATH`
+/// its own value and returns 0.
 #[must_use]
 pub fn render(entries: &[PathEntry]) -> String {
     if entries.is_empty() {
@@ -365,8 +372,19 @@ pub fn render(entries: &[PathEntry]) -> String {
     for entry in in_list(Position::Remove) {
         removal(&mut out, &entry.shell);
     }
+    if out
+        .lines()
+        .next_back()
+        .is_some_and(|line| line.starts_with("[[ -d "))
+    {
+        out.push_str(SETTLE);
+    }
     out
 }
+
+/// The line that closes a `[path]` block whose last line is gated: `PATH`
+/// assigned its own value, changing nothing and returning 0.
+const SETTLE: &str = "export PATH=${PATH}\n";
 
 #[cfg(test)]
 mod tests {
@@ -559,5 +577,39 @@ mod tests {
         );
         assert_eq!(render(&[]), "");
         assert_eq!(render(&entries), render(&entries));
+    }
+
+    #[test]
+    fn a_block_whose_last_line_is_gated_ends_on_a_line_that_succeeds() {
+        // The first-declared prepend is written last, so with nothing after
+        // it the block would end on its gate.
+        assert_eq!(
+            render(&[
+                entry("${HOME}/.local/bin", Position::Prepend, true),
+                entry("${HOME}/bin", Position::Prepend, false),
+            ]),
+            "# [path]\n\
+             path=(${path:#${HOME}/bin})\n\
+             export PATH=${HOME}/bin:${PATH}\n\
+             path=(${path:#${HOME}/.local/bin})\n\
+             [[ -d ${HOME}/.local/bin ]] && export PATH=${HOME}/.local/bin:${PATH}\n\
+             export PATH=${PATH}\n"
+        );
+        // The last append, with no removal after it, is the same case.
+        assert_eq!(
+            render(&[entry("/opt/x/bin", Position::Append, true)]),
+            "# [path]\n\
+             path=(${path:#/opt/x/bin})\n\
+             [[ -d /opt/x/bin ]] && export PATH=${PATH}:/opt/x/bin\n\
+             export PATH=${PATH}\n"
+        );
+        // A block that ends on anything else gets no extra line.
+        assert!(
+            !render(&[
+                entry("/opt/x/bin", Position::Append, true),
+                entry("/opt/y/bin", Position::Remove, false),
+            ])
+            .ends_with(SETTLE)
+        );
     }
 }

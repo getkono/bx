@@ -8808,6 +8808,50 @@ mod tests {
     }
 
     #[test]
+    fn a_path_block_ending_on_a_missing_gated_directory_is_approved_and_survives_err_exit() {
+        use crate::config::env::{Fragment, Syntax};
+        use crate::config::path::{PathEntry, Position, shell_spelling};
+        let shells = Shells::found();
+        let Some((shell, program, _)) = shells
+            .found
+            .iter()
+            .find(|(shell, _, _)| shell.program == "zsh")
+        else {
+            return;
+        };
+        let home = shells.home();
+        let entry = |dir: &str, position| PathEntry {
+            dir: dir.to_string(),
+            shell: shell_spelling(dir).expect("a PATH entry"),
+            position,
+            if_exists: true,
+            enabled: true,
+            origin: crate::config::Origin::unknown(Path::new("bx.toml")),
+        };
+        // The first-declared prepend is written last, and its directory does
+        // not exist; so does the lone append's.
+        for path in [
+            vec![entry("~/missing/bin", Position::Prepend)],
+            vec![entry("~/missing/bin", Position::Append)],
+        ] {
+            let fragment = Fragment {
+                syntax: Syntax::Zsh,
+                vars: vec![],
+                path,
+            }
+            .render(&|_| unreachable!("nothing is gated on a tool"));
+            assert_eq!(scan_with(&fragment, &shells.rooted()), vec![]);
+            let file = home.join("fragment.zsh");
+            std::fs::write(&file, &fragment).expect("the fragment is written");
+            let mut flags = shell.flags.to_vec();
+            flags.push("-e");
+            let script = format!("source {}\nprint -rn reached\n", file.display());
+            let out = run_script(program, &flags, &home, &script);
+            assert_eq!(out, b"reached", "{fragment}");
+        }
+    }
+
+    #[test]
     fn nothing_a_shell_runs_names_a_path_outside_the_sandbox() {
         // What replaced the old skip. The fragments these checks run are
         // deliberately broken shell, and a stray `>` in one is a redirection

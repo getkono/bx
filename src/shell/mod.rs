@@ -43,9 +43,9 @@
 //! what lands in them must be an environment fragment the plan judges through
 //! [`crate::env_guard`]. Every other phase is generated shell content that is
 //! not an environment fragment, and the bx-derived content in it must carry no
-//! assignment at all. Code the user wrote verbatim — a declared function's
-//! body — is transported byte for byte, not derived, and is not judged: the
-//! invariant governs what bx itself emits or relocates. The
+//! assignment at all. A declared function's body is a template the user wrote.
+//! bx only substitutes declared values into it and does not judge it, because
+//! the invariant governs what bx itself emits or relocates. The
 //! scaffolding this module adds — the header and one comment per phase — sets
 //! nothing, and the plugin lines [`plugin`] renders only test a file and source
 //! it; the tests below establish both of the bytes actually emitted. The

@@ -93,10 +93,11 @@
 //! tool's files live. `rendering_functions_changes_only_the_hook_arrays` runs
 //! the rendered bytes in zsh and holds them to exactly that.
 //!
-//! The body is not bx-derived content. It is code the user wrote verbatim in
-//! their own config repo, and bx transports it byte for byte, deriving nothing
-//! from it, exactly as an owned `file` target may hold anything its author
-//! wrote. Invariant 2 governs what bx itself emits or relocates, so it does
+//! The body is not bx-derived content. The body as written is a template the
+//! user authored in their own config repo. bx changes it in one way only: it
+//! substitutes each `{{name}}` with a value the configuration declares, then
+//! splices the result verbatim. That is the same way an owned `file` target's
+//! text is substituted, and such a target may hold anything its author wrote. Invariant 2 governs what bx itself emits or relocates, so it does
 //! not judge a body, hooked or not — even though a hooked body runs at every
 //! firing of its hook without the user invoking it, and may set any variable
 //! the user chose to set there. Passing bodies through [`crate::env_guard`]

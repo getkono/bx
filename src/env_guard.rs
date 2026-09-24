@@ -1998,8 +1998,12 @@ fn after_value(rest: &str) -> Result<(), Reason> {
     })
 }
 
-/// Whether `name` is a shell-legal variable name.
-fn is_variable_name(name: &str) -> bool {
+/// Whether `name` is a variable name every shell and `environment.d` read the
+/// same way: `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// The `[[env]]` parser checks a declared name with this same predicate, so
+/// the parser and the guard cannot disagree on what a variable name is.
+pub(crate) fn is_variable_name(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -6248,8 +6252,13 @@ mod tests {
         // print a warning: the file is adopted verbatim whatever the verdict,
         // and the scan's text is never generated. So no generated fragment
         // reaches the guard through it.
-        const KNOWN: [(&str, &str); 8] = [
+        //
+        // `config/env.rs` imports only the name predicate, so the `[[env]]`
+        // parser and the guard agree on what a variable name is; a predicate
+        // reads no fragment and writes no bytes.
+        const KNOWN: [(&str, &str); 9] = [
             ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
+            ("config/env.rs", "use crate::env_guard::is_variable_name;"),
             ("adopt.rs", "env_guard::scan_with(text, roots)"),
             ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
             (

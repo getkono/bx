@@ -40,6 +40,7 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::{Ctx, Error, Origin};
+use crate::env_guard::is_variable_name;
 use crate::paths::Portable;
 
 /// The section header, as messages spell it.
@@ -166,16 +167,6 @@ pub fn parse_env(table: &Table, file: &Path, text: &str) -> Result<EnvDecl, Erro
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
     })
-}
-
-/// Whether `name` is a variable name every shell and `environment.d` read the
-/// same way: `[A-Za-z_][A-Za-z0-9_]*`.
-fn is_variable_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Why `value` cannot be written as one value on one line of a fragment, or

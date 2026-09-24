@@ -424,12 +424,18 @@ pub(super) fn decide(
             return Ok((change, None));
         }
     };
+    // A generator may hold part of its content back, and every row of its
+    // target says so, whatever the row's action.
+    let held = match &target.body {
+        Body::Generated(generator) => generator.note(),
+        _ => None,
+    };
     let row = |action, diff, note| Change {
         target: target.path.as_str().to_string(),
         origin: target.origin.clone(),
         action,
         diff,
-        note,
+        note: join([note, held.clone()]),
     };
 
     let bytes = match wanted(target, ctx)? {
@@ -899,8 +905,12 @@ fn unsupported(target: &Target) -> Option<&'static str> {
 /// The interactive file is judged by its `env` phase alone, rendered with the
 /// same `present` as the file, since that phase is its one environment
 /// fragment; every other phase holds plugin and alias lines that set nothing,
-/// which the guard's grammar would refuse as unreadable, and the tests of
-/// [`crate::config::target::Interactive`] hold them to carrying no assignment.
+/// and function definitions whose registrations assign only zsh's hook
+/// arrays, which the guard's grammar would refuse as unreadable. The tests of
+/// [`crate::config::target::Interactive`] hold the plugin and alias lines to
+/// carrying no assignment, and those of [`crate::shell::function`] and this
+/// module hold the `functions` phase to changing no parameter but a hook
+/// array.
 /// A line number in the note is still the file's own: the phase is found in
 /// the file's bytes, and each line is counted from the top of the file.
 fn guard_generated(

@@ -66,6 +66,7 @@ use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
 use crate::shell::alias::AliasDecl;
+use crate::shell::function::FunctionDecl;
 use crate::shell::plugin::PluginDecl;
 
 /// A configuration entry that either resolved or could not.
@@ -167,7 +168,9 @@ pub struct Resolved {
 /// references a later value, a `default` that is not of its kind with no
 /// account answer involved, a target field that substitution makes invalid
 /// with no account answer in it, or a `file` that references a `path` value,
-/// answered or not; for two enabled plugins that claim the terminal slot; and
+/// answered or not; for a `[[function]]` body holding a malformed placeholder,
+/// a reference to a value no layer declares, or a committed `default` it
+/// cannot hold; for two enabled plugins that claim the terminal slot; and
 /// for two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
@@ -189,6 +192,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         &merged.path,
         &merged.plugins,
         &merged.aliases,
+        &merged.functions,
         &values,
     )?);
 
@@ -248,23 +252,34 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// it. Nothing in an alias is substituted, and a variable that holds the file
 /// back holds its aliases back with it.
 ///
+/// The enabled `[[function]]` entries land in that file's `functions` phase,
+/// each body substituted from the same values every target is, and an enabled
+/// function places the file on its own as an alias does. A function whose
+/// body waits on a value is held back alone: the file is still written with
+/// every other function in it, and its plan row names each held-back one
+/// ([`Interactive::note`]). A variable that holds the file back holds its
+/// functions back with it.
+///
 /// # Errors
 ///
-/// [`Error::BadValue`] for a variable whose value is a repo defect: a
-/// malformed placeholder, a reference to a value no layer declares, or a
-/// committed `default` that puts a character no fragment line can hold into
-/// it; and for a second enabled plugin claiming the terminal slot.
+/// [`Error::BadValue`] for a variable or a function body whose value is a
+/// repo defect: a malformed placeholder, a reference to a value no layer
+/// declares, or a committed `default` that puts a character no fragment line
+/// or function body can hold into it; and for a second enabled plugin
+/// claiming the terminal slot.
 fn place_envs(
     envs: &[EnvDecl],
     path: &[PathEntry],
     plugins: &[PluginDecl],
     aliases: &[AliasDecl],
+    functions: &[FunctionDecl],
     values: &ResolvedValues,
 ) -> Result<Vec<Resolution<Target>>, Error> {
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
         .collect::<Result<Vec<_>, Error>>()?;
+    let bodies = crate::shell::function::resolve(functions, values)?;
 
     let mut placed = Vec::new();
     for place in Place::ALL {
@@ -273,19 +288,21 @@ fn place_envs(
             .filter(|(decl, _)| decl.kind.places().contains(&place))
             .collect();
         let entries = if place == Place::Zshenv { path } else { &[] };
-        let (interactive, declared) = if place == Place::Zshrc {
-            (plugins, aliases)
+        let (interactive, declared, defined) = if place == Place::Zshrc {
+            (plugins, aliases, functions)
         } else {
-            (&[][..], &[][..])
+            (&[][..], &[][..], &[][..])
         };
         let plugin = interactive.iter().find(|p| p.enabled);
         let alias = declared.iter().find(|a| a.enabled);
-        let origin = match (here.first(), entries.first(), plugin, alias) {
-            (Some((first, _)), _, _, _) => first.origin.clone(),
-            (None, Some(entry), _, _) => entry.origin.clone(),
-            (None, None, Some(plugin), _) => plugin.origin.clone(),
-            (None, None, None, Some(alias)) => alias.origin.clone(),
-            (None, None, None, None) => continue,
+        let function = defined.iter().find(|f| f.enabled);
+        let origin = match (here.first(), entries.first(), plugin, alias, function) {
+            (Some((first, _)), ..) => first.origin.clone(),
+            (None, Some(entry), ..) => entry.origin.clone(),
+            (None, None, Some(plugin), ..) => plugin.origin.clone(),
+            (None, None, None, Some(alias), _) => alias.origin.clone(),
+            (None, None, None, None, Some(function)) => function.origin.clone(),
+            (None, None, None, None, None) => continue,
         };
         let portable = |raw: &str| {
             Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
@@ -310,9 +327,11 @@ fn place_envs(
                 })
                 .collect();
             let generator = match fragment_gen(place, vars, entries.to_vec()) {
-                Gen::Interactive(file) => {
-                    Gen::Interactive(file.with_plugins(interactive)?.with_aliases(declared))
-                }
+                Gen::Interactive(file) => Gen::Interactive(
+                    file.with_plugins(interactive)?
+                        .with_aliases(declared)
+                        .with_functions(bodies.clone()),
+                ),
                 other => other,
             };
             Resolution::Ready(fragment_target(place, fragment.clone(), generator, &origin))

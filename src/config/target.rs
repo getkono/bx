@@ -39,11 +39,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::shell::alias::AliasDecl;
+use crate::shell::function::Function;
 use crate::shell::plugin::PluginDecl;
 use crate::shell::{Assembly, Phase};
 
 use toml_edit::Table;
 
+use super::resolve::{BlockedEntry, Resolution};
 use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
 
@@ -127,11 +129,12 @@ pub enum Body {
 /// `apply` writes. [`Gen::render`] is that function.
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
-/// ([`super::env`]), which also carries the `[[plugin]]` entries and the
-/// declared aliases into the interactive file, and none is named by a config
-/// author: a fragment carries the variables resolution placed in it, which no
-/// `generated = "…"` string could spell. A generator a config author may name adds its variant here and
-/// its arm in [`parse_generated`] together.
+/// ([`super::env`]), which also carries the `[[plugin]]` entries, the
+/// declared aliases and the declared functions into the interactive file, and
+/// none is named by a config author: a fragment carries the variables
+/// resolution placed in it, which no `generated = "…"` string could spell. A
+/// generator a config author may name adds its variant here and its arm in
+/// [`parse_generated`] together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gen {
     /// An environment fragment: the variables one place holds. The plan judges
@@ -161,6 +164,18 @@ impl Gen {
             Self::Interactive(file) => file.render(present),
         }
     }
+
+    /// What the generator's plan row says beside its bytes: for the
+    /// interactive file, the functions held back from it, each with what
+    /// would release it. `None` for every other generator, and for an
+    /// interactive file holding every function it declares.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Self::Interactive(file) => file.note(),
+            Self::Env(_) | Self::Source(_) => None,
+        }
+    }
 }
 
 /// The interactive shell file, `~/.local/share/bx/zshrc.zsh`, rendered through
@@ -171,8 +186,11 @@ impl Gen {
 /// `[[plugin]]` lands in the `plugins` phase, or in the `terminal` slot when it
 /// claims it, as the one guarded line [`PluginDecl::line`] renders; and every
 /// enabled alias lands in the `aliases` phase, as the line
-/// [`crate::shell::alias::AliasDecl::render`] renders for it. No phase but
-/// `env` holds an assignment (Invariant 2).
+/// [`crate::shell::alias::AliasDecl::render`] renders for it; and every
+/// enabled `[[function]]` whose body resolved lands in the `functions` phase,
+/// as [`Function::render`] renders it. No phase but `env` holds an
+/// environment assignment (Invariant 2); the `functions` phase assigns only
+/// zsh's hook arrays, which no process inherits.
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what
@@ -185,17 +203,54 @@ pub struct Interactive {
     plugins: Vec<PluginDecl>,
     /// The enabled aliases, in the merged configuration's order.
     aliases: Vec<AliasDecl>,
+    /// The enabled functions, each resolved or held back in its own
+    /// position, in the merged configuration's order.
+    functions: Vec<Resolution<Function>>,
 }
 
 impl Interactive {
-    /// The file holding `env` and no plugin or alias.
+    /// The file holding `env` and no plugin, alias or function.
     #[must_use]
     pub const fn new(env: super::env::Fragment) -> Self {
         Self {
             env,
             plugins: Vec::new(),
             aliases: Vec::new(),
+            functions: Vec::new(),
         }
+    }
+
+    /// The file with `functions` added: the enabled functions as
+    /// [`crate::shell::function::resolve`] resolved them, each ready one
+    /// written and each held-back one named by [`Interactive::note`].
+    #[must_use]
+    pub fn with_functions(mut self, functions: Vec<Resolution<Function>>) -> Self {
+        self.functions = functions;
+        self
+    }
+
+    /// The enabled functions, each resolved or held back.
+    #[must_use]
+    pub fn functions(&self) -> &[Resolution<Function>] {
+        &self.functions
+    }
+
+    /// The note the file's plan row carries: every function held back from
+    /// it, named with what would release it, or `None` when none is.
+    ///
+    /// Decided by the values alone, never by `present`, so the note is the
+    /// same whichever tools this machine has.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        let held: Vec<&BlockedEntry> = self
+            .functions
+            .iter()
+            .filter_map(|function| match function {
+                Resolution::Blocked(entry) => Some(entry),
+                Resolution::Ready(_) => None,
+            })
+            .collect();
+        crate::shell::function::note(&held)
     }
 
     /// The file with `aliases` added, the disabled ones dropped.
@@ -243,9 +298,10 @@ impl Interactive {
     ///
     /// The fragment is contributed only when it holds a variable, so a file
     /// with plugins alone has no `env` phase, and a file whose every alias is
-    /// gated on a missing tool has no `aliases` phase. The bytes are a
-    /// function of the variables, the plugins, the aliases and `present`'s
-    /// answers alone.
+    /// gated on a missing tool has no `aliases` phase, and a file whose every
+    /// function is held back has no `functions` phase. The bytes are a
+    /// function of the variables, the plugins, the aliases, the functions and
+    /// `present`'s answers alone.
     ///
     /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
     /// file is absent returns 1, and a file sourced at startup returns the
@@ -265,6 +321,8 @@ impl Interactive {
         // admitted at most one claimant.
         contributed.expect("an `Interactive` holds at most one terminal claimant");
         crate::shell::alias::contribute(&mut assembly, &self.aliases, present);
+        // The held-back functions are the note's to name, not the bytes'.
+        crate::shell::function::contribute(&mut assembly, &self.functions, present);
         let mut out = assembly.render();
         if !self.plugins.is_empty() {
             out.push_str(SETTLE);

@@ -921,10 +921,17 @@ fn passes_through(path: &Path, parts: &[&str]) -> bool {
 /// — the guard turns itself off and says nothing. A guard may fail loudly; it
 /// may not fail open in silence.
 ///
-/// The configuration layer does **not** refuse such a value: a `path` value of
-/// `/` is accepted there. This floor is therefore the only one, which is why a
-/// refused root is logged at error level — the level `bx` reports with `BX_LOG`
-/// unset — and changes the verdict rather than only narrowing the set.
+/// This is the second floor, not the only one. The configuration layer refuses
+/// an `is_root` answer that resolves to `/` — spelled `/`, `//`, `/./` or `/..`
+/// — as `config::values::ValueError::RootIsFilesystem`, and refuses a
+/// `~`-rooted climb such as `~/../../..` before it can resolve anywhere, so a
+/// root read from `local.toml` reaches [`RootSet::new`] already normalised and
+/// never trips this check. [`RootSet::new`] is public and takes any path,
+/// though, so the guard does not rely on its caller: a root that reaches here
+/// and fails the floor means something bypassed the configuration layer. That
+/// is why a refused root is logged at error level — the level `bx` reports
+/// with `BX_LOG` unset — and changes the verdict rather than only narrowing the
+/// set.
 ///
 /// `..` is rejected *before* normalisation as well, on the shape rather than
 /// the result: a declared root that climbs is anomalous by construction, and

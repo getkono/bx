@@ -510,6 +510,77 @@ fn decision_18_an_apply_over_a_blocked_interruption_refuses_before_rolling_anyth
 }
 
 #[test]
+fn d1_a_secret_is_listed_planned_without_its_plaintext_and_applied_private() {
+    use age::secrecy::ExposeSecret as _;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = guarded_home();
+    let key = age::x25519::Identity::generate();
+    std::fs::create_dir_all(home.child(".config/age")).expect("~/.config/age");
+    std::fs::write(
+        home.child(".config/age/key.txt"),
+        key.to_string().expose_secret(),
+    )
+    .expect("the identity");
+    std::fs::create_dir_all(home.child(".local/state/bx")).expect("the state directory");
+    std::fs::write(
+        home.child(".local/state/bx/local.toml"),
+        "[secrets]\nidentity = \"~/.config/age/key.txt\"\n",
+    )
+    .expect("local.toml");
+
+    let recipient = key.to_public();
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(&recipient as _)).expect("a recipient");
+    let mut ciphertext = Vec::new();
+    let mut writer = encryptor.wrap_output(&mut ciphertext).expect("the output");
+    writer.write_all(b"hunter2\n").expect("the plaintext");
+    writer.finish().expect("the stream");
+    std::fs::create_dir_all(home.child(".config/bx/secrets")).expect("secrets/");
+    std::fs::write(home.child(".config/bx/secrets/token.age"), ciphertext).expect("ciphertext");
+    seed(
+        home.path(),
+        "[[target]]\npath = \"~/.token\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n",
+    );
+
+    let listed = bx(home.path(), &["secret", "list"]);
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert_eq!(
+        stdout(&listed),
+        "  ~/.token  secrets/token.age  decryptable\n"
+    );
+
+    let planned = bx(home.path(), &["plan"]);
+    assert_eq!(planned.status.code(), Some(2), "{}", stderr(&planned));
+    assert!(
+        !stdout(&planned).contains("hunter2"),
+        "{}",
+        stdout(&planned)
+    );
+
+    let applied = bx(home.path(), &["apply", "--yes"]);
+    assert_eq!(applied.status.code(), Some(0), "{}", stderr(&applied));
+    assert!(
+        !stdout(&applied).contains("hunter2"),
+        "{}",
+        stdout(&applied)
+    );
+    assert_eq!(
+        std::fs::read(home.child(".token")).expect("written"),
+        b"hunter2\n"
+    );
+    let mode = std::fs::metadata(home.child(".token"))
+        .expect("the secret")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o600);
+
+    let again = bx(home.path(), &["plan"]);
+    assert_eq!(again.status.code(), Some(0), "{}", stdout(&again));
+}
+
+#[test]
 fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
     let home = guarded_home();
     seed(home.path(), "# mine\n");

@@ -63,6 +63,8 @@ pub enum Why {
     Binary,
     /// One side is larger than [`TEXT_LIMIT`].
     TooLarge,
+    /// The target is a secret, whose content is never printed.
+    Secret,
 }
 
 impl Diff {
@@ -107,6 +109,30 @@ impl Diff {
             }
         };
         Some(Self { kind })
+    }
+
+    /// [`Diff::between`] for content that must not be printed: a secret's
+    /// plaintext, and whatever sits where it goes. A mode change is still
+    /// shown; changed content is only counted.
+    #[must_use]
+    pub(super) fn concealed(
+        _target: &str,
+        before: Option<&[u8]>,
+        after: &[u8],
+        mode: Option<(Mode, Mode)>,
+    ) -> Option<Self> {
+        if before == Some(after) {
+            return mode.map(|(from, to)| Self {
+                kind: DiffKind::Mode { from, to },
+            });
+        }
+        Some(Self {
+            kind: DiffKind::Summary {
+                before: before.map(<[u8]>::len),
+                after: after.len(),
+                why: Why::Secret,
+            },
+        })
     }
 }
 
@@ -376,6 +402,7 @@ fn row(out: &mut String, change: &Change, palette: Palette, home: &Path) {
             let why = match why {
                 Why::Binary => "binary content",
                 Why::TooLarge => "too large to show",
+                Why::Secret => "secret, not shown",
             };
             let _ = writeln!(out, "{DIFF_INDENT}{why}: {before} -> {after} bytes");
         }
@@ -391,6 +418,37 @@ mod tests {
     use crate::journal::SessionKind;
     use crate::paths::Portable;
     use crate::recover::{Interrupted, Standing, Unfinished};
+
+    #[test]
+    fn a_concealed_diff_counts_bytes_and_shows_only_a_mode() {
+        assert_eq!(
+            Diff::concealed("~/.s", None, b"token\n", None),
+            Some(Diff {
+                kind: DiffKind::Summary {
+                    before: None,
+                    after: 6,
+                    why: Why::Secret
+                }
+            })
+        );
+        assert_eq!(
+            Diff::concealed("~/.s", Some(b"old"), b"token\n", None).map(|diff| diff.kind),
+            Some(DiffKind::Summary {
+                before: Some(3),
+                after: 6,
+                why: Why::Secret
+            })
+        );
+        let drift = Some((Mode::DEFAULT_FILE, Mode::PRIVATE_FILE));
+        assert_eq!(
+            Diff::concealed("~/.s", Some(b"same"), b"same", drift).map(|diff| diff.kind),
+            Some(DiffKind::Mode {
+                from: Mode::DEFAULT_FILE,
+                to: Mode::PRIVATE_FILE
+            })
+        );
+        assert_eq!(Diff::concealed("~/.s", Some(b"same"), b"same", None), None);
+    }
 
     #[test]
     fn a_create_is_every_line_added() {

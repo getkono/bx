@@ -1,5 +1,5 @@
-//! The bodies of `bx`, `bx plan`, `bx apply`, `bx doctor`, `bx add` and
-//! `bx rm`.
+//! The bodies of `bx`, `bx plan`, `bx apply`, `bx doctor`, `bx add`, `bx rm`
+//! and `bx secret list`.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
 //! or, for `doctor`, the read-only checks in [`crate::doctor`], and for `add`
@@ -11,11 +11,14 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::adopt::{self, Adoption, Removal};
+use crate::config::resolve::Resolution;
+use crate::config::target::Body;
 use crate::doctor::{self, Probes, systemd};
 use crate::paths;
 use crate::plan::{self, Env, Error, Inputs, Mode, Palette, Report, View};
 use crate::report::Exit;
 use crate::restore::Restored;
+use crate::secret::{Passphrase, Unlock};
 
 /// `bx doctor`: what a human should look at, changing nothing.
 ///
@@ -160,6 +163,92 @@ fn recovered(report: &Report, outcome: &crate::recover::Outcome) -> String {
         }
     };
     format!("{done}; nothing else was applied; run `bx plan` again.")
+}
+
+/// `bx secret list`: every declared secret, its ciphertext, and whether this
+/// account can decrypt it now.
+///
+/// The one command that may ask for an identity's passphrase, and only when
+/// standard input is a terminal; without one a locked identity is reported as
+/// locked. Each secret is checked on its own, so a locked identity is asked
+/// for once per secret: nothing keeps a passphrase between them. Nothing is
+/// written.
+///
+/// Exits [`Exit::Converged`] when every secret can be decrypted, and
+/// [`Exit::Pending`] when one cannot.
+///
+/// # Errors
+///
+/// Whatever loading returns, and [`Error::Output`] when `out` cannot be
+/// written. A secret that cannot be read or decrypted is a row, not an error.
+pub fn secret_list(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
+    secret_list_with(env, out, &mut ask_passphrase)
+}
+
+/// Ask on the terminal for an identity's passphrase, masked. A prompt that
+/// fails or is cancelled is no passphrase, and the identity stays locked.
+fn ask_passphrase(shown: &str) -> Option<Passphrase> {
+    inquire::Password::new(&format!("Passphrase for {shown}:"))
+        .without_confirmation()
+        .prompt()
+        .ok()
+        .map(Passphrase::from)
+}
+
+/// [`secret_list`], with the passphrase asked through `ask`.
+fn secret_list_with(
+    env: &Env,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut(&str) -> Option<Passphrase>,
+) -> Result<Exit, Error> {
+    let inputs = Inputs::load(env)?;
+    let secrets = &inputs.resolved().secrets;
+    let identity = secrets.identity_path(inputs.home());
+    let shown = secrets.identity_spelling();
+
+    let mut text = String::new();
+    let mut all = true;
+    for (declared, resolution) in inputs.declared_targets() {
+        let Body::Secret(written) = &declared.body else {
+            continue;
+        };
+        let (target, ciphertext, status) = match resolution {
+            Resolution::Blocked(entry) => (
+                entry.key.clone(),
+                written.display().to_string(),
+                Err(format!("blocked: {}", entry.hint)),
+            ),
+            Resolution::Ready(target) => {
+                let Body::Secret(rel) = &target.body else {
+                    unreachable!("substitution keeps a secret a secret");
+                };
+                let status = plan::read_repo_file(target, inputs.repo(), rel)
+                    .map_err(|error| format!("unreadable: {error}"))
+                    .and_then(|bytes| {
+                        let unlock = if env.stdin_tty {
+                            Unlock::Ask(&mut *ask)
+                        } else {
+                            Unlock::Never
+                        };
+                        crate::secret::decrypt(&bytes, &identity, shown, unlock)
+                            .map_err(|refusal| format!("not decryptable: {refusal}"))
+                    });
+                (
+                    target.path.as_str().to_string(),
+                    rel.display().to_string(),
+                    status.map(drop),
+                )
+            }
+        };
+        all &= status.is_ok();
+        let status = status.map_or_else(|why| why, |()| "decryptable".to_string());
+        text.push_str(&format!("  {target}  {ciphertext}  {status}\n"));
+    }
+    if text.is_empty() {
+        text.push_str("No secrets are declared.\n");
+    }
+    out.write_all(text.as_bytes()).map_err(Error::Output)?;
+    Ok(if all { Exit::Converged } else { Exit::Pending })
 }
 
 /// `bx add PATH`: adopt a file, or every regular file under a directory, byte
@@ -582,6 +671,182 @@ mod tests {
             apply(&env, true, &mut Vec::new()),
             Err(Error::RepoMissing(_))
         ));
+    }
+
+    /// A secret target at `~/{name}` whose ciphertext is `secrets/{name}.age`.
+    fn secret_target(name: &str) -> String {
+        format!(
+            "[[target]]\npath = \"~/{name}\"\nsecret = \"secrets/{name}.age\"\nmode = \"0600\"\n"
+        )
+    }
+
+    /// Encrypt `plaintext` to `recipient` as the repo's `secrets/{name}.age`.
+    fn seal(home: &crate::testing::GuardedHome, name: &str, recipient: &str) {
+        let path = home.child(format!(".config/bx/secrets/{name}.age"));
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("secrets/");
+        std::fs::write(path, crate::secret::tests::encrypt_to(recipient, b"x\n"))
+            .expect("the ciphertext");
+    }
+
+    fn no_passphrase(_: &str) -> Option<Passphrase> {
+        panic!("nothing should have asked for a passphrase")
+    }
+
+    #[test]
+    fn d1_secret_list_reports_each_secret_and_whether_it_decrypts() {
+        use crate::secret::tests::{LOCKED_SSH_PUB, SSH_KEY, SSH_PUB};
+
+        let home = guarded_home();
+        home.write(".ssh/id_ed25519", SSH_KEY);
+        seal(&home, "one", SSH_PUB);
+        seal(&home, "two", LOCKED_SSH_PUB);
+        let layer = [
+            secret_target("one"),
+            inline("~/.plain", "a\\n"),
+            secret_target("two"),
+            secret_target("absent"),
+            "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n\
+             [[target]]\npath = \"~/.w\"\nsecret = \"secrets/{{who}}.age\"\nmode = \"0600\"\n"
+                .to_string(),
+        ]
+        .concat();
+        seed(home.path(), &layer);
+
+        let mut out = Vec::new();
+        let exit =
+            secret_list_with(&env(home.path()), &mut out, &mut no_passphrase).expect("listed");
+
+        assert_eq!(exit, Exit::Pending);
+        let lines: Vec<&str> = text(&out).lines().collect();
+        assert_eq!(lines.len(), 4, "{}", text(&out));
+        assert_eq!(lines[0], "  ~/one  secrets/one.age  decryptable");
+        assert!(
+            lines[1].starts_with(
+                "  ~/two  secrets/two.age  not decryptable: the identity ~/.ssh/id_ed25519 is \
+                 not one this secret is encrypted to"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with("  ~/absent  secrets/absent.age  unreadable: "),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[3].starts_with("  ~/.w  secrets/{{who}}.age  blocked: "),
+            "{}",
+            lines[3]
+        );
+        assert!(!text(&out).contains("x\n  "), "no plaintext is printed");
+    }
+
+    #[test]
+    fn d1_secret_list_asks_for_a_locked_identity_only_on_a_terminal_and_per_secret() {
+        use crate::secret::tests::{LOCKED_PASSPHRASE, LOCKED_SSH_KEY, LOCKED_SSH_PUB};
+
+        let home = guarded_home();
+        home.write(".ssh/id_ed25519", LOCKED_SSH_KEY);
+        seal(&home, "one", LOCKED_SSH_PUB);
+        seal(&home, "two", LOCKED_SSH_PUB);
+        seed(
+            home.path(),
+            &[secret_target("one"), secret_target("two")].concat(),
+        );
+
+        let mut out = Vec::new();
+        let exit =
+            secret_list_with(&env(home.path()), &mut out, &mut no_passphrase).expect("listed");
+        assert_eq!(
+            exit,
+            Exit::Pending,
+            "no terminal: locked, and nothing asked"
+        );
+        assert!(
+            text(&out).contains(
+                "  ~/one  secrets/one.age  not decryptable: the identity \
+                 ~/.ssh/id_ed25519 is locked by a passphrase"
+            ),
+            "{}",
+            text(&out)
+        );
+
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut asked = Vec::new();
+        let mut out = Vec::new();
+        let exit = secret_list_with(&tty, &mut out, &mut |shown| {
+            asked.push(shown.to_string());
+            Some(Passphrase::from(LOCKED_PASSPHRASE))
+        })
+        .expect("listed");
+        assert_eq!(exit, Exit::Converged, "{}", text(&out));
+        assert_eq!(
+            text(&out),
+            "  ~/one  secrets/one.age  decryptable\n  ~/two  secrets/two.age  decryptable\n"
+        );
+        assert_eq!(
+            asked,
+            ["~/.ssh/id_ed25519", "~/.ssh/id_ed25519"],
+            "asked once per secret: nothing keeps a passphrase"
+        );
+    }
+
+    #[test]
+    fn d1_secret_list_with_no_secrets_says_so_and_converges() {
+        let home = guarded_home();
+        seed(home.path(), &inline("~/.a", "a\\n"));
+        let mut out = Vec::new();
+        let exit = secret_list(&env(home.path()), &mut out).expect("listed");
+        assert_eq!(exit, Exit::Converged);
+        assert_eq!(text(&out), "No secrets are declared.\n");
+
+        assert!(matches!(
+            secret_list(&env(home.path()), &mut Refusing),
+            Err(Error::Output(_))
+        ));
+    }
+
+    /// Set on the child that actually calls [`ask_passphrase`].
+    const PASSPHRASE_CHILD: &str = "BX_TEST_PASSPHRASE_CHILD";
+
+    #[test]
+    #[ignore = "spawned by the test below; it must run with a stdin that is not a terminal"]
+    fn passphrase_child() {
+        if std::env::var_os(PASSPHRASE_CHILD).is_none() {
+            return;
+        }
+        assert!(
+            ask_passphrase("~/.ssh/id_ed25519").is_none(),
+            "a prompt with no terminal is no passphrase"
+        );
+    }
+
+    #[test]
+    fn a_passphrase_prompt_without_a_terminal_is_no_passphrase() {
+        // As `confirm_without_a_terminal_is_a_prompt_error_and_never_an_answer`:
+        // in a child whose stdin is certainly not a terminal, so this never
+        // hangs on a developer's machine.
+        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "command::tests::passphrase_child",
+            ])
+            .env(PASSPHRASE_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn the passphrase child");
+
+        let ran = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{ran}");
+        assert!(
+            ran.contains("1 passed") && ran.contains("0 failed"),
+            "the child ran no test: {ran}"
+        );
     }
 
     /// A writer that refuses every byte.

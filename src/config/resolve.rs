@@ -148,6 +148,8 @@ pub struct Resolved {
     /// Blocked targets keep their position, so the order `bx plan` reports in is
     /// the configuration's own order with nothing silently moved to the end.
     pub targets: Vec<Resolution<Target>>,
+    /// The merged `[secrets]` table: nothing in it is substituted.
+    pub secrets: super::secrets::Secrets,
 }
 
 /// Resolve a merged configuration.
@@ -182,7 +184,25 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
 
     refuse_shared_files(&targets)?;
 
-    Ok(Resolved { values, targets })
+    Ok(Resolved {
+        values,
+        targets,
+        secrets: merged.secrets.clone(),
+    })
+}
+
+/// The body key that names a repo file, with the file as written.
+///
+/// `file`, or `secret`, whose ciphertext is a repo file by the same rule: every
+/// refusal that keeps `file` inside the repo and free of machine locations
+/// keeps `secret` there too, since an escape through it would decrypt whatever
+/// age file it reached into the target.
+fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
+    match body {
+        Body::File(path) => Some(("file", path.to_string_lossy())),
+        Body::Secret(path) => Some(("secret", path.to_string_lossy())),
+        Body::Inline(_) | Body::Generated(_) | Body::Dir => None,
+    }
 }
 
 /// The targets the `[[env]]` placement graph derives, after every declared
@@ -449,8 +469,8 @@ fn resolve_target(
     assignments: &[ValueAssignment],
     conflicts: &[Conflict],
 ) -> Result<Resolution<Target>, Error> {
-    if let Body::File(file) = &target.body {
-        refuse_path_value_in_file(target, &file.to_string_lossy(), values)?;
+    if let Some((key, file)) = repo_file(&target.body) {
+        refuse_path_value_in_file(target, key, &file, values)?;
     }
     for tool in &target.requires {
         refuse_committed_requirement(target, tool)?;
@@ -499,9 +519,9 @@ fn resolve_target(
     // `a_path_answer_block_outranks_an_unrelated_disabled_or_invalid_value`,
     // `a_switched_off_declaration_is_walked_through_by_its_default` and
     // `a_disabled_value_s_answer_is_not_walked`.
-    if let Body::File(file) = &target.body
+    if let Some((key, file)) = repo_file(&target.body)
         && let Some((names, hint)) =
-            refuse_path_answer_in_file(target, &file.to_string_lossy(), values, assignments)
+            refuse_path_answer_in_file(target, key, &file, values, assignments)
     {
         return block(BlockReason::InvalidValue { names }, hint);
     }
@@ -723,8 +743,11 @@ fn stood_in(pieces: &[super::values::Piece<'_>], stand_in: &str) -> String {
 ///
 /// A malformed placeholder is left to the probe, which reports it with the
 /// rest of the target's defects.
+///
+/// `key` is the body key that names the repo file, as [`repo_file`] gives it.
 fn refuse_path_value_in_file(
     target: &Target,
+    key: &str,
     file: &str,
     values: &ResolvedValues,
 ) -> Result<(), Error> {
@@ -754,10 +777,10 @@ fn refuse_path_value_in_file(
     Err(Error::BadValue {
         origin: target.origin.clone(),
         message: format!(
-            "target `{}`: `file` references `{}`{steps}, a `path` value; a `path` value \
-             is always absolute and `file` is relative to the config repo root, so no \
+            "target `{}`: `{key}` references `{}`{steps}, a `path` value; a `path` value \
+             is always absolute and `{key}` is relative to the config repo root, so no \
              answer could make it name a file in the repo; reference a `string` value\
-             {not_built}, with relative text: an absolute text is refused in `file` \
+             {not_built}, with relative text: an absolute text is refused in `{key}` \
              whatever its kind",
             target.path, chain[0].name
         ),
@@ -822,6 +845,7 @@ fn path_value_behind<'a>(
 /// [`refuse_rooted_value_in_file`], once every value is answered.
 fn refuse_path_answer_in_file(
     target: &Target,
+    key: &str,
     file: &str,
     values: &ResolvedValues,
     assignments: &[ValueAssignment],
@@ -850,8 +874,8 @@ fn refuse_path_answer_in_file(
         })
         .collect();
     let problem = format!(
-        "target `{}`: `file` references {steps}, a `path` value; a `path` value is always \
-         absolute and `file` is relative to the config repo root",
+        "target `{}`: `{key}` references {steps}, a `path` value; a `path` value is always \
+         absolute and `{key}` is relative to the config repo root",
         target.path
     );
 
@@ -1047,7 +1071,7 @@ fn for_each_string(target: &Target, visit: &mut impl FnMut(&str)) {
     visit(target.path.as_str());
 
     match &target.body {
-        Body::File(path) => visit(&path.to_string_lossy()),
+        Body::File(path) | Body::Secret(path) => visit(&path.to_string_lossy()),
         Body::Inline(text) => visit(text),
         Body::Generated(_) | Body::Dir => {}
     }
@@ -1110,8 +1134,17 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
             let raw = path.to_string_lossy();
             let confined = super::target::confine_to_repo("file", &sub(&raw)?)
                 .map_err(|message| field(&raw, message))?;
-            refuse_rooted_value_in_file(&raw, values, &sub)?;
+            refuse_rooted_value_in_file("file", &raw, values, &sub)?;
             Body::File(confined)
+        }
+        // The ciphertext is a repo file by the same rule, and an escape through
+        // it would decrypt whatever age file it reached into the target.
+        Body::Secret(path) => {
+            let raw = path.to_string_lossy();
+            let confined = super::target::confine_to_repo("secret", &sub(&raw)?)
+                .map_err(|message| field(&raw, message))?;
+            refuse_rooted_value_in_file("secret", &raw, values, &sub)?;
+            Body::Secret(confined)
         }
         Body::Inline(text) => Body::Inline(sub(text)?),
         other => other.clone(),
@@ -1215,6 +1248,7 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
 /// carried out is still the `{{name}}` written in `file`, whose account inputs
 /// include every answer along that chain.
 fn refuse_rooted_value_in_file(
+    key: &str,
     raw: &str,
     values: &ResolvedValues,
     sub: &impl Fn(&str) -> Result<String, Broken>,
@@ -1231,15 +1265,15 @@ fn refuse_rooted_value_in_file(
         let rooted = chain.last().map_or(name, String::as_str);
         let problem = if chain.len() > 1 {
             format!(
-                "`file` takes `{name}`{through}, and `{rooted}` is {text:?}, which is rooted \
-                 at the filesystem or the home; `file` is relative to the config repo root, \
+                "`{key}` takes `{name}`{through}, and `{rooted}` is {text:?}, which is rooted \
+                 at the filesystem or the home; `{key}` is relative to the config repo root, \
                  so every value in it, and every value those are built from, must be \
                  relative text whatever its kind"
             )
         } else {
             format!(
-                "`file` takes `{name}` as {text:?}, which is rooted at the filesystem or \
-                 the home; `file` is relative to the config repo root, so a value in it \
+                "`{key}` takes `{name}` as {text:?}, which is rooted at the filesystem or \
+                 the home; `{key}` is relative to the config repo root, so a value in it \
                  must be relative text whatever its kind"
             )
         };
@@ -1883,6 +1917,88 @@ mod tests {
             ready(&answered, 0).body,
             Body::File(PathBuf::from("cfg/work/gitconfig"))
         );
+    }
+
+    #[test]
+    fn a_substituted_secret_is_confined_to_the_config_repo_like_a_file() {
+        const LAYER: &str = "[[value]]\n\
+                             name = \"account\"\n\
+                             kind = \"KIND\"\n\
+                             [[target]]\n\
+                             path = \"~/.token\"\n\
+                             secret = \"secrets/{{account}}/token.age\"\n\
+                             mode = \"0600\"\n";
+        let string = LAYER.replace("KIND", "string");
+
+        let climbing = resolved(&string, Some("[values]\naccount = \"../../../../etc\"\n"))
+            .expect("an account's answer blocks its target, not the load");
+        let entry = blocked(&climbing, 0);
+        assert!(
+            entry
+                .hint
+                .contains("`secret` may not climb out of the config repo"),
+            "{}",
+            entry.hint
+        );
+
+        let rooted = resolved(&string, Some("[values]\naccount = \"/home/example\"\n"))
+            .expect("an account's rooted answer blocks its target, not the load");
+        let entry = blocked(&rooted, 0);
+        assert!(
+            entry.hint.contains("`secret` takes `account`"),
+            "{}",
+            entry.hint
+        );
+
+        let ordinary = resolved(&string, Some("[values]\naccount = \"work\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::Secret(PathBuf::from("secrets/work/token.age"))
+        );
+
+        let message = resolved(&LAYER.replace("KIND", "path"), None)
+            .expect_err("a `path` value in `secret` is the layer's defect");
+        assert!(
+            message.contains("`secret` references `account`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_secret_reaching_a_path_value_through_an_answer_is_blocked() {
+        let layer = "[[value]]\n\
+                     name = \"base\"\n\
+                     kind = \"path\"\n\
+                     default = \"~/x\"\n\
+                     [[value]]\n\
+                     name = \"account\"\n\
+                     kind = \"string\"\n\
+                     [[target]]\n\
+                     path = \"~/.token\"\n\
+                     secret = \"secrets/{{account}}/token.age\"\n\
+                     mode = \"0600\"\n";
+        let through = resolved(layer, Some("[values]\naccount = \"{{base}}\"\n"))
+            .expect("an answer reaching a `path` value blocks its target, not the load");
+        let entry = blocked(&through, 0);
+        assert!(
+            entry.hint.contains("`secret` references `account`"),
+            "{}",
+            entry.hint
+        );
+    }
+
+    #[test]
+    fn the_secrets_table_is_carried_through_resolution() {
+        let resolved = resolved(
+            "[secrets]\nrecipients = [\"ssh-ed25519 AAAAC3Nz one\"]\n",
+            Some("[secrets]\nidentity = \"~/.config/age/key.txt\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.secrets.identity_spelling(),
+            "~/.config/age/key.txt"
+        );
+        assert!(resolved.secrets.recipients.is_some());
     }
 
     #[test]
@@ -4820,12 +4936,13 @@ mod tests {
 
         // The chain is there for the committed walk, which owes the load error.
         assert!(
-            refuse_path_value_in_file(&merged.targets[0], "cfg/{{s}}/x", &values).is_err(),
+            refuse_path_value_in_file(&merged.targets[0], "file", "cfg/{{s}}/x", &values).is_err(),
             "the committed walk is the one that reaches this chain"
         );
         assert_eq!(
             refuse_path_answer_in_file(
                 &merged.targets[0],
+                "file",
                 "cfg/{{s}}/x",
                 &values,
                 &merged.value_assignments,

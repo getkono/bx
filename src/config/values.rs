@@ -470,7 +470,7 @@ impl ValueKind {
                 }
             }
             Self::AgeRecipient => {
-                if is_age_recipient(answer) || is_ssh_public_key(answer) {
+                if is_recipient(answer) {
                     Ok(answer.to_string())
                 } else {
                     Err(malformed("be an `age1…` recipient or an ssh public key"))
@@ -520,6 +520,13 @@ fn is_ssh_public_key(text: &str) -> bool {
         && blob
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+/// Whether `text` is something age can encrypt to: an `age1…` recipient or an
+/// ssh public key. The rule an `age-recipient` value is held to, and the one a
+/// `[secrets]` recipient list is.
+pub(crate) fn is_recipient(text: &str) -> bool {
+    is_age_recipient(text) || is_ssh_public_key(text)
 }
 
 /// The bech32 data charset an `age1…` recipient is spelled in.

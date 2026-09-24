@@ -32,6 +32,17 @@
 //! written in place through the locked descriptor, because an atomic write
 //! renames a new inode over the name, and the lock is held on the old one.
 //!
+//! [`journal`] is the durability layer between the two: the write-ahead log and
+//! the session every byte bx writes passes through, which records each write
+//! before it is made and unlinks the log only once the session has ended, so a
+//! run that stops halfway leaves a record of everything it may have touched.
+//! [`recover`] is what a later run does with a log that is still there:
+//! detection and a report in a read-only command, an automatic roll back in a
+//! writing one. Between them they are the second half of Invariant 4, and
+//! [`restore`] is the first: `bx rm`, spending the ledger's record of the
+//! bytes bx displaced to put a file back exactly as it was — or to remove one
+//! bx created, which is not the same as emptying it.
+//!
 //! # How one repo serves many accounts
 //!
 //! A developer with several Linux accounts has several *differences*, not
@@ -62,8 +73,11 @@ pub mod config;
 pub mod detect;
 pub mod env_guard;
 pub mod fs;
+pub mod journal;
 pub mod paths;
+pub mod recover;
 pub mod report;
+pub mod restore;
 pub mod state;
 #[doc(hidden)]
 pub mod testing;

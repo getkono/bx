@@ -130,6 +130,23 @@ pub(crate) fn rename(temp: NamedTempFile, dest: &Path) -> Result<(), tempfile::P
     Ok(())
 }
 
+/// `unlink` the file at `path`.
+///
+/// Not itself a durability call, but the operation a journalled removal guards:
+/// recorded so a test can assert that the frame announcing a removal was synced
+/// before the file went, the way [`rename`] lets it assert that for a write. The
+/// caller makes it durable with a [`Dir`] opened before and synced after.
+///
+/// # Errors
+///
+/// The failed `unlink`, including `NotFound`, which the caller interprets.
+pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
+    std::fs::remove_file(path)?;
+    #[cfg(test)]
+    probe::note(Event::Unlink(path.to_path_buf()));
+    Ok(())
+}
+
 /// One durability call, as the recorder saw it.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +157,8 @@ pub(crate) enum Event {
     OpenDir(PathBuf),
     /// [`Dir::sync`] on this directory.
     SyncDir(PathBuf),
+    /// A successful [`remove_file`].
+    Unlink(PathBuf),
     /// A successful [`rename`].
     Rename {
         /// The temporary file.
@@ -252,6 +271,26 @@ mod tests {
             ],
         );
         assert_eq!(std::fs::read(&dest).expect("read"), b"x");
+    }
+
+    #[test]
+    fn an_unlink_is_recorded_only_when_it_happens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").expect("seed");
+
+        let (result, events) = recording(|| {
+            let removed = remove_file(&file);
+            let again = remove_file(&file);
+            (removed, again)
+        });
+        assert!(result.0.is_ok());
+        assert_eq!(
+            result.1.expect_err("already gone").kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(events, [Event::Unlink(file.clone())]);
+        assert!(!file.exists());
     }
 
     #[test]

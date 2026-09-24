@@ -106,9 +106,11 @@ use std::path::{Path, PathBuf};
 use crate::fs::Mode;
 
 pub use dir::StateDir;
+pub(crate) use dir::move_aside;
 pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use ledger::RestoreRef;
+pub(crate) use ledger::blob_len;
 pub use ledger::{
     Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, Withdrawal,
 };

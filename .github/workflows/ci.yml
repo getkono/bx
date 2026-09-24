@@ -50,6 +50,25 @@ jobs:
       # is on the image already.
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
+      # Some tests run a copy of the suite as another uid, inside a user
+      # namespace `unshare --map-auto --map-root-user` builds, against a
+      # directory set-group-ID to a group that uid is not in. A scenario the
+      # machine cannot build fails the test rather than skipping it
+      # (`journal::tests::cannot_build`), so the runner has to be able to build
+      # it. Three things stand in the way on the stock image: Ubuntu's AppArmor
+      # policy strips every capability from an unprivileged user namespace, so
+      # the `chown` inside it is refused; `--map-auto` needs `newuidmap` and
+      # `newgidmap` from `uidmap`; and it needs a subordinate id range for the
+      # runner's user to map.
+      - name: Allow unprivileged user namespaces with subordinate ids
+        run: |
+          sudo apt-get install -y uidmap
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+          user=$(id -un)
+          for file in /etc/subuid /etc/subgid; do
+            grep -q "^$user:" "$file" 2>/dev/null || echo "$user:100000:65536" | sudo tee -a "$file"
+          done
       - uses: oven-sh/setup-bun@v2
       # uv is pinned, not floated. `Reason::DeclaredRootItself` exists because
       # uv derives its executable directory as `$XDG_DATA_HOME/../bin`, and the
@@ -244,9 +263,18 @@ jobs:
       # Coverage runs the same suite as `check`, so it needs the same programs;
       # without them the differential tests fail here too. The uv pin is the
       # same one, and so is the exact-release-tag ref, for the reasons written
-      # out in `check`.
+      # out in `check`. So are the user-namespace provisions.
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Allow unprivileged user namespaces with subordinate ids
+        run: |
+          sudo apt-get install -y uidmap
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+          user=$(id -un)
+          for file in /etc/subuid /etc/subgid; do
+            grep -q "^$user:" "$file" 2>/dev/null || echo "$user:100000:65536" | sudo tee -a "$file"
+          done
       - uses: oven-sh/setup-bun@v2
       - uses: astral-sh/setup-uv@v10.2.0
         with:

@@ -52,7 +52,11 @@ enum Command {
         yes: bool,
     },
     /// Pull, apply, push
-    Sync,
+    Sync {
+        /// Write without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Set, list, and rotate secrets
     Secret {
         #[command(subcommand)]
@@ -89,6 +93,7 @@ fn main() -> Result<()> {
         Some(Command::Init { set, yes }) => bx::command::init(&env, &set, yes, &mut out)?,
         Some(Command::Plan) => bx::command::plan(&env, &mut out)?,
         Some(Command::Apply { yes }) => bx::command::apply(&env, yes, &mut out)?,
+        Some(Command::Sync { yes }) => bx::command::sync(&env, yes, &mut out)?,
         Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,
         Some(Command::Secret {
             action: SecretAction::List,

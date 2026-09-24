@@ -38,6 +38,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::shell::plugin::PluginDecl;
+use crate::shell::{Assembly, Phase};
+
 use toml_edit::Table;
 
 use super::{Ctx, Error, Origin};
@@ -123,7 +126,8 @@ pub enum Body {
 /// `apply` writes. [`Gen::render`] is that function.
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
-/// ([`super::env`]) and none is named by a config author: a fragment carries
+/// ([`super::env`]), which also carries the `[[plugin]]` entries into the
+/// interactive file, and none is named by a config author: a fragment carries
 /// the variables resolution placed in it, which no `generated = "…"` string
 /// could spell. A generator a config author may name adds its variant here and
 /// its arm in [`parse_generated`] together.
@@ -136,6 +140,10 @@ pub enum Gen {
     /// Sets nothing, so it is not an environment fragment and is not judged as
     /// one; `env_guard`'s tests hold its bytes to carrying no assignment.
     Source(Portable),
+    /// The interactive shell file, assembled phase by phase. Only its `env`
+    /// phase is an environment fragment, and only that phase is judged as
+    /// one; see [`Interactive`].
+    Interactive(Interactive),
 }
 
 impl Gen {
@@ -149,9 +157,99 @@ impl Gen {
         match self {
             Self::Env(fragment) => fragment.render(present),
             Self::Source(fragment) => super::env::source_line(fragment),
+            Self::Interactive(file) => file.render(present),
         }
     }
 }
+
+/// The interactive shell file, `~/.local/share/bx/zshrc.zsh`, rendered through
+/// [`crate::shell::Assembly`] in its fixed phase order.
+///
+/// The interactive `[[env]]` fragment lands in the `env` phase, whole, and is
+/// the one part of the file [`crate::env_guard`] judges; every enabled
+/// `[[plugin]]` lands in the `plugins` phase, or in the `terminal` slot when it
+/// claims it, as the one guarded line [`PluginDecl::line`] renders. No phase
+/// but `env` holds an assignment (Invariant 2).
+///
+/// The fields are private so that every value holds at most one terminal
+/// claimant: [`Interactive::with_plugins`] refuses a second, which is what
+/// lets [`Interactive::render`] never fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interactive {
+    /// The interactive variables, in the fragment `[[env]]` places.
+    env: super::env::Fragment,
+    /// The enabled plugins, in declaration order.
+    plugins: Vec<PluginDecl>,
+}
+
+impl Interactive {
+    /// The file holding `env` and no plugin.
+    #[must_use]
+    pub const fn new(env: super::env::Fragment) -> Self {
+        Self {
+            env,
+            plugins: Vec::new(),
+        }
+    }
+
+    /// The file with `plugins` added, the disabled ones dropped.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`crate::shell::plugin::check_terminal`] returns: a second
+    /// enabled plugin claiming the terminal slot, named with the first.
+    pub fn with_plugins(mut self, plugins: &[PluginDecl]) -> Result<Self, super::Error> {
+        crate::shell::plugin::check_terminal(plugins)?;
+        self.plugins = plugins.iter().filter(|p| p.enabled).cloned().collect();
+        Ok(self)
+    }
+
+    /// The `env` phase's fragment, which the plan judges on its own.
+    #[must_use]
+    pub const fn env(&self) -> &super::env::Fragment {
+        &self.env
+    }
+
+    /// The enabled plugins, in declaration order.
+    #[must_use]
+    pub fn plugins(&self) -> &[PluginDecl] {
+        &self.plugins
+    }
+
+    /// The file's bytes.
+    ///
+    /// The fragment is contributed only when it holds a variable, so a file
+    /// with plugins alone has no `env` phase. The bytes are a function of the
+    /// variables, the plugins and `present`'s answers alone.
+    ///
+    /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
+    /// file is absent returns 1, and a file sourced at startup returns the
+    /// status of its last command, so a file ending on one would stop a shell
+    /// running under `ERR_EXIT` before its prompt — and show every other shell
+    /// a failed status at its first prompt.
+    #[must_use]
+    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+        let mut assembly = Assembly::new();
+        let contributed = if self.env.vars.is_empty() {
+            Ok(())
+        } else {
+            assembly.contribute(Phase::Env, super::env::SECTION, self.env.render(present))
+        }
+        .and_then(|()| crate::shell::plugin::contribute(&mut assembly, &self.plugins));
+        // Only the terminal slot refuses a contribution, and `with_plugins`
+        // admitted at most one claimant.
+        contributed.expect("an `Interactive` holds at most one terminal claimant");
+        let mut out = assembly.render();
+        if !self.plugins.is_empty() {
+            out.push_str(SETTLE);
+        }
+        out
+    }
+}
+
+/// The lines that close an interactive file holding a plugin: a comment, and a
+/// command that sets nothing and returns 0.
+const SETTLE: &str = "\n# bx: done, whichever plugins were found\ntrue\n";
 
 /// Resolve the name a config author wrote as `generated = "…"`.
 ///
@@ -1710,5 +1808,170 @@ mod tests {
             message("[[target]]\npath = 1\nfile = \"f\"\n")
                 .contains("`path` must be a string, found integer")
         );
+    }
+
+    mod interactive {
+        //! The interactive shell file, rendered through the phase assembly.
+
+        use super::super::super::env::{Fragment, Syntax, Var};
+        use super::*;
+        use crate::shell::testing::{installed, run};
+
+        /// The fragment the interactive place holds, with `vars`.
+        fn fragment(vars: Vec<Var>) -> Fragment {
+            Fragment {
+                syntax: Syntax::Zsh,
+                vars,
+                path: Vec::new(),
+            }
+        }
+
+        fn plugin(name: &str, source: &str, terminal: bool, line: usize) -> PluginDecl {
+            PluginDecl {
+                name: name.to_string(),
+                source: source.to_string(),
+                terminal,
+                enabled: true,
+                origin: super::super::super::Origin {
+                    file: PathBuf::from("/repo/bx.toml"),
+                    line,
+                },
+            }
+        }
+
+        fn render(file: &Interactive) -> String {
+            file.render(&|_| true)
+        }
+
+        /// The non-blank lines of `rendered` from `heading` up to the next
+        /// heading or the end.
+        fn phase<'a>(rendered: &'a str, heading: &str) -> Vec<&'a str> {
+            rendered
+                .lines()
+                .skip_while(|line| *line != heading)
+                .skip(1)
+                .take_while(|line| !line.starts_with("# bx phase: "))
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        #[test]
+        fn env_then_plugins_then_the_terminal_slot_whatever_the_declaration_order() {
+            let mut off = plugin("off", "~/off.zsh", false, 4);
+            off.enabled = false;
+            let file = Interactive::new(fragment(vec![Var::always("EDITOR", "nvim")]))
+                .with_plugins(&[
+                    plugin("highlight", "~/h.zsh", true, 1),
+                    plugin("b", "~/b.zsh", false, 2),
+                    off,
+                    plugin("a", "/usr/share/a.zsh", false, 3),
+                ])
+                .expect("one terminal claimant");
+            assert_eq!(file.plugins().len(), 3, "the disabled one is dropped");
+            assert_eq!(file.env().vars.len(), 1);
+            let rendered = render(&file);
+            assert_eq!(
+                rendered,
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: env\n\
+                 # Generated by bx from [[env]]. Edit the config repo, not this file.\n\
+                 export EDITOR=nvim\n\
+                 \n# bx phase: plugins\n\
+                 [[ -r ~/b.zsh ]] && source ~/b.zsh\n\
+                 [[ -r /usr/share/a.zsh ]] && source /usr/share/a.zsh\n\
+                 \n# bx phase: terminal\n\
+                 [[ -r ~/h.zsh ]] && source ~/h.zsh\n\
+                 \n# bx: done, whichever plugins were found\ntrue\n"
+            );
+            assert_eq!(render(&file), rendered, "byte-identical");
+        }
+
+        #[test]
+        fn an_empty_part_emits_no_phase_and_no_plugin_emits_no_closing_line() {
+            let bare = "# Generated by bx. Edit the config repo, not this file.\n";
+            assert_eq!(render(&Interactive::new(fragment(Vec::new()))), bare);
+            let env_only = render(&Interactive::new(fragment(vec![Var::always("A", "1")])));
+            assert!(env_only.ends_with("export A=1\n"), "{env_only}");
+            assert!(!env_only.contains("true"), "{env_only}");
+            let plugins_only = render(
+                &Interactive::new(fragment(Vec::new()))
+                    .with_plugins(&[plugin("p", "~/p.zsh", false, 1)])
+                    .expect("no claimant"),
+            );
+            assert!(!plugins_only.contains("# bx phase: env"), "{plugins_only}");
+            assert!(!plugins_only.contains("[[env]]"), "{plugins_only}");
+            assert!(plugins_only.starts_with(bare), "{plugins_only}");
+        }
+
+        #[test]
+        fn a_second_terminal_claimant_is_refused_naming_both() {
+            let err = Interactive::new(fragment(Vec::new()))
+                .with_plugins(&[
+                    plugin("zsh-syntax-highlighting", "~/a.zsh", true, 3),
+                    plugin("fast-syntax-highlighting", "~/b.zsh", true, 7),
+                ])
+                .expect_err("two claimants")
+                .to_string();
+            assert!(err.starts_with("/repo/bx.toml:7: "), "{err}");
+            assert!(
+                err.contains("plugin `zsh-syntax-highlighting` already claims at /repo/bx.toml:3"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn no_phase_but_env_sets_anything() {
+            // Invariant 2: only the `env` phase is an environment fragment.
+            // Every other line bx writes here is a comment, a blank, a plugin
+            // line or the closing `true`, and none holds an `=`.
+            let file = Interactive::new(fragment(vec![Var::always("EDITOR", "nvim")]))
+                .with_plugins(&[
+                    plugin("t", "~/t.zsh", true, 1),
+                    plugin("p", "/opt/p/p.zsh", false, 2),
+                ])
+                .expect("one claimant");
+            let rendered = render(&file);
+            let env = phase(&rendered, "# bx phase: env");
+            assert_eq!(env.len(), 2, "{rendered}");
+            let rest: Vec<&str> = rendered
+                .lines()
+                .filter(|line| !env.contains(line))
+                .collect();
+            for line in &rest {
+                assert!(!line.contains('='), "{line:?}");
+                assert!(
+                    line.is_empty()
+                        || line.starts_with("# ")
+                        || line.starts_with("[[ -r ")
+                        || *line == "true",
+                    "{line:?}"
+                );
+            }
+
+            // And in zsh: sourcing everything but the `env` phase changes no
+            // parameter and exports nothing, whether or not a plugin's file
+            // is there.
+            let Some(zsh) = installed("zsh") else {
+                return;
+            };
+            let without_env = render(
+                &Interactive::new(fragment(Vec::new()))
+                    .with_plugins(file.plugins())
+                    .expect("one claimant"),
+            );
+            let dump = "__bx_dump() { local n; for n in ${(ok)parameters}; do \
+                        [[ ${parameters[$n]} == *special* ]] || print -r -- \"$n=${(P)n}\"; \
+                        done; print -r -- ---; export; print -r -- ---; }\n";
+            let script = format!("{dump}__bx_dump >/dev/null\n__bx_dump\n{without_env}__bx_dump\n");
+            let got = String::from_utf8(run(&zsh, &["-f"], &script)).expect("utf-8");
+            let parts: Vec<&str> = got.split("---\n").collect();
+            assert_eq!(parts[1], parts[3], "nothing is exported");
+            assert_eq!(parts[0], parts[2], "no parameter changes");
+            // The dump does see an assignment, so the equality means something.
+            let script = format!("{dump}__bx_dump >/dev/null\n__bx_dump\nZ=1\n__bx_dump\n");
+            let got = String::from_utf8(run(&zsh, &["-f"], &script)).expect("utf-8");
+            let parts: Vec<&str> = got.split("---\n").collect();
+            assert_ne!(parts[2], parts[0]);
+        }
     }
 }

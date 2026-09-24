@@ -41,10 +41,13 @@
 //! variables, so a `${NAME}` in one reads a variable the file has already
 //! exported; see [`super::path`].
 //!
-//! Every fragment is an environment fragment in the guard's grammar, and the
-//! plan judges it against the declared roots before it is written. A fragment
-//! for which a declared value has no usable answer is held back on its own —
-//! the other fragments, and every other target, still resolve.
+//! Every fragment but the interactive file is an environment fragment in the
+//! guard's grammar, and the plan judges it against the declared roots before it
+//! is written. The interactive file, `zshrc.zsh`, is assembled from phases, and
+//! the plan judges it by its `env` phase alone: that phase is its one
+//! environment fragment, and every other phase holds lines that set nothing.
+//! A fragment for which a declared value has no usable answer is held back on
+//! its own — the other fragments, and every other target, still resolve.
 
 use std::path::Path;
 

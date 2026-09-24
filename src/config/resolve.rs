@@ -61,10 +61,11 @@ use std::path::Path;
 use super::env::{EnvDecl, Fragment, Place, Syntax, Var};
 use super::merge::Conflict;
 use super::path::PathEntry;
-use super::target::{Attach, Body, Direction, Format, Gen, KeyPath, Target};
+use super::target::{Attach, Body, Direction, Format, Gen, Interactive, KeyPath, Target};
 use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
+use crate::shell::plugin::PluginDecl;
 
 /// A configuration entry that either resolved or could not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +166,8 @@ pub struct Resolved {
 /// references a later value, a `default` that is not of its kind with no
 /// account answer involved, a target field that substitution makes invalid
 /// with no account answer in it, or a `file` that references a `path` value,
-/// answered or not; and for two ready targets that name one file.
+/// answered or not; for two enabled plugins that claim the terminal slot; and
+/// for two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -181,7 +183,12 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    targets.extend(place_envs(&merged.envs, &merged.path, &values)?);
+    targets.extend(place_envs(
+        &merged.envs,
+        &merged.path,
+        &merged.plugins,
+        &values,
+    )?);
 
     refuse_shared_files(&targets)?;
 
@@ -224,15 +231,23 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// substituted, so an entry never holds a fragment back; a variable the
 /// fragment holds back holds its entries back with it.
 ///
+/// The enabled `[[plugin]]` entries land in the `zshrc` fragment, which is
+/// the interactive shell file and is rendered through the phase assembly
+/// ([`Interactive`]), and it is emitted when either an interactive variable or
+/// a plugin is declared. Nothing in a plugin is substituted either, so a
+/// plugin never holds the file back; a variable that holds it back holds its
+/// plugins back with it.
+///
 /// # Errors
 ///
 /// [`Error::BadValue`] for a variable whose value is a repo defect: a
 /// malformed placeholder, a reference to a value no layer declares, or a
 /// committed `default` that puts a character no fragment line can hold into
-/// it.
+/// it; and for a second enabled plugin claiming the terminal slot.
 fn place_envs(
     envs: &[EnvDecl],
     path: &[PathEntry],
+    plugins: &[PluginDecl],
     values: &ResolvedValues,
 ) -> Result<Vec<Resolution<Target>>, Error> {
     let resolved = envs
@@ -247,10 +262,13 @@ fn place_envs(
             .filter(|(decl, _)| decl.kind.places().contains(&place))
             .collect();
         let entries = if place == Place::Zshenv { path } else { &[] };
-        let origin = match (here.first(), entries.first()) {
-            (Some((first, _)), _) => first.origin.clone(),
-            (None, Some(entry)) => entry.origin.clone(),
-            (None, None) => continue,
+        let interactive = if place == Place::Zshrc { plugins } else { &[] };
+        let plugin = interactive.iter().find(|p| p.enabled);
+        let origin = match (here.first(), entries.first(), plugin) {
+            (Some((first, _)), _, _) => first.origin.clone(),
+            (None, Some(entry), _) => entry.origin.clone(),
+            (None, None, Some(plugin)) => plugin.origin.clone(),
+            (None, None, None) => continue,
         };
         let portable = |raw: &str| {
             Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
@@ -274,13 +292,11 @@ fn place_envs(
                     Resolution::Blocked(_) => None,
                 })
                 .collect();
-            Resolution::Ready(fragment_target(
-                place,
-                fragment.clone(),
-                vars,
-                entries.to_vec(),
-                &origin,
-            ))
+            let generator = match fragment_gen(place, vars, entries.to_vec()) {
+                Gen::Interactive(file) => Gen::Interactive(file.with_plugins(interactive)?),
+                other => other,
+            };
+            Resolution::Ready(fragment_target(place, fragment.clone(), generator, &origin))
         } else {
             let (reason, hint) = held_together(&held, values);
             Resolution::Blocked(BlockedEntry {
@@ -303,29 +319,28 @@ fn place_envs(
     Ok(placed)
 }
 
-/// The fragment bx owns whole at `place`, holding `vars` and then `entries`.
-fn fragment_target(
-    place: Place,
-    path: Portable,
-    vars: Vec<Var>,
-    entries: Vec<PathEntry>,
-    origin: &Origin,
-) -> Target {
+/// What produces the fragment at `place`, holding `vars` and then `entries`:
+/// an environment fragment, or at the interactive place the file the phase
+/// assembly renders, with the fragment in its `env` phase and no plugin yet.
+fn fragment_gen(place: Place, vars: Vec<Var>, entries: Vec<PathEntry>) -> Gen {
+    let fragment = Fragment {
+        syntax: place.syntax(),
+        vars,
+        path: entries,
+    };
+    match place {
+        Place::Zshrc => Gen::Interactive(Interactive::new(fragment)),
+        Place::Zshenv | Place::EnvironmentD | Place::Zprofile => Gen::Env(fragment),
+    }
+}
+
+/// The fragment bx owns whole at `place`, produced by `generator`.
+fn fragment_target(place: Place, path: Portable, generator: Gen, origin: &Origin) -> Target {
     let format = match place.syntax() {
         Syntax::EnvironmentD => Format::EnvD,
         Syntax::Zsh => Format::Opaque,
     };
-    placed_target(
-        path,
-        Gen::Env(Fragment {
-            syntax: place.syntax(),
-            vars,
-            path: entries,
-        }),
-        Attach::Own,
-        format,
-        origin,
-    )
+    placed_target(path, generator, Attach::Own, format, origin)
 }
 
 /// A header-only fragment for each place the placement graph no longer puts a
@@ -368,8 +383,7 @@ pub fn vacated_fragments(
                 Resolution::Ready(fragment_target(
                     place,
                     path,
-                    Vec::new(),
-                    Vec::new(),
+                    fragment_gen(place, Vec::new(), Vec::new()),
                     &origin,
                 ))
             })
@@ -1566,11 +1580,11 @@ mod tests {
         let zshrc_fragment = ready(&resolved, 2);
         assert_eq!(
             zshrc_fragment.body,
-            Body::Generated(Gen::Env(Fragment {
+            Body::Generated(Gen::Interactive(Interactive::new(Fragment {
                 syntax: Syntax::Zsh,
                 vars: vec![Var::always("EDITOR", "x")],
                 path: Vec::new(),
-            }))
+            })))
         );
         assert_eq!(zshrc_fragment.format, Format::Opaque);
         // Attributed to the variable that put it there.
@@ -1583,6 +1597,118 @@ mod tests {
         assert_eq!(
             region.body,
             Body::Generated(Gen::Source(zshrc_fragment.path.clone()))
+        );
+    }
+
+    /// One `[[plugin]]` entry, as TOML.
+    fn plugin(name: &str, terminal: bool) -> String {
+        format!(
+            "[[plugin]]\nname = \"{name}\"\nsource = \"~/.zsh/{name}.zsh\"\nterminal = {terminal}\n"
+        )
+    }
+
+    #[test]
+    fn declared_plugins_land_in_the_interactive_file_and_alone_still_place_it() {
+        // Beside an interactive variable: one file, attributed to the variable.
+        let both = resolved(
+            &format!(
+                "{}{}",
+                plugin("p", false),
+                env("EDITOR", "nvim", "interactive")
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(keys(&both), vec!["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]);
+        let file = ready(&both, 0);
+        assert_eq!(file.origin.line, 5, "the variable's line");
+        let Body::Generated(Gen::Interactive(interactive)) = &file.body else {
+            panic!("{:?}", file.body);
+        };
+        assert_eq!(interactive.env().vars, vec![Var::always("EDITOR", "nvim")]);
+        let names: Vec<&str> = interactive
+            .plugins()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["p"]);
+
+        // Alone: the file and its region, attributed to the first enabled plugin.
+        let alone = resolved(
+            &format!(
+                "[[plugin]]\nname = \"off\"\nsource = \"~/off.zsh\"\nenabled = false\n{}",
+                plugin("p", true)
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            keys(&alone),
+            vec!["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
+        );
+        assert_eq!(ready(&alone, 0).origin.line, 5);
+        assert_eq!(ready(&alone, 1).origin.line, 5);
+
+        // Only a switched-off plugin: nothing is placed.
+        let off = resolved(
+            "[[plugin]]\nname = \"off\"\nsource = \"~/off.zsh\"\nenabled = false\n",
+            None,
+        )
+        .unwrap();
+        assert!(off.targets.is_empty());
+    }
+
+    #[test]
+    fn a_held_back_interactive_variable_holds_its_plugins_back_with_it() {
+        let held = resolved(
+            &format!(
+                "{ABC}{}{}",
+                plugin("p", false),
+                env("EDITOR", "{{b}}", "interactive")
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(blocked(&held, 0).key, "~/.local/share/bx/zshrc.zsh");
+        // The region still sources it once it is there.
+        assert_eq!(ready(&held, 1).path.to_string(), "~/.zshrc");
+    }
+
+    #[test]
+    fn resolving_a_configuration_with_two_terminal_claimants_fails() {
+        // `merge` refuses them first; a `Config` built another way is refused
+        // here too, so no rendered file ever holds two.
+        let mut merged = merge(
+            &[layer("bx.toml", LayerKind::Global, &plugin("one", true)).unwrap()],
+            &home(),
+        )
+        .unwrap();
+        let mut second = merged.plugins[0].clone();
+        second.name = "two".to_string();
+        merged.plugins.push(second);
+        let err = resolve(&merged, &home()).expect_err("refused").to_string();
+        assert!(
+            err.contains("plugin `two` claims the terminal slot"),
+            "{err}"
+        );
+        assert!(err.contains("plugin `one` already claims"), "{err}");
+    }
+
+    #[test]
+    fn a_recorded_interactive_file_nothing_places_is_planned_empty() {
+        let ledger = Path::new("/var/home/example/.local/state/bx/ledger");
+        let every = vacated_fragments(&[], |_| true, &home(), ledger);
+        let Some(Resolution::Ready(file)) = every.last() else {
+            panic!("{every:?}");
+        };
+        assert_eq!(file.path.to_string(), "~/.local/share/bx/zshrc.zsh");
+        assert_eq!(
+            file.body,
+            Body::Generated(Gen::Interactive(Interactive::new(Fragment {
+                syntax: Syntax::Zsh,
+                vars: Vec::new(),
+                path: Vec::new(),
+            })))
         );
     }
 

@@ -27,10 +27,10 @@
 //!
 //! A plugin takes no `when` key, unlike `[[env]]`: an unknown key is refused,
 //! so adding one later breaks no configuration written today. The readability
-//! test already gates each plugin on being installed, a `has:TOOL` gate is
-//! decided by the loader wiring this module does not yet have, and a
-//! conditional terminal claimant would need [`check_terminal`] to reason about
-//! which conditions can hold together.
+//! test already gates each plugin on its file being installed, which is the
+//! condition a `has:TOOL` gate would otherwise stand in for, so a `when` would
+//! add nothing a plugin needs; and a conditional terminal claimant would need
+//! [`check_terminal`] to reason about which conditions can hold together.
 
 use std::path::Path;
 

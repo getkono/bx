@@ -1769,6 +1769,37 @@ mod tests {
     }
 
     #[test]
+    fn a_link_whose_prior_text_is_missing_or_corrupt_is_blocked_not_guessed() {
+        for (corrupt, words) in [(false, "missing"), (true, "does not match")] {
+            let home = guarded_home();
+            let state = StateDir::resolve(home.path());
+            let dest = home.child(".tool");
+            std::os::unix::fs::symlink("old", &dest).expect("the prior link");
+            interrupted(
+                &state,
+                home.path(),
+                vec![link_to(home.path(), ".tool", "new")],
+            );
+            let blob = state.restore().join(ContentHash::of(b"old").to_hex());
+            if corrupt {
+                std::fs::write(&blob, "elsewhere").expect("corrupt the snapshot");
+            } else {
+                std::fs::remove_file(&blob).expect("delete the snapshot");
+            }
+
+            let Outcome::Blocked { conflicts } = recover(&state).expect("recover") else {
+                panic!("a link's unreadable prior text blocks recovery ({words})");
+            };
+            assert!(conflicts[0].note.contains(words), "{}", conflicts[0].note);
+            assert_eq!(
+                link_at(&dest).as_deref(),
+                Some(Path::new("new")),
+                "bx relinks nothing rather than guessing the text it displaced"
+            );
+        }
+    }
+
+    #[test]
     fn a_terminated_link_session_is_recorded_as_a_link() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());

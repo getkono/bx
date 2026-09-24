@@ -111,8 +111,10 @@ jobs:
       - name: Build
         run: |
           # The cross container has no git, so export the commit hash here and
-          # forward it via Cross.toml.
-          export BX_BUILD_SHA="$(git rev-parse --short=12 HEAD)"
+          # forward it via Cross.toml. Assign and export separately: `export`
+          # would mask a failing `git rev-parse` and ship an empty hash.
+          BX_BUILD_SHA="$(git rev-parse --short=12 HEAD)"
+          export BX_BUILD_SHA
           cross build --release --locked --target ${{ matrix.target }}
       - name: Package and checksum
         run: |

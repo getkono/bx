@@ -48,12 +48,18 @@
 //! [`crate::env_guard`]. The `activations` and `completions` phases hold a
 //! tool's cached activation output, judged as the next paragraph says. Every
 //! other phase is generated shell content that is not an environment fragment,
-//! and must carry no assignment at all. The scaffolding this module adds — the
-//! header and one comment per phase — sets nothing, and the plugin lines
+//! and the bx-derived content in it must carry no assignment at all. A
+//! declared function's body is a template the user wrote. bx only substitutes
+//! declared values into it and does not judge it, because the invariant
+//! governs what bx itself emits or relocates. The scaffolding this module adds
+//! — the header and one comment per phase — sets nothing, and the plugin lines
 //! [`plugin`] renders only test a file and source it; the tests below establish
 //! both of the bytes actually emitted. The alias lines [`alias`] renders define
 //! an alias and nothing else, and its tests run them in zsh to establish that
-//! too.
+//! too. The `functions` phase [`function`] renders defines functions and
+//! appends to zsh's hook arrays — shell arrays zsh cannot export, which name
+//! what runs at a hook and relocate nothing — and its tests run it in zsh to
+//! establish that those arrays are the only parameters it changes.
 //!
 //! A tool's activation output assigns variables of its own — `MISE_SHELL`,
 //! `STARSHIP_SHELL`, a function's locals, ZLE's `BUFFER` — and none of those
@@ -79,7 +85,55 @@
 
 pub mod activation;
 pub mod alias;
+pub mod function;
 pub mod plugin;
+
+/// Running generated shell text in a real shell, for the submodules' tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
+
+    /// The installed shell `program`, or `None` on a machine excused from
+    /// supplying it. A runner may not excuse itself, as `env_guard`'s
+    /// differential checks rule.
+    pub(crate) fn installed(program: &str) -> Option<PathBuf> {
+        if let crate::detect::Presence::Present { path } = crate::detect::locate_in_env(program) {
+            return Some(path);
+        }
+        let excused = std::env::var_os("BX_TEST_WITHOUT_SHELLS").is_some();
+        assert!(
+            excused && std::env::var_os("CI").is_none(),
+            "{program} is not installed, so the shell checks held against it would assert \
+             nothing — install it, or set BX_TEST_WITHOUT_SHELLS off a runner"
+        );
+        None
+    }
+
+    /// Run `script` in `shell` with `flags` and an empty environment, and
+    /// return what it printed.
+    ///
+    /// The script is a file rather than `-c`, because zsh parses a `-c`
+    /// string whole, before any `alias` in it has run, and a startup file is
+    /// read the way a script file is: each line parsed once the ones before
+    /// it have run.
+    pub(crate) fn run(shell: &Path, flags: &[&str], script: &str) -> Vec<u8> {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let file = scratch.path().join("script");
+        std::fs::write(&file, script).expect("the script is written");
+        let output = std::process::Command::new(shell)
+            .args(flags)
+            .arg(&file)
+            .current_dir(scratch.path())
+            .env_clear()
+            .env("HOME", scratch.path())
+            .env("PATH", "/nonexistent")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("an installed shell runs");
+        assert!(output.status.success(), "{script}: {output:?}");
+        output.stdout
+    }
+}
 
 /// One named section of the generated interactive shell file.
 ///

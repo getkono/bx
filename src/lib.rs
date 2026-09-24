@@ -59,10 +59,13 @@
 //! [`shell`] is the generated interactive shell file's load order: eleven
 //! named phases assembled in one fixed order whatever order their content was
 //! contributed in, the declared plugins sourced only once readable, the
-//! single terminal slot at most one of them may claim, and the declared
+//! single terminal slot at most one of them may claim, the declared
 //! aliases, each body single-quoted so it reaches the alias exactly as
-//! written. Its tool activations run at `plan` time, not at shell start: each
-//! is trusted once two runs agree, cached in the fingerprint store against its
+//! written, and the declared functions, each body substituted from the
+//! declared values and written whether or not the tool it runs is installed,
+//! a hooked one under a name of bx's own so registering it clobbers nothing.
+//! Its tool activations run at `plan` time, not at shell start: each is
+//! trusted once two runs agree, cached in the fingerprint store against its
 //! binary's content, and written only when the environment guard approves
 //! every assignment it makes to a variable that relocates a tool.
 //!

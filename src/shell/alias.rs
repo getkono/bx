@@ -256,6 +256,7 @@ pub fn contribute(assembly: &mut Assembly, aliases: &[AliasDecl], present: &dyn 
 mod tests {
     use super::*;
     use crate::config::parse_str;
+    use crate::shell::testing::{installed, run};
     use std::path::PathBuf;
 
     const FILE: &str = "/repo/bx.toml";
@@ -538,47 +539,6 @@ mod tests {
              if [[ -o interactive ]]; then\n  alias mm='m'\nfi\n"
         ));
         assert!(!first.contains("off"), "{first}");
-    }
-
-    /// The installed shell `program`, or `None` on a machine excused from
-    /// supplying it. A runner may not excuse itself, as `env_guard`'s
-    /// differential checks rule.
-    fn installed(program: &str) -> Option<PathBuf> {
-        if let crate::detect::Presence::Present { path } = crate::detect::locate_in_env(program) {
-            return Some(path);
-        }
-        let excused = std::env::var_os("BX_TEST_WITHOUT_SHELLS").is_some();
-        assert!(
-            excused && std::env::var_os("CI").is_none(),
-            "{program} is not installed, so the alias checks held against it would assert \
-             nothing — install it, or set BX_TEST_WITHOUT_SHELLS off a runner"
-        );
-        None
-    }
-
-    /// Run `script` in `shell` with `flags` and an empty environment, and
-    /// return what it printed.
-    ///
-    /// The script is a file rather than `-c`, because zsh parses a `-c`
-    /// string whole, before any `alias` in it has run, and a startup file is
-    /// read the way a script file is: each line parsed once the ones before
-    /// it have run.
-    fn run(shell: &Path, flags: &[&str], script: &str) -> Vec<u8> {
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let file = scratch.path().join("script");
-        std::fs::write(&file, script).expect("the script is written");
-        let output = std::process::Command::new(shell)
-            .args(flags)
-            .arg(&file)
-            .current_dir(scratch.path())
-            .env_clear()
-            .env("HOME", scratch.path())
-            .env("PATH", "/nonexistent")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("an installed shell runs");
-        assert!(output.status.success(), "{script}: {output:?}");
-        output.stdout
     }
 
     #[test]

@@ -242,7 +242,7 @@ fn uncomparable(value: &str) -> Option<String> {
 ///
 /// A bare name of ASCII letters, digits, `.`, `_`, `+` and `-`, not made only
 /// of dots, or an absolute path of such segments.
-fn unfindable(tool: &str) -> Option<String> {
+pub(crate) fn unfindable(tool: &str) -> Option<String> {
     let segment = |s: &str| {
         !s.is_empty()
             && s.chars().any(|c| c != '.')

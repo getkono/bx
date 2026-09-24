@@ -34,7 +34,7 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::alias;
+use crate::shell::{alias, function};
 use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
@@ -75,6 +75,9 @@ pub struct Config {
     /// in the order each table first appears in the file, and each table's
     /// entries in the order written. See [`crate::shell::alias`].
     pub aliases: Vec<crate::shell::alias::AliasDecl>,
+    /// `[[function]]`'s entries, keyed by `name`, in the order written. See
+    /// [`crate::shell::function`].
+    pub functions: Vec<crate::shell::function::FunctionDecl>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
@@ -427,6 +430,16 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     }
                 }
             }
+            "function" => {
+                for table in entries(root, name, item, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Function, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config
+                            .functions
+                            .push(function::parse_function(table, file, text)?),
+                    }
+                }
+            }
             unknown => {
                 return Err(Error::UnknownSection {
                     origin: section_origin(root, unknown, file, text),
@@ -482,6 +495,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|a| (a.name.as_str(), &a.origin))
             .chain(toggles_in(&config, merge::Section::Alias))
+            .collect(),
+    )?;
+    check_unique(
+        "function",
+        config
+            .functions
+            .iter()
+            .map(|f| (f.name.as_str(), &f.origin))
+            .chain(toggles_in(&config, merge::Section::Function))
             .collect(),
     )?;
 

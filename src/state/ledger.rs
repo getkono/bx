@@ -64,6 +64,15 @@ pub enum Mechanism {
     /// [`Prior::Existed`] names the directory's earlier mode against the empty
     /// blob. [`crate::journal::DIR_BYTES`] is that convention's one spelling.
     Dir,
+    /// bx owns a symlink it made: the link itself, never what it points at.
+    ///
+    /// A link's content is its text, so an entry attached this way records
+    /// the digest of that text as [`LedgerEntry::written`] — see
+    /// [`crate::fs::link::digest`] — at [`crate::fs::Mode::LINK`], and a
+    /// [`Prior::Existed`] names an earlier link's text stored as a blob like
+    /// any file's bytes. Added last, so every entry an earlier bx saved still
+    /// decodes as the variant it was written as.
+    Link,
 }
 
 /// A pointer to the bytes that were at a target before bx wrote it.

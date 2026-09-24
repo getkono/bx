@@ -469,6 +469,21 @@ pub struct Intent {
     /// targets holds.
     #[serde(default)]
     pub dir: bool,
+    /// Whether the destination is a symlink rather than a file.
+    ///
+    /// A link's content is its text, so [`Intent::before`] and
+    /// [`Intent::after`] name it by the digest of that text at
+    /// [`crate::fs::Mode::LINK`], and a `before` that existed is a link whose
+    /// text is stored under `restore/` like a file's bytes. Recovery compares a
+    /// link found there by its text, and puts an earlier one back as a link.
+    /// Never set with [`Intent::dir`]. `false` for every intent a journal
+    /// written before symlink targets holds.
+    ///
+    /// A bx that predates this field reads a link intent as a file's, finds a
+    /// symlink where it expects a file, and blocks the rollback rather than
+    /// acting on it.
+    #[serde(default)]
+    pub link: bool,
 }
 
 impl Intent {
@@ -909,6 +924,9 @@ fn misplaced(intent: &Intent, home: &Path) -> Option<&'static str> {
     let dest = &intent.dest;
     if *dest != intent.target.render(home) {
         return Some("an intent's destination is not where its target renders");
+    }
+    if intent.dir && intent.link {
+        return Some("an intent names its destination both a directory and a link");
     }
     if let Some(temp) = &intent.temp {
         if intent.dir {
@@ -1388,6 +1406,28 @@ pub enum Content {
         /// announced and again immediately before the removal.
         planned: fs::Observed,
     },
+    /// A symlink holding this text, made through [`crate::fs::stage_link`]
+    /// where plan saw nothing or a link. [`Request::mode`] is ignored: a link
+    /// is recorded at [`crate::fs::Mode::LINK`].
+    Link {
+        /// The link's text, exactly as it is to be written.
+        text: PathBuf,
+        /// What plan observed at the destination when it decided on the link.
+        /// The link is staged against it, as [`Content::Bytes`] is.
+        planned: fs::Observed,
+    },
+    /// No symlink any more: the one bx made for a symlink target.
+    ///
+    /// The link is unlinked, never what it points at, and `created_dirs` are
+    /// released as [`Content::Absent`] releases a file's. A destination that
+    /// is not a link is refused.
+    LinkAbsent {
+        /// Directories bx created for the target, deepest first.
+        created_dirs: Vec<PathBuf>,
+        /// What plan observed at the destination when it decided on the
+        /// removal, checked as [`Content::Absent`] checks its own.
+        planned: fs::Observed,
+    },
 }
 
 /// Whether bx owns what the write leaves behind.
@@ -1608,10 +1648,10 @@ impl Session {
         // *drops* what fails it, because there nothing was announced and the
         // directory had to be made to reach the destination at all.
         let claimed: &[PathBuf] = match &content {
-            Content::Bytes { .. } | Content::Dir { .. } => &[],
-            Content::Absent { created_dirs, .. } | Content::DirAbsent { created_dirs, .. } => {
-                created_dirs
-            }
+            Content::Bytes { .. } | Content::Dir { .. } | Content::Link { .. } => &[],
+            Content::Absent { created_dirs, .. }
+            | Content::DirAbsent { created_dirs, .. }
+            | Content::LinkAbsent { created_dirs, .. } => created_dirs,
         };
         if let Err(e) = self.admit(&target, &dest, claimed) {
             self.poisoned = true;
@@ -1625,12 +1665,19 @@ impl Session {
             Content::Absent {
                 created_dirs,
                 planned,
-            } => self.remove(index, target, dest, created_dirs, &planned),
+            } => self.remove(index, target, dest, created_dirs, &planned, false),
             Content::Dir { planned } => self.write_dir(target, dest, &planned, mode, &ownership),
             Content::DirAbsent {
                 created_dirs,
                 planned,
             } => self.remove_dir(index, target, dest, created_dirs, &planned),
+            Content::Link { text, planned } => {
+                self.write_link(target, dest, &text, &planned, &ownership)
+            }
+            Content::LinkAbsent {
+                created_dirs,
+                planned,
+            } => self.remove(index, target, dest, created_dirs, &planned, true),
         };
         if let Err(e) = applied {
             self.poisoned = true;
@@ -1768,20 +1815,7 @@ impl Session {
         // `umask`, and no `chmod`. Made before `stage`, so the directory never
         // exists at `0755` for an instant — a window a descriptor opened
         // inside would outlive. See `r3 round 6` decision R3R6-1.
-        if let Some(shared) = shared_ancestor(&dest, &self.home) {
-            std::fs::create_dir_all(&shared).map_err(|source| fs::Error::Write {
-                path: shared.clone(),
-                source,
-            })?;
-            tracing::debug!(
-                dir = %shared.display(),
-                "made a directory bx shares with every other tool, at the process umask",
-            );
-            #[cfg(test)]
-            if let Some(meddle) = self.before_stage {
-                meddle(&shared);
-            }
-        }
+        self.make_shared_ancestors(&dest)?;
         let staged = fs::stage(&dest, mode, planned, &mut self.created)?;
         let temp = staged.temp_path().to_path_buf();
         self.crash.reached(index, Phase::AfterStage);
@@ -1821,18 +1855,7 @@ impl Session {
         // true statement about the code and a false one about the tests, which
         // constrained it nowhere until the seam above existed (`r3 round 7`,
         // CL1).
-        let mut created_dirs = Vec::with_capacity(filled.created_dirs().len());
-        for dir in filled.created_dirs() {
-            if stray_created_dir(&dest, &self.home, std::slice::from_ref(dir)).is_some() {
-                tracing::debug!(
-                    dir = %dir.display(),
-                    dest = %dest.display(),
-                    "bx made a directory on the way to a destination and claims none of it",
-                );
-                continue;
-            }
-            created_dirs.push(dir.clone());
-        }
+        let created_dirs = self.claimable(&dest, filled.created_dirs());
         // Assembled now, while the writer still holds the prior, and handed to
         // the ledger only once the write has landed. `None` is the restore half
         // of `bx rm`: bx is handing the target back, so there is nothing left for
@@ -1885,6 +1908,7 @@ impl Session {
             mechanism,
             ledger_written,
             dir: false,
+            link: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -1899,6 +1923,56 @@ impl Session {
             .map_err(crate::fs::Unpublished::into_error)?;
         // Only now is there something to own, or to stop owning. Told any
         // earlier, the ledger would describe a write whose publish then failed.
+        self.settle_entry(&target, entry)?;
+        self.crash.reached(index, Phase::AfterPublish);
+
+        self.journal.append(&Record::Done(Done { target }))?;
+        self.crash.reached(index, Phase::AfterDone);
+        Ok(())
+    }
+
+    /// Make the home, and anything above it, that `dest` needs and that is
+    /// not there, at the process `umask`. See [`Session::write`] for why.
+    fn make_shared_ancestors(&self, dest: &Path) -> Result<(), Error> {
+        if let Some(shared) = shared_ancestor(dest, &self.home) {
+            std::fs::create_dir_all(&shared).map_err(|source| fs::Error::Write {
+                path: shared.clone(),
+                source,
+            })?;
+            tracing::debug!(
+                dir = %shared.display(),
+                "made a directory bx shares with every other tool, at the process umask",
+            );
+            #[cfg(test)]
+            if let Some(meddle) = self.before_stage {
+                meddle(&shared);
+            }
+        }
+        Ok(())
+    }
+
+    /// The directories a write made on the way to `dest` that it may claim:
+    /// every one but the home or a directory above it, which is made and left
+    /// unclaimed. See [`Session::write`] for why.
+    fn claimable(&self, dest: &Path, made: &[PathBuf]) -> Vec<PathBuf> {
+        let mut created_dirs = Vec::with_capacity(made.len());
+        for dir in made {
+            if stray_created_dir(dest, &self.home, std::slice::from_ref(dir)).is_some() {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    dest = %dest.display(),
+                    "bx made a directory on the way to a destination and claims none of it",
+                );
+                continue;
+            }
+            created_dirs.push(dir.clone());
+        }
+        created_dirs
+    }
+
+    /// Tell the ledger about a write that has landed: record the entry, or,
+    /// for a write that hands the target back, drop it.
+    fn settle_entry(&mut self, target: &Portable, entry: Option<NewEntry>) -> Result<(), Error> {
         match entry {
             Some(entry) => {
                 self.ledger.record(entry)?;
@@ -1912,7 +1986,7 @@ impl Session {
             // `self.forgotten`, not `self.released`, because this write
             // announced no removal and so prunes nothing.
             None => {
-                if let Some(dropped) = self.ledger.forget(&target) {
+                if let Some(dropped) = self.ledger.forget(target) {
                     self.forgotten.extend(
                         dropped
                             .created_dirs
@@ -1922,6 +1996,84 @@ impl Session {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The link path: stage, record, journal, publish, done — the file path
+    /// with a link in place of a file, and nothing to fill.
+    ///
+    /// Staged against `planned` through [`crate::fs::stage_link`], which
+    /// refuses anything but nothing or a link, and a destination that changed
+    /// since plan. The prior is a link's text, stored in `restore/` before the
+    /// Intent that names it, and the Intent is marked [`Intent::link`], so a
+    /// rollback puts back a link rather than a file holding its text.
+    fn write_link(
+        &mut self,
+        target: Portable,
+        dest: PathBuf,
+        text: &Path,
+        planned: &Observed,
+        ownership: &Ownership,
+    ) -> Result<(), Error> {
+        let index = self.written;
+        // As in `write`: plan's verdict before any directory is made.
+        refuse_unplanned(&dest, planned)?;
+        self.make_shared_ancestors(&dest)?;
+        let staged = fs::stage_link(&dest, text, planned, &mut self.created)?;
+        let temp = staged.temp_path().to_path_buf();
+        self.crash.reached(index, Phase::AfterStage);
+        // A link is complete when it is made: there is no content to fill.
+        self.crash.reached(index, Phase::AfterFill);
+
+        let created_dirs = self.claimable(&dest, staged.created_dirs());
+        let (entry, mechanism) = match ownership {
+            Ownership::Owned(mechanism) => (
+                Some(
+                    NewEntry::new(
+                        target.clone(),
+                        staged.written(),
+                        Mode::LINK,
+                        mechanism.clone(),
+                        link_prior_bytes(staged.prior()),
+                    )
+                    .with_created_dirs(portable_dirs(&created_dirs, &self.home)?),
+                ),
+                Some(mechanism.clone()),
+            ),
+            Ownership::Released => (None, None),
+        };
+        // As in `write`: refused before anything is stored or announced.
+        if let Some(entry) = &entry {
+            self.ledger.check_record(entry)?;
+        }
+        let before = store_link_prior(&self.state, staged.prior())?;
+
+        let ledger_written = self.ledger.get(&target).map(|entry| entry.written);
+        self.journal.append(&Record::Intent(Intent {
+            target: target.clone(),
+            dest,
+            temp: Some(temp),
+            before,
+            after: Written::Present {
+                digest: staged.written(),
+                mode: Mode::LINK,
+            },
+            created_dirs,
+            mechanism,
+            ledger_written,
+            dir: false,
+            link: true,
+        }))?;
+        self.crash.reached(index, Phase::AfterIntent);
+
+        #[cfg(test)]
+        if let Some(meddle) = self.before_publish {
+            meddle(staged.dest());
+        }
+        staged
+            .publish()
+            .map_err(crate::fs::Unpublished::into_error)?;
+        self.settle_entry(&target, entry)?;
         self.crash.reached(index, Phase::AfterPublish);
 
         self.journal.append(&Record::Done(Done { target }))?;
@@ -1941,6 +2093,9 @@ impl Session {
     /// finds a destination holding neither recorded state and leaves it alone.
     /// What stays open is the window between that last look and the `unlink`
     /// call itself.
+    ///
+    /// `link` says the target is a symlink: then only a link is removed, its
+    /// text is the prior stored, and the Intent is marked [`Intent::link`].
     fn remove(
         &mut self,
         index: usize,
@@ -1948,9 +2103,17 @@ impl Session {
         dest: PathBuf,
         created_dirs: Vec<PathBuf>,
         planned: &Observed,
+        link: bool,
     ) -> Result<(), Error> {
         let observed = refuse_unplanned(&dest, planned)?;
-        if !observed.kind.is_writable_destination() {
+        if link && observed.kind != fs::Kind::Symlink {
+            return Err(fs::Error::NotALink {
+                path: dest,
+                kind: observed.kind,
+            }
+            .into());
+        }
+        if !link && !observed.kind.is_writable_destination() {
             return Err(fs::Error::NotAFile {
                 path: dest,
                 kind: observed.kind,
@@ -1960,7 +2123,11 @@ impl Session {
 
         // Same as in `write`: the bytes the removal is about to displace are
         // made durable before the Intent frame that names them.
-        let before = store_prior(&self.state, &observed)?;
+        let before = if link {
+            store_link_prior(&self.state, &observed)?
+        } else {
+            store_prior(&self.state, &observed)?
+        };
 
         self.journal.append(&Record::Intent(Intent {
             target: target.clone(),
@@ -1972,6 +2139,7 @@ impl Session {
             mechanism: None,
             ledger_written: self.ledger.get(&target).map(|entry| entry.written),
             dir: false,
+            link,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -2086,6 +2254,7 @@ impl Session {
             mechanism,
             ledger_written,
             dir: true,
+            link: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -2156,6 +2325,7 @@ impl Session {
             mechanism: None,
             ledger_written: self.ledger.get(&target).map(|entry| entry.written),
             dir: true,
+            link: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -2396,7 +2566,35 @@ impl Crash {
 /// [`Error::Write`] when the snapshot cannot be stored. It is `fsync`ed, along
 /// with the directory entry naming it, before this returns.
 fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
-    let PriorBytes::Bytes { bytes, mode } = observed.prior_bytes() else {
+    store_prior_bytes(state, observed.prior_bytes())
+}
+
+/// [`store_prior`] for a symlink target: the link's text is its bytes.
+///
+/// # Errors
+///
+/// As [`store_prior`].
+fn store_link_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
+    store_prior_bytes(state, link_prior_bytes(observed))
+}
+
+/// What a symlink target displaces, in the shape a ledger entry records: the
+/// link's text at [`Mode::LINK`], or nothing when no link was there.
+fn link_prior_bytes(observed: &Observed) -> PriorBytes {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    match &observed.link {
+        Some(text) => PriorBytes::Bytes {
+            bytes: text.as_os_str().as_bytes().to_vec(),
+            mode: Mode::LINK,
+        },
+        None => PriorBytes::Absent,
+    }
+}
+
+/// Store `prior` under its digest in `restore/`, durably.
+fn store_prior_bytes(state: &StateDir, prior: PriorBytes) -> Result<Prior, Error> {
+    let PriorBytes::Bytes { bytes, mode } = prior else {
         return Ok(Prior::Absent);
     };
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -2836,6 +3034,23 @@ pub(crate) mod tests {
             },
             mode,
             ownership: Ownership::Owned(Mechanism::Own),
+        }
+    }
+
+    /// A request to make `rel` under `home` a symlink holding `text`, owned
+    /// by bx, carrying what is there now as plan's observation.
+    pub(crate) fn link_to(home: &Path, rel: &str, text: &str) -> Request {
+        let (target, dest) = target(home, rel);
+        let planned = fs::observe(&dest).expect("plan's observation");
+        Request {
+            target,
+            dest,
+            content: Content::Link {
+                text: PathBuf::from(text),
+                planned,
+            },
+            mode: Mode::LINK,
+            ownership: Ownership::Owned(Mechanism::Link),
         }
     }
 
@@ -3814,6 +4029,7 @@ pub(crate) mod tests {
                     mechanism: Some(Mechanism::Own),
                     ledger_written: None,
                     dir: false,
+                    link: false,
                 }),
             ],
         );
@@ -3938,6 +4154,7 @@ pub(crate) mod tests {
             mechanism: None,
             ledger_written: None,
             dir: false,
+            link: false,
         };
         let once = vec![
             Record::Begin(Begin {
@@ -4714,6 +4931,7 @@ pub(crate) mod tests {
                     mechanism: None,
                     ledger_written: None,
                     dir: false,
+                    link: false,
                 }),
             ],
         );
@@ -5925,6 +6143,7 @@ pub(crate) mod tests {
             mechanism: Some(Mechanism::Own),
             ledger_written: None,
             dir: false,
+            link: false,
         })
     }
 
@@ -7242,6 +7461,7 @@ pub(crate) mod tests {
             mechanism: Some(Mechanism::Dir),
             ledger_written: None,
             dir: true,
+            link: false,
         };
         assert_eq!(
             misplaced(&intent, home.path()),
@@ -7251,11 +7471,165 @@ pub(crate) mod tests {
             misplaced(
                 &Intent {
                     temp: None,
-                    ..intent
+                    ..intent.clone()
                 },
                 home.path()
             ),
             None
         );
+        assert_eq!(
+            misplaced(
+                &Intent {
+                    temp: None,
+                    link: true,
+                    ..intent
+                },
+                home.path()
+            ),
+            Some("an intent names its destination both a directory and a link")
+        );
+    }
+
+    /// The text at `path` when a symlink is there, following nothing.
+    pub(crate) fn link_at(path: &Path) -> Option<PathBuf> {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|meta| meta.file_type().is_symlink())
+            .map(|_| std::fs::read_link(path).expect("a readable link"))
+    }
+
+    #[test]
+    fn a_link_write_is_journalled_and_recorded_under_its_text() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let request = link_to(home.path(), ".local/bin/tool", "../../src/tool");
+        let portable = request.target.clone();
+        let dest = request.dest.clone();
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session.apply(request).expect("make the link");
+        assert_eq!(
+            link_at(&dest).as_deref(),
+            Some(Path::new("../../src/tool")),
+            "made verbatim, and dangling"
+        );
+        let intent = load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .cloned()
+            .expect("an intent");
+        assert!(intent.link && !intent.dir);
+        assert_eq!(intent.before, Prior::Absent);
+        assert_eq!(
+            intent.after,
+            Written::Present {
+                digest: fs::link::digest(Path::new("../../src/tool")),
+                mode: Mode::LINK,
+            }
+        );
+        // `~/.local` is there already: the state directory is under it.
+        assert_eq!(intent.created_dirs, [home.child(".local/bin")]);
+        session.finish().expect("finish");
+
+        let entry = LedgerView::read(&state, home.path())
+            .expect("ledger")
+            .value
+            .get(&portable)
+            .cloned()
+            .expect("recorded");
+        assert_eq!(entry.mechanism, Mechanism::Link);
+        assert_eq!(entry.written, fs::link::digest(Path::new("../../src/tool")));
+        assert_eq!(entry.mode, Mode::LINK);
+        assert_eq!(entry.prior, Prior::Absent);
+
+        // A retarget stores the text it displaces, and keeps the first prior.
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session
+            .apply(link_to(home.path(), ".local/bin/tool", "/opt/tool"))
+            .expect("retarget");
+        let intent = load(&state.journal())
+            .expect("load")
+            .intents()
+            .next()
+            .cloned()
+            .expect("an intent");
+        let Prior::Existed(reference) = &intent.before else {
+            panic!(
+                "the earlier link is the rollback's prior: {:?}",
+                intent.before
+            );
+        };
+        assert_eq!(
+            reference.digest,
+            fs::link::digest(Path::new("../../src/tool"))
+        );
+        assert_eq!(reference.mode, Mode::LINK);
+        assert_eq!(
+            LedgerView::default()
+                .restore_bytes(&state, reference)
+                .expect("the text is stored"),
+            b"../../src/tool"
+        );
+        session.finish().expect("finish");
+        let entry = LedgerView::read(&state, home.path())
+            .expect("ledger")
+            .value
+            .get(&portable)
+            .cloned()
+            .expect("recorded");
+        assert_eq!(entry.written, fs::link::digest(Path::new("/opt/tool")));
+        assert_eq!(
+            entry.prior,
+            Prior::Absent,
+            "bx made the link; rm removes it"
+        );
+        assert_eq!(link_at(&dest).as_deref(), Some(Path::new("/opt/tool")));
+    }
+
+    #[test]
+    fn a_link_is_never_written_over_a_file_and_a_link_removal_takes_only_a_link() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".tool");
+        plant_file(&dest, "the user's\n", Mode::DEFAULT_FILE);
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let err = session
+            .apply(link_to(home.path(), ".tool", "x"))
+            .expect_err("a file is not replaced by a link");
+        assert!(
+            matches!(err, Error::Write(fs::Error::NotALink { .. })),
+            "{err}"
+        );
+        drop(session);
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's\n");
+        crate::recover::recover(&state).expect("nothing was announced");
+
+        let (target, dest) = target(home.path(), ".tool");
+        let planned = fs::observe(&dest).expect("observe");
+        let mut session =
+            Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
+        let err = session
+            .apply(Request {
+                target,
+                dest: dest.clone(),
+                content: Content::LinkAbsent {
+                    created_dirs: Vec::new(),
+                    planned,
+                },
+                mode: Mode::LINK,
+                ownership: Ownership::Released,
+            })
+            .expect_err("a file is not removed as a link");
+        assert!(
+            matches!(err, Error::Write(fs::Error::NotALink { .. })),
+            "{err}"
+        );
+        drop(session);
+        assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's\n");
     }
 }

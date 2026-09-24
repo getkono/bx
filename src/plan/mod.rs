@@ -688,7 +688,29 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
         let observed = crate::fs::observe(&unfinished.dest)?;
         let written = unfinished.standing == recover::Standing::Written;
         let dir = intent.is_some_and(|intent| intent.dir);
+        let link = intent.is_some_and(|intent| intent.link);
         let (diff, what) = match (written, intent.map(|intent| &intent.before)) {
+            // A link's row shows its text on each side, as `plan` shows a
+            // symlink target's: the link recovery puts back was stored as
+            // its text.
+            (true, Some(state::Prior::Existed(reference))) if link => {
+                let prior = LedgerView::default()
+                    .restore_bytes(&inputs.state, reference)
+                    .ok()
+                    .map(|bytes| {
+                        PathBuf::from(<OsString as std::os::unix::ffi::OsStringExt>::from_vec(
+                            bytes,
+                        ))
+                    });
+                (
+                    prior.map(|prior| Diff::link(observed.link.as_deref(), Some(&prior))),
+                    "rolls back: puts back the link that was there before",
+                )
+            }
+            (true, Some(state::Prior::Absent)) if link => (
+                Some(Diff::link(observed.link.as_deref(), None)),
+                "rolls back: removes the link the session made",
+            ),
             // A directory has no bytes to diff: its row says what recovery
             // does to it, and a mode it puts back is shown as one.
             (true, Some(state::Prior::Existed(reference))) if dir => {
@@ -1724,6 +1746,285 @@ pub(crate) mod tests {
         crate::restore::restore(&state, home.path(), &targets).expect("restore");
 
         assert_eq!(snapshot(home.path(), &OUTSIDE), before);
+    }
+
+    /// One symlink target, as TOML.
+    fn symlink(path: &str, text: &str) -> String {
+        format!("[[target]]\npath = \"{path}\"\nsymlink = \"{text}\"\n")
+    }
+
+    /// The two sides of a row's link diff.
+    fn link(change: &Change) -> (Option<&str>, Option<&str>) {
+        match change.diff.as_ref().map(|diff| &diff.kind) {
+            Some(DiffKind::Link { from, to }) => (from.as_deref(), to.as_deref()),
+            other => panic!("expected a link diff, found {other:?}"),
+        }
+    }
+
+    /// The text of the link at `path`.
+    fn text_of(path: &Path) -> PathBuf {
+        std::fs::read_link(path).expect("a link")
+    }
+
+    #[test]
+    fn a_symlink_and_an_empty_file_are_delivered_and_a_second_plan_is_empty() {
+        let home = guarded_home();
+        let layer = [
+            symlink("~/.local/bin/tool", "../../src/tool/bin/tool"),
+            symlink("~/.toolrc", "~/dotfiles/toolrc"),
+            "[[target]]\npath = \"~/.hushlogin\"\ncontent = \"\"\nmode = \"0600\"\n".to_string(),
+        ]
+        .concat();
+        let inputs = inputs(&home, &layer);
+
+        let planned = plan(&inputs);
+        assert_eq!(planned.actions(), vec![Action::Create; 3]);
+        assert_eq!(
+            link(&planned.changes[0]),
+            (None, Some("../../src/tool/bin/tool"))
+        );
+        let rendered = format!("{}/dotfiles/toolrc", home.path().display());
+        assert_eq!(
+            link(&planned.changes[1]),
+            (None, Some(rendered.as_str())),
+            "a leading `~` is the one thing rendered"
+        );
+        let shown = render(&planned, View::Plan, Palette::PLAIN, home.path());
+        assert!(
+            shown.contains("\n    + symlink ../../src/tool/bin/tool\n"),
+            "{shown}"
+        );
+
+        let applied = apply(&inputs);
+        assert!(applied.executed);
+        assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
+        let tool = home.child(".local/bin/tool");
+        assert_eq!(text_of(&tool), Path::new("../../src/tool/bin/tool"));
+        assert!(!tool.exists(), "made dangling, and never followed");
+        assert_eq!(text_of(&home.child(".toolrc")), Path::new(&rendered));
+        let empty = std::fs::symlink_metadata(home.child(".hushlogin")).expect("a file");
+        assert!(empty.is_file());
+        assert_eq!(empty.len(), 0, "an empty body is a zero-byte file");
+        assert_eq!(empty.permissions().mode() & 0o7777, 0o600);
+
+        let after = plan(&inputs);
+        assert_eq!(after.actions(), vec![Action::Unchanged; 3]);
+        assert_eq!(exit(&after, Mode::Plan), Exit::Converged);
+        let written = snapshot(home.path(), &[".local/state/bx/lock"]);
+        let second = run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve"))
+            .expect("the second apply");
+        assert!(!second.executed);
+        assert_eq!(snapshot(home.path(), &[".local/state/bx/lock"]), written);
+        assert_eq!(text_of(&tool), Path::new("../../src/tool/bin/tool"));
+    }
+
+    #[test]
+    fn a_link_bx_made_is_retargeted_showing_the_old_and_new_text() {
+        let home = guarded_home();
+        apply(&inputs(&home, &symlink("~/.tool", "/opt/one")));
+        let inputs = inputs(&home, &symlink("~/.tool", "/opt/two"));
+
+        let planned = plan(&inputs);
+        assert_eq!(planned.actions(), vec![Action::Modify]);
+        assert_eq!(
+            link(&planned.changes[0]),
+            (Some("/opt/one"), Some("/opt/two"))
+        );
+        let shown = render(&planned, View::Plan, Palette::PLAIN, home.path());
+        assert!(
+            shown.contains("\n    - symlink /opt/one\n    + symlink /opt/two\n"),
+            "{shown}"
+        );
+
+        apply(&inputs);
+        assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/two"));
+        assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+    }
+
+    #[test]
+    fn a_path_bx_did_not_link_is_never_replaced_and_a_link_already_right_is_adopted() {
+        let home = guarded_home();
+        std::os::unix::fs::symlink("elsewhere", home.child(".a")).expect("the user's link");
+        std::os::unix::fs::symlink("/opt/b", home.child(".b")).expect("the user's link");
+        home.write(".c", "mine\n");
+        std::fs::create_dir(home.child(".d")).expect("a directory");
+        let layer = [
+            symlink("~/.a", "/opt/a"),
+            symlink("~/.b", "/opt/b"),
+            symlink("~/.c", "/opt/c"),
+            symlink("~/.d", "/opt/d"),
+            symlink("~/.c/inner", "/opt/inner"),
+        ]
+        .concat();
+        let inputs = inputs(&home, &layer);
+
+        let planned = plan(&inputs);
+        assert_eq!(
+            planned.actions(),
+            vec![
+                Action::Conflict,
+                Action::Unchanged,
+                Action::Conflict,
+                Action::Conflict,
+                Action::Conflict,
+            ]
+        );
+        assert!(
+            planned.changes[4]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("~/.c ")),
+            "an unusable parent is named portably: {:?}",
+            planned.changes[4].note
+        );
+        let note = |at: usize| planned.changes[at].note.clone().unwrap_or_default();
+        assert!(note(0).contains("a symlink bx did not make"), "{}", note(0));
+        assert_eq!(
+            link(&planned.changes[0]),
+            (Some("elsewhere"), Some("/opt/a"))
+        );
+        assert!(note(2).contains("a regular file"), "{}", note(2));
+        assert!(note(3).contains("a directory"), "{}", note(3));
+        assert_eq!(planned.changes[2].diff, None);
+
+        let applied = apply(&inputs);
+        assert!(!applied.executed, "nothing to write");
+        assert_eq!(text_of(&home.child(".a")), Path::new("elsewhere"));
+        assert_eq!(std::fs::read(home.child(".c")).expect("kept"), b"mine\n");
+        assert!(home.child(".d").is_dir());
+        let ledger = LedgerView::read(inputs.state(), home.path())
+            .expect("the ledger")
+            .value;
+        assert!(ledger.is_empty(), "an adopted link is recorded by no write");
+    }
+
+    #[test]
+    fn link_text_that_differs_only_by_normalisation_is_different_text() {
+        // `Path` equality would call each pair equal; the link text is compared
+        // byte for byte, as it is stored exactly as written.
+        let pairs = [
+            ("/opt/x", "/opt/x/"),
+            ("/opt/x/", "/opt/x"),
+            ("a//b", "a/b"),
+            ("a/./b", "a/b"),
+        ];
+        for (made, declared) in pairs {
+            // A link bx made is retargeted to the declared text.
+            let home = guarded_home();
+            apply(&inputs(&home, &symlink("~/.tool", made)));
+            let retarget = inputs(&home, &symlink("~/.tool", declared));
+            let planned = plan(&retarget);
+            assert_eq!(
+                planned.actions(),
+                vec![Action::Modify],
+                "{made} -> {declared}"
+            );
+            assert_eq!(link(&planned.changes[0]), (Some(made), Some(declared)));
+            apply(&retarget);
+            assert_eq!(
+                text_of(&home.child(".tool")).as_os_str(),
+                std::ffi::OsStr::new(declared)
+            );
+            assert_eq!(plan(&retarget).actions(), vec![Action::Unchanged]);
+
+            // A user's link with that text is theirs, not adopted.
+            let home = guarded_home();
+            std::os::unix::fs::symlink(made, home.child(".tool")).expect("the user's link");
+            let theirs = inputs(&home, &symlink("~/.tool", declared));
+            assert_eq!(
+                plan(&theirs).actions(),
+                vec![Action::Conflict],
+                "{made} -> {declared}"
+            );
+            assert!(!apply(&theirs).executed);
+            let os = std::fs::read_link(home.child(".tool")).expect("a link");
+            assert_eq!(os.as_os_str(), std::ffi::OsStr::new(made));
+        }
+    }
+
+    #[test]
+    fn a_link_retargeted_since_bx_made_it_and_a_path_bx_owns_otherwise_are_conflicts() {
+        let home = guarded_home();
+        apply(&inputs(&home, &symlink("~/.tool", "/opt/one")));
+        std::fs::remove_file(home.child(".tool")).expect("unlink");
+        std::os::unix::fs::symlink("/opt/theirs", home.child(".tool")).expect("retarget");
+        own(home.path(), ".f", b"bx\n", Mechanism::Own);
+        std::fs::remove_file(home.child(".f")).expect("the user removes it");
+        let inputs = inputs(
+            &home,
+            &[symlink("~/.tool", "/opt/two"), symlink("~/.f", "/opt/f")].concat(),
+        );
+
+        let planned = plan(&inputs);
+        assert_eq!(planned.actions(), vec![Action::Conflict; 2]);
+        assert_eq!(
+            planned.changes[0].note.as_deref(),
+            Some("retargeted since bx made it")
+        );
+        assert_eq!(
+            planned.changes[1].note.as_deref(),
+            Some("bx attached to this path as the whole file")
+        );
+        assert!(!apply(&inputs).executed);
+        assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/theirs"));
+    }
+
+    #[test]
+    fn an_interrupted_link_is_shown_as_the_link_recovery_puts_back() {
+        let home = guarded_home();
+        apply(&inputs(&home, &symlink("~/.tool", "/opt/one")));
+        let inputs = inputs(
+            &home,
+            &[
+                symlink("~/.tool", "/opt/two"),
+                symlink("~/.new", "/opt/new"),
+            ]
+            .concat(),
+        );
+        let mut session = Session::open(inputs.state(), SessionKind::Apply, home.path(), vec![])
+            .expect("a session");
+        session
+            .apply(crate::journal::tests::link_to(
+                home.path(),
+                ".tool",
+                "/opt/two",
+            ))
+            .expect("retarget");
+        session
+            .apply(crate::journal::tests::link_to(
+                home.path(),
+                ".new",
+                "/opt/new",
+            ))
+            .expect("create");
+        drop(session);
+
+        let report = plan(&inputs);
+        let row = |target: &str| {
+            report
+                .changes
+                .iter()
+                .find(|change| change.target == target)
+                .expect("a row")
+        };
+        assert_eq!(row("~/.tool").action, Action::Modify);
+        assert_eq!(link(row("~/.tool")), (Some("/opt/two"), Some("/opt/one")));
+        assert_eq!(
+            row("~/.tool").note.as_deref(),
+            Some("rolls back: puts back the link that was there before")
+        );
+        assert_eq!(link(row("~/.new")), (Some("/opt/new"), None));
+        assert_eq!(
+            row("~/.new").note.as_deref(),
+            Some("rolls back: removes the link the session made")
+        );
+
+        apply(&inputs);
+        assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/one"));
+        assert!(std::fs::symlink_metadata(home.child(".new")).is_err());
+        apply(&inputs);
+        assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/two"));
+        assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged; 2]);
     }
 
     /// The home the crash child applies in. Passed per command.

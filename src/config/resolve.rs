@@ -59,6 +59,7 @@
 use std::path::Path;
 
 use super::env::{EnvDecl, Fragment, Place, Syntax, Var};
+use super::history::History;
 use super::merge::Conflict;
 use super::path::PathEntry;
 use super::target::{Attach, Body, Direction, Format, Gen, Interactive, KeyPath, Target};
@@ -194,6 +195,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         &merged.envs,
         &merged.path,
         &merged.plugins,
+        &merged.history,
         &merged.aliases,
         &merged.functions,
         &merged.sources,
@@ -219,7 +221,7 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
     match body {
         Body::File(path) => Some(("file", path.to_string_lossy())),
         Body::Secret(path) => Some(("secret", path.to_string_lossy())),
-        Body::Inline(_) | Body::Generated(_) | Body::Dir => None,
+        Body::Inline(_) | Body::Generated(_) | Body::Symlink(_) | Body::Dir => None,
     }
 }
 
@@ -247,6 +249,11 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// a plugin is declared. Nothing in a plugin is substituted either, so a
 /// plugin never holds the file back; a variable that holds it back holds its
 /// plugins back with it.
+///
+/// The `[history]` declaration lands in the same file's `options` phase, in
+/// zsh's names, and a history that says anything zsh reads places the file on
+/// its own too. It holds no placeholder either, so it never holds the file
+/// back, and a variable that does holds the history back with it.
 ///
 /// The enabled `[aliases]` and `[[alias]]` entries land in that file's
 /// `aliases` phase, and an enabled alias places the file on its own as a
@@ -280,11 +287,18 @@ fn place_envs(
     envs: &[EnvDecl],
     path: &[PathEntry],
     plugins: &[PluginDecl],
+    history: &History,
     aliases: &[AliasDecl],
     functions: &[FunctionDecl],
     sources: &[SourceDecl],
     values: &ResolvedValues,
 ) -> Result<Vec<Resolution<Target>>, Error> {
+    // The history's origin, when it says anything zsh reads: what places the
+    // interactive file when nothing else does.
+    let zsh_history = history
+        .origin
+        .as_ref()
+        .filter(|_| !history.render_zsh().is_empty());
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
@@ -307,6 +321,7 @@ fn place_envs(
         let plugin = interactive.iter().find(|p| p.enabled);
         let alias = declared.iter().find(|a| a.enabled);
         let function = defined.iter().find(|f| f.enabled);
+        let history_origin = zsh_history.filter(|_| place == Place::Zshrc);
         let source = optional.iter().find(|s| s.enabled);
         let origin = match (
             here.first(),
@@ -314,15 +329,17 @@ fn place_envs(
             plugin,
             alias,
             function,
+            history_origin,
             source,
         ) {
             (Some((first, _)), ..) => first.origin.clone(),
             (None, Some(entry), ..) => entry.origin.clone(),
             (None, None, Some(plugin), ..) => plugin.origin.clone(),
             (None, None, None, Some(alias), ..) => alias.origin.clone(),
-            (None, None, None, None, Some(function), _) => function.origin.clone(),
-            (None, None, None, None, None, Some(source)) => source.origin.clone(),
-            (None, None, None, None, None, None) => continue,
+            (None, None, None, None, Some(function), ..) => function.origin.clone(),
+            (None, None, None, None, None, Some(history), _) => history.clone(),
+            (None, None, None, None, None, None, Some(source)) => source.origin.clone(),
+            (None, None, None, None, None, None, None) => continue,
         };
         let portable = |raw: &str| {
             Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
@@ -349,6 +366,7 @@ fn place_envs(
             let generator = match fragment_gen(place, vars, entries.to_vec()) {
                 Gen::Interactive(file) => Gen::Interactive(
                     file.with_plugins(interactive)?
+                        .with_history(history.clone())
                         .with_aliases(declared)
                         .with_functions(bodies.clone())
                         .with_sources(sourced.clone()),
@@ -1226,7 +1244,7 @@ fn for_each_string(target: &Target, visit: &mut impl FnMut(&str)) {
 
     match &target.body {
         Body::File(path) | Body::Secret(path) => visit(&path.to_string_lossy()),
-        Body::Inline(text) => visit(text),
+        Body::Inline(text) | Body::Symlink(text) => visit(text),
         Body::Generated(_) | Body::Dir => {}
     }
 
@@ -1301,6 +1319,13 @@ fn substituted(target: &Target, values: &ResolvedValues) -> Result<Target, Broke
             Body::Secret(confined)
         }
         Body::Inline(text) => Body::Inline(sub(text)?),
+        // Through the parser's own rule, as a `file` is: an answer can empty
+        // the text, or put a NUL or a `~name` at its start.
+        Body::Symlink(text) => {
+            let linked = sub(text)?;
+            super::target::check_link_text(&linked).map_err(|message| field(text, message))?;
+            Body::Symlink(linked)
+        }
         other => other.clone(),
     };
 
@@ -2036,6 +2061,47 @@ mod tests {
             ready(&ordinary, 0).body,
             Body::File(PathBuf::from("cfg/work/gitconfig")),
             "the case this spelling exists for still resolves"
+        );
+    }
+
+    #[test]
+    fn a_symlink_text_is_substituted_and_checked_again() {
+        const LAYER: &str = "[[value]]\n\
+                             name = \"tool\"\n\
+                             kind = \"string\"\n\
+                             [[target]]\n\
+                             path = \"~/.local/bin/tool\"\n\
+                             symlink = \"{{tool}}/bin/tool\"\n";
+
+        // An absolute answer is a link to an absolute path: a link's text is
+        // not confined to anything, and bx never follows it.
+        let ordinary = resolved(LAYER, Some("[values]\ntool = \"/opt/tool\"\n")).unwrap();
+        assert_eq!(
+            ready(&ordinary, 0).body,
+            Body::Symlink("/opt/tool/bin/tool".to_string())
+        );
+        let home = resolved(LAYER, Some("[values]\ntool = \"~/src/tool\"\n")).unwrap();
+        assert_eq!(
+            ready(&home, 0).body,
+            Body::Symlink("~/src/tool/bin/tool".to_string()),
+            "stored as written; the home is rendered where the link is made"
+        );
+
+        // An answer that makes the text one no link can hold blocks the
+        // target, naming the answer.
+        let other = resolved(LAYER, Some("[values]\ntool = \"~other\"\n"))
+            .expect("an answer blocks its target, not the load");
+        let entry = blocked(&other, 0);
+        assert_eq!(
+            entry.reason,
+            BlockReason::InvalidValue {
+                names: vec!["tool".to_string()]
+            }
+        );
+        assert!(
+            entry.hint.contains("another account's home"),
+            "{}",
+            entry.hint
         );
     }
 

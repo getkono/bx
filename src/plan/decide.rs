@@ -354,6 +354,8 @@ enum Made {
     Region(Vec<u8>, char),
     /// A directory, created or set to the op's mode.
     Dir,
+    /// A symlink holding this text, made or retargeted.
+    Link(PathBuf),
 }
 
 impl Op {
@@ -388,6 +390,13 @@ impl Op {
                     planned: self.planned,
                 },
                 Mechanism::Dir,
+            ),
+            Made::Link(text) => (
+                Content::Link {
+                    text,
+                    planned: self.planned,
+                },
+                Mechanism::Link,
             ),
         };
         Request {
@@ -441,6 +450,7 @@ pub(super) fn decide(
     let bytes = match wanted(target, ctx)? {
         Wanted::Bytes(bytes) => bytes,
         Wanted::Dir => return decide_dir(target, ctx, row),
+        Wanted::Link(text) => return decide_link(target, text, ctx, row),
         Wanted::Blocked(note) => return Ok((row(Action::Blocked, None, Some(note)), None)),
     };
 
@@ -739,6 +749,124 @@ fn dir_ownership(
     }
 }
 
+/// Decide a symlink target: make the link, retarget one bx made, leave it, or
+/// refuse.
+///
+/// A link is compared by its text alone, read with `readlink` and never
+/// resolved, so whether anything is at the far end changes nothing: a
+/// dangling link is created and kept like any other. What is at the
+/// destination decides the rest:
+///
+/// * nothing is a create, and a link already holding the text is unchanged —
+///   adopted as it stands, with nothing written or recorded, as a file already
+///   holding a file target's bytes is;
+/// * a link holding other text is a modify only when bx made it and it still
+///   holds what bx left there, settled by [`link_ownership`];
+/// * a regular file, a directory or anything else is never replaced by a link.
+///
+/// A modify is shown as the old and new text, never as a content diff.
+fn decide_link(
+    target: &Target,
+    text: PathBuf,
+    ctx: &Ctx<'_>,
+    row: impl Fn(Action, Option<Diff>, Option<String>) -> Change,
+) -> Result<(Change, Option<Op>), Error> {
+    let dest = target.path.render(ctx.home);
+    let observed = fs::observe(&dest)?;
+    let (action, note) = match (
+        observed.parent.as_ref().and_then(|p| p.unusable()),
+        observed.kind,
+    ) {
+        (Some(reason), _) => {
+            let parent = observed.parent.as_ref().map_or(dest.as_path(), |p| &p.path);
+            (
+                Action::Conflict,
+                Some(portable_reason(parent, reason, ctx.home)),
+            )
+        }
+        (None, Kind::Absent) => (Action::Create, None),
+        // Byte for byte: `Path` equality compares normalised components, so
+        // `/opt/x/` would equal `/opt/x` and a retarget that changes how the
+        // link resolves would never be delivered.
+        (None, Kind::Symlink)
+            if observed.link.as_deref().map(Path::as_os_str) == Some(text.as_os_str()) =>
+        {
+            (Action::Unchanged, None)
+        }
+        (None, Kind::Symlink) => (Action::Modify, None),
+        (None, Kind::File) => (
+            Action::Conflict,
+            Some("a regular file, where the target declares a symlink".to_string()),
+        ),
+        (None, Kind::Dir) => (
+            Action::Conflict,
+            Some("a directory, where the target declares a symlink".to_string()),
+        ),
+        (None, Kind::Other) => (Action::Conflict, Some("not a symlink".to_string())),
+    };
+    let (action, note) = link_ownership(action, &observed, ctx.ledger.get(&target.path), note);
+    // Making a link writes an entry in its parent, as a file's write does.
+    let (action, note) = match (
+        action.is_pending(),
+        locked_parent(&observed, ctx.home, ctx.declared, Write::File),
+    ) {
+        (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
+        _ => (action, note),
+    };
+    // A link on either side has text to show; anything else is explained by
+    // the note alone.
+    let diff = match action {
+        Action::Create | Action::Modify => Some(Diff::link(observed.link.as_deref(), Some(&text))),
+        Action::Conflict if observed.kind == Kind::Symlink => {
+            Some(Diff::link(observed.link.as_deref(), Some(&text)))
+        }
+        Action::Conflict | Action::Unchanged | Action::Blocked => None,
+    };
+    let note = match action {
+        Action::Create => join([created_dirs(&observed, ctx.home, ctx.declared), note]),
+        _ => note,
+    };
+    let change = row(action, diff, note);
+    let op = action.is_pending().then(|| Op {
+        target: target.path.clone(),
+        dest,
+        made: Made::Link(text),
+        planned: observed,
+        mode: Mode::LINK,
+    });
+    Ok((change, op))
+}
+
+/// Settle what [`decide_link`] found against what the ledger says bx owns.
+///
+/// Only a link bx made, still holding the text bx left in it, is retargeted:
+/// a link bx did not make is the user's, and one bx made that holds other text
+/// now was retargeted by somebody else, whose change a write would undo. A
+/// path the ledger says bx attached to some other way is refused as well.
+fn link_ownership(
+    action: Action,
+    observed: &Observed,
+    entry: Option<&LedgerEntry>,
+    note: Option<String>,
+) -> (Action, Option<String>) {
+    let conflict = |why: String| (Action::Conflict, join([Some(why), note.clone()]));
+    match (action, entry) {
+        (Action::Create | Action::Modify, Some(entry)) if entry.mechanism != Mechanism::Link => {
+            conflict(format!(
+                "bx attached to this path as {}",
+                attached_as(&entry.mechanism)
+            ))
+        }
+        (Action::Modify, None) => {
+            conflict("a symlink bx did not make; bx will not retarget a link you created".into())
+        }
+        (Action::Modify, Some(entry)) if observed.link_digest() != Some(entry.written) => {
+            conflict("retargeted since bx made it".to_string())
+        }
+        _ => (action, note),
+    }
+}
+
 /// The parent note a file gets when its parent is a declared directory: the
 /// declared mode is the one the file will sit in, whatever is on disk now.
 ///
@@ -804,6 +932,8 @@ enum Wanted {
     Bytes(Vec<u8>),
     /// A directory, which has none.
     Dir,
+    /// A symlink holding this text, already rendered against the home.
+    Link(PathBuf),
     /// The note a blocked row carries.
     Blocked(String),
 }
@@ -849,6 +979,13 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
         // A declared directory mode reaches disk before any file beneath it
         // is written, which [`locked_parent`] reads as a declaration.
         Body::Dir => return Ok(Wanted::Dir),
+        // The text as the link will hold it: only a leading `~` is rendered,
+        // and nothing is resolved.
+        Body::Symlink(text) => {
+            return Ok(Wanted::Link(crate::config::target::link_text(
+                text, ctx.home,
+            )));
+        }
     };
     Ok(Wanted::Bytes(bytes))
 }
@@ -929,10 +1066,30 @@ fn guard_generated(
             let before = content
                 .find(&env)
                 .map_or(0, |at| content[..at].matches('\n').count());
-            guard_fragment_after(&env, roots, before)
+            join([
+                guard_fragment_after(&env, roots, before),
+                guard_history_file(file.history().zsh_file.as_ref(), roots),
+            ])
         }
         Gen::Source(_) => None,
     }
+}
+
+/// Judge a declared zsh history file against Invariant 2: the one path the
+/// interactive file's `options` phase names.
+///
+/// zsh keeps no history file unless one is named, so naming one moves nothing
+/// and needs no root; but zsh writes every command line typed into it, so it
+/// may not lie inside a directory bx owns, nor inside the config repo, where
+/// it would be committed. Rendered against the set's home, the same home
+/// `${HOME}` is at shell start.
+fn guard_history_file(file: Option<&Portable>, roots: &RootSet) -> Option<String> {
+    let file = file?;
+    let path = roots
+        .home()
+        .map_or_else(|| PathBuf::from(file.as_str()), |home| file.render(home));
+    env_guard::refuses_bx_location(&path, roots)
+        .map(|reason| format!("[history] zsh file {file} {reason}"))
 }
 
 /// Judge a generated environment fragment against Invariant 2.
@@ -1007,6 +1164,7 @@ const fn attached_as(mechanism: &Mechanism) -> &'static str {
         Mechanism::Region { .. } => "a managed region",
         Mechanism::Include { .. } => "an include line",
         Mechanism::Dir => "a directory",
+        Mechanism::Link => "a symlink",
     }
 }
 
@@ -1436,6 +1594,41 @@ mod tests {
         assert_eq!(row_for(&plan_of(&inputs), "~/.d/f").action, Action::Create);
         assert!(apply_of(&inputs).executed);
         assert_eq!(mode_on_disk(control.path(), ".d"), Some(Mode::DEFAULT_DIR));
+    }
+
+    #[test]
+    fn a_symlink_whose_parent_denies_its_owner_write_or_search_is_a_conflict() {
+        // Making a link writes an entry in its parent, so `decide_link` asks
+        // `locked_parent` as a file's write does: one parent on disk that
+        // denies write, and one declared at a mode that denies search.
+        let link = |path: &str| format!("[[target]]\npath = \"{path}\"\nsymlink = \"/opt/x\"\n");
+        let home = guarded_home();
+        let inputs = crate::plan::tests::inputs(&home, &link("~/locked/tool"));
+        let _unlock = locked_dir_at(home.path(), "locked", 0o500);
+
+        let row = row_for(&plan_of(&inputs), "~/locked/tool").clone();
+        assert_eq!(row.action, Action::Conflict, "{row:?}");
+        assert_eq!(
+            row.note.as_deref(),
+            Some(
+                "~/locked is 0500 on disk, which denies its owner write, so apply could not \
+                 write a file inside it"
+            )
+        );
+        assert!(!apply_of(&inputs).executed, "apply wrote");
+        assert!(std::fs::symlink_metadata(home.child("locked/tool")).is_err());
+
+        let home = guarded_home();
+        let inputs =
+            crate::plan::tests::inputs(&home, &a_directory_target("0600", &link("~/.d/tool")));
+        let row = row_for(&plan_of(&inputs), "~/.d/tool").clone();
+        assert_eq!(row.action, Action::Conflict, "{row:?}");
+        assert!(
+            row.note
+                .as_deref()
+                .is_some_and(|note| note.contains("denies its owner search")),
+            "{row:?}"
+        );
     }
 
     #[test]
@@ -1888,6 +2081,7 @@ mod tests {
             kind,
             mode: Some(Mode::DEFAULT_DIR),
             bytes: None,
+            link: None,
             parent: None,
             stamp: None,
         };
@@ -2409,6 +2603,117 @@ mod tests {
             crate::restore::restore(&state, home.path(), &targets).expect("rm");
             assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
             assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+        }
+
+        /// The source configuration's history and shell options.
+        const HISTORY: &str = "[history]\nsize = 10000\nduplicates = \"all\"\nshare = true\n\
+             [history.file]\nzsh = \"~/.zsh_history\"\n\
+             [shell-options]\nhistappend = true\ncheckwinsize = true\n";
+
+        #[test]
+        fn declared_history_reaches_the_interactive_file_twice_alike_and_rm_restores_it() {
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            let first = apply(&home, HISTORY);
+            assert_eq!(
+                rows(&first),
+                vec![
+                    ("~/.local/share/bx/zshrc.zsh", Action::Create),
+                    ("~/.zshrc", Action::Modify),
+                ]
+            );
+            let written = read(&home, ".local/share/bx/zshrc.zsh");
+            assert_eq!(
+                written,
+                format!(
+                    "{}\n# bx phase: options\n\
+                     HISTFILE=\"${{HOME}}/.zsh_history\"\n\
+                     HISTSIZE=10000\nSAVEHIST=10000\n\
+                     typeset -g +x HISTFILE HISTSIZE SAVEHIST\n\
+                     setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n",
+                    interactive("")
+                )
+            );
+            // The interactive file, which every interactive zsh sources —
+            // not the login-only one, which bx does not write here at all.
+            assert!(!home.child(".local/share/bx/zprofile.zsh").exists());
+            assert!(!home.child(".zprofile").exists());
+            // bash's option is bash's alone, and reaches no zsh file.
+            assert!(!written.contains("histappend"), "{written}");
+
+            // Idempotent: an empty second plan, and nothing rewritten.
+            let second = plan(&home, HISTORY);
+            assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&second)
+            );
+            assert!(!apply(&home, HISTORY).executed);
+            assert_eq!(read(&home, ".local/share/bx/zshrc.zsh"), written);
+
+            // Reversible: `rm` puts back the bytes each file held before bx.
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
+                .iter()
+                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+                .collect();
+            crate::restore::restore(&state, home.path(), &targets).expect("rm");
+            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
+            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+        }
+
+        #[test]
+        fn declaring_no_history_zsh_reads_places_nothing() {
+            let home = guarded_home();
+            for layer in [
+                "[history]\n[shell-options]\n",
+                "[history.file]\nbash = \"~/.bash_history\"\n[shell-options]\nhistappend = true\n",
+            ] {
+                assert_eq!(rows(&plan(&home, layer)), vec![], "{layer}");
+            }
+        }
+
+        #[test]
+        fn a_zsh_history_file_bx_owns_or_would_commit_blocks_the_file() {
+            let home = guarded_home();
+            for (file, reason) in [
+                (
+                    "~/.local/state/bx/history",
+                    "points inside a directory bx owns",
+                ),
+                (
+                    "~/.local/share/bx/history",
+                    "points inside a directory bx owns",
+                ),
+                ("~/.config/bx/history", "points inside bx's config repo"),
+            ] {
+                let layer = format!("[history.file]\nzsh = \"{file}\"\n");
+                let report = plan(&home, &layer);
+                let row = row(&report, "~/.local/share/bx/zshrc.zsh");
+                assert_eq!(row.action, Action::Blocked, "{file}");
+                let note = row.note.as_deref().expect("a note");
+                assert!(
+                    note.contains(&format!("[history] zsh file {file} {reason}")),
+                    "{note}"
+                );
+            }
+            // Anywhere else in the home, or outside it, is the user's choice.
+            for file in [
+                "~/.zsh_history",
+                "~/.local/state/zsh/history",
+                "/srv/history",
+            ] {
+                let layer = format!("[history.file]\nzsh = \"{file}\"\n");
+                let report = plan(&home, &layer);
+                assert_eq!(
+                    row(&report, "~/.local/share/bx/zshrc.zsh").action,
+                    Action::Create,
+                    "{file}"
+                );
+            }
         }
 
         #[test]

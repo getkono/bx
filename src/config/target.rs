@@ -9,9 +9,11 @@
 //! content    = "…"                              # body, verbatim literal  ) exactly
 //! generated  = "shell-init"                     # body, named generator   ) one of
 //! secret     = "secrets/npmrc.age"              # body, age ciphertext    )
+//! symlink    = "~/src/tool/bin/tool"            # the target is a symlink   )
 //! dir        = true                             # the target is a directory )
 //! mode       = "0600"                           # optional octal *string*;
-//!                                               #   required, and private, for a secret
+//!                                               #   required, and private, for a secret;
+//!                                               #   refused for a symlink
 //! attach     = "own"                            # own | region | include; default own
 //! comment    = "#"                              # required iff attach = "region"
 //! include    = "Include ~/.ssh/config.d/*.conf" # required iff attach = "include"
@@ -46,6 +48,7 @@ use crate::shell::{Assembly, Phase};
 
 use toml_edit::Table;
 
+use super::history::History;
 use super::resolve::{BlockedEntry, Resolution};
 use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
@@ -54,12 +57,13 @@ use crate::paths::Portable;
 pub(crate) const SECTION: &str = "[[target]]";
 
 /// Every key a `[[target]]` entry may carry.
-const KEYS: [&str; 16] = [
+const KEYS: [&str; 17] = [
     "path",
     "file",
     "content",
     "generated",
     "secret",
+    "symlink",
     "dir",
     "mode",
     "attach",
@@ -74,7 +78,7 @@ const KEYS: [&str; 16] = [
 ];
 
 /// The keys that declare a body. Exactly one, except for an `include` target.
-const BODY_KEYS: [&str; 5] = ["file", "content", "generated", "secret", "dir"];
+const BODY_KEYS: [&str; 6] = ["file", "content", "generated", "secret", "symlink", "dir"];
 
 /// One path in the user's environment that bx has something to say about.
 ///
@@ -111,15 +115,75 @@ pub struct Target {
 pub enum Body {
     /// A file in the config repo, named repo-relative.
     File(PathBuf),
-    /// A literal written in the config file itself.
+    /// A literal written in the config file itself. The empty string is a
+    /// body like any other: a zero-byte file bx delivers and keeps.
     Inline(String),
     /// Produced by a named generator.
     Generated(Gen),
     /// An age-encrypted file in the config repo, named repo-relative, whose
     /// plaintext is the content. Decrypted in-process by [`crate::secret`].
     Secret(PathBuf),
+    /// The target is a symbolic link holding this text, as written.
+    ///
+    /// The text is what the link says, never a path bx resolves: a relative
+    /// one stays relative to the link's own directory, and bx neither follows
+    /// it nor asks whether anything is there, so a dangling link is created
+    /// like any other. The one rendering it gets is a leading `~`, which
+    /// becomes the home — see [`link_text`] — and a `{{name}}` in it is
+    /// substituted like any other string field.
+    ///
+    /// A link has no mode, no format and no attachment but its own: the
+    /// parser refuses a `mode`, a `format` other than `opaque` and an
+    /// `attach` other than `own` beside it.
+    Symlink(String),
     /// The target is a directory: it has a mode and no content.
     Dir,
+}
+
+/// Why the text of a `symlink` body cannot be a link's, if it cannot.
+///
+/// Empty text is no link at all, and a NUL cannot be in one: `symlink(2)`
+/// takes a C string. A `~` is rendered as the home only as the whole text or
+/// as `~/…`; a `~name` would name another account's home, which bx renders
+/// no path against, so it is refused rather than written as a relative link
+/// named `~name`.
+///
+/// Two callers, like [`confine_to_repo`]: the parser, on the text as written,
+/// and [`super::resolve`], on the text a substitution produced.
+pub(crate) fn check_link_text(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("`symlink` is the text of the link bx makes, so it may not be empty".into());
+    }
+    if text.contains('\0') {
+        return Err(format!(
+            "`symlink` may not hold a NUL character, which no link can; got {text:?}"
+        ));
+    }
+    if text.starts_with('~') && text != "~" && !text.starts_with("~/") {
+        return Err(format!(
+            "`symlink` renders a leading `~` as the home only as `~` or `~/…`; \
+             write another account's home out in full. Got {text:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The text a link declared as `text` holds on this machine: `text` with a
+/// leading `~` or `~/` rendered against `home`, and anything else verbatim.
+///
+/// Nothing else is normalised, so a relative text stays relative, `a//b`
+/// stays `a//b`, and the link says exactly what the config wrote.
+#[must_use]
+pub fn link_text(text: &str, home: &Path) -> PathBuf {
+    match text.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with('/') => {
+            let mut rendered = home.as_os_str().to_os_string();
+            rendered.push(rest);
+            PathBuf::from(rendered)
+        }
+        _ => PathBuf::from(text),
+    }
 }
 
 /// The generators a target's body can be produced by.
@@ -186,15 +250,18 @@ impl Gen {
 /// The interactive `[[env]]` fragment lands in the `env` phase, whole, and is
 /// the one part of the file [`crate::env_guard`] judges; every enabled
 /// `[[plugin]]` lands in the `plugins` phase, or in the `terminal` slot when it
-/// claims it, as the one guarded line [`PluginDecl::line`] renders; and every
-/// enabled alias lands in the `aliases` phase, as the line
-/// [`crate::shell::alias::AliasDecl::render`] renders for it; and every
-/// enabled `[[function]]` whose body resolved lands in the `functions` phase,
-/// as [`Function::render`] renders it; and every enabled `[[source]]` whose
-/// path resolved lands in the phase it names, after that phase's own
-/// declarations, as the one guarded line [`Source::render`] renders. No phase
-/// but `env` holds an environment assignment (Invariant 2); the `functions`
-/// phase assigns only zsh's hook arrays, which no process inherits.
+/// claims it, as the one guarded line [`PluginDecl::line`] renders; the
+/// declared `[history]` lands in the `options` phase in zsh's names, as
+/// [`History::render_zsh`] renders it; every enabled alias lands in the
+/// `aliases` phase, as the line [`crate::shell::alias::AliasDecl::render`]
+/// renders for it; every enabled `[[function]]` whose body resolved lands in
+/// the `functions` phase, as [`Function::render`] renders it; and every
+/// enabled `[[source]]` whose path resolved lands in the phase it names, after
+/// that phase's own declarations, as the one guarded line [`Source::render`]
+/// renders. No phase but `env` holds an environment assignment (Invariant 2):
+/// the `options` phase assigns only zsh's own unexported history parameters,
+/// which [`super::history`]'s tests hold it to, and the `functions` phase
+/// assigns only zsh's hook arrays, which no process inherits.
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what
@@ -205,6 +272,9 @@ pub struct Interactive {
     env: super::env::Fragment,
     /// The enabled plugins, in declaration order.
     plugins: Vec<PluginDecl>,
+    /// The declared history, rendered in zsh's names into the `options`
+    /// phase.
+    history: History,
     /// The enabled aliases, in the merged configuration's order.
     aliases: Vec<AliasDecl>,
     /// The enabled functions, each resolved or held back in its own
@@ -216,16 +286,31 @@ pub struct Interactive {
 }
 
 impl Interactive {
-    /// The file holding `env` and no plugin, alias, function or source.
+    /// The file holding `env`, and no plugin, history, alias, function or
+    /// source.
     #[must_use]
-    pub const fn new(env: super::env::Fragment) -> Self {
+    pub fn new(env: super::env::Fragment) -> Self {
         Self {
             env,
             plugins: Vec::new(),
+            history: History::default(),
             aliases: Vec::new(),
             functions: Vec::new(),
             sources: Vec::new(),
         }
+    }
+
+    /// The file with `history` in its `options` phase.
+    #[must_use]
+    pub fn with_history(mut self, history: History) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// The declared history, whose zsh file the plan judges.
+    #[must_use]
+    pub const fn history(&self) -> &History {
+        &self.history
     }
 
     /// The file with `sources` added: the enabled declared optional sources
@@ -330,12 +415,13 @@ impl Interactive {
     /// The file's bytes.
     ///
     /// The fragment is contributed only when it holds a variable, so a file
-    /// with plugins alone has no `env` phase, and a file whose every alias is
-    /// gated on a missing tool has no `aliases` phase, and a file whose every
-    /// function is held back has no `functions` phase. The bytes are a
-    /// function of the variables, the plugins, the aliases, the functions,
-    /// the sources and `present`'s answers alone: never of whether a plugin's
-    /// or a source's file exists.
+    /// with plugins alone has no `env` phase, a history declaring nothing zsh
+    /// reads adds no `options` phase, a file whose every alias is gated on a
+    /// missing tool has no `aliases` phase, and a file whose every function is
+    /// held back has no `functions` phase. The bytes are a function of the
+    /// variables, the plugins, the history, the aliases, the functions, the
+    /// sources and `present`'s answers alone: never of whether a plugin's or a
+    /// source's file exists.
     ///
     /// A file holding a plugin or a source line closes with [`SETTLE`]. A
     /// guarded line whose file is absent returns 1, and a file sourced at
@@ -350,7 +436,14 @@ impl Interactive {
         } else {
             assembly.contribute(Phase::Env, super::env::SECTION, self.env.render(present))
         }
-        .and_then(|()| crate::shell::plugin::contribute(&mut assembly, &self.plugins));
+        .and_then(|()| crate::shell::plugin::contribute(&mut assembly, &self.plugins))
+        .and_then(|()| {
+            assembly.contribute(
+                Phase::Options,
+                super::history::SECTION,
+                self.history.render_zsh(),
+            )
+        });
         // Only the terminal slot refuses a contribution, and `with_plugins`
         // admitted at most one claimant.
         contributed.expect("an `Interactive` holds at most one terminal claimant");
@@ -556,6 +649,10 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
         check_secret(&ctx, table, mode, &attach, &format, direction)?;
     }
 
+    if matches!(body, Body::Symlink(_)) {
+        check_symlink(&ctx, table, &attach, &format)?;
+    }
+
     if matches!(&format, Format::Jsonc { owns } if owns.is_empty()) {
         // `Jsonc { owns: [] }` says bx manages part of a file and names no part:
         // every run a silent no-op. Checked here rather than in `parse_format`
@@ -676,6 +773,41 @@ fn check_secret(
             table,
             "format",
             "a secret target's plaintext is the whole file, so `format` has nothing to describe",
+        ));
+    }
+    Ok(())
+}
+
+/// The companion keys a symlink target refuses, each by name.
+///
+/// A link is its text and nothing else. Its mode is not bx's to set — Linux
+/// gives every link `0777` and ignores it — so a declared one would be a
+/// promise the writer cannot keep, and the format and attachment describe
+/// bytes in a file, which a link has none of. The same rule the other flat
+/// companion keys follow: a key that cannot mean anything is an error, not a
+/// key quietly ignored.
+fn check_symlink(ctx: &Ctx, table: &Table, attach: &Attach, format: &Format) -> Result<(), Error> {
+    if table.contains_key("mode") {
+        return Err(ctx.bad(
+            table,
+            "mode",
+            "a symlink target takes no `mode`: a link's permission bits are not used, \
+             and the file it points at keeps its own",
+        ));
+    }
+    if *format != Format::Opaque {
+        return Err(ctx.bad(
+            table,
+            "format",
+            "a symlink target holds no content, so `format` has nothing to describe",
+        ));
+    }
+    if *attach != Attach::Own {
+        return Err(ctx.bad(
+            table,
+            "attach",
+            "a symlink target's `attach` is always \"own\": a link has no content to \
+             delimit a region in",
         ));
     }
     Ok(())
@@ -831,7 +963,7 @@ fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> 
             _ => Err(Error::MissingKey {
                 origin: ctx.origin().clone(),
                 section: SECTION,
-                key: "file`, `content`, `generated`, `secret` or `dir",
+                key: "file`, `content`, `generated`, `secret`, `symlink` or `dir",
             }),
         },
         [one] => body_from(ctx, table, one),
@@ -983,6 +1115,11 @@ fn body_from(ctx: &Ctx, table: &Table, key: &str) -> Result<Body, Error> {
         "secret" => {
             let raw = ctx.required_str(table, "secret")?;
             Ok(Body::Secret(repo_relative(ctx, table, "secret", raw)?))
+        }
+        "symlink" => {
+            let text = ctx.required_str(table, "symlink")?;
+            check_link_text(text).map_err(|message| ctx.bad(table, "symlink", message))?;
+            Ok(Body::Symlink(text.to_string()))
         }
         "generated" => {
             let name = ctx.required_str(table, "generated")?;
@@ -1871,6 +2008,119 @@ mod tests {
         }
     }
 
+    /// A symlink target, plus whatever else the test needs.
+    fn symlink(text: &str, extra: &str) -> String {
+        format!("[[target]]\npath = \"~/.local/bin/tool\"\nsymlink = {text:?}\n{extra}")
+    }
+
+    #[test]
+    fn a_symlink_target_keeps_its_text_as_written() {
+        for text in [
+            "../share/tool/bin/tool",
+            "/opt/tool/bin/tool",
+            "~/src/tool",
+            "~",
+        ] {
+            assert_eq!(
+                parse(&symlink(text, "")).unwrap().body,
+                Body::Symlink(text.to_string()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlink_is_one_body_among_the_others() {
+        for body in [
+            "file = \"f\"",
+            "content = \"x\"",
+            "secret = \"s.age\"",
+            "dir = true",
+        ] {
+            let message = message(&symlink("x", &format!("{body}\n")));
+            assert!(message.contains("exactly one body"), "{body}: {message}");
+            assert!(message.contains("`symlink`"), "{body}: {message}");
+        }
+        let generated = message(&symlink("x", "generated = \"shell-init\"\n"));
+        assert!(generated.contains("exactly one body"), "{generated}");
+    }
+
+    #[test]
+    fn a_symlink_target_refuses_every_key_that_describes_content() {
+        // Each is named where it was written: the key's own line, or for an
+        // include target the `symlink` it would never read.
+        for (extra, key, line) in [
+            ("mode = \"0644\"\n", "`mode`", "bx.toml:4"),
+            ("format = \"env.d\"\n", "`format`", "bx.toml:4"),
+            (
+                "attach = \"region\"\ncomment = \"#\"\n",
+                "`attach`",
+                "bx.toml:4",
+            ),
+            (
+                "attach = \"include\"\ninclude = \"x\"\n",
+                "`symlink`",
+                "bx.toml:3",
+            ),
+        ] {
+            let message = message(&symlink("x", extra));
+            assert!(message.contains(key), "{extra}: {message}");
+            assert!(message.contains(line), "{extra}: {message}");
+        }
+        // Their defaults, and the keys that say nothing about content, are
+        // not refused.
+        let target = parse(&symlink(
+            "x",
+            "format = \"opaque\"\nattach = \"own\"\nrequires = [\"tool\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(target.body, Body::Symlink("x".to_string()));
+    }
+
+    #[test]
+    fn a_symlink_text_that_no_link_can_hold_is_refused() {
+        // Spelled as TOML, since Rust's `{:?}` escapes a NUL in a way TOML
+        // does not read.
+        for (text, why) in [
+            ("\"\"", "may not be empty"),
+            ("\"a\\u0000b\"", "NUL"),
+            ("\"~other/bin\"", "another account's home"),
+        ] {
+            let toml = format!("[[target]]\npath = \"~/.local/bin/tool\"\nsymlink = {text}\n");
+            let message = message(&toml);
+            assert!(message.contains(why), "{text}: {message}");
+            assert!(message.contains("`symlink`"), "{text}: {message}");
+        }
+        assert!(message(&symlink("x", "").replace("\"x\"", "true")).contains("string"));
+    }
+
+    #[test]
+    fn a_symlink_may_not_be_the_home_or_above_it() {
+        let text = "[[target]]\npath = \"~\"\nsymlink = \"/elsewhere\"\n";
+        assert!(message(text).contains("only a `dir = true` target"));
+    }
+
+    #[test]
+    fn link_text_renders_only_a_leading_home() {
+        let home = home();
+        for (text, rendered) in [
+            ("~", "/var/home/example"),
+            ("~/src/tool", "/var/home/example/src/tool"),
+            ("../a/~/b", "../a/~/b"),
+            ("a//b/./c", "a//b/./c"),
+            ("/opt/x/", "/opt/x/"),
+        ] {
+            assert_eq!(link_text(text, home), PathBuf::from(rendered), "{text}");
+        }
+    }
+
+    /// An empty inline body is a zero-byte file, not a missing body.
+    #[test]
+    fn an_empty_content_is_a_body() {
+        let text = "[[target]]\npath = \"~/.hushlogin\"\ncontent = \"\"\n";
+        assert_eq!(parse(text).unwrap().body, Body::Inline(String::new()));
+    }
+
     #[test]
     fn requires_defaults_to_empty() {
         assert!(parse(&with("")).unwrap().requires.is_empty());
@@ -1909,9 +2159,9 @@ mod tests {
 
     #[test]
     fn an_unknown_target_key_is_rejected_with_its_line() {
-        let message = message(&with("symlink = true\n"));
+        let message = message(&with("hardlink = true\n"));
 
-        assert!(message.contains("unknown key `symlink`"), "{message}");
+        assert!(message.contains("unknown key `hardlink`"), "{message}");
         assert!(message.contains("[[target]]"), "{message}");
         assert!(message.contains("bx.toml:4"), "{message}");
     }
@@ -2342,6 +2592,85 @@ mod tests {
             let got = String::from_utf8(run(&zsh, &["-f"], &script)).expect("utf-8");
             let parts: Vec<&str> = got.split("---\n").collect();
             assert_ne!(parts[2], parts[0]);
+        }
+
+        /// The source configuration's zsh history, parsed as a layer would.
+        fn history() -> History {
+            crate::config::parse_str(
+                "[history]\nsize = 10000\nduplicates = \"all\"\nshare = true\n\
+                 [history.file]\nzsh = \"~/.zsh_history\"\nbash = \"~/.bash_history\"\n",
+                std::path::Path::new("/repo/bx.toml"),
+                std::path::Path::new("/home/u"),
+            )
+            .expect("parses")
+            .history
+        }
+
+        #[test]
+        fn declared_history_lands_in_the_options_phase_in_zshs_names_only() {
+            let file = Interactive::new(fragment(Vec::new()))
+                .with_plugins(&[
+                    plugin("t", "~/t.zsh", true, 1),
+                    plugin("p", "~/p.zsh", false, 2),
+                ])
+                .expect("one claimant")
+                .with_history(history());
+            assert_eq!(file.history(), &history());
+            let rendered = render(&file);
+            assert_eq!(
+                rendered,
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: plugins\n\
+                 [[ -r ~/p.zsh ]] && source ~/p.zsh\n\
+                 \n# bx phase: options\n\
+                 HISTFILE=\"${HOME}/.zsh_history\"\n\
+                 HISTSIZE=10000\n\
+                 SAVEHIST=10000\n\
+                 typeset -g +x HISTFILE HISTSIZE SAVEHIST\n\
+                 setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n\
+                 \n# bx phase: terminal\n\
+                 [[ -r ~/t.zsh ]] && source ~/t.zsh\n\
+                 \n# bx: done, whichever plugins were found\ntrue\n"
+            );
+            // bash's file and bash's names never reach zsh's file.
+            assert!(!rendered.contains("bash_history"), "{rendered}");
+            assert!(!rendered.contains("HISTFILESIZE"), "{rendered}");
+
+            // A history alone is a file of its own, and one declaring nothing
+            // zsh reads adds nothing.
+            let alone = render(&Interactive::new(fragment(Vec::new())).with_history(history()));
+            assert!(
+                alone.ends_with("setopt HIST_IGNORE_ALL_DUPS SHARE_HISTORY\n"),
+                "{alone}"
+            );
+            let bash_only = History {
+                bash_file: history().bash_file,
+                ..History::default()
+            };
+            assert_eq!(
+                render(&Interactive::new(fragment(Vec::new())).with_history(bash_only)),
+                "# Generated by bx. Edit the config repo, not this file.\n"
+            );
+        }
+
+        #[test]
+        fn an_interactive_zsh_reads_the_declared_history() {
+            let Some(zsh) = installed("zsh") else {
+                return;
+            };
+            let rendered = render(&Interactive::new(fragment(Vec::new())).with_history(history()));
+            let got = run(
+                &zsh,
+                &["-f", "-e"],
+                &format!(
+                    "{rendered}print -r -- \"${{HISTFILE#$HOME}} $HISTSIZE $SAVEHIST\"\n\
+                     [[ -o histignorealldups && -o sharehistory ]] && print -r -- options-on\n"
+                ),
+            );
+            assert_eq!(
+                String::from_utf8(got).expect("utf-8"),
+                "/.zsh_history 10000 10000\noptions-on\n"
+            );
         }
     }
 }

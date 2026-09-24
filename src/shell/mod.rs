@@ -59,11 +59,18 @@
 //! too. The `functions` phase [`function`] renders defines functions and
 //! appends to zsh's hook arrays — shell arrays zsh cannot export, which name
 //! what runs at a hook and relocate nothing — and its tests run it in zsh to
-//! establish that those arrays are the only parameters it changes. A declared
-//! optional source [`source`] renders is the same guarded line a plugin is, in
-//! whichever phase between `activations` and `options` it names — never `env`,
-//! `path`, `completion` or the terminal slot — and its tests hold it to a test
-//! and a `source` word for word.
+//! establish that those arrays are the only parameters it changes. The
+//! `options` phase holds the declared `[history]` in zsh's names
+//! ([`crate::config::history`]): `HISTFILE`, `HISTSIZE` and `SAVEHIST`, which
+//! zsh reads for itself, a `typeset -g +x` line that keeps them unexported
+//! even when a parent exported them, and `setopt` lines. The history
+//! file is judged by the plan against bx's own directories, and that module's
+//! tests run the phase in zsh to establish that those three are the only
+//! parameters it changes and that it exports nothing. A declared optional
+//! source [`source`] renders is the same guarded line a plugin is, in
+//! whichever phase between `activations` and `options` it names — never
+//! `env`, `path`, `completion` or the terminal slot — and its tests hold it to
+//! a test and a `source` word for word.
 //!
 //! A tool's activation output assigns variables of its own — `MISE_SHELL`,
 //! `STARSHIP_SHELL`, a function's locals, ZLE's `BUFFER` — and none of those

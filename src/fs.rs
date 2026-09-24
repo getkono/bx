@@ -1,7 +1,8 @@
 //! Filesystem primitives: file modes, and the one atomic write in the crate.
 //!
 //! This module is the single place in bx where a byte reaches the filesystem,
-//! but one. Everything downstream — generated shell fragments, managed regions
+//! but one. A symlink target's link is made here too, by [`link`], through the
+//! same preamble and the same rename-then-sync as a file. Everything downstream — generated shell fragments, managed regions
 //! and include lines, surgical edits to another tool's config, and decrypted
 //! secrets — writes through [`atomic`], so the durability sequence, the
 //! reversibility record and the mode policy exist once rather than once per
@@ -27,6 +28,7 @@
 
 pub mod atomic;
 pub(crate) mod durable;
+pub mod link;
 pub mod mode;
 
 pub use atomic::{
@@ -34,4 +36,5 @@ pub use atomic::{
     Staged, Stamp, TEMP_PREFIX, Unpublished, compare, compare_dir, ensure_dir, observe, set_mode,
     stage, write_atomically,
 };
+pub use link::{StagedLink, stage_link};
 pub use mode::{Kind, Mode, ModeError};

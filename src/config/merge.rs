@@ -142,8 +142,10 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::env::EnvDecl;
+use super::history::History;
 use super::path::PathEntry;
 use super::secrets::Secrets;
+use super::shell_options::ShellOptions;
 use super::target::Target;
 use super::values::{
     Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan, statements_named,
@@ -1178,6 +1180,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut plugins: Merged<PluginDecl> = Merged::default();
     let mut sources: Merged<SourceDecl> = Merged::default();
     let mut secrets = Secrets::default();
+    let mut history = History::default();
+    let mut shell_options = ShellOptions::default();
 
     // Values first, across every layer. A value never depends on a target, and
     // a target's key depends on the values — the final ones, because the file a
@@ -1197,6 +1201,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
         secrets.absorb(&layer.config.secrets);
+        // Both tables hold no placeholder, so they fold here too, key by key.
+        history.absorb(&layer.config.history);
+        shell_options.absorb(&layer.config.shell_options);
 
         values.absorb(layer.config.values.iter().cloned());
         envs.absorb(layer.config.envs.iter().cloned());
@@ -1271,6 +1278,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         // Nor to a declared optional source.
         sources: sources.into_enabled(),
         secrets,
+        history,
+        shell_options,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
         conflicts: clashes
@@ -2048,6 +2057,47 @@ mod tests {
             merged.secrets.identity.expect("an identity").path.as_str(),
             "~/.config/age/key.txt"
         );
+    }
+
+    #[test]
+    fn history_and_shell_options_merge_key_by_key_the_last_layer_winning() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[history]\nsize = 10000\nshare = true\n[history.file]\nzsh = \"~/.zsh_history\"\n\
+                 [shell-options]\nhistappend = true\ncheckwinsize = true\n",
+            ),
+            global("modules/k.toml", "[history]\nsize = 500\n"),
+            local(
+                "[history.file]\nbash = \"~/.bash_history\"\n[shell-options]\nhistappend = false\n",
+            ),
+        ])
+        .expect("merges");
+
+        let history = merged.history;
+        assert_eq!(history.size, Some(500), "the later layer wins");
+        assert_eq!(
+            history.share,
+            Some(true),
+            "a key no later layer sets is kept"
+        );
+        assert_eq!(
+            history
+                .zsh_file
+                .as_ref()
+                .map(crate::paths::Portable::as_str),
+            Some("~/.zsh_history")
+        );
+        assert_eq!(
+            history
+                .bash_file
+                .as_ref()
+                .map(crate::paths::Portable::as_str),
+            Some("~/.bash_history"),
+            "each shell's file is its own key"
+        );
+        assert_eq!(merged.shell_options.checkwinsize, Some(true));
+        assert_eq!(merged.shell_options.histappend, Some(false));
     }
 
     #[test]

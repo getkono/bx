@@ -118,8 +118,9 @@ pub enum Body {
 /// The generators a target's body can be produced by.
 ///
 /// Each variant carries everything its bytes are made of, so producing them is
-/// a pure function of the resolved target: the plan decides on exactly the
-/// bytes `apply` writes. [`Gen::render`] is that function.
+/// a pure function of the resolved target and whether each tool a
+/// `when = "has:TOOL"` names is present: the plan decides on exactly the bytes
+/// `apply` writes. [`Gen::render`] is that function.
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
 /// ([`super::env`]) and none is named by a config author: a fragment carries
@@ -139,10 +140,14 @@ pub enum Gen {
 
 impl Gen {
     /// The body this generator produces.
+    ///
+    /// `present` answers whether a tool a `when = "has:TOOL"` names is usable
+    /// on this machine: the one input besides the target itself, asked while
+    /// `plan` and `apply` decide, never by the generated shell.
     #[must_use]
-    pub fn render(&self) -> String {
+    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
         match self {
-            Self::Env(fragment) => fragment.render(),
+            Self::Env(fragment) => fragment.render(present),
             Self::Source(fragment) => super::env::source_line(fragment),
         }
     }

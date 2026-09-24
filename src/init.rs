@@ -778,6 +778,18 @@ pub(crate) mod tests {
                 .expect("discover")
                 .is_empty()
         );
+
+        home.write("xdg/tool.toml", "t\n");
+        assert_eq!(
+            adopt::discover(&ctx, &home.child("xdg")).expect("discover"),
+            [Portable::parse_in("~/xdg/tool.toml", home.path()).expect("portable")],
+            "a config home inside the home is looked in, wherever it is"
+        );
+        assert!(
+            adopt::discover(&ctx, &home.child("absent"))
+                .expect("an absent config home is nothing to offer")
+                .is_empty()
+        );
     }
 
     #[test]

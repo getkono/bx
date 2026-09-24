@@ -1,16 +1,50 @@
-//! The bodies of `bx`, `bx plan`, `bx apply` and `bx secret list`.
+//! The bodies of `bx`, `bx plan`, `bx apply`, `bx doctor` and `bx secret list`.
 //!
-//! Each loads the configuration, runs the one traversal in [`crate::plan`],
-//! writes the rendering to the output it is handed, and returns the exit
-//! status. `main` does nothing but call one of them.
+//! Each loads the configuration, runs the one traversal in [`crate::plan`] —
+//! or, for `doctor`, the read-only checks in [`crate::doctor`] — writes the
+//! rendering to the output it is handed, and returns the exit status. `main`
+//! does nothing but call one of them.
 
 use std::io::Write;
 
 use crate::config::resolve::Resolution;
 use crate::config::target::Body;
+use crate::doctor::{self, Probes, systemd};
+use crate::paths;
 use crate::plan::{self, Env, Error, Inputs, Mode, Palette, Report, View};
 use crate::report::Exit;
 use crate::secret::{Passphrase, Unlock};
+
+/// `bx doctor`: what a human should look at, changing nothing.
+///
+/// # Errors
+///
+/// Whatever loading the configuration returns, and [`Error::Output`] when
+/// `out` cannot be written. A check that cannot ask what it needs — systemd's
+/// user session unreachable — is a finding, not an error.
+pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
+    doctor_with(env, out, &systemd::Systemctl::default())
+}
+
+/// [`doctor`], asking systemd through `systemd`.
+fn doctor_with(
+    env: &Env,
+    out: &mut dyn Write,
+    systemd: &dyn systemd::Query,
+) -> Result<Exit, Error> {
+    let inputs = Inputs::load(env)?;
+    let unit_dir = paths::systemd_user_dir_in(&env.home, env.xdg_config_home.as_deref());
+    let report = doctor::run(
+        &inputs,
+        &Probes {
+            unit_dir: &unit_dir,
+            systemd,
+        },
+    );
+    out.write_all(doctor::render(&report, &env.home).as_bytes())
+        .map_err(Error::Output)?;
+    Ok(doctor::exit(&report))
+}
 
 /// Bare `bx`: every target, unchanged ones included.
 ///
@@ -169,7 +203,7 @@ fn secret_list_with(
 
     let mut text = String::new();
     let mut all = true;
-    for (declared, resolution) in inputs.targets() {
+    for (declared, resolution) in inputs.declared_targets() {
         let Body::Secret(written) = &declared.body else {
             continue;
         };
@@ -698,6 +732,83 @@ mod tests {
             Err(Error::Output(_))
         ));
         assert!(!home.child(".a").exists(), "written with no plan shown");
+    }
+
+    /// A systemd whose every unit is loaded, enabled and failed.
+    struct AllFailed;
+
+    impl systemd::Query for AllFailed {
+        fn show(&self, names: &[String]) -> Result<Vec<systemd::State>, systemd::Unreachable> {
+            Ok(vec![
+                systemd::State {
+                    load: "loaded".into(),
+                    active: "failed".into(),
+                    file: "enabled".into(),
+                    need_reload: false,
+                };
+                names.len()
+            ])
+        }
+    }
+
+    #[test]
+    fn doctor_checks_written_units_in_the_xdg_unit_directory() {
+        let home = guarded_home();
+        let xdg = home.child("xdg");
+        let env = Env {
+            xdg_config_home: Some(xdg.clone().into_os_string()),
+            ..env(home.path())
+        };
+        std::fs::create_dir_all(xdg.join("bx")).expect("the config repo");
+        std::fs::write(
+            xdg.join("bx/bx.toml"),
+            "[[target]]\npath = \"~/xdg/systemd/user/a.service\"\ncontent = \"x\"\n\n\
+             [[target]]\npath = \"~/.config/systemd/user/b.service\"\ncontent = \"x\"\n",
+        )
+        .expect("bx.toml");
+        home.write("xdg/systemd/user/a.service", "x");
+        home.write(".config/systemd/user/b.service", "x");
+
+        let mut out = Vec::new();
+        let exit = doctor_with(&env, &mut out, &AllFailed).expect("doctor");
+
+        assert_eq!(exit, Exit::Pending);
+        assert_eq!(
+            text(&out),
+            "  ! ~/xdg/systemd/user/a.service  (~/xdg/bx/bx.toml:1) has failed; see `systemctl \
+             --user status a.service`\nDoctor: 1 finding(s).\n",
+            "only the unit in $XDG_CONFIG_HOME/systemd/user is checked"
+        );
+    }
+
+    #[test]
+    fn doctor_with_nothing_to_check_is_converged_and_needs_no_systemd() {
+        let home = guarded_home();
+        seed(
+            home.path(),
+            &inline("~/.config/systemd/user/a.service", "x"),
+        );
+
+        let mut out = Vec::new();
+        let exit = doctor(&env(home.path()), &mut out).expect("doctor");
+
+        assert_eq!(exit, Exit::Converged);
+        assert_eq!(text(&out), "Doctor: 0 finding(s).\n");
+    }
+
+    #[test]
+    fn doctor_without_a_repo_or_an_output_is_an_error() {
+        let home = guarded_home();
+        assert!(matches!(
+            doctor(&env(home.path()), &mut Vec::new()),
+            Err(Error::RepoMissing(_))
+        ));
+
+        seed(home.path(), "");
+        assert!(matches!(
+            doctor(&env(home.path()), &mut Refusing),
+            Err(Error::Output(_))
+        ));
     }
 
     #[test]

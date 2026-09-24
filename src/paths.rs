@@ -317,6 +317,17 @@ pub fn config_root_in(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
     xdg_base(xdg_config_home, home, ".config").join("bx")
 }
 
+/// The systemd user unit directory — `$XDG_CONFIG_HOME/systemd/user`, default
+/// `~/.config/systemd/user`.
+///
+/// The one directory in systemd's user search path that holds the user's own
+/// unit files, and so the one `bx doctor` checks units in. It follows the same
+/// XDG rule as [`config_root_in`], because systemd resolves it the same way.
+#[must_use]
+pub fn systemd_user_dir_in(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
+    xdg_base(xdg_config_home, home, ".config").join("systemd/user")
+}
+
 /// The config repo root, resolved from the process environment.
 ///
 /// # Errors
@@ -801,6 +812,22 @@ mod tests {
         assert_eq!(
             config_root_in(&home(), None),
             Path::new("/var/home/example/.config/bx")
+        );
+    }
+
+    #[test]
+    fn the_systemd_user_unit_directory_follows_the_same_xdg_rule() {
+        assert_eq!(
+            systemd_user_dir_in(&home(), None),
+            Path::new("/var/home/example/.config/systemd/user")
+        );
+        assert_eq!(
+            systemd_user_dir_in(&home(), Some(OsStr::new("/etc/xdg-for-this-account"))),
+            Path::new("/etc/xdg-for-this-account/systemd/user")
+        );
+        assert_eq!(
+            systemd_user_dir_in(&home(), Some(OsStr::new("relative/config"))),
+            Path::new("/var/home/example/.config/systemd/user")
         );
     }
 

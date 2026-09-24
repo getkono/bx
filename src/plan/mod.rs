@@ -25,6 +25,7 @@ use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 pub(crate) use decide::read_repo_file;
+pub(crate) use diff::escape;
 pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
 
 use crate::config::resolve::{self, Resolution, Resolved};
@@ -164,7 +165,7 @@ impl Inputs {
 
     /// Every enabled target as written, paired with its resolution, in
     /// configuration order.
-    pub fn targets(&self) -> impl Iterator<Item = (&Target, &Resolution<Target>)> {
+    pub fn declared_targets(&self) -> impl Iterator<Item = (&Target, &Resolution<Target>)> {
         self.declared.iter().zip(&self.resolved.targets)
     }
 
@@ -184,6 +185,14 @@ impl Inputs {
     #[must_use]
     pub const fn state(&self) -> &StateDir {
         &self.state
+    }
+
+    /// Every enabled target, ready or held back, in configuration order — the
+    /// list `plan` decides, for a read-only command that looks at the same
+    /// targets without deciding them.
+    #[must_use]
+    pub fn targets(&self) -> &[Resolution<Target>] {
+        &self.resolved.targets
     }
 }
 
@@ -605,7 +614,7 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
         // secret is read from the declared body, which a blocked resolution
         // still has.
         let configured = inputs
-            .targets()
+            .declared_targets()
             .find(|(declared, resolution)| match resolution {
                 Resolution::Ready(ready) => ready.path.as_str() == target,
                 Resolution::Blocked(_) => declared.path.as_str() == target,
@@ -624,7 +633,7 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
             |declared: &Target| matches!(declared.body, crate::config::target::Body::Secret(_));
         let conceal = configured.map_or_else(
             || {
-                inputs.targets().any(|(declared, resolution)| {
+                inputs.declared_targets().any(|(declared, resolution)| {
                     is_secret(declared) && matches!(resolution, Resolution::Blocked(_))
                 })
             },

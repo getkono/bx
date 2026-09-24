@@ -221,7 +221,7 @@ pub fn parse_source(table: &Table, file: &Path, text: &str) -> Result<SourceDecl
         Err(problem) => return Err(ctx.bad(table, "path", format!("source `{name}`: {problem}"))),
         // Nothing to substitute, so the path is final and is checked now.
         Ok(names) if names.is_empty() => {
-            if let Some(problem) = unsourceable(&path) {
+            if let Some(problem) = unsourceable("path", &path) {
                 return Err(ctx.bad(table, "path", format!("source `{name}`: {problem}")));
             }
         }
@@ -285,7 +285,7 @@ fn resolve_one(decl: &SourceDecl, values: &ResolvedValues) -> Result<Resolution<
     }
     match values.substitute(&decl.path) {
         Ok(path) => {
-            let Some(problem) = unsourceable(&path) else {
+            let Some(problem) = unsourceable("path", &path) else {
                 return Ok(Resolution::Ready(Source {
                     name: decl.name.clone(),
                     path,
@@ -513,7 +513,10 @@ mod tests {
             ("name = \"\"\npath = \"~/a\"\n", "not a source name"),
             ("name = \"a\\nb\"\npath = \"~/a\"\n", "not a source name"),
             ("name = \"s\"\npath = 1\n", "`path` must be a string"),
-            ("name = \"s\"\npath = \"a.zsh\"\n", "must open with"),
+            (
+                "name = \"s\"\npath = \"a.zsh\"\n",
+                "`path = \"a.zsh\"` must open with",
+            ),
             ("name = \"s\"\npath = \"~a.zsh\"\n", "must open with"),
             ("name = \"s\"\npath = \"~/a b\"\n", "found ' '"),
             ("name = \"s\"\npath = \"~/a;id\"\n", "found ';'"),
@@ -544,6 +547,9 @@ mod tests {
             let text = format!("[[source]]\n{body}");
             let err = load(&text).expect_err(body);
             assert!(err.contains(needle), "{body}: {err}");
+            // A source's file is its `path`; the message never names the
+            // `source` key `[[source]]` refuses.
+            assert!(!err.contains("`source = "), "{body}: {err}");
             assert!(err.starts_with("/repo/bx.toml:"), "{body}: {err}");
         }
     }
@@ -649,6 +655,11 @@ mod tests {
         assert!(matches!(entry.reason, BlockReason::InvalidValue { .. }));
         assert!(entry.hint.contains("found ' '"), "{}", entry.hint);
         assert!(
+            entry.hint.contains("`path = \"~/.keychain/my box-sh\"`"),
+            "{}",
+            entry.hint
+        );
+        assert!(
             entry.hint.contains("the answer to `h` at /repo/bx.toml:5"),
             "{}",
             entry.hint
@@ -668,6 +679,7 @@ mod tests {
         )
         .expect_err("no answer can clear it");
         assert!(err.contains("found ';'"), "{err}");
+        assert!(err.contains("`path = \"~/a;b\"`"), "{err}");
         // A disabled source is not read at all.
         let none = resolved("[[source]]\nname = \"s\"\npath = \"~/{{nobody}}\"\nenabled = false\n")
             .expect("a disabled path is not read");

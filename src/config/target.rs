@@ -302,7 +302,7 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
     }
 
     if matches!(body, Body::Secret(_)) {
-        check_secret(&ctx, table, mode, &attach, &format)?;
+        check_secret(&ctx, table, mode, &attach, &format, direction)?;
     }
 
     if matches!(&format, Format::Jsonc { owns } if owns.is_empty()) {
@@ -374,13 +374,26 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
 /// keys inside one; none of them can keep plaintext private. An include target
 /// already cannot carry a second body, so only a region and a format arrive
 /// here.
+///
+/// **Applied, never tracked.** A tracked target is one the tool writes and bx
+/// carries back, and the only place a secret may be carried back to is its
+/// ciphertext; carrying the plaintext would put a cleartext secret in the repo.
 fn check_secret(
     ctx: &Ctx,
     table: &Table,
     mode: Option<Mode>,
     attach: &Attach,
     format: &Format,
+    direction: Direction,
 ) -> Result<(), Error> {
+    if direction != Direction::Apply {
+        return Err(ctx.bad(
+            table,
+            "direction",
+            "a secret target is always applied: tracking it would carry the plaintext \
+             the tool writes back toward the config repo",
+        ));
+    }
     let Some(mode) = mode else {
         return Err(ctx.bad(
             table,
@@ -1023,6 +1036,13 @@ mod tests {
             include.contains("`secret` would never be read"),
             "{include}"
         );
+    }
+
+    #[test]
+    fn a_secret_target_is_never_tracked() {
+        let track = message(&secret("mode = \"0600\"\ndirection = \"track\"\n"));
+        assert!(track.contains("always applied"), "{track}");
+        assert!(parse(&secret("mode = \"0600\"\ndirection = \"apply\"\n")).is_ok());
     }
 
     #[test]

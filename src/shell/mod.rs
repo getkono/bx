@@ -87,6 +87,7 @@ pub mod activation;
 pub mod alias;
 pub mod function;
 pub mod plugin;
+pub mod source;
 
 /// Running generated shell text in a real shell, for the submodules' tests.
 #[cfg(test)]

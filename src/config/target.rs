@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::Function;
 use crate::shell::plugin::PluginDecl;
+use crate::shell::source::Source;
 use crate::shell::{Assembly, Phase};
 
 use toml_edit::Table;
@@ -188,9 +189,11 @@ impl Gen {
 /// enabled alias lands in the `aliases` phase, as the line
 /// [`crate::shell::alias::AliasDecl::render`] renders for it; and every
 /// enabled `[[function]]` whose body resolved lands in the `functions` phase,
-/// as [`Function::render`] renders it. No phase but `env` holds an
-/// environment assignment (Invariant 2); the `functions` phase assigns only
-/// zsh's hook arrays, which no process inherits.
+/// as [`Function::render`] renders it; and every enabled `[[source]]` whose
+/// path resolved lands in the phase it names, after that phase's own
+/// declarations, as the one guarded line [`Source::render`] renders. No phase
+/// but `env` holds an environment assignment (Invariant 2); the `functions`
+/// phase assigns only zsh's hook arrays, which no process inherits.
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what
@@ -206,10 +209,13 @@ pub struct Interactive {
     /// The enabled functions, each resolved or held back in its own
     /// position, in the merged configuration's order.
     functions: Vec<Resolution<Function>>,
+    /// The enabled declared optional sources, each resolved or held back in
+    /// its own position, in the merged configuration's order.
+    sources: Vec<Resolution<Source>>,
 }
 
 impl Interactive {
-    /// The file holding `env` and no plugin, alias or function.
+    /// The file holding `env` and no plugin, alias, function or source.
     #[must_use]
     pub const fn new(env: super::env::Fragment) -> Self {
         Self {
@@ -217,7 +223,24 @@ impl Interactive {
             plugins: Vec::new(),
             aliases: Vec::new(),
             functions: Vec::new(),
+            sources: Vec::new(),
         }
+    }
+
+    /// The file with `sources` added: the enabled declared optional sources
+    /// as [`crate::shell::source::resolve`] resolved them, each ready one
+    /// written and each held-back one named by [`Interactive::note`].
+    #[must_use]
+    pub fn with_sources(mut self, sources: Vec<Resolution<Source>>) -> Self {
+        self.sources = sources;
+        self
+    }
+
+    /// The enabled declared optional sources, each resolved or held back:
+    /// what [`crate::shell::source::missing`] is asked about.
+    #[must_use]
+    pub fn sources(&self) -> &[Resolution<Source>] {
+        &self.sources
     }
 
     /// The file with `functions` added: the enabled functions as
@@ -236,21 +259,30 @@ impl Interactive {
     }
 
     /// The note the file's plan row carries: every function held back from
-    /// it, named with what would release it, or `None` when none is.
+    /// it, then every source, each named with what would release it, or
+    /// `None` when none is.
     ///
     /// Decided by the values alone, never by `present`, so the note is the
     /// same whichever tools this machine has.
     #[must_use]
     pub fn note(&self) -> Option<String> {
-        let held: Vec<&BlockedEntry> = self
-            .functions
-            .iter()
-            .filter_map(|function| match function {
-                Resolution::Blocked(entry) => Some(entry),
-                Resolution::Ready(_) => None,
-            })
-            .collect();
-        crate::shell::function::note(&held)
+        fn held<T>(resolutions: &[Resolution<T>]) -> Vec<&BlockedEntry> {
+            resolutions
+                .iter()
+                .filter_map(|resolution| match resolution {
+                    Resolution::Blocked(entry) => Some(entry),
+                    Resolution::Ready(_) => None,
+                })
+                .collect()
+        }
+        let notes: Vec<String> = [
+            crate::shell::function::note(&held(&self.functions)),
+            crate::shell::source::note(&held(&self.sources)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 
     /// The file with `aliases` added, the disabled ones dropped.
@@ -300,14 +332,15 @@ impl Interactive {
     /// with plugins alone has no `env` phase, and a file whose every alias is
     /// gated on a missing tool has no `aliases` phase, and a file whose every
     /// function is held back has no `functions` phase. The bytes are a
-    /// function of the variables, the plugins, the aliases, the functions and
-    /// `present`'s answers alone.
+    /// function of the variables, the plugins, the aliases, the functions,
+    /// the sources and `present`'s answers alone: never of whether a plugin's
+    /// or a source's file exists.
     ///
-    /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
-    /// file is absent returns 1, and a file sourced at startup returns the
-    /// status of its last command, so a file ending on one would stop a shell
-    /// running under `ERR_EXIT` before its prompt — and show every other shell
-    /// a failed status at its first prompt.
+    /// A file holding a plugin or a source line closes with [`SETTLE`]. A
+    /// guarded line whose file is absent returns 1, and a file sourced at
+    /// startup returns the status of its last command, so a file ending on one
+    /// would stop a shell running under `ERR_EXIT` before its prompt — and
+    /// show every other shell a failed status at its first prompt.
     #[must_use]
     pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
         let mut assembly = Assembly::new();
@@ -323,16 +356,21 @@ impl Interactive {
         crate::shell::alias::contribute(&mut assembly, &self.aliases, present);
         // The held-back functions are the note's to name, not the bytes'.
         crate::shell::function::contribute(&mut assembly, &self.functions, present);
+        // Last, so each source follows its phase's own declarations; the
+        // held-back ones are the note's to name.
+        let sourced = crate::shell::source::contribute(&mut assembly, &self.sources, present);
         let mut out = assembly.render();
-        if !self.plugins.is_empty() {
+        if !self.plugins.is_empty() || sourced {
             out.push_str(SETTLE);
         }
         out
     }
 }
 
-/// The lines that close an interactive file holding a plugin: a comment, and a
-/// command that sets nothing and returns 0.
+/// The lines that close an interactive file holding a plugin or a source line:
+/// a comment, and a command that sets nothing and returns 0. The comment's
+/// words predate declared sources and are kept, so a file written before them
+/// is not rewritten for a comment.
 const SETTLE: &str = "\n# bx: done, whichever plugins were found\ntrue\n";
 
 /// Resolve the name a config author wrote as `generated = "…"`.

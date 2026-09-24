@@ -75,9 +75,14 @@ impl PluginDecl {
     /// The one line that sources the plugin when it is readable.
     #[must_use]
     pub fn line(&self) -> String {
-        let path = &self.source;
-        format!("[[ -r {path} ]] && source {path}\n")
+        guarded(&self.source)
     }
+}
+
+/// The one line that sources `path` when it is readable, and does nothing
+/// when it is not. `path` is one [`unsourceable`] passed.
+pub(crate) fn guarded(path: &str) -> String {
+    format!("[[ -r {path} ]] && source {path}\n")
 }
 
 /// Parse one `[[plugin]]` entry.
@@ -114,9 +119,9 @@ pub fn parse_plugin(table: &Table, file: &Path, text: &str) -> Result<PluginDecl
     })
 }
 
-/// Why `source` cannot be written bare into the plugin's line, or `None` when
-/// it can.
-fn unsourceable(source: &str) -> Option<String> {
+/// Why `source` cannot be written bare into a guarded line, or `None` when it
+/// can.
+pub(crate) fn unsourceable(source: &str) -> Option<String> {
     if !(source.starts_with("~/") || source.starts_with('/')) {
         return Some(format!(
             "`source = {source:?}` must open with `~/` or `/`: a relative path would be \

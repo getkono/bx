@@ -66,8 +66,10 @@
 //!
 //! **What does not hold.** The form does not recognise every pair that names
 //! one file for every answer. When it misses one, a layer that spells the same
-//! file twice loads `Ok` and the file is blocked as a [`Conflict`], whose
-//! "change that answer" hint no answer satisfies. **No general rule is claimed
+//! file twice loads `Ok` and the file is blocked as a [`Conflict`] that no
+//! answer clears. Because the form cannot anchor such a toggle to a declared
+//! spelling, the conflict's hint names the toggles to remove rather than an
+//! answer to change. **No general rule is claimed
 //! for which pairs are missed.** Several rounds of review each proposed one and
 //! each was found unsound or too narrow.
 //!
@@ -2034,7 +2036,9 @@ mod tests {
     ///
     /// Every entry is an **open defect**, registered rather than repaired, and
     /// that is a decision: the pair loads `Ok` and the file it names is blocked
-    /// as a [`Conflict`] whose hint no answer satisfies. Deciding one means
+    /// as a [`Conflict`] no answer clears. Its hint does not ask for one: a
+    /// toggle the written form cannot anchor to a declared spelling is named
+    /// for removal instead. Deciding one means
     /// widening the reduction, and every rule proposed for these shapes so far
     /// has been refuted — `REFUTED` holds each with the answers that killed it,
     /// which is why no general rule is claimed and why adding a pair here is a
@@ -2294,8 +2298,11 @@ mod tests {
         // `check_unique` refuses the layer before `merge` compares anything. A
         // toggle names a key by the spelling it reaches and is held to neither
         // that rule nor the one refusing a spelling that opens with a
-        // placeholder, so it is the route by which a miss becomes a `Conflict`
-        // whose "change that answer" hint no answer satisfies.
+        // placeholder, so it is the route by which a miss becomes a `Conflict`.
+        // No answer clears that clash, and neither toggle is anchored to a
+        // declared spelling, so its hint names both toggles for removal rather
+        // than an answer to change: removing them leaves the entry naming
+        // `/conf` once.
         const VALUES: &str = "[[value]]\nname = \"r\"\nkind = \"path\"\n";
         let (first, second) = ("/opt/{{r}}x/../../conf", "/opt/{{r}}/../../conf");
 
@@ -2328,6 +2335,15 @@ mod tests {
 
         assert_eq!(as_toggles.conflicts.len(), 1, "{:?}", as_toggles.conflicts);
         assert_eq!(as_toggles.conflicts[0].file, "/conf");
+        let hint = &as_toggles.conflicts[0].hint;
+        assert!(
+            hint.ends_with(&format!(
+                "remove the toggles `{first}` at bx.toml:7 and `{second}` at \
+                 bx.toml:10{CANNOT_SHOW_SEVERAL}"
+            )),
+            "{hint}"
+        );
+        assert!(!hint.contains("change that answer"), "{hint}");
     }
 
     #[test]

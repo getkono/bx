@@ -6753,7 +6753,9 @@ mod tests {
         // `bx add`'s advisory scan, and a test that reads a `Reason`'s text. A
         // new site fails here, and so does a known one that is gone, so the
         // list cannot rot, and a second route from a generated body to bytes
-        // cannot open without being read.
+        // cannot open without being read. The interactive file's `env` phase
+        // reaches the zsh judgement too, carrying the count of lines above it
+        // so a note names the file's own line.
         //
         // Until `config::target::Gen` had a variant this test held a second
         // fact — that no generated fragment reached the guard at all — which
@@ -6800,15 +6802,15 @@ mod tests {
             ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
             (
                 "plan/decide.rs",
-                "violations(&env_guard::scan_with(content, roots))",
+                "violations(&env_guard::scan_with(content, roots), before)",
             ),
             (
                 "plan/decide.rs",
-                "violations(&env_guard::scan_exported(content, roots))",
+                "violations(&env_guard::scan_exported(content, roots), 0)",
             ),
             (
                 "plan/decide.rs",
-                "fn violations(found: &[env_guard::Violation]) -> Option<String> {",
+                "fn violations(found: &[env_guard::Violation], before: usize) -> Option<String> {",
             ),
             ("plan/mod.rs", "use crate::env_guard::RootSet;"),
             (

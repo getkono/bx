@@ -39,12 +39,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::shell::alias::AliasDecl;
+use crate::shell::function::Function;
 use crate::shell::plugin::PluginDecl;
 use crate::shell::{Assembly, Phase};
 
 use toml_edit::Table;
 
 use super::history::History;
+use super::resolve::{BlockedEntry, Resolution};
 use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
 
@@ -128,11 +130,12 @@ pub enum Body {
 /// `apply` writes. [`Gen::render`] is that function.
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
-/// ([`super::env`]), which also carries the `[[plugin]]` entries and the
-/// declared aliases into the interactive file, and none is named by a config
-/// author: a fragment carries the variables resolution placed in it, which no
-/// `generated = "…"` string could spell. A generator a config author may name adds its variant here and
-/// its arm in [`parse_generated`] together.
+/// ([`super::env`]), which also carries the `[[plugin]]` entries, the
+/// declared aliases and the declared functions into the interactive file, and
+/// none is named by a config author: a fragment carries the variables
+/// resolution placed in it, which no `generated = "…"` string could spell. A
+/// generator a config author may name adds its variant here and its arm in
+/// [`parse_generated`] together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gen {
     /// An environment fragment: the variables one place holds. The plan judges
@@ -162,6 +165,18 @@ impl Gen {
             Self::Interactive(file) => file.render(present),
         }
     }
+
+    /// What the generator's plan row says beside its bytes: for the
+    /// interactive file, the functions held back from it, each with what
+    /// would release it. `None` for every other generator, and for an
+    /// interactive file holding every function it declares.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Self::Interactive(file) => file.note(),
+            Self::Env(_) | Self::Source(_) => None,
+        }
+    }
 }
 
 /// The interactive shell file, `~/.local/share/bx/zshrc.zsh`, rendered through
@@ -172,11 +187,14 @@ impl Gen {
 /// `[[plugin]]` lands in the `plugins` phase, or in the `terminal` slot when it
 /// claims it, as the one guarded line [`PluginDecl::line`] renders; the
 /// declared `[history]` lands in the `options` phase in zsh's names, as
-/// [`History::render_zsh`] renders it; and every enabled alias lands in the
+/// [`History::render_zsh`] renders it; every enabled alias lands in the
 /// `aliases` phase, as the line [`crate::shell::alias::AliasDecl::render`]
-/// renders for it. No phase but `env` holds an environment assignment
-/// (Invariant 2): the `options` phase assigns only zsh's own unexported
-/// history parameters, which [`super::history`]'s tests hold it to.
+/// renders for it; and every enabled `[[function]]` whose body resolved lands
+/// in the `functions` phase, as [`Function::render`] renders it. No phase but
+/// `env` holds an environment assignment (Invariant 2): the `options` phase
+/// assigns only zsh's own unexported history parameters, which
+/// [`super::history`]'s tests hold it to, and the `functions` phase assigns
+/// only zsh's hook arrays, which no process inherits.
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what
@@ -192,10 +210,13 @@ pub struct Interactive {
     history: History,
     /// The enabled aliases, in the merged configuration's order.
     aliases: Vec<AliasDecl>,
+    /// The enabled functions, each resolved or held back in its own
+    /// position, in the merged configuration's order.
+    functions: Vec<Resolution<Function>>,
 }
 
 impl Interactive {
-    /// The file holding `env`, and no plugin, history or alias.
+    /// The file holding `env`, and no plugin, history, alias or function.
     #[must_use]
     pub fn new(env: super::env::Fragment) -> Self {
         Self {
@@ -203,6 +224,7 @@ impl Interactive {
             plugins: Vec::new(),
             history: History::default(),
             aliases: Vec::new(),
+            functions: Vec::new(),
         }
     }
 
@@ -217,6 +239,39 @@ impl Interactive {
     #[must_use]
     pub const fn history(&self) -> &History {
         &self.history
+    }
+
+    /// The file with `functions` added: the enabled functions as
+    /// [`crate::shell::function::resolve`] resolved them, each ready one
+    /// written and each held-back one named by [`Interactive::note`].
+    #[must_use]
+    pub fn with_functions(mut self, functions: Vec<Resolution<Function>>) -> Self {
+        self.functions = functions;
+        self
+    }
+
+    /// The enabled functions, each resolved or held back.
+    #[must_use]
+    pub fn functions(&self) -> &[Resolution<Function>] {
+        &self.functions
+    }
+
+    /// The note the file's plan row carries: every function held back from
+    /// it, named with what would release it, or `None` when none is.
+    ///
+    /// Decided by the values alone, never by `present`, so the note is the
+    /// same whichever tools this machine has.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        let held: Vec<&BlockedEntry> = self
+            .functions
+            .iter()
+            .filter_map(|function| match function {
+                Resolution::Blocked(entry) => Some(entry),
+                Resolution::Ready(_) => None,
+            })
+            .collect();
+        crate::shell::function::note(&held)
     }
 
     /// The file with `aliases` added, the disabled ones dropped.
@@ -264,10 +319,11 @@ impl Interactive {
     ///
     /// The fragment is contributed only when it holds a variable, so a file
     /// with plugins alone has no `env` phase, a history declaring nothing zsh
-    /// reads adds no `options` phase, and a file whose every alias is gated on
-    /// a missing tool has no `aliases` phase. The bytes are a function of the
-    /// variables, the plugins, the history, the aliases and `present`'s
-    /// answers alone.
+    /// reads adds no `options` phase, a file whose every alias is gated on a
+    /// missing tool has no `aliases` phase, and a file whose every function is
+    /// held back has no `functions` phase. The bytes are a function of the
+    /// variables, the plugins, the history, the aliases, the functions and
+    /// `present`'s answers alone.
     ///
     /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
     /// file is absent returns 1, and a file sourced at startup returns the
@@ -294,6 +350,8 @@ impl Interactive {
         // admitted at most one claimant.
         contributed.expect("an `Interactive` holds at most one terminal claimant");
         crate::shell::alias::contribute(&mut assembly, &self.aliases, present);
+        // The held-back functions are the note's to name, not the bytes'.
+        crate::shell::function::contribute(&mut assembly, &self.functions, present);
         let mut out = assembly.render();
         if !self.plugins.is_empty() {
             out.push_str(SETTLE);
@@ -2027,6 +2085,83 @@ mod tests {
             assert!(with_eza.contains("alias ls='eza'\n"), "{with_eza}");
             assert!(!with_eza.contains("bat"), "{with_eza}");
             assert!(!with_eza.contains("command -v"), "{with_eza}");
+        }
+
+        fn ready(name: &str, body: &str, hook: Option<&str>) -> Resolution<Function> {
+            Resolution::Ready(Function {
+                name: name.to_string(),
+                body: body.to_string(),
+                hook: hook.map(|h| crate::shell::function::Hook::parse(h).expect("a hook")),
+                when: None,
+            })
+        }
+
+        fn held(name: &str, hint: &str) -> Resolution<Function> {
+            Resolution::Blocked(BlockedEntry {
+                key: name.to_string(),
+                origin: super::super::super::Origin {
+                    file: PathBuf::from("/repo/bx.toml"),
+                    line: 9,
+                },
+                reason: super::super::super::resolve::BlockReason::UnsetValue {
+                    names: vec!["proj".to_string()],
+                },
+                hint: hint.to_string(),
+            })
+        }
+
+        #[test]
+        fn functions_land_after_aliases_and_the_held_back_ones_are_named_in_the_note() {
+            let file = Interactive::new(fragment(Vec::new()))
+                .with_aliases(&[alias("ll", "ls -la", None)])
+                .with_functions(vec![
+                    ready("mkcd", "mkdir -p -- \"$1\" && cd -- \"$1\"\n", None),
+                    held("goproj", "run `bx init` to set proj"),
+                    ready("track", "return 0", Some("chpwd")),
+                ]);
+            assert_eq!(file.functions().len(), 3);
+            let rendered = render(&file);
+            assert_eq!(
+                rendered,
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: aliases\n\
+                 alias ll='ls -la'\n\
+                 \n# bx phase: functions\n\
+                 function mkcd {\nmkdir -p -- \"$1\" && cd -- \"$1\"\n}\n\
+                 function __bx_hook_track {\nreturn 0\n}\n\
+                 (( ${+chpwd_functions} )) && (( ${chpwd_functions[(Ie)__bx_hook_track]} )) \
+                 || chpwd_functions+=(__bx_hook_track)\n"
+            );
+            assert_eq!(render(&file), rendered, "byte-identical");
+            assert!(!rendered.contains("goproj"), "{rendered}");
+            assert_eq!(
+                file.note().as_deref(),
+                Some("function `goproj` held back: run `bx init` to set proj")
+            );
+            assert_eq!(
+                Gen::Interactive(file.clone()).note(),
+                file.note(),
+                "the generator's note is the file's"
+            );
+
+            // Every function held back: no `functions` phase, and the note
+            // names each in declaration order.
+            let all_held = Interactive::new(fragment(Vec::new()))
+                .with_functions(vec![held("a", "answer a"), held("b", "answer b")]);
+            assert_eq!(
+                render(&all_held),
+                "# Generated by bx. Edit the config repo, not this file.\n"
+            );
+            assert_eq!(
+                all_held.note().as_deref(),
+                Some("function `a` held back: answer a; function `b` held back: answer b")
+            );
+
+            // Nothing held back, and no other generator, says anything.
+            assert_eq!(Interactive::new(fragment(Vec::new())).note(), None);
+            assert_eq!(Gen::Env(fragment(Vec::new())).note(), None);
+            let source = Portable::parse_in("~/.x", Path::new("/home/u")).expect("portable");
+            assert_eq!(Gen::Source(source).note(), None);
         }
 
         #[test]

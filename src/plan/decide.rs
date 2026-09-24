@@ -424,12 +424,18 @@ pub(super) fn decide(
             return Ok((change, None));
         }
     };
+    // A generator may hold part of its content back, and every row of its
+    // target says so, whatever the row's action.
+    let held = match &target.body {
+        Body::Generated(generator) => generator.note(),
+        _ => None,
+    };
     let row = |action, diff, note| Change {
         target: target.path.as_str().to_string(),
         origin: target.origin.clone(),
         action,
         diff,
-        note,
+        note: join([note, held.clone()]),
     };
 
     let bytes = match wanted(target, ctx)? {
@@ -899,8 +905,12 @@ fn unsupported(target: &Target) -> Option<&'static str> {
 /// The interactive file is judged by its `env` phase alone, rendered with the
 /// same `present` as the file, since that phase is its one environment
 /// fragment; every other phase holds plugin and alias lines that set nothing,
-/// which the guard's grammar would refuse as unreadable, and the tests of
-/// [`crate::config::target::Interactive`] hold them to carrying no assignment.
+/// and function definitions whose registrations assign only zsh's hook
+/// arrays, which the guard's grammar would refuse as unreadable. The tests of
+/// [`crate::config::target::Interactive`] hold the plugin and alias lines to
+/// carrying no assignment, and those of [`crate::shell::function`] and this
+/// module hold the `functions` phase to changing no parameter but a hook
+/// array.
 /// A line number in the note is still the file's own: the phase is found in
 /// the file's bytes, and each line is counted from the top of the file.
 fn guard_generated(
@@ -2671,6 +2681,172 @@ mod tests {
                 // something.
                 let parts = dumps("Z=1\n");
                 assert_ne!(parts[2], parts[0]);
+            }
+
+            // Reversible: `rm` puts back the bytes each file held before bx.
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
+                .iter()
+                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+                .collect();
+            crate::restore::restore(&state, home.path(), &targets).expect("rm");
+            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
+            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+        }
+
+        /// The `functions` phase of an interactive file's bytes: from its
+        /// heading up to the next phase's, headings excluded.
+        fn functions_phase(written: &str) -> &str {
+            let heading = "# bx phase: functions\n";
+            let start = written.find(heading).expect("a functions phase") + heading.len();
+            let rest = &written[start..];
+            rest.find("\n# bx phase: ")
+                .map_or(rest, |end| &rest[..=end])
+        }
+
+        #[test]
+        fn a_declared_function_arrives_once_its_value_is_answered_and_sets_only_hook_arrays() {
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            let layer = "[[value]]\nname = \"proj\"\nkind = \"string\"\n\n\
+                         [[function]]\nname = \"mkcd\"\n\
+                         body = '''\nmkdir -p -- \"$1\" && cd -- \"$1\"\n'''\n\
+                         [[function]]\nname = \"goproj\"\nbody = \"cd -- {{proj}}\"\n\
+                         [[function]]\nname = \"track\"\nbody = \"return 0\"\nhook = \"chpwd\"\n\
+                         [[function]]\nname = \"off\"\nbody = \"x\"\nenabled = false\n";
+            let registration = "(( ${+chpwd_functions} )) && \
+                                (( ${chpwd_functions[(Ie)__bx_hook_track]} )) || \
+                                chpwd_functions+=(__bx_hook_track)\n";
+            let ready = format!(
+                "function mkcd {{\nmkdir -p -- \"$1\" && cd -- \"$1\"\n}}\n\
+                 function __bx_hook_track {{\nreturn 0\n}}\n{registration}"
+            );
+
+            // Functions alone place the file and its region. The one waiting
+            // on `proj` is held back, named in the file's row, and every
+            // other function is written.
+            let first = apply(&home, layer);
+            assert_eq!(
+                rows(&first),
+                vec![
+                    ("~/.local/share/bx/zshrc.zsh", Action::Create),
+                    ("~/.zshrc", Action::Modify),
+                ]
+            );
+            let note = row(&first, "~/.local/share/bx/zshrc.zsh")
+                .note
+                .as_deref()
+                .expect("a note naming the held-back function");
+            assert!(note.contains("function `goproj` held back: "), "{note}");
+            assert!(note.contains("proj"), "{note}");
+            assert!(note.contains("bx init"), "{note}");
+            assert_eq!(row(&first, "~/.zshrc").note, None);
+            let written = read(&home, ".local/share/bx/zshrc.zsh");
+            assert_eq!(
+                written,
+                format!("{}\n# bx phase: functions\n{ready}", interactive(""))
+            );
+            assert!(!written.contains("goproj"), "{written}");
+            assert!(!written.contains("off"), "{written}");
+
+            // Idempotent while the value is unanswered: nothing to write, and
+            // the row still says why the function is missing.
+            let second = plan(&home, layer);
+            assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&second)
+            );
+            let held = row(&second, "~/.local/share/bx/zshrc.zsh")
+                .note
+                .as_deref()
+                .expect("the held-back function is still named");
+            assert!(held.starts_with("function `goproj` held back: "), "{held}");
+            assert!(note.ends_with(held), "{note}");
+
+            // Answering the value is a change the next plan shows, and the
+            // function arrives with it substituted, in declaration order.
+            home.write(
+                ".local/state/bx/local.toml",
+                "[values]\nproj = \"src/bx\"\n",
+            );
+            let answered = plan(&home, layer);
+            let file = row(&answered, "~/.local/share/bx/zshrc.zsh");
+            assert_eq!(file.action, Action::Modify);
+            assert_eq!(file.note, None, "nothing is held back");
+            assert_eq!(row(&answered, "~/.zshrc").action, Action::Unchanged);
+            apply(&home, layer);
+            let written = read(&home, ".local/share/bx/zshrc.zsh");
+            let phase = functions_phase(&written);
+            assert_eq!(
+                phase,
+                format!(
+                    "function mkcd {{\nmkdir -p -- \"$1\" && cd -- \"$1\"\n}}\n\
+                     function goproj {{\ncd -- src/bx\n}}\n\
+                     function __bx_hook_track {{\nreturn 0\n}}\n{registration}"
+                )
+            );
+            let settled = plan(&home, layer);
+            assert!(
+                settled
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&settled)
+            );
+
+            // Invariant 2: sourcing the written `functions` phase exports
+            // nothing and changes no parameter but zsh's hook arrays.
+            if let Some(zsh) = crate::shell::testing::installed("zsh") {
+                let dump = "__bx_dump() { local n; for n in ${(ok)parameters}; do \
+                            [[ ${parameters[$n]} == *special* ]] || \
+                            print -r -- \"$n=${(P)n}\"; \
+                            done; print -r -- ---; export; print -r -- ---; }\n";
+                let dumps = |body: &str| {
+                    let script =
+                        format!("{dump}__bx_dump >/dev/null\n__bx_dump\n{body}__bx_dump\n");
+                    let got = String::from_utf8(crate::shell::testing::run(&zsh, &["-f"], &script))
+                        .expect("utf-8");
+                    got.split("---\n").map(str::to_string).collect::<Vec<_>>()
+                };
+                let parts = dumps(phase);
+                assert_eq!(parts[1], parts[3], "nothing is exported");
+                let hooks: Vec<String> = crate::shell::function::Hook::ALL
+                    .iter()
+                    .map(|hook| hook.array())
+                    .collect();
+                let kept = |dump: &str| {
+                    dump.lines()
+                        .filter(|line| {
+                            let name = line.split('=').next().unwrap_or_default();
+                            !hooks.iter().any(|hook| hook == name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                assert_eq!(kept(&parts[2]), kept(&parts[0]), "only hook arrays change");
+                assert!(
+                    parts[2]
+                        .lines()
+                        .any(|line| line == "chpwd_functions=__bx_hook_track"),
+                    "{}",
+                    parts[2]
+                );
+                // The functions were defined, so the phase ran at all.
+                let defined = crate::shell::testing::run(
+                    &zsh,
+                    &["-f"],
+                    &format!("{phase}print -r -- ${{+functions[goproj]}} ${{+functions[mkcd]}}\n"),
+                );
+                assert_eq!(defined, b"1 1\n");
+                // The dump does see an assignment, so the equalities mean
+                // something.
+                let parts = dumps("Z=1\n");
+                assert_ne!(kept(&parts[2]), kept(&parts[0]));
             }
 
             // Reversible: `rm` puts back the bytes each file held before bx.

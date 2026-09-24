@@ -116,6 +116,16 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// A directory in the config repo, to hold an adopted body, could not be
+    /// made.
+    #[error("creating {}: {source}", .path.display())]
+    RepoDir {
+        /// The directory.
+        path: PathBuf,
+        /// Why.
+        #[source]
+        source: std::io::Error,
+    },
     /// A write failed.
     #[error(transparent)]
     Fs(#[from] fs::Error),
@@ -629,9 +639,7 @@ fn relocations(bytes: &[u8], roots: &RootSet) -> Vec<String> {
 /// Take the state directory for a writing command: resolve any interrupted
 /// session, then hold the lock, refusing if a session still stands.
 fn lock(state: &StateDir) -> Result<ExclusiveLock, Error> {
-    recover::before_writing(state)?;
-    state.ensure()?;
-    let lock = ExclusiveLock::acquire(state)?;
+    let lock = recover::lock_for_writing(state)?;
     let path = state.journal();
     if journal::load_exclusive(&path, &lock)?.is_interrupted() {
         return Err(journal::Error::InProgress { path }.into());
@@ -663,7 +671,18 @@ pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
             ..
         } = row
         {
-            fs::write_atomically(&ctx.repo.join(body), bytes, *mode)?;
+            // `write_atomically` makes no directories. These are in the user's
+            // config repo, not the home: nothing reverses them (rm leaves the
+            // body, decision 5), so they are made as `git` makes a checkout's
+            // directories, at the umask's mode.
+            let path = ctx.repo.join(body);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| Error::RepoDir {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            fs::write_atomically(&path, bytes, *mode)?;
         }
     }
     declare(ctx, &rows)?;
@@ -683,16 +702,20 @@ pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
         } = row
         {
             ledger.record(
+                // The prior is the file as the user left it, for `Own` as for
+                // `Adopt`: bx wrote nothing here, so `rm` must put these bytes
+                // back rather than read `Absent` and unlink a file the user
+                // wrote.
                 NewEntry::new(
                     target.clone(),
                     ContentHash::of(bytes),
                     *mode,
                     Mechanism::Own,
-                )
-                .with_prior(PriorBytes::Bytes {
-                    bytes: bytes.clone(),
-                    mode: *mode,
-                }),
+                    PriorBytes::Bytes {
+                        bytes: bytes.clone(),
+                        mode: *mode,
+                    },
+                ),
             )?;
             recorded = true;
         }
@@ -1315,7 +1338,7 @@ mod tests {
     #[test]
     fn a_declared_identical_file_bx_does_not_own_becomes_owned() {
         let home = repo(&inline("~/.declared", "same\\n"));
-        plant(&home, ".declared", b"same\n", 0o644);
+        let file = plant(&home, ".declared", b"same\n", 0o644);
         let layer_before = layer(&home);
 
         let rows = add_rel(&home, ".declared");
@@ -1324,13 +1347,25 @@ mod tests {
             "{rows:?}"
         );
         assert_eq!(layer(&home), layer_before, "nothing declared twice");
-        assert!(ledger(&home).get(&target(&home, ".declared")).is_some());
+        let entry = ledger(&home)
+            .get(&target(&home, ".declared"))
+            .cloned()
+            .expect("owned");
+        assert!(
+            matches!(entry.prior, Prior::Existed(_)),
+            "the file the user wrote is the prior, never Absent: {entry:?}"
+        );
 
         let rows = add_rel(&home, ".declared");
         assert!(
             matches!(rows.as_slice(), [Adoption::Unchanged { .. }]),
             "{rows:?}"
         );
+
+        // `rm` hands the file back rather than unlinking it: bx wrote none of it.
+        rm_rel(&home, ".declared");
+        assert_eq!(std::fs::read(&file).expect("still there"), b"same\n");
+        assert_eq!(mode_of(&file), 0o644);
     }
 
     #[test]

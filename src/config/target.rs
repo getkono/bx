@@ -38,6 +38,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::shell::alias::AliasDecl;
 use crate::shell::plugin::PluginDecl;
 use crate::shell::{Assembly, Phase};
 
@@ -126,10 +127,10 @@ pub enum Body {
 /// `apply` writes. [`Gen::render`] is that function.
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
-/// ([`super::env`]), which also carries the `[[plugin]]` entries into the
-/// interactive file, and none is named by a config author: a fragment carries
-/// the variables resolution placed in it, which no `generated = "…"` string
-/// could spell. A generator a config author may name adds its variant here and
+/// ([`super::env`]), which also carries the `[[plugin]]` entries and the
+/// declared aliases into the interactive file, and none is named by a config
+/// author: a fragment carries the variables resolution placed in it, which no
+/// `generated = "…"` string could spell. A generator a config author may name adds its variant here and
 /// its arm in [`parse_generated`] together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gen {
@@ -168,8 +169,10 @@ impl Gen {
 /// The interactive `[[env]]` fragment lands in the `env` phase, whole, and is
 /// the one part of the file [`crate::env_guard`] judges; every enabled
 /// `[[plugin]]` lands in the `plugins` phase, or in the `terminal` slot when it
-/// claims it, as the one guarded line [`PluginDecl::line`] renders. No phase
-/// but `env` holds an assignment (Invariant 2).
+/// claims it, as the one guarded line [`PluginDecl::line`] renders; and every
+/// enabled alias lands in the `aliases` phase, as the line
+/// [`crate::shell::alias::AliasDecl::render`] renders for it. No phase but
+/// `env` holds an assignment (Invariant 2).
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what
@@ -180,16 +183,36 @@ pub struct Interactive {
     env: super::env::Fragment,
     /// The enabled plugins, in declaration order.
     plugins: Vec<PluginDecl>,
+    /// The enabled aliases, in the merged configuration's order.
+    aliases: Vec<AliasDecl>,
 }
 
 impl Interactive {
-    /// The file holding `env` and no plugin.
+    /// The file holding `env` and no plugin or alias.
     #[must_use]
     pub const fn new(env: super::env::Fragment) -> Self {
         Self {
             env,
             plugins: Vec::new(),
+            aliases: Vec::new(),
         }
+    }
+
+    /// The file with `aliases` added, the disabled ones dropped.
+    ///
+    /// Whether a `has:TOOL` alias is written is not decided here: it is
+    /// decided by [`Interactive::render`]'s `present`, so the file carries
+    /// every enabled alias and the bytes follow the machine.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: &[AliasDecl]) -> Self {
+        self.aliases = aliases.iter().filter(|a| a.enabled).cloned().collect();
+        self
+    }
+
+    /// The enabled aliases, in the merged configuration's order.
+    #[must_use]
+    pub fn aliases(&self) -> &[AliasDecl] {
+        &self.aliases
     }
 
     /// The file with `plugins` added, the disabled ones dropped.
@@ -219,8 +242,10 @@ impl Interactive {
     /// The file's bytes.
     ///
     /// The fragment is contributed only when it holds a variable, so a file
-    /// with plugins alone has no `env` phase. The bytes are a function of the
-    /// variables, the plugins and `present`'s answers alone.
+    /// with plugins alone has no `env` phase, and a file whose every alias is
+    /// gated on a missing tool has no `aliases` phase. The bytes are a
+    /// function of the variables, the plugins, the aliases and `present`'s
+    /// answers alone.
     ///
     /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
     /// file is absent returns 1, and a file sourced at startup returns the
@@ -239,6 +264,7 @@ impl Interactive {
         // Only the terminal slot refuses a contribution, and `with_plugins`
         // admitted at most one claimant.
         contributed.expect("an `Interactive` holds at most one terminal claimant");
+        crate::shell::alias::contribute(&mut assembly, &self.aliases, present);
         let mut out = assembly.render();
         if !self.plugins.is_empty() {
             out.push_str(SETTLE);
@@ -1839,6 +1865,19 @@ mod tests {
             }
         }
 
+        fn alias(name: &str, command: &str, when: Option<&str>) -> AliasDecl {
+            AliasDecl {
+                name: name.to_string(),
+                command: command.to_string(),
+                when: when.map(|w| crate::config::when::When::parse(w).expect("a condition")),
+                enabled: true,
+                origin: super::super::super::Origin {
+                    file: PathBuf::from("/repo/bx.toml"),
+                    line: 1,
+                },
+            }
+        }
+
         fn render(file: &Interactive) -> String {
             file.render(&|_| true)
         }
@@ -1901,6 +1940,64 @@ mod tests {
             assert!(!plugins_only.contains("# bx phase: env"), "{plugins_only}");
             assert!(!plugins_only.contains("[[env]]"), "{plugins_only}");
             assert!(plugins_only.starts_with(bare), "{plugins_only}");
+            // Aliases alone: no `env` phase, and no closing line, since an
+            // alias line returns 0.
+            let aliases_only = render(
+                &Interactive::new(fragment(Vec::new())).with_aliases(&[alias("ll", "ls", None)]),
+            );
+            assert_eq!(
+                aliases_only,
+                format!("{bare}\n# bx phase: aliases\nalias ll='ls'\n")
+            );
+            // Every alias gated on a missing tool: no `aliases` phase at all.
+            let gated_off = Interactive::new(fragment(Vec::new()))
+                .with_aliases(&[alias("cat", "bat", Some("has:bat"))])
+                .render(&|_| false);
+            assert_eq!(gated_off, bare);
+        }
+
+        #[test]
+        fn aliases_land_between_plugins_and_the_terminal_slot_decided_by_present() {
+            let mut off = alias("off", "nothing", None);
+            off.enabled = false;
+            let file = Interactive::new(fragment(vec![Var::always("EDITOR", "nvim")]))
+                .with_plugins(&[
+                    plugin("highlight", "~/h.zsh", true, 1),
+                    plugin("p", "~/p.zsh", false, 2),
+                ])
+                .expect("one claimant")
+                .with_aliases(&[
+                    alias("zz", "declared first", None),
+                    off,
+                    alias("cat", "bat --paging=never", Some("has:bat")),
+                    alias("ls", "eza", Some("has:eza")),
+                ]);
+            assert_eq!(file.aliases().len(), 3, "the disabled one is dropped");
+            let with_bat = file.render(&|tool| tool == "bat");
+            assert_eq!(
+                with_bat,
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: env\n\
+                 # Generated by bx from [[env]]. Edit the config repo, not this file.\n\
+                 export EDITOR=nvim\n\
+                 \n# bx phase: plugins\n\
+                 [[ -r ~/p.zsh ]] && source ~/p.zsh\n\
+                 \n# bx phase: aliases\n\
+                 alias zz='declared first'\n\
+                 alias cat='bat --paging=never'\n\
+                 \n# bx phase: terminal\n\
+                 [[ -r ~/h.zsh ]] && source ~/h.zsh\n\
+                 \n# bx: done, whichever plugins were found\ntrue\n"
+            );
+            assert_eq!(
+                file.render(&|tool| tool == "bat"),
+                with_bat,
+                "byte-identical"
+            );
+            let with_eza = file.render(&|tool| tool == "eza");
+            assert!(with_eza.contains("alias ls='eza'\n"), "{with_eza}");
+            assert!(!with_eza.contains("bat"), "{with_eza}");
+            assert!(!with_eza.contains("command -v"), "{with_eza}");
         }
 
         #[test]
@@ -1923,42 +2020,66 @@ mod tests {
         fn no_phase_but_env_sets_anything() {
             // Invariant 2: only the `env` phase is an environment fragment.
             // Every other line bx writes here is a comment, a blank, a plugin
-            // line or the closing `true`, and none holds an `=`.
+            // line, an alias line or the guarded block around one, or the
+            // closing `true`. None but an alias line holds an `=`, and an
+            // alias line is exactly the one its declaration renders: the
+            // `alias` builtin given one word, the body single-quoted.
+            let aliases = [
+                alias("ll", "ls -la", None),
+                alias("g", "export X=1", Some("interactive")),
+                alias("h", "Y=2 it's", Some("env:TMUX")),
+                alias("gone", "Z=3", Some("has:missing")),
+            ];
             let file = Interactive::new(fragment(vec![Var::always("EDITOR", "nvim")]))
                 .with_plugins(&[
                     plugin("t", "~/t.zsh", true, 1),
                     plugin("p", "/opt/p/p.zsh", false, 2),
                 ])
-                .expect("one claimant");
-            let rendered = render(&file);
+                .expect("one claimant")
+                .with_aliases(&aliases);
+            let present = |tool: &str| tool != "missing";
+            let rendered = file.render(&present);
             let env = phase(&rendered, "# bx phase: env");
             assert_eq!(env.len(), 2, "{rendered}");
+            assert_eq!(phase(&rendered, "# bx phase: aliases").len(), 7);
+            let alias_lines: Vec<String> = aliases
+                .iter()
+                .map(|a| a.line().trim_end().to_string())
+                .collect();
             let rest: Vec<&str> = rendered
                 .lines()
                 .filter(|line| !env.contains(line))
                 .collect();
             for line in &rest {
+                let bare = line.trim_start();
+                if alias_lines.iter().any(|expected| expected == bare) {
+                    continue;
+                }
                 assert!(!line.contains('='), "{line:?}");
                 assert!(
                     line.is_empty()
                         || line.starts_with("# ")
                         || line.starts_with("[[ -r ")
+                        || (line.starts_with("if [[ ") && line.ends_with(" ]]; then"))
+                        || *line == "fi"
                         || *line == "true",
                     "{line:?}"
                 );
             }
+            assert!(!rendered.contains("Z=3"), "{rendered}");
 
             // And in zsh: sourcing everything but the `env` phase changes no
             // parameter and exports nothing, whether or not a plugin's file
-            // is there.
+            // is there, and whichever runtime condition an alias holds.
             let Some(zsh) = installed("zsh") else {
                 return;
             };
-            let without_env = render(
-                &Interactive::new(fragment(Vec::new()))
-                    .with_plugins(file.plugins())
-                    .expect("one claimant"),
-            );
+            let without_env = Interactive::new(fragment(Vec::new()))
+                .with_plugins(file.plugins())
+                .expect("one claimant")
+                .with_aliases(file.aliases())
+                .render(&present);
+            assert!(without_env.contains("alias ll='ls -la'\n"), "{without_env}");
             let dump = "__bx_dump() { local n; for n in ${(ok)parameters}; do \
                         [[ ${parameters[$n]} == *special* ]] || print -r -- \"$n=${(P)n}\"; \
                         done; print -r -- ---; export; print -r -- ---; }\n";

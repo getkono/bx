@@ -29,9 +29,28 @@ wrong even if it passes CI.
 
 1. **Additive only.** Never delete or rewrite a byte the user wrote. Writes land
    in delimited managed regions, or in files bx owns because the user said so.
-2. **Native locations only.** Never point a tool at a bx-owned directory. Never
-   emit an env var that relocates a tool's config, data, or cache — `env_guard`
-   enforces this and every generated shell fragment must pass through it.
+2. **Native locations unless the configuration declares otherwise.** Never point
+   a tool at a bx-owned directory. Never move a tool's config, data, or cache
+   outside a root the configuration declares. `env_guard` enforces this, and
+   every generated environment fragment must pass through it: a fragment may set
+   only variables bx knows how to judge, and each value is judged for what it is
+   — a location, a list of locations, an anchor, a program, a search list, a
+   socket or a setting. Generated shell content that is **not** an environment
+   fragment must carry no environment assignment at all; that replacement rule
+   is what keeps the guard's reach total. The shell-init snippet is the one
+   file under it: fixed text that sets no environment variable outside bx's own
+   `BX_` namespace, and gets every other variable by sourcing a guarded
+   environment fragment, and `env_guard`'s
+   `the_init_snippet_is_not_an_environment_fragment` holds its bytes to the
+   rule. Nothing holds a *second* such file to it, so the change that generates
+   one carries the proof of its own bytes with it. Declare no root and nothing
+   moves: no location, no list of locations and no anchor is permitted at all.
+   A program, a search list and a socket say what a tool runs, where it looks
+   and what it connects to rather than where its files live, so they move
+   nothing and need no root — but no more than any other kind may they point
+   inside a directory bx owns. Containment is decided lexically, never by
+   touching the filesystem, because invariant 3 forbids a verdict that depends
+   on what happens to exist.
 3. **Idempotent.** `apply` twice must produce an empty second `plan`, and
    generated files must be byte-identical between runs: no timestamps, no
    nondeterministic iteration order.

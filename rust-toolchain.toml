@@ -1,3 +1,8 @@
+# The components CI actually uses: `rustfmt` for `format-check`, `clippy` for
+# `lint`, `llvm-tools-preview` for `coverage`. `rust-analyzer` is deliberately
+# absent — it is an IDE component no task here runs, and requiring it made every
+# `cargo` invocation on a clean runner download it (see issue #55). A developer
+# who wants it runs `rustup component add rust-analyzer`.
 [toolchain]
 channel = "stable"
-components = ["rustfmt", "clippy", "rust-analyzer", "llvm-tools-preview"]
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

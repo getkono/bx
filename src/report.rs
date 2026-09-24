@@ -50,7 +50,8 @@ pub enum Action {
     /// shell fragment naming a binary: writing `RUSTC_WRAPPER=/usr/bin/sccache`
     /// when sccache is absent does not degrade gracefully, it breaks every
     /// `cargo build` on the machine. [`env_guard`](crate::env_guard) cannot
-    /// catch that — it checks the name being assigned, not the value.
+    /// catch that — it checks where a value points, never whether what it
+    /// points at exists, which is a question only the filesystem can answer.
     Blocked,
 }
 

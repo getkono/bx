@@ -3,8 +3,10 @@
 //! The crate is organised around two invariants that the rest of the tool is
 //! built on top of, and that are enforced here rather than by convention:
 //!
-//! * [`env_guard`] — bx may never emit an environment variable that relocates
-//!   another tool's config, data, or cache away from that tool's default.
+//! * [`env_guard`] — bx may never emit an environment variable that moves
+//!   another tool's config, data, or cache outside a root the configuration
+//!   declares. It admits only variables bx knows how to judge, and judges each
+//!   value for what the variable holds.
 //! * [`paths`] — anything stored in the config repo is home-relative, so a repo
 //!   moves between machines with different `$HOME` values without edits.
 //!

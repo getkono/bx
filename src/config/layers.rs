@@ -44,12 +44,21 @@
 //!   paths that name one directory are one directory, whatever they are
 //!   written as, and that includes a bind mount of the repo.
 //!
+//! The identity check never starts from the normalized spelling. A `..` after
+//! a symlink is resolved by the kernel against the link's physical parent, but
+//! [`paths::normalize`] cancels it against the link's lexical one: with
+//! `link -> repo/sub`, `link/..` is the repo on disk and the link's own parent
+//! as spelled. So the state directory's spelling is walked a component at a
+//! time, each `..` left for the kernel to resolve, and only the part that does
+//! not exist yet is reduced by spelling.
+//!
 //! The cost is paid here on purpose: layer resolution reads the filesystem for
 //! this check. It already does — [`super::layer_files`] lists the repo and
-//! `local.toml` is `lstat`ed — so the check adds one `stat` of the repo and one
-//! `stat` per directory from the state directory up to `/`. It reads no link
-//! and resolves no path, and its failures are the ones examining `local.toml`
-//! already had: a path that cannot be examined is an [`Error::Io`] naming it. It is not on the
+//! `local.toml` is `lstat`ed — so the check adds one `stat` of the repo, one
+//! per component of the state directory's spelling, and one per directory from
+//! the state directory up to `/`. It reads no link and resolves no path, and
+//! its failures are the ones examining `local.toml` already had: a path that
+//! cannot be examined is an [`Error::Io`] naming it. It is not on the
 //! shell-start path, so Invariant 6 is untouched, and Invariant 3 is unchanged:
 //! the answer depends on the filesystem, as the layer list already did, not on
 //! the time or the order of anything. The `local.toml` writer entry A8 adds may
@@ -153,20 +162,22 @@ pub fn layer_paths(repo: &Path, state_dir: &Path) -> Result<Vec<PathBuf>, Error>
 
 /// Whether `dir` is `repo`, or beneath it, on disk rather than as spelled.
 ///
-/// The deepest part of `dir` that exists is found — the rest of it can only be
-/// created beneath that — and it and every directory physically above it, up
-/// to `/`, is compared with `repo` by device and inode. No link is read or
+/// The deepest part of `dir` that exists is found by [`deepest_existing`] — the
+/// rest of it can only be created beneath that — with each `..` in `dir`'s own
+/// spelling resolved physically rather than cancelled by
+/// [`paths::normalize`]. It and every directory physically above it, up to
+/// `/`, is compared with `repo` by device and inode. No link is read or
 /// walked: the kernel answers each step, which is what catches a link that
 /// points *into* the repo rather than at it — `link/state` with
 /// `link -> repo/sub` has no lexical ancestor that is the repo, but `link/..`
-/// is the repo.
+/// is the repo, and so is a state directory spelled `link/..` itself.
 ///
 /// The first step up is the lexical parent unless the deepest existing part is
-/// itself a symlink. A path's last component that is not a link lives in the
-/// directory its parent spelling resolves to, so that step needs no search
-/// permission on the state directory itself — one at mode 0644 is still
-/// examined, and reported for what it is by [`layer_paths`]. Every later step
-/// is `..`, which the kernel resolves physically.
+/// itself a symlink or ends in `..`. A path's last component that is not a
+/// link lives in the directory its parent spelling resolves to, so that step
+/// needs no search permission on the state directory itself — one at mode
+/// 0644 is still examined, and reported for what it is by [`layer_paths`].
+/// Every later step is `..`, which the kernel resolves physically.
 ///
 /// A repo that does not exist has nothing inside it on disk, and a `dir` none of
 /// whose ancestors exist is not inside anything; both are `false`, and the
@@ -179,7 +190,7 @@ fn inside_on_disk(dir: &Path, repo: &Path) -> Result<bool, Error> {
     let Some(repo_id) = identity(repo)? else {
         return Ok(false);
     };
-    let mut existing = paths::normalize(dir);
+    let mut existing = deepest_existing(dir)?;
     let mut previous = loop {
         if let Some(id) = identity(&existing)? {
             break id;
@@ -192,20 +203,22 @@ fn inside_on_disk(dir: &Path, repo: &Path) -> Result<bool, Error> {
         return Ok(true);
     }
 
-    let is_link = std::fs::symlink_metadata(&existing)
-        .map_err(|source| Error::Io {
-            path: existing.clone(),
-            source,
-        })?
-        .is_symlink();
-    let mut at = if is_link {
-        existing.join("..")
-    } else {
-        match existing.parent() {
-            Some(parent) => parent.to_path_buf(),
-            None => return Ok(false),
+    // `Path::parent` is lexical, so it is the physical step up only from a
+    // last component that names a directory entry which is not a link. After
+    // a `..` it would step back *down* into the component the `..` left.
+    let lexical_parent = match existing.components().next_back() {
+        Some(std::path::Component::Normal(_)) => {
+            let is_link = std::fs::symlink_metadata(&existing)
+                .map_err(|source| Error::Io {
+                    path: existing.clone(),
+                    source,
+                })?
+                .is_symlink();
+            if is_link { None } else { existing.parent() }
         }
+        _ => None,
     };
+    let mut at = lexical_parent.map_or_else(|| existing.join(".."), Path::to_path_buf);
     loop {
         let Some(id) = identity(&at)? else {
             return Ok(false);
@@ -220,6 +233,54 @@ fn inside_on_disk(dir: &Path, repo: &Path) -> Result<bool, Error> {
         previous = id;
         at.push("..");
     }
+}
+
+/// The spelling of the deepest part of `dir` that exists, resolved the way the
+/// kernel resolves it rather than the way [`paths::normalize`] spells it.
+///
+/// `dir` is read one component at a time. While every component so far
+/// exists, a component is appended to the spelling as written, a `..`
+/// included, so the kernel resolves each `..` against the physical parent of
+/// whatever it follows: `link/..` with `link -> repo/sub` is `repo`, where the
+/// lexical rule would cancel `link` and never look at it. From the first
+/// component that does not exist, the rest can only be created beneath the
+/// spelling reached so far, as real directories; a `..` there cancels the
+/// pending component before it, and a `..` with no pending component left
+/// steps up from the spelling physically, so the search resumes from there.
+///
+/// The spelling returned may still name nothing where a component exists but
+/// is not a directory; the caller's walk back up covers that.
+///
+/// # Errors
+///
+/// [`Error::Io`] naming a prefix of `dir` that could not be examined.
+fn deepest_existing(dir: &Path) -> Result<PathBuf, Error> {
+    use std::path::Component;
+
+    let mut existing = PathBuf::new();
+    let mut pending: Vec<&OsStr> = Vec::new();
+    for component in dir.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if pending.pop().is_none() {
+                    existing.push("..");
+                }
+            }
+            Component::Normal(name) => {
+                if pending.is_empty() && identity(&existing.join(name))?.is_some() {
+                    existing.push(name);
+                } else {
+                    pending.push(name);
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => existing.push(component),
+        }
+    }
+    if existing.as_os_str().is_empty() {
+        existing.push(".");
+    }
+    Ok(existing)
 }
 
 /// The device and inode `path` names, following symlinks, or `None` when
@@ -533,6 +594,85 @@ mod tests {
             layer_paths(&repo, &link.join("state")),
             Err(Error::LocalInRepo { .. })
         ));
+    }
+
+    /// A `..` after a symlink in the state directory's own spelling is resolved
+    /// the way the kernel resolves it, against the link's physical parent.
+    ///
+    /// With `link -> repo/sub`, `$HOME/link/..` is the repo on disk, but
+    /// [`paths::normalize`] cancels `link` against the `..` and reduces it to
+    /// `$HOME`. The identity walk used to start from that, so this state
+    /// directory was accepted.
+    #[test]
+    fn a_dotdot_after_a_link_into_the_repo_is_resolved_physically_and_refused() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        std::fs::create_dir_all(repo.join("sub")).expect("mkdir");
+        let link = home.child("link");
+        std::os::unix::fs::symlink(repo.join("sub"), &link).expect("symlink");
+        let state = link.join("..");
+        assert_eq!(
+            state.canonicalize().expect("the state directory resolves"),
+            repo.canonicalize().expect("the repo resolves"),
+            "the fixture must really land in the repo on disk"
+        );
+        assert_eq!(
+            paths::normalize(&state),
+            home.path(),
+            "and must be outside it by spelling"
+        );
+
+        match layer_paths(&repo, &state) {
+            Err(err @ Error::LocalInRepo { .. }) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains(&format!("inside the config repo {}", repo.display())),
+                    "{message}"
+                );
+            }
+            other => panic!("expected LocalInRepo, got {other:?}"),
+        }
+        load_layer_set(&repo, &state, home.path()).expect_err("nor through the loader");
+
+        // Refused before anything is there, and however the part that does not
+        // exist yet is spelled.
+        for spelling in ["../state", "missing/../..", "../a/b/../c", "./.."] {
+            let state = link.join(spelling);
+            assert!(
+                matches!(layer_paths(&repo, &state), Err(Error::LocalInRepo { .. })),
+                "{} is inside the repo on disk",
+                state.display()
+            );
+        }
+    }
+
+    /// Guards against over-reach: a `..` after a link that lands outside the
+    /// repo is not refused, and a `..` that cancels a component which does not
+    /// exist yet is resolved by spelling, as creating it would.
+    #[test]
+    fn a_dotdot_after_a_link_outside_the_repo_is_not_refused() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        std::fs::create_dir_all(home.child("elsewhere/sub")).expect("mkdir");
+        std::fs::create_dir_all(repo.join("sub")).expect("mkdir");
+        let link = home.child(".config/bx/link");
+        std::os::unix::fs::symlink(home.child("elsewhere/sub"), &link).expect("symlink");
+
+        // Lexically `repo/state`, physically `elsewhere/state`: the spelling
+        // refuses it, and the identity check alone does not.
+        let state = link.join("../state");
+        assert!(!inside_on_disk(&state, &repo).unwrap());
+        layer_paths(&repo, &state).expect_err("the lexical check still refuses it");
+
+        let outside = home.child("elsewhere/sub/../state");
+        assert!(!inside_on_disk(&outside, &repo).unwrap());
+        assert!(!inside_on_disk(&home.child("missing/../elsewhere"), &repo).unwrap());
+        assert!(
+            inside_on_disk(&home.child("missing/../.config/bx/sub"), &repo).unwrap(),
+            "a cancelled missing component resumes the search from where it began"
+        );
     }
 
     /// Guards against over-reach on disk: a state directory that is a symlink to

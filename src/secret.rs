@@ -604,6 +604,64 @@ ffxbALZN3JpDBBEk8TeZk55mo+jjJlOtAf63Q=
         ));
     }
 
+    /// An ecdsa key, which age reads and cannot use: age's own test fixture,
+    /// protecting nothing.
+    const ECDSA_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQQ0odKVFtwOmuCl6RXfwzExGs9dP9a
+V9H5xAfETILMd7sLFgqyOxz1FA84EZV0vKdW5c0HPB7/JxQw0vFmNSWeAAAAqGOGFFJjhh
+RSAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBDSh0pUW3A6a4KX
+pFd/DMTEaz10/1pX0fnEB8RMgsx3uwsWCrI7HPUUDzgRlXS8p1blzQc8Hv8nFDDS8WY1JZ
+4AAAAgBQ5LA+stpdk3TYwB/4xhiOaDHzxaacv+u47ciigD8bQAAAAKc3RyNGRAY3ViZQEC
+AwQFBg==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// A passphrase-locked PEM key, which age refuses to unlock. Only its
+    /// header is read, so the body is filler.
+    const LOCKED_PEM_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,00000000000000000000000000000000
+
+AAAA
+-----END RSA PRIVATE KEY-----
+";
+
+    #[test]
+    fn an_ssh_key_age_cannot_use_is_refused_as_no_identity() {
+        let home = guarded_home();
+        let ciphertext = encrypt_to(SSH_PUB, b"x");
+        for (name, text) in [("ecdsa", ECDSA_KEY), ("locked pem", LOCKED_PEM_KEY)] {
+            // The premise: age reads the key and says it cannot use it, rather
+            // than failing to parse it.
+            assert!(
+                matches!(
+                    age::ssh::Identity::from_buffer(BufReader::new(text.as_bytes()), None),
+                    Ok(age::ssh::Identity::Unsupported(_))
+                ),
+                "{name}"
+            );
+            let file = home.write(name, text);
+            assert!(
+                matches!(
+                    never(&ciphertext, &file),
+                    Err(Refusal::NotAnIdentity { .. })
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identity_whose_path_cannot_be_looked_at_is_unreadable_not_missing() {
+        // A regular file where a directory is expected: `ENOTDIR`, not
+        // `ENOENT`, so the identity is not merely absent.
+        let home = guarded_home();
+        let file = home.write("file", "not a directory\n");
+        let refused = never(&encrypt_to(SSH_PUB, b"x"), &file.join("id")).expect_err("refused");
+        assert!(matches!(refused, Refusal::Unreadable { .. }), "{refused:?}");
+    }
+
     #[test]
     fn a_secret_for_someone_else_names_the_identity() {
         let home = guarded_home();

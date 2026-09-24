@@ -67,7 +67,8 @@ pub struct Unit {
 /// `None` for anything that is not a direct child of `unit_dir` — a drop-in
 /// under `name.service.d/`, a link under `name.target.wants/`, a file anywhere
 /// else — for a suffix systemd does not load from a file, for a name systemd
-/// would refuse, and for a template (`name@.service`), which is never a unit
+/// would refuse (among them an instance with no prefix, `@x.service`), and for
+/// a template (`name@.service`), which is never a unit
 /// itself, only the source of its instances. Lexical, like every path
 /// comparison in bx: nothing is resolved on disk.
 #[must_use]
@@ -82,7 +83,11 @@ pub fn unit_name(path: &Path, unit_dir: &Path) -> Option<String> {
     // spells everything outside it, as in `mnt-scratch\x2ddisk.mount`.
     let valid =
         |c: char| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '-' | '@' | '\\');
+    // An `@` opens the instance, so it needs a prefix before it: `systemctl`
+    // refuses `@x.service` and would fail the whole query with it. Later `@`s
+    // belong to the instance, which systemd accepts (`a@b@c.service`).
     if stem.is_empty()
+        || stem.starts_with('@')
         || stem.ends_with('@')
         || !SUFFIXES.contains(&suffix)
         || !stem.chars().all(valid)
@@ -367,6 +372,23 @@ mod tests {
             name(&format!("{DIR}/app@one.service")),
             Some("app@one.service".to_string())
         );
+        assert_eq!(
+            name(&format!("{DIR}/app@one@two.service")),
+            Some("app@one@two.service".to_string()),
+            "a later `@` belongs to the instance, which systemd accepts"
+        );
+    }
+
+    #[test]
+    fn an_instance_without_a_prefix_is_not_a_unit() {
+        // `systemctl` refuses these names, so one would fail the whole query.
+        for path in [
+            format!("{DIR}/@one.service"),
+            format!("{DIR}/@.service"),
+            format!("{DIR}/@@one.service"),
+        ] {
+            assert_eq!(name(&path), None, "{path}");
+        }
     }
 
     #[test]

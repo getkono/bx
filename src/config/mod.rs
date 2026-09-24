@@ -24,6 +24,7 @@ pub mod env;
 pub mod layers;
 pub mod merge;
 pub mod origin;
+pub mod path;
 pub mod resolve;
 pub mod secrets;
 pub mod target;
@@ -66,6 +67,9 @@ pub struct Config {
     pub value_assignments: Vec<ValueAssignment>,
     /// `[[env]]`, keyed by `name`.
     pub envs: Vec<EnvDecl>,
+    /// `[path]`'s entries, every list's in one `Vec`, keyed by the directory
+    /// as zsh is given it. See [`path`].
+    pub path: Vec<path::PathEntry>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
@@ -390,6 +394,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                 })?;
                 config.secrets = secrets::parse_secrets(table, file, text, home)?;
             }
+            "path" => {
+                let table = item.as_table().ok_or_else(|| Error::WrongType {
+                    origin: section_origin(root, name, file, text),
+                    key: name.to_string(),
+                    expected: "a table `[path]`",
+                    found: item.type_name(),
+                })?;
+                config.path = path::parse_path(table, file, text)?;
+            }
             unknown => {
                 return Err(Error::UnknownSection {
                     origin: section_origin(root, unknown, file, text),
@@ -427,6 +440,14 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|e| (e.name.as_str(), &e.origin))
             .chain(toggles_in(&config, merge::Section::Env))
+            .collect(),
+    )?;
+    check_unique(
+        "path entry",
+        config
+            .path
+            .iter()
+            .map(|entry| (entry.shell.as_str(), &entry.origin))
             .collect(),
     )?;
 

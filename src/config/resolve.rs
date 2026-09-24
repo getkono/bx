@@ -60,6 +60,7 @@ use std::path::Path;
 
 use super::env::{EnvDecl, Fragment, Place, Syntax, Var};
 use super::merge::Conflict;
+use super::path::PathEntry;
 use super::target::{Attach, Body, Direction, Format, Gen, KeyPath, Target};
 use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
@@ -180,7 +181,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    targets.extend(place_envs(&merged.envs, &values)?);
+    targets.extend(place_envs(&merged.envs, &merged.path, &values)?);
 
     refuse_shared_files(&targets)?;
 
@@ -218,13 +219,22 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// there to read. A place no variable lands in emits nothing here; a fragment
 /// bx wrote there earlier is planned empty by [`vacated_fragments`].
 ///
+/// The `[path]` entries land in the `zshenv` fragment, after its variables,
+/// which is emitted when either is declared. Nothing in an entry is
+/// substituted, so an entry never holds a fragment back; a variable the
+/// fragment holds back holds its entries back with it.
+///
 /// # Errors
 ///
 /// [`Error::BadValue`] for a variable whose value is a repo defect: a
 /// malformed placeholder, a reference to a value no layer declares, or a
 /// committed `default` that puts a character no fragment line can hold into
 /// it.
-fn place_envs(envs: &[EnvDecl], values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
+fn place_envs(
+    envs: &[EnvDecl],
+    path: &[PathEntry],
+    values: &ResolvedValues,
+) -> Result<Vec<Resolution<Target>>, Error> {
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
@@ -236,10 +246,12 @@ fn place_envs(envs: &[EnvDecl], values: &ResolvedValues) -> Result<Vec<Resolutio
             .iter()
             .filter(|(decl, _)| decl.kind.places().contains(&place))
             .collect();
-        let Some((first, _)) = here.first() else {
-            continue;
+        let entries = if place == Place::Zshenv { path } else { &[] };
+        let origin = match (here.first(), entries.first()) {
+            (Some((first, _)), _) => first.origin.clone(),
+            (None, Some(entry)) => entry.origin.clone(),
+            (None, None) => continue,
         };
-        let origin = first.origin.clone();
         let portable = |raw: &str| {
             Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
                 origin: origin.clone(),
@@ -262,7 +274,13 @@ fn place_envs(envs: &[EnvDecl], values: &ResolvedValues) -> Result<Vec<Resolutio
                     Resolution::Blocked(_) => None,
                 })
                 .collect();
-            Resolution::Ready(fragment_target(place, fragment.clone(), vars, &origin))
+            Resolution::Ready(fragment_target(
+                place,
+                fragment.clone(),
+                vars,
+                entries.to_vec(),
+                &origin,
+            ))
         } else {
             let (reason, hint) = held_together(&held, values);
             Resolution::Blocked(BlockedEntry {
@@ -285,8 +303,14 @@ fn place_envs(envs: &[EnvDecl], values: &ResolvedValues) -> Result<Vec<Resolutio
     Ok(placed)
 }
 
-/// The fragment bx owns whole at `place`, holding `vars`.
-fn fragment_target(place: Place, path: Portable, vars: Vec<Var>, origin: &Origin) -> Target {
+/// The fragment bx owns whole at `place`, holding `vars` and then `entries`.
+fn fragment_target(
+    place: Place,
+    path: Portable,
+    vars: Vec<Var>,
+    entries: Vec<PathEntry>,
+    origin: &Origin,
+) -> Target {
     let format = match place.syntax() {
         Syntax::EnvironmentD => Format::EnvD,
         Syntax::Zsh => Format::Opaque,
@@ -296,6 +320,7 @@ fn fragment_target(place: Place, path: Portable, vars: Vec<Var>, origin: &Origin
         Gen::Env(Fragment {
             syntax: place.syntax(),
             vars,
+            path: entries,
         }),
         Attach::Own,
         format,
@@ -339,8 +364,15 @@ pub fn vacated_fragments(
                 Resolution::Ready(target) => target.path == path,
                 Resolution::Blocked(entry) => entry.key == path.to_string(),
             });
-            (!named && recorded(&path))
-                .then(|| Resolution::Ready(fragment_target(place, path, Vec::new(), &origin)))
+            (!named && recorded(&path)).then(|| {
+                Resolution::Ready(fragment_target(
+                    place,
+                    path,
+                    Vec::new(),
+                    Vec::new(),
+                    &origin,
+                ))
+            })
         })
         .collect()
 }
@@ -1537,6 +1569,7 @@ mod tests {
             Body::Generated(Gen::Env(Fragment {
                 syntax: Syntax::Zsh,
                 vars: vec![Var::always("EDITOR", "x")],
+                path: Vec::new(),
             }))
         );
         assert_eq!(zshrc_fragment.format, Format::Opaque);
@@ -1577,6 +1610,7 @@ mod tests {
                         Body::Generated(Gen::Env(Fragment {
                             syntax: Syntax::Zsh,
                             vars: Vec::new(),
+                            path: Vec::new(),
                         }))
                     );
                     assert_eq!(target.origin.file, ledger);

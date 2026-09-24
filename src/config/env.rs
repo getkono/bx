@@ -37,6 +37,10 @@
 //! every account, so an edit the user makes anywhere else in the file is never
 //! bx's business, and a change of declaration rewrites only bx's own file.
 //!
+//! The `zshenv` fragment also carries the `[path]` entries, after its
+//! variables, so a `${NAME}` in one reads a variable the file has already
+//! exported; see [`super::path`].
+//!
 //! Every fragment is an environment fragment in the guard's grammar, and the
 //! plan judges it against the declared roots before it is written. A fragment
 //! for which a declared value has no usable answer is held back on its own —
@@ -46,6 +50,7 @@ use std::path::Path;
 
 use toml_edit::Table;
 
+use super::path::{self, PathEntry};
 use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
 use crate::env_guard::is_variable_name;
@@ -319,6 +324,9 @@ pub struct Fragment {
     pub syntax: Syntax,
     /// Each variable, value already substituted.
     pub vars: Vec<Var>,
+    /// The `[path]` entries, written after every variable. Only the `zshenv`
+    /// fragment holds any; see [`super::path`].
+    pub path: Vec<PathEntry>,
 }
 
 /// The line every fragment opens with. Fixed, so the fragment's bytes are a
@@ -364,6 +372,7 @@ impl Fragment {
                 }
             }
         }
+        out.push_str(&path::render(&self.path));
         out
     }
 }
@@ -528,6 +537,7 @@ mod tests {
         let zsh = Fragment {
             syntax: Syntax::Zsh,
             vars: vars.clone(),
+            path: Vec::new(),
         };
         let render = |fragment: &Fragment| fragment.render(&|_| unreachable!("nothing is gated"));
         assert_eq!(
@@ -544,6 +554,7 @@ mod tests {
         let env_d = Fragment {
             syntax: Syntax::EnvironmentD,
             vars,
+            path: Vec::new(),
         };
         assert!(render(&env_d).contains("\nCARGO_HOME=$HOME/.cargo\n"));
         assert!(!render(&env_d).contains("export"));
@@ -572,6 +583,7 @@ mod tests {
                 gated("RUSTC_WRAPPER", "sccache", "has:sccache"),
                 gated("VISUAL", "hx", "has:hx"),
             ],
+            path: Vec::new(),
         };
         let asked = std::cell::RefCell::new(Vec::new());
         let present = |tool: &str| {

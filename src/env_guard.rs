@@ -73,8 +73,10 @@
 //! The guard **fails closed by shape** as well. It does not model shell syntax
 //! and approve whatever it does not recognise: it reads a fragment against a
 //! small grammar — blank lines, comments, `NAME=VALUE` or
-//! `export NAME=VALUE` with a restricted value, and the `if TEST; then` / `fi`
-//! pair a runtime `when` condition renders — and refuses **every** line that
+//! `export NAME=VALUE` with a restricted value, the `if TEST; then` / `fi`
+//! pair a runtime `when` condition renders, and two one-line zsh forms
+//! `[path]` needs, a search-list assignment gated on `[[ -d WORD ]] && ` and
+//! `path=(${path:#WORD})` — and refuses **every** line that
 //! is not one of those, whatever the line mentions and whether or not it
 //! relocates anything. Every multi-line construct but that block is refused at
 //! its first line, because no line the grammar accepts can leave a quote, a
@@ -1215,7 +1217,25 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///   runs no test, and not inside another block;
 /// * **a guarded block's close** — optional blanks, then `fi`, closing the one
 ///   open block. A `fi` with no block open is refused, and so is a block left
-///   open at the end, at the line that opened it.
+///   open at the end, at the line that opened it;
+/// * **a gated assignment** — optional blanks, `[[ -d WORD ]] && `, then an
+///   assignment as above to a name the emit table records as a **search
+///   list**. `WORD` is one bare word with no `~`. The shell makes the
+///   assignment only when `WORD` is a directory, and the guard judges it
+///   either way: every entry either outcome leaves in the list is one it
+///   judged, which is what a search list is judged by. Its value as one
+///   string is known in neither case, so a later reference to it by another
+///   name is [`Reason::UnreadableReference`]; its own next extension still
+///   reads it.
+/// * **a removal** — optional blanks, then exactly `path=(${path:#WORD})`,
+///   `WORD` as in a gated assignment. zsh takes every entry of `PATH` that is
+///   `WORD` out, and nothing else changes, so nothing it can do is a
+///   relocation; `WORD` must still resolve, because a reference to nothing
+///   would leave a word that names some other entry.
+///
+/// The last two are zsh's own and are read only by [`scan_with`]: bx writes
+/// them only into a fragment zsh sources, and an `environment.d` fragment,
+/// read by [`scan_exported`], refuses both as [`Reason::Unreadable`].
 ///
 /// An assignment inside a block is judged exactly as one outside it, so a
 /// condition hides nothing from the guard. After the block closes, every name
@@ -1230,8 +1250,10 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// `.`, `for`, `read`, `printf`), `export` itself quoted or escaped, `export`
 /// with no value, a backslash, a quote that does not close on its line, mixed
 /// quoting, command, arithmetic and brace substitution, a `${NAME…}` operator,
-/// a special parameter (`$@ $* $# $? $! $$ $- $0`…), a glob, `;`, `&&`, `|`, a
-/// redirection or heredoc, `+=`, an array or subscript, a `=` or `~` anywhere
+/// a special parameter (`$@ $* $# $? $! $$ $- $0`…), a glob, `;`, `|`, an `&&`
+/// or a `[[ … ]]` outside a gated assignment's one shape, a redirection or
+/// heredoc, `+=`, an array or subscript outside a removal's one shape, and in
+/// neither shape any word but a bare one: a `=` or `~` anywhere
 /// but where listed (so zsh's `=cmd` and a `~` after `:` never occur), and any
 /// control character. Because no accepted line can leave a quote, a
 /// continuation or a heredoc open, every accepted line begins where a shell
@@ -1364,7 +1386,7 @@ fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>
             found.push(violation("", line.trim_matches(BLANKS), Reason::Unreadable));
             scope.forget_everything();
         };
-        match statement(line) {
+        match readable(statement(line), every_exported) {
             Statement::Nothing => {}
             // `environment.d` runs no test, and a block does not nest.
             Statement::Open if every_exported || block.is_some() => refuse(&mut scope),
@@ -1388,6 +1410,34 @@ fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>
                 scope.learn(name, judged);
                 if let Some((_, assigned)) = block.as_mut() {
                     assigned.push(name.to_string());
+                }
+            }
+            Statement::Gated {
+                name,
+                value,
+                exported,
+                ..
+            } => {
+                let judged = evaluate(name, value, exported, &scope, roots);
+                if let Some(reason) = judged.reason {
+                    found.push(violation(name, value, reason));
+                }
+                scope.learn(name, judged);
+                scope.perhaps(name);
+                if let Some((_, assigned)) = block.as_mut() {
+                    assigned.push(name.to_string());
+                }
+            }
+            Statement::Removal { word } => {
+                // Only an entry the guard can name is taken out: a reference
+                // to nothing would leave a pattern that strips some other
+                // entry instead.
+                if let Err(reason) = word.resolve(&scope, roots.home()) {
+                    found.push(violation(SEARCH_PATH, word.text, reason));
+                }
+                scope.narrowed(SEARCH_PATH);
+                if let Some((_, assigned)) = block.as_mut() {
+                    assigned.push(SEARCH_PATH.to_string());
                 }
             }
         }
@@ -1799,6 +1849,39 @@ impl Scope {
         }
     }
 
+    /// After a [`Statement::Gated`] assignment to the search list `name`, which
+    /// the shell may or may not have made.
+    ///
+    /// The list's extension stays as the assignment left it: its entries are
+    /// every entry either outcome holds, and a search list is judged entry by
+    /// entry, so judging them all covers both. Its value as one string is
+    /// known in neither case, so a reference to it is unreadable.
+    fn perhaps(&mut self, name: &str) {
+        if !self.lost {
+            self.learned
+                .insert(name.to_string(), Err(Reason::UnreadableReference));
+        }
+    }
+
+    /// After a [`Statement::Removal`] took entries out of the search list
+    /// `name`.
+    ///
+    /// What is left is some of what was there, so the extension already
+    /// known — the inherited list itself, when nothing has assigned it yet —
+    /// still holds every entry the list can hold. Its value as one string is
+    /// no longer known.
+    fn narrowed(&mut self, name: &str) {
+        if self.lost {
+            return;
+        }
+        if self.inherits(name) {
+            self.extended
+                .insert(name.to_string(), INHERITED.to_string());
+        }
+        self.learned
+            .insert(name.to_string(), Err(Reason::UnreadableReference));
+    }
+
     /// After a guarded block closes, know nothing about what it assigned: the
     /// shell may or may not have run it, so each name holds either its value
     /// from before the block or the one inside it. A later reference to one is
@@ -1852,6 +1935,19 @@ enum Statement<'a> {
         value: &'a str,
         exported: bool,
     },
+    /// `[[ -d TEST ]] && ` before an assignment to a search list, which the
+    /// shell makes only when `TEST` is a directory. `test` is the bare word
+    /// tested, already read; the rest is [`Statement::Assign`]'s.
+    Gated {
+        test: Word<'a>,
+        name: &'a str,
+        value: &'a str,
+        exported: bool,
+    },
+    /// zsh's `path=(${path:#WORD})`: every entry of `PATH` that is exactly
+    /// `WORD` taken out, and nothing else changed. `word` is the bare word
+    /// removed, already read.
+    Removal { word: Word<'a> },
     /// `if TEST; then`, where `TEST` is exactly one a runtime `when` condition
     /// renders ([`crate::config::when::is_opener`]).
     Open,
@@ -1860,6 +1956,17 @@ enum Statement<'a> {
     /// Not a statement the grammar reads.
     Refused,
 }
+
+/// The one search list [`Statement::Removal`] takes an entry out of, as the
+/// environment spells it.
+const SEARCH_PATH: &str = "PATH";
+
+/// What opens a [`Statement::Gated`] line, and what separates its test from
+/// its assignment.
+const GATE: (&str, &str) = ("[[ -d ", " ]] && ");
+
+/// What opens and closes a [`Statement::Removal`] line, around its word.
+const REMOVAL: (&str, &str) = ("path=(${path:#", "})");
 
 /// Read one line of a fragment against the statement grammar.
 fn statement(line: &str) -> Statement<'_> {
@@ -1880,17 +1987,74 @@ fn statement(line: &str) -> Statement<'_> {
     if crate::config::when::is_opener(text) {
         return Statement::Open;
     }
-    let (assignment, exported) = match text.strip_prefix("export") {
-        Some(operand) if operand.starts_with(BLANKS) => (operand.trim_start_matches(BLANKS), true),
-        _ => (text, false),
-    };
-    match assignment.split_once('=') {
-        Some((name, value)) if is_variable_name(name) => Statement::Assign {
+    if let Some(gated) = text.strip_prefix(GATE.0) {
+        return gated
+            .split_once(GATE.1)
+            .and_then(|(test, assignment)| {
+                let test = exact_word(test)?;
+                let (name, value, exported) = assignment_in(assignment)?;
+                // Only a search list may be assigned conditionally: every entry
+                // either outcome could hold is judged, which is not true of a
+                // value a later line reads as one whole path.
+                (emittable(name) == Some(Kind::SearchList)).then_some(Statement::Gated {
+                    test,
+                    name,
+                    value,
+                    exported,
+                })
+            })
+            .unwrap_or(Statement::Refused);
+    }
+    if let Some(word) = text
+        .strip_prefix(REMOVAL.0)
+        .and_then(|rest| rest.strip_suffix(REMOVAL.1))
+    {
+        return exact_word(word).map_or(Statement::Refused, |word| Statement::Removal { word });
+    }
+    match assignment_in(text) {
+        Some((name, value, exported)) => Statement::Assign {
             name,
             value,
             exported,
         },
-        _ => Statement::Refused,
+        None => Statement::Refused,
+    }
+}
+
+/// `NAME=VALUE` or `export NAME=VALUE`, as `(name, value, exported)`: the
+/// value still to be read by the value grammar.
+fn assignment_in(text: &str) -> Option<(&str, &str, bool)> {
+    let (assignment, exported) = match text.strip_prefix("export") {
+        Some(operand) if operand.starts_with(BLANKS) => (operand.trim_start_matches(BLANKS), true),
+        _ => (text, false),
+    };
+    let (name, value) = assignment.split_once('=')?;
+    is_variable_name(name).then_some((name, value, exported))
+}
+
+/// `text` read as one bare word with nothing before or after it, and no `~`:
+/// the word a [`Statement::Gated`] tests and a [`Statement::Removal`] removes.
+///
+/// A `~` is refused because whether zsh expands one inside a pattern depends
+/// on options the fragment does not set; `$HOME` says the same thing in every
+/// one of them.
+fn exact_word(text: &str) -> Option<Word<'_>> {
+    if text.chars().any(is_unprintable) {
+        return None;
+    }
+    match bare(text) {
+        Ok((word, "")) if !word.tilde => Some(word),
+        _ => None,
+    }
+}
+
+/// `statement` as a fragment of this syntax reads it: a gated assignment and a
+/// removal are zsh's own, and an `environment.d` fragment, where
+/// `every_exported`, reads neither.
+fn readable(statement: Statement<'_>, every_exported: bool) -> Statement<'_> {
+    match statement {
+        Statement::Gated { .. } | Statement::Removal { .. } if every_exported => Statement::Refused,
+        statement => statement,
     }
 }
 
@@ -3626,6 +3790,154 @@ mod tests {
             "\u{c}",
         ] {
             assert_eq!(statement(line), Statement::Refused, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_gate_and_a_removal_are_read_only_in_the_one_shape_each_is_written() {
+        let Statement::Gated {
+            test,
+            name,
+            value,
+            exported,
+        } = statement("  [[ -d $HOME/bin ]] && export PATH=$HOME/bin:$PATH")
+        else {
+            panic!("a gated assignment to PATH is read");
+        };
+        assert_eq!(
+            (test.text, name, value, exported),
+            ("$HOME/bin", "PATH", "$HOME/bin:$PATH", true)
+        );
+        let Statement::Removal { word } = statement("path=(${path:#${CARGO_HOME}/bin})") else {
+            panic!("a removal is read");
+        };
+        assert_eq!(word.text, "${CARGO_HOME}/bin");
+
+        // Every near miss is a line the guard does not read, so nothing after
+        // it is known either.
+        for line in [
+            "[[ -d /x ]] && export CARGO_HOME=/x",
+            "[[ -d /x ]] && EDITOR=nvim",
+            "[[ -f /x ]] && export PATH=/x:$PATH",
+            "[[ -d /x ]] || export PATH=/x:$PATH",
+            "[[ -d /x ]]  && export PATH=/x:$PATH",
+            "[[ -d /x y ]] && export PATH=/x:$PATH",
+            "[[ -d ~/x ]] && export PATH=/x:$PATH",
+            "[[ -d \"/x\" ]] && export PATH=/x:$PATH",
+            "[[ -d $(pwd) ]] && export PATH=/x:$PATH",
+            "[[ -d /x ]] && source /x",
+            "[[ -d /x ]] && export PATH",
+            "[[ -d /x ]] && [[ -d /y ]] && export PATH=/x:$PATH",
+            "[[ -d /x ]] && export PATH=/x:$PATH; export CARGO_HOME=/etc/evil",
+            "path=(${path:#~/x})",
+            "path=(${path:#/x} /evil)",
+            "path=(/evil ${path:#/x})",
+            "path=(${path:#/x*})",
+            "path=(${path:#/x /y})",
+            "path=(${path:#$(pwd)})",
+            "path=(${path:#\"/x\"})",
+            "path=(${path:#$X[1]})",
+            "path=(${path:#/x}) # note",
+            "path=(${path:#/x}); export CARGO_HOME=/etc/evil",
+            "fpath=(${fpath:#/x})",
+            "path=(${path%/x})",
+        ] {
+            let (found, scope) = pass(line, &rooted(), false);
+            assert_ne!(found, vec![], "{line:?}");
+            assert!(scope.lost, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_gated_entry_is_judged_as_any_other_and_a_removal_must_name_what_it_removes() {
+        let roots = rooted();
+        // The shape the `[path]` renderer writes, approved.
+        let content = "export CARGO_HOME=/var/mnt/scratch/example/cargo\n\
+                       path=(${path:#$HOME/bin})\n\
+                       [[ -d $HOME/bin ]] && export PATH=$HOME/bin:$PATH\n\
+                       path=(${path:#$CARGO_HOME/bin})\n\
+                       export PATH=$CARGO_HOME/bin:$PATH\n\
+                       export PATH=${PATH}:/opt/x/bin\n\
+                       path=(${path:#${HOME}/.cargo/bin})\n";
+        assert_eq!(reasons(content, &roots), vec![]);
+
+        // A gate decides whether the entry is added, never whether it is
+        // judged.
+        for (line, reason) in [
+            (
+                "[[ -d $HOME/.local/state/bx/bin ]] && export PATH=$HOME/.local/state/bx/bin:$PATH",
+                Reason::BxOwnedDirectory,
+            ),
+            ("[[ -d bin ]] && export PATH=bin:$PATH", Reason::NotAbsolute),
+            (
+                "[[ -d /x ]] && export PATH=$NOWHERE/bin:$PATH",
+                Reason::UnresolvedReference,
+            ),
+        ] {
+            assert_eq!(reasons(line, &roots), vec![(1, reason)], "{line:?}");
+        }
+        // Whether the gated line ran is not known, so the list's value as one
+        // string is not either; the list itself still extends.
+        assert_eq!(
+            reasons(
+                "[[ -d /a ]] && export PATH=/a:$PATH\nexport PATH=/b:$PATH\nexport INFOPATH=$PATH\n",
+                &roots
+            ),
+            vec![(3, Reason::UnreadableReference)]
+        );
+        // A removal changes what the list holds, so its value as one string,
+        // known before, is not after.
+        assert_eq!(
+            reasons(
+                "export PATH=/usr/bin:/opt/x/bin\npath=(${path:#/opt/x/bin})\n\
+                 export INFOPATH=$PATH\n",
+                &roots
+            ),
+            vec![(3, Reason::UnreadableReference)]
+        );
+        // Inside a `when` block, either form assigns PATH as an assignment
+        // there does, and the list extends nothing the guard can name after
+        // the block closes.
+        for line in ["[[ -d /a ]] && export PATH=/a:$PATH", "path=(${path:#/a})"] {
+            assert_eq!(
+                reasons(
+                    &format!("if [[ -o login ]]; then\n  {line}\nfi\nexport PATH=/b:$PATH\n"),
+                    &roots
+                ),
+                vec![(4, Reason::UnreadableReference)],
+                "{line:?}"
+            );
+        }
+        // An entry a later line would add is judged after a removal too.
+        assert_eq!(
+            reasons(
+                "path=(${path:#/a})\nexport PATH=$HOME/.local/state/bx:$PATH\n",
+                &roots
+            ),
+            vec![(2, Reason::BxOwnedDirectory)]
+        );
+        // A removal names only an entry the guard can resolve, since a
+        // reference to nothing would remove some other entry instead.
+        assert_eq!(
+            reasons("path=(${path:#$NOWHERE/bin})\n", &roots),
+            vec![(1, Reason::UnresolvedReference)]
+        );
+        assert_eq!(
+            reasons(
+                "export CARGO_HOME=/var/mnt/scratch/example/cargo\npath=(${path:#$CARGO_HOME/bin})\n",
+                &roots
+            ),
+            vec![]
+        );
+        // Both are zsh's own, and an `environment.d` fragment reads neither.
+        for line in ["[[ -d /a ]] && PATH=/a:$PATH", "path=(${path:#/a})"] {
+            let found = scan_exported(line, &roots);
+            assert_eq!(
+                found.iter().map(|v| v.reason).collect::<Vec<_>>(),
+                vec![Reason::Unreadable],
+                "{line:?}"
+            );
+            assert_eq!(scan_with(line, &roots), vec![], "{line:?}");
         }
     }
 
@@ -6477,11 +6789,13 @@ mod tests {
         // `config/env.rs` imports only the name predicate, so the `[[env]]`
         // parser and the guard agree on what a variable name is; a predicate
         // reads no fragment and writes no bytes. `config/when.rs` imports it
-        // for the same reason, to check the name a `when = "env:NAME"` tests.
-        const KNOWN: [(&str, &str); 10] = [
+        // for the same reason, to check the name a `when = "env:NAME"` tests,
+        // and `config/path.rs` for the references a `[path]` entry holds.
+        const KNOWN: [(&str, &str); 11] = [
             ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
             ("config/env.rs", "use crate::env_guard::is_variable_name;"),
             ("config/when.rs", "use crate::env_guard::is_variable_name;"),
+            ("config/path.rs", "use crate::env_guard::is_variable_name;"),
             ("adopt.rs", "env_guard::scan_with(text, roots)"),
             ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
             (
@@ -8410,6 +8724,11 @@ mod tests {
         "X=/var/mnt/scratch/example\nX=$X/b\nexport CARGO_HOME=$X/cargo\n",
         "export PATH=\"$HOME/.local/bin:/usr/bin\"\n",
         "export PATH=/a:$PATH\nexport PATH=/b:$PATH\n",
+        // zsh's own forms, the removal last: bash cannot read it, and stops.
+        "export PATH=/a:$PATH\n\
+         [[ -d /var/mnt/scratch/example ]] && export PATH=/var/mnt/scratch/example/bin:$PATH\n\
+         [[ -d /var/mnt/scratch/example/none ]] && export PATH=/b:$PATH\n\
+         path=(${path:#/a})\n",
         "export XDG_STATE_HOME=~/.local/state/bx\n",
         "export npm_config_cache=/etc/evil\nexport TMPDIR=/tmp\n",
         "X=\"it's\"\nY='say \"hi\"'\nZ='a\\b'\nW='$(echo pwned)'\nV=\"{a,b} *\"\n",
@@ -8427,6 +8746,108 @@ mod tests {
                 );
                 shells.agree(content, &roots);
             }
+        }
+    }
+
+    #[test]
+    fn the_path_lines_bx_writes_are_approved_and_give_zsh_the_declared_order() {
+        use crate::config::env::{Fragment, Syntax, Var};
+        use crate::config::path::{PathEntry, Position, shell_spelling};
+        let shells = Shells::found();
+        let Some((shell, program, _)) = shells
+            .found
+            .iter()
+            .find(|(shell, _, _)| shell.program == "zsh")
+        else {
+            return;
+        };
+        let home = shells.home();
+        let root = shells.root();
+        for dir in ["bin", "opt/bin", ".cargo/bin"] {
+            std::fs::create_dir_all(home.join(dir)).expect("a sandbox directory");
+        }
+        let entry = |dir: &str, position, if_exists| PathEntry {
+            dir: dir.to_string(),
+            shell: shell_spelling(dir).expect("a PATH entry"),
+            position,
+            if_exists,
+            enabled: true,
+            origin: crate::config::Origin::unknown(Path::new("bx.toml")),
+        };
+        let cargo = root.join("cargo");
+        let fragment = Fragment {
+            syntax: Syntax::Zsh,
+            vars: vec![Var::always("CARGO_HOME", cargo.display().to_string())],
+            path: vec![
+                entry("/opt/tool/bin", Position::Append, false),
+                entry("~/bin", Position::Prepend, false),
+                entry("~/.local/bin", Position::Prepend, true),
+                entry("$HOME/opt/bin", Position::Prepend, true),
+                entry("${CARGO_HOME}/bin", Position::Prepend, false),
+                entry("~/.cargo/bin", Position::Remove, false),
+            ],
+        }
+        .render(&|_| unreachable!("nothing is gated on a tool"));
+        assert_eq!(scan_with(&fragment, &shells.rooted()), vec![]);
+
+        // An inherited PATH holding the stale install and a declared entry
+        // out of place, then the fragment read once, and read again as a
+        // nested shell reads it.
+        let h = home.display();
+        let inherited = format!("export PATH={h}/.cargo/bin:/usr/bin:{h}/bin\n");
+        let once = format!("{inherited}{fragment}");
+        let twice = format!("{once}{fragment}");
+        let expected = format!(
+            "{h}/bin:{h}/opt/bin:{}/bin:/usr/bin:/opt/tool/bin",
+            cargo.display()
+        );
+        for content in [&once, &twice] {
+            let after = variables_after(shell, program, &home, content);
+            assert_eq!(after.get("PATH"), Some(&expected), "{content}");
+        }
+    }
+
+    #[test]
+    fn a_path_block_ending_on_a_missing_gated_directory_is_approved_and_survives_err_exit() {
+        use crate::config::env::{Fragment, Syntax};
+        use crate::config::path::{PathEntry, Position, shell_spelling};
+        let shells = Shells::found();
+        let Some((shell, program, _)) = shells
+            .found
+            .iter()
+            .find(|(shell, _, _)| shell.program == "zsh")
+        else {
+            return;
+        };
+        let home = shells.home();
+        let entry = |dir: &str, position| PathEntry {
+            dir: dir.to_string(),
+            shell: shell_spelling(dir).expect("a PATH entry"),
+            position,
+            if_exists: true,
+            enabled: true,
+            origin: crate::config::Origin::unknown(Path::new("bx.toml")),
+        };
+        // The first-declared prepend is written last, and its directory does
+        // not exist; so does the lone append's.
+        for path in [
+            vec![entry("~/missing/bin", Position::Prepend)],
+            vec![entry("~/missing/bin", Position::Append)],
+        ] {
+            let fragment = Fragment {
+                syntax: Syntax::Zsh,
+                vars: vec![],
+                path,
+            }
+            .render(&|_| unreachable!("nothing is gated on a tool"));
+            assert_eq!(scan_with(&fragment, &shells.rooted()), vec![]);
+            let file = home.join("fragment.zsh");
+            std::fs::write(&file, &fragment).expect("the fragment is written");
+            let mut flags = shell.flags.to_vec();
+            flags.push("-e");
+            let script = format!("source {}\nprint -rn reached\n", file.display());
+            let out = run_script(program, &flags, &home, &script);
+            assert_eq!(out, b"reached", "{fragment}");
         }
     }
 

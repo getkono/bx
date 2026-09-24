@@ -142,6 +142,7 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::env::EnvDecl;
+use super::path::PathEntry;
 use super::secrets::Secrets;
 use super::target::Target;
 use super::values::{
@@ -213,6 +214,26 @@ impl Keyed for EnvDecl {
     fn enabled(&self) -> bool {
         self.enabled
     }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
+impl Keyed for PathEntry {
+    /// The directory as zsh is given it, so two spellings of one directory
+    /// are one entry.
+    fn key(&self) -> &str {
+        &self.shell
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    // Unreachable from `merge`: a `[path]` entry is switched off by restating
+    // it with `enabled = false`, never by a toggle; kept because `Keyed`
+    // requires it of a public list type.
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
@@ -1055,6 +1076,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut values: Merged<ValueDecl> = Merged::default();
     let mut assignments: Vec<ValueAssignment> = Vec::new();
     let mut envs: Merged<EnvDecl> = Merged::default();
+    let mut path: Merged<PathEntry> = Merged::default();
     let mut secrets = Secrets::default();
 
     // Values first, across every layer. A value never depends on a target, and
@@ -1063,7 +1085,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // not by the answers known when its own layer was read.
     //
     // An `[[env]]` entry is keyed by its name as written, which no answer can
-    // change, so it folds here beside the values.
+    // change, so it folds here beside the values; so does a `[path]` entry,
+    // keyed by its directory, which holds no placeholder.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1071,6 +1094,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
 
         values.absorb(layer.config.values.iter().cloned());
         envs.absorb(layer.config.envs.iter().cloned());
+        path.absorb(layer.config.path.iter().cloned());
 
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
@@ -1116,6 +1140,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         // Nothing refers to a variable by name, so a disabled one is simply
         // not placed, as a disabled target is not written.
         envs: envs.into_enabled(),
+        // Nothing refers to a `[path]` entry either.
+        path: path.into_enabled(),
         secrets,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
@@ -1671,6 +1697,62 @@ mod tests {
         assert_eq!(
             merged.secrets.identity.expect("an identity").path.as_str(),
             "~/.config/age/key.txt"
+        );
+    }
+
+    #[test]
+    fn a_path_entry_merges_by_its_directory_in_place_across_lists() {
+        use super::super::path::Position;
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[path]\nprepend = [\"~/bin\", \"/opt/a/bin\", \"/opt/b/bin\"]\n\
+                 append = [\"/opt/c/bin\"]\n",
+            ),
+            global(
+                "modules/tool.toml",
+                "[path]\nprepend = [\"/opt/d/bin\"]\nremove = [\"$HOME/bin\"]\n",
+            ),
+            local(
+                "[path]\nprepend = [{ dir = \"/opt/a/bin\", enabled = false }]\n\
+                 append = [{ dir = \"/opt/b/bin\", if_exists = true }]\n",
+            ),
+        ])
+        .expect("merges");
+        let seen: Vec<_> = merged
+            .path
+            .iter()
+            .map(|e| {
+                (
+                    e.shell.as_str(),
+                    e.position,
+                    e.if_exists,
+                    e.origin.file.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                // Restated as `$HOME/bin`, one directory with `~/bin`: moved
+                // to `remove`, where `~/bin` was.
+                (
+                    "${HOME}/bin",
+                    Position::Remove,
+                    false,
+                    "modules/tool.toml".into()
+                ),
+                // `/opt/a/bin`, switched off by the account, is gone, and
+                // `/opt/b/bin` is replaced in place and moved to `append`.
+                ("/opt/b/bin", Position::Append, true, "local.toml".into()),
+                ("/opt/c/bin", Position::Append, false, "bx.toml".into()),
+                (
+                    "/opt/d/bin",
+                    Position::Prepend,
+                    false,
+                    "modules/tool.toml".into()
+                ),
+            ]
         );
     }
 

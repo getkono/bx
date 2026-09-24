@@ -121,6 +121,28 @@ pub enum Restoration {
         /// it, so a directory that changed since is refused.
         planned: Box<fs::Observed>,
     },
+    /// bx made the symlink; it is unlinked — never what it points at — and
+    /// the directories bx created for it are removed while they are empty.
+    RemoveLink {
+        /// The link to remove.
+        dest: PathBuf,
+        /// Directories bx created on the way to it, deepest first.
+        created_dirs: Vec<PathBuf>,
+        /// What this plan observed at `dest`. The removal is checked against
+        /// it, so a link retargeted since is refused, not unlinked.
+        planned: Box<fs::Observed>,
+    },
+    /// bx replaced a symlink; the link it replaced goes back, holding the
+    /// text it held.
+    Relink {
+        /// The link to put back.
+        dest: PathBuf,
+        /// Where the earlier link's text lives.
+        reference: RestoreRef,
+        /// What this plan observed at `dest`. The link is made against it, so
+        /// a destination that changed since is refused.
+        planned: Box<fs::Observed>,
+    },
     /// bx changed a directory's mode and it is back at the mode it had before:
     /// there is nothing to put back. Only the ledger entry goes.
     Release {
@@ -261,6 +283,9 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
     if entry.mechanism == Mechanism::Dir {
         return Ok(plan_restore_dir(entry, home, dest, observed));
     }
+    if entry.mechanism == Mechanism::Link {
+        return Ok(plan_restore_link(entry, home, dest, observed));
+    }
 
     match (observed.kind, observed.digest()) {
         (Kind::Absent, _) => Ok(match &entry.prior {
@@ -357,6 +382,66 @@ fn plan_restore_dir(
         (kind, _) => Restoration::Conflict {
             note: format!(
                 "is {kind}, not the directory bx made; bx is leaving it and forgetting nothing"
+            ),
+            dest,
+        },
+    }
+}
+
+/// [`plan_restore`] for a symlink target, from what was observed at `dest`.
+///
+/// The rules a file follows, with a link's text in place of its bytes. Only
+/// the link is bx's, never what it points at:
+///
+/// * nothing there: bx made the link and it is already gone,
+///   [`Restoration::AlreadyGone`], or it replaced one, which goes back,
+///   [`Restoration::Relink`], whoever removed it since;
+/// * a link still holding the text bx left: [`Restoration::RemoveLink`] for
+///   one bx made, [`Restoration::Relink`] for one it replaced;
+/// * a link holding other text was retargeted since, and anything that is not
+///   a link is not what bx made. Both are a [`Restoration::Conflict`], and
+///   nothing is forgotten.
+fn plan_restore_link(
+    entry: &LedgerEntry,
+    home: &Path,
+    dest: PathBuf,
+    observed: fs::Observed,
+) -> Restoration {
+    let put_back = |dest, planned| match &entry.prior {
+        Prior::Absent => None,
+        Prior::Existed(reference) => Some(Restoration::Relink {
+            dest,
+            reference: reference.clone(),
+            planned,
+        }),
+    };
+    match observed.kind {
+        Kind::Absent => {
+            put_back(dest.clone(), Box::new(observed)).unwrap_or(Restoration::AlreadyGone { dest })
+        }
+        Kind::Symlink if observed.link_digest() == Some(entry.written) => {
+            let planned = Box::new(observed);
+            put_back(dest.clone(), planned.clone()).unwrap_or_else(|| Restoration::RemoveLink {
+                created_dirs: entry
+                    .created_dirs
+                    .iter()
+                    .map(|dir| dir.render(home))
+                    .collect(),
+                dest,
+                planned,
+            })
+        }
+        Kind::Symlink => Restoration::Conflict {
+            note: format!(
+                "has been retargeted since bx made it (bx left {}); bx is leaving it and \
+                 forgetting nothing",
+                entry.written,
+            ),
+            dest,
+        },
+        kind => Restoration::Conflict {
+            note: format!(
+                "is {kind}, not the symlink bx made; bx is leaving it and forgetting nothing"
             ),
             dest,
         },
@@ -466,6 +551,64 @@ fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Err
                 dest: dest.clone(),
                 content: Content::Dir { planned: *planned },
                 mode,
+                ownership: Ownership::Released,
+            })?;
+            Ok(Restored::Reverted {
+                target: target.clone(),
+                dest,
+            })
+        }
+        Restoration::RemoveLink {
+            dest,
+            created_dirs,
+            planned,
+        } => {
+            session.apply(Request {
+                target: target.clone(),
+                dest: dest.clone(),
+                content: Content::LinkAbsent {
+                    created_dirs,
+                    planned: *planned,
+                },
+                mode: entry.mode,
+                ownership: Ownership::Released,
+            })?;
+            Ok(Restored::Removed {
+                target: target.clone(),
+                dest,
+            })
+        }
+        Restoration::Relink {
+            dest,
+            reference,
+            planned,
+        } => {
+            // The earlier text, verified as a file's bytes are before any is
+            // written.
+            let text = match session.ledger().restore_bytes(session.state(), &reference) {
+                Ok(bytes) => PathBuf::from(
+                    <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes),
+                ),
+                Err(
+                    e @ (crate::state::Error::RestoreMissing { .. }
+                    | crate::state::Error::RestoreCorrupt { .. }),
+                ) => {
+                    return Ok(Restored::Conflict {
+                        target: target.clone(),
+                        dest,
+                        note: format!("{e}; bx will not guess at the link it replaced"),
+                    });
+                }
+                Err(e) => return Err(e.into()),
+            };
+            session.apply(Request {
+                target: target.clone(),
+                dest: dest.clone(),
+                content: Content::Link {
+                    text,
+                    planned: *planned,
+                },
+                mode: reference.mode,
                 ownership: Ownership::Released,
             })?;
             Ok(Restored::Reverted {
@@ -2304,5 +2447,147 @@ mod tests {
             out.status.success(),
             "the unprivileged child failed:\n{stdout}\n{stderr}"
         );
+    }
+
+    /// Let bx make `rel` a link holding `text`, through a finished session.
+    fn linked(state: &StateDir, home: &Path, rel: &str, text: &str) -> Portable {
+        let request = crate::journal::tests::link_to(home, rel, text);
+        let portable = request.target.clone();
+        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
+        session.apply(request).expect("make the link");
+        session.finish().expect("finish");
+        portable
+    }
+
+    #[test]
+    fn rm_removes_a_link_bx_made_with_the_directories_it_made_and_never_its_target() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        home.write("real/tool", "the tool\n");
+        let portable = linked(&state, home.path(), ".opt/bin/tool", "../../real/tool");
+        let linked_twice = linked(&state, home.path(), ".opt/bin/tool", "/elsewhere");
+        assert_eq!(portable, linked_twice);
+
+        assert!(matches!(
+            plan_restore(
+                &entry_for(&state, home.path(), &portable).expect("managed"),
+                home.path()
+            )
+            .expect("plan"),
+            Restoration::RemoveLink { .. }
+        ));
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(restored.as_slice(), [Restored::Removed { .. }]),
+            "{restored:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.child(".opt")).is_err(),
+            "all gone"
+        );
+        assert_eq!(
+            std::fs::read(home.child("real/tool")).expect("kept"),
+            b"the tool\n",
+            "what a link points at is never touched"
+        );
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+
+        let again = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(matches!(again.as_slice(), [Restored::Unmanaged { .. }]));
+    }
+
+    #[test]
+    fn rm_leaves_a_link_retargeted_since_and_anything_that_is_not_a_link() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let retargeted = linked(&state, home.path(), ".a", "/opt/a");
+        std::fs::remove_file(home.child(".a")).expect("unlink");
+        std::os::unix::fs::symlink("/opt/theirs", home.child(".a")).expect("retarget");
+        let replaced = linked(&state, home.path(), ".b", "/opt/b");
+        std::fs::remove_file(home.child(".b")).expect("unlink");
+        home.write(".b", "a file now\n");
+        let gone = linked(&state, home.path(), ".c", "/opt/c");
+        std::fs::remove_file(home.child(".c")).expect("unlink");
+
+        let restored = restore(
+            &state,
+            home.path(),
+            &[retargeted.clone(), replaced.clone(), gone.clone()],
+        )
+        .expect("rm");
+        let [
+            Restored::Conflict { note: first, .. },
+            Restored::Conflict { note: second, .. },
+            Restored::AlreadyGone { .. },
+        ] = restored.as_slice()
+        else {
+            panic!("{restored:?}");
+        };
+        assert!(first.contains("retargeted since bx made it"), "{first}");
+        assert!(second.contains("not the symlink bx made"), "{second}");
+        assert_eq!(
+            std::fs::read_link(home.child(".a")).expect("kept"),
+            Path::new("/opt/theirs")
+        );
+        assert_eq!(
+            std::fs::read(home.child(".b")).expect("kept"),
+            b"a file now\n"
+        );
+        assert!(entry_for(&state, home.path(), &retargeted).is_some());
+        assert!(entry_for(&state, home.path(), &replaced).is_some());
+        assert!(entry_for(&state, home.path(), &gone).is_none());
+    }
+
+    #[test]
+    fn rm_puts_back_the_link_bx_replaced() {
+        // No `apply` records a link bx replaced — a link bx did not make is a
+        // conflict — so the entry is recorded directly, as an adoption would.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let (portable, dest) = target(home.path(), ".tool");
+        {
+            let lock = crate::state::ExclusiveLock::acquire(&state).expect("lock");
+            let mut ledger = crate::state::Ledger::open(&state, &lock, home.path())
+                .expect("open the ledger")
+                .value;
+            ledger
+                .record(crate::state::NewEntry::new(
+                    portable.clone(),
+                    fs::link::digest(Path::new("/opt/bx")),
+                    Mode::LINK,
+                    Mechanism::Link,
+                    crate::state::PriorBytes::Bytes {
+                        bytes: b"/opt/theirs".to_vec(),
+                        mode: Mode::LINK,
+                    },
+                ))
+                .expect("record");
+            ledger.save().expect("save");
+        }
+        std::os::unix::fs::symlink("/opt/bx", &dest).expect("bx's link");
+
+        let restored = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
+        assert!(
+            matches!(restored.as_slice(), [Restored::Reverted { .. }]),
+            "{restored:?}"
+        );
+        assert_eq!(
+            std::fs::read_link(&dest).expect("a link"),
+            Path::new("/opt/theirs")
+        );
+        assert!(entry_for(&state, home.path(), &portable).is_none());
+    }
+
+    #[test]
+    fn every_link_bx_makes_is_removed_by_rm_with_the_directories_it_made() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let links = [
+            linked(&state, home.path(), ".local/bin/one", "../../one"),
+            linked(&state, home.path(), ".config/deep/two", "/opt/two"),
+        ];
+        restore(&state, home.path(), &links).expect("rm");
+        assert!(std::fs::symlink_metadata(home.child(".local/bin")).is_err());
+        assert!(std::fs::symlink_metadata(home.child(".config")).is_err());
     }
 }

@@ -6601,10 +6601,12 @@ mod tests {
         //
         // `config/env.rs` imports only the name predicate, so the `[[env]]`
         // parser and the guard agree on what a variable name is; a predicate
-        // reads no fragment and writes no bytes.
-        const KNOWN: [(&str, &str); 9] = [
+        // reads no fragment and writes no bytes. `config/path.rs` imports the
+        // same predicate for the references a `[path]` entry holds.
+        const KNOWN: [(&str, &str); 10] = [
             ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
             ("config/env.rs", "use crate::env_guard::is_variable_name;"),
+            ("config/path.rs", "use crate::env_guard::is_variable_name;"),
             ("adopt.rs", "env_guard::scan_with(text, roots)"),
             ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
             (

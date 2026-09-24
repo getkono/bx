@@ -133,8 +133,8 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::layers;
 use crate::config::values::ResolvedValues;
+use crate::config::{env, layers};
 use crate::paths;
 
 /// Names a shell defines and manages itself. A fragment may not assign one,
@@ -682,12 +682,21 @@ const INHERITED: &str = "\0";
 /// contain one ([`Reason::ContainsBxDirectory`]), because a tool clears its
 /// own directory — `uv cache clean` on `UV_CACHE_DIR=~/.local/state` deletes
 /// bx's ledger with it.
+///
+/// bx's fragment directory, [`env::FRAGMENT_DIR`], is judged **one way**: no
+/// location may lie inside it ([`Reason::BxOwnedDirectory`]), but one may
+/// contain it. `XDG_DATA_HOME=~/.local/share` is that directory's native
+/// default, and refusing it would refuse the native location invariant 2
+/// protects. What a tool clearing it would delete is only generated output,
+/// which the next `apply` writes again from the configuration; the ledger,
+/// which nothing can regenerate, stays judged both ways.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootSet {
     home: Option<PathBuf>,
     roots: Vec<PathBuf>,
     inadmissible: Vec<PathBuf>,
     owned: Vec<PathBuf>,
+    fragment_dirs: Vec<PathBuf>,
     repos: Vec<PathBuf>,
 }
 
@@ -706,6 +715,7 @@ impl RootSet {
             roots: Vec::new(),
             inadmissible: Vec::new(),
             owned: Vec::new(),
+            fragment_dirs: Vec::new(),
             repos: Vec::new(),
         }
     }
@@ -736,12 +746,14 @@ impl RootSet {
             }
         }
         let owned = vec![paths::normalize(&layers::state_dir(&home, None))];
+        let fragment_dirs = vec![paths::normalize(&paths::render(env::FRAGMENT_DIR, &home))];
         let repos = vec![paths::normalize(&paths::config_root_in(&home, None))];
         Self {
             home: Some(home),
             roots: admitted,
             inadmissible,
             owned,
+            fragment_dirs,
             repos,
         }
     }
@@ -849,11 +861,22 @@ impl RootSet {
     /// owns every path that passes through `.local/state/bx`, whoever's home
     /// that is. A set with a home knows where its state directory is, and owns
     /// only that and what [`RootSet::owning`] adds.
+    ///
+    /// bx's fragment directory, [`env::FRAGMENT_DIR`], is owned the same way —
+    /// its own path under a home, `.local/share/bx` under any home for a set
+    /// without one — since a tool pointed into it writes beside the fragments
+    /// every shell sources. Unlike the state directory it is not consulted by
+    /// [`RootSet::holds_bx_directory`]; see [`RootSet`].
     #[must_use]
     pub fn owns(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);
-        self.owned.iter().any(|dir| normalised.starts_with(dir))
-            || (self.home.is_none() && passes_through(&normalised, &[".local", "state", "bx"]))
+        self.owned
+            .iter()
+            .chain(&self.fragment_dirs)
+            .any(|dir| normalised.starts_with(dir))
+            || (self.home.is_none()
+                && (passes_through(&normalised, &[".local", "state", "bx"])
+                    || passes_through(&normalised, &[".local", "share", "bx"])))
     }
 
     /// Whether `path` lies inside some declared root.
@@ -5119,6 +5142,46 @@ mod tests {
             reason_of(&check("PATH", "/home/other/.local/state/bx/bin", &strict)),
             Some(Reason::BxOwnedDirectory)
         );
+    }
+
+    #[test]
+    fn the_fragment_directory_is_owned_but_its_parent_is_not_refused() {
+        // PR #75 note D2: `~/.local/share/bx` holds the fragments every shell
+        // sources, so no tool may be pointed into it, even under a `~` root.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for value in [
+            "/var/home/example/.local/share/bx",
+            "/var/home/example/.local/share/bx/cargo",
+            "/var/home/example/.local/share/./bx",
+        ] {
+            assert_eq!(
+                reason_of(&check("CARGO_HOME", value, &home_rooted)),
+                Some(Reason::BxOwnedDirectory),
+                "{value}"
+            );
+        }
+        // Its parent is `XDG_DATA_HOME`'s native default, and a location that
+        // merely contains it is not refused.
+        for name in ["CARGO_HOME", "XDG_DATA_HOME"] {
+            assert_eq!(
+                check(name, "/var/home/example/.local/share", &home_rooted),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            check(
+                "CARGO_HOME",
+                "/var/home/example/.local/share/bxtra",
+                &home_rooted
+            ),
+            Verdict::Allowed
+        );
+        // A set without a home owns it under any home, as it does the state
+        // directory; a set with one owns only its own.
+        assert!(RootSet::strict().owns(Path::new("/home/other/.local/share/bx/x")));
+        assert!(!RootSet::strict().owns(Path::new("/home/other/.local/share")));
+        assert!(!home_rooted.owns(Path::new("/home/other/.local/share/bx/x")));
     }
 
     // Review round 6 (r3 round 1).

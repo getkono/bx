@@ -8561,6 +8561,64 @@ mod tests {
     }
 
     #[test]
+    fn the_path_lines_bx_writes_are_approved_and_give_zsh_the_declared_order() {
+        use crate::config::env::{Fragment, Syntax};
+        use crate::config::path::{PathEntry, Position, shell_spelling};
+        let shells = Shells::found();
+        let Some((shell, program, _)) = shells
+            .found
+            .iter()
+            .find(|(shell, _, _)| shell.program == "zsh")
+        else {
+            return;
+        };
+        let home = shells.home();
+        let root = shells.root();
+        for dir in ["bin", "opt/bin", ".cargo/bin"] {
+            std::fs::create_dir_all(home.join(dir)).expect("a sandbox directory");
+        }
+        let entry = |dir: &str, position, if_exists| PathEntry {
+            dir: dir.to_string(),
+            shell: shell_spelling(dir).expect("a PATH entry"),
+            position,
+            if_exists,
+            enabled: true,
+            origin: crate::config::Origin::unknown(Path::new("bx.toml")),
+        };
+        let cargo = root.join("cargo");
+        let fragment = Fragment {
+            syntax: Syntax::Zsh,
+            vars: vec![("CARGO_HOME".to_string(), cargo.display().to_string())],
+            path: vec![
+                entry("/opt/tool/bin", Position::Append, false),
+                entry("~/bin", Position::Prepend, false),
+                entry("~/.local/bin", Position::Prepend, true),
+                entry("$HOME/opt/bin", Position::Prepend, true),
+                entry("${CARGO_HOME}/bin", Position::Prepend, false),
+                entry("~/.cargo/bin", Position::Remove, false),
+            ],
+        }
+        .render();
+        assert_eq!(scan_with(&fragment, &shells.rooted()), vec![]);
+
+        // An inherited PATH holding the stale install and a declared entry
+        // out of place, then the fragment read once, and read again as a
+        // nested shell reads it.
+        let h = home.display();
+        let inherited = format!("export PATH={h}/.cargo/bin:/usr/bin:{h}/bin\n");
+        let once = format!("{inherited}{fragment}");
+        let twice = format!("{once}{fragment}");
+        let expected = format!(
+            "{h}/bin:{h}/opt/bin:{}/bin:/usr/bin:/opt/tool/bin",
+            cargo.display()
+        );
+        for content in [&once, &twice] {
+            let after = variables_after(shell, program, &home, content);
+            assert_eq!(after.get("PATH"), Some(&expected), "{content}");
+        }
+    }
+
+    #[test]
     fn nothing_a_shell_runs_names_a_path_outside_the_sandbox() {
         // What replaced the old skip. The fragments these checks run are
         // deliberately broken shell, and a stray `>` in one is a redirection

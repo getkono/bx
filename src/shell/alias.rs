@@ -42,7 +42,8 @@
 //!
 //! A name is written bare, before the `=`, so it holds only characters no
 //! shell gives a meaning to there: ASCII letters, digits and `_.+:@%,-`, and
-//! it does not open with `-`, which `alias` would read as an option. Shadowing
+//! it does not open with `-` or `+`, either of which zsh's `alias` reads as an
+//! option rather than a name. Shadowing
 //! a real command is the config author's choice and is not refused.
 //!
 //! # `when`
@@ -209,10 +210,10 @@ fn check(name: &str, command: &str) -> Result<(), String> {
 /// can.
 fn unnameable(name: &str) -> Option<String> {
     let bare = |c: char| c.is_ascii_alphanumeric() || "_.+:@%,-".contains(c);
-    (name.is_empty() || name.starts_with('-') || !name.chars().all(bare)).then(|| {
+    (name.is_empty() || name.starts_with(['-', '+']) || !name.chars().all(bare)).then(|| {
         format!(
             "{name:?} is not an alias name: a name is written bare, so it is non-empty, holds \
-             only ASCII letters, digits and `_.+:@%,-`, and does not open with `-`"
+             only ASCII letters, digits and `_.+:@%,-`, and does not open with `-` or `+`"
         )
     })
 }
@@ -369,6 +370,7 @@ mod tests {
             ("[aliases]\nll.x = \"a\"\n", "`ll` must be a string"),
             ("[aliases]\n\"\" = \"a\"\n", "not an alias name"),
             ("[aliases]\n\"-x\" = \"a\"\n", "not an alias name"),
+            ("[aliases]\n\"+x\" = \"a\"\n", "not an alias name"),
             ("[aliases]\n\"a b\" = \"a\"\n", "not an alias name"),
             ("[aliases]\n\"a=b\" = \"a\"\n", "not an alias name"),
             ("[aliases]\n\"a*\" = \"a\"\n", "not an alias name"),

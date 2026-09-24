@@ -368,7 +368,15 @@ pub fn run(
             return Err(recover::Error::Blocked { conflicts: blocked }.into());
         }
         if approve(&report)? {
-            report.recovered = Some(recover::before_writing(&inputs.state)?);
+            // A session that became blocked between `pending` and here is
+            // still refused: this run is a writing one, and `recover` hands
+            // that verdict back as a value only for a caller that reports it.
+            report.recovered = Some(match recover::recover(&inputs.state)? {
+                recover::Outcome::Blocked { conflicts } => {
+                    return Err(recover::Error::Blocked { conflicts }.into());
+                }
+                outcome => outcome,
+            });
         }
         return Ok(report);
     }
@@ -1821,7 +1829,10 @@ pub(crate) mod tests {
             assert!(inputs.state().journal().exists(), "the journal went");
 
             // Recovery's own error keeps the absolute path.
-            let recovery = recover::before_writing(inputs.state()).expect_err("blocked");
+            let recovery = match recover::recover(inputs.state()).expect("recover") {
+                recover::Outcome::Blocked { conflicts } => recover::Error::Blocked { conflicts },
+                outcome => panic!("recovered: {outcome:?}"),
+            };
             assert!(
                 recovery.to_string().contains(&blob.display().to_string()),
                 "{recovery}"

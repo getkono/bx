@@ -19,6 +19,9 @@
 //!   removed deepest-first while they are empty; one another managed file
 //!   still holds is handed to that file's entry, so its own `rm` removes it,
 //!   and one the user replaced with something that is not a directory is left.
+//!   A claim is never simply dropped: a target handed back to the user, whose
+//!   file stays where it is, gives its claims to a surviving entry beneath them
+//!   the same way a removal does.
 //!   The file is unlinked only while it is still the one the plan observed.
 //! * **Never overwrite a later edit.** The destination's current digest is
 //!   compared with the digest bx recorded when it last wrote the file. If they
@@ -209,6 +212,12 @@ impl Restored {
 /// wrote, so `rm` writes nothing there, forgets nothing, and restores the
 /// rest — and this preview says so, as `rm` does.
 ///
+/// So is a destination whose parent is on the filesystem but does not resolve
+/// to a directory — a dangling symlink, or a file — whatever prior bx
+/// recorded. bx will not create the parent through or over what the user put
+/// there, and cannot tell a file that is gone from one that is out of reach.
+/// The note names the parent `~`-relative.
+///
 /// # Errors
 ///
 /// [`Error::Read`] for a destination path that cannot be observed at all: one
@@ -223,8 +232,32 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
                 dest,
             });
         }
+        // Not reached from a ledger entry. What is left of `observe`'s errors
+        // is `NoParent` and `ParentComponent`, and `render` joins a non-empty
+        // relative path onto an absolute home, so the destination always has
+        // a parent; a `Portable` is lexically normalised and holds no `..`,
+        // so only a home spelled with one could produce the second. Kept, so
+        // the match stays total without a panic.
         Err(e) => return Err(e.into()),
     };
+    // A parent that does not resolve is observed as an absent destination,
+    // whichever prior bx recorded. Neither a revert nor a forget is sound
+    // there: the write cannot be made through it, and bx cannot tell whether
+    // the file is gone or only out of reach.
+    if let Some(parent) = observed
+        .parent
+        .as_ref()
+        .filter(|parent| parent.unusable().is_some())
+    {
+        return Ok(Restoration::Conflict {
+            note: format!(
+                "its parent {} does not resolve to a directory; \
+                 bx wrote nothing and forgets nothing",
+                crate::paths::to_portable(&parent.path, home),
+            ),
+            dest,
+        });
+    }
     if entry.mechanism == Mechanism::Dir {
         return Ok(plan_restore_dir(entry, home, dest, observed));
     }
@@ -335,7 +368,10 @@ fn plan_restore_dir(
 ///
 /// Resolves any interrupted session first — `rm` is a writing command — then
 /// opens a [`SessionKind::Restore`] session, so an `rm` interrupted halfway is
-/// itself rolled back by the next run.
+/// itself rolled back by the next run. Both happen under one exclusive lock
+/// ([`recover::lock_for_writing`]), so a second bx cannot win the state
+/// directory between the recovery and the session and be reported as an
+/// interruption.
 ///
 /// A target that conflicts is reported and skipped; the rest still restore. A
 /// target bx has never written is [`Restored::Unmanaged`], which is what makes
@@ -343,7 +379,7 @@ fn plan_restore_dir(
 ///
 /// A destination that cannot be read is one of those conflicts: bx cannot
 /// compare it with what it wrote, so it writes nothing there and forgets
-/// nothing.
+/// nothing. So is one whose parent does not resolve to a directory.
 ///
 /// # Errors
 ///
@@ -359,9 +395,11 @@ pub fn restore(
     home: &Path,
     targets: &[Portable],
 ) -> Result<Vec<Restored>, Error> {
-    recover::before_writing(state)?;
-
-    let mut session = Session::open(state, SessionKind::Restore, home, targets.to_vec())?;
+    // One lock across the recovery and the session: see
+    // `recover::lock_for_writing`.
+    let lock = recover::lock_for_writing(state)?;
+    let mut session =
+        Session::open_locked(state, SessionKind::Restore, home, targets.to_vec(), lock)?;
     let mut done = Vec::with_capacity(targets.len());
     for target in targets {
         done.push(restore_one(&mut session, target)?);
@@ -1051,10 +1089,10 @@ mod tests {
         if std::fs::read(&unreadable).is_ok() {
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
                 .expect("chmod back");
-            eprintln!(
-                "skipped: this process reads through file permissions, so the failure cannot be produced"
+            return crate::journal::tests::cannot_build(
+                "a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore",
+                crate::journal::tests::WRITES_THROUGH_PERMISSIONS,
             );
-            return;
         }
 
         let done = restore(&state, home.path(), &targets);
@@ -1090,6 +1128,98 @@ mod tests {
             matches!(planned, Some(Ok(Restoration::Conflict { .. }))),
             "the preview says what rm did: {planned:?}"
         );
+    }
+
+    #[test]
+    fn an_rm_target_whose_parent_does_not_resolve_is_a_conflict_and_the_rest_still_restore() {
+        // r3 round 2, P9R4-D1. A destination whose parent does not resolve is
+        // observed as absent, so `plan_restore` said Revert (or AlreadyGone);
+        // rm's write then failed with UnusableParent and stopped the whole rm,
+        // and the next writing run rolled back the target it had restored.
+        let guard = guarded_home();
+        for displaced in [true, false] {
+            let case = format!("the second target displaced a file: {displaced}");
+            let home = guard.child(format!("displaced-{displaced}"));
+            let state = StateDir::resolve(&home);
+            plant_file(
+                &home.join(".first.conf"),
+                "user first\n",
+                Mode::DEFAULT_FILE,
+            );
+            let first = managed(
+                &state,
+                &home,
+                ".first.conf",
+                "bx first\n",
+                Mode::DEFAULT_FILE,
+            );
+            if displaced {
+                plant_file(
+                    &home.join(".linked/app.conf"),
+                    "user app\n",
+                    Mode::DEFAULT_FILE,
+                );
+            }
+            let second = managed(
+                &state,
+                &home,
+                ".linked/app.conf",
+                "bx app\n",
+                Mode::DEFAULT_FILE,
+            );
+            // `~/.linked` becomes a link into a checkout that is not mounted.
+            std::fs::remove_dir_all(home.join(".linked")).expect("rm the directory");
+            std::os::unix::fs::symlink(home.join("unmounted/linked"), home.join(".linked"))
+                .expect("link");
+
+            let entry = entry_for(&state, &home, &second).expect("managed");
+            let preview = plan_restore(&entry, &home).expect("preview");
+            let Restoration::Conflict { note, dest } = &preview else {
+                panic!("{case}: the preview is a conflict: {preview:?}");
+            };
+            assert_eq!(*dest, home.join(".linked/app.conf"), "{case}");
+            assert!(
+                note.contains("its parent ~/.linked does not resolve"),
+                "{case}: {note}"
+            );
+            assert!(!note.contains(&*home.to_string_lossy()), "{case}: {note}");
+
+            let done = restore(&state, &home, &[first.clone(), second.clone()])
+                .expect("an unusable parent does not stop rm");
+            assert!(
+                matches!(
+                    done.as_slice(),
+                    [Restored::Reverted { .. }, Restored::Conflict { .. }]
+                ),
+                "{case}: {done:?}"
+            );
+            let Restored::Conflict { note: reported, .. } = &done[1] else {
+                unreachable!()
+            };
+            assert_eq!(reported, note, "{case}: rm says what the preview said");
+            assert_eq!(
+                peek(&home.join(".first.conf")).expect("restored").0,
+                b"user first\n",
+                "{case}"
+            );
+            assert!(!state.journal().exists(), "{case}: the session finished");
+            assert!(entry_for(&state, &home, &first).is_none(), "{case}");
+            assert!(
+                entry_for(&state, &home, &second).is_some(),
+                "{case}: bx forgets nothing about the conflict"
+            );
+
+            assert_eq!(
+                crate::recover::recover(&state).expect("the next writing run"),
+                crate::recover::Outcome::Nothing,
+                "{case}"
+            );
+            assert_eq!(
+                peek(&home.join(".first.conf")).expect("still restored").0,
+                b"user first\n",
+                "{case}: nothing rolled back"
+            );
+        }
     }
 
     #[test]
@@ -1628,9 +1758,40 @@ mod tests {
         // r3 round 1, D1. The file went through the link, pruning the claimed
         // directory failed with ENOTDIR, and the session was left for a rollback
         // that put the file back: every `rm` after that did the same.
+        //
+        // Extended for r3 coverage COV3: `hand_off_claims`' guard for a claim
+        // that is no longer a directory was reached with no entry beneath the
+        // path, so deleting it changed no assertion. `heir.conf` is that
+        // entry. Without the guard the claim on `~/d` lands on it, and the
+        // `rm` that removes it calls `remove_if_empty` on a symlink — the
+        // breakage this test's own repair exists to stop.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let portable = managed(&state, home.path(), "d/a.conf", "bx\n", Mode::DEFAULT_FILE);
+        let heir = managed(
+            &state,
+            home.path(),
+            "d/heir.conf",
+            "bx\n",
+            Mode::DEFAULT_FILE,
+        );
+        assert_eq!(
+            entry_for(&state, home.path(), &portable)
+                .expect("a.conf")
+                .created_dirs
+                .iter()
+                .map(|dir| dir.render(home.path()))
+                .collect::<Vec<_>>(),
+            vec![home.child("d")],
+            "a.conf claims the directory bx made",
+        );
+        assert!(
+            entry_for(&state, home.path(), &heir)
+                .expect("heir.conf")
+                .created_dirs
+                .is_empty(),
+            "and heir.conf claims nothing yet",
+        );
         std::fs::rename(home.child("d"), home.child("real")).expect("move the directory");
         std::os::unix::fs::symlink(home.child("real"), home.child("d")).expect("link it back");
 
@@ -1652,12 +1813,28 @@ mod tests {
         assert!(home.child("real").is_dir(), "and so does what it names");
         assert!(!state.journal().exists(), "the session finished");
         assert!(entry_for(&state, home.path(), &portable).is_none());
+        assert!(
+            entry_for(&state, home.path(), &heir)
+                .expect("heir.conf survives")
+                .created_dirs
+                .is_empty(),
+            "a claim the user replaced with a symlink is not handed to the \
+             entry beneath it",
+        );
 
         let again = restore(&state, home.path(), std::slice::from_ref(&portable)).expect("rm");
         assert!(
             matches!(again.as_slice(), [Restored::Unmanaged { .. }]),
             "{again:?}"
         );
+        // And the heir's own `rm` finishes: it inherited no claim to prune.
+        let heir_done = restore(&state, home.path(), std::slice::from_ref(&heir)).expect("rm");
+        assert!(
+            matches!(heir_done.as_slice(), [Restored::Removed { .. }]),
+            "{heir_done:?}"
+        );
+        assert!(peek(&home.child("real/heir.conf")).is_none());
+        assert!(home.child("real").is_dir(), "the user's directory stays");
     }
 
     #[test]
@@ -1702,7 +1879,15 @@ mod tests {
             fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make it read-only");
             if !crate::journal::tests::permissions_refuse(&locked) {
                 fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
-                return;
+                // `continue`, not `return`: r3 coverage COV1. Returning out of
+                // the whole test meant the `remove` half's skip took the
+                // `revert` half with it, and the revert half needs no
+                // privilege this one lacks that the remove half does not.
+                crate::journal::tests::cannot_build(
+                    "a_write_rm_cannot_make_is_the_sessions_own_error",
+                    crate::journal::tests::WRITES_THROUGH_PERMISSIONS,
+                );
+                continue;
             }
             let result = restore(&state, &home, std::slice::from_ref(&portable));
             // Before any assertion, so the tempdir can be removed whatever happens.
@@ -1959,5 +2144,159 @@ mod tests {
         assert!(crate::recover::recover(&state).expect("recover").is_clear());
         assert_eq!(mode_at(&home.child(".d")), Some(Mode::PRIVATE_DIR));
         assert!(entry_for(&state, home.path(), &portable).is_some());
+    }
+
+    /// The variable the foreign-prior child finds its directory in.
+    const FOREIGN_PRIOR_CHILD_DIR: &str = "BX_TEST_RESTORE_FOREIGN_PRIOR_DIR";
+
+    /// What the foreign-prior child prints first, so a child that never
+    /// started is told apart from one that ran and failed.
+    const FOREIGN_PRIOR_CHILD_RAN: &str = "bx-restore-foreign-prior-child-ran";
+
+    #[test]
+    fn rm_restores_a_prior_mode_without_owner_read_at_that_mode() {
+        // Integration of #8 @746fdc0. restore_one passes the recorded prior
+        // mode to stage, which refused any mode without owner read until
+        // 4a3248d, so a foreign 0004 file bx replaced could never be put back.
+        // Only somebody else's file can be read at 0004, so the apply and the
+        // rm run as another uid.
+        const NAME: &str =
+            "restore::tests::rm_restores_a_prior_mode_without_owner_read_at_that_mode";
+        let theirs = "theirs\n";
+        let recorded = Mode::from_bits(0o004);
+
+        if let Some(dir) = std::env::var_os(FOREIGN_PRIOR_CHILD_DIR) {
+            println!("{FOREIGN_PRIOR_CHILD_RAN}");
+            let home = PathBuf::from(dir).join("home");
+            let state = StateDir::resolve(&home);
+            let dest = home.join("foreign");
+
+            let portable = managed(&state, &home, "foreign", "managed\n", Mode::DEFAULT_FILE);
+            let entry = entry_for(&state, &home, &portable).expect("managed");
+            let Prior::Existed(reference) = &entry.prior else {
+                panic!("the foreign file must be the prior, got {:?}", entry.prior);
+            };
+            assert_eq!(reference.mode, recorded, "the prior mode is recorded");
+
+            let done = restore(&state, &home, std::slice::from_ref(&portable))
+                .expect("rm restores a prior mode without owner read");
+            assert!(
+                matches!(done.as_slice(), [Restored::Reverted { .. }]),
+                "{done:?}"
+            );
+            let on_disk = std::fs::symlink_metadata(&dest).expect("restored");
+            assert_eq!(
+                Mode::from_bits(std::os::unix::fs::PermissionsExt::mode(
+                    &on_disk.permissions()
+                )),
+                recorded,
+                "restored at the recorded mode",
+            );
+            fs::set_mode(&dest, Mode::DEFAULT_FILE).expect("unlock for the assertion");
+            assert_eq!(std::fs::read(&dest).expect("read"), theirs.as_bytes());
+            assert!(entry_for(&state, &home, &portable).is_none());
+            assert!(!state.journal().exists(), "the rm session closed cleanly");
+            // What this uid made, so the parent can remove its tempdir.
+            std::fs::remove_dir_all(home.join(".local")).expect("tidy the state directory");
+            return;
+        }
+
+        run_unprivileged_in_a_foreign_setgid_directory(NAME, FOREIGN_PRIOR_CHILD_DIR, |dir| {
+            let home = dir.join("home");
+            std::fs::create_dir(&home).expect("the home");
+            fs::set_mode(&home, Mode::from_bits(0o777)).expect("a home uid 1 can write in");
+            plant_file(&home.join("foreign"), theirs, recorded);
+        });
+    }
+
+    /// Run the test `name` again as uid 1 with no supplementary groups, inside
+    /// a user namespace, with `child_env` naming a world-writable setgid
+    /// directory owned by a group that uid is not in. `seed` fills the
+    /// directory first, as this user, who is somebody else to uid 1.
+    ///
+    /// The pattern of `fs::atomic`'s harness of the same name, whose test
+    /// module is private to it. Skips, with a message on stderr, wherever the
+    /// scenario cannot be constructed; fails only when the child ran and
+    /// failed.
+    fn run_unprivileged_in_a_foreign_setgid_directory(
+        name: &str,
+        child_env: &str,
+        seed: impl FnOnce(&Path),
+    ) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // r3 coverage COV1. Not an `eprintln!` that passes: a scenario this
+        // machine cannot build fails unless a human opted the skip in. See
+        // `crate::journal::tests::cannot_build`.
+        let skip = |why: &str| crate::journal::tests::cannot_build(name, why);
+        let home = guarded_home();
+        // Another uid has to reach the directory and run this test binary.
+        fs::set_mode(home.path(), Mode::DEFAULT_DIR).expect("open the home to traversal");
+        let exe = home.child("bx-test");
+        if let Err(e) = std::fs::copy(std::env::current_exe().expect("the test binary"), &exe) {
+            return skip(&format!("the test binary could not be copied: {e}"));
+        }
+        fs::set_mode(&exe, Mode::from_bits(0o755)).expect("chmod the copy");
+        let dir = home.child("shared");
+        std::fs::create_dir(&dir).expect("mkdir");
+        seed(&dir);
+
+        let in_namespace = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new("unshare")
+                .args(["--map-auto", "--map-root-user", "--"])
+                .args(args)
+                .env(child_env, &dir)
+                .output()
+        };
+        for step in [
+            [
+                std::ffi::OsStr::new("chown"),
+                "0:5".as_ref(),
+                dir.as_os_str(),
+            ],
+            ["chmod".as_ref(), "2777".as_ref(), dir.as_os_str()],
+        ] {
+            match in_namespace(&step) {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    return skip(&format!(
+                        "{step:?} in a user namespace failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                Err(e) => return skip(&format!("unshare could not run: {e}")),
+            }
+        }
+        let meta = std::fs::metadata(&dir).expect("stat");
+        if meta.mode() & 0o2000 == 0 || meta.gid() == rustix::process::getegid().as_raw() {
+            return skip("the directory is not setgid to a foreign group");
+        }
+
+        let child = in_namespace(&[
+            "setpriv".as_ref(),
+            "--reuid=1".as_ref(),
+            "--regid=1".as_ref(),
+            "--clear-groups".as_ref(),
+            "--".as_ref(),
+            exe.as_os_str(),
+            "--exact".as_ref(),
+            name.as_ref(),
+            "--nocapture".as_ref(),
+        ]);
+        let out = match child {
+            Ok(out) => out,
+            Err(e) => return skip(&format!("unshare could not run: {e}")),
+        };
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        if !stdout.contains(FOREIGN_PRIOR_CHILD_RAN) {
+            return skip(&format!("the unprivileged child did not start: {stderr}"));
+        }
+        assert!(
+            out.status.success(),
+            "the unprivileged child failed:\n{stdout}\n{stderr}"
+        );
     }
 }

@@ -62,29 +62,34 @@
 //!
 //! # Invariant 2
 //!
-//! A tool's activation output assigns environment variables, so the phases it
-//! lands in fall under the environment guard: **every assignment in the
-//! output is judged by [`env_guard::check`] before it is written**, against
-//! the same [`RootSet`] every environment fragment is judged against, and an
-//! output with one the guard refuses is omitted as a blocked step naming the
-//! variable. Nothing it would have set reaches the file.
+//! Invariant 2 forbids moving a tool's config, data or cache outside a root
+//! the configuration declares. A tool's activation output is the tool's own
+//! shell code: it assigns variables of its own — `MISE_SHELL`,
+//! `STARSHIP_SHELL`, a function's locals, ZLE's `BUFFER` — defines functions
+//! and registers hooks, and none of that moves a file. So it is held to the
+//! relocation rule, not to the environment-fragment grammar: **every
+//! assignment it makes to a variable that relocates a tool is judged by
+//! [`env_guard::check`] before it is written**, against the same [`RootSet`]
+//! every environment fragment is judged against, and an output with one the
+//! guard refuses, or one bx cannot value, is omitted as a blocked step naming
+//! the variable. Nothing it would have set reaches the file.
 //!
-//! [`refusals`] is that judgement. It reads the output as shell — quotes,
-//! escapes, substitutions, comments, command position — and judges each
-//! `NAME=VALUE` it finds: a bare assignment in command position, a prefix
-//! assignment to a command, and every operand of `export`, `typeset`,
-//! `declare`, `readonly`, `local`, `integer` and `float`, at any depth of the
-//! output's own functions and blocks, and inside the body of every `alias` it
-//! defines. It **fails closed**: an assignment it can find but not value — an
-//! append, a subscript, an array, a loop variable, an operand of a command
-//! whose name is itself a substitution — and a construct that can assign what
-//! it cannot see — `eval`, `source`, `.`, `read`, `vared`, `getopts`,
-//! `zparseopts`, `let`, `trap`, `emulate -c`, `print -v`, `set -A`,
-//! `${NAME=…}`, an arithmetic assignment, an alias body it cannot unquote, a
-//! heredoc, a quote that does not close — are refused as
-//! [`Reason::Unreadable`]. Only a command
-//! substitution's own assignments are not judged, because it runs in a
-//! subshell and cannot change the shell the file is sourced into.
+//! [`relocations`] is that judgement. It searches the whole output for every
+//! name [`env_guard::is_relocating`] knows — the emit table's locations and
+//! anchors, the `XDG_*_HOME` family, and the tool homes the guard lists — and
+//! judges each occurrence that stands in an assigning position: a readable
+//! `NAME=WORD` goes to [`env_guard::check`], and every other form that assigns
+//! or may — `NAME+=`, an array, a quoted `NAME=`, an operand of `export`,
+//! `typeset`, `local`, `read` and the other assigning builtins, an arithmetic
+//! assignment, `${NAME:=…}`, the name given as a value an indirect assignment
+//! could use — is refused as [`Reason::Unreadable`]. Every other line of the
+//! output passes untouched, so the real outputs of mise, starship, zoxide, fzf
+//! and uv are cached and rendered; `the_real_outputs_of_common_tools_render`
+//! holds that against captured outputs in `tests/fixtures/activation/`.
+//!
+//! What the output's code does when it runs — `mise activate zsh`'s
+//! `eval "$(mise hook-env)"` at every prompt — is the tool's own behaviour at
+//! runtime, not bytes bx emits, and is outside this judgement.
 //!
 //! What passes is rendered as **one `eval` statement whose single argument is
 //! a single-quoted literal** holding the tool's output byte for byte, so bx's
@@ -92,7 +97,8 @@
 //! rather than swallowing the rest of the file.
 //! `a_rendered_activation_is_one_eval_of_a_literal_and_sets_nothing_itself`
 //! holds the rendered bytes to that, and
-//! `every_assignment_in_an_output_is_judged_by_the_guard` holds the reader.
+//! `every_assignment_to_a_relocating_variable_is_judged_by_the_guard` holds
+//! the search.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -479,13 +485,11 @@ impl fmt::Display for Omission {
                  the next plan runs it again",
             ),
             Self::Refused { first, more } => {
-                f.write_str("the environment guard refuses its output: ")?;
-                if first.name.is_empty() {
-                    write!(f, "line {}, `{}`,", first.line, first.value)?;
-                } else {
-                    write!(f, "`{}` at line {}", first.name, first.line)?;
-                }
-                write!(f, " {}", first.reason)?;
+                write!(
+                    f,
+                    "the environment guard refuses its output: `{}` at line {} {}",
+                    first.name, first.line, first.reason
+                )?;
                 match more {
                     0 => Ok(()),
                     1 => f.write_str("; 1 more assignment is refused"),
@@ -710,9 +714,9 @@ pub fn plan(
 }
 
 /// Why the guard keeps `output` out of the file, or `None` when it refuses
-/// none of its assignments.
+/// none of its assignments to a relocating variable.
 fn judged(output: &str, roots: &RootSet) -> Option<Omission> {
-    let mut refused = refusals(output, roots).into_iter();
+    let mut refused = relocations(output, roots).into_iter();
     refused.next().map(|first| Omission::Refused {
         first,
         more: refused.len(),
@@ -775,46 +779,209 @@ fn decide(decl: &ActivationDecl, cache: &Fingerprints, host: &impl Host) -> Outc
     }
 }
 
-/// How deep one substitution may nest inside another before the reader
-/// refuses the output rather than follow it.
-const MAX_NESTING: usize = 64;
-
-/// Commands every `NAME=VALUE` operand of which is an assignment.
-const DECLARERS: [&str; 7] = [
-    "export", "typeset", "declare", "readonly", "local", "integer", "float",
-];
-
-/// Commands that can assign what the reader cannot see.
-const INDIRECT: [&str; 9] = [
+/// Commands and keywords whose operands may be names they assign, by value or
+/// indirectly: an occurrence of a relocating name among the operands of a
+/// command whose command word is one of these is refused, whatever else
+/// surrounds it.
+/// `unset` is not one: it takes a name back to its tool's native default.
+const ASSIGNERS: [&str; 30] = [
+    "alias",
+    "compadd",
+    "declare",
+    "emulate",
     "eval",
-    "source",
-    ".",
-    "read",
-    "vared",
+    "export",
+    "float",
+    "for",
+    "foreach",
     "getopts",
-    "zparseopts",
+    "integer",
     "let",
+    "local",
+    "pcre_match",
+    "print",
+    "printf",
+    "private",
+    "read",
+    "readonly",
+    "select",
+    "set",
+    "strftime",
+    "sysread",
     "trap",
+    "typeset",
+    "vared",
+    "zparseopts",
+    "zregexparse",
+    "zselect",
+    "zstat",
 ];
 
-/// Words after which the next word is still in command position.
-const PREFIXES: [&str; 22] = [
-    "!",
-    "{",
-    "}",
+/// What ends the command an occurrence stands in, searching back from it: a
+/// newline no backslash continues, a list or pipeline separator, a brace
+/// group's edge, or a backtick substitution's.
+const COMMAND_EDGES: [char; 7] = ['\n', ';', '&', '|', '{', '}', '`'];
+
+/// Every assignment `output` makes to a relocating variable that
+/// [`env_guard::check`] refuses under `roots`, or that bx cannot value, in the
+/// order they occur, each numbered by its line within the output. An output
+/// is written only when this is empty.
+///
+/// This is a search, not a reading of the whole output as shell. Every
+/// occurrence of a name [`env_guard::is_relocating`] knows is found, wherever
+/// it stands, and classified by what surrounds it:
+///
+/// * `$NAME`, and `${NAME…}` with any operator but an assigning one, read the
+///   variable and pass;
+/// * a line that begins with `#` is a comment, and passes;
+/// * `NAME=WORD`, with nothing quoting or escaping the name, is judged by
+///   [`env_guard::check`] when `WORD` is one shell word whose quotes close —
+///   the check itself refuses one it cannot read, a substitution included;
+/// * every other assigning form is refused as [`Reason::Unreadable`]:
+///   `NAME+=`, a subscript, an array, a quoted or escaped `NAME=` (it is text
+///   something else may run), `${NAME=…}` and its kin, an arithmetic
+///   assignment or increment, the name given as the value of an assignment or
+///   an array element (it may name the variable an indirect assignment
+///   writes), and the name anywhere among the operands of a builtin or
+///   keyword that assigns its operands — `export NAME`, `read NAME`,
+///   `print -v NAME`, `for NAME in`, `eval "NAME…"`, `alias`, `trap` and the
+///   rest of `ASSIGNERS`;
+/// * anything else — the name in a string, a pattern or another command's
+///   operand — passes.
+///
+/// A name that is not relocating is never looked at, so a tool's own
+/// variables, functions and hooks pass untouched. The command word is found
+/// by searching back from the occurrence, not by parsing, so a name that
+/// follows an assigning word at the start of a line of a multi-line string
+/// is refused: the search fails closed.
+#[must_use]
+pub fn relocations(output: &str, roots: &RootSet) -> Vec<Violation> {
+    let chars: Vec<char> = output.chars().collect();
+    let mut found = Vec::new();
+    let mut k = 0;
+    while k < chars.len() {
+        if !is_name_char(chars[k]) {
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while chars.get(k).copied().is_some_and(is_name_char) {
+            k += 1;
+        }
+        let name: String = chars[start..k].iter().collect();
+        if name.starts_with(|c: char| c.is_ascii_digit()) || !env_guard::is_relocating(&name) {
+            continue;
+        }
+        let refused = match occurrence(&chars, start, k) {
+            Use::Reads => None,
+            Use::Assigns(value) => match env_guard::check(&name, &value, roots) {
+                Verdict::Allowed => None,
+                Verdict::Violation(refused) => Some(refused),
+            },
+            Use::Unreadable => Some(Violation {
+                line: 0,
+                name: name.clone(),
+                value: line_of(&chars, start).trim().to_string(),
+                reason: Reason::Unreadable,
+            }),
+        };
+        if let Some(mut refused) = refused {
+            refused.line = chars[..start].iter().filter(|c| **c == '\n').count() + 1;
+            found.push(refused);
+        }
+    }
+    found
+}
+
+/// Whether `c` can be part of a variable name.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// What one occurrence of a relocating name does.
+enum Use {
+    /// It reads the variable, or is only text.
+    Reads,
+    /// It assigns the variable this word, as written.
+    Assigns(String),
+    /// It assigns, or may, a value that cannot be read.
+    Unreadable,
+}
+
+/// What the name occupying `chars[start..end]` does, from what surrounds it.
+fn occurrence(chars: &[char], start: usize, end: usize) -> Use {
+    let before = &chars[..start];
+    let line = line_of(chars, start);
+    if line.trim_start().starts_with('#') {
+        return Use::Reads;
+    }
+    if let Some(reads) = expansion(before, &chars[end..]) {
+        return if reads { Use::Reads } else { Use::Unreadable };
+    }
+
+    // What follows the name: a subscript, then an operator.
+    let mut after = end;
+    let subscript = chars.get(after) == Some(&'[');
+    if subscript {
+        match chars[after..].iter().position(|c| *c == ']') {
+            Some(p) => after += p + 1,
+            None => return Use::Unreadable,
+        }
+    }
+    let rest = &chars[after..];
+    let quoted = before
+        .last()
+        .is_some_and(|c| matches!(c, '\'' | '"' | '\\' | '`'));
+    if rest.first() == Some(&'=') && !matches!(rest.get(1), Some('=' | '~')) {
+        if subscript || quoted || rest.get(1) == Some(&'(') {
+            return Use::Unreadable;
+        }
+        return word(&rest[1..]).map_or(Use::Unreadable, Use::Assigns);
+    }
+    if rest.starts_with(&['+', '=']) || rest.starts_with(&['\\', '=']) {
+        return Use::Unreadable;
+    }
+    if arithmetic(before, rest) {
+        return Use::Unreadable;
+    }
+
+    // Where the name is a value or an operand, what it is given to.
+    let preceding: String = before
+        .iter()
+        .rev()
+        .take_while(|c| matches!(c, '\'' | '"'))
+        .collect();
+    if before[..start - preceding.len()].last() == Some(&'=') {
+        return Use::Unreadable;
+    }
+    let command = command_before(before, &COMMAND_EDGES);
+    let in_array = command
+        .rfind("=(")
+        .is_some_and(|open| !command[open..].contains(')'));
+    // The command word, read both across parentheses — `local x=$(y) NAME` —
+    // and within them — `case $a in b) export NAME`.
+    let grouped = command_before(before, &[&COMMAND_EDGES[..], &['(', ')']].concat());
+    let assigner = [command.as_str(), grouped.as_str()]
+        .into_iter()
+        .filter_map(command_word)
+        .any(|word| ASSIGNERS.contains(&word));
+    if in_array || assigner {
+        Use::Unreadable
+    } else {
+        Use::Reads
+    }
+}
+
+/// Words that leave the next word in command position.
+const PRECOMMANDS: [&str; 14] = [
     "if",
     "then",
     "elif",
     "else",
-    "fi",
     "while",
     "until",
     "do",
-    "done",
-    "esac",
-    "always",
     "time",
-    "coproc",
     "builtin",
     "command",
     "exec",
@@ -823,581 +990,150 @@ const PREFIXES: [&str; 22] = [
     "-",
 ];
 
-/// Keywords whose next word is a loop variable.
-const LOOPS: [&str; 3] = ["for", "select", "foreach"];
-
-/// Every environment assignment `output` makes that [`env_guard::check`]
-/// refuses under `roots`, in the order the output makes them, each numbered by
-/// its line within the output. An output is written only when this is empty.
-///
-/// The output is read as shell, as the module docs set out, and judged
-/// assignment by assignment: a construct that can assign but that the reader
-/// cannot value is refused as [`Reason::Unreadable`], naming the variable
-/// where there is one to name and quoting the line otherwise. A construct the
-/// reader cannot follow at all — a heredoc, a quote or a substitution that
-/// does not close, one nested past its bound — ends the reading with that one
-/// refusal, since nothing after it can be told apart from what it holds.
-#[must_use]
-pub fn refusals(output: &str, roots: &RootSet) -> Vec<Violation> {
-    let chars: Vec<char> = output.chars().collect();
-    let lexer = Lexer {
-        c: &chars,
-        i: 0,
-        word: String::new(),
-        start: 0,
-        depth: 0,
-        out: Vec::new(),
-    };
-    let mut reader = Reader {
-        chars: &chars,
-        roots,
-        found: Vec::new(),
-    };
-    match lexer.run() {
-        Ok(tokens) => reader.read(&tokens),
-        Err(at) => reader.unreadable(at, ""),
-    }
-    reader.found
-}
-
-/// One token of an output.
-enum Tok {
-    /// A word, as written: quotes, escapes and substitutions kept.
-    Word(String),
-    /// A newline, `;`, `&` or `|`: the next word begins a command.
-    Sep,
-    /// `(`.
-    Open,
-    /// `)`.
-    Close,
-}
-
-/// A token, and the characters it spans.
-struct Token {
-    /// The token.
-    tok: Tok,
-    /// Its first character.
-    at: usize,
-    /// One past its last character.
-    end: usize,
-}
-
-/// Splits an output into [`Token`]s, refusing — by returning where it
-/// begins — a construct that can assign unseen or that it cannot follow.
-struct Lexer<'a> {
-    /// The output.
-    c: &'a [char],
-    /// The next character.
-    i: usize,
-    /// The word being read.
-    word: String,
-    /// Where it began.
-    start: usize,
-    /// How deep the substitution being read is nested.
-    depth: usize,
-    /// The tokens read so far.
-    out: Vec<Token>,
-}
-
-impl Lexer<'_> {
-    /// Every token, or where the construct it refuses begins.
-    fn run(mut self) -> Result<Vec<Token>, usize> {
-        while let Some(&ch) = self.c.get(self.i) {
-            let at = self.i;
-            match ch {
-                ' ' | '\t' | '\r' => {
-                    self.end_word();
-                    self.i += 1;
-                }
-                '\n' | ';' | '&' | '|' => self.mark(Tok::Sep),
-                // `(( … ))`, an arithmetic command.
-                '(' if self.word.is_empty() && self.c.get(at + 1) == Some(&'(') => {
-                    let end = self.group(at, '(', ')')?;
-                    if arithmetic_assigns(&self.c[at + 2..end - 2]) {
-                        return Err(at);
-                    }
-                    self.take_to(end);
-                }
-                '(' => self.mark(Tok::Open),
-                ')' => self.mark(Tok::Close),
-                '<' | '>' => self.redirection()?,
-                // A line continuation joins what it splits.
-                '\\' if self.c.get(at + 1) == Some(&'\n') => self.i += 2,
-                '\\' => self.take_to((at + 2).min(self.c.len())),
-                '#' if self.word.is_empty() => {
-                    while self.c.get(self.i).is_some_and(|c| *c != '\n') {
-                        self.i += 1;
-                    }
-                }
-                '\'' => {
-                    let end = self.single(at)?;
-                    self.take_to(end);
-                }
-                '"' => {
-                    let end = self.double(at)?;
-                    self.take_to(end);
-                }
-                '`' => {
-                    let end = self.backtick(at)?;
-                    self.take_to(end);
-                }
-                '$' => {
-                    let end = self.dollar(at)?;
-                    self.take_to(end);
-                }
-                _ => self.take_to(at + 1),
+/// The word of `command` in command position, past any precommand, keyword
+/// or prefix assignment, with the quotes, escapes and openers that can wrap
+/// a command name taken off.
+fn command_word(command: &str) -> Option<&str> {
+    // The quote a prefix assignment's value left open, whose blanks do not
+    // end the value.
+    let mut open: Option<char> = None;
+    for raw in command.split_whitespace() {
+        if let Some(quote) = open {
+            if raw.matches(quote).count() % 2 == 1 {
+                open = None;
             }
+            continue;
         }
-        self.end_word();
-        Ok(self.out)
-    }
-
-    /// Add the characters up to `end` to the word being read.
-    fn take_to(&mut self, end: usize) {
-        if self.word.is_empty() {
-            self.start = self.i;
+        let word = raw
+            .trim_start_matches(['\\', '\'', '"', '(', '!', '$'])
+            .trim_end_matches(['\'', '"']);
+        if word.is_empty() || PRECOMMANDS.contains(&word) {
+            continue;
         }
-        self.word.extend(&self.c[self.i..end]);
-        self.i = end;
-    }
-
-    /// End the word being read, if there is one.
-    fn end_word(&mut self) {
-        if !self.word.is_empty() {
-            self.out.push(Token {
-                tok: Tok::Word(std::mem::take(&mut self.word)),
-                at: self.start,
-                end: self.i,
-            });
-        }
-    }
-
-    /// End the word being read, and add the one-character `tok` after it.
-    fn mark(&mut self, tok: Tok) {
-        self.end_word();
-        self.out.push(Token {
-            tok,
-            at: self.i,
-            end: self.i + 1,
-        });
-        self.i += 1;
-    }
-
-    /// Step over a redirection operator. A heredoc is refused: its body is
-    /// not shell, and the reader cannot tell where it ends without running
-    /// the command that reads it.
-    fn redirection(&mut self) -> Result<(), usize> {
-        let at = self.i;
-        self.end_word();
-        if self.c[at] == '<' && self.c.get(at + 1) == Some(&'<') {
-            if self.c.get(at + 2) == Some(&'<') {
-                self.i = at + 3;
-                return Ok(());
-            }
-            return Err(at);
-        }
-        if self.c.get(at + 1) == Some(&'(') {
-            // A process substitution runs in a subshell of its own.
-            self.i = self.group(at + 1, '(', ')')?;
-            return Ok(());
-        }
-        self.i = at + 1;
-        while self
-            .c
-            .get(self.i)
-            .is_some_and(|c| matches!(c, '<' | '>' | '&' | '|'))
+        if let Some((name, value)) = raw.split_once('=')
+            && !name.is_empty()
+            && name.chars().all(is_name_char)
         {
-            self.i += 1;
+            open = ['"', '\'']
+                .into_iter()
+                .find(|quote| value.matches(*quote).count() % 2 == 1);
+            continue;
         }
-        Ok(())
+        return Some(word);
     }
-
-    /// One past the `'` that closes the one at `at`.
-    fn single(&self, at: usize) -> Result<usize, usize> {
-        self.c[at + 1..]
-            .iter()
-            .position(|c| *c == '\'')
-            .map(|p| at + p + 2)
-            .ok_or(at)
-    }
-
-    /// One past the `"` that closes the one at `at`.
-    fn double(&mut self, at: usize) -> Result<usize, usize> {
-        let mut j = at + 1;
-        loop {
-            match self.c.get(j) {
-                None => return Err(at),
-                Some('\\') => j += 2,
-                Some('"') => return Ok(j + 1),
-                Some('$') => j = self.dollar(j)?,
-                Some('`') => j = self.backtick(j)?,
-                Some(_) => j += 1,
-            }
-        }
-    }
-
-    /// One past the `` ` `` that closes the one at `at`. What it runs, it
-    /// runs in a subshell.
-    fn backtick(&self, at: usize) -> Result<usize, usize> {
-        let mut j = at + 1;
-        loop {
-            match self.c.get(j) {
-                None => return Err(at),
-                Some('\\') => j += 2,
-                Some('`') => return Ok(j + 1),
-                Some(_) => j += 1,
-            }
-        }
-    }
-
-    /// One past the expansion the `$` at `at` begins. A command substitution
-    /// runs in a subshell, so what it assigns is not judged; a parameter
-    /// expansion or an arithmetic expansion that assigns is refused.
-    fn dollar(&mut self, at: usize) -> Result<usize, usize> {
-        self.depth += 1;
-        if self.depth > MAX_NESTING {
-            return Err(at);
-        }
-        let end = match self.c.get(at + 1) {
-            Some('(') if self.c.get(at + 2) == Some(&'(') => {
-                let end = self.group(at + 1, '(', ')')?;
-                if arithmetic_assigns(&self.c[at + 3..end - 2]) {
-                    return Err(at);
-                }
-                end
-            }
-            Some('(') => self.group(at + 1, '(', ')')?,
-            Some('{') => {
-                let end = self.group(at + 1, '{', '}')?;
-                if parameter_assigns(&self.c[at + 2..end - 1]) {
-                    return Err(at);
-                }
-                end
-            }
-            Some('\'') => {
-                let mut j = at + 2;
-                loop {
-                    match self.c.get(j) {
-                        None => return Err(at),
-                        Some('\\') => j += 2,
-                        Some('\'') => break j + 1,
-                        Some(_) => j += 1,
-                    }
-                }
-            }
-            _ => at + 1,
-        };
-        self.depth -= 1;
-        Ok(end)
-    }
-
-    /// One past the `close` that balances the `open` at `at`, stepping over
-    /// quotes, escapes, expansions and — between parentheses — comments.
-    fn group(&mut self, at: usize, open: char, close: char) -> Result<usize, usize> {
-        let mut depth = 0usize;
-        let mut j = at;
-        loop {
-            match self.c.get(j) {
-                None => return Err(at),
-                Some('\\') => j += 2,
-                Some('\'') => j = self.single(j)?,
-                Some('"') => j = self.double(j)?,
-                Some('`') => j = self.backtick(j)?,
-                Some('$') => j = self.dollar(j)?,
-                Some('#') if open == '(' && self.c[j - 1].is_ascii_whitespace() => {
-                    while self.c.get(j).is_some_and(|c| *c != '\n') {
-                        j += 1;
-                    }
-                }
-                Some(c) if *c == open => {
-                    depth += 1;
-                    j += 1;
-                }
-                Some(c) if *c == close => {
-                    depth -= 1;
-                    j += 1;
-                    if depth == 0 {
-                        return Ok(j);
-                    }
-                }
-                Some(_) => j += 1,
-            }
-        }
-    }
+    None
 }
 
-/// Whether an arithmetic expression assigns: any `=` that is not part of
-/// `==`, `!=`, `<=` or `>=`, and any `++` or `--`.
-fn arithmetic_assigns(c: &[char]) -> bool {
-    c.iter().enumerate().any(|(k, &x)| match x {
-        '=' => {
-            let doubled = |b: char| k >= 2 && c[k - 2] == b;
-            c.get(k + 1) != Some(&'=')
-                && match k.checked_sub(1).map(|p| c[p]) {
-                    Some('=' | '!') => false,
-                    Some(b @ ('<' | '>')) => doubled(b),
-                    _ => true,
-                }
-        }
-        '+' | '-' => c.get(k + 1) == Some(&x),
-        _ => false,
-    })
-}
-
-/// Whether the inside of a `${…}` assigns: `${NAME=…}`, `${NAME:=…}` or
-/// `${NAME::=…}`, flags and a subscript allowed before the operator.
-fn parameter_assigns(c: &[char]) -> bool {
-    let mut j = 0;
-    if c.first() == Some(&'(') {
-        match c.iter().position(|x| *x == ')') {
-            Some(p) => j = p + 1,
-            None => return true,
-        }
+/// Whether the name that `before` ends at and `after` begins at sits inside a
+/// `${…}` expansion: `Some(true)` when the expansion only reads it,
+/// `Some(false)` when it assigns it (`${NAME=…}`, `${NAME:=…}`,
+/// `${NAME::=…}`), and `None` when it is not in one. `$NAME` reads it too.
+fn expansion(before: &[char], after: &[char]) -> Option<bool> {
+    if before.last() == Some(&'$') {
+        return Some(true);
     }
-    while matches!(c.get(j), Some('^' | '=' | '~' | '#' | '!' | '+')) {
-        j += 1;
+    // Flags a `${…}` may carry before its name: `${#…}`, `${(j: :)…}`.
+    let mut open = before.len();
+    while open > 0 && "#!^=~+".contains(before[open - 1]) {
+        open -= 1;
     }
-    let name = j;
-    while c
-        .get(j)
-        .is_some_and(|x| x.is_ascii_alphanumeric() || *x == '_')
-    {
-        j += 1;
+    if open > 0 && before[open - 1] == ')' {
+        open = before[..open].iter().rposition(|c| *c == '(')?;
     }
-    if j == name && c.get(j).is_some_and(|x| "@*#?$!-".contains(*x)) {
-        j += 1;
-    }
-    if c.get(j) == Some(&'[') {
-        match c[j..].iter().position(|x| *x == ']') {
-            Some(p) => j += p + 1,
-            None => return true,
-        }
-    }
-    let rest = &c[j..];
-    rest.starts_with(&['=']) || rest.starts_with(&[':', '=']) || rest.starts_with(&[':', ':', '='])
-}
-
-/// `raw` as an assignment: its name, and its value where the reader can
-/// judge one — `None` for an append or a subscript.
-fn assignment(raw: &str) -> Option<(&str, Option<&str>)> {
-    let len = raw
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(raw.len());
-    let (name, rest) = raw.split_at(len);
-    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+    if !before[..open].ends_with(&['$', '{']) {
         return None;
     }
-    if let Some(value) = rest.strip_prefix('=') {
-        Some((name, Some(value)))
-    } else if rest.starts_with("+=") || (rest.starts_with('[') && rest.contains('=')) {
-        Some((name, None))
-    } else {
-        None
+    let mut k = 0;
+    if after.first() == Some(&'[') {
+        k = after
+            .iter()
+            .position(|c| *c == ']')
+            .map_or(after.len(), |p| p + 1);
     }
+    let rest = &after[k..];
+    let assigns = rest.starts_with(&['='])
+        || rest.starts_with(&[':', '='])
+        || rest.starts_with(&[':', ':', '=']);
+    Some(!assigns)
 }
 
-/// `raw` with its quotes and escapes removed, or `None` when it expands to
-/// something the reader cannot know.
-fn plain(raw: &str) -> Option<String> {
-    (!raw.contains(['$', '`'])).then(|| {
-        raw.chars()
-            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
-            .collect()
-    })
+/// Whether the name between `before` and `rest` is assigned in arithmetic:
+/// followed, after blanks, by `=` that is not `==`, by a compound assignment
+/// or by `++`/`--`, or preceded by `++`/`--`.
+fn arithmetic(before: &[char], rest: &[char]) -> bool {
+    let next: String = rest
+        .iter()
+        .skip_while(|c| **c == ' ' || **c == '\t')
+        .take(3)
+        .collect();
+    let assigns = (next.starts_with('=') && !next.starts_with("==") && !next.starts_with("=~"))
+        || [
+            "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "**=", "++", "--",
+        ]
+        .iter()
+        .any(|op| next.starts_with(op));
+    let previous: String = before
+        .iter()
+        .rev()
+        .skip_while(|c| **c == ' ' || **c == '\t')
+        .take(2)
+        .collect();
+    assigns || previous == "++" || previous == "--"
 }
 
-/// Where the reader stands in a command.
-#[derive(Clone, Copy)]
-enum State {
-    /// At a command's first word, or after a prefix assignment.
-    Start,
-    /// In the operands of a [`DECLARERS`] command.
-    Declaring,
-    /// In the operands of a command whose name is an expansion.
-    Dynamic,
-    /// At a loop variable.
-    Loop,
-    /// At the name `function` defines.
-    Named,
-    /// In the operands of a command a flag holding this letter makes assign.
-    Flags(char),
-    /// In the operands of `alias`.
-    Alias,
-    /// In operands that assign nothing.
-    Other,
+/// The text of the command `before` ends in: back to the nearest of `edges`
+/// no backslash escapes, so a backslash-continued newline joins the lines it
+/// splits and an escaped backtick is only text.
+fn command_before(before: &[char], edges: &[char]) -> String {
+    let mut k = before.len();
+    while k > 0 {
+        let c = before[k - 1];
+        let escaped = k >= 2 && before[k - 2] == '\\';
+        if edges.contains(&c) && !escaped {
+            break;
+        }
+        k -= 1;
+    }
+    before[k..].iter().collect()
 }
 
-/// Judges the assignments in a token stream.
-struct Reader<'a> {
-    /// The output, to number lines and quote them.
-    chars: &'a [char],
-    /// The roots every value is judged against.
-    roots: &'a RootSet,
-    /// Every refusal, in order.
-    found: Vec<Violation>,
-}
-
-impl Reader<'_> {
-    /// Judge every assignment in `tokens`.
-    fn read(&mut self, tokens: &[Token]) {
-        let mut state = State::Start;
-        for (k, token) in tokens.iter().enumerate() {
-            let Tok::Word(raw) = &token.tok else {
-                state = State::Start;
-                continue;
-            };
-            // `NAME=(`, with nothing between: an array.
-            let array = tokens
-                .get(k + 1)
-                .is_some_and(|next| matches!(next.tok, Tok::Open) && next.at == token.end);
-            state = match state {
-                State::Start => self.command(raw, token.at, array),
-                State::Declaring | State::Dynamic => {
-                    self.operand(raw, token.at, array);
-                    state
-                }
-                State::Loop if raw.starts_with("((") => State::Other,
-                State::Loop => {
-                    self.unreadable(token.at, raw);
-                    State::Other
-                }
-                State::Named => State::Start,
-                State::Flags(letter) => {
-                    if raw.starts_with(['-', '+']) && raw.contains(letter) {
-                        self.unreadable(token.at, "");
+/// The shell word `text` begins with, as written — quotes and escapes kept —
+/// or `None` when a quote in it does not close.
+fn word(text: &[char]) -> Option<String> {
+    let mut k = 0;
+    while let Some(&c) = text.get(k) {
+        match c {
+            ' ' | '\t' | '\n' | ';' | '&' | '|' | ')' | '<' | '>' => break,
+            '\'' => k += 2 + text[k + 1..].iter().position(|c| *c == '\'')?,
+            '"' => {
+                let mut j = k + 1;
+                loop {
+                    match text.get(j)? {
+                        '\\' => j += 2,
+                        '"' => break,
+                        _ => j += 1,
                     }
-                    state
                 }
-                State::Alias => {
-                    self.alias(raw, token.at);
-                    state
-                }
-                State::Other => State::Other,
-            };
-        }
-    }
-
-    /// Read `raw` in command position.
-    fn command(&mut self, raw: &str, at: usize, array: bool) -> State {
-        if let Some((name, value)) = assignment(raw) {
-            self.assignment(name, value, at, array);
-            return State::Start;
-        }
-        let Some(name) = plain(raw) else {
-            return State::Dynamic;
-        };
-        match name.as_str() {
-            n if PREFIXES.contains(&n) => State::Start,
-            n if DECLARERS.contains(&n) => State::Declaring,
-            n if LOOPS.contains(&n) => State::Loop,
-            n if INDIRECT.contains(&n) => {
-                self.unreadable(at, "");
-                State::Other
+                k = j + 1;
             }
-            "function" => State::Named,
-            "print" | "printf" => State::Flags('v'),
-            "set" => State::Flags('A'),
-            "emulate" => State::Flags('c'),
-            "alias" => State::Alias,
-            _ => State::Other,
+            '\\' => k += 2,
+            _ => k += 1,
         }
     }
+    Some(text[..k.min(text.len())].iter().collect())
+}
 
-    /// Read `raw` as an operand of `alias`: a body is shell that runs in this
-    /// shell wherever the alias is used, so what it assigns is judged as if it
-    /// were written there. A body quoted any way but one plain single-quoted
-    /// string is refused.
-    fn alias(&mut self, raw: &str, at: usize) {
-        const HIDING: [char; 5] = ['\'', '"', '\\', '$', '`'];
-        let Some((name, value)) = raw.split_once('=') else {
-            // An expansion may yet expand to a definition.
-            if raw.contains(HIDING) {
-                self.unreadable(at, "");
-            }
-            return;
-        };
-        if name.contains(HIDING) {
-            self.unreadable(at, "");
-            return;
-        }
-        let quoted = value.len() >= 2
-            && value.starts_with('\'')
-            && value.ends_with('\'')
-            && value.matches('\'').count() == 2;
-        let body = if quoted {
-            &value[1..value.len() - 1]
-        } else if value.contains(HIDING) {
-            self.unreadable(at, "");
-            return;
-        } else {
-            value
-        };
-        for mut refused in refusals(body, self.roots) {
-            refused.line = self.line(at);
-            self.found.push(refused);
-        }
-    }
-
-    /// Read `raw` as an operand that may assign: judged where it is an
-    /// assignment, refused where quoting or an expansion hides whether it is.
-    fn operand(&mut self, raw: &str, at: usize, array: bool) {
-        if let Some((name, value)) = assignment(raw) {
-            self.assignment(name, value, at, array);
-            return;
-        }
-        match plain(raw) {
-            None => self.unreadable(at, ""),
-            Some(text) if text.contains('=') && !text.starts_with(['-', '+']) => {
-                let name = text.split('=').next().unwrap_or_default().to_string();
-                self.unreadable(at, &name);
-            }
-            Some(_) => {}
-        }
-    }
-
-    /// Judge the assignment of `value` to `name`; `None` is one the reader
-    /// cannot value.
-    fn assignment(&mut self, name: &str, value: Option<&str>, at: usize, array: bool) {
-        match value {
-            Some(value) if !(array && value.is_empty()) => {
-                if let Verdict::Violation(mut refused) = env_guard::check(name, value, self.roots) {
-                    refused.line = self.line(at);
-                    self.found.push(refused);
-                }
-            }
-            _ => self.unreadable(at, name),
-        }
-    }
-
-    /// Refuse what begins at `at` as unreadable, naming `name` or, where there
-    /// is none, quoting the line.
-    fn unreadable(&mut self, at: usize, name: &str) {
-        let at = at.min(self.chars.len());
-        let start = self.chars[..at]
-            .iter()
-            .rposition(|c| *c == '\n')
-            .map_or(0, |p| p + 1);
-        let end = self.chars[at..]
-            .iter()
-            .position(|c| *c == '\n')
-            .map_or(self.chars.len(), |p| at + p);
-        let text: String = self.chars[start..end].iter().collect();
-        self.found.push(Violation {
-            line: self.line(at),
-            name: name.to_string(),
-            value: text.trim().to_string(),
-            reason: Reason::Unreadable,
-        });
-    }
-
-    /// The 1-based line `at` is on.
-    fn line(&self, at: usize) -> usize {
-        self.chars[..at.min(self.chars.len())]
-            .iter()
-            .filter(|c| **c == '\n')
-            .count()
-            + 1
-    }
+/// The whole line the character at `at` is on.
+fn line_of(chars: &[char], at: usize) -> String {
+    let start = chars[..at]
+        .iter()
+        .rposition(|c| *c == '\n')
+        .map_or(0, |p| p + 1);
+    let end = chars[at..]
+        .iter()
+        .position(|c| *c == '\n')
+        .map_or(chars.len(), |p| at + p);
+    chars[start..end].iter().collect()
 }
 
 #[cfg(test)]
@@ -1641,111 +1377,148 @@ mod tests {
     }
 
     #[test]
-    fn every_assignment_in_an_output_is_judged_by_the_guard() {
+    fn every_assignment_to_a_relocating_variable_is_judged_by_the_guard() {
         use Reason::{NoRootsDeclared, NotEmittable, Unreadable};
         /// One refusal: its line, the variable it names, and why.
         type Refusal = (usize, &'static str, Reason);
         let strict = RootSet::strict();
         // (output, every refusal it holds).
         let cases: &[(&str, &[Refusal])] = &[
-            // Emittable and allowed, or no assignment at all.
-            ("export EDITOR=nvim\n", &[]),
-            ("EDITOR=vi; export PAGER='less'\n", &[]),
-            ("z() { :; }\nalias zi='z -i' ll=ls -g\n", &[]),
-            ("echo X=1 'Y=2' \"Z=3\" # W=4\n", &[]),
-            ("export EDITOR\nlocal x\ntypeset -f z\nunset X\n", &[]),
+            // A tool's own variables, functions and constructs pass untouched,
+            // however they assign: none of them relocates anything.
             (
-                "x() { echo \"$(( a == 1 ))\" ${X:-d} ${#Y} ${(j: :)Z}; }\n",
+                "export STARSHIP_SHELL=zsh\nexport MISE_SHELL=zsh\nlocal ret=1\n",
                 &[],
             ),
-            ("(( a <= 1 && b >= 2 && c != 3 ))\n", &[]),
-            ("cat <<< X=1 2>&1 >/dev/null | cat\n", &[]),
-            // A command substitution's own assignment is a subshell's; the
-            // value it gives `x` is still judged, and cannot be read.
-            ("x=$(Y=1 cmd)\n", &[(1, "x", Unreadable)]),
-            ("echo `Y=1 cmd` <(Y=1 cmd) $'it\\'s'\n", &[]),
-            ("export \\\n  EDITOR=vi\n", &[]),
-            // Each form of assignment, wherever it is.
+            ("x=$(Y=1 cmd)\nX+=1\nX=(a b)\nread X\n", &[]),
+            ("eval \"$(mise hook-env -s zsh)\"\n", &[]),
             (
-                "export STARSHIP_SHELL=zsh\n",
-                &[(1, "STARSHIP_SHELL", NotEmittable)],
+                "(( X = 1 ))\nfor (( i = 0; i < 2; i++ )); do :; done\n",
+                &[],
             ),
+            ("cat <<EOF\nX=1\nEOF\necho 'unclosed\n", &[]),
+            // Review item D6: `&&` inside `[[ … ]]` with a comparison after it.
             (
-                "STARSHIP_SHELL=zsh\n",
-                &[(1, "STARSHIP_SHELL", NotEmittable)],
+                "if [[ \"$a\" == \"b\" && \"$c\" != \"d\" ]]; then :; fi\n",
+                &[],
             ),
-            ("\\builtin export X=1\n", &[(1, "X", NotEmittable)]),
-            ("command 'export' X=1\n", &[(1, "X", NotEmittable)]),
-            ("typeset -gx X=1\n", &[(1, "X", NotEmittable)]),
-            ("declare -x X=1\n", &[(1, "X", NotEmittable)]),
-            ("readonly X=1\n", &[(1, "X", NotEmittable)]),
-            ("local X=1\n", &[(1, "X", NotEmittable)]),
-            ("X=1 cmd\n", &[(1, "X", NotEmittable)]),
-            ("f() {\n  X=1\n}\n", &[(2, "X", NotEmittable)]),
-            ("function f {\n  X=1\n}\n", &[(2, "X", NotEmittable)]),
+            // A relocating name that is read, or is only text, passes.
+            ("export PATH=\"$XDG_DATA_HOME/bin:$PATH\"\n", &[]),
             (
-                "if true; then X=1; else Y=2; fi\n",
-                &[(1, "X", NotEmittable), (1, "Y", NotEmittable)],
+                "echo ${XDG_CACHE_HOME:-~/.cache} ${#CARGO_HOME} ${(j: :)CARGO_HOME}\n",
+                &[],
             ),
-            ("{ :; } always { X=1; }\n", &[(1, "X", NotEmittable)]),
-            ("case $a in\n  b) X=1 ;;\nesac\n", &[(2, "X", NotEmittable)]),
-            (
-                "true && ! X=1 || (Y=2)\n",
-                &[(1, "X", NotEmittable), (1, "Y", NotEmittable)],
-            ),
-            // The value is judged, not only the name.
+            ("echo ${CARGO_HOME[1]} ${CARGO_HOME:+x}\n", &[]),
+            ("[[ $x == CARGO_HOME || $CARGO_HOME == /x ]]\n", &[]),
+            ("  # export CARGO_HOME=/x\n", &[]),
+            ("unset XDG_CONFIG_HOME\n", &[]),
+            ("'--cache-dir=[Path]:CACHE_DIR:_files -/' \\\n", &[]),
+            ("MY_CARGO_HOME=/x\nCARGO_HOMES=/x\n1CARGO_HOME=/x\n", &[]),
+            // A readable value is judged for what the name holds.
             (
                 "export CARGO_HOME=/tmp/cargo\n",
                 &[(1, "CARGO_HOME", NoRootsDeclared)],
             ),
-            // Assignments the reader can find but not value.
-            ("X+=1\n", &[(1, "X", Unreadable)]),
-            ("X[1]=a\n", &[(1, "X", Unreadable)]),
-            ("X=(a b)\n", &[(1, "X", Unreadable)]),
-            ("typeset -a X=(a b)\n", &[(1, "X", Unreadable)]),
-            ("for X in a b; do :; done\n", &[(1, "X", Unreadable)]),
-            ("export 'X=1'\n", &[(1, "X", Unreadable)]),
-            ("export \"$n=1\"\n", &[(1, "", Unreadable)]),
-            ("$cmd X=1\n", &[(1, "X", NotEmittable)]),
-            ("$cmd \"$@\"\n", &[(1, "", Unreadable)]),
-            // Constructs that can assign what the reader cannot see.
-            ("eval \"$(mise hook-env)\"\n", &[(1, "", Unreadable)]),
             (
-                "source ./x\n. ./y\n",
-                &[(1, "", Unreadable), (2, "", Unreadable)],
+                "f() {\n  local XDG_CONFIG_HOME=/x\n}\n",
+                &[(2, "XDG_CONFIG_HOME", NotEmittable)],
             ),
-            ("read X\n", &[(1, "", Unreadable)]),
-            ("print -rv X hi\n", &[(1, "", Unreadable)]),
-            ("set -A X a b\n", &[(1, "", Unreadable)]),
-            ("let X=1\n", &[(1, "", Unreadable)]),
-            ("trap 'X=1' EXIT\n", &[(1, "", Unreadable)]),
-            ("emulate zsh -c 'X=1'\n", &[(1, "", Unreadable)]),
-            // An alias body is judged where it is defined.
-            ("f\nalias s='X=1 cmd'\n", &[(2, "X", NotEmittable)]),
-            ("alias s=\"X=1\"\n", &[(1, "", Unreadable)]),
-            ("alias \"$n\"=x\n", &[(1, "", Unreadable)]),
-            ("alias $def\n", &[(1, "", Unreadable)]),
-            ("echo ${X:=1}\n", &[(1, "", Unreadable)]),
-            ("echo ${(L)X=1}\n", &[(1, "", Unreadable)]),
-            ("echo \"${X::=1}\"\n", &[(1, "", Unreadable)]),
-            ("(( X = 1 ))\n", &[(1, "", Unreadable)]),
-            ("echo $(( X++ ))\n", &[(1, "", Unreadable)]),
-            ("(( X <<= 1 ))\n", &[(1, "", Unreadable)]),
             (
-                "for (( i = 0; i < 2; i++ )); do :; done\n",
-                &[(1, "", Unreadable)],
+                "CARGO_HOME=/tmp/c cargo build\n",
+                &[(1, "CARGO_HOME", NoRootsDeclared)],
             ),
-            // Shell the reader cannot follow ends the reading.
-            ("cat <<EOF\nX=1\nEOF\n", &[(1, "", Unreadable)]),
-            ("echo 'unclosed\nX=1\n", &[(1, "", Unreadable)]),
-            ("echo \"unclosed\n", &[(1, "", Unreadable)]),
-            ("echo `unclosed\n", &[(1, "", Unreadable)]),
-            ("echo $'unclosed\n", &[(1, "", Unreadable)]),
-            ("echo $(unclosed\n", &[(1, "", Unreadable)]),
-            ("echo ${unclosed\n", &[(1, "", Unreadable)]),
+            (
+                "true && XDG_CONFIG_HOME='/x'; _ZO_DATA_DIR=/y\n",
+                &[
+                    (1, "XDG_CONFIG_HOME", NotEmittable),
+                    (1, "_ZO_DATA_DIR", NotEmittable),
+                ],
+            ),
+            // Every other form that assigns, or may, is refused.
+            ("CARGO_HOME+=/x\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("CARGO_HOME[1]=x\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("CARGO_HOME[1\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("CARGO_HOME=(a b)\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("CARGO_HOME=\"unclosed\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("CARGO_HOME='unclosed\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("eval CARGO_HOME\\=/x\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("export CARGO_HOME\n", &[(1, "CARGO_HOME", Unreadable)]),
+            (
+                "export \\\n  CARGO_HOME\n",
+                &[(2, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "\\typeset -gx CARGO_HOME\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "read -r XDG_CONFIG_HOME\n",
+                &[(1, "XDG_CONFIG_HOME", Unreadable)],
+            ),
+            ("print -v CARGO_HOME x\n", &[(1, "CARGO_HOME", Unreadable)]),
+            (
+                "x=1 builtin export CARGO_HOME\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "if export CARGO_HOME; then :; fi\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "local x=$(y) CARGO_HOME\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "case $a in b) export CARGO_HOME ;; esac\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            ("$(export CARGO_HOME)\n", &[(1, "CARGO_HOME", Unreadable)]),
+            (
+                "x=\"a b\" y='c \"d' export CARGO_HOME\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            ("x=\"a b\" echo CARGO_HOME\n", &[]),
+            // An escaped edge is text, so the command word is before it.
+            ("_arguments 'a \\`for\\` b:CACHE_DIR:'\n", &[]),
+            ("echo `for` CACHE_DIR\n", &[]),
+            (
+                "echo a; for CACHE_DIR in x; do :; done\n",
+                &[(1, "CACHE_DIR", Unreadable)],
+            ),
+            (
+                "for CARGO_HOME in a; do :; done\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            ("eval 'CARGO_HOME=/x'\n", &[(1, "CARGO_HOME", Unreadable)]),
+            (
+                "alias c='CARGO_HOME=/x cargo'\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "typeset -n r=CARGO_HOME\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            ("v='CARGO_HOME'\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("v=(a CARGO_HOME)\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("echo ${CARGO_HOME:=/x}\n", &[(1, "CARGO_HOME", Unreadable)]),
+            (
+                "echo ${(L)CARGO_HOME=/x}\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            (
+                "echo ${CARGO_HOME::=/x}\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            ("(( CARGO_HOME = 1 ))\n", &[(1, "CARGO_HOME", Unreadable)]),
+            ("(( CARGO_HOME <<= 1 ))\n", &[(1, "CARGO_HOME", Unreadable)]),
+            (
+                "echo $(( CARGO_HOME++ ))\n",
+                &[(1, "CARGO_HOME", Unreadable)],
+            ),
+            ("(( ++CARGO_HOME ))\n", &[(1, "CARGO_HOME", Unreadable)]),
         ];
         for (output, expected) in cases {
-            let found: Vec<(usize, String, Reason)> = refusals(output, &strict)
+            let found: Vec<(usize, String, Reason)> = relocations(output, &strict)
                 .into_iter()
                 .map(|v| (v.line, v.name, v.reason))
                 .collect();
@@ -1756,25 +1529,67 @@ mod tests {
             assert_eq!(found, expected, "{output:?}");
         }
 
-        // A refusal with no name quotes its line.
-        let quoted = refusals("true\n  eval x\n", &strict);
-        assert_eq!(quoted[0].value, "eval x");
-        // Nesting past the bound is refused rather than followed.
-        let deep = format!(
-            "echo {}{}\n",
-            "$(".repeat(MAX_NESTING + 1),
-            ")".repeat(MAX_NESTING + 1)
-        );
-        assert_eq!(refusals(&deep, &strict)[0].reason, Unreadable);
-        let shallow = format!(
-            "echo {}{}\n",
-            "$(".repeat(MAX_NESTING),
-            ")".repeat(MAX_NESTING)
-        );
-        assert!(refusals(&shallow, &strict).is_empty());
+        // An unreadable refusal quotes its line.
+        let quoted = relocations("true\n  export CARGO_HOME\n", &strict);
+        assert_eq!(quoted[0].value, "export CARGO_HOME");
         // What a declared root allows, the guard allows here too.
         let rooted = RootSet::new(Path::new("/home/u"), &[PathBuf::from("/scratch")]);
-        assert!(refusals("export CARGO_HOME=/scratch/cargo\n", &rooted).is_empty());
+        assert!(relocations("export CARGO_HOME=/scratch/cargo\n", &rooted).is_empty());
+    }
+
+    /// Every captured activation output under `tests/fixtures/activation/`,
+    /// by the command that printed it. Each was captured from the real tool,
+    /// with the absolute paths of the capturing machine replaced by neutral
+    /// ones.
+    const REAL_OUTPUTS: [(&str, &str); 5] = [
+        (
+            "mise activate zsh",
+            include_str!("../../tests/fixtures/activation/mise-activate-zsh.zsh"),
+        ),
+        (
+            "starship init zsh --print-full-init",
+            include_str!("../../tests/fixtures/activation/starship-init-zsh.zsh"),
+        ),
+        (
+            "zoxide init zsh",
+            include_str!("../../tests/fixtures/activation/zoxide-init-zsh.zsh"),
+        ),
+        (
+            "fzf --zsh",
+            include_str!("../../tests/fixtures/activation/fzf-zsh.zsh"),
+        ),
+        (
+            "uv generate-shell-completion zsh",
+            include_str!("../../tests/fixtures/activation/uv-completion-zsh.zsh"),
+        ),
+    ];
+
+    #[test]
+    fn the_real_outputs_of_common_tools_render() {
+        // Review items D1 to D5: the strict-grammar reader refused every one
+        // of these, for assignments none of which relocates anything. Under
+        // the strict root set too — nothing in them moves a tool.
+        for (command, output) in REAL_OUTPUTS {
+            assert_eq!(relocations(output, &RootSet::strict()), vec![], "{command}");
+            let program = command.split(' ').next().unwrap();
+            let host = Fake::default().tool(program, program.as_bytes(), &[output]);
+            let mut activation = decl(program, &command.split(' ').collect::<Vec<_>>());
+            activation.phase = Phase::Completions;
+            let mut cache = Fingerprints::default();
+            let (plan, file) = apply(&[activation], &mut cache, &host);
+            assert_eq!(plan.steps()[0].action(), Action::Create, "{command}");
+            assert!(file.contains(&literal(output)), "{command}");
+        }
+        // And one relocating assignment in any of them is still found.
+        let (_, mise) = REAL_OUTPUTS[0];
+        let moved = mise.replace(
+            "export MISE_SHELL=zsh\n",
+            "export MISE_SHELL=zsh\nexport MISE_DATA_DIR=/elsewhere\n",
+        );
+        let found = relocations(&moved, &RootSet::strict());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "MISE_DATA_DIR");
+        assert_eq!(found[0].reason, Reason::NoRootsDeclared);
     }
 
     #[test]
@@ -1783,7 +1598,8 @@ mod tests {
             .tool(
                 "starship",
                 b"starship",
-                &["export STARSHIP_SHELL=zsh\nexport STARSHIP_SESSION_KEY=1\nX=2\n"],
+                &["export STARSHIP_SHELL=zsh\nexport STARSHIP_CONFIG=/etc/x\n\
+                   export CARGO_HOME=/c\nexport XDG_CACHE_HOME=/d\n"],
             )
             .tool("vi", b"vi", &["export EDITOR=vi\n"]);
         let decls = [decl("starship", &["starship"]), decl("vi", &["vi"])];
@@ -1794,7 +1610,7 @@ mod tests {
         assert_eq!(
             step.line(),
             "? activation `starship`: omitted: the environment guard refuses its output: \
-             `STARSHIP_SHELL` at line 1 assigns a variable no bx generator declares, so bx \
+             `STARSHIP_CONFIG` at line 2 assigns a variable no bx generator declares, so bx \
              cannot judge the value — a defect in bx, not in your configuration; 2 more \
              assignments are refused"
         );
@@ -1806,15 +1622,15 @@ mod tests {
         let keys: Vec<&String> = cache.iter().map(|(k, _)| k).collect();
         assert_eq!(keys, ["activation:vi"], "a refused output is never cached");
 
-        // One more refusal, and a refusal with no name, read as sentences.
+        // One more refusal, and an unreadable one, read as sentences.
         let one = Omission::Refused {
-            first: refusals("eval x\n", &RootSet::strict()).remove(0),
+            first: relocations("export CARGO_HOME\n", &RootSet::strict()).remove(0),
             more: 1,
         };
         assert_eq!(
             one.to_string(),
-            "the environment guard refuses its output: line 1, `eval x`, is shell the guard \
-             cannot read, so it is not approved; 1 more assignment is refused"
+            "the environment guard refuses its output: `CARGO_HOME` at line 1 is shell the \
+             guard cannot read, so it is not approved; 1 more assignment is refused"
         );
 
         // A cached output is judged again at every plan: one the roots allowed

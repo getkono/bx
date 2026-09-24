@@ -86,9 +86,29 @@
 //! This module is that rule as code. Every environment fragment bx generates is
 //! run through [`scan_with`] before it is written, and the check is covered by
 //! tests rather than left to review. Generated shell content that is **not** an
-//! environment fragment carries no environment assignment at all, which is what
-//! leaves nothing outside the guard's reach. The shell-init snippet is the one
-//! file under that rule: fixed text that sets no environment variable outside
+//! environment fragment, and is not a tool's cached activation output, carries
+//! no environment assignment at all, which is what leaves nothing outside the
+//! guard's reach.
+//!
+//! **A tool's cached activation output** is the one exception, and the rule it
+//! is held to is the relocation rule itself rather than the fragment grammar.
+//! It is the tool's own shell code — `mise activate zsh`, `starship init zsh`,
+//! `fzf --zsh` — full of functions, hooks and variables of its own
+//! (`MISE_SHELL`, a function's locals, ZLE's `BUFFER`), none of which moves a
+//! file. So it is searched, not parsed: every occurrence of a name
+//! [`is_relocating`] knows, anywhere in the output, that stands in an
+//! assigning position — `NAME=`, `NAME+=`, an operand of `export`, `typeset`,
+//! `declare`, `local`, `readonly`, `read` and the other builtins that assign
+//! their operands, an arithmetic assignment, `${NAME=…}`, and every quoted or
+//! indirect form that could assign it — is judged by [`check`] when its value
+//! is a readable literal, and refused as [`Reason::Unreadable`] when it is
+//! not. An output with any refusal is not written. Every other line passes
+//! untouched, and what the output's code runs later — `eval "$(mise
+//! hook-env)"` — is the tool's own behaviour at runtime, outside what bx
+//! emits. [`crate::shell::activation::relocations`] is that search.
+//!
+//! The shell-init snippet is the one file under the no-assignment rule
+//! above: fixed text that sets no environment variable outside
 //! bx's own `BX_` namespace, and gets every other variable by sourcing a
 //! guarded environment fragment.
 //! `tests::the_init_snippet_is_not_an_environment_fragment` holds the
@@ -640,6 +660,92 @@ fn emittable(name: &str) -> Option<Kind> {
         .iter()
         .find(|(listed, _)| *listed == name)
         .map(|(_, kind)| *kind)
+}
+
+/// Names that move a tool's config, data or cache, or the directory every
+/// such default is found from, and that the emit table does not list, so
+/// [`check`] refuses every value given to one. The table's own locations,
+/// lists of locations and anchors, and the `XDG_*_HOME` family, are
+/// relocating too; [`is_relocating`] is the whole set.
+///
+/// These are the names this module's review rounds found some tool reading
+/// as a location — `rg` and `git` were shown to obey two of them — plus the
+/// homes of the tools whose activation output bx caches (mise, starship,
+/// zoxide). The list is knowledge, not a closed name space: a name missing
+/// from it is one a tool's cached activation output could assign unjudged,
+/// so it grows whenever a relocating name is found missing.
+const UNLISTED_RELOCATIONS: &[&str] = &[
+    "BAT_CONFIG_PATH",
+    "BUNDLE_PATH",
+    "BUNDLE_USER_CONFIG",
+    "CARGO_INSTALL_ROOT",
+    "CARGO_TARGET_DIR",
+    "CCACHE_CONFIGPATH",
+    "CCACHE_DIR",
+    "CONDA_PKGS_DIRS",
+    "CYPRESS_CACHE_FOLDER",
+    "ELECTRON_CACHE",
+    "FNM_DIR",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GOBIN",
+    "GOENV",
+    "GOTMPDIR",
+    "HOME",
+    "INPUTRC",
+    "LD_LIBRARY_PATH",
+    "LESSHISTFILE",
+    "MISE_CONFIG_DIR",
+    "MISE_GLOBAL_CONFIG_FILE",
+    "MISE_STATE_DIR",
+    "NODENV_ROOT",
+    "NODE_REPL_HISTORY",
+    "NUGET_PLUGINS_CACHE_PATH",
+    "PIPX_BIN_DIR",
+    "PIPX_HOME",
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "POETRY_VIRTUALENVS_PATH",
+    "PYTHONPYCACHEPREFIX",
+    "PYTHONUSERBASE",
+    "RBENV_ROOT",
+    "RIPGREP_CONFIG_PATH",
+    "SDKMAN_DIR",
+    "STARSHIP_CACHE",
+    "STARSHIP_CONFIG",
+    "TERMINFO",
+    "TMPDIR",
+    "XDG_CONFIG_DIRS",
+    "XDG_DATA_DIRS",
+    "XDG_RUNTIME_DIR",
+    "YARN_CACHE_FOLDER",
+    "YARN_GLOBAL_FOLDER",
+    "ZDOTDIR",
+    "_ZO_DATA_DIR",
+    "npm_config_cache",
+    "pnpm_config_store_dir",
+];
+
+/// Whether assigning `name` can move a tool's config, data or cache: a
+/// location, a list of locations or an anchor in the emit table, a name of
+/// the `XDG_*_HOME` family, or one of the tool homes and relocating names
+/// the table does not list (`UNLISTED_RELOCATIONS`).
+///
+/// This is the set a tool's cached activation output is searched for
+/// ([`crate::shell::activation::relocations`]). A fragment bx writes needs no
+/// such set: every assignment in it is judged, whatever its name.
+#[must_use]
+pub fn is_relocating(name: &str) -> bool {
+    let xdg_home = name
+        .strip_prefix("XDG_")
+        .and_then(|rest| rest.strip_suffix("_HOME"))
+        .is_some_and(|middle| !middle.is_empty() && middle.bytes().all(|b| b.is_ascii_uppercase()));
+    xdg_home
+        || matches!(
+            emittable(name),
+            Some(Kind::Location | Kind::LocationList | Kind::Anchor)
+        )
+        || UNLISTED_RELOCATIONS.contains(&name)
 }
 
 /// What an unassigned reference to a search list's own name expands to while
@@ -4307,6 +4413,50 @@ mod tests {
     }
 
     #[test]
+    fn the_relocating_names_are_the_locations_the_xdg_homes_and_the_known_tool_homes() {
+        // Every location, list of locations and anchor the table lists.
+        for (name, kind) in EMITTABLE {
+            let locates = matches!(kind, Kind::Location | Kind::LocationList | Kind::Anchor);
+            assert_eq!(is_relocating(name), locates, "{name}");
+        }
+        // The whole `XDG_*_HOME` family, listed or not, and every name a
+        // review round found a tool reading as a location.
+        for name in [
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_BIN_HOME",
+            "XDG_RUNTIME_DIR",
+            "HOME",
+            "ZDOTDIR",
+            "TMPDIR",
+            "STARSHIP_CONFIG",
+            "MISE_CONFIG_DIR",
+            "_ZO_DATA_DIR",
+        ]
+        .into_iter()
+        .chain(R4_UNLISTED_RELOCATIONS.iter().copied())
+        {
+            assert!(is_relocating(name), "{name}");
+        }
+        // Nothing else: a tool's own variables, and near misses of the family.
+        for name in [
+            "MISE_SHELL",
+            "STARSHIP_SHELL",
+            "BUFFER",
+            "FZF_DEFAULT_OPTS",
+            "XDG__HOME",
+            "XDG_config_HOME",
+            "XDG_HOME",
+            "MY_CARGO_HOME",
+            "cargo_home",
+        ] {
+            assert!(!is_relocating(name), "{name}");
+        }
+        // The list is sorted, so a duplicate or a missing name shows.
+        assert!(UNLISTED_RELOCATIONS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
     fn a_name_the_table_does_not_list_is_not_emittable_whatever_its_family() {
         // Every rule round 4 matched a name by — an exact list, a family
         // prefix, a location suffix, an exception — is gone. None of these is
@@ -6792,12 +6942,13 @@ mod tests {
         // for the same reason, to check the name a `when = "env:NAME"` tests,
         // and `config/path.rs` for the references a `[path]` entry holds.
         //
-        // `shell/activation.rs` judges a tool's activation output, which is
-        // not an environment fragment and cannot be read by `scan_with`'s
-        // grammar: it finds every assignment the output makes and passes each
-        // through `check`, the function `scan_with` calls per assignment, and
-        // an output with any refusal is never written.
-        const KNOWN: [(&str, &str); 13] = [
+        // `shell/activation.rs` judges a tool's cached activation output,
+        // which is the tool's own shell code rather than an environment
+        // fragment: it searches the output for every name `is_relocating`
+        // knows, passes each readable assignment of one through `check`, the
+        // function `scan_with` calls per assignment, refuses every other
+        // assigning form, and never writes an output with any refusal.
+        const KNOWN: [(&str, &str); 14] = [
             ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
             ("config/env.rs", "use crate::env_guard::is_variable_name;"),
             ("config/when.rs", "use crate::env_guard::is_variable_name;"),
@@ -6827,7 +6978,11 @@ mod tests {
             ),
             (
                 "shell/activation.rs",
-                "if let Verdict::Violation(mut refused) = env_guard::check(name, value, self.roots) {",
+                "if name.starts_with(|c: char| c.is_ascii_digit()) || !env_guard::is_relocating(&name) {",
+            ),
+            (
+                "shell/activation.rs",
+                "Use::Assigns(value) => match env_guard::check(&name, &value, roots) {",
             ),
         ];
         let live = "A generated body reaches bytes through the plan's judgement of it, and a \

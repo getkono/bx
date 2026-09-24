@@ -213,25 +213,36 @@ impl Context {
     }
 
     /// What the configuration already says about `target`.
+    ///
+    /// A layer's declarations and toggles, and a blocked target's key, are
+    /// compared by the path they resolve to ([`resolved_path`]), as `rm`
+    /// compares them: `~/.config/{{profile}}/s` switched off is still the
+    /// declaration of `~/.config/work/s`, so adopting that file is refused
+    /// rather than declared a second time.
     fn declared(&self, target: &Portable) -> Declared<'_> {
+        let values = &self.resolved.values;
+        let names = |raw: &str| resolved_path(raw, values).is_some_and(|path| path == *target);
         for resolution in &self.resolved.targets {
             match resolution {
                 Resolution::Ready(ready) if ready.path == *target => {
                     return Declared::Ready(ready);
                 }
-                Resolution::Blocked(entry) if entry.key == target.as_str() => {
+                Resolution::Blocked(entry) if names(&entry.key) => {
                     return Declared::Blocked(&entry.origin, &entry.hint);
                 }
                 _ => {}
             }
         }
         for layer in &self.layers {
-            if let Some(found) = layer.config.targets.iter().find(|t| t.path == *target) {
+            if let Some(found) = layer.config.targets.iter().find(|t| names(t.path.as_str())) {
                 return Declared::Disabled(&found.origin);
             }
-            if let Some(toggle) = layer.config.toggles.iter().find(|toggle| {
-                Portable::parse_in(&toggle.key, &self.home).is_ok_and(|key| key == *target)
-            }) {
+            if let Some(toggle) = layer
+                .config
+                .toggles
+                .iter()
+                .find(|toggle| names(&toggle.key))
+            {
                 return Declared::Disabled(&toggle.origin);
             }
         }
@@ -872,7 +883,12 @@ fn declarations(ctx: &Context, under: &Portable) -> Result<Vec<Declaration>, Err
 /// answered `work`. A path whose values are not all answered names no file
 /// yet, so it is read as written.
 fn declared_path(table: &Table, values: &ResolvedValues) -> Option<Portable> {
-    let raw = table.get("path").and_then(Item::as_str)?;
+    resolved_path(table.get("path").and_then(Item::as_str)?, values)
+}
+
+/// The file a declared path names once its `{{name}}`s are substituted, or
+/// as written when they are not all answered.
+fn resolved_path(raw: &str, values: &ResolvedValues) -> Option<Portable> {
     let rendered = values.substitute(raw).unwrap_or_else(|_| raw.to_string());
     Portable::parse_in(&rendered, values.home()).ok()
 }
@@ -1387,6 +1403,40 @@ mod tests {
             "{rows:?}"
         );
         assert_eq!(layer(&home), off);
+    }
+
+    #[test]
+    fn a_switched_off_placeholder_pathed_declaration_is_found_by_the_path_it_resolves_to() {
+        let values = "[[value]]\nname = \"profile\"\nkind = \"string\"\ndefault = \"work\"\n";
+        let templated = inline("~/.config/{{profile}}/s", "s\\n");
+
+        // Switched off where it is declared.
+        let off = format!("{values}\n{templated}enabled = false\n");
+        let home = repo(&off);
+        plant(&home, ".config/work/s", b"s\n", 0o644);
+        let rows = add_rel(&home, ".config/work/s");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }] if note.contains("switched off")),
+            "{rows:?}"
+        );
+        assert_eq!(layer(&home), off, "not declared a second time");
+        assert!(ledger(&home).is_empty());
+
+        // Switched off by a toggle in local.toml.
+        let on = format!("{values}\n{templated}");
+        let home = repo(&on);
+        let local = StateDir::resolve(home.path()).local_toml();
+        let toggle = "[[target]]\npath = \"~/.config/{{profile}}/s\"\nenabled = false\n";
+        std::fs::create_dir_all(local.parent().expect("parent")).expect("state dir");
+        std::fs::write(&local, toggle).expect("local.toml");
+        plant(&home, ".config/work/s", b"s\n", 0o644);
+        let rows = add_rel(&home, ".config/work/s");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }] if note.contains("switched off")),
+            "{rows:?}"
+        );
+        assert_eq!(layer(&home), on, "not declared a second time");
+        assert_eq!(std::fs::read_to_string(&local).expect("local.toml"), toggle);
     }
 
     #[test]

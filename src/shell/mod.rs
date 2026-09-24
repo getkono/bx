@@ -45,8 +45,20 @@
 //! not an environment fragment, and must carry no assignment at all. The
 //! scaffolding this module adds — the header and one comment per phase — sets
 //! nothing, and the plugin lines [`plugin`] renders only test a file and source
-//! it; the tests below establish both of the bytes actually emitted.
+//! it; the tests below establish both of the bytes actually emitted. The
+//! activations [`activation`] renders are each one `eval` of a single-quoted
+//! literal holding a tool's own output, or a guarded `eval "$(…)"`; that
+//! module states why neither is an assignment of bx's and tests the bytes.
+//!
+//! # Activations
+//!
+//! A tool's own shell integration — `brew shellenv`, `mise activate zsh`,
+//! `starship init zsh` — is run by [`activation::plan`] rather than at every
+//! shell start, trusted once two runs agree, and cached against the content
+//! of the tool's binary, so the `activations` and `completions` phases hold
+//! text and start no process.
 
+pub mod activation;
 pub mod plugin;
 
 /// One named section of the generated interactive shell file.

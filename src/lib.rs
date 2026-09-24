@@ -59,7 +59,9 @@
 //! [`shell`] is the generated interactive shell file's load order: eleven
 //! named phases assembled in one fixed order whatever order their content was
 //! contributed in, the declared plugins sourced only once readable, and the
-//! single terminal slot at most one of them may claim.
+//! single terminal slot at most one of them may claim. Its tool activations
+//! run at `plan` time, not at shell start: each is trusted once two runs agree
+//! and cached in the fingerprint store against its binary's content.
 //!
 //! [`doctor`] reads the same resolved targets without deciding them, and asks
 //! read-only questions about what is on disk — whether systemd has reloaded,

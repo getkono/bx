@@ -19,6 +19,7 @@
 mod decide;
 mod diff;
 mod execute;
+mod region;
 
 use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;
@@ -36,7 +37,7 @@ use crate::journal::{self, Session, SessionKind};
 use crate::paths;
 use crate::recover::{self, Interrupted};
 use crate::report::{Action, Exit};
-use crate::state::{self, LedgerView, SharedLock, StateDir};
+use crate::state::{self, LedgerView, Mechanism, SharedLock, StateDir};
 
 /// Which half of the traversal is running.
 ///
@@ -418,7 +419,20 @@ pub fn run(
         secrets: &inputs.resolved.secrets,
         declared: &decide::Declared::new(),
     };
-    let decided = decide::decide_all(&inputs.resolved.targets, &ctx)?;
+    // A fragment bx wrote for a place no variable lands in any more is planned
+    // empty, so switching a variable off takes it out of every shell.
+    let mut targets = inputs.resolved.targets.clone();
+    targets.extend(resolve::vacated_fragments(
+        &inputs.resolved.targets,
+        |path| {
+            ledger
+                .get(path)
+                .is_some_and(|entry| entry.mechanism == Mechanism::Own)
+        },
+        &inputs.home,
+        &inputs.state.ledger(),
+    ));
+    let decided = decide::decide_all(&targets, &ctx)?;
     report.changes = decided.changes;
     let ops = decided.ops;
 

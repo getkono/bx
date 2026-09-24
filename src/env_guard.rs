@@ -133,8 +133,8 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::layers;
 use crate::config::values::ResolvedValues;
+use crate::config::{env, layers};
 use crate::paths;
 
 /// Names a shell defines and manages itself. A fragment may not assign one,
@@ -682,12 +682,21 @@ const INHERITED: &str = "\0";
 /// contain one ([`Reason::ContainsBxDirectory`]), because a tool clears its
 /// own directory — `uv cache clean` on `UV_CACHE_DIR=~/.local/state` deletes
 /// bx's ledger with it.
+///
+/// bx's fragment directory, [`env::FRAGMENT_DIR`], is judged **one way**: no
+/// location may lie inside it ([`Reason::BxOwnedDirectory`]), but one may
+/// contain it. `XDG_DATA_HOME=~/.local/share` is that directory's native
+/// default, and refusing it would refuse the native location invariant 2
+/// protects. What a tool clearing it would delete is only generated output,
+/// which the next `apply` writes again from the configuration; the ledger,
+/// which nothing can regenerate, stays judged both ways.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootSet {
     home: Option<PathBuf>,
     roots: Vec<PathBuf>,
     inadmissible: Vec<PathBuf>,
     owned: Vec<PathBuf>,
+    fragment_dirs: Vec<PathBuf>,
     repos: Vec<PathBuf>,
 }
 
@@ -706,6 +715,7 @@ impl RootSet {
             roots: Vec::new(),
             inadmissible: Vec::new(),
             owned: Vec::new(),
+            fragment_dirs: Vec::new(),
             repos: Vec::new(),
         }
     }
@@ -736,12 +746,14 @@ impl RootSet {
             }
         }
         let owned = vec![paths::normalize(&layers::state_dir(&home, None))];
+        let fragment_dirs = vec![paths::normalize(&paths::render(env::FRAGMENT_DIR, &home))];
         let repos = vec![paths::normalize(&paths::config_root_in(&home, None))];
         Self {
             home: Some(home),
             roots: admitted,
             inadmissible,
             owned,
+            fragment_dirs,
             repos,
         }
     }
@@ -815,16 +827,18 @@ impl RootSet {
     /// every path a homeless set is shown, refusing all of them.
     ///
     /// Answering `false` instead is sound only because this is consulted from
-    /// [`refuses_entry_bx`] alone, which [`judge`] reaches only for a location
-    /// or a list of them — once per `:`-entry through
-    /// [`refuses_entry_placement`] and once for a location's whole value — and
-    /// only after [`RootSet::refuses_everything`] has refused a set with no
-    /// admissible root, and the only set without a home is
-    /// [`RootSet::strict`], which declares none. A later kind given a
-    /// containing check must not simply call this: under `scan` it would get
-    /// no protection at all, and it needs its own answer to the question
-    /// above. `a_set_with_no_home_is_never_asked_what_holds_bxs_directories`
-    /// pins both halves.
+    /// two places, and [`judge`] reaches each only after
+    /// [`RootSet::refuses_everything`] has refused a set with no admissible
+    /// root: [`refuses_entry_bx`], for a location or a list of them — once
+    /// per `:`-entry through [`refuses_entry_placement`] and once for a
+    /// location's whole value — and [`refuses_anchor`], for an exported
+    /// anchor. The only set without a home is [`RootSet::strict`], which
+    /// declares none. A later kind given a containing check must not simply
+    /// call this: unless it is judged behind the same refusal, under `scan` it
+    /// would get no protection at all, and it needs its own answer to the
+    /// question above.
+    /// `a_set_with_no_home_is_never_asked_what_holds_bxs_directories` pins
+    /// both halves.
     fn holds_bx_directory(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);
         self.owned
@@ -847,11 +861,22 @@ impl RootSet {
     /// owns every path that passes through `.local/state/bx`, whoever's home
     /// that is. A set with a home knows where its state directory is, and owns
     /// only that and what [`RootSet::owning`] adds.
+    ///
+    /// bx's fragment directory, [`env::FRAGMENT_DIR`], is owned the same way —
+    /// its own path under a home, `.local/share/bx` under any home for a set
+    /// without one — since a tool pointed into it writes beside the fragments
+    /// every shell sources. Unlike the state directory it is not consulted by
+    /// [`RootSet::holds_bx_directory`]; see [`RootSet`].
     #[must_use]
     pub fn owns(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);
-        self.owned.iter().any(|dir| normalised.starts_with(dir))
-            || (self.home.is_none() && passes_through(&normalised, &[".local", "state", "bx"]))
+        self.owned
+            .iter()
+            .chain(&self.fragment_dirs)
+            .any(|dir| normalised.starts_with(dir))
+            || (self.home.is_none()
+                && (passes_through(&normalised, &[".local", "state", "bx"])
+                    || passes_through(&normalised, &[".local", "share", "bx"])))
     }
 
     /// Whether `path` lies inside some declared root.
@@ -1138,9 +1163,14 @@ pub struct Violation {
 /// so the two cannot disagree about one. No reference resolves here except
 /// `$HOME` and `~`: `check` judges one assignment in isolation and has no
 /// fragment to learn from.
+///
+/// The assignment is judged as **exported**. There is no line to read an
+/// `export` from, and the exported reading is the stricter one: it is the one
+/// in which [`Kind::Anchor`]'s exemption does not apply, so a verdict of
+/// [`Verdict::Allowed`] here holds wherever the assignment is written.
 #[must_use]
 pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
-    match evaluate(name, value, &Scope::default(), roots).reason {
+    match evaluate(name, value, true, &Scope::default(), roots).reason {
         None => Verdict::Allowed,
         Some(reason) => Verdict::Violation(Violation {
             line: 0,
@@ -1265,7 +1295,19 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// checked against bash and zsh.
 #[must_use]
 pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
-    pass(content, roots).0
+    pass(content, roots, false).0
+}
+
+/// [`scan_with`] for a fragment whose every assignment is exported although
+/// no line says `export`: an `environment.d` fragment, which the systemd user
+/// manager reads into the environment of everything it starts.
+///
+/// The grammar and the judgement are [`scan_with`]'s. Only whether a line is
+/// exported differs, and that is what [`Kind::Anchor`]'s one exemption turns
+/// on.
+#[must_use]
+pub fn scan_exported(content: &str, roots: &RootSet) -> Vec<Violation> {
+    pass(content, roots, true).0
 }
 
 /// Find every forbidden assignment in a block of shell bx is about to write.
@@ -1283,7 +1325,10 @@ pub fn scan(content: &str) -> Vec<Violation> {
 /// [`scan_with`]'s verdict, and what the fragment was learned to assign: one
 /// walk over `content`, judging each line against `roots` and what the lines
 /// before it assigned, and learning from it.
-fn pass(content: &str, roots: &RootSet) -> (Vec<Violation>, Scope) {
+///
+/// `every_exported` judges every assignment as exported, whether or not its
+/// line says so — the reading of an `environment.d` fragment.
+fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>, Scope) {
     let mut scope = Scope::default();
     let mut found = Vec::new();
     for (idx, line) in content.split('\n').enumerate() {
@@ -1299,8 +1344,12 @@ fn pass(content: &str, roots: &RootSet) -> (Vec<Violation>, Scope) {
                 found.push(violation("", line.trim_matches(BLANKS), Reason::Unreadable));
                 scope.forget_everything();
             }
-            Statement::Assign { name, value } => {
-                let judged = evaluate(name, value, &scope, roots);
+            Statement::Assign {
+                name,
+                value,
+                exported,
+            } => {
+                let judged = evaluate(name, value, exported || every_exported, &scope, roots);
                 if let Some(reason) = judged.reason {
                     found.push(violation(name, value, reason));
                 }
@@ -1325,7 +1374,10 @@ struct Judged {
 }
 
 /// The verdict on `name = value`, for [`check`] and [`scan_with`] alike.
-fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
+///
+/// `exported` is whether the assignment reaches the environment of what the
+/// shell starts, which only [`Kind::Anchor`]'s judgement turns on.
+fn evaluate(name: &str, value: &str, exported: bool, scope: &Scope, roots: &RootSet) -> Judged {
     let refused = |reason| Judged {
         reason: Some(reason),
         resolved: Err(reason),
@@ -1351,7 +1403,12 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
         (kind == Some(Kind::SearchList)).then(|| word.expand(scope, roots.home(), Some(name)));
     let reason = match kind {
         None => Some(Reason::NotEmittable),
-        Some(kind) => judge(kind, extended.as_ref().unwrap_or(&resolved), roots),
+        Some(kind) => judge(
+            kind,
+            exported,
+            extended.as_ref().unwrap_or(&resolved),
+            roots,
+        ),
     };
     Judged {
         reason,
@@ -1363,7 +1420,12 @@ fn evaluate(name: &str, value: &str, scope: &Scope, roots: &RootSet) -> Judged {
 /// Why `resolved` may not be given to a variable of `kind`, or `None` if it
 /// may. For a search list, `resolved` holds [`INHERITED`] wherever the list
 /// refers to what the shell inherited.
-fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Option<Reason> {
+fn judge(
+    kind: Kind,
+    exported: bool,
+    resolved: &Result<String, Reason>,
+    roots: &RootSet,
+) -> Option<Reason> {
     let anchored = |entry: &str| refuses_unanchored(entry, None, roots);
     match kind {
         Kind::SearchList => within(resolved, |list| {
@@ -1431,10 +1493,11 @@ fn judge(kind: Kind, resolved: &Result<String, Reason>, roots: &RootSet) -> Opti
             })
         }),
         // An anchor is one directory bx has found no tool to read, so none is
-        // known to clear it or to write beside it.
+        // known to clear it or to write beside it — while it stays out of the
+        // environment. Exported, every tool can read it.
         Kind::Anchor => roots
             .refuses_everything()
-            .or_else(|| within(resolved, |value| refuses_anchor(value, roots))),
+            .or_else(|| within(resolved, |value| refuses_anchor(value, exported, roots))),
         Kind::Program => within(resolved, |value| refuses_program(value, roots)),
         Kind::Socket => within(resolved, anchored),
         Kind::Setting(setting) => within(resolved, |value| {
@@ -1528,12 +1591,12 @@ fn refuses_entry_at_root(path: &str, roots: &RootSet) -> Option<Reason> {
 /// bx's own directories. A tool-read location written in terms of the anchor
 /// is judged for that at its own line.
 ///
-/// # The exemption is open, and this is what it costs
+/// # The exemption holds only while the anchor is not exported
 ///
-/// **Measured, not supposed.** With home `/var/home/example` and a single `~`
-/// root, `DATA_DIR=/var/home/example/.local/state` and `SCRATCH_HOME` with the
-/// same value are both `Allowed`, while `UV_CACHE_DIR` with the *identical*
-/// value is [`Reason::ContainsBxDirectory`]. Both approved values contain bx's
+/// **What it was.** With home `/var/home/example` and a single `~` root,
+/// `DATA_DIR=/var/home/example/.local/state` and `SCRATCH_HOME` with the same
+/// value were both `Allowed`, while `UV_CACHE_DIR` with the *identical* value
+/// is [`Reason::ContainsBxDirectory`]. Both approved values contain bx's
 /// ledger, journal and fingerprints — the record invariant 4 rests on.
 ///
 /// The exemption's premise is that **no tool reads an anchor**, and that is a
@@ -1543,25 +1606,27 @@ fn refuses_entry_at_root(path: &str, roots: &RootSet) -> Option<Reason> {
 /// longer an anchor. `DATA_DIR` and `SCRATCH_HOME` are generic names carrying
 /// the same unenforced premise.
 ///
-/// **What closes it**, and why it is not closed here. The right shape is to
-/// condition the exemption on the assignment **not being exported** — the
-/// thing that actually makes "no tool reads it" true, and something the
-/// grammar already parses. That is not a local edit: [`Statement::Assign`]
-/// carries no `exported` flag, [`evaluate`] discards the distinction, and
-/// [`check`] — a public entry point that judges one name and value outside any
-/// fragment — has no `export` keyword to read at all, so it would have to gain
-/// a parameter or pick a default, and picking one is a decision, not a fix.
+/// **How it is closed.** The exemption is conditioned on the assignment **not
+/// being exported**, which is what actually makes "no tool reads it" hold: an
+/// unexported anchor stays in the shell that sourced the fragment, where only
+/// the fragment's own later lines read it. An `exported` one reaches every
+/// program the shell starts, so it is held to the containing check a location
+/// is — [`Reason::ContainsBxDirectory`] — and keeps only the other half of
+/// the exemption, being a root itself, since no tool is known to write beside
+/// it. A line says `export` in a zsh fragment; every line of an
+/// `environment.d` fragment is exported ([`scan_exported`]); and [`check`],
+/// which has no line to read, judges as exported, the stricter reading.
 ///
-/// **What it costs today: nothing.** The one non-test caller is the plan's
-/// `guard_fragment`, and it judges only a generated body. Generated bodies come
-/// from `config::target::Gen`, which has no variant, so no fragment is
-/// generated and none of this reaches a user. It becomes live with the first
-/// `Gen` variant, and the change that adds it must close it first.
-/// `the_guard_judges_no_generated_fragment_yet` fails when either fact moves.
-/// `an_anchor_may_contain_bxs_directories_and_a_tool_read_location_may_not`
-/// pins the behaviour as it stands, so closing it changes that test.
-fn refuses_anchor(path: &str, roots: &RootSet) -> Option<Reason> {
+/// It was closed by the change that gave `config::target::Gen` its first
+/// variant, because that is when a generated fragment first reached the
+/// guard. `an_anchor_may_contain_bxs_directories_only_while_it_is_not_exported`
+/// pins both halves.
+fn refuses_anchor(path: &str, exported: bool, roots: &RootSet) -> Option<Reason> {
     refuses_unanchored(path, None, roots)
+        .or_else(|| {
+            (exported && roots.holds_bx_directory(Path::new(path)))
+                .then_some(Reason::ContainsBxDirectory)
+        })
         .or_else(|| (!roots.contains(Path::new(path))).then_some(Reason::OutsideDeclaredRoots))
 }
 
@@ -1720,8 +1785,13 @@ enum Statement<'a> {
     /// A blank line or a comment.
     Nothing,
     /// `NAME=VALUE` or `export NAME=VALUE`: `value` is everything after the
-    /// `=`, still to be read by the value grammar.
-    Assign { name: &'a str, value: &'a str },
+    /// `=`, still to be read by the value grammar, and `exported` whether the
+    /// line said `export`.
+    Assign {
+        name: &'a str,
+        value: &'a str,
+        exported: bool,
+    },
     /// Not a statement the grammar reads.
     Refused,
 }
@@ -1739,12 +1809,16 @@ fn statement(line: &str) -> Statement<'_> {
             Statement::Nothing
         };
     }
-    let assignment = match text.strip_prefix("export") {
-        Some(operand) if operand.starts_with(BLANKS) => operand.trim_start_matches(BLANKS),
-        _ => text,
+    let (assignment, exported) = match text.strip_prefix("export") {
+        Some(operand) if operand.starts_with(BLANKS) => (operand.trim_start_matches(BLANKS), true),
+        _ => (text, false),
     };
     match assignment.split_once('=') {
-        Some((name, value)) if is_variable_name(name) => Statement::Assign { name, value },
+        Some((name, value)) if is_variable_name(name) => Statement::Assign {
+            name,
+            value,
+            exported,
+        },
         _ => Statement::Refused,
     }
 }
@@ -1947,8 +2021,12 @@ fn after_value(rest: &str) -> Result<(), Reason> {
     })
 }
 
-/// Whether `name` is a shell-legal variable name.
-fn is_variable_name(name: &str) -> bool {
+/// Whether `name` is a variable name every shell and `environment.d` read the
+/// same way: `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// The `[[env]]` parser checks a declared name with this same predicate, so
+/// the parser and the guard cannot disagree on what a variable name is.
+pub(crate) fn is_variable_name(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -2989,10 +3067,13 @@ mod tests {
         // The only set without a home declares no root, so every kind that
         // consults the containing check is refused before it is reached.
         assert!(strict.refuses_everything().is_some());
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", "/x", &strict)),
-            Some(Reason::NoRootsDeclared)
-        );
+        for name in ["CARGO_HOME", "SCRATCH_HOME"] {
+            assert_eq!(
+                reason_of(&check(name, "/x", &strict)),
+                Some(Reason::NoRootsDeclared),
+                "{name}"
+            );
+        }
         // A set that does have a home answers the containing question, which
         // is the only configuration that asks it.
         assert_eq!(
@@ -3345,17 +3426,26 @@ mod tests {
         ] {
             assert_eq!(statement(line), Statement::Nothing, "{line:?}");
         }
-        for (line, name, value) in [
-            ("CARGO_HOME=/x", "CARGO_HOME", "/x"),
-            ("export CARGO_HOME=/x", "CARGO_HOME", "/x"),
-            ("  export\t CARGO_HOME=/x # c ", "CARGO_HOME", "/x # c"),
-            ("export=/x", "export", "/x"),
-            ("exportX=", "exportX", ""),
-            ("X=a=b", "X", "a=b"),
+        for (line, name, value, exported) in [
+            ("CARGO_HOME=/x", "CARGO_HOME", "/x", false),
+            ("export CARGO_HOME=/x", "CARGO_HOME", "/x", true),
+            (
+                "  export\t CARGO_HOME=/x # c ",
+                "CARGO_HOME",
+                "/x # c",
+                true,
+            ),
+            ("export=/x", "export", "/x", false),
+            ("exportX=", "exportX", "", false),
+            ("X=a=b", "X", "a=b", false),
         ] {
             assert_eq!(
                 statement(line),
-                Statement::Assign { name, value },
+                Statement::Assign {
+                    name,
+                    value,
+                    exported
+                },
                 "{line:?}"
             );
         }
@@ -3896,6 +3986,15 @@ mod tests {
             .iter()
             .map(|violation| (violation.line, violation.reason))
             .collect()
+    }
+
+    /// The reason `NAME=VALUE` is refused on a line of its own that does not
+    /// say `export`, or `None` when it is allowed there. [`check`] judges as
+    /// exported, and this is the other reading.
+    fn unexported(name: &str, value: &str, roots: &RootSet) -> Option<Reason> {
+        scan_with(&format!("{name}={value}\n"), roots)
+            .first()
+            .map(|violation| violation.reason)
     }
 
     #[test]
@@ -5045,6 +5144,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_fragment_directory_is_owned_but_its_parent_is_not_refused() {
+        // PR #75 note D2: `~/.local/share/bx` holds the fragments every shell
+        // sources, so no tool may be pointed into it, even under a `~` root.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for value in [
+            "/var/home/example/.local/share/bx",
+            "/var/home/example/.local/share/bx/cargo",
+            "/var/home/example/.local/share/./bx",
+        ] {
+            assert_eq!(
+                reason_of(&check("CARGO_HOME", value, &home_rooted)),
+                Some(Reason::BxOwnedDirectory),
+                "{value}"
+            );
+        }
+        // Its parent is `XDG_DATA_HOME`'s native default, and a location that
+        // merely contains it is not refused.
+        for name in ["CARGO_HOME", "XDG_DATA_HOME"] {
+            assert_eq!(
+                check(name, "/var/home/example/.local/share", &home_rooted),
+                Verdict::Allowed,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            check(
+                "CARGO_HOME",
+                "/var/home/example/.local/share/bxtra",
+                &home_rooted
+            ),
+            Verdict::Allowed
+        );
+        // A set without a home owns it under any home, as it does the state
+        // directory; a set with one owns only its own.
+        assert!(RootSet::strict().owns(Path::new("/home/other/.local/share/bx/x")));
+        assert!(!RootSet::strict().owns(Path::new("/home/other/.local/share")));
+        assert!(!home_rooted.owns(Path::new("/home/other/.local/share/bx/x")));
+    }
+
     // Review round 6 (r3 round 1).
 
     #[test]
@@ -5452,19 +5591,60 @@ mod tests {
     }
 
     #[test]
+    fn the_region_line_is_not_an_environment_fragment() {
+        // The fixed region the `[[env]]` placement graph attaches to each zsh
+        // startup file is generated shell content that is not an environment
+        // fragment: two delimiter comments and one line that tests a fragment
+        // and sources it. Invariant 2 requires of it that it carry no
+        // environment assignment at all, and the plan does not send it through
+        // the guard — whose grammar would refuse the line as unreadable, which
+        // is no evidence that it sets nothing. So it is established here, of
+        // the bytes the generator actually emits, for every place that has
+        // one. The delimiters are `plan::region`'s, spelled out.
+        use crate::config::env::{Place, source_line};
+        use crate::paths::Portable;
+        let mut regions = 0;
+        for place in Place::ALL {
+            if place.startup_file().is_none() {
+                continue;
+            }
+            let fragment =
+                Portable::parse_in(place.fragment(), Path::new(HOME)).expect("a portable path");
+            let line = source_line(&fragment);
+            let region = format!("# >>> bx >>>\n{line}# <<< bx <<<\n");
+            assert_eq!(region.lines().count(), 3, "{region:?}");
+            assert_eq!(assignments_in(&region), Vec::<&str>::new(), "{region:?}");
+            for text in region.lines() {
+                assert!(
+                    !matches!(statement(text), Statement::Assign { .. }),
+                    "{text:?}"
+                );
+            }
+            // It names the fragment it sources and nothing else.
+            assert_eq!(
+                line,
+                format!("[[ -r {0} ]] && source {0}\n", fragment.as_str())
+            );
+            regions += 1;
+        }
+        assert_eq!(regions, 3, "zshenv, zprofile and zshrc each have one");
+    }
+
+    #[test]
     fn the_init_snippet_is_not_an_environment_fragment() {
         // Invariant 2 sends bx's generated environment fragments through the
         // guard, and requires of generated shell content that is *not* one of
         // them that it carry no environment assignment at all. The shell-init
-        // snippet is the repository's one such file — a staleness test, a
-        // completion function, a `compdef` — so that property has to be
-        // established of it rather than assumed.
+        // snippet is one such file — a staleness test, a completion function,
+        // a `compdef` — so that property has to be established of it rather
+        // than assumed. The placement graph's region line is the other, and
+        // `the_region_line_is_not_an_environment_fragment` establishes it.
         //
         // The bytes below are the benchmark's copy, and at this head they are
-        // the *only* copy: no bx code generates shell content yet, because
-        // `Gen` has no variant and so no generator exists. So this holds the snippet bx will
-        // emit, in the one place the repository keeps it, and the first
-        // generator must emit these bytes for it to keep meaning that.
+        // the *only* copy: no bx generator emits the snippet yet. So this
+        // holds the snippet bx will emit, in the one place the repository
+        // keeps it, and the generator that emits it must emit these bytes for
+        // it to keep meaning that.
         //
         // It is established positively, and not out of the guard's inability
         // to parse the snippet: `Reason::Unreadable` says only that a line is
@@ -5514,7 +5694,7 @@ mod tests {
             }
         }
         assert!(
-            pass(snippet, &RootSet::strict())
+            pass(snippet, &RootSet::strict(), false)
                 .1
                 .learned
                 .values()
@@ -5839,7 +6019,7 @@ mod tests {
     }
 
     #[test]
-    fn an_anchor_may_contain_bxs_directories_and_a_tool_read_location_may_not() {
+    fn an_anchor_may_contain_bxs_directories_only_while_it_is_not_exported() {
         use Reason::{
             BxOwnedDirectory, ContainsBxDirectory, InsideConfigRepo, NoRootsDeclared,
             OutsideDeclaredRoots, ParentComponent, UnlistedCharacter,
@@ -5849,26 +6029,52 @@ mod tests {
             assert_eq!(emittable(name), Some(Kind::Anchor), "{name}");
         }
         // The operator's fragment written in terms of the home, under a `~`
-        // root: the anchor names the home, which holds bx's directories, and
-        // no tool reads or clears it.
-        let at_home = OPERATOR_FRAGMENT.replacen(
-            "export SCRATCH_HOME=\"/var/mnt/scratch/example\"",
-            "export SCRATCH_HOME=\"$HOME\"",
-            1,
-        );
+        // root: the anchor names the home, which holds bx's directories. Kept
+        // out of the environment, no tool reads or clears it; exported, every
+        // tool the shell starts can.
+        let exported = "export SCRATCH_HOME=\"/var/mnt/scratch/example\"";
+        let unexported = "SCRATCH_HOME=\"/var/mnt/scratch/example\"";
+        let at_home = OPERATOR_FRAGMENT.replacen(exported, "SCRATCH_HOME=\"$HOME\"", 1);
         assert_ne!(at_home, OPERATOR_FRAGMENT);
         assert_eq!(scan_with(&at_home, &home_rooted), vec![]);
+        let exported_home =
+            OPERATOR_FRAGMENT.replacen(exported, "export SCRATCH_HOME=\"$HOME\"", 1);
+        assert_eq!(
+            reasons(&exported_home, &home_rooted),
+            vec![(1, ContainsBxDirectory)]
+        );
+        // So is every line of an `environment.d` fragment, which says no
+        // `export` and is read into the environment whole.
+        assert_eq!(
+            scan_exported("SCRATCH_HOME=$HOME\n", &home_rooted)
+                .iter()
+                .map(|violation| violation.reason)
+                .collect::<Vec<_>>(),
+            vec![ContainsBxDirectory]
+        );
         // The operator fragment under the three layouts: the home beside the
-        // scratch root, the home equal to it, and the home under it.
-        for roots in [
-            rooted(),
-            RootSet::new(Path::new(ROOT), &[PathBuf::from(ROOT)]),
-            RootSet::new(
-                Path::new("/var/mnt/scratch/example/home"),
-                &[PathBuf::from(ROOT)],
+        // scratch root, the home equal to it, and the home under it. Its
+        // exported anchor contains bx's directories in the last two, and is
+        // refused there; unexported, it scans clean in all three.
+        let kept_in = OPERATOR_FRAGMENT.replacen(exported, unexported, 1);
+        for (roots, refused) in [
+            (rooted(), false),
+            (RootSet::new(Path::new(ROOT), &[PathBuf::from(ROOT)]), true),
+            (
+                RootSet::new(
+                    Path::new("/var/mnt/scratch/example/home"),
+                    &[PathBuf::from(ROOT)],
+                ),
+                true,
             ),
         ] {
-            assert_eq!(scan_with(OPERATOR_FRAGMENT, &roots), vec![], "{roots:?}");
+            let expected = if refused {
+                vec![(1, ContainsBxDirectory)]
+            } else {
+                vec![]
+            };
+            assert_eq!(reasons(OPERATOR_FRAGMENT, &roots), expected, "{roots:?}");
+            assert_eq!(scan_with(&kept_in, &roots), vec![], "{roots:?}");
         }
         assert_eq!(scan(OPERATOR_FRAGMENT).len(), 25);
         // A tool-read location is still refused for containing them, whether
@@ -5880,7 +6086,7 @@ mod tests {
         );
         assert_eq!(
             reasons(
-                "export SCRATCH_HOME=~/.local/state\nexport UV_CACHE_DIR=$SCRATCH_HOME\n",
+                "SCRATCH_HOME=~/.local/state\nexport UV_CACHE_DIR=$SCRATCH_HOME\n",
                 &home_rooted
             ),
             vec![(2, ContainsBxDirectory)]
@@ -5914,46 +6120,33 @@ mod tests {
     }
 
     #[test]
-    fn the_anchor_exemption_is_open_and_this_is_what_it_allows() {
-        // The three measurements `refuses_anchor`'s doc records as the open
-        // defect this pull request ships with, asserted so the record cannot
-        // rot (round-4 note COV4).
-        //
-        // It lives in its own test, and that is round-5 note COV3: inside
-        // `an_anchor_may_contain_bxs_directories_and_a_tool_read_location_may_not`
-        // an earlier assertion fired first under the very mutation these were
-        // written for, so the record-bearing lines were never reached. A pin
-        // nothing reaches pins nothing.
-        //
-        // This test **fails when the exemption is closed**, which is
-        // deliberate: the honest pin for a limit the change ships with is one
-        // that breaks when the limit lifts. The message says so, so that a
-        // failure here reads as a signpost rather than an obstacle.
+    fn the_anchor_exemption_is_closed_to_an_exported_anchor() {
+        // The measurement `refuses_anchor`'s doc records as what the exemption
+        // was, asserted in its own test so an earlier assertion cannot hide it
+        // (round-5 note COV3): exported, an anchor is refused for containing
+        // bx's state directory exactly as a tool-read location with the
+        // identical value is, and only unexported does the exemption stand.
         use Reason::ContainsBxDirectory;
         let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
-        let closing = "If you have just given `Kind::Anchor` the containing check, this test \
-                       failing is the expected and wanted consequence. Read the paragraph on \
-                       `refuses_anchor` headed \"The exemption is open, and this is what it \
-                       costs\", which records this measurement as the open defect, and rewrite \
-                       it with this test.";
-        // An anchor may contain bx's state directory. This is the defect.
-        for name in ["DATA_DIR", "SCRATCH_HOME"] {
+        let state = "/var/home/example/.local/state";
+        for name in ["DATA_DIR", "SCRATCH_HOME", "UV_CACHE_DIR"] {
             assert_eq!(
-                check(name, "/var/home/example/.local/state", &home_rooted),
-                Verdict::Allowed,
-                "{name} no longer contains bx's state directory unrefused. {closing}"
+                reason_of(&check(name, state, &home_rooted)),
+                Some(ContainsBxDirectory),
+                "{name}"
+            );
+            assert_eq!(
+                reasons(&format!("export {name}={state}\n"), &home_rooted),
+                vec![(1, ContainsBxDirectory)],
+                "{name}"
             );
         }
-        // A tool-read location with the identical value is refused, which is
-        // what makes the anchor's exemption a difference of name alone.
+        for name in ["DATA_DIR", "SCRATCH_HOME"] {
+            assert_eq!(unexported(name, state, &home_rooted), None, "{name}");
+        }
         assert_eq!(
-            reason_of(&check(
-                "UV_CACHE_DIR",
-                "/var/home/example/.local/state",
-                &home_rooted
-            )),
-            Some(ContainsBxDirectory),
-            "the contrast the exemption is measured against has moved. {closing}"
+            unexported("UV_CACHE_DIR", state, &home_rooted),
+            Some(ContainsBxDirectory)
         );
     }
 
@@ -6082,23 +6275,21 @@ mod tests {
     }
 
     #[test]
-    fn the_guard_judges_no_generated_fragment_yet() {
-        // The fact that caps the open anchor exemption at zero real-world
-        // impact: no generated environment fragment reaches the guard yet.
+    fn every_site_that_reaches_the_guard_is_known() {
+        // Generated environment fragments reach the guard through the plan,
+        // and through nothing else: **every site outside this module that
+        // names the guard is one of `KNOWN`** — the plan's two fragment
+        // judgements, one per syntax, the note they share, its type imports,
+        // `bx add`'s advisory scan, and a test that reads a `Reason`'s text. A
+        // new site fails here, and so does a known one that is gone, so the
+        // list cannot rot, and a second route from a generated body to bytes
+        // cannot open without being read.
         //
-        // Until the plan landed that was "nothing calls the guard". The plan
-        // wires the one route a generated body takes to bytes through
-        // `guard_fragment`, ahead of any generator, so the fact is now two
-        // facts, and this test holds both:
-        //
-        // 1. **Every site outside this module that names the guard is one of
-        //    `KNOWN`**: the plan's `guard_fragment`, its type imports, and a
-        //    test that reads a `Reason`'s text. A new site fails here, and
-        //    so does a known one that is gone, so the list cannot rot.
-        // 2. **`config::target::Gen` has no variant**, so `guard_fragment` is
-        //    unreachable outside tests: no `Body::Generated` value exists.
-        //    The first generator adds a variant, fails here, and is the change
-        //    that must close the anchor exemption first.
+        // Until `config::target::Gen` had a variant this test held a second
+        // fact — that no generated fragment reached the guard at all — which
+        // capped the open `Kind::Anchor` exemption at zero impact. The change
+        // that gave `Gen` its variants closed the exemption for an exported
+        // anchor first, so that fact no longer caps anything and is not held.
         //
         // Round-4 note COV3: that was prose, and prose is the same shape as
         // the premise the exemption itself is criticised for. Round-5 note D1:
@@ -6122,23 +6313,39 @@ mod tests {
         //
         // `adopt.rs` scans a file the *user* wrote, at `bx add`, and only to
         // print a warning: the file is adopted verbatim whatever the verdict,
-        // and the scan's text is never generated. So it leaves both facts
-        // standing — no generated fragment reaches the guard through it.
-        const KNOWN: [(&str, &str); 6] = [
+        // and the scan's text is never generated. So no generated fragment
+        // reaches the guard through it.
+        //
+        // `config/env.rs` imports only the name predicate, so the `[[env]]`
+        // parser and the guard agree on what a variable name is; a predicate
+        // reads no fragment and writes no bytes.
+        const KNOWN: [(&str, &str); 9] = [
             ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
+            ("config/env.rs", "use crate::env_guard::is_variable_name;"),
             ("adopt.rs", "env_guard::scan_with(text, roots)"),
             ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
-            ("plan/decide.rs", "env_guard::scan_with(content, roots)"),
+            (
+                "plan/decide.rs",
+                "violations(&env_guard::scan_with(content, roots))",
+            ),
+            (
+                "plan/decide.rs",
+                "violations(&env_guard::scan_exported(content, roots))",
+            ),
+            (
+                "plan/decide.rs",
+                "fn violations(found: &[env_guard::Violation]) -> Option<String> {",
+            ),
             ("plan/mod.rs", "use crate::env_guard::RootSet;"),
             (
                 "plan/mod.rs",
                 "let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();",
             ),
         ];
-        let live = "Everything this module's docs cap at zero impact because no generated \
-                    fragment reaches the guard — the open `Kind::Anchor` containing-check \
-                    exemption on `refuses_anchor` above all — is live from here on. Read that \
-                    paragraph before changing this test.";
+        let live = "A generated body reaches bytes through the plan's judgement of it, and a \
+                    new route has to be read before it is trusted: check that it passes every \
+                    environment fragment through `scan_with` or `scan_exported`, as its syntax \
+                    exports, before adding it to `KNOWN`.";
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let own = src.join("env_guard.rs");
         let mut callers = Vec::new();
@@ -6190,14 +6397,6 @@ mod tests {
             gone.is_empty(),
             "a known site no longer names the guard: {gone:?}. Update `KNOWN`, and check the \
              route it took still passes a generated body through `guard_fragment`."
-        );
-        let target = std::fs::read_to_string(src.join("config/target.rs")).expect("target.rs");
-        assert!(
-            code_only(&target)
-                .iter()
-                .any(|(_, code)| code.trim() == "pub enum Gen {}"),
-            "`config::target::Gen` has a variant, so a generated fragment now reaches the \
-             guard. {live}"
         );
     }
 
@@ -6517,6 +6716,14 @@ mod tests {
         // home at the root is refused in each: beside, because uv would write
         // beside the root; equal and under, because the root holds bx's
         // directories, which outranks it.
+        //
+        // The anchor is kept out of the environment here: exported, it
+        // contains bx's directories in the last two layouts and is refused
+        // there, which
+        // `an_anchor_may_contain_bxs_directories_only_while_it_is_not_exported`
+        // pins.
+        let fragment = OPERATOR_FRAGMENT.replacen("export SCRATCH_HOME=", "SCRATCH_HOME=", 1);
+        assert_ne!(fragment, OPERATOR_FRAGMENT);
         for (roots, at_root) in [
             (rooted(), DeclaredRootItself),
             (
@@ -6531,17 +6738,17 @@ mod tests {
                 ContainsBxDirectory,
             ),
         ] {
-            assert_eq!(scan_with(OPERATOR_FRAGMENT, &roots), vec![], "{roots:?}");
-            let beneath = format!("{OPERATOR_FRAGMENT}export XDG_DATA_HOME=\"$DATA_DIR\"\n");
+            assert_eq!(scan_with(&fragment, &roots), vec![], "{roots:?}");
+            let beneath = format!("{fragment}export XDG_DATA_HOME=\"$DATA_DIR\"\n");
             assert_eq!(scan_with(&beneath, &roots), vec![], "{roots:?}");
-            let at = format!("{OPERATOR_FRAGMENT}export XDG_DATA_HOME=\"$SCRATCH_HOME\"\n");
+            let at = format!("{fragment}export XDG_DATA_HOME=\"$SCRATCH_HOME\"\n");
             assert_eq!(reasons(&at, &roots), vec![(26, at_root)], "{roots:?}");
         }
         // Written in terms of the home, under a `~` root.
         let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
         let at_home = OPERATOR_FRAGMENT.replacen(
             "export SCRATCH_HOME=\"/var/mnt/scratch/example\"",
-            "export SCRATCH_HOME=\"$HOME\"",
+            "SCRATCH_HOME=\"$HOME\"",
             1,
         );
         assert_ne!(at_home, OPERATOR_FRAGMENT);
@@ -6564,7 +6771,8 @@ mod tests {
         // name its consumer picks. A consumer named `bx` under
         // `CACHE_DIR=~/.local/state` or `~/.config`, or one named `state` under
         // `CACHE_DIR=~/.local`, reaches bx's directories. So `CACHE_DIR` may not
-        // contain them, while the two anchors no tool is known to read still may.
+        // contain them, while the two anchors no tool is known to read still may
+        // — unexported, where no tool can read them.
         assert_eq!(emittable("CACHE_DIR"), Some(Kind::Location));
         let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
         for value in ["~/.local/state", "~/.config", "~/.local"] {
@@ -6575,15 +6783,15 @@ mod tests {
             );
             for anchor in ["DATA_DIR", "SCRATCH_HOME"] {
                 assert_eq!(
-                    check(anchor, value, &home_rooted),
-                    Verdict::Allowed,
+                    unexported(anchor, value, &home_rooted),
+                    None,
                     "{anchor}={value}"
                 );
             }
         }
         assert_eq!(
             scan_with(
-                "export SCRATCH_HOME=~\nCACHE_DIR=$SCRATCH_HOME/cache\n",
+                "SCRATCH_HOME=~\nCACHE_DIR=$SCRATCH_HOME/cache\n",
                 &home_rooted
             ),
             vec![]
@@ -6691,8 +6899,21 @@ mod tests {
             );
         }
         // Without the character the containment reasons stand, and an anchor
-        // may contain what a tool-read location may not.
+        // may contain what a tool-read location may not while it is not
+        // exported. `check` judges as exported, so there it may not either.
         let plain = rooted().owning(&[PathBuf::from("/var/mnt/scratch/example/ab/state/bx")]);
+        assert_eq!(
+            unexported("SCRATCH_HOME", "/var/mnt/scratch/example/ab", &plain),
+            None
+        );
+        assert_eq!(
+            reason_of(&check(
+                "SCRATCH_HOME",
+                "/var/mnt/scratch/example/ab",
+                &plain
+            )),
+            Some(ContainsBxDirectory)
+        );
         assert_eq!(
             reason_of(&check("CARGO_HOME", "/var/mnt/scratch/example/ab", &plain)),
             Some(ContainsBxDirectory)
@@ -6704,10 +6925,6 @@ mod tests {
                 &plain
             )),
             Some(BxOwnedDirectory)
-        );
-        assert_eq!(
-            check("SCRATCH_HOME", "/var/mnt/scratch/example/ab", &plain),
-            Verdict::Allowed
         );
         assert_eq!(
             reason_of(&check(
@@ -6858,7 +7075,14 @@ mod tests {
                 &home_rooted,
                 Some(Reason::ContainsBxDirectory),
             ),
-            ("SCRATCH_HOME", "~/.local//state/./", &home_rooted, None),
+            // `check` judges an anchor as exported, which may not contain bx's
+            // directories either.
+            (
+                "SCRATCH_HOME",
+                "~/.local//state/./",
+                &home_rooted,
+                Some(Reason::ContainsBxDirectory),
+            ),
             (
                 "SCRATCH_HOME",
                 "~/.config/bx/",
@@ -6880,21 +7104,22 @@ mod tests {
         }
         // An anchor does not carry a tool-read location past the containment
         // check: the location is judged at its own line, whatever it refers to.
+        // The anchors are unexported, where they may contain bx's directories.
         for (content, expected) in [
             (
-                "export DATA_DIR=~\nexport XDG_DATA_HOME=$DATA_DIR\n",
+                "DATA_DIR=~\nexport XDG_DATA_HOME=$DATA_DIR\n",
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (
-                "export DATA_DIR=~/.local\nexport GOPATH=~/go:$DATA_DIR\n",
+                "DATA_DIR=~/.local\nexport GOPATH=~/go:$DATA_DIR\n",
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (
-                "export DATA_DIR=~/.local\nexport GOPATH=\"${DATA_DIR}\"\n",
+                "DATA_DIR=~/.local\nexport GOPATH=\"${DATA_DIR}\"\n",
                 vec![(2, Reason::ContainsBxDirectory)],
             ),
             (
-                "export SCRATCH_HOME=~/.local/state\nexport SCCACHE_DIR=$SCRATCH_HOME/x\n",
+                "SCRATCH_HOME=~/.local/state\nexport SCCACHE_DIR=$SCRATCH_HOME/x\n",
                 vec![],
             ),
         ] {
@@ -7958,7 +8183,7 @@ mod tests {
         fn agree(&self, content: &str, roots: &RootSet) -> Vec<bool> {
             let content = &self.rewrite(content);
             let home = self.home();
-            let (found, scope) = pass(content, roots);
+            let (found, scope) = pass(content, roots, false);
             let mut escaped_in = Vec::new();
             for (shell, path, baseline) in &self.found {
                 let after = variables_after(shell, path, &home, content);
@@ -8037,7 +8262,7 @@ mod tests {
         for content in READABLE_FRAGMENTS {
             for roots in [shells.rooted(), shells.home_rooted()] {
                 assert!(
-                    !pass(&shells.rewrite(content), &roots).1.lost,
+                    !pass(&shells.rewrite(content), &roots, false).1.lost,
                     "{content:?}"
                 );
                 shells.agree(content, &roots);

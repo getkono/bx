@@ -141,6 +141,7 @@ use std::path::Path;
 
 use toml_edit::Table;
 
+use super::env::EnvDecl;
 use super::secrets::Secrets;
 use super::target::Target;
 use super::values::{
@@ -202,6 +203,21 @@ impl Keyed for ValueDecl {
     }
 }
 
+impl Keyed for EnvDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 /// Which keyed list an entry belongs to.
 ///
 /// An enum rather than the section's name, because [`Toggle`], [`Config`],
@@ -215,6 +231,8 @@ pub enum Section {
     Target,
     /// `[[value]]`, keyed by `name`.
     Value,
+    /// `[[env]]`, keyed by `name`.
+    Env,
 }
 
 impl Section {
@@ -224,6 +242,7 @@ impl Section {
         match self {
             Self::Target => "target",
             Self::Value => "value",
+            Self::Env => "env",
         }
     }
 
@@ -233,6 +252,7 @@ impl Section {
         match self {
             Self::Target => super::target::SECTION,
             Self::Value => super::values::DECL_SECTION,
+            Self::Env => super::env::SECTION,
         }
     }
 
@@ -241,7 +261,7 @@ impl Section {
     pub fn natural_key(self) -> &'static str {
         match self {
             Self::Target => "path",
-            Self::Value => "name",
+            Self::Value | Self::Env => "name",
         }
     }
 
@@ -254,6 +274,7 @@ impl Section {
         match self {
             Self::Target => "one of `file`, `content`, `generated` or `dir`",
             Self::Value => "a `kind`",
+            Self::Env => "a `value` and a `kind`",
         }
     }
 }
@@ -630,7 +651,7 @@ impl Merged<Target, TargetKey> {
                         fragile,
                     });
                 }
-                Section::Value => {}
+                Section::Value | Section::Env => {}
             }
         }
 
@@ -1033,24 +1054,30 @@ fn refuse_twice(earlier: &Said, spelling: &str, origin: &Origin) -> Error {
 pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut values: Merged<ValueDecl> = Merged::default();
     let mut assignments: Vec<ValueAssignment> = Vec::new();
+    let mut envs: Merged<EnvDecl> = Merged::default();
     let mut secrets = Secrets::default();
 
     // Values first, across every layer. A value never depends on a target, and
     // a target's key depends on the values — the final ones, because the file a
     // target is written to is decided by the answers this account ends up with,
     // not by the answers known when its own layer was read.
+    //
+    // An `[[env]]` entry is keyed by its name as written, which no answer can
+    // change, so it folds here beside the values.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
         secrets.absorb(&layer.config.secrets);
 
         values.absorb(layer.config.values.iter().cloned());
+        envs.absorb(layer.config.envs.iter().cloned());
 
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
             // compile error here rather than a panic in a library call.
             match toggle.section {
                 Section::Value => values.toggle(toggle)?,
+                Section::Env => envs.toggle(toggle)?,
                 Section::Target => {}
             }
         }
@@ -1086,6 +1113,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         targets: targets.into_enabled(),
         values,
         value_assignments: assignments,
+        // Nothing refers to a variable by name, so a disabled one is simply
+        // not placed, as a disabled target is not written.
+        envs: envs.into_enabled(),
         secrets,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
@@ -1219,6 +1249,52 @@ mod tests {
         merge(layers)
             .expect_err("should have been refused")
             .to_string()
+    }
+
+    /// An `[[env]]` entry.
+    fn env_toml(name: &str, value: &str, kind: &str) -> String {
+        format!("[[env]]\nname = \"{name}\"\nvalue = \"{value}\"\nkind = \"{kind}\"\n")
+    }
+
+    #[test]
+    fn env_entries_merge_by_name_and_a_toggle_removes_one() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                &format!(
+                    "{}{}{}",
+                    env_toml("LANG", "C", "environment"),
+                    env_toml("EDITOR", "vi", "interactive"),
+                    env_toml("PAGER", "less", "login")
+                ),
+            ),
+            global("modules/a.toml", &env_toml("LANG", "C.UTF-8", "gui")),
+            local("[[env]]\nname = \"EDITOR\"\nenabled = false\n"),
+        ])
+        .unwrap();
+        let envs: Vec<(&str, &str, &Path)> = merged
+            .envs
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_str(), e.origin.file.as_path()))
+            .collect();
+        assert_eq!(
+            envs,
+            vec![
+                ("LANG", "C.UTF-8", Path::new("modules/a.toml")),
+                ("PAGER", "less", Path::new("bx.toml")),
+            ]
+        );
+        assert_eq!(merged.envs[0].kind, crate::config::env::EnvKind::Gui);
+    }
+
+    #[test]
+    fn an_env_toggle_that_names_nothing_is_refused() {
+        let message = failure(&[
+            global("bx.toml", &env_toml("LANG", "C", "gui")),
+            local("[[env]]\nname = \"PAGER\"\nenabled = false\n"),
+        ]);
+        assert!(message.contains("PAGER"), "{message}");
+        assert!(message.contains("a `value` and a `kind`"), "{message}");
     }
 
     #[test]
@@ -1423,6 +1499,7 @@ mod tests {
         for (section, key, header, natural) in [
             (Section::Target, "target", "[[target]]", "path"),
             (Section::Value, "value", "[[value]]", "name"),
+            (Section::Env, "env", "[[env]]", "name"),
         ] {
             assert_eq!(section.key(), key);
             assert_eq!(section.header(), header);

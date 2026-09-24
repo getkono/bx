@@ -28,6 +28,7 @@ pub mod resolve;
 pub mod secrets;
 pub mod target;
 pub mod values;
+pub mod when;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -508,6 +508,45 @@ mod tests {
     }
 
     #[test]
+    fn a_decoded_mode_carries_only_the_permission_bits() {
+        // One flipped byte in `ledger.mpk` must not give a `Mode` that renders,
+        // converts and chmods as `0644` but compares unequal to the `0644` a
+        // `plan` reads off the disk — two values printed identically that
+        // never converge.
+        let wire = rmp_serde::to_vec_named(&0o100_644_u32).expect("encode");
+        let back: Mode = rmp_serde::from_slice(&wire).expect("decode");
+        assert_eq!(back, Mode::DEFAULT_FILE, "equal to the mode a stat gives");
+        assert_eq!(back.bits(), 0o644);
+        assert_eq!(back.to_string(), "0644");
+
+        // Every bit `from_bits` keeps survives the round trip, set-id and
+        // sticky included: `0o7777`, not `0o777`.
+        for bits in [0o4755, 0o2755, 0o1777, 0o7777] {
+            let mode = Mode::from_bits(bits);
+            let wire = rmp_serde::to_vec_named(&mode).expect("encode");
+            assert_eq!(
+                rmp_serde::from_slice::<Mode>(&wire).expect("decode"),
+                mode,
+                "{bits:04o}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_set_id_and_sticky_bits_reach_the_chmod() {
+        // `from_bits_truncate` dropping `0o7000` in the conversion `fchmod`
+        // uses would lose precisely the four bits the `0o7777` mask in
+        // `from_bits` exists to preserve.
+        for bits in [0o4755, 0o2755, 0o1777, 0o7777] {
+            assert_eq!(
+                RawMode::from(Mode::from_bits(bits)).bits(),
+                bits,
+                "{bits:04o}",
+            );
+        }
+    }
+
+    #[test]
     fn the_messagepack_encoding_is_the_bare_integer_the_ledger_already_holds() {
         // The machine-owned half of the split codec, pinned as bytes rather
         // than as a round trip: a `ledger.mpk` written before this type carried

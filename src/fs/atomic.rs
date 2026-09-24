@@ -1458,8 +1458,8 @@ impl Filled {
             self.written(),
             self.pending.mode,
             mechanism,
+            self.pending.prior.prior_bytes(),
         )
-        .with_prior(self.pending.prior.prior_bytes())
         .with_created_dirs(
             self.pending
                 .created_dirs
@@ -7325,15 +7325,13 @@ mod tests {
         }
 
         let recorded = ledger
-            .record(
-                NewEntry::new(
-                    Portable::from_path(&dest, home.path()).expect("portable"),
-                    ContentHash::of(b"Host v2\n"),
-                    Mode::PRIVATE_FILE,
-                    Mechanism::Own,
-                )
-                .with_prior(PriorBytes::Absent),
-            )
+            .record(NewEntry::new(
+                Portable::from_path(&dest, home.path()).expect("portable"),
+                ContentHash::of(b"Host v2\n"),
+                Mode::PRIVATE_FILE,
+                Mechanism::Own,
+                PriorBytes::Absent,
+            ))
             .expect("record")
             .clone();
 

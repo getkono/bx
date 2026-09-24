@@ -1,11 +1,18 @@
 //! Filesystem primitives: file modes, and the one atomic write in the crate.
 //!
-//! This module is the single place in bx where a byte reaches the filesystem.
-//! Everything downstream — generated shell fragments, managed regions and
-//! include lines, surgical edits to another tool's config, and decrypted
+//! This module is the single place in bx where a byte reaches the filesystem,
+//! but one. Everything downstream — generated shell fragments, managed regions
+//! and include lines, surgical edits to another tool's config, and decrypted
 //! secrets — writes through [`atomic`], so the durability sequence, the
 //! reversibility record and the mode policy exist once rather than once per
 //! caller.
+//!
+//! The one exception is the advisory lock file's body, a best-effort line
+//! naming the holder, which `state::lock` truncates and writes in place through
+//! the descriptor the lock is held on. Renaming a new file over it would move
+//! the name to an inode nobody holds the lock on, and the body is only ever a
+//! diagnostic, so a torn one costs a vaguer "already running" message and
+//! nothing else.
 //!
 //! A write that is interrupted — by a crash, a full disk, or a `SIGKILL` —
 //! must leave the previous file exactly as it was, because an additive tool

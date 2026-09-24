@@ -30,6 +30,10 @@
 //! every account, so an edit the user makes anywhere else in the file is never
 //! bx's business, and a change of declaration rewrites only bx's own file.
 //!
+//! The `zshenv` fragment also carries the `[path]` entries, after its
+//! variables, so a `${NAME}` in one reads a variable the file has already
+//! exported; see [`super::path`].
+//!
 //! Every fragment is an environment fragment in the guard's grammar, and the
 //! plan judges it against the declared roots before it is written. A fragment
 //! for which a declared value has no usable answer is held back on its own —
@@ -39,6 +43,7 @@ use std::path::Path;
 
 use toml_edit::Table;
 
+use super::path::{self, PathEntry};
 use super::{Ctx, Error, Origin};
 use crate::env_guard::is_variable_name;
 use crate::paths::Portable;
@@ -266,6 +271,9 @@ pub struct Fragment {
     pub syntax: Syntax,
     /// `(name, value)`, each value already substituted.
     pub vars: Vec<(String, String)>,
+    /// The `[path]` entries, written after every variable. Only the `zshenv`
+    /// fragment holds any; see [`super::path`].
+    pub path: Vec<PathEntry>,
 }
 
 /// The line every fragment opens with. Fixed, so the fragment's bytes are a
@@ -293,6 +301,7 @@ impl Fragment {
             out.push_str(&quoted(&home_spelled(value)));
             out.push('\n');
         }
+        out.push_str(&path::render(&self.path));
         out
     }
 }
@@ -456,6 +465,7 @@ mod tests {
         let zsh = Fragment {
             syntax: Syntax::Zsh,
             vars: vars.clone(),
+            path: Vec::new(),
         };
         assert_eq!(
             zsh.render(),
@@ -471,6 +481,7 @@ mod tests {
         let env_d = Fragment {
             syntax: Syntax::EnvironmentD,
             vars,
+            path: Vec::new(),
         };
         assert!(env_d.render().contains("\nCARGO_HOME=$HOME/.cargo\n"));
         assert!(!env_d.render().contains("export"));

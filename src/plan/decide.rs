@@ -1397,6 +1397,12 @@ fn track_into_repo(
 /// array.
 /// A line number in the note is still the file's own: the phase is found in
 /// the file's bytes, and each line is counted from the top of the file.
+///
+/// bash's interactive file holds no environment fragment at all: its alias
+/// lines set nothing and its `options` phase assigns only bash's own history
+/// variables, unexported, which [`crate::shell::bash`]'s tests hold it to. So
+/// the one thing judged in it is the history file it names, as zsh's is.
+/// `~/.inputrc` is readline's syntax and names no variable.
 fn guard_generated(
     generator: &Gen,
     content: &str,
@@ -1415,28 +1421,29 @@ fn guard_generated(
                 .map_or(0, |at| content[..at].matches('\n').count());
             join([
                 guard_fragment_after(&env, roots, before),
-                guard_history_file(file.history().zsh_file.as_ref(), roots),
+                guard_history_file("zsh", file.history().zsh_file.as_ref(), roots),
             ])
         }
-        Gen::Source(_) => None,
+        Gen::Bash(file) => guard_history_file("bash", file.history().bash_file.as_ref(), roots),
+        Gen::Source(_) | Gen::Inputrc(_) => None,
     }
 }
 
-/// Judge a declared zsh history file against Invariant 2: the one path the
-/// interactive file's `options` phase names.
+/// Judge a declared history file against Invariant 2: the one path an
+/// interactive file's `options` phase names, for `shell`.
 ///
-/// zsh keeps no history file unless one is named, so naming one moves nothing
-/// and needs no root; but zsh writes every command line typed into it, so it
-/// may not lie inside a directory bx owns, nor inside the config repo, where
-/// it would be committed. Rendered against the set's home, the same home
-/// `${HOME}` is at shell start.
-fn guard_history_file(file: Option<&Portable>, roots: &RootSet) -> Option<String> {
+/// zsh keeps no history file unless one is named, and bash's default is its
+/// own, so naming one moves nothing and needs no root; but the shell writes
+/// every command line typed into it, so it may not lie inside a directory bx
+/// owns, nor inside the config repo, where it would be committed. Rendered
+/// against the set's home, the same home `${HOME}` is at shell start.
+fn guard_history_file(shell: &str, file: Option<&Portable>, roots: &RootSet) -> Option<String> {
     let file = file?;
     let path = roots
         .home()
         .map_or_else(|| PathBuf::from(file.as_str()), |home| file.render(home));
     env_guard::refuses_bx_location(&path, roots)
-        .map(|reason| format!("[history] zsh file {file} {reason}"))
+        .map(|reason| format!("[history] {shell} file {file} {reason}"))
 }
 
 /// Judge a generated environment fragment against Invariant 2.
@@ -3011,11 +3018,14 @@ mod tests {
             let home = guarded_home();
             home.write(".zshrc", "alias ll='ls -l'\n");
             let first = apply(&home, HISTORY);
+            // bash's file carries the same declaration in bash's names.
             assert_eq!(
                 rows(&first),
                 vec![
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Modify),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
             );
             let written = read(&home, ".local/share/bx/zshrc.zsh");
@@ -3052,13 +3062,20 @@ mod tests {
 
             // Reversible: `rm` puts back the bytes each file held before bx.
             let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
-                .iter()
-                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
-                .collect();
+            let targets: Vec<Portable> = [
+                "~/.local/share/bx/zshrc.zsh",
+                "~/.zshrc",
+                "~/.local/share/bx/bashrc.bash",
+                "~/.bashrc",
+            ]
+            .iter()
+            .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+            .collect();
             crate::restore::restore(&state, home.path(), &targets).expect("rm");
             assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
             assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+            assert!(!home.child(".local/share/bx/bashrc.bash").exists());
+            assert!(!home.child(".bashrc").exists());
         }
 
         #[test]
@@ -3068,11 +3085,13 @@ mod tests {
             let home = guarded_home();
             home.write(".zshrc", "alias ll='ls -l'\n");
             let first = apply(&home, KEYBINDINGS);
+            // readline gets the same bindings in `~/.inputrc`.
             assert_eq!(
                 rows(&first),
                 vec![
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Modify),
+                    ("~/.inputrc", Action::Create),
                 ]
             );
             let written = read(&home, ".local/share/bx/zshrc.zsh");
@@ -3103,13 +3122,14 @@ mod tests {
 
             // Reversible: `rm` puts back the bytes each file held before bx.
             let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
+            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc", "~/.inputrc"]
                 .iter()
                 .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
                 .collect();
             crate::restore::restore(&state, home.path(), &targets).expect("rm");
             assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
             assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+            assert!(!home.child(".inputrc").exists());
         }
 
         #[test]
@@ -3137,12 +3157,17 @@ mod tests {
         #[test]
         fn declaring_no_history_zsh_reads_places_nothing() {
             let home = guarded_home();
-            for layer in [
-                "[history]\n[shell-options]\n",
-                "[history.file]\nbash = \"~/.bash_history\"\n[shell-options]\nhistappend = true\n",
-            ] {
-                assert_eq!(rows(&plan(&home, layer)), vec![], "{layer}");
-            }
+            assert_eq!(rows(&plan(&home, "[history]\n[shell-options]\n")), vec![]);
+            // What only bash reads places bash's file alone.
+            let layer =
+                "[history.file]\nbash = \"~/.bash_history\"\n[shell-options]\nhistappend = true\n";
+            assert_eq!(
+                rows(&plan(&home, layer)),
+                vec![
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
+                ]
+            );
         }
 
         #[test]
@@ -3233,13 +3258,16 @@ mod tests {
                  [[alias]]\nname = \"off\"\ncommand = \"y\"\nenabled = false\n"
             );
 
-            // Aliases alone place the file, and the region that sources it.
+            // Aliases alone place the file, and the region that sources it,
+            // and bash's.
             let first = apply(&home, &layer);
             assert_eq!(
                 rows(&first),
                 vec![
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Modify),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
             );
             let written = read(&home, ".local/share/bx/zshrc.zsh");
@@ -3273,6 +3301,11 @@ mod tests {
                 Action::Modify
             );
             assert_eq!(row(&installed, "~/.zshrc").action, Action::Unchanged);
+            assert_eq!(
+                row(&installed, "~/.local/share/bx/bashrc.bash").action,
+                Action::Modify
+            );
+            assert_eq!(row(&installed, "~/.bashrc").action, Action::Unchanged);
             apply(&home, &layer);
             let written = read(&home, ".local/share/bx/zshrc.zsh");
             let phase = aliases_phase(&written);
@@ -3335,6 +3368,168 @@ mod tests {
             crate::restore::restore(&state, home.path(), &targets).expect("rm");
             assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
             assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+        }
+
+        #[test]
+        fn bash_gets_its_file_a_fixed_region_and_an_inputrc_twice_alike_and_rm_restores_them() {
+            const SHARED: &str = "[aliases]\nll = \"ls -la\"\n\
+                                  [history]\nsize = 500\nignore_space = true\n\
+                                  [shell-options]\nhistappend = true\n\
+                                  [keybindings]\nalt-f = \"forward-word\"\n";
+            let bashrc = "# a distribution's own ~/.bashrc\n\
+                          [ -z \"$PS1\" ] && return\nPS1='\\u@\\h \\w\\$ '\n";
+            let home = guarded_home();
+            home.write(".bashrc", bashrc);
+            let first = apply(&home, SHARED);
+            assert_eq!(
+                rows(&first)
+                    .into_iter()
+                    .filter(|(path, _)| !path.contains("zsh"))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Modify),
+                    ("~/.inputrc", Action::Create),
+                ]
+            );
+            // The region is appended, and every byte around it is the user's.
+            let region = "# >>> bx >>>\n\
+                          [[ -r ~/.local/share/bx/bashrc.bash ]] && \
+                          source ~/.local/share/bx/bashrc.bash\n\
+                          # <<< bx <<<\n";
+            assert_eq!(read(&home, ".bashrc"), format!("{bashrc}{region}"));
+            let file = read(&home, ".local/share/bx/bashrc.bash");
+            assert_eq!(
+                file,
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: aliases\nalias ll='ls -la'\n\
+                 \n# bx phase: options\nHISTSIZE=500\nHISTFILESIZE=500\n\
+                 HISTCONTROL=ignorespace\nexport -n HISTSIZE HISTFILESIZE HISTCONTROL\n\
+                 shopt -s histappend\n"
+            );
+            let inputrc = read(&home, ".inputrc");
+            assert!(
+                inputrc.ends_with("$include /etc/inputrc\n\"\\ef\": forward-word\n"),
+                "{inputrc}"
+            );
+
+            // bash reads the region, and through it the file.
+            if let Some(bash) = crate::shell::testing::installed("bash") {
+                // The region names the file under `~`, so run under this home.
+                let script = format!(
+                    "HOME={}\nPS1=x\nsource ~/.bashrc\n\
+                     printf '%s|' \"${{BASH_ALIASES[ll]}}\" \"$HISTSIZE\"\n",
+                    home.path().display()
+                );
+                let out = crate::shell::testing::run(&bash, &["--norc", "--noprofile"], &script);
+                assert_eq!(String::from_utf8(out).expect("utf-8"), "ls -la|500|");
+            }
+
+            // Idempotent: an empty second plan, and nothing rewritten.
+            let second = plan(&home, SHARED);
+            assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&second)
+            );
+            assert!(!apply(&home, SHARED).executed);
+            assert_eq!(read(&home, ".local/share/bx/bashrc.bash"), file);
+            assert_eq!(read(&home, ".bashrc"), format!("{bashrc}{region}"));
+            assert_eq!(read(&home, ".inputrc"), inputrc);
+
+            // Declaring nothing any more leaves bash's files planned empty,
+            // and the region as it is.
+            let vacated = plan(&home, "");
+            for path in ["~/.local/share/bx/bashrc.bash", "~/.inputrc"] {
+                assert_eq!(row(&vacated, path).action, Action::Modify, "{path}");
+            }
+            assert!(
+                vacated
+                    .changes
+                    .iter()
+                    .all(|change| change.target != "~/.bashrc"),
+                "{:?}",
+                rows(&vacated)
+            );
+
+            // Reversible: `rm` puts back the bytes each file held before bx.
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = [
+                "~/.local/share/bx/zshrc.zsh",
+                "~/.zshrc",
+                "~/.local/share/bx/bashrc.bash",
+                "~/.bashrc",
+                "~/.inputrc",
+            ]
+            .iter()
+            .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+            .collect();
+            crate::restore::restore(&state, home.path(), &targets).expect("rm");
+            assert_eq!(read(&home, ".bashrc"), bashrc);
+            assert!(!home.child(".local/share/bx/bashrc.bash").exists());
+            assert!(!home.child(".inputrc").exists());
+        }
+
+        #[test]
+        fn an_inputrc_a_dropped_target_wrote_is_left_alone() {
+            // PR #102 note D1: the ledger records a `[[target]]`'s file as
+            // owned whole, as it does the inputrc bx generates, so dropping
+            // the target planned `~/.inputrc` rewritten with no bindings.
+            let bindings = "set editing-mode vi\n";
+            let target =
+                "[[target]]\npath = \"~/.inputrc\"\ncontent = \"set editing-mode vi\\n\"\n";
+            let home = guarded_home();
+            assert_eq!(
+                row(&apply(&home, target), "~/.inputrc").action,
+                Action::Create
+            );
+            assert_eq!(read(&home, ".inputrc"), bindings);
+
+            let dropped = plan(&home, "");
+            assert!(
+                dropped
+                    .changes
+                    .iter()
+                    .all(|change| change.target != "~/.inputrc"),
+                "{:?}",
+                rows(&dropped)
+            );
+            assert!(!apply(&home, "").executed);
+            assert_eq!(read(&home, ".inputrc"), bindings);
+        }
+
+        #[test]
+        fn an_inputrc_bx_did_not_write_is_a_conflict_left_as_it_is() {
+            let home = guarded_home();
+            home.write(".inputrc", "set bell-style none\n");
+            let report = apply(&home, "[keybindings]\nhome = \"beginning-of-line\"\n");
+            assert_eq!(row(&report, "~/.inputrc").action, Action::Conflict);
+            assert_eq!(read(&home, ".inputrc"), "set bell-style none\n");
+        }
+
+        #[test]
+        fn a_bash_history_file_bx_owns_blocks_bash_s_file() {
+            let home = guarded_home();
+            let layer = "[history.file]\nbash = \"~/.local/state/bx/history\"\n";
+            let report = plan(&home, layer);
+            let file = row(&report, "~/.local/share/bx/bashrc.bash");
+            assert_eq!(file.action, Action::Blocked);
+            let note = file.note.as_deref().expect("a note");
+            assert!(
+                note.contains(
+                    "[history] bash file ~/.local/state/bx/history \
+                     points inside a directory bx owns"
+                ),
+                "{note}"
+            );
+            let layer = "[history.file]\nbash = \"~/.bash_history\"\n";
+            assert_eq!(
+                row(&plan(&home, layer), "~/.local/share/bx/bashrc.bash").action,
+                Action::Create
+            );
         }
 
         /// The `functions` phase of an interactive file's bytes: from its

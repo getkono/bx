@@ -140,10 +140,41 @@ impl When {
         })
     }
 
+    /// The test a runtime condition renders to in bash, or `None` for one bx
+    /// decides itself.
+    ///
+    /// bash's `[[ -o NAME ]]` tests only `set -o` options, and neither
+    /// `interactive` nor `login` is one, so those two are asked the way bash
+    /// answers them: `$-` holds `i` in an interactive shell, and
+    /// `login_shell` is the read-only option bash sets for a login shell.
+    /// Every other test is the one [`When::test`] writes, which bash reads
+    /// alike.
+    #[must_use]
+    pub fn test_bash(&self) -> Option<String> {
+        match self {
+            Self::Interactive => Some("[[ $- == *i* ]]".to_string()),
+            Self::Login => Some("shopt -q login_shell".to_string()),
+            other => other.test(),
+        }
+    }
+
     /// Decide what bx can: a tool's presence through `present`, asked once
     /// per call, and nothing about the shell, which is left as a test.
     #[must_use]
     pub fn gate(&self, present: &dyn Fn(&str) -> bool) -> Gate {
+        self.gate_with(present, Self::test)
+    }
+
+    /// [`When::gate`], leaving the shell a test in bash's words
+    /// ([`When::test_bash`]).
+    #[must_use]
+    pub fn gate_bash(&self, present: &dyn Fn(&str) -> bool) -> Gate {
+        self.gate_with(present, Self::test_bash)
+    }
+
+    /// Decide a tool's presence through `present`, and render any other
+    /// condition through `test`.
+    fn gate_with(&self, present: &dyn Fn(&str) -> bool, test: fn(&Self) -> Option<String>) -> Gate {
         match self {
             Self::Has(tool) => {
                 if present(tool) {
@@ -152,7 +183,7 @@ impl When {
                     Gate::Never
                 }
             }
-            runtime => Gate::Test(runtime.test().unwrap_or_default()),
+            runtime => Gate::Test(test(runtime).unwrap_or_default()),
         }
     }
 }
@@ -359,6 +390,59 @@ mod tests {
         assert_eq!(has.gate(&|tool| tool == "sccache"), Gate::Always);
         assert_eq!(has.gate(&|_| false), Gate::Never);
         assert_eq!(has.test(), None);
+        assert_eq!(has.gate_bash(&|tool| tool == "sccache"), Gate::Always);
+        assert_eq!(has.gate_bash(&|_| false), Gate::Never);
+        assert_eq!(has.test_bash(), None);
+    }
+
+    #[test]
+    fn bash_asks_interactive_and_login_its_own_way_and_the_rest_alike() {
+        for (when, test) in [
+            (When::Interactive, "[[ $- == *i* ]]"),
+            (When::Login, "shopt -q login_shell"),
+        ] {
+            assert_eq!(when.test_bash().as_deref(), Some(test), "{when:?}");
+            assert_ne!(when.test(), when.test_bash(), "{when:?}");
+            assert_eq!(
+                when.gate_bash(&|_| unreachable!()),
+                Gate::Test(test.to_string())
+            );
+        }
+        for when in [
+            When::Ssh,
+            When::EnvSet("TMUX".to_string()),
+            When::EnvEquals {
+                name: "T".to_string(),
+                value: "a b".to_string(),
+            },
+        ] {
+            assert_eq!(when.test_bash(), when.test(), "{when:?}");
+        }
+    }
+
+    #[test]
+    fn bash_answers_each_runtime_test_as_the_condition_means() {
+        let Some(bash) = crate::shell::testing::installed("bash") else {
+            return;
+        };
+        let probe = |flags: &[&str], when: &When, setup: &str| {
+            let test = when.test_bash().expect("a runtime test");
+            let script = format!("{setup}if {test}; then echo yes; else echo no; fi\n");
+            String::from_utf8(crate::shell::testing::run(&bash, flags, &script)).expect("utf-8")
+        };
+        assert_eq!(probe(&["--norc", "-i"], &When::Interactive, ""), "yes\n");
+        assert_eq!(probe(&[], &When::Interactive, ""), "no\n");
+        assert_eq!(probe(&["--noprofile", "-l"], &When::Login, ""), "yes\n");
+        assert_eq!(probe(&[], &When::Login, ""), "no\n");
+        let tmux = When::EnvSet("TMUX".to_string());
+        assert_eq!(probe(&[], &tmux, "TMUX=\n"), "yes\n");
+        assert_eq!(probe(&[], &tmux, ""), "no\n");
+        let term = When::EnvEquals {
+            name: "T".to_string(),
+            value: "a *".to_string(),
+        };
+        assert_eq!(probe(&[], &term, "T='a *'\n"), "yes\n");
+        assert_eq!(probe(&[], &term, "T='a b'\n"), "no\n");
     }
 
     #[test]

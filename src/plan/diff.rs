@@ -16,6 +16,7 @@ use super::{Change, Report};
 use crate::fs::Mode;
 use crate::paths;
 use crate::report::{self, Action};
+use crate::shell::activation;
 
 /// The largest body, in bytes, that is shown line by line.
 ///
@@ -385,6 +386,13 @@ pub fn render(report: &Report, view: View, palette: Palette, home: &Path) -> Str
         }
         row(&mut out, change, palette, home);
     }
+    for step in report.activations.steps() {
+        let action = step.action();
+        if view == View::Plan && action == Action::Unchanged {
+            continue;
+        }
+        activation_row(&mut out, step, palette);
+    }
     out.push_str(&report::summary(&report.actions()));
     out.push('\n');
     out
@@ -467,6 +475,29 @@ fn unified_rows(out: &mut String, text: &str, palette: Palette) {
         }
         out.push('\n');
     }
+}
+
+/// One activation, as [`activation::Step::line`] says it, its symbol styled
+/// as a change's is. Escaped whole: an omission can quote what a tool printed
+/// on standard error.
+fn activation_row(out: &mut String, step: &activation::Step, palette: Palette) {
+    let action = step.action();
+    let style = if action.needs_attention() {
+        ATTENTION
+    } else if action.is_pending() {
+        PENDING
+    } else {
+        QUIET
+    };
+    let line = step.line();
+    let symbol = action.symbol();
+    let rest = line.strip_prefix(symbol).unwrap_or(&line);
+    let _ = writeln!(
+        out,
+        "{ROW_INDENT}{}{}",
+        palette.paint(style, &symbol.to_string()),
+        escape(rest),
+    );
 }
 
 /// One change — `  {symbol} {target}  ({origin}) {note}` — then its diff.

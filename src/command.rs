@@ -144,12 +144,12 @@ fn converge(
     } else if let Some(outcome) = &report.recovered {
         writeln!(out, "{}", recovered(&report, outcome)).map_err(Error::Output)?;
     } else if report.executed {
+        // Every row and every activation it cached: an activation's pending
+        // step is a cache entry written, as a row's is a file.
         let written = report
-            .changes
-            .iter()
-            .filter(|change| {
-                change.action.is_pending() || (mode == Mode::Sync && change.action == Action::Sync)
-            })
+            .actions()
+            .into_iter()
+            .filter(|action| action.is_pending() || (mode == Mode::Sync && *action == Action::Sync))
             .count();
         writeln!(out, "Applied {written} change(s).").map_err(Error::Output)?;
         // A row apply stopped short of was announced as work and shown so; its
@@ -711,6 +711,48 @@ mod tests {
 
         let exit = plan(&env(home.path()), &mut Vec::new()).expect("plan");
         assert_eq!(exit, Exit::Converged);
+    }
+
+    #[test]
+    fn applied_counts_an_activation_capture_as_a_change() {
+        // V1: the interactive file, its `~/.zshrc` region, and the capture.
+        let home = guarded_home();
+        home.write(".zshrc", "user\n");
+        let stub = home.child("stub");
+        std::fs::write(&stub, "#!/bin/sh\nprintf 'stub_hook() { :; }\\n'\n").expect("the stub");
+        std::fs::set_permissions(
+            &stub,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("executable");
+        seed(
+            home.path(),
+            &format!(
+                "[[activation]]\nname = \"stub\"\ncommand = [\"{}\"]\n",
+                stub.display()
+            ),
+        );
+        let mut out = Vec::new();
+
+        let exit = apply_with(&env(home.path()), true, &mut out, &mut never).expect("apply");
+
+        assert_eq!(exit, Exit::Converged);
+        assert!(
+            text(&out).contains("  + activation `stub`: run twice, output agreed; cached\n"),
+            "{}",
+            text(&out)
+        );
+        assert!(
+            text(&out).ends_with("Applied 3 change(s).\n"),
+            "{}",
+            text(&out)
+        );
+
+        // Recorded, so the next apply has nothing to count.
+        let mut again = Vec::new();
+        let exit = apply_with(&env(home.path()), true, &mut again, &mut never).expect("apply");
+        assert_eq!(exit, Exit::Converged);
+        assert!(!text(&again).contains("Applied"), "{}", text(&again));
     }
 
     #[test]

@@ -2618,6 +2618,49 @@ mod tests {
     }
 
     #[test]
+    fn rm_of_a_tracked_tree_apply_created_removes_every_file_and_its_directories() {
+        let layer_text = "[[target]]\npath = \"~/.config/x\"\ntree = \"files/.config/x\"\n\
+                          direction = \"track\"\n";
+        let home = repo(layer_text);
+        plant(&home, ".config/bx/files/.config/x/a", b"a\n", 0o644);
+        plant(&home, ".config/bx/files/.config/x/sub/b", b"b\n", 0o644);
+        apply_yes(&home);
+        assert_eq!(
+            std::fs::read(home.child(".config/x/sub/b")).expect("written"),
+            b"b\n"
+        );
+        assert_eq!(
+            plan_exit(&home).0,
+            Exit::Converged,
+            "a second plan is empty"
+        );
+
+        let (exit, text) = rm_text(&home, "~/.config/x");
+        assert_eq!(exit, Exit::Converged, "{text}");
+        assert!(
+            text.contains("  - ~/.config/x/a  removed the file bx created")
+                && text.contains("  - ~/.config/x/sub/b  removed the file bx created"),
+            "{text}"
+        );
+        assert!(!home.child(".config/x").exists(), "the home is as it was");
+        assert_eq!(
+            std::fs::read(body(&home, ".config/x/a")).expect("a"),
+            b"a\n",
+            "bx never wrote the repo copies"
+        );
+        assert_eq!(
+            std::fs::read(body(&home, ".config/x/sub/b")).expect("b"),
+            b"b\n"
+        );
+        assert_eq!(layer(&home), "");
+        assert_eq!(ledger(&home).iter().count(), 0);
+        assert!(
+            rm_rel(&home, ".config/x").is_empty(),
+            "a second rm is a no-op"
+        );
+    }
+
+    #[test]
     fn a_repo_change_written_over_a_copy_bx_created_keeps_it_claimed() {
         let home = tracked_onto_a_fresh_machine();
         std::fs::write(body(&home, "lock"), b"newer\n").expect("a pulled change");

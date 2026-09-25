@@ -592,6 +592,11 @@ mod tests {
         );
         let got = String::from_utf8(run(&bash, &["--norc", "--noprofile", "-i"], &script))
             .expect("utf-8");
+        // Readline spells an escape-prefixed sequence `\M-` where
+        // `convert-meta` is on and `\e` where it is off. The inputrc includes
+        // the system's, which decides that setting (Fedora's turns it off,
+        // Ubuntu's leaves it on), and both spellings name the same keys.
+        let got = got.replace("\\M-", "\\e");
         assert!(
             got.contains("beginning-of-line can be invoked via") && got.contains("\"\\e[H\""),
             "{got}"

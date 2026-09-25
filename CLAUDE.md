@@ -34,8 +34,8 @@ wrong even if it passes CI.
    outside a root the configuration declares. `env_guard` enforces this, and
    every generated environment fragment must pass through it: a fragment may set
    only variables bx knows how to judge, and each value is judged for what it is
-   — a location, a list of locations, an anchor, a program, a search list, a
-   socket or a setting. Generated shell content that is **not** an environment
+   — a location, a list of locations, an anchor, a program, a command line, a
+   tool's options, a search list, a socket or a setting. Generated shell content that is **not** an environment
    fragment must carry no environment assignment at all; that replacement rule
    is what keeps the guard's reach total. The shell-init snippet is the one
    file under it: fixed text that sets no environment variable outside bx's own
@@ -50,10 +50,14 @@ wrong even if it passes CI.
    own variables that relocate nothing pass and an output with any refused
    assignment is not written. Declare no root and nothing
    moves: no location, no list of locations and no anchor is permitted at all.
-   A program, a search list and a socket say what a tool runs, where it looks
-   and what it connects to rather than where its files live, so they move
-   nothing and need no root — but no more than any other kind may they point
-   inside a directory bx owns. Containment is decided lexically, never by
+   A program, a command line, a tool's options, a search list and a socket say
+   what a tool runs, how it runs it, where it looks and what it connects to
+   rather than where its files live, so they move nothing and need no root —
+   but no more than any other kind may they point inside a directory bx owns.
+   A command line's or options' absolute and `~` words are judged for that,
+   and none may name a relocating variable; a relative word is admitted,
+   because it resolves against a directory bx does not choose and so cannot
+   be judged lexically. Containment is decided lexically, never by
    touching the filesystem, because invariant 3 forbids a verdict that depends
    on what happens to exist.
 3. **Idempotent.** `apply` twice must produce an empty second `plan`, and

@@ -2874,6 +2874,9 @@ mod tests {
                 let name = program.file_name().expect("a name").to_string_lossy();
                 Ok(format!("{name}_init\n").into_bytes())
             }
+            fn path(&self) -> &std::ffi::OsStr {
+                std::ffi::OsStr::new("")
+            }
         }
 
         fn activations(decls: &[(&str, Phase)]) -> activation::Plan {

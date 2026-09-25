@@ -46,6 +46,11 @@
 //! declaration, so nothing about it changes. The body file in the repo is left
 //! where it is: it may be a file the user wrote, and deleting it is theirs.
 //!
+//! A tracked target (`direction = "track"`) is handed back through its repo
+//! copy, the one file of it bx writes: the copy gets back the bytes it held
+//! before `sync` first carried this machine's copy into it, and the machine's
+//! own file, which bx never claims, is left as it is.
+//!
 //! A `tree = "…"` entry is one declaration of many files, so `rm` hands a tree
 //! back whole or not at all: on the tree's path it releases every file and the
 //! table together, unless one file would be a conflict, which leaves the whole
@@ -306,6 +311,20 @@ impl Context {
             }
         }
         Declared::No
+    }
+
+    /// The repo copy of `target`, by the path the ledger records it under,
+    /// when the configuration declares `target` tracked with a `file` body.
+    fn tracked_copy(&self, target: &Portable) -> Option<Portable> {
+        let Declared::Ready(declared) = self.declared(target) else {
+            return None;
+        };
+        match (&declared.body, declared.direction) {
+            (Body::File(rel), Direction::Track) => {
+                Portable::from_path(&self.repo.join(rel), &self.home).ok()
+            }
+            _ => None,
+        }
     }
 
     /// Every path the configuration declares, whether ready, held back, or
@@ -727,10 +746,12 @@ fn decide_file(
     match ctx.declared(target) {
         Declared::Ready(declared) => {
             let origin = &declared.origin;
-            if declared.attach != Attach::Own
-                || declared.direction != Direction::Apply
-                || declared.format != Format::Opaque
-            {
+            if declared.direction == Direction::Track {
+                return Ok(refused(format!(
+                    "is already declared at {origin} as tracked; bx sync carries it into the repo"
+                )));
+            }
+            if declared.attach != Attach::Own || declared.format != Format::Opaque {
                 return Ok(refused(format!(
                     "is already declared at {origin} as part of a file; bx add adopts whole files"
                 )));
@@ -1193,17 +1214,27 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
                 .map(|(path, _)| path.clone())
                 .filter(|path| beneath(path, target)),
         )
+        // A tracked file a tree declares has no ledger entry of its own, and
+        // no table naming it: its repo copy is what `rm` hands back.
+        .chain(
+            ctx.resolved
+                .targets
+                .iter()
+                .filter_map(|resolution| match resolution {
+                    Resolution::Ready(ready) if ready.direction == Direction::Track => {
+                        Some(ready.path.clone())
+                    }
+                    _ => None,
+                })
+                .filter(|path| beneath(path, target)),
+        )
         .collect();
     let held = hold_trees(ctx, &ledger, target, &mut targets)?;
     if targets.is_empty() && held.is_empty() {
         return Ok(Vec::new());
     }
     let targets: Vec<Portable> = targets.into_iter().collect();
-    let restored = if targets.is_empty() {
-        Vec::new()
-    } else {
-        restore::restore_with(&ctx.state, &ctx.home, &targets, &ctx.git)?
-    };
+    let restored = restore_tracking(ctx, &ledger, &targets)?;
 
     let conflicts: BTreeSet<&Portable> = restored
         .iter()
@@ -1261,6 +1292,84 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
     Ok(removals)
 }
 
+/// Restore `targets` as [`restore::restore_with`] does, one result per
+/// target in order, with each tracked target handed back through its repo
+/// copy, and a row after them for each repo copy restored.
+///
+/// # Decision: `rm` restores a tracked target's repo copy, never its machine copy
+///
+/// bx never claims a tracked target's copy on this machine — the tool writes
+/// it — so there is nothing there for `rm` to put back, and it is left as it
+/// is. What bx did write is the repo copy, each time `sync` carried this
+/// machine's copy into it, and the ledger holds the bytes that copy had before
+/// bx first wrote it; `rm` puts those back, exactly as it restores any file bx
+/// wrote, and refuses to when the copy changed since bx last wrote it — as it
+/// does after another machine's sync brought a newer one. Such a conflict
+/// keeps the tracked target declared, like any conflict.
+///
+/// A tracked target the ledger does hold an entry for was applied before it
+/// was tracked; that entry is restored by its own rules as well.
+fn restore_tracking(
+    ctx: &Context,
+    ledger: &LedgerView,
+    targets: &[Portable],
+) -> Result<Vec<Restored>, Error> {
+    let copies: Vec<Option<Portable>> = targets.iter().map(|t| ctx.tracked_copy(t)).collect();
+    let mut restoring: Vec<Portable> = targets
+        .iter()
+        .zip(&copies)
+        .filter(|(target, copy)| copy.is_none() || ledger.get(target).is_some())
+        .map(|(target, _)| target.clone())
+        .collect();
+    for copy in copies.iter().flatten() {
+        if ledger.get(copy).is_some() && !restoring.contains(copy) {
+            restoring.push(copy.clone());
+        }
+    }
+    if restoring.is_empty() && copies.iter().all(Option::is_none) {
+        return Ok(Vec::new());
+    }
+    let done = if restoring.is_empty() {
+        Vec::new()
+    } else {
+        restore::restore_with(&ctx.state, &ctx.home, &restoring, &ctx.git)?
+    };
+    let result = |path: &Portable| {
+        restoring
+            .iter()
+            .position(|restored| restored == path)
+            .and_then(|at| done.get(at))
+    };
+    let mut out = Vec::with_capacity(targets.len());
+    for (target, copy) in targets.iter().zip(&copies) {
+        let own = result(target).cloned();
+        let Some(copy) = copy else {
+            out.extend(own);
+            continue;
+        };
+        let dest = target.render(&ctx.home);
+        out.push(match (own, result(copy)) {
+            (_, Some(Restored::Conflict { note, .. })) => Restored::Conflict {
+                target: target.clone(),
+                dest,
+                note: format!("its repo copy {copy} {note}"),
+            },
+            (Some(own), _) => own,
+            (None, _) => Restored::Unmanaged {
+                target: target.clone(),
+            },
+        });
+    }
+    // The repo copies restored alongside, each as a row of its own; one that
+    // conflicts is already said by its tracked target's row.
+    for (copy, done) in restoring.iter().zip(&done) {
+        if !targets.contains(copy) && !done.is_conflict() {
+            out.push(done.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Take out of `targets` every file of a tree that `rm` must leave managed,
 /// returning each as a conflict that says why.
 ///
@@ -1300,13 +1409,25 @@ fn hold_trees(
         let mut own: Vec<(Portable, String)> = Vec::new();
         if whole {
             for file in &mine {
-                let Some(entry) = ledger.get(file) else {
-                    continue;
-                };
-                if let restore::Restoration::Conflict { note, .. } =
-                    restore::plan_restore_with(entry, &ctx.home, &ctx.git)?
-                {
-                    own.push((file.clone(), note));
+                // A tracked file is handed back through its repo copy too, so
+                // a copy that would conflict holds the tree as the file would.
+                let copy = ctx.tracked_copy(file);
+                let entries = [Some(file), copy.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|path| Some((path, ledger.get(path)?)));
+                for (path, entry) in entries {
+                    if let restore::Restoration::Conflict { note, .. } =
+                        restore::plan_restore_with(entry, &ctx.home, &ctx.git)?
+                    {
+                        let note = if path == file {
+                            note
+                        } else {
+                            format!("its repo copy {path} {note}")
+                        };
+                        own.push((file.clone(), note));
+                        break;
+                    }
                 }
             }
             if own.is_empty() {
@@ -2302,5 +2423,163 @@ mod tests {
         );
         assert!(!home.child(".config/x/sub/b").exists());
         assert_eq!(layer(&home), TREE);
+    }
+
+    /// `~/.lock`, tracked, with its repo copy at `files/lock`.
+    const TRACKED: &str =
+        "[[target]]\npath = \"~/.lock\"\nfile = \"files/lock\"\ndirection = \"track\"\n";
+
+    /// A sync's apply: carries every tracked target this machine changed.
+    fn sync_apply(home: &GuardedHome) {
+        let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+        crate::plan::run(&inputs, crate::plan::Mode::Sync, &mut |_| Ok(true)).expect("sync");
+    }
+
+    /// A home tracking `~/.lock`, whose repo copy held `before` until this
+    /// machine's `after` was carried into it.
+    fn tracked_and_synced(before: &[u8], after: &[u8]) -> GuardedHome {
+        let home = repo(TRACKED);
+        plant(&home, ".config/bx/files/lock", before, 0o644);
+        plant(&home, ".lock", before, 0o644);
+        sync_apply(&home);
+        plant(&home, ".lock", after, 0o644);
+        sync_apply(&home);
+        assert_eq!(
+            std::fs::read(body(&home, "lock")).expect("the copy"),
+            after,
+            "carried"
+        );
+        home
+    }
+
+    #[test]
+    fn rm_of_a_tracked_target_restores_the_repo_copy_and_leaves_the_machine_copy() {
+        let home = tracked_and_synced(b"before\n", b"after\n");
+
+        let (exit, text) = rm_text(&home, "~/.lock");
+        assert_eq!(exit, Exit::Converged, "{text}");
+        assert_eq!(
+            text,
+            "  - ~/.config/bx/files/lock  put back the file bx replaced\n\
+             \x20 - ~/.lock  left as it is; bx never wrote it; no longer declared in \
+             ~/.config/bx/bx.toml; files/lock stays in the repo\n"
+        );
+        assert_eq!(
+            std::fs::read(body(&home, "lock")).expect("the copy"),
+            b"before\n"
+        );
+        assert_eq!(
+            std::fs::read(home.child(".lock")).expect("kept"),
+            b"after\n"
+        );
+        assert_eq!(layer(&home), "");
+        assert_eq!(ledger(&home).iter().count(), 0);
+        assert!(rm_rel(&home, ".lock").is_empty(), "a second rm is a no-op");
+    }
+
+    #[test]
+    fn rm_of_a_tracked_target_whose_repo_copy_moved_since_is_a_conflict_that_changes_nothing() {
+        let home = tracked_and_synced(b"before\n", b"after\n");
+        // Another machine's sync, pulled into this repo.
+        std::fs::write(body(&home, "lock"), b"theirs\n").expect("theirs");
+
+        let (exit, text) = rm_text(&home, "~/.lock");
+        assert_eq!(exit, Exit::Pending, "{text}");
+        assert!(
+            text.starts_with("  ! ~/.lock  its repo copy ~/.config/bx/files/lock "),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert_eq!(
+            std::fs::read(body(&home, "lock")).expect("the copy"),
+            b"theirs\n"
+        );
+        assert_eq!(
+            std::fs::read(home.child(".lock")).expect("kept"),
+            b"after\n"
+        );
+        assert_eq!(layer(&home), TRACKED, "still declared");
+    }
+
+    #[test]
+    fn rm_of_a_tracked_target_never_synced_only_undeclares_it() {
+        let home = repo(TRACKED);
+        plant(&home, ".config/bx/files/lock", b"repo\n", 0o644);
+        plant(&home, ".lock", b"machine\n", 0o644);
+
+        let removals = rm_rel(&home, ".lock");
+        assert!(
+            matches!(
+                removals.as_slice(),
+                [Removal { restored: Restored::Unmanaged { .. }, undeclared, .. }]
+                    if undeclared.len() == 1
+            ),
+            "{removals:?}"
+        );
+        assert_eq!(std::fs::read(body(&home, "lock")).expect("copy"), b"repo\n");
+        assert_eq!(
+            std::fs::read(home.child(".lock")).expect("kept"),
+            b"machine\n"
+        );
+    }
+
+    #[test]
+    fn rm_of_a_tracked_tree_restores_every_copy_and_holds_on_one_that_conflicts() {
+        let layer_text = "[[target]]\npath = \"~/.config/x\"\ntree = \"files/.config/x\"\n\
+                          direction = \"track\"\n";
+        let home = repo(layer_text);
+        for (rel, bytes) in [("a", b"a\n"), ("b", b"b\n")] {
+            plant(
+                &home,
+                &format!(".config/bx/files/.config/x/{rel}"),
+                bytes,
+                0o644,
+            );
+            plant(&home, &format!(".config/x/{rel}"), bytes, 0o644);
+        }
+        sync_apply(&home);
+        plant(&home, ".config/x/a", b"a2\n", 0o644);
+        plant(&home, ".config/x/b", b"b2\n", 0o644);
+        sync_apply(&home);
+        std::fs::write(body(&home, ".config/x/b"), b"theirs\n").expect("theirs");
+
+        let (exit, text) = rm_text(&home, "~/.config/x");
+        assert_eq!(exit, Exit::Pending, "{text}");
+        assert_eq!(layer(&home), layer_text, "the tree stays whole");
+        assert_eq!(
+            std::fs::read(body(&home, ".config/x/a")).expect("a"),
+            b"a2\n",
+            "nothing restored"
+        );
+
+        std::fs::write(body(&home, ".config/x/b"), b"b2\n").expect("put back");
+        let (exit, text) = rm_text(&home, "~/.config/x");
+        assert_eq!(exit, Exit::Converged, "{text}");
+        assert_eq!(layer(&home), "");
+        assert_eq!(
+            std::fs::read(body(&home, ".config/x/a")).expect("a"),
+            b"a\n"
+        );
+        assert_eq!(
+            std::fs::read(body(&home, ".config/x/b")).expect("b"),
+            b"b\n"
+        );
+        assert_eq!(
+            std::fs::read(home.child(".config/x/a")).expect("a"),
+            b"a2\n"
+        );
+    }
+
+    #[test]
+    fn add_of_a_tracked_target_is_refused_naming_sync() {
+        let home = repo(TRACKED);
+        plant(&home, ".config/bx/files/lock", b"x\n", 0o644);
+        plant(&home, ".lock", b"x\n", 0o644);
+        let rows = add_rel(&home, ".lock");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                if note.ends_with("as tracked; bx sync carries it into the repo")),
+            "{rows:?}"
+        );
     }
 }

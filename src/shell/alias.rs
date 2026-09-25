@@ -113,8 +113,21 @@ impl AliasDecl {
     /// asked while `plan` and `apply` render, never by the generated shell.
     #[must_use]
     pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+        self.render_gated(self.when.as_ref().map(|when| when.gate(present)))
+    }
+
+    /// [`AliasDecl::render`] for bash: the same line, a `has:TOOL` decided
+    /// the same way, and a runtime condition asked in bash's words
+    /// ([`When::test_bash`]).
+    #[must_use]
+    pub fn render_bash(&self, present: &dyn Fn(&str) -> bool) -> String {
+        self.render_gated(self.when.as_ref().map(|when| when.gate_bash(present)))
+    }
+
+    /// The alias's line, gated as `gate` says.
+    fn render_gated(&self, gate: Option<Gate>) -> String {
         let line = self.line();
-        match self.when.as_ref().map(|when| when.gate(present)) {
+        match gate {
             None | Some(Gate::Always) => line,
             Some(Gate::Never) => String::new(),
             Some(Gate::Test(test)) => {
@@ -487,6 +500,24 @@ mod tests {
             "if [[ -n ${SSH_CONNECTION-} ]]; then\n  alias x='y'\nfi\n"
         );
         assert_eq!(alias("x", "y", None).render(&|_| false), "alias x='y'\n");
+    }
+
+    #[test]
+    fn bash_gets_the_same_line_gated_in_its_own_words() {
+        let has = alias("cat", "bat", Some(When::Has("bat".to_string())));
+        assert_eq!(has.render_bash(&|tool| tool == "bat"), "alias cat='bat'\n");
+        assert_eq!(has.render_bash(&|_| false), "");
+        let interactive = alias("x", "y", Some(When::Interactive));
+        assert_eq!(
+            interactive.render_bash(&|_| unreachable!("a runtime test asks for no tool")),
+            "if [[ $- == *i* ]]; then\n  alias x='y'\nfi\n"
+        );
+        let ssh = alias("x", "y", Some(When::Ssh));
+        assert_eq!(ssh.render_bash(&|_| false), ssh.render(&|_| false));
+        assert_eq!(
+            alias("x", "y", None).render_bash(&|_| false),
+            "alias x='y'\n"
+        );
     }
 
     #[test]

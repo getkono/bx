@@ -49,14 +49,18 @@ pub enum Action {
     /// the whole apply exit 1. The blocked entry names the values and the
     /// `bx init` invocation that sets them, so the report is actionable.
     ///
-    /// An **absent tool** is produced from [`crate::detect::Presence::is_usable`].
-    /// It matters most
-    /// where a tool is configured entirely by environment and bx's output is a
-    /// shell fragment naming a binary: writing `RUSTC_WRAPPER=/usr/bin/sccache`
-    /// when sccache is absent does not degrade gracefully, it breaks every
-    /// `cargo build` on the machine. [`env_guard`](crate::env_guard) cannot
-    /// catch that — it checks where a value points, never whether what it
-    /// points at exists, which is a question only the filesystem can answer.
+    /// An **absent tool** is decided by [`crate::detect::Presence::is_usable`],
+    /// and it never blocks a target's own file: a target's `requires` is
+    /// reported by `bx doctor` and gates nothing, so a tool's configuration is
+    /// written before the tool is installed. What an absent tool does hold
+    /// back is a line or a step that would *run* it. A `when = "has:TOOL"`
+    /// line is left out of its shared file, which is still written, so writing
+    /// `RUSTC_WRAPPER=/usr/bin/sccache` where sccache is absent — which breaks
+    /// every `cargo build` on the machine rather than degrading — never
+    /// happens. [`env_guard`](crate::env_guard) cannot catch that: it checks
+    /// where a value points, never whether what it points at exists, which is
+    /// a question only the filesystem can answer. An activation step whose
+    /// tool is absent is this action, since its output is the tool's to print.
     Blocked,
 }
 

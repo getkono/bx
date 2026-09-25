@@ -17,8 +17,10 @@
 //!
 //! The checks, in order:
 //!
-//! 1. [`tools`] — a declared tool that is not an executable on `PATH`, with
-//!    its `install` command quoted, never run.
+//! 1. [`tools`] — a declared tool, or a tool a target `requires`, that is not
+//!    an executable on `PATH`, with its `install` command quoted, never run,
+//!    and the targets that require it named. One finding per tool, whichever
+//!    declarations name it.
 //! 2. [`values`] — a required declared value with no answer.
 //! 3. [`state`] — a state file that is damaged, unreadable, not a regular
 //!    file, or set aside as damaged and still standing.
@@ -65,7 +67,7 @@ pub struct Report {
 
 /// What the checks ask the machine through.
 pub struct Probes<'a> {
-    /// The `PATH` a declared tool is looked for along.
+    /// The `PATH` a declared or required tool is looked for along.
     pub path: &'a OsStr,
     /// The systemd user unit directory.
     pub unit_dir: &'a Path,
@@ -81,7 +83,7 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
     let state = state::check(inputs.state(), home);
     let units = systemd::units(inputs.targets(), home, probes.unit_dir);
 
-    let mut findings = tools::check(&resolved.tools, probes.path, home);
+    let mut findings = tools::check(&resolved.tools, inputs.targets(), probes.path, home);
     findings.extend(values::check(&resolved.values));
     findings.extend(state.damage);
     findings.extend(state.session);
@@ -575,5 +577,49 @@ install = \"sudo dnf install bx-no-such-tool\"
         let (out, _) = doctor_of(&home, layer, OsStr::new(""), &Every::unreachable());
 
         assert_eq!(out, "Doctor: 0 finding(s).\n");
+    }
+
+    #[test]
+    fn a_required_tool_that_is_absent_never_blocks_its_target_and_doctor_names_it() {
+        use crate::plan::Mode;
+        use crate::report::Action;
+
+        let home = guarded_home();
+        let layer = "[[tool]]\nname = \"bx-no-such-tool\"\ninstall = \"make install\"\n\
+                     [[target]]\npath = \"~/.config/absent/config\"\ncontent = \"x\\n\"\n\
+                     requires = [\"bx-no-such-tool\", \"bx-nor-this-one\"]\n";
+        let inputs = inputs(&home, layer);
+        let action = |mode| {
+            let report = crate::plan::run(&inputs, mode, &mut |_| Ok(true)).expect("it runs");
+            report.changes.iter().map(|c| c.action).collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            action(Mode::Plan),
+            [Action::Create],
+            "an absent tool blocks nothing"
+        );
+        assert_eq!(action(Mode::Apply), [Action::Create]);
+        assert_eq!(
+            std::fs::read(home.child(".config/absent/config")).unwrap(),
+            b"x\n",
+            "the target is written while its tools are absent"
+        );
+        assert_eq!(
+            action(Mode::Plan),
+            [Action::Unchanged],
+            "and stays converged"
+        );
+
+        let (out, code) = doctor_of(&home, layer, OsStr::new(""), &Every::unreachable());
+
+        assert_eq!(
+            out,
+            "  ! tool bx-no-such-tool  (~/.config/bx/bx.toml:1) is not on PATH; `make install` \
+             installs it; ~/.config/absent/config requires it\n  ! tool bx-nor-this-one  \
+             (~/.config/bx/bx.toml:4) is not on PATH, and no `[[tool]]` entry declares it; \
+             ~/.config/absent/config requires it\nDoctor: 2 finding(s).\n"
+        );
+        assert_eq!(code, Exit::Pending);
     }
 }

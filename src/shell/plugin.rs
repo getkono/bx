@@ -75,9 +75,14 @@ impl PluginDecl {
     /// The one line that sources the plugin when it is readable.
     #[must_use]
     pub fn line(&self) -> String {
-        let path = &self.source;
-        format!("[[ -r {path} ]] && source {path}\n")
+        guarded(&self.source)
     }
+}
+
+/// The one line that sources `path` when it is readable, and does nothing
+/// when it is not. `path` is one [`unsourceable`] passed.
+pub(crate) fn guarded(path: &str) -> String {
+    format!("[[ -r {path} ]] && source {path}\n")
 }
 
 /// Parse one `[[plugin]]` entry.
@@ -101,7 +106,7 @@ pub fn parse_plugin(table: &Table, file: &Path, text: &str) -> Result<PluginDecl
     }
 
     let source = ctx.required_str(table, "source")?.to_string();
-    if let Some(problem) = unsourceable(&source) {
+    if let Some(problem) = unsourceable("source", &source) {
         return Err(ctx.bad(table, "source", format!("`{name}`: {problem}")));
     }
 
@@ -114,12 +119,13 @@ pub fn parse_plugin(table: &Table, file: &Path, text: &str) -> Result<PluginDecl
     })
 }
 
-/// Why `source` cannot be written bare into the plugin's line, or `None` when
-/// it can.
-fn unsourceable(source: &str) -> Option<String> {
+/// Why `source` cannot be written bare into a guarded line, or `None` when it
+/// can. `key` is the field the path was written under (`source` for a plugin,
+/// `path` for a source), so the message names the key the user wrote.
+pub(crate) fn unsourceable(key: &str, source: &str) -> Option<String> {
     if !(source.starts_with("~/") || source.starts_with('/')) {
         return Some(format!(
-            "`source = {source:?}` must open with `~/` or `/`: a relative path would be \
+            "`{key} = {source:?}` must open with `~/` or `/`: a relative path would be \
              read from whatever directory the shell starts in"
         ));
     }
@@ -130,7 +136,7 @@ fn unsourceable(source: &str) -> Option<String> {
         .find(|c| !(c.is_ascii_alphanumeric() || "_./,:@%+-".contains(*c)))
         .map(|c| {
             format!(
-                "`source = {source:?}` is written unquoted, so after a leading `~` it may hold \
+                "`{key} = {source:?}` is written unquoted, so after a leading `~` it may hold \
                  only ASCII letters, digits and `_./,:@%+-`; found {c:?}"
             )
         })
@@ -259,7 +265,10 @@ mod tests {
                 "name = \"a\\nb\"\nsource = \"~/a.zsh\"\n",
                 "not a plugin name",
             ),
-            ("name = \"a\"\nsource = \"a.zsh\"\n", "must open with"),
+            (
+                "name = \"a\"\nsource = \"a.zsh\"\n",
+                "`source = \"a.zsh\"` must open with",
+            ),
             ("name = \"a\"\nsource = \"~a.zsh\"\n", "must open with"),
             ("name = \"a\"\nsource = \"~/a b.zsh\"\n", "found ' '"),
             ("name = \"a\"\nsource = \"~/a;rm.zsh\"\n", "found ';'"),
@@ -376,7 +385,7 @@ mod tests {
         assert!(!line.contains('='), "{line}");
         for c in "= \t;&|'\"$`[](){}<>\\*?!#~^".chars() {
             assert!(
-                unsourceable(&format!("~/a{c}b")).is_some(),
+                unsourceable("source", &format!("~/a{c}b")).is_some(),
                 "{c:?} would be written bare"
             );
         }

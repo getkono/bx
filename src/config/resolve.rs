@@ -70,6 +70,7 @@ use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
 use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::PluginDecl;
+use crate::shell::source::SourceDecl;
 
 /// A configuration entry that either resolved or could not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +173,9 @@ pub struct Resolved {
 /// with no account answer in it, or a `file` that references a `path` value,
 /// answered or not; for a `[[function]]` body holding a malformed placeholder,
 /// a reference to a value no layer declares, or a committed `default` it
-/// cannot hold; for two enabled plugins that claim the terminal slot; and
+/// cannot hold; for a `[[source]]` path referencing a value no layer declares,
+/// or made unwritable by a committed `default`; for two enabled plugins that
+/// claim the terminal slot; and
 /// for two ready targets that name one file.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
@@ -189,18 +192,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    targets.extend(place_envs(
-        &merged.envs,
-        &merged.path,
-        &merged.plugins,
-        Tables {
-            history: &merged.history,
-            keybindings: &merged.keybindings,
-        },
-        &merged.aliases,
-        &merged.functions,
-        &values,
-    )?);
+    targets.extend(place_envs(merged, &values)?);
 
     refuse_shared_files(&targets)?;
 
@@ -223,16 +215,6 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
         Body::Secret(path) => Some(("secret", path.to_string_lossy())),
         Body::Inline(_) | Body::Generated(_) | Body::Symlink(_) | Body::Dir => None,
     }
-}
-
-/// The interactive file's table-shaped declarations: each merged key by key,
-/// and none holding a placeholder.
-#[derive(Clone, Copy)]
-struct Tables<'a> {
-    /// `[history]`.
-    history: &'a History,
-    /// `[keybindings]`.
-    keybindings: &'a Keybindings,
 }
 
 /// The targets the `[[env]]` placement graph derives, after every declared
@@ -286,26 +268,24 @@ struct Tables<'a> {
 /// ([`Interactive::note`]). A variable that holds the file back holds its
 /// functions back with it.
 ///
+/// The enabled `[[source]]` entries land in that file too, each in the phase
+/// it names, its path substituted from the same values, and an enabled source
+/// places the file on its own as a function does. A source whose path waits
+/// on a value is held back alone and named in the plan row, as a function is.
+///
 /// # Errors
 ///
-/// [`Error::BadValue`] for a variable or a function body whose value is a
-/// repo defect: a malformed placeholder, a reference to a value no layer
-/// declares, or a committed `default` that puts a character no fragment line
-/// or function body can hold into it; and for a second enabled plugin
-/// claiming the terminal slot.
-fn place_envs(
-    envs: &[EnvDecl],
-    path: &[PathEntry],
-    plugins: &[PluginDecl],
-    tables: Tables<'_>,
-    aliases: &[AliasDecl],
-    functions: &[FunctionDecl],
-    values: &ResolvedValues,
-) -> Result<Vec<Resolution<Target>>, Error> {
-    let Tables {
-        history,
-        keybindings,
-    } = tables;
+/// [`Error::BadValue`] for a variable, a function body or a source path whose
+/// value is a repo defect: a malformed placeholder, a reference to a value no
+/// layer declares, or a committed `default` that puts a character no fragment
+/// line, function body or source path can hold into it; and for a second
+/// enabled plugin claiming the terminal slot.
+fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
+    let (envs, path, plugins, history): (&[EnvDecl], &[PathEntry], &[PluginDecl], &History) =
+        (&merged.envs, &merged.path, &merged.plugins, &merged.history);
+    let (aliases, functions, sources): (&[AliasDecl], &[FunctionDecl], &[SourceDecl]) =
+        (&merged.aliases, &merged.functions, &merged.sources);
+    let keybindings: &Keybindings = &merged.keybindings;
     // The history's origin, when it says anything zsh reads, or else the
     // keybindings', when any key is bound: what places the interactive file
     // when nothing else does.
@@ -324,6 +304,7 @@ fn place_envs(
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
         .collect::<Result<Vec<_>, Error>>()?;
     let bodies = crate::shell::function::resolve(functions, values)?;
+    let sourced = crate::shell::source::resolve(sources, values)?;
 
     let mut placed = Vec::new();
     for place in Place::ALL {
@@ -332,15 +313,16 @@ fn place_envs(
             .filter(|(decl, _)| decl.kind.places().contains(&place))
             .collect();
         let entries = if place == Place::Zshenv { path } else { &[] };
-        let (interactive, declared, defined) = if place == Place::Zshrc {
-            (plugins, aliases, functions)
+        let (interactive, declared, defined, optional) = if place == Place::Zshrc {
+            (plugins, aliases, functions, sources)
         } else {
-            (&[][..], &[][..], &[][..])
+            (&[][..], &[][..], &[][..], &[][..])
         };
         let plugin = interactive.iter().find(|p| p.enabled);
         let alias = declared.iter().find(|a| a.enabled);
         let function = defined.iter().find(|f| f.enabled);
         let table_here = table_origin.filter(|_| place == Place::Zshrc);
+        let source = optional.iter().find(|s| s.enabled);
         let origin = match (
             here.first(),
             entries.first(),
@@ -348,14 +330,16 @@ fn place_envs(
             alias,
             function,
             table_here,
+            source,
         ) {
             (Some((first, _)), ..) => first.origin.clone(),
             (None, Some(entry), ..) => entry.origin.clone(),
             (None, None, Some(plugin), ..) => plugin.origin.clone(),
             (None, None, None, Some(alias), ..) => alias.origin.clone(),
-            (None, None, None, None, Some(function), _) => function.origin.clone(),
-            (None, None, None, None, None, Some(table)) => table.clone(),
-            (None, None, None, None, None, None) => continue,
+            (None, None, None, None, Some(function), ..) => function.origin.clone(),
+            (None, None, None, None, None, Some(table), _) => table.clone(),
+            (None, None, None, None, None, None, Some(source)) => source.origin.clone(),
+            (None, None, None, None, None, None, None) => continue,
         };
         let portable = |raw: &str| {
             Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
@@ -385,7 +369,8 @@ fn place_envs(
                         .with_history(history.clone())
                         .with_keybindings(keybindings.clone())
                         .with_aliases(declared)
-                        .with_functions(bodies.clone()),
+                        .with_functions(bodies.clone())
+                        .with_sources(sourced.clone()),
                 )),
                 other => other,
             };

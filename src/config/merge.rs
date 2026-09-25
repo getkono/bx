@@ -156,6 +156,7 @@ use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
 use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::{self, PluginDecl};
+use crate::shell::source::SourceDecl;
 
 /// A list entry that merges by a natural key.
 ///
@@ -270,6 +271,21 @@ impl Keyed for PluginDecl {
     }
 }
 
+impl Keyed for SourceDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 impl Keyed for PathEntry {
     /// The directory as zsh is given it, so two spellings of one directory
     /// are one entry.
@@ -312,6 +328,8 @@ pub enum Section {
     Function,
     /// `[[plugin]]`, keyed by `name`.
     Plugin,
+    /// `[[source]]`, keyed by `name`.
+    Source,
 }
 
 impl Section {
@@ -325,6 +343,7 @@ impl Section {
             Self::Alias => "alias",
             Self::Function => "function",
             Self::Plugin => "plugin",
+            Self::Source => "source",
         }
     }
 
@@ -338,6 +357,7 @@ impl Section {
             Self::Alias => crate::shell::alias::SECTION,
             Self::Function => crate::shell::function::SECTION,
             Self::Plugin => plugin::SECTION,
+            Self::Source => crate::shell::source::SECTION,
         }
     }
 
@@ -346,7 +366,12 @@ impl Section {
     pub fn natural_key(self) -> &'static str {
         match self {
             Self::Target => "path",
-            Self::Value | Self::Env | Self::Alias | Self::Function | Self::Plugin => "name",
+            Self::Value
+            | Self::Env
+            | Self::Alias
+            | Self::Function
+            | Self::Plugin
+            | Self::Source => "name",
         }
     }
 
@@ -363,6 +388,7 @@ impl Section {
             Self::Alias => "a `command`",
             Self::Function => "a `body`",
             Self::Plugin => "a `source`",
+            Self::Source => "a `path`",
         }
     }
 }
@@ -743,7 +769,8 @@ impl Merged<Target, TargetKey> {
                 | Section::Env
                 | Section::Alias
                 | Section::Function
-                | Section::Plugin => {}
+                | Section::Plugin
+                | Section::Source => {}
             }
         }
 
@@ -1152,6 +1179,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut aliases: Merged<AliasDecl> = Merged::default();
     let mut functions: Merged<FunctionDecl> = Merged::default();
     let mut plugins: Merged<PluginDecl> = Merged::default();
+    let mut sources: Merged<SourceDecl> = Merged::default();
     let mut secrets = Secrets::default();
     let mut history = History::default();
     let mut shell_options = ShellOptions::default();
@@ -1168,7 +1196,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // alias, keyed by its name, whichever of its two tables it is written in;
     // and so does a function, keyed by its name, whose body's placeholders are
     // substituted only once the values are final; and so does a plugin, keyed
-    // by its name, which holds no placeholder.
+    // by its name, which holds no placeholder; and so does a declared optional
+    // source, keyed by its name, whose path is substituted only once the
+    // values are final.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1184,6 +1214,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         aliases.absorb(layer.config.aliases.iter().cloned());
         functions.absorb(layer.config.functions.iter().cloned());
         plugins.absorb(layer.config.plugins.iter().cloned());
+        sources.absorb(layer.config.sources.iter().cloned());
 
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
@@ -1194,6 +1225,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Alias => aliases.toggle(toggle)?,
                 Section::Function => functions.toggle(toggle)?,
                 Section::Plugin => plugins.toggle(toggle)?,
+                Section::Source => sources.toggle(toggle)?,
                 Section::Target => {}
             }
         }
@@ -1246,6 +1278,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         functions: functions.into_enabled(),
         // Nor to a plugin.
         plugins,
+        // Nor to a declared optional source.
+        sources: sources.into_enabled(),
         secrets,
         history,
         shell_options,
@@ -1569,6 +1603,53 @@ mod tests {
     }
 
     #[test]
+    fn sources_merge_by_name_and_a_toggle_flips_one() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[[source]]\nname = \"a\"\npath = \"~/a\"\n\
+                 [[source]]\nname = \"b\"\npath = \"~/b\"\n\
+                 [[source]]\nname = \"c\"\npath = \"~/c\"\nenabled = false\n",
+            ),
+            global(
+                "modules/m.toml",
+                "[[source]]\nname = \"a\"\npath = \"/opt/a\"\nphase = \"options\"\n",
+            ),
+            local(
+                "[[source]]\nname = \"b\"\nenabled = false\n\
+                 [[source]]\nname = \"c\"\nenabled = true\n",
+            ),
+        ])
+        .unwrap();
+        let sources: Vec<(&str, &str, &str, &Path)> = merged
+            .sources
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    s.path.as_str(),
+                    s.phase.name(),
+                    s.origin.file.as_path(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                ("a", "/opt/a", "options", Path::new("modules/m.toml")),
+                ("c", "~/c", "plugins", Path::new("bx.toml")),
+            ]
+        );
+
+        let message = failure(&[
+            global("bx.toml", "[[source]]\nname = \"a\"\npath = \"~/a\"\n"),
+            local("[[source]]\nname = \"z\"\nenabled = true\n"),
+        ]);
+        assert!(message.contains("`z`"), "{message}");
+        assert!(message.contains("a `path`"), "{message}");
+    }
+
+    #[test]
     fn a_second_terminal_claimant_fails_the_merge_unless_a_layer_switches_one_off() {
         let claimants = "[[plugin]]\nname = \"zsh-syntax-highlighting\"\n\
                          source = \"~/zsh/zsh-syntax-highlighting.zsh\"\nterminal = true\n";
@@ -1807,6 +1888,7 @@ mod tests {
             (Section::Alias, "alias", "[[alias]]", "name"),
             (Section::Function, "function", "[[function]]", "name"),
             (Section::Plugin, "plugin", "[[plugin]]", "name"),
+            (Section::Source, "source", "[[source]]", "name"),
         ] {
             assert_eq!(section.key(), key);
             assert_eq!(section.header(), header);

@@ -44,6 +44,7 @@ use crate::shell::alias::AliasDecl;
 use crate::shell::function::Function;
 use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::PluginDecl;
+use crate::shell::source::Source;
 use crate::shell::{Assembly, Phase};
 
 use toml_edit::Table;
@@ -195,7 +196,8 @@ pub fn link_text(text: &str, home: &Path) -> PathBuf {
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
 /// ([`super::env`]), which also carries the `[[plugin]]` entries, the
-/// declared aliases and the declared functions into the interactive file, and
+/// declared aliases, the declared functions and the declared optional sources
+/// into the interactive file, and
 /// none is named by a config author: a fragment carries the variables
 /// resolution placed in it, which no `generated = "…"` string could spell. A
 /// generator a config author may name adds its variant here and its arm in
@@ -212,7 +214,7 @@ pub enum Gen {
     /// The interactive shell file, assembled phase by phase. Only its `env`
     /// phase is an environment fragment, and only that phase is judged as
     /// one; see [`Interactive`]. Boxed, because it carries every interactive
-    /// declaration and would otherwise size every other generator to match.
+    /// declaration and would otherwise size every target's body to it.
     Interactive(Box<Interactive>),
 }
 
@@ -254,12 +256,14 @@ impl Gen {
 /// declared `[history]` lands in the `options` phase in zsh's names, as
 /// [`History::render_zsh`] renders it; every enabled alias lands in the
 /// `aliases` phase, as the line [`crate::shell::alias::AliasDecl::render`]
-/// renders for it; and every enabled `[[function]]` whose body resolved lands
-/// in the `functions` phase, as [`Function::render`] renders it; and the
-/// declared `[keybindings]` land in the `keybindings` phase, as
-/// [`Keybindings::render_zsh`] renders them. No phase but
-/// `env` holds an environment assignment (Invariant 2): the `options` phase
-/// assigns only zsh's own unexported history parameters, which
+/// renders for it; every enabled `[[function]]` whose body resolved lands in
+/// the `functions` phase, as [`Function::render`] renders it; the declared
+/// `[keybindings]` land in the `keybindings` phase, as
+/// [`Keybindings::render_zsh`] renders them; and every enabled `[[source]]`
+/// whose path resolved lands in the phase it names, after that phase's own
+/// declarations, as the one guarded line [`Source::render`] renders. No phase
+/// but `env` holds an environment assignment (Invariant 2): the `options`
+/// phase assigns only zsh's own unexported history parameters, which
 /// [`super::history`]'s tests hold it to, and the `functions` phase assigns
 /// only zsh's hook arrays, which no process inherits.
 ///
@@ -282,11 +286,14 @@ pub struct Interactive {
     functions: Vec<Resolution<Function>>,
     /// The declared keybindings, rendered into the `keybindings` phase.
     keybindings: Keybindings,
+    /// The enabled declared optional sources, each resolved or held back in
+    /// its own position, in the merged configuration's order.
+    sources: Vec<Resolution<Source>>,
 }
 
 impl Interactive {
-    /// The file holding `env`, and no plugin, history, alias, function or
-    /// keybinding.
+    /// The file holding `env`, and no plugin, history, alias, function,
+    /// keybinding or source.
     #[must_use]
     pub fn new(env: super::env::Fragment) -> Self {
         Self {
@@ -296,6 +303,7 @@ impl Interactive {
             aliases: Vec::new(),
             functions: Vec::new(),
             keybindings: Keybindings::default(),
+            sources: Vec::new(),
         }
     }
 
@@ -319,6 +327,22 @@ impl Interactive {
         &self.history
     }
 
+    /// The file with `sources` added: the enabled declared optional sources
+    /// as [`crate::shell::source::resolve`] resolved them, each ready one
+    /// written and each held-back one named by [`Interactive::note`].
+    #[must_use]
+    pub fn with_sources(mut self, sources: Vec<Resolution<Source>>) -> Self {
+        self.sources = sources;
+        self
+    }
+
+    /// The enabled declared optional sources, each resolved or held back:
+    /// what [`crate::shell::source::missing`] is asked about.
+    #[must_use]
+    pub fn sources(&self) -> &[Resolution<Source>] {
+        &self.sources
+    }
+
     /// The file with `functions` added: the enabled functions as
     /// [`crate::shell::function::resolve`] resolved them, each ready one
     /// written and each held-back one named by [`Interactive::note`].
@@ -335,21 +359,30 @@ impl Interactive {
     }
 
     /// The note the file's plan row carries: every function held back from
-    /// it, named with what would release it, or `None` when none is.
+    /// it, then every source, each named with what would release it, or
+    /// `None` when none is.
     ///
     /// Decided by the values alone, never by `present`, so the note is the
     /// same whichever tools this machine has.
     #[must_use]
     pub fn note(&self) -> Option<String> {
-        let held: Vec<&BlockedEntry> = self
-            .functions
-            .iter()
-            .filter_map(|function| match function {
-                Resolution::Blocked(entry) => Some(entry),
-                Resolution::Ready(_) => None,
-            })
-            .collect();
-        crate::shell::function::note(&held)
+        fn held<T>(resolutions: &[Resolution<T>]) -> Vec<&BlockedEntry> {
+            resolutions
+                .iter()
+                .filter_map(|resolution| match resolution {
+                    Resolution::Blocked(entry) => Some(entry),
+                    Resolution::Ready(_) => None,
+                })
+                .collect()
+        }
+        let notes: Vec<String> = [
+            crate::shell::function::note(&held(&self.functions)),
+            crate::shell::source::note(&held(&self.sources)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 
     /// The file with `aliases` added, the disabled ones dropped.
@@ -401,14 +434,15 @@ impl Interactive {
     /// missing tool has no `aliases` phase, and a file whose every function is
     /// held back has no `functions` phase, and a file binding no key has no
     /// `keybindings` phase. The bytes are a function of the variables, the
-    /// plugins, the history, the aliases, the functions, the keybindings and
-    /// `present`'s answers alone.
+    /// plugins, the history, the aliases, the functions, the keybindings, the
+    /// sources and `present`'s answers alone: never of whether a plugin's or a
+    /// source's file exists.
     ///
-    /// A file holding a plugin closes with [`SETTLE`]. A plugin line whose
-    /// file is absent returns 1, and a file sourced at startup returns the
-    /// status of its last command, so a file ending on one would stop a shell
-    /// running under `ERR_EXIT` before its prompt — and show every other shell
-    /// a failed status at its first prompt.
+    /// A file holding a plugin or a source line closes with [`SETTLE`]. A
+    /// guarded line whose file is absent returns 1, and a file sourced at
+    /// startup returns the status of its last command, so a file ending on one
+    /// would stop a shell running under `ERR_EXIT` before its prompt — and
+    /// show every other shell a failed status at its first prompt.
     #[must_use]
     pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
         let mut assembly = Assembly::new();
@@ -432,16 +466,21 @@ impl Interactive {
         // The held-back functions are the note's to name, not the bytes'.
         crate::shell::function::contribute(&mut assembly, &self.functions, present);
         crate::shell::keybindings::contribute(&mut assembly, &self.keybindings);
+        // Last, so each source follows its phase's own declarations; the
+        // held-back ones are the note's to name.
+        let sourced = crate::shell::source::contribute(&mut assembly, &self.sources, present);
         let mut out = assembly.render();
-        if !self.plugins.is_empty() {
+        if !self.plugins.is_empty() || sourced {
             out.push_str(SETTLE);
         }
         out
     }
 }
 
-/// The lines that close an interactive file holding a plugin: a comment, and a
-/// command that sets nothing and returns 0.
+/// The lines that close an interactive file holding a plugin or a source line:
+/// a comment, and a command that sets nothing and returns 0. The comment's
+/// words predate declared sources and are kept, so a file written before them
+/// is not rewritten for a comment.
 const SETTLE: &str = "\n# bx: done, whichever plugins were found\ntrue\n";
 
 /// Resolve the name a config author wrote as `generated = "…"`.
@@ -2333,7 +2372,7 @@ mod tests {
             })
         }
 
-        fn held(name: &str, hint: &str) -> Resolution<Function> {
+        fn held<T>(name: &str, hint: &str) -> Resolution<T> {
             Resolution::Blocked(BlockedEntry {
                 key: name.to_string(),
                 origin: super::super::super::Origin {
@@ -2399,6 +2438,81 @@ mod tests {
             assert_eq!(Gen::Env(fragment(Vec::new())).note(), None);
             let source = Portable::parse_in("~/.x", Path::new("/home/u")).expect("portable");
             assert_eq!(Gen::Source(source).note(), None);
+        }
+
+        fn sourced(name: &str, path: &str, phase: Phase, when: Option<&str>) -> Resolution<Source> {
+            Resolution::Ready(Source {
+                name: name.to_string(),
+                path: path.to_string(),
+                phase,
+                when: when.map(|w| crate::config::when::When::parse(w).expect("a condition")),
+                origin: super::super::super::Origin {
+                    file: PathBuf::from("/repo/bx.toml"),
+                    line: 1,
+                },
+            })
+        }
+
+        #[test]
+        fn sources_follow_their_phases_own_declarations_and_the_file_settles_to_zero() {
+            let file = Interactive::new(fragment(Vec::new()))
+                .with_plugins(&[plugin("p", "~/p.zsh", false, 1)])
+                .expect("no claimant")
+                .with_aliases(&[alias("ll", "ls -la", None)])
+                .with_sources(vec![
+                    sourced("aliases", "~/.aliases", Phase::Aliases, None),
+                    sourced("fzf", "~/.fzf.zsh", Phase::Plugins, None),
+                    held("keychain", "run `bx init` to set host"),
+                ]);
+            assert_eq!(file.sources().len(), 3);
+            let rendered = render(&file);
+            assert_eq!(
+                rendered,
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: plugins\n\
+                 [[ -r ~/p.zsh ]] && source ~/p.zsh\n\
+                 [[ -r ~/.fzf.zsh ]] && source ~/.fzf.zsh\n\
+                 \n# bx phase: aliases\n\
+                 alias ll='ls -la'\n\
+                 [[ -r ~/.aliases ]] && source ~/.aliases\n\
+                 \n# bx: done, whichever plugins were found\ntrue\n"
+            );
+            assert_eq!(render(&file), rendered, "byte-identical");
+            assert_eq!(
+                file.note().as_deref(),
+                Some("source `keychain` held back: run `bx init` to set host")
+            );
+
+            // A source alone closes the file too, since its line returns 1
+            // when the file is absent; a source gated off writes nothing and
+            // needs no closing line.
+            let alone = render(
+                &Interactive::new(fragment(Vec::new())).with_sources(vec![sourced(
+                    "fzf",
+                    "~/.fzf.zsh",
+                    Phase::Options,
+                    None,
+                )]),
+            );
+            assert!(
+                alone.ends_with("~/.fzf.zsh\n\n# bx: done, whichever plugins were found\ntrue\n")
+            );
+            let gated = Interactive::new(fragment(Vec::new()))
+                .with_sources(vec![sourced("b", "~/b", Phase::Plugins, Some("has:bat"))])
+                .render(&|_| false);
+            assert_eq!(
+                gated,
+                "# Generated by bx. Edit the config repo, not this file.\n"
+            );
+
+            // Functions and sources held back together: functions first.
+            let both = Interactive::new(fragment(Vec::new()))
+                .with_functions(vec![held("f", "answer a")])
+                .with_sources(vec![held("s", "answer b")]);
+            assert_eq!(
+                both.note().as_deref(),
+                Some("function `f` held back: answer a; source `s` held back: answer b")
+            );
         }
 
         #[test]

@@ -136,7 +136,11 @@ impl Machine {
         home.write(".zshrc", ZSHRC);
         home.write(".bashrc", BASHRC);
         // The plugin manager already wrote its lock file, as the repo has it:
-        // a tracked file bx watches and never claims.
+        // a tracked file bx watches and never claims. Workaround for #116:
+        // `rm` leaves behind a tracked file that `apply` wrote, so without
+        // this seed the rm test would fail on that defect. Drop the seed
+        // (this block) once #116 lands, so `apply` writes the tracked file
+        // and `rm` is held to removing it.
         std::fs::create_dir_all(home.child(".config/nvim")).expect("~/.config/nvim");
         std::fs::copy(
             example().join("home/.config/nvim/lazy-lock.json"),
@@ -354,7 +358,7 @@ impl Snapshot {
     }
 
     /// The snapshot without bx's `.bx-` temporary files, and the paths of
-    /// those it left out.
+    /// those it left out. A workaround for #117; see its two call sites.
     fn without_orphans(self) -> (Self, Vec<PathBuf>) {
         let (orphans, kept): (BTreeMap<_, _>, BTreeMap<_, _>) =
             self.0.into_iter().partition(|(path, _)| {
@@ -668,6 +672,10 @@ fn an_interrupted_apply_is_detected_and_rolled_back() {
     // intent naming it was journalled is a `.bx-` file the journal never
     // recorded, and recovery unlinks only what the journal names. Such an
     // orphan is `bx doctor`'s to report, which it does not yet (#117).
+    // Workaround for #117, one of two sites (the other follows the `rm`
+    // below; both call `without_orphans`). Once #117 lands, replace this
+    // tolerance with an assertion that `bx doctor` reports each orphan as a
+    // finding, and assert the same at the second site.
     let (rolled_back, orphans) = machine.the_accounts().without_orphans();
     assert!(
         orphans.len() <= 1,
@@ -684,7 +692,10 @@ fn an_interrupted_apply_is_detected_and_rolled_back() {
     machine.bx(&["plan"]).converged();
 
     // And what it converged to is recorded exactly: rm still restores the
-    // home as it was before the interrupted run.
+    // home as it was before the interrupted run. Workaround for #117, second
+    // site: the orphan the rollback left is still there, so it is filtered
+    // out. Once #117 lands, replace the filter with the same doctor-finding
+    // assertion as the first site.
     machine.rm_everything();
     assert_same(
         &before,

@@ -868,6 +868,24 @@ mod tests {
         run(&load(home, layer), Mode::Apply, &mut |_| Ok(true)).expect("apply runs")
     }
 
+    /// Apply `layer`, running `change` once the decision is made and before
+    /// any of its work is done, as a user acting between the two would.
+    fn apply_after(home: &GuardedHome, layer: &str, mut change: impl FnMut()) -> Report {
+        run(&load(home, layer), Mode::Apply, &mut |_| {
+            change();
+            Ok(true)
+        })
+        .expect("apply runs")
+    }
+
+    /// The one row `applied` stopped short of, and its note.
+    fn stopped_note(applied: &Report) -> String {
+        assert_eq!(applied.stopped, [0], "{applied:?}");
+        let row = only(applied);
+        assert_eq!(row.action, Action::Blocked);
+        row.note.clone().expect("a note")
+    }
+
     /// The commit checked out at [`AT`].
     fn checked_out(home: &GuardedHome) -> String {
         git_run(home.path(), &home.child(AT), &["rev-parse", "HEAD"])
@@ -1338,6 +1356,115 @@ mod tests {
         assert_eq!(
             plan(&home, &layer(&up.second)).actions(),
             [Action::Unchanged]
+        );
+    }
+
+    #[test]
+    fn a_path_that_appears_after_plan_is_not_cloned_into() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        let applied = apply_after(&home, &layer(&up.first), || {
+            std::fs::create_dir_all(home.child(AT)).expect("the user's directory");
+            std::fs::write(home.child(AT).join("mine"), "mine\n").expect("the user's file");
+        });
+        let note = stopped_note(&applied);
+        assert!(
+            note.contains("is a directory now, which is not what bx planned against"),
+            "{note}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.child(AT).join("mine")).expect("the user's file"),
+            "mine\n"
+        );
+        assert!(!home.child(AT).join(".git").exists(), "nothing cloned");
+        assert!(entry(&home).is_none(), "nothing recorded");
+    }
+
+    #[test]
+    fn a_checkout_that_changed_after_plan_is_not_fast_forwarded() {
+        // Edited between plan and apply.
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let at = home.child(AT);
+        let applied = apply_after(&home, &layer(&up.second), || {
+            std::fs::write(at.join("a.zsh"), "edited\n").expect("an edit");
+        });
+        let note = stopped_note(&applied);
+        assert!(
+            note.contains("has uncommitted changes since bx planned"),
+            "{note}"
+        );
+        assert_eq!(checked_out(&home), up.first);
+        assert_eq!(
+            std::fs::read_to_string(at.join("a.zsh")).expect("the edit"),
+            "edited\n"
+        );
+        assert_eq!(
+            entry(&home).expect("recorded").written,
+            clone_written(Some(&up.first))
+        );
+
+        // Moved to another commit between plan and apply.
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let at = home.child(AT);
+        let applied = apply_after(&home, &layer(&up.second), || {
+            git_run(home.path(), &at, &["fetch", "--quiet", "origin"]);
+            git_run(
+                home.path(),
+                &at,
+                &["checkout", "--quiet", "--detach", &up.side],
+            );
+        });
+        let note = stopped_note(&applied);
+        assert!(
+            note.contains(&format!(
+                "moved to {} since bx planned against {}",
+                up.side, up.first
+            )),
+            "{note}"
+        );
+        assert_eq!(checked_out(&home), up.side, "left where the user put it");
+        assert_eq!(
+            entry(&home).expect("recorded").written,
+            clone_written(Some(&up.first))
+        );
+    }
+
+    #[test]
+    fn a_checkout_that_moved_after_plan_is_not_recorded_at_rev() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let at = home.child(AT);
+        // The stale ledger `Work::Record` exists for: at `second`, recorded
+        // at `first`.
+        git_run(home.path(), &at, &["fetch", "--quiet", "origin"]);
+        git_run(
+            home.path(),
+            &at,
+            &["checkout", "--quiet", "--detach", &up.second],
+        );
+
+        let applied = apply_after(&home, &layer(&up.second), || {
+            git_run(
+                home.path(),
+                &at,
+                &["checkout", "--quiet", "--detach", &up.first],
+            );
+        });
+        let note = stopped_note(&applied);
+        assert!(
+            note.contains(&format!("moved to {} since bx planned", up.first)),
+            "{note}"
+        );
+        assert_eq!(checked_out(&home), up.first);
+        assert_eq!(
+            entry(&home).expect("recorded").written,
+            clone_written(Some(&up.first)),
+            "the ledger still says what is there"
         );
     }
 

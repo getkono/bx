@@ -1293,6 +1293,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
 
     Ok(Config {
         targets: targets.into_enabled(),
+        // A tree is expanded as its layer is loaded, into the targets above;
+        // what the merge folds has none left.
+        trees: Vec::new(),
         // Nothing refers to an external by its path, so a disabled one is
         // simply not checked out, as a disabled target is not written.
         externals: externals.into_enabled(),

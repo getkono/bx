@@ -11,6 +11,8 @@
 //! secret     = "secrets/npmrc.age"              # body, age ciphertext    )
 //! symlink    = "~/src/tool/bin/tool"            # the target is a symlink   )
 //! dir        = true                             # the target is a directory )
+//! tree       = "files/nvim"                     # a repo directory, file by file )
+//! exclude    = ["*.md"]                         # only beside `tree`; see below
 //! mode       = "0600"                           # optional octal *string*;
 //!                                               #   required, and private, for a secret;
 //!                                               #   refused for a symlink
@@ -36,6 +38,18 @@
 //! what `toml_edit` edits surgically without reflowing a nested table — and what
 //! a human types. A companion key without its discriminant is an error, so the
 //! flat form cannot silently ignore a key.
+//!
+//! # A tree
+//!
+//! `tree = "files/nvim"` beside `path = "~/.config/nvim"` is not a target of
+//! its own: when its layer is loaded from a config repo it becomes one target
+//! per file beneath the directory — a `file` body for a regular file, a
+//! `symlink` body holding the link's text for a symlink — at `path` joined
+//! with the file's path relative to the tree. See [`super::tree`], which walks
+//! it. Its `mode`, `direction`, `requires` and `enabled` are every expanded
+//! file's; with no `mode`, each regular file is `0755` when its repo file is
+//! executable by its owner and `0644` otherwise. `exclude` lists patterns
+//! for files and directories the tree leaves out; see [`super::tree::Glob`].
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -58,7 +72,7 @@ use crate::paths::Portable;
 pub(crate) const SECTION: &str = "[[target]]";
 
 /// Every key a `[[target]]` entry may carry.
-const KEYS: [&str; 17] = [
+const KEYS: [&str; 19] = [
     "path",
     "file",
     "content",
@@ -66,6 +80,8 @@ const KEYS: [&str; 17] = [
     "secret",
     "symlink",
     "dir",
+    "tree",
+    "exclude",
     "mode",
     "attach",
     "comment",
@@ -79,7 +95,15 @@ const KEYS: [&str; 17] = [
 ];
 
 /// The keys that declare a body. Exactly one, except for an `include` target.
-const BODY_KEYS: [&str; 6] = ["file", "content", "generated", "secret", "symlink", "dir"];
+const BODY_KEYS: [&str; 7] = [
+    "file",
+    "content",
+    "generated",
+    "secret",
+    "symlink",
+    "dir",
+    "tree",
+];
 
 /// One path in the user's environment that bx has something to say about.
 ///
@@ -139,6 +163,56 @@ pub enum Body {
     Symlink(String),
     /// The target is a directory: it has a mode and no content.
     Dir,
+}
+
+/// A `[[target]]` whose body is `tree = "…"`, before it is expanded.
+///
+/// Not a [`Target`]: a tree names a repo directory, and what it declares is
+/// the files beneath that directory, which only a read of the config repo can
+/// list. The parser stays a pure function of the layer's text, so it records
+/// the tree as written and [`super::tree::expand`] turns it into targets when
+/// the layer is loaded from a repo. Nothing after loading ever sees one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tree {
+    /// Where the directory lands, home-relative. Each file's target is this
+    /// joined with the file's path relative to [`Tree::root`].
+    pub path: Portable,
+    /// The directory in the config repo, repo-relative and normalised.
+    pub root: PathBuf,
+    /// Files and directories left out, by their path relative to the root.
+    pub exclude: Vec<super::tree::Glob>,
+    /// Every regular file's mode. `None` gives each file the executable bit of
+    /// its repo file: `0755` or `0644`.
+    pub mode: Option<Mode>,
+    /// Every expanded file's direction.
+    pub direction: Direction,
+    /// Every expanded file's requirements.
+    pub requires: Vec<String>,
+    /// Every expanded file's `enabled`, which a later layer can toggle one
+    /// file at a time.
+    pub enabled: bool,
+    /// Where the entry was written, and so where each expanded file was.
+    pub origin: Origin,
+    /// How many of its layer's targets were written before it, so its files
+    /// take its place in document order.
+    pub at: usize,
+}
+
+/// One parsed `[[target]]` table: a target, or a tree that expands into some.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entry {
+    /// An ordinary target.
+    Target(Target),
+    /// A `tree = "…"` entry, not yet expanded.
+    Tree(Tree),
+}
+
+/// What a table's body key declares.
+enum Declared {
+    /// A target's body.
+    Body(Body),
+    /// A tree, by its repo-relative root.
+    Tree(PathBuf),
 }
 
 /// Why the text of a `symlink` body cannot be a link's, if it cannot.
@@ -618,7 +692,26 @@ pub enum KeyPathError {
 /// # Errors
 ///
 /// Any [`Error`] the entry's own keys can produce. Every one carries an origin.
+/// A `tree` body is refused, since only a layer loaded from a repo can expand
+/// one; [`parse_entry`] takes both.
 pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Result<Target, Error> {
+    match parse_entry(table, file, text, home)? {
+        Entry::Target(target) => Ok(target),
+        Entry::Tree(_) => Err(Ctx::new(table, file, text, SECTION).bad(
+            table,
+            "tree",
+            "a `tree` expands into one target per file in the config repo, so it is \
+             read only as part of a layer loaded from one",
+        )),
+    }
+}
+
+/// Parse one `[[target]]` entry, which may be a tree.
+///
+/// # Errors
+///
+/// As [`parse_target`], less the refusal of a tree.
+pub fn parse_entry(table: &Table, file: &Path, text: &str, home: &Path) -> Result<Entry, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);
     ctx.reject_unknown_keys(table, &KEYS)?;
 
@@ -627,7 +720,19 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
         Portable::parse_in(raw_path, home).map_err(|e| ctx.bad(table, "path", e.to_string()))?;
 
     let attach = parse_attach(&ctx, table)?;
-    let body = parse_body(&ctx, table, &attach)?;
+    let body = match parse_body(&ctx, table, &attach)? {
+        Declared::Body(body) => body,
+        Declared::Tree(root) => {
+            return parse_tree(&ctx, table, path, root, &attach).map(Entry::Tree);
+        }
+    };
+    if table.contains_key("exclude") {
+        return Err(ctx.bad(
+            table,
+            "exclude",
+            "`exclude` names files a `tree` leaves out, so it only means something beside `tree`",
+        ));
+    }
     let mode = parse_mode(&ctx, table)?;
     let direction = parse_direction(&ctx, table)?;
     let format = parse_format(&ctx, table)?;
@@ -710,7 +815,7 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ctx.bad(table, "references", e.to_string()))?;
 
-    Ok(Target {
+    Ok(Entry::Target(Target {
         path,
         body,
         mode,
@@ -721,6 +826,62 @@ pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Resu
         references,
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
+    }))
+}
+
+/// The rest of a tree entry, once its body key said it is one.
+///
+/// A tree is a set of whole files bx owns, so the keys that describe a part of
+/// one file, or its content, are refused by name rather than copied onto every
+/// file: `attach` other than `own`, `format` other than `opaque`, and
+/// `references`, which names paths inside one file's content.
+fn parse_tree(
+    ctx: &Ctx,
+    table: &Table,
+    path: Portable,
+    root: PathBuf,
+    attach: &Attach,
+) -> Result<Tree, Error> {
+    if *attach != Attach::Own {
+        return Err(ctx.bad(
+            table,
+            "attach",
+            "a tree target is always attached as `own`: each file it expands to is a whole \
+             file bx owns",
+        ));
+    }
+    if parse_format(ctx, table)? != Format::Opaque {
+        return Err(ctx.bad(
+            table,
+            "format",
+            "a tree names many files, so `format`, which describes one file's content, has \
+             nothing to describe; declare the one file as its own target instead",
+        ));
+    }
+    if table.contains_key("references") {
+        return Err(ctx.bad(
+            table,
+            "references",
+            "`references` names paths inside one file's content, and a tree names many files; \
+             declare the one file as its own target instead",
+        ));
+    }
+    let exclude = ctx
+        .str_array_at(table, "exclude")?
+        .iter()
+        .map(|raw| super::tree::Glob::parse(raw))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| ctx.bad(table, "exclude", message))?;
+    Ok(Tree {
+        path,
+        root,
+        exclude,
+        mode: parse_mode(ctx, table)?,
+        direction: parse_direction(ctx, table)?,
+        requires: ctx.str_array_at(table, "requires")?,
+        enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
+        origin: ctx.origin().clone(),
+        at: 0,
     })
 }
 
@@ -941,7 +1102,7 @@ fn parse_attach(ctx: &Ctx, table: &Table) -> Result<Attach, Error> {
 
 /// Exactly one body key — and for an `include` target, none, because its body
 /// *is* its line.
-fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> {
+fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Declared, Error> {
     let declared: Vec<&str> = BODY_KEYS
         .iter()
         .copied()
@@ -975,14 +1136,15 @@ fn parse_body(ctx: &Ctx, table: &Table, attach: &Attach) -> Result<Body, Error> 
         [] => match attach {
             // An include target already declares the only line it writes;
             // making it repeat that line as `content` would be ceremony.
-            Attach::Include { line } => Ok(Body::Inline(line.clone())),
+            Attach::Include { line } => Ok(Declared::Body(Body::Inline(line.clone()))),
             _ => Err(Error::MissingKey {
                 origin: ctx.origin().clone(),
                 section: SECTION,
-                key: "file`, `content`, `generated`, `secret`, `symlink` or `dir",
+                key: "file`, `content`, `generated`, `secret`, `symlink`, `dir` or `tree",
             }),
         },
-        [one] => body_from(ctx, table, one),
+        ["tree"] => tree_root(ctx, table).map(Declared::Tree),
+        [one] => body_from(ctx, table, one).map(Declared::Body),
         many => Err(ctx.bad(
             table,
             many[1],
@@ -1116,6 +1278,28 @@ pub(crate) fn refuse_file_at_home_or_above(
         ));
     }
     Ok(())
+}
+
+/// A tree's root: a directory in the config repo, confined to it as a `file`
+/// is.
+///
+/// Unlike a `file`, it may not carry a `{{name}}`. A tree is expanded when its
+/// layer is loaded, before any value has an answer, so a placeholder in its
+/// root could only be read literally, and a directory that exists under a
+/// name with braces in it would be a different directory from the one meant.
+fn tree_root(ctx: &Ctx, table: &Table) -> Result<PathBuf, Error> {
+    let raw = ctx.required_str(table, "tree")?;
+    if raw.contains("{{") {
+        return Err(ctx.bad(
+            table,
+            "tree",
+            format!(
+                "`tree` is expanded when its layer is loaded, before any value is answered, \
+                 so it may not hold a `{{{{name}}}}`; got {raw:?}"
+            ),
+        ));
+    }
+    repo_relative(ctx, table, "tree", raw)
 }
 
 /// The body one declared key names.
@@ -2022,6 +2206,129 @@ mod tests {
             assert!(message.contains("exactly one body"), "{body}: {message}");
             assert!(message.contains("`dir`"), "{body}: {message}");
         }
+    }
+
+    /// A tree entry, plus whatever else the test needs.
+    fn tree(extra: &str) -> String {
+        format!("[[target]]\npath = \"~/.config/nvim\"\ntree = \"files/nvim\"\n{extra}")
+    }
+
+    /// Parse the first `[[target]]` out of a document as an entry.
+    fn entry(text: &str) -> Result<Entry, Error> {
+        let doc = Document::parse(text).expect("valid TOML");
+        let table = doc["target"]
+            .as_array_of_tables()
+            .and_then(|tables| tables.get(0))
+            .expect("one [[target]]");
+        parse_entry(table, Path::new("bx.toml"), text, home())
+    }
+
+    fn tree_message(text: &str) -> String {
+        entry(text)
+            .expect_err("should have been rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn a_tree_parses_with_its_companion_keys() {
+        let text = tree(
+            "exclude = [\"*.md\", \"docs/**\"]\nmode = \"0600\"\ndirection = \"track\"\n\
+             requires = [\"nvim\"]\nenabled = false\n",
+        );
+        let Entry::Tree(parsed) = entry(&text).expect("parses") else {
+            panic!("a tree");
+        };
+        assert_eq!(parsed.path.as_str(), "~/.config/nvim");
+        assert_eq!(parsed.root, PathBuf::from("files/nvim"));
+        assert_eq!(
+            parsed
+                .exclude
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["*.md", "docs/**"]
+        );
+        assert_eq!(parsed.mode, Mode::parse_octal("0600").ok());
+        assert_eq!(parsed.direction, Direction::Track);
+        assert_eq!(parsed.requires, ["nvim"]);
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.origin.line, 1);
+
+        let Entry::Tree(bare) = entry(&tree("")).expect("parses") else {
+            panic!("a tree");
+        };
+        assert_eq!(
+            (bare.mode, bare.direction, bare.enabled),
+            (None, Direction::Apply, true)
+        );
+        assert!(bare.exclude.is_empty());
+        assert!(matches!(entry(&with("")), Ok(Entry::Target(_))));
+    }
+
+    #[test]
+    fn a_tree_root_is_normalised_and_confined_to_the_repo() {
+        let Entry::Tree(parsed) = entry(&tree("").replace("files/nvim", "files/./nvim/")).unwrap()
+        else {
+            panic!("a tree");
+        };
+        assert_eq!(parsed.root, PathBuf::from("files/nvim"));
+
+        for root in ["../out", "/etc", "~/x", ".", "files/{{acct}}"] {
+            let message = tree_message(&tree("").replace("files/nvim", root));
+            assert!(message.contains("`tree`"), "{root}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_tree_is_one_body_among_the_others() {
+        for body in [
+            "file = \"f\"",
+            "content = \"x\"",
+            "symlink = \"x\"",
+            "dir = true",
+        ] {
+            let message = tree_message(&tree(&format!("{body}\n")));
+            assert!(message.contains("exactly one body"), "{body}: {message}");
+            assert!(message.contains("`tree`"), "{body}: {message}");
+        }
+        let message = tree_message(&tree("attach = \"include\"\ninclude = \"x\"\n"));
+        assert!(message.contains("`tree` would never be read"), "{message}");
+    }
+
+    #[test]
+    fn a_tree_refuses_the_keys_that_describe_one_file() {
+        for (extra, key) in [
+            ("attach = \"region\"\ncomment = \"#\"\n", "attach"),
+            ("format = \"env.d\"\n", "format"),
+            ("format = \"jsonc\"\nowns = [\"a\"]\n", "format"),
+            ("references = [\"~/.x\"]\n", "references"),
+            ("exclude = [\"[a]\"]\n", "exclude"),
+            ("exclude = \"*.md\"\n", "exclude"),
+        ] {
+            let message = tree_message(&tree(extra));
+            assert!(message.contains(key), "{extra}: {message}");
+        }
+    }
+
+    #[test]
+    fn exclude_needs_a_tree() {
+        let message = message(&with("exclude = [\"*.md\"]\n"));
+        assert!(
+            message.contains("only means something beside `tree`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn parse_target_refuses_a_tree_it_cannot_expand() {
+        let message = message(&tree(""));
+        assert!(message.contains("loaded from"), "{message}");
+    }
+
+    #[test]
+    fn a_target_with_no_body_names_tree_among_the_body_keys() {
+        let message = message("[[target]]\npath = \"~/.x\"\n");
+        assert!(message.contains("`dir` or `tree`"), "{message}");
     }
 
     /// A symlink target, plus whatever else the test needs.

@@ -31,6 +31,7 @@ pub mod resolve;
 pub mod secrets;
 pub mod shell_options;
 pub mod target;
+pub mod tree;
 pub mod values;
 pub mod when;
 
@@ -65,6 +66,13 @@ const MODULES_DIR: &str = "modules";
 pub struct Config {
     /// `[[target]]`, keyed by `path`.
     pub targets: Vec<Target>,
+    /// `[[target]]` entries whose body is `tree = "…"`, not yet expanded.
+    ///
+    /// Filled by [`parse_str`], which reads no disk, and emptied by
+    /// [`tree::expand`], which [`load_layer`] runs against the config repo:
+    /// each tree becomes one target per file, in [`Config::targets`] where the
+    /// tree was written. A layer loaded from a repo never holds one.
+    pub trees: Vec<target::Tree>,
     /// `[[external]]`, keyed by `path`. See [`external`].
     pub externals: Vec<external::External>,
     /// `[[value]]`, keyed by `name`.
@@ -320,30 +328,35 @@ fn filename_bytes(path: &Path) -> &[u8] {
 pub fn load_layers(repo: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
     layer_files(repo)?
         .iter()
-        .map(|path| load_layer(path, home))
+        .map(|path| load_layer(path, repo, home))
         .collect()
 }
 
-/// Read and parse one layer file.
+/// Read and parse one layer file, expanding its trees against `repo`.
 ///
-/// Any file in the layer schema, including the state directory's `local.toml`.
+/// Any file in the layer schema, including the state directory's `local.toml`,
+/// whose `tree` entries name directories in the same config repo the global
+/// layers do.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] if the file cannot be read, and whatever [`parse_str`] returns.
-pub fn load_layer(path: &Path, home: &Path) -> Result<Layer, Error> {
+/// [`Error::Io`] if the file cannot be read, whatever [`parse_str`] returns,
+/// and whatever [`tree::expand`] returns.
+pub fn load_layer(path: &Path, repo: &Path, home: &Path) -> Result<Layer, Error> {
     tracing::debug!(file = %path.display(), "reading configuration layer");
     let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    let mut config = parse_str(&text, path, home)?;
+    tree::expand(&mut config, repo, home)?;
 
     Ok(Layer {
         file: path.to_path_buf(),
         // The repo loader only ever reads committed material. `layers::load_layer_set`
         // is what marks the one layer that came from the state directory.
         kind: LayerKind::Global,
-        config: parse_str(&text, path, home)?,
+        config,
     })
 }
 
@@ -379,9 +392,13 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     // entry an earlier layer introduced.
                     match merge::toggle_of(table, merge::Section::Target, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
-                        None => config
-                            .targets
-                            .push(target::parse_target(table, file, text, home)?),
+                        None => match target::parse_entry(table, file, text, home)? {
+                            target::Entry::Target(target) => config.targets.push(target),
+                            target::Entry::Tree(mut tree) => {
+                                tree.at = config.targets.len();
+                                config.trees.push(tree);
+                            }
+                        },
                     }
                 }
             }
@@ -1436,7 +1453,7 @@ mod tests {
         let dir = repo(&[]);
         let missing = dir.path().join("bx.toml");
 
-        let error = load_layer(&missing, home()).expect_err("should be an error");
+        let error = load_layer(&missing, dir.path(), home()).expect_err("should be an error");
         assert!(matches!(error, Error::Io { .. }));
         assert!(error.to_string().contains("bx.toml"));
     }

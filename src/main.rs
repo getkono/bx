@@ -62,7 +62,8 @@ enum Command {
         #[command(subcommand)]
         action: SecretAction,
     },
-    /// Drift, missing tools, broken seams, stale caches, shell cost
+    /// Missing tools, unanswered values, damaged state, and what else needs a
+    /// look; changes nothing
     Doctor,
     /// Print the one line for your shell rc
     ShellInit { shell: String },

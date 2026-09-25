@@ -31,6 +31,7 @@ pub mod resolve;
 pub mod secrets;
 pub mod shell_options;
 pub mod target;
+pub mod tool;
 pub mod tree;
 pub mod values;
 pub mod when;
@@ -101,6 +102,10 @@ pub struct Config {
     /// declared tool activations, run at `plan` time and cached. See
     /// [`crate::shell::activation`].
     pub activations: Vec<activation::ActivationDecl>,
+    /// `[[tool]]`'s entries, keyed by `name`, in the order written: the
+    /// declared tool inventory `bx doctor` reports on and never installs. See
+    /// [`tool`].
+    pub tools: Vec<tool::ToolDecl>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
@@ -558,6 +563,14 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     }
                 }
             }
+            "tool" => {
+                for table in entries(root, name, item, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Tool, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config.tools.push(tool::parse_tool(table, file, text)?),
+                    }
+                }
+            }
             unknown => {
                 return Err(Error::UnknownSection {
                     origin: section_origin(root, unknown, file, text),
@@ -658,6 +671,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|a| (a.name.as_str(), &a.origin))
             .chain(toggles_in(&config, merge::Section::Activation))
+            .collect(),
+    )?;
+    check_unique(
+        "tool",
+        config
+            .tools
+            .iter()
+            .map(|t| (t.name.as_str(), &t.origin))
+            .chain(toggles_in(&config, merge::Section::Tool))
             .collect(),
     )?;
 

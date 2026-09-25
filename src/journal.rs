@@ -5132,6 +5132,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_stage_that_made_other_directories_than_its_intent_named_is_refused() {
+        // #119. The Intent names the parents read from disk before the stage;
+        // a disk that changed in between makes the two differ, and the write
+        // is refused rather than carried on with a ledger claim the journal
+        // does not share. What the home or above adds is dropped from both
+        // sides alike, so it alone is no difference.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let dest = home.child(".config/app/x.conf");
+        let (app, config) = (home.child(".config/app"), home.child(".config"));
+        let announced = [app.clone(), config.clone()];
+
+        session
+            .refuse_unannounced(&dest, &announced, &announced)
+            .expect("the same set");
+        session
+            .refuse_unannounced(
+                &dest,
+                &announced,
+                &[app.clone(), config.clone(), home.path().to_path_buf()],
+            )
+            .expect("the home is claimed by neither");
+        for made in [vec![app.clone()], vec![], vec![config.clone(), app.clone()]] {
+            let err = session
+                .refuse_unannounced(&dest, &announced, &made)
+                .expect_err("a different set");
+            assert!(
+                matches!(&err, Error::Write(fs::Error::Changed { path, .. }) if *path == dest),
+                "{made:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_claim_that_appears_after_the_directory_is_lost_is_still_dropped() {
         // r3 round 7, CL1/COV1. The `r3 round 6` fix makes the home before
         // `fs::stage` looks, so `stage` stops inventing it and the claim

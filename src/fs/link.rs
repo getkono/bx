@@ -410,6 +410,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_link_staged_as_a_chosen_name_is_there_and_a_taken_name_is_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dest = root.path().join("a/tool");
+        let planned = observe(&dest).expect("observe");
+        let prior = refuse_stage_link(&dest, &planned, &CreatedDirs::new()).expect("admitted");
+        assert_eq!(prior.kind, Kind::Absent);
+        assert!(!root.path().join("a").exists(), "the check makes nothing");
+
+        let temp = crate::fs::temp_beside(&dest).expect("a name");
+        let staged = stage_link_as(
+            &dest,
+            &temp,
+            Path::new("t"),
+            &planned,
+            &mut CreatedDirs::new(),
+        )
+        .expect("stage");
+        assert_eq!(staged.temp_path(), temp);
+        assert_eq!(staged.created_dirs(), [root.path().join("a")]);
+        assert_eq!(std::fs::read_link(&temp).expect("a link"), Path::new("t"));
+
+        // The same name again is taken, and the link there is not replaced.
+        let err = stage_link_as(
+            &dest,
+            &temp,
+            Path::new("other"),
+            &planned,
+            &mut CreatedDirs::new(),
+        )
+        .expect_err("taken");
+        assert!(matches!(err, Error::Write { .. }), "{err:?}");
+        assert_eq!(std::fs::read_link(&temp).expect("kept"), Path::new("t"));
+
+        // A file where plan saw nothing is refused before anything is made.
+        let file = root.path().join("file");
+        let planned = observe(&file).expect("observe");
+        std::fs::write(&file, b"x").expect("since");
+        assert!(matches!(
+            refuse_stage_link(&file, &planned, &CreatedDirs::new()),
+            Err(Error::Changed { .. })
+        ));
+    }
+
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .expect("read_dir")

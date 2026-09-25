@@ -8103,4 +8103,116 @@ mod tests {
             "`bx plan` prints this note, so it names no absolute home",
         );
     }
+
+    #[test]
+    fn a_temp_name_chosen_first_is_a_fresh_bx_name_beside_the_destination() {
+        let home = guarded_home();
+        let dest = home.child(".config/app/x.conf");
+        let one = temp_beside(&dest).expect("a name");
+        let two = temp_beside(&dest).expect("another");
+        assert_eq!(one.parent(), dest.parent());
+        let name = one
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with(TEMP_PREFIX), "{name}");
+        assert_eq!(name.len(), TEMP_PREFIX.len() + 16, "{name}");
+        assert_ne!(one, two, "each write gets its own");
+        // Chosen, not made: nothing exists on the way to it yet.
+        assert!(!home.child(".config").exists());
+        assert!(matches!(
+            temp_beside(&home.child("a/../b")),
+            Err(Error::ParentComponent(_))
+        ));
+    }
+
+    #[test]
+    fn stage_as_makes_exactly_the_named_temp_and_the_parents_it_invents() {
+        let home = guarded_home();
+        let dest = home.child(".config/app/x.conf");
+        let temp = temp_beside(&dest).expect("a name");
+        let planned = observe(&dest).expect("observe");
+        let staged = stage_as(
+            &dest,
+            &temp,
+            Mode::DEFAULT_FILE,
+            &planned,
+            &mut CreatedDirs::new(),
+        )
+        .expect("stage");
+        assert_eq!(staged.temp_path(), temp);
+        assert!(temp.is_file());
+        assert_eq!(
+            staged.created_dirs(),
+            [home.child(".config/app"), home.child(".config")],
+            "deepest first, as the filled write names them",
+        );
+        let filled = staged.fill(b"x\n").expect("fill");
+        assert_eq!(
+            filled.created_dirs(),
+            [home.child(".config/app"), home.child(".config")]
+        );
+        filled.publish().expect("publish");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"x\n");
+        assert!(!temp.exists(), "renamed over the destination");
+    }
+
+    #[test]
+    fn stage_as_refuses_a_name_that_is_taken_or_not_a_bx_name_beside_the_destination() {
+        let home = guarded_home();
+        let dest = home.child("x.conf");
+        let planned = observe(&dest).expect("observe");
+        let taken = temp_beside(&dest).expect("a name");
+        std::fs::write(&taken, b"theirs").expect("take it");
+        let elsewhere = home.child("sub").join(format!("{TEMP_PREFIX}x"));
+        for temp in [taken.clone(), home.child("x.conf.tmp"), elsewhere] {
+            let err = stage_as(
+                &dest,
+                &temp,
+                Mode::DEFAULT_FILE,
+                &planned,
+                &mut CreatedDirs::new(),
+            )
+            .expect_err("refused");
+            assert!(
+                matches!(err, Error::Write { .. }),
+                "{}: {err:?}",
+                temp.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&taken).expect("kept"),
+            b"theirs",
+            "never replaced"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn refuse_stage_refuses_what_stage_would_and_makes_nothing() {
+        let home = guarded_home();
+        let dest = home.child(".config/app/x.conf");
+        let planned = observe(&dest).expect("observe");
+        let prior = refuse_stage(&dest, &planned, &CreatedDirs::new()).expect("admitted");
+        assert_eq!(prior.kind, Kind::Absent);
+        assert!(!home.child(".config").exists(), "nothing made");
+
+        // A destination that changed since plan is refused as `stage` refuses it.
+        let file = home.child("f");
+        let planned = observe(&file).expect("observe");
+        std::fs::write(&file, b"since\n").expect("write");
+        assert!(matches!(
+            refuse_stage(&file, &planned, &CreatedDirs::new()),
+            Err(Error::Changed { .. })
+        ));
+        // And plan's own verdict: a directory is not a file bx can write.
+        let dir = home.child("d");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let planned = observe(&dir).expect("observe");
+        assert!(matches!(
+            refuse_stage(&dir, &planned, &CreatedDirs::new()),
+            Err(Error::NotAFile { .. })
+        ));
+    }
 }

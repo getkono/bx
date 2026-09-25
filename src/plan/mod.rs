@@ -13,7 +13,9 @@
 //!   `apply` recovers an interrupted session before it decides anything, and
 //!   makes every write through one journalled session.
 //!
-//! The one environment read in the whole path is [`Env::from_process`]; every
+//! The one environment read in the whole path is [`Env::from_process`], and
+//! the `PATH` a declared activation's tool is looked up along, which
+//! [`Inputs::load`] takes once through [`activation::System::from_env`]; every
 //! other function takes what it needs as an argument.
 
 mod decide;
@@ -31,14 +33,17 @@ pub(crate) use diff::escape;
 pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
 
 use crate::config::resolve::{self, Resolution, Resolved};
-use crate::config::target::Target;
+use crate::config::target::{Body, Gen, Target};
 use crate::config::{self, Origin, layers, merge};
 use crate::env_guard::RootSet;
 use crate::journal::{self, Session, SessionKind};
 use crate::paths;
 use crate::recover::{self, Interrupted};
 use crate::report::{Action, Exit};
-use crate::state::{self, ExclusiveLock, LedgerView, Mechanism, SharedLock, StateDir};
+use crate::shell::activation;
+use crate::state::{
+    self, ExclusiveLock, Fingerprints, LedgerView, Mechanism, SharedLock, StateDir,
+};
 use crate::sync::Git;
 
 /// Which half of the traversal is running.
@@ -131,6 +136,10 @@ pub struct Inputs {
     /// own, seeing the home and config home this run resolved, and unable to
     /// ask anything.
     git: Git,
+    /// Every enabled `[[activation]]`, in the merged configuration's order.
+    activations: Vec<activation::ActivationDecl>,
+    /// The machine an activation's tool is looked up and run on.
+    host: activation::System,
 }
 
 impl Inputs {
@@ -162,6 +171,8 @@ impl Inputs {
             roots,
             progress: env.stderr_tty,
             git: Git::new(env).unattended(),
+            activations: merged.activations,
+            host: activation::System::from_env(),
         })
     }
 
@@ -169,6 +180,13 @@ impl Inputs {
     #[cfg(test)]
     pub(crate) fn with_git(mut self, git: Git) -> Self {
         self.git = git;
+        self
+    }
+
+    /// The same inputs, running activations on `host`.
+    #[cfg(test)]
+    pub(crate) fn with_host(mut self, host: activation::System) -> Self {
+        self.host = host;
         self
     }
 
@@ -247,13 +265,26 @@ pub struct Report {
     /// external can stop: its fetch can fail, and only the fetch shows whether
     /// its `rev` is a fast-forward.
     pub stopped: Vec<usize>,
+    /// Every enabled `[[activation]]`, decided once by this run: what the
+    /// interactive file was rendered with, and what an executed `apply`
+    /// recorded in the fingerprint store.
+    pub activations: activation::Plan,
 }
 
 impl Report {
-    /// Every row's action, in order.
+    /// Every row's action, in order, then every activation's.
     #[must_use]
     pub fn actions(&self) -> Vec<Action> {
-        self.changes.iter().map(|change| change.action).collect()
+        self.changes
+            .iter()
+            .map(|change| change.action)
+            .chain(
+                self.activations
+                    .steps()
+                    .iter()
+                    .map(activation::Step::action),
+            )
+            .collect()
     }
 }
 
@@ -431,6 +462,11 @@ pub fn run(
     }
 
     let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
+    // Every declared activation is decided here, once, against the cache as
+    // it stands, read without a lock: what the interactive file is rendered
+    // with below is what `apply` records, and nothing decides them again.
+    let cache = Fingerprints::read(&inputs.state)?.value;
+    report.activations = activation::plan(&inputs.activations, &cache, &inputs.roots, &inputs.host);
     let ctx = decide::Ctx {
         ledger: &ledger,
         home: &inputs.home,
@@ -441,7 +477,12 @@ pub fn run(
     };
     // A fragment bx wrote for a place no variable lands in any more is planned
     // empty, so switching a variable off takes it out of every shell.
-    let mut targets = inputs.resolved.targets.clone();
+    let mut targets: Vec<Resolution<Target>> = inputs
+        .resolved
+        .targets
+        .iter()
+        .map(|target| with_activations(target.clone(), &report.activations))
+        .collect();
     targets.extend(resolve::vacated_fragments(
         &inputs.resolved.targets,
         |path| {
@@ -470,7 +511,15 @@ pub fn run(
     match mode {
         Mode::Plan => Ok(report),
         Mode::Apply => {
-            if (ops.is_empty() && clones.is_empty()) || !approve(&report)? {
+            // A capture is work even when the file it renders into is already
+            // right — a binary upgraded to one printing the same text — since
+            // until it is recorded every `plan` runs the tool again.
+            let captured = report
+                .activations
+                .steps()
+                .iter()
+                .any(|step| step.action().is_pending());
+            if (ops.is_empty() && clones.is_empty() && !captured) || !approve(&report)? {
                 return Ok(report);
             }
             // Every target first, so a clone beneath a directory a target
@@ -507,10 +556,49 @@ pub fn run(
                     report.stopped.push(at);
                 }
             }
+            // Last, so a cache entry is never saved for output a failed write
+            // left out of the file: losing it costs only a re-run.
+            record_activations(&inputs.state, &report.activations)?;
             report.executed = true;
             Ok(report)
         }
     }
+}
+
+/// `target` as `plan` renders it: the interactive file with `activations`
+/// attached, and any other target as it is.
+fn with_activations(
+    target: Resolution<Target>,
+    activations: &activation::Plan,
+) -> Resolution<Target> {
+    match target {
+        Resolution::Ready(mut ready) => {
+            if let Body::Generated(Gen::Interactive(file)) = &mut ready.body {
+                **file = file.as_ref().clone().with_activations(activations.clone());
+            }
+            Resolution::Ready(ready)
+        }
+        blocked @ Resolution::Blocked(_) => blocked,
+    }
+}
+
+/// Record `activations` in the fingerprint store, under the exclusive lock.
+///
+/// The store is read again under the lock rather than reusing the copy
+/// `plan` read without one, and [`activation::Plan::record`] touches only
+/// the activation entries, so nothing another writer recorded is lost. An
+/// unchanged store is not written, so an `apply` that captured nothing
+/// leaves `fingerprints.mpk` byte-identical.
+fn record_activations(state: &StateDir, activations: &activation::Plan) -> Result<(), Error> {
+    state.ensure()?;
+    let lock = ExclusiveLock::acquire(state)?;
+    let before = Fingerprints::open(state, &lock)?.value;
+    let mut after = before.clone();
+    activations.record(&mut after);
+    if after != before {
+        after.save(state, &lock)?;
+    }
+    Ok(())
 }
 
 /// The process status a report implies.
@@ -1801,6 +1889,185 @@ pub(crate) mod tests {
         crate::restore::restore(&state, home.path(), &targets).expect("restore");
 
         assert_eq!(snapshot(home.path(), &OUTSIDE), before);
+    }
+
+    /// A stub tool at `~/bin/stub` that appends a line to `~/runs` each time
+    /// it runs and prints a one-line activation, and the machine that finds
+    /// it: `~/bin` is its whole `PATH`.
+    fn stub_tool(home: &GuardedHome) -> activation::System {
+        let bin = home.child("bin");
+        std::fs::create_dir_all(&bin).expect("~/bin");
+        let stub = bin.join("stub");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho ran >> '{}'\nprintf 'stub_hook() {{ :; }}\\n'\n",
+                home.child("runs").display()
+            ),
+        )
+        .expect("the stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        activation::System::new(bin.into_os_string(), activation::TIMEOUT)
+    }
+
+    /// How many times the stub tool has run.
+    fn stub_runs(home: &GuardedHome) -> usize {
+        std::fs::read_to_string(home.child("runs")).map_or(0, |runs| runs.lines().count())
+    }
+
+    const STUB: &str = "[[activation]]\nname = \"stub\"\ncommand = [\"stub\", \"init\", \"zsh\"]\n\
+                        phase = \"completions\"\n";
+
+    const INTERACTIVE: &str = ".local/share/bx/zshrc.zsh";
+
+    #[test]
+    fn a_declared_activation_is_run_once_cached_rendered_and_reversed() {
+        let home = guarded_home();
+        home.write(".zshrc", "user\n");
+        seed(home.path(), STUB);
+        let inputs = load(home.path()).with_host(stub_tool(&home));
+        let state = StateDir::resolve(home.path());
+
+        // `plan` runs it twice, shows the capture, and writes nothing.
+        let planned = plan(&inputs);
+        assert_eq!(stub_runs(&home), 2);
+        assert_eq!(
+            planned.actions(),
+            vec![Action::Create, Action::Modify, Action::Create]
+        );
+        assert_eq!(exit(&planned, Mode::Plan), Exit::Pending);
+        let shown = render(
+            &planned,
+            View::Plan,
+            Palette::resolve(true, false),
+            home.path(),
+        );
+        assert!(
+            shown.contains("  + activation `stub`: run twice, output agreed; cached\n"),
+            "{shown}"
+        );
+        assert!(!state.fingerprints().exists());
+
+        // `apply` renders the output into the interactive file and records it.
+        let applied = apply(&inputs);
+        assert!(applied.executed);
+        assert_eq!(stub_runs(&home), 4, "one plan inside the apply, not two");
+        assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
+        let file = std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file");
+        assert!(
+            file.contains(
+                "\n# bx phase: completions\n# bx activation: stub\neval 'stub_hook() { :; }\n'\n"
+            ),
+            "{file}"
+        );
+        let cache = std::fs::read(state.fingerprints()).expect("the cache is saved");
+
+        // On an unchanged machine nothing runs and nothing is written.
+        let again = plan(&inputs);
+        assert_eq!(stub_runs(&home), 4);
+        assert_eq!(again.actions(), vec![Action::Unchanged; 3]);
+        assert_eq!(exit(&again, Mode::Plan), Exit::Converged);
+        let quiet = render(
+            &again,
+            View::Plan,
+            Palette::resolve(true, false),
+            home.path(),
+        );
+        assert!(!quiet.contains("activation"), "{quiet}");
+        let status = render(
+            &again,
+            View::Status,
+            Palette::resolve(true, false),
+            home.path(),
+        );
+        assert!(
+            status.contains("  = activation `stub`: cached output reused, nothing run\n"),
+            "{status}"
+        );
+        let second = run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve"))
+            .expect("the second apply");
+        assert!(!second.executed);
+        assert_eq!(stub_runs(&home), 4);
+        assert_eq!(
+            std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file"),
+            file
+        );
+        assert_eq!(
+            std::fs::read(state.fingerprints()).expect("the cache"),
+            cache
+        );
+
+        // Losing the cache costs a re-run, and nothing else: the file is
+        // already right, and the cache comes back byte for byte.
+        std::fs::remove_file(state.fingerprints()).expect("lose the cache");
+        let lost = apply(&inputs);
+        assert!(lost.executed);
+        assert_eq!(
+            lost.actions(),
+            vec![Action::Unchanged, Action::Unchanged, Action::Create]
+        );
+        assert_eq!(stub_runs(&home), 6);
+        assert_eq!(
+            std::fs::read(state.fingerprints()).expect("the cache"),
+            cache
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file"),
+            file
+        );
+
+        // `rm` puts back exactly what was there before.
+        let targets: Vec<Portable> = LedgerView::read(&state, home.path())
+            .expect("the ledger")
+            .value
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect();
+        crate::restore::restore(&state, home.path(), &targets).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(home.child(".zshrc")).expect(".zshrc"),
+            "user\n"
+        );
+        assert!(!home.child(INTERACTIVE).exists());
+    }
+
+    #[test]
+    fn an_absent_tool_is_blocked_and_everything_else_is_still_written() {
+        let home = guarded_home();
+        seed(
+            home.path(),
+            &format!("{STUB}[[activation]]\nname = \"gone\"\ncommand = [\"gone\"]\n"),
+        );
+        let inputs = load(home.path()).with_host(stub_tool(&home));
+
+        let planned = plan(&inputs);
+        assert_eq!(
+            planned.actions(),
+            vec![
+                Action::Create,
+                Action::Create,
+                Action::Create,
+                Action::Blocked
+            ]
+        );
+        let shown = render(
+            &planned,
+            View::Plan,
+            Palette::resolve(true, false),
+            home.path(),
+        );
+        assert!(
+            shown.contains("  ? activation `gone`: omitted: `gone` is not on PATH\n"),
+            "{shown}"
+        );
+
+        let applied = apply(&inputs);
+        assert!(applied.executed);
+        assert_eq!(exit(&applied, Mode::Apply), Exit::Pending);
+        let file = std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file");
+        assert!(file.contains("# bx activation: stub\n"), "{file}");
+        assert!(!file.contains("gone"), "{file}");
     }
 
     /// One symlink target, as TOML.

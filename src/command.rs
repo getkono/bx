@@ -142,10 +142,12 @@ fn converge(
     } else if let Some(outcome) = &report.recovered {
         writeln!(out, "{}", recovered(&report, outcome)).map_err(Error::Output)?;
     } else if report.executed {
+        // Every row and every activation it cached: an activation's pending
+        // step is a cache entry written, as a row's is a file.
         let written = report
-            .changes
-            .iter()
-            .filter(|change| change.action.is_pending())
+            .actions()
+            .into_iter()
+            .filter(|action| action.is_pending())
             .count();
         writeln!(out, "Applied {written} change(s).").map_err(Error::Output)?;
         // A row apply stopped short of was announced as work and shown so; its

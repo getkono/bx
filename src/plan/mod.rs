@@ -2043,6 +2043,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_capture_under_another_path_renders_the_same_file() {
+        // D1: a tool that prints the PATH it ran with, as `mise activate`
+        // does. Re-captured under a different PATH, the file does not change.
+        let home = guarded_home();
+        let bin = home.child("bin");
+        std::fs::create_dir_all(&bin).expect("~/bin");
+        let stub = bin.join("stub");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf \"export PATH='/opt/stub/bin:%s'\\n\" \"$PATH\"\n",
+        )
+        .expect("the stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        seed(home.path(), STUB);
+        let state = StateDir::resolve(home.path());
+        let under = |path: String| {
+            load(home.path()).with_host(activation::System::new(path, activation::TIMEOUT))
+        };
+
+        let applied = apply(&under(bin.display().to_string()));
+        assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
+        let file = std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file");
+        assert!(
+            file.contains("eval 'export PATH='\\''/opt/stub/bin:'\\''\"$PATH\"\n'\n"),
+            "{file}"
+        );
+
+        std::fs::remove_file(state.fingerprints()).expect("lose the cache");
+        let elsewhere = under(format!("{}:/nonexistent", bin.display()));
+        let planned = plan(&elsewhere);
+        assert_eq!(
+            planned.actions(),
+            vec![Action::Unchanged, Action::Unchanged, Action::Create]
+        );
+        apply(&elsewhere);
+        assert_eq!(
+            std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file"),
+            file
+        );
+    }
+
+    #[test]
     fn an_absent_tool_is_blocked_and_everything_else_is_still_written() {
         let home = guarded_home();
         seed(

@@ -73,6 +73,36 @@ pub enum Mechanism {
     /// any file's bytes. Added last, so every entry an earlier bx saved still
     /// decodes as the variant it was written as.
     Link,
+    /// bx cloned a declared git external into a directory it created: the
+    /// directory and everything git put in it, never a directory that was
+    /// already there.
+    ///
+    /// A checkout has no one digest bx could compare, so an entry attached
+    /// this way records, as [`LedgerEntry::written`], the digest of the
+    /// commit id bx last left checked out, spelled as `git rev-parse` prints
+    /// it — see [`clone_written`]. Its prior is always [`Prior::Absent`]: bx
+    /// never clones into or over anything, so there was nothing there.
+    ///
+    /// While bx is still populating the directory, or already removing it,
+    /// `written` is [`clone_written`] of `None`, the digest of the empty
+    /// string, which no commit id has. The entry is saved so before the first
+    /// byte of a clone lands and before the first byte of a removal goes, so a
+    /// run that stops part way leaves an entry that says the directory is
+    /// bx's and not a finished checkout: the next `apply` removes it and
+    /// clones again, and the next `rm` removes it.
+    ///
+    /// A unit variant, like [`Mechanism::Dir`], so the commit lives in the
+    /// digest and every [`Mechanism`] stays the size it was. Added after
+    /// [`Mechanism::Link`], so every entry an earlier bx saved still decodes
+    /// as the variant it was written as.
+    Clone,
+}
+
+/// What a [`Mechanism::Clone`] entry records as [`LedgerEntry::written`]: the
+/// digest of `rev`, or of the empty string while no finished checkout stands.
+#[must_use]
+pub fn clone_written(rev: Option<&str>) -> ContentHash {
+    ContentHash::of(rev.unwrap_or_default().as_bytes())
 }
 
 /// A pointer to the bytes that were at a target before bx wrote it.
@@ -2556,6 +2586,9 @@ mod tests {
             Mechanism::Include {
                 line: "source ~/.local/state/bx/shell/init.zsh".to_string(),
             },
+            Mechanism::Dir,
+            Mechanism::Link,
+            Mechanism::Clone,
         ];
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
         for (index, mechanism) in mechanisms.iter().enumerate() {

@@ -113,6 +113,7 @@ pub use ledger::RestoreRef;
 pub(crate) use ledger::blob_len;
 pub use ledger::{
     Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, Withdrawal,
+    clone_written,
 };
 pub use lock::{ExclusiveLock, Holder, SharedLock};
 pub use store::{Damage, Health, Loaded, MAX_STATE_FILE, Unlisted};

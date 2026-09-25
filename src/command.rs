@@ -148,6 +148,18 @@ fn converge(
             .filter(|change| change.action.is_pending())
             .count();
         writeln!(out, "Applied {written} change(s).").map_err(Error::Output)?;
+        // A row apply stopped short of was announced as work and shown so; its
+        // reason is known only now, so it is said now.
+        for &at in &report.stopped {
+            let change = &report.changes[at];
+            writeln!(
+                out,
+                "  ! {}  stopped: {}",
+                plan::escape(&change.target),
+                plan::escape(change.note.as_deref().unwrap_or_default()),
+            )
+            .map_err(Error::Output)?;
+        }
     } else {
         writeln!(out, "Nothing was written.").map_err(Error::Output)?;
     }
@@ -674,6 +686,36 @@ mod tests {
 
         let exit = plan(&env(home.path()), &mut Vec::new()).expect("plan");
         assert_eq!(exit, Exit::Converged);
+    }
+
+    #[test]
+    fn an_external_apply_stopped_short_of_is_named_with_why_and_exits_pending() {
+        let home = guarded_home();
+        // The declared url leads nowhere that can be fetched from.
+        std::fs::write(
+            home.child(".gitconfig"),
+            format!(
+                "[url \"file://{}/nowhere/\"]\n\tinsteadOf = https://example.invalid/\n",
+                home.path().display()
+            ),
+        )
+        .expect("~/.gitconfig");
+        seed(
+            home.path(),
+            "[[external]]\npath = \"~/.x\"\nurl = \"https://example.invalid/x\"\n\
+             rev = \"0e810e5afa27acbd074398eefbe28d13005dbc15\"\n",
+        );
+        let mut out = Vec::new();
+
+        let exit = apply_with(&env(home.path()), true, &mut out, &mut never).expect("apply");
+
+        assert_eq!(exit, Exit::Pending);
+        let shown = text(&out);
+        assert!(
+            shown.contains("Applied 0 change(s).\n  ! ~/.x  stopped: "),
+            "{shown}"
+        );
+        assert!(!home.child(".x").exists());
     }
 
     #[test]

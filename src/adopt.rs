@@ -164,6 +164,9 @@ pub struct Context {
     layers: Vec<Layer>,
     resolved: Resolved,
     roots: RootSet,
+    /// The `git` `rm` asks whether a checkout bx cloned holds anything of
+    /// the user's.
+    git: crate::sync::Git,
 }
 
 impl Context {
@@ -191,6 +194,7 @@ impl Context {
             layers,
             resolved,
             roots,
+            git: crate::sync::Git::new(env),
         })
     }
 
@@ -1124,7 +1128,7 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
         return Ok(Vec::new());
     }
     let targets: Vec<Portable> = targets.into_iter().collect();
-    let restored = restore::restore(&ctx.state, &ctx.home, &targets)?;
+    let restored = restore::restore_with(&ctx.state, &ctx.home, &targets, &ctx.git)?;
 
     let released: BTreeSet<&Portable> = restored
         .iter()

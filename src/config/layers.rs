@@ -372,7 +372,7 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
     layer_paths(repo, state_dir)?
         .iter()
         .map(|path| {
-            let mut layer = load_layer(path, home)?;
+            let mut layer = load_layer(path, repo, home)?;
             if *path == local {
                 layer.kind = LayerKind::Local;
             }
@@ -814,6 +814,40 @@ mod tests {
             None,
             "the state directory is its home"
         );
+    }
+
+    #[test]
+    fn a_local_layer_tree_expands_against_the_config_repo_not_the_state_dir() {
+        let home = guarded_home();
+        let (repo, state) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+        home.write(".config/bx/mirror/from-repo", "repo\n");
+        // A directory of the same name beside `local.toml`: a tree resolved
+        // against the layer's own directory would find this one instead.
+        home.write(".local/state/bx/mirror/from-state", "state\n");
+        home.write(
+            ".local/state/bx/local.toml",
+            "[[target]]\npath = \"~/.mirror\"\ntree = \"mirror\"\n",
+        );
+
+        let layers = load_layer_set(&repo, &state, home.path()).unwrap();
+        let local = layers.last().expect("the local layer");
+        assert_eq!(local.kind, LayerKind::Local);
+        let expanded: Vec<(&str, &crate::config::target::Body)> = local
+            .config
+            .targets
+            .iter()
+            .map(|target| (target.path.as_str(), &target.body))
+            .collect();
+        assert_eq!(
+            expanded,
+            [(
+                "~/.mirror/from-repo",
+                &crate::config::target::Body::File(PathBuf::from("mirror/from-repo"))
+            )],
+            "a body is repo-relative in every layer, local.toml's included",
+        );
+        assert!(local.config.trees.is_empty());
     }
 
     #[test]

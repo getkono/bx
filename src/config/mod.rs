@@ -36,7 +36,7 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::{alias, function, plugin};
+use crate::shell::{alias, function, plugin, source};
 use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
@@ -83,6 +83,9 @@ pub struct Config {
     /// `[[plugin]]`'s entries, keyed by `name`, in the order written. See
     /// [`crate::shell::plugin`].
     pub plugins: Vec<crate::shell::plugin::PluginDecl>,
+    /// `[[source]]`'s entries, keyed by `name`, in the order written: the
+    /// declared optional sources. See [`crate::shell::source`].
+    pub sources: Vec<crate::shell::source::SourceDecl>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
@@ -478,6 +481,16 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     }
                 }
             }
+            "source" => {
+                for table in entries(root, name, item, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Source, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config
+                            .sources
+                            .push(source::parse_source(table, file, text)?),
+                    }
+                }
+            }
             unknown => {
                 return Err(Error::UnknownSection {
                     origin: section_origin(root, unknown, file, text),
@@ -551,6 +564,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|p| (p.name.as_str(), &p.origin))
             .chain(toggles_in(&config, merge::Section::Plugin))
+            .collect(),
+    )?;
+    check_unique(
+        "source",
+        config
+            .sources
+            .iter()
+            .map(|s| (s.name.as_str(), &s.origin))
+            .chain(toggles_in(&config, merge::Section::Source))
             .collect(),
     )?;
 

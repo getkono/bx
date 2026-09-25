@@ -63,7 +63,10 @@
 //! aliases, each body single-quoted so it reaches the alias exactly as
 //! written, and the declared functions, each body substituted from the
 //! declared values and written whether or not the tool it runs is installed,
-//! a hooked one under a name of bx's own so registering it clobbers nothing.
+//! a hooked one under a name of bx's own so registering it clobbers nothing,
+//! and the declared optional sources, each a file some other tool writes,
+//! its path substituted from the declared values and sourced only once
+//! readable in the phase it names, with a pure check naming the ones missing.
 //! Its tool activations run at `plan` time, not at shell start: each is
 //! trusted once two runs agree, cached in the fingerprint store against its
 //! binary's content, and written only when the environment guard approves

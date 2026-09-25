@@ -56,10 +56,12 @@ description = "Run tests with coverage (minimum 80% line coverage; the main.rs e
 run = '''cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80'''
 
 [tasks.bench]
-description = "Measure bx's contribution to zsh startup against its 5 ms budget"
-# The budget is a product requirement, so it is measured, not assumed. See
-# bench/README.md for what the fixture controls for.
-run = "bench/run.sh"
+description = "Measure what bx's generated files cost zsh startup against its 5 ms budget"
+# The budget is a product requirement, so it is measured, not assumed. The bench
+# applies the example configuration with the real binary, so it builds that
+# binary first: a bench that measured without one would pass by measuring
+# nothing. See bench/README.md for what the fixture controls for.
+run = ["cargo build --release --bin bx", "bench/run.sh"]
 
 [tasks.commit-check]
 description = "Verify this branch's commits (vs origin/master) follow Conventional Commits"

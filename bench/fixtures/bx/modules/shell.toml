@@ -1,0 +1,40 @@
+# Tool integrations: activations, plugins and optional sources.
+
+# Each activation runs once when `bx plan` does, is trusted when two runs
+# agree, and is cached; a shell start sources the cached text and spawns
+# nothing. `{shell}` gives each shell its own command.
+[[activation]]
+name    = "mise"
+command = ["mise", "activate", "{shell}"]
+
+[[activation]]
+name    = "starship"
+command = ["starship", "init", "{shell}"]
+phase   = "completions"
+
+[[activation]]
+name    = "zoxide"
+command = ["zoxide", "init", "{shell}"]
+phase   = "completions"
+
+[[activation]]
+name    = "fzf"
+command = ["fzf", "--{shell}"]
+phase   = "completions"
+
+# zsh plugins: sourced only once readable, so a plugin that is not installed
+# costs nothing and breaks nothing.
+[[plugin]]
+name   = "zsh-autosuggestions"
+source = "~/.local/share/zsh/zsh-autosuggestions/zsh-autosuggestions.zsh"
+
+[[plugin]]
+name     = "zsh-syntax-highlighting"
+source   = "/usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
+terminal = true
+
+# This account's own untracked aliases, when it keeps any.
+[[source]]
+name  = "local-aliases"
+path  = "~/.config/shell/aliases.local"
+phase = "aliases"

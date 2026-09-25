@@ -1,0 +1,13 @@
+[include]
+	path = ~/.config/git/identity
+[init]
+	defaultBranch = main
+[pull]
+	ff = only
+[push]
+	autoSetupRemote = true
+[diff]
+	algorithm = histogram
+[alias]
+	st = status --short --branch
+	lg = log --graph --oneline --decorate

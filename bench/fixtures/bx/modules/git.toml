@@ -1,0 +1,23 @@
+# git reads ~/.config/git/config as well as ~/.gitconfig, so bx owns the
+# first whole and leaves the second to the account.
+[[target]]
+path     = "~/.config/git/config"
+file     = "home/.config/git/config"
+requires = ["git"]
+
+[[target]]
+path     = "~/.config/git/ignore"
+file     = "home/.config/git/ignore"
+requires = ["git"]
+
+# The account's identity, which the config above includes. It names two
+# declared values, so it waits until local.toml answers both; every other
+# target applies without them.
+[[target]]
+path     = "~/.config/git/identity"
+content  = """
+[user]
+\tname = {{git_name}}
+\temail = {{git_email}}
+"""
+requires = ["git"]

@@ -1,0 +1,23 @@
+# Neovim's configuration, file by file. The plugin manager rewrites its lock
+# file itself, so the tree leaves it out and bx tracks it rather than writing
+# it: `bx sync` carries this machine's copy back into the repository.
+[[target]]
+path     = "~/.config/nvim"
+tree     = "home/.config/nvim"
+exclude  = ["*.md", "lazy-lock.json"]
+requires = ["nvim"]
+
+[[target]]
+path      = "~/.config/nvim/lazy-lock.json"
+file      = "home/.config/nvim/lazy-lock.json"
+direction = "track"
+
+# `vim` runs Neovim. The link's text is written as is; bx never follows it.
+[[target]]
+path    = "~/.local/bin/vim"
+symlink = "nvim"
+
+[[target]]
+path     = "~/.config/starship.toml"
+file     = "home/.config/starship.toml"
+requires = ["starship"]

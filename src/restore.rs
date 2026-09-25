@@ -51,8 +51,13 @@ use std::path::{Path, PathBuf};
 use crate::fs::{self, Kind, Mode};
 use crate::journal::{self, Content, Ownership, Request, Session, SessionKind};
 use crate::paths::Portable;
+use crate::plan::external;
 use crate::recover;
-use crate::state::{LedgerEntry, Mechanism, Prior, RestoreRef, StateDir};
+use crate::state::{
+    Ledger, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, StateDir,
+    clone_written,
+};
+use crate::sync::Git;
 
 /// Everything that can go wrong restoring.
 #[derive(Debug, thiserror::Error)]
@@ -142,6 +147,15 @@ pub enum Restoration {
         /// What this plan observed at `dest`. The link is made against it, so
         /// a destination that changed since is refused.
         planned: Box<fs::Observed>,
+    },
+    /// bx cloned the git checkout, and nothing in it is anybody's but the
+    /// remote's — or bx never finished it. The whole directory is removed, and
+    /// the directories bx created for it are removed while they are empty.
+    RemoveClone {
+        /// The checkout to remove.
+        dest: PathBuf,
+        /// Directories bx created on the way to it, deepest first.
+        created_dirs: Vec<PathBuf>,
     },
     /// bx changed a directory's mode and it is back at the mode it had before:
     /// there is nothing to put back. Only the ledger entry goes.
@@ -245,6 +259,19 @@ impl Restored {
 /// [`Error::Read`] for a destination path that cannot be observed at all: one
 /// with no parent, or with a `..` component.
 pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Error> {
+    plan_restore_with(entry, home, &Git::at_home(home))
+}
+
+/// [`plan_restore`], asking `git` about a checkout bx cloned.
+///
+/// # Errors
+///
+/// As [`plan_restore`].
+pub fn plan_restore_with(
+    entry: &LedgerEntry,
+    home: &Path,
+    git: &Git,
+) -> Result<Restoration, Error> {
     let dest = entry.path.render(home);
     let observed = match fs::observe(&dest) {
         Ok(observed) => observed,
@@ -285,6 +312,9 @@ pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Err
     }
     if entry.mechanism == Mechanism::Link {
         return Ok(plan_restore_link(entry, home, dest, observed));
+    }
+    if entry.mechanism == Mechanism::Clone {
+        return Ok(plan_restore_clone(entry, home, dest, &observed, git));
     }
 
     match (observed.kind, observed.digest()) {
@@ -448,6 +478,54 @@ fn plan_restore_link(
     }
 }
 
+/// [`plan_restore`] for a git checkout bx cloned, from what was observed at
+/// `dest`.
+///
+/// The checkout is removed whole, and only when removing it loses nothing but
+/// what the remote has:
+///
+/// * nothing there is [`Restoration::AlreadyGone`];
+/// * a directory bx never finished cloning is [`Restoration::RemoveClone`] as
+///   it stands — nothing in it was ever the user's;
+/// * a finished checkout is [`Restoration::RemoveClone`] only when
+///   `git status` shows nothing, ignored files aside, and every commit on any
+///   ref, `HEAD` and the stash is on a remote-tracking branch or is the
+///   commit bx left checked out. Anything else is a
+///   [`Restoration::Conflict`] naming it, and nothing is forgotten;
+/// * anything that is not a directory is not what bx cloned: a conflict.
+fn plan_restore_clone(
+    entry: &LedgerEntry,
+    home: &Path,
+    dest: PathBuf,
+    observed: &fs::Observed,
+    git: &Git,
+) -> Restoration {
+    let created_dirs = entry
+        .created_dirs
+        .iter()
+        .map(|dir| dir.render(home))
+        .collect();
+    match observed.kind {
+        Kind::Absent => Restoration::AlreadyGone { dest },
+        Kind::Dir if entry.written == clone_written(None) => {
+            Restoration::RemoveClone { dest, created_dirs }
+        }
+        Kind::Dir => match external::kept_by_rm(git, &dest, entry) {
+            None => Restoration::RemoveClone { dest, created_dirs },
+            Some(why) => Restoration::Conflict {
+                note: format!("{why}; bx is leaving the checkout and forgetting nothing"),
+                dest,
+            },
+        },
+        kind => Restoration::Conflict {
+            note: format!(
+                "is {kind}, not the checkout bx cloned; bx is leaving it and forgetting nothing"
+            ),
+            dest,
+        },
+    }
+}
+
 /// Put back what bx displaced at each of `targets`, through a journalled
 /// session.
 ///
@@ -480,17 +558,114 @@ pub fn restore(
     home: &Path,
     targets: &[Portable],
 ) -> Result<Vec<Restored>, Error> {
-    // One lock across the recovery and the session: see
+    restore_with(state, home, targets, &Git::at_home(home))
+}
+
+/// [`restore`], asking `git` about a checkout bx cloned.
+///
+/// A clone is not a write a journal can roll back — its bytes are git's, not
+/// bx's — so it is removed outside the session, under the same lock and
+/// before the session opens, by [`remove_clone`]. Every other target is
+/// restored through the session exactly as [`restore`] says. The results are
+/// in the order of `targets`.
+///
+/// # Errors
+///
+/// As [`restore`], and [`Error::Journal`] when a checkout cannot be removed.
+pub fn restore_with(
+    state: &StateDir,
+    home: &Path,
+    targets: &[Portable],
+    git: &Git,
+) -> Result<Vec<Restored>, Error> {
+    // One lock across the recovery, the clones and the session: see
     // `recover::lock_for_writing`.
     let lock = recover::lock_for_writing(state)?;
-    let mut session =
-        Session::open_locked(state, SessionKind::Restore, home, targets.to_vec(), lock)?;
-    let mut done = Vec::with_capacity(targets.len());
-    for target in targets {
-        done.push(restore_one(&mut session, target)?);
+    let mut done: Vec<Option<Restored>> = vec![None; targets.len()];
+    let mut rest = Vec::with_capacity(targets.len());
+    {
+        let mut ledger = Ledger::open(state, &lock, home)
+            .map_err(journal::Error::from)?
+            .value;
+        for (at, target) in targets.iter().enumerate() {
+            let clone = ledger
+                .get(target)
+                .filter(|entry| entry.mechanism == Mechanism::Clone)
+                .cloned();
+            match clone {
+                Some(entry) => done[at] = Some(remove_clone(&mut ledger, &entry, home, git)?),
+                None => rest.push(at),
+            }
+        }
+    }
+    let scope = rest.iter().map(|at| targets[*at].clone()).collect();
+    let mut session = Session::open_locked(state, SessionKind::Restore, home, scope, lock)?;
+    for at in rest {
+        done[at] = Some(restore_one(&mut session, &targets[at])?);
     }
     session.finish()?;
-    Ok(done)
+    Ok(done.into_iter().flatten().collect())
+}
+
+/// Remove one checkout bx cloned, as [`plan_restore_clone`] decides, and
+/// forget it.
+///
+/// Crash-safe by the ledger alone. Before the first byte goes, the entry is
+/// re-recorded as unfinished — [`clone_written`] of `None` — and saved, so a
+/// removal that stops part way leaves an entry the next `rm` removes whole
+/// and the next `apply` clones afresh, never a half-deleted directory taken
+/// for the user's checkout. The entry is forgotten and saved only once the
+/// directory is gone; the directories bx created for it are then removed
+/// where empty, and a claim on one that still stands is handed to an entry
+/// beneath it, as a session hands a removed file's claims.
+fn remove_clone(
+    ledger: &mut Ledger,
+    entry: &LedgerEntry,
+    home: &Path,
+    git: &Git,
+) -> Result<Restored, Error> {
+    let target = entry.path.clone();
+    match plan_restore_with(entry, home, git)? {
+        Restoration::Conflict { dest, note } => Ok(Restored::Conflict { target, dest, note }),
+        Restoration::AlreadyGone { dest } => {
+            let claims: Vec<PathBuf> = entry.created_dirs.iter().map(|d| d.render(home)).collect();
+            let _ = ledger.forget(&target);
+            journal::hand_off_claims(ledger, home, &claims)?;
+            ledger.save().map_err(journal::Error::from)?;
+            Ok(Restored::AlreadyGone { target, dest })
+        }
+        Restoration::RemoveClone { dest, created_dirs } => {
+            ledger
+                .record(NewEntry::new(
+                    target.clone(),
+                    clone_written(None),
+                    entry.mode,
+                    Mechanism::Clone,
+                    PriorBytes::Absent,
+                ))
+                .map_err(journal::Error::from)?;
+            ledger.save().map_err(journal::Error::from)?;
+            if std::fs::symlink_metadata(&dest).is_ok_and(|meta| meta.is_dir()) {
+                std::fs::remove_dir_all(&dest).map_err(|source| journal::Error::Io {
+                    path: dest.clone(),
+                    source,
+                })?;
+            }
+            let _ = ledger.forget(&target);
+            journal::prune_claims(ledger, home, &created_dirs)?;
+            journal::hand_off_claims(ledger, home, &created_dirs)?;
+            ledger.save().map_err(journal::Error::from)?;
+            Ok(Restored::Removed { target, dest })
+        }
+        // `plan_restore_clone` decides nothing else.
+        _ => Ok(Restored::Conflict {
+            target,
+            dest: entry.path.render(home),
+            note: "is a checkout bx cloned and cannot be removed; bx is leaving it and \
+                   forgetting nothing"
+                .to_string(),
+        }),
+    }
 }
 
 /// Restore one target inside an open session.
@@ -616,6 +791,15 @@ fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Err
                 dest,
             })
         }
+        // A clone is removed by `remove_clone` before the session opens, so
+        // one reaching a session is refused rather than removed unjournalled.
+        Restoration::RemoveClone { dest, .. } => Ok(Restored::Conflict {
+            target: target.clone(),
+            dest,
+            note: "is a checkout bx cloned, which rm removes only outside a session; bx is \
+                   leaving it and forgetting nothing"
+                .to_string(),
+        }),
         Restoration::Remove {
             dest,
             created_dirs,

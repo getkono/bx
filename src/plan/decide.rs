@@ -1158,7 +1158,7 @@ fn ownership(
 }
 
 /// How a ledger mechanism reads in a note.
-const fn attached_as(mechanism: &Mechanism) -> &'static str {
+pub(super) const fn attached_as(mechanism: &Mechanism) -> &'static str {
     match mechanism {
         Mechanism::Own => "the whole file",
         Mechanism::Region { .. } => "a managed region",

@@ -625,8 +625,11 @@ pub fn run(
 /// which is its path, so it declares its file the same way.
 ///
 /// A tracked target also declares its repo copy, which `sync` claims in the
-/// ledger: the file in the repo its `file` names, whether the target is ready
-/// or held back.
+/// ledger: the file in the repo its `file` names. A held-back tracked target's
+/// `file` may itself wait on a value, so its copy cannot be named; while any
+/// tracked target is held back, every ledger entry under the config repo
+/// counts as declared — the conservative rule a blocked secret gets — rather
+/// than advising `bx rm` on a copy the configuration may still declare.
 ///
 /// The rows are [`decide::decide_undeclared`]'s, which writes nothing, so they
 /// produce no op: `apply` leaves the file and its ledger entry as they are,
@@ -640,11 +643,17 @@ fn undeclared_rows(
         .declared_targets()
         .filter(|(_, resolution)| matches!(resolution, Resolution::Blocked(_)))
         .map(|(declared, _)| declared.path.as_str());
+    let tracking_held_back = inputs.declared_targets().any(|(declared, resolution)| {
+        matches!(resolution, Resolution::Blocked(_)) && declared.direction == Direction::Track
+    });
+    let repo = paths::normalize(&inputs.repo);
     let copies: Vec<Portable> = inputs
-        .declared_targets()
-        .map(|(declared, resolution)| match resolution {
-            Resolution::Ready(target) => target,
-            Resolution::Blocked(_) => declared,
+        .resolved
+        .targets
+        .iter()
+        .filter_map(|resolution| match resolution {
+            Resolution::Ready(target) => Some(target),
+            Resolution::Blocked(_) => None,
         })
         .filter(|target| target.direction == Direction::Track)
         .filter_map(|target| match &target.body {
@@ -685,6 +694,10 @@ fn undeclared_rows(
     ledger
         .iter()
         .filter(|(path, _)| !declared.contains(path.as_str()))
+        // Lexical, like every containment verdict bx makes.
+        .filter(|(path, _)| {
+            !(tracking_held_back && paths::normalize(&path.render(&inputs.home)).starts_with(&repo))
+        })
         .map(|(_, entry)| decide::decide_undeclared(entry, &origin, &inputs.home))
         .collect()
 }
@@ -4410,6 +4423,58 @@ pub(crate) mod tests {
 
             let report = plan(&inputs(&home, &blocked));
             assert_eq!(report.actions(), vec![Action::Blocked]);
+        }
+
+        /// Track `~/.lock` against `files/lock`, then change this machine's
+        /// copy and sync, so the ledger claims the repo copy.
+        fn synced_repo_copy(home: &GuardedHome) {
+            let copy = home.child(".config/bx/files/lock");
+            std::fs::create_dir_all(copy.parent().expect("a parent")).expect("parents");
+            std::fs::write(&copy, "a\n").expect("the repo copy");
+            std::fs::write(home.child(".lock"), "a\n").expect("the machine copy");
+            let tracked = inputs(
+                home,
+                "[[target]]\npath = \"~/.lock\"\nfile = \"files/lock\"\ndirection = \"track\"\n",
+            );
+            apply(&tracked);
+            std::fs::write(home.child(".lock"), "b\n").expect("the change");
+            assert!(
+                run(&tracked, Mode::Sync, &mut |_| Ok(true))
+                    .expect("sync")
+                    .executed
+            );
+            let key = Portable::parse_in("~/.config/bx/files/lock", home.path()).expect("a path");
+            assert!(
+                ledger(home).get(&key).is_some(),
+                "sync claims the repo copy"
+            );
+        }
+
+        #[test]
+        fn a_tracked_target_held_back_keeps_its_synced_repo_copy_declared() {
+            // Its `file` waits on the value, so the copy cannot be named; and
+            // its path waits on it, so neither side can.
+            for target in [
+                "[[target]]\npath = \"~/.lock\"\nfile = \"files/{{who}}\"\ndirection = \"track\"\n",
+                "[[target]]\npath = \"~/.{{who}}\"\nfile = \"files/lock\"\ndirection = \"track\"\n",
+            ] {
+                let home = guarded_home();
+                synced_repo_copy(&home);
+                let blocked = format!(
+                    "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n{target}"
+                );
+                let report = plan(&inputs(&home, &blocked));
+                assert_eq!(report.actions(), vec![Action::Blocked], "{target}");
+            }
+        }
+
+        #[test]
+        fn a_synced_repo_copy_is_undeclared_once_no_tracked_target_is_held_back() {
+            let home = guarded_home();
+            synced_repo_copy(&home);
+            let report = plan(&inputs(&home, &inline("~/.b", "b\\n")));
+            assert_eq!(report.actions(), vec![Action::Create, Action::Undeclared]);
+            assert_eq!(report.changes[1].target, "~/.config/bx/files/lock");
         }
 
         #[test]

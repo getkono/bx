@@ -1334,15 +1334,19 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///   string is known in neither case, so a later reference to it by another
 ///   name is [`Reason::UnreadableReference`]; its own next extension still
 ///   reads it.
-/// * **a removal** — optional blanks, then exactly `path=(${path:#WORD})`,
-///   `WORD` as in a gated assignment. zsh takes every entry of `PATH` that is
-///   `WORD` out, and nothing else changes, so nothing it can do is a
-///   relocation; `WORD` must still resolve, because a reference to nothing
-///   would leave a word that names some other entry.
+/// * **a removal** — optional blanks, then exactly zsh's
+///   `path=(${path:#WORD})` or exactly bash's
+///   `PATH=:${PATH//:/::}:; PATH=${PATH//":WORD:"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}`,
+///   `WORD` as in a gated assignment, and in bash's shape not ending in an
+///   unbraced reference, which zsh would read the `:` after as a modifier on.
+///   Either shell takes every entry of `PATH` that is `WORD` out, and nothing
+///   else changes, so nothing it can do is a relocation; `WORD` must still
+///   resolve, because a reference to nothing would leave a word that names
+///   some other entry.
 ///
-/// The last two are zsh's own and are read only by [`scan_with`]: bx writes
-/// them only into a fragment zsh sources, and an `environment.d` fragment,
-/// read by [`scan_exported`], refuses both as [`Reason::Unreadable`].
+/// The last two are read only by [`scan_with`]: bx writes them only into a
+/// fragment a shell sources, and an `environment.d` fragment, read by
+/// [`scan_exported`], refuses both as [`Reason::Unreadable`].
 ///
 /// An assignment inside a block is judged exactly as one outside it, so a
 /// condition hides nothing from the guard. After the block closes, every name
@@ -2063,9 +2067,10 @@ enum Statement<'a> {
         value: &'a str,
         exported: bool,
     },
-    /// zsh's `path=(${path:#WORD})`: every entry of `PATH` that is exactly
-    /// `WORD` taken out, and nothing else changed. `word` is the bare word
-    /// removed, already read.
+    /// zsh's `path=(${path:#WORD})`, or bash's line of [`BASH_REMOVAL`]'s
+    /// one shape around `WORD`: every entry of `PATH` that is exactly `WORD`
+    /// taken out, and nothing else changed. `word` is the bare word removed,
+    /// already read.
     Removal { word: Word<'a> },
     /// `if TEST; then`, where `TEST` is exactly one a runtime `when` condition
     /// renders ([`crate::config::when::is_opener`]).
@@ -2084,8 +2089,24 @@ const SEARCH_PATH: &str = "PATH";
 /// its assignment.
 const GATE: (&str, &str) = ("[[ -d ", " ]] && ");
 
-/// What opens and closes a [`Statement::Removal`] line, around its word.
+/// What opens and closes zsh's [`Statement::Removal`] line, around its word.
 const REMOVAL: (&str, &str) = ("path=(${path:#", "})");
+
+/// What opens and closes bash's [`Statement::Removal`] line, around its word.
+///
+/// bash ties no array to `PATH`, so it takes an entry out with five
+/// assignments to `PATH` on one line: every `:` doubled and one more at each
+/// end, so each entry stands between colons of its own; every `:WORD:` dropped,
+/// which with no colon shared takes out every copy; the doubled colons
+/// collapsed; the two added stripped. The word is double-quoted, so a `/` in
+/// it does not end the pattern and no character in it is a glob, and a
+/// reference in it expands as it would bare. Nothing but `PATH` is assigned,
+/// and what it holds after is what it held before less every entry that is
+/// `WORD`, so the line is judged exactly as zsh's is.
+const BASH_REMOVAL: (&str, &str) = (
+    "PATH=:${PATH//:/::}:; PATH=${PATH//\":",
+    ":\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}",
+);
 
 /// Read one line of a fragment against the statement grammar.
 fn statement(line: &str) -> Statement<'_> {
@@ -2124,11 +2145,21 @@ fn statement(line: &str) -> Statement<'_> {
             })
             .unwrap_or(Statement::Refused);
     }
-    if let Some(word) = text
-        .strip_prefix(REMOVAL.0)
-        .and_then(|rest| rest.strip_suffix(REMOVAL.1))
-    {
-        return exact_word(word).map_or(Statement::Refused, |word| Statement::Removal { word });
+    for (open, close) in [REMOVAL, BASH_REMOVAL] {
+        if let Some(word) = text
+            .strip_prefix(open)
+            .and_then(|rest| rest.strip_suffix(close))
+        {
+            // In bash's shape a `:` follows the word, which zsh would read
+            // as the start of a modifier on an unbraced reference ending it.
+            let modified = close == BASH_REMOVAL.1
+                && word.rfind('$').is_some_and(|at| {
+                    !word[at + 1..].starts_with('{') && !word[at..].contains('/')
+                });
+            return exact_word(word)
+                .filter(|_| !modified)
+                .map_or(Statement::Refused, |word| Statement::Removal { word });
+        }
     }
     match assignment_in(text) {
         Some((name, value, exported)) => Statement::Assign {
@@ -2168,7 +2199,7 @@ fn exact_word(text: &str) -> Option<Word<'_>> {
 }
 
 /// `statement` as a fragment of this syntax reads it: a gated assignment and a
-/// removal are zsh's own, and an `environment.d` fragment, where
+/// removal are a shell's, and an `environment.d` fragment, where
 /// `every_exported`, reads neither.
 fn readable(statement: Statement<'_>, every_exported: bool) -> Statement<'_> {
     match statement {
@@ -3931,6 +3962,40 @@ mod tests {
             panic!("a removal is read");
         };
         assert_eq!(word.text, "${CARGO_HOME}/bin");
+        let bash = |word: &str| format!("{}{word}{}", BASH_REMOVAL.0, BASH_REMOVAL.1);
+        for (line, removed) in [
+            (bash("${CARGO_HOME}/bin"), "${CARGO_HOME}/bin"),
+            (format!("  {}", bash("$HOME/bin")), "$HOME/bin"),
+            (bash("/usr/local/bin"), "/usr/local/bin"),
+        ] {
+            let Statement::Removal { word } = statement(&line) else {
+                panic!("bash's removal is read: {line:?}");
+            };
+            assert_eq!(word.text, removed);
+        }
+        // bash's shape, near missed: the word, each assignment, or what
+        // follows the line.
+        let bash_near_misses = [
+            bash("~/x"),
+            bash("$HOME"),
+            bash("${HOME}/x/$Y"),
+            bash("/x*"),
+            bash("/x /y"),
+            bash("$(pwd)"),
+            bash("/x\"/evil\""),
+            bash("/x:\"/}; export CARGO_HOME=/etc/evil; : \"${PATH//\":/x"),
+            format!("{}; export CARGO_HOME=/etc/evil", bash("/x")),
+            format!("{} # note", bash("/x")),
+            bash("/x").replace("PATH=${PATH#:}; ", ""),
+            bash("/x").replace("${PATH%:}", "${PATH%%:*}"),
+            bash("/x").replace(":; PATH=${PATH//\":", ":; FPATH=${PATH//\":"),
+            bash("/x").replace("\":/x:\"", ":/x:"),
+        ];
+        for line in &bash_near_misses {
+            let (found, scope) = pass(line, &rooted(), false);
+            assert_ne!(found, vec![], "{line:?}");
+            assert!(scope.lost, "{line:?}");
+        }
 
         // Every near miss is a line the guard does not read, so nothing after
         // it is known either.
@@ -4048,8 +4113,42 @@ mod tests {
             ),
             vec![]
         );
-        // Both are zsh's own, and an `environment.d` fragment reads neither.
-        for line in ["[[ -d /a ]] && PATH=/a:$PATH", "path=(${path:#/a})"] {
+        // bash's removal is judged exactly as zsh's: its value as one string
+        // is unknown after it, its word must resolve, and a later entry is
+        // judged.
+        let bash = |word: &str| format!("{}{word}{}", BASH_REMOVAL.0, BASH_REMOVAL.1);
+        for (content, expected) in [
+            (
+                format!(
+                    "export PATH=/usr/bin:/opt/x/bin\n{}\nexport INFOPATH=$PATH\n",
+                    bash("/opt/x/bin")
+                ),
+                vec![(3, Reason::UnreadableReference)],
+            ),
+            (
+                format!("{}\nexport PATH=$HOME/.local/state/bx:$PATH\n", bash("/a")),
+                vec![(2, Reason::BxOwnedDirectory)],
+            ),
+            (
+                format!("{}\n", bash("${NOWHERE}/bin")),
+                vec![(1, Reason::UnresolvedReference)],
+            ),
+            (
+                format!(
+                    "export CARGO_HOME=/var/mnt/scratch/example/cargo\n{}\n",
+                    bash("${CARGO_HOME}/bin")
+                ),
+                vec![],
+            ),
+        ] {
+            assert_eq!(reasons(&content, &roots), expected, "{content:?}");
+        }
+        // Each is a shell's, and an `environment.d` fragment reads neither.
+        for line in [
+            "[[ -d /a ]] && PATH=/a:$PATH",
+            "path=(${path:#/a})",
+            &bash("/a"),
+        ] {
             let found = scan_exported(line, &roots);
             assert_eq!(
                 found.iter().map(|v| v.reason).collect::<Vec<_>>(),
@@ -8919,6 +9018,10 @@ mod tests {
          [[ -d /var/mnt/scratch/example ]] && export PATH=/var/mnt/scratch/example/bin:$PATH\n\
          [[ -d /var/mnt/scratch/example/none ]] && export PATH=/b:$PATH\n\
          path=(${path:#/a})\n",
+        // bash's removal, which both shells read alike.
+        "export PATH=/a:/b:/a:/a:$PATH\n\
+         PATH=:${PATH//:/::}:; PATH=${PATH//\":/a:\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}\n\
+         export PATH=/a:$PATH\n",
         "export XDG_STATE_HOME=~/.local/state/bx\n",
         "export npm_config_cache=/etc/evil\nexport TMPDIR=/tmp\n",
         "X=\"it's\"\nY='say \"hi\"'\nZ='a\\b'\nW='$(echo pwned)'\nV=\"{a,b} *\"\n",
@@ -8962,6 +9065,7 @@ mod tests {
             position,
             if_exists,
             enabled: true,
+            shells: crate::shell::Shells::EVERY,
             origin: crate::config::Origin::unknown(Path::new("bx.toml")),
         };
         let cargo = root.join("cargo");
@@ -8998,6 +9102,97 @@ mod tests {
     }
 
     #[test]
+    fn bash_s_path_lines_are_approved_and_give_bash_the_declared_order_once_even_after_zsh() {
+        use crate::config::env::{Fragment, Syntax, Var};
+        use crate::config::path::{self, PathEntry, Position, shell_spelling};
+        let shells = Shells::found();
+        let find = |name: &str| {
+            shells
+                .found
+                .iter()
+                .find(|(shell, _, _)| shell.program == name)
+        };
+        let Some((bash, bash_program, _)) = find("bash") else {
+            return;
+        };
+        let home = shells.home();
+        let root = shells.root();
+        for dir in ["bin", "opt/bin", ".cargo/bin"] {
+            std::fs::create_dir_all(home.join(dir)).expect("a sandbox directory");
+        }
+        let entry = |dir: &str, position, if_exists| PathEntry {
+            dir: dir.to_string(),
+            shell: shell_spelling(dir).expect("a PATH entry"),
+            position,
+            if_exists,
+            enabled: true,
+            shells: crate::shell::Shells::EVERY,
+            origin: crate::config::Origin::unknown(Path::new("bx.toml")),
+        };
+        let cargo = root.join("cargo");
+        let entries = vec![
+            entry("/opt/tool/bin", Position::Append, false),
+            entry("~/bin", Position::Prepend, false),
+            entry("~/.local/bin", Position::Prepend, true),
+            entry("$HOME/opt/bin", Position::Prepend, true),
+            entry("${CARGO_HOME}/bin", Position::Prepend, false),
+            entry("~/.cargo/bin", Position::Remove, false),
+        ];
+        let fragment = format!(
+            "export CARGO_HOME={}\n{}",
+            cargo.display(),
+            path::render(&entries, crate::shell::Shell::Bash)
+        );
+        assert_eq!(scan_with(&fragment, &shells.rooted()), vec![]);
+
+        // An inherited PATH holding the stale install twice, a declared entry
+        // out of place and repeated side by side, and an empty entry; then
+        // the lines read once, and again as a nested bash reads them. Every
+        // copy of an entry taken out goes, and nothing else moves.
+        let h = home.display();
+        let inherited =
+            format!("export PATH={h}/.cargo/bin:{h}/bin:{h}/bin:/usr/bin::{h}/.cargo/bin\n");
+        let once = format!("{inherited}{fragment}");
+        let twice = format!("{once}{fragment}");
+        let expected = format!(
+            "{h}/bin:{h}/opt/bin:{}/bin:/usr/bin::/opt/tool/bin",
+            cargo.display()
+        );
+        for content in [&once, &twice] {
+            let after = variables_after(bash, bash_program, &home, content);
+            assert_eq!(after.get("PATH"), Some(&expected), "{content}");
+        }
+
+        // A bash started from a zsh that read zsh's lines for the same
+        // entries finds every entry already where it goes, and repeats none.
+        let Some((zsh, zsh_program, _)) = find("zsh") else {
+            return;
+        };
+        let zsh_fragment = Fragment {
+            syntax: Syntax::Zsh,
+            vars: vec![Var::always("CARGO_HOME", cargo.display().to_string())],
+            path: entries,
+        }
+        .render(&|_| unreachable!("nothing is gated on a tool"));
+        let inherited = format!("export PATH={h}/.cargo/bin:/usr/bin:{h}/bin\n");
+        let from_zsh = variables_after(
+            zsh,
+            zsh_program,
+            &home,
+            &format!("{inherited}{zsh_fragment}"),
+        )
+        .remove("PATH")
+        .expect("zsh exports PATH");
+        let after = variables_after(
+            bash,
+            bash_program,
+            &home,
+            &format!("export PATH={from_zsh}\n{fragment}"),
+        );
+        assert_eq!(after.get("PATH"), Some(&from_zsh), "{fragment}");
+    }
+
+    #[test]
     fn a_path_block_ending_on_a_missing_gated_directory_is_approved_and_survives_err_exit() {
         use crate::config::env::{Fragment, Syntax};
         use crate::config::path::{PathEntry, Position, shell_spelling};
@@ -9016,6 +9211,7 @@ mod tests {
             position,
             if_exists: true,
             enabled: true,
+            shells: crate::shell::Shells::EVERY,
             origin: crate::config::Origin::unknown(Path::new("bx.toml")),
         };
         // The first-declared prepend is written last, and its directory does

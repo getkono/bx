@@ -8,7 +8,7 @@
 //!
 //! | file                                  | holds                                          | attached as          |
 //! |---------------------------------------|------------------------------------------------|----------------------|
-//! | [`FILE`], `~/.local/share/bx/bashrc.bash` | the variables, activations, sources, aliases, functions, `[history]` and `[shell-options]` | a file bx owns whole |
+//! | [`FILE`], `~/.local/share/bx/bashrc.bash` | the variables, `[path]`, activations, sources, aliases, functions, `[history]` and `[shell-options]` | a file bx owns whole |
 //! | [`STARTUP_FILE`], `~/.bashrc`         | the one line that sources [`FILE`]              | a fixed region       |
 //! | [`INPUTRC`], `~/.inputrc`             | `[keybindings]`, in readline's syntax           | a file bx owns whole |
 //!
@@ -25,9 +25,14 @@
 //!   bash's words. bash reads no `~/.zprofile`, so a `login` variable is
 //!   written inside a block bash's login test guards, joined to its own
 //!   condition when it has one ([`crate::config::when::login_opener_bash`]).
-//!   A `gui` variable is `environment.d`'s alone. `[path]` is not here: its
-//!   lines are zsh's words, and bash inherits a `PATH` zsh or the session
-//!   exported.
+//!   A `gui` variable is `environment.d`'s alone.
+//! - `path` holds every `[path]` entry `shells` does not keep to zsh, as the
+//!   `zshenv` fragment's lines for them in the same order, the same
+//!   `if_exists` gates and the same closing line, each entry taken out of
+//!   `PATH` in bash's words rather than zsh's ([`crate::config::path::render`]).
+//!   Each added entry is taken out before it is put back, so a bash started
+//!   from a zsh that already read zsh's lines, or from another bash, moves
+//!   the entry rather than repeating it.
 //! - `activations` and `completions` hold every declared activation's bash
 //!   command's output, cached apart from zsh's
 //!   ([`super::activation`]'s *One command per shell*), and any source there.
@@ -44,9 +49,9 @@
 //! - Every `[[source]]` bash reads lands in the phase it names, after that
 //!   phase's own declarations, as the guarded line zsh's file holds.
 //!
-//! The file is placed when anything above reaches bash: a variable, an
-//! enabled alias — gated on a missing tool or not, as zsh's is — a history or
-//! shell option bash reads, a function, a source, or an activation with a
+//! The file is placed when anything above reaches bash: a variable, a
+//! `[path]` entry, an enabled alias — gated on a missing tool or not, as
+//! zsh's is — a history or shell option bash reads, a function, a source, or an activation with a
 //! bash command. Its region in `~/.bashrc` is the one [`crate::config::env`]
 //! attaches to every zsh startup file: the region's delimiters around one
 //! line that sources the file only when it is readable. Its bytes name the
@@ -78,9 +83,10 @@
 //!
 //! # Invariant 2
 //!
-//! The interactive file is judged as zsh's is: its `env` phase is its one
-//! environment fragment, which the plan passes through the guard
-//! ([`Bash::env`]), every opener in it one the guard reads. The `aliases`
+//! The interactive file is judged as zsh's is: its `env` and `path` phases,
+//! which open the file, are its one environment fragment, which the plan
+//! passes through the guard ([`Bash::env`]), every opener and every removal
+//! in it one the guard reads. The `aliases`
 //! phase defines aliases and nothing else; the `functions` phase defines
 //! functions, whose bodies are the user's templates as zsh's are; source
 //! lines test a file and source it; the activation phases hold a tool's
@@ -103,6 +109,7 @@ use super::source::{Source, SourceDecl};
 use super::{Assembly, Phase, Shell, activation};
 use crate::config::env::{EnvDecl, EnvKind, Var, assignment};
 use crate::config::history::{self, History};
+use crate::config::path::{self, PathEntry};
 use crate::config::resolve::{BlockedEntry, Resolution, held_together, resolve_env};
 use crate::config::shell_options::{self, ShellOptions};
 use crate::config::target::{Attach, Body, Direction, Format, Gen, SETTLE, Target};
@@ -171,6 +178,9 @@ pub struct Bash {
     /// The variables, `environment` then `login` then `interactive`, each
     /// kind in the merged configuration's order.
     env: Vec<BashVar>,
+    /// The `[path]` entries that reach bash, in the merged configuration's
+    /// order.
+    path: Vec<PathEntry>,
     /// The enabled aliases, in the merged configuration's order.
     aliases: Vec<AliasDecl>,
     /// The declared history, rendered in bash's names.
@@ -206,6 +216,13 @@ impl Bash {
     #[must_use]
     pub fn with_env(mut self, env: Vec<BashVar>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// The file with `entries` in its `path` phase.
+    #[must_use]
+    pub fn with_path(mut self, entries: Vec<PathEntry>) -> Self {
+        self.path = entries;
         self
     }
 
@@ -245,11 +262,27 @@ impl Bash {
         &self.history
     }
 
-    /// The `env` phase's lines, which the plan judges as the file's one
-    /// environment fragment. Empty when no variable is written.
+    /// The file's one environment fragment, which the plan judges: its
+    /// opening, then its `env` and `path` phases. They are the first phases,
+    /// so these are exactly the file's first bytes, and a line the guard
+    /// names is numbered as the file's own.
     #[must_use]
     pub fn env(&self, present: &dyn Fn(&str) -> bool) -> String {
-        self.env.iter().map(|var| var.render(present)).collect()
+        self.environment(present).render()
+    }
+
+    /// An assembly holding the `env` and `path` phases alone.
+    fn environment(&self, present: &dyn Fn(&str) -> bool) -> Assembly {
+        // Neither phase is the terminal slot, so no contribution is refused.
+        let mut assembly = Assembly::new();
+        let vars: String = self.env.iter().map(|var| var.render(present)).collect();
+        let _ = assembly.contribute(Phase::Env, crate::config::env::SECTION, vars);
+        let _ = assembly.contribute(
+            Phase::Path,
+            path::SECTION,
+            path::render(&self.path, Shell::Bash),
+        );
+        assembly
     }
 
     /// The note the file's plan row carries: every function held back from
@@ -289,8 +322,7 @@ impl Bash {
     #[must_use]
     pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
         // No phase here is the terminal slot, so no contribution is refused.
-        let mut assembly = Assembly::new();
-        let _ = assembly.contribute(Phase::Env, crate::config::env::SECTION, self.env(present));
+        let mut assembly = self.environment(present);
         for alias in &self.aliases {
             let body = alias.render_bash(present);
             if !body.is_empty() {
@@ -354,6 +386,12 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
         .iter()
         .map(|decl| Ok((*decl, resolve_env(decl, values)?)))
         .collect::<Result<Vec<_>, Error>>()?;
+    let entries: Vec<PathEntry> = merged
+        .path
+        .iter()
+        .filter(|entry| entry.shells.includes(Shell::Bash))
+        .cloned()
+        .collect();
     let sources: Vec<SourceDecl> = merged
         .sources
         .iter()
@@ -372,13 +410,14 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
         merged.history.clone(),
         merged.shell_options.clone(),
     );
-    // What places the file: the first variable, else the first enabled
-    // alias, else the history when it says anything bash reads, else the
-    // shell options when they do, else the first function, source or
-    // activation bash gets.
+    // What places the file: the first variable, else the first `[path]`
+    // entry, else the first enabled alias, else the history when it says
+    // anything bash reads, else the shell options when they do, else the
+    // first function, source or activation bash gets.
     let origin = envs
         .first()
         .map(|e| &e.origin)
+        .or_else(|| entries.first().map(|entry| &entry.origin))
         .or_else(|| bash.aliases.first().map(|alias| &alias.origin))
         .or_else(|| {
             bash.history
@@ -433,6 +472,7 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
                 .collect();
             let bash = bash
                 .with_env(env)
+                .with_path(entries)
                 .with_functions(functions)
                 .with_sources(sources)
                 .with_omitted(super::omitted(Shell::Bash, merged));

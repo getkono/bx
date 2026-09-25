@@ -309,9 +309,15 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// line, function body or source path can hold into it; and for a second
 /// enabled plugin claiming the terminal slot.
 fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
-    let (envs, path, plugins, history): (&[EnvDecl], &[PathEntry], &[PluginDecl], &History) =
-        (&merged.envs, &merged.path, &merged.plugins, &merged.history);
     // Only what reaches zsh: a declaration kept to bash is bash's file's.
+    let path: Vec<PathEntry> = merged
+        .path
+        .iter()
+        .filter(|entry| entry.shells.includes(Shell::Zsh))
+        .cloned()
+        .collect();
+    let (envs, path, plugins, history): (&[EnvDecl], &[PathEntry], &[PluginDecl], &History) =
+        (&merged.envs, &path, &merged.plugins, &merged.history);
     let functions: Vec<FunctionDecl> = merged
         .functions
         .iter()

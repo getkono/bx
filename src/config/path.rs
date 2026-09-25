@@ -15,8 +15,8 @@
 //! ```
 //!
 //! Each list holds directories, one per string. An entry is a string, or an
-//! inline table `{ dir = "…", if_exists = true, enabled = false }` when it
-//! needs either flag:
+//! inline table `{ dir = "…", if_exists = true, enabled = false,
+//! shells = ["zsh"] }` when it needs a flag or a restriction:
 //!
 //! - `prepend` — put ahead of the inherited `PATH`, the first entry first.
 //! - `append` — put after it, the first entry first.
@@ -27,12 +27,15 @@
 //!   time a shell starts. Not allowed on a `remove` entry, which removing
 //!   covers whether or not the directory is there.
 //! - `enabled = false` — drop an entry an earlier layer declared.
+//! - `shells` — the shells the entry is kept to, as every other declaration
+//!   takes it ([`crate::shell::Shells`]); without it the entry reaches zsh and
+//!   bash alike.
 //!
 //! # What an entry may say
 //!
 //! An absolute path, `~` or a path under it, or a path that opens with a
 //! variable reference, `${NAME}` or `$NAME`. A reference is **not** resolved
-//! by bx: it is written for zsh to expand, so the variable has to be one the
+//! by bx: it is written for the shell to expand, so the variable has to be one the
 //! same file exports first — an `[[env]]` variable of kind `environment`,
 //! whose `export` lines come before every `PATH` line — or `HOME`. The guard
 //! judges the fragment before it is written, and a reference to anything else
@@ -54,11 +57,15 @@
 //! # Where it lands
 //!
 //! In the `zshenv` fragment, which every zsh reads whether it is a login shell
-//! or not, interactive or not, after the fragment's `[[env]]` variables. Each
-//! prepended or appended entry is first taken out of `PATH` wherever it
-//! already is, so a nested shell that reads the file again moves the entry
-//! rather than repeating it. bash, and the `environment.d` fragment, get no
-//! `PATH` entry from here.
+//! or not, interactive or not, after the fragment's `[[env]]` variables; and
+//! in bash's generated file's `path` phase, after its `env` phase, for every
+//! entry `shells` does not keep to zsh. Each shell gets the same lines in the
+//! same order but for how an entry is taken out of `PATH`, which each says in
+//! its own words ([`render`]). Each prepended or appended entry is first taken
+//! out of `PATH` wherever it already is, so a nested shell that reads the
+//! file again — a zsh, or a bash started from one, whose `PATH` the zsh
+//! already extended — moves the entry rather than repeating it. The
+//! `environment.d` fragment gets no `PATH` entry from here.
 
 use std::path::Path;
 
@@ -66,6 +73,7 @@ use toml_edit::{InlineTable, Table, Value};
 
 use super::{Ctx, Error, Origin};
 use crate::env_guard::is_variable_name;
+use crate::shell::{Shell, Shells};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[path]";
@@ -79,7 +87,7 @@ const LISTS: [(&str, Position); 3] = [
 ];
 
 /// Every key an entry's inline table may carry.
-const ENTRY_KEYS: [&str; 3] = ["dir", "if_exists", "enabled"];
+const ENTRY_KEYS: [&str; 4] = ["dir", "if_exists", "enabled", Shells::KEY];
 
 /// Which list an entry is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,6 +115,8 @@ pub struct PathEntry {
     pub if_exists: bool,
     /// `false` in a later layer drops an entry an earlier one declared.
     pub enabled: bool,
+    /// The shells it reaches.
+    pub shells: Shells,
     /// Where the entry was written.
     pub origin: Origin,
 }
@@ -121,8 +131,9 @@ pub struct PathEntry {
 /// [`Error::UnknownKey`] for a key this version does not know, in the table or
 /// in an entry, [`Error::WrongType`] for a list or an entry of the wrong type,
 /// [`Error::MissingKey`] for an inline entry with no `dir`, and
-/// [`Error::BadValue`] for a directory [`shell_spelling`] refuses or an
-/// `if_exists` on a `remove` entry.
+/// [`Error::BadValue`] for a directory [`shell_spelling`] refuses, an
+/// `if_exists` on a `remove` entry, or a `shells` that names no shell or one
+/// bx does not generate for.
 pub fn parse_path(table: &Table, file: &Path, text: &str) -> Result<Vec<PathEntry>, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);
     ctx.reject_unknown_keys(table, &LISTS.map(|(key, _)| key))?;
@@ -163,8 +174,8 @@ fn parse_entry(
         origin: origin.clone(),
         message,
     };
-    let (dir, if_exists, enabled) = match value {
-        Value::String(dir) => (dir.value().as_str(), false, true),
+    let (dir, if_exists, enabled, shells) = match value {
+        Value::String(dir) => (dir.value().as_str(), false, true, Shells::EVERY),
         Value::InlineTable(entry) => {
             reject_unknown_entry_keys(entry, list, &origin)?;
             let flag = |key: &str| match entry.get(key) {
@@ -184,10 +195,27 @@ fn parse_entry(
                     });
                 }
             };
+            let shells = match entry.get(Shells::KEY) {
+                None => Shells::EVERY,
+                Some(names) => {
+                    let names = names
+                        .as_array()
+                        .and_then(|names| {
+                            names
+                                .iter()
+                                .map(|name| name.as_str().map(str::to_string))
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .ok_or_else(|| wrong(Shells::KEY, "an array of strings", names))?;
+                    Shells::from_names(&names)
+                        .map_err(|problem| bad(format!("`{dir}`: {problem}")))?
+                }
+            };
             (
                 dir,
                 flag("if_exists")?.unwrap_or(false),
                 flag("enabled")?.unwrap_or(true),
+                shells,
             )
         }
         other => {
@@ -211,6 +239,7 @@ fn parse_entry(
         position,
         if_exists,
         enabled,
+        shells,
         origin,
     })
 }
@@ -322,13 +351,30 @@ fn spelled(text: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// The lines the `zshenv` fragment carries for `entries`, after its
-/// variables; empty when there are none.
+/// The lines `shell`'s environment fragment carries for `entries`, after its
+/// variables; empty when there are none. Every entry given is written: which
+/// entries reach `shell` is the caller's to decide from their `shells`.
 ///
 /// Prepended entries are written last first, so the first one declared ends
 /// up first, and each added entry is taken out of `PATH` just before it is
 /// put back where it is declared. Removals come after every entry has been
 /// added.
+///
+/// The two shells differ only in how an entry is taken out of `PATH`, each a
+/// line of one fixed shape the environment guard reads:
+///
+/// - zsh: `path=(${path:#DIR})`, every element of the array tied to `PATH`
+///   that is `DIR` dropped.
+/// - bash, which has no such array: [`BASH_REMOVAL`] around `DIR`, one line
+///   of five assignments to `PATH`. It doubles every `:` and wraps the list in
+///   one more at each end, so each entry stands alone between its own two
+///   colons; drops every `:DIR:`, which with no colon shared between two
+///   entries takes out every copy, adjacent ones included; then collapses the
+///   doubled colons and strips the two it added. `DIR` is double-quoted, so
+///   the `/` in it does not end the pattern and nothing in it is a glob.
+///
+/// Both leave every other entry as and where it was, and neither runs a
+/// command.
 ///
 /// The block never ends on a gated line. A gated line whose directory is
 /// missing returns 1, and a file sourced at startup returns the status of its
@@ -337,16 +383,21 @@ fn spelled(text: &str) -> Result<String, String> {
 /// written is gated, the block closes with [`SETTLE`], which assigns `PATH`
 /// its own value and returns 0.
 #[must_use]
-pub fn render(entries: &[PathEntry]) -> String {
+pub fn render(entries: &[PathEntry], shell: Shell) -> String {
     if entries.is_empty() {
         return String::new();
     }
     let in_list = |position| entries.iter().filter(move |e| e.position == position);
     let mut out = String::from("# [path]\n");
+    let (open, close) = match shell {
+        Shell::Zsh => ZSH_REMOVAL,
+        Shell::Bash => BASH_REMOVAL,
+    };
     let removal = |out: &mut String, dir: &str| {
-        out.push_str("path=(${path:#");
+        out.push_str(open);
         out.push_str(dir);
-        out.push_str("})\n");
+        out.push_str(close);
+        out.push('\n');
     };
     let added = |out: &mut String, entry: &PathEntry, list: String| {
         removal(out, &entry.shell);
@@ -386,6 +437,18 @@ pub fn render(entries: &[PathEntry]) -> String {
 /// assigned its own value, changing nothing and returning 0.
 const SETTLE: &str = "export PATH=${PATH}\n";
 
+/// What opens and closes zsh's line taking one directory out of `PATH`,
+/// around the directory. The environment guard reads exactly this shape.
+const ZSH_REMOVAL: (&str, &str) = ("path=(${path:#", "})");
+
+/// What opens and closes bash's line taking one directory out of `PATH`,
+/// around the directory; [`render`] says how it works. The environment guard
+/// reads exactly this shape.
+const BASH_REMOVAL: (&str, &str) = (
+    "PATH=:${PATH//:/::}:; PATH=${PATH//\":",
+    ":\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}",
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,7 +472,51 @@ mod tests {
             position,
             if_exists,
             enabled: true,
+            shells: Shells::EVERY,
             origin: Origin::unknown(Path::new("/repo/bx.toml")),
+        }
+    }
+
+    #[test]
+    fn an_entry_is_kept_to_the_shells_it_names_and_an_unknown_one_is_refused() {
+        let entries = parse(
+            "[path]\nprepend = [\"/a\", { dir = \"/b\", shells = [\"zsh\"] }]\n\
+             remove = [{ dir = \"/c\", shells = [\"bash\"] }]\n",
+        )
+        .expect("parses");
+        let shells: Vec<_> = entries
+            .iter()
+            .map(|e| (e.shell.as_str(), e.shells))
+            .collect();
+        assert_eq!(
+            shells,
+            vec![
+                ("/a", Shells::EVERY),
+                ("/b", Shells::only(Shell::Zsh)),
+                ("/c", Shells::only(Shell::Bash)),
+            ]
+        );
+        for (text, needle) in [
+            (
+                "[path]\nprepend = [{ dir = \"/b\", shells = [\"fish\"] }]\n",
+                "\"fish\" is not a shell bx generates for",
+            ),
+            (
+                "[path]\nprepend = [{ dir = \"/b\", shells = [] }]\n",
+                "`shells` names no shell",
+            ),
+            (
+                "[path]\nprepend = [{ dir = \"/b\", shells = \"zsh\" }]\n",
+                "`shells` must be an array of strings",
+            ),
+            (
+                "[path]\nprepend = [{ dir = \"/b\", shells = [1] }]\n",
+                "`shells` must be an array of strings",
+            ),
+        ] {
+            let err = parse(text).expect_err(text);
+            assert!(err.contains(needle), "{text}: {err}");
+            assert!(err.contains("/repo/bx.toml:2"), "{text}: {err}");
         }
     }
 
@@ -562,8 +669,9 @@ mod tests {
             entry("${HOME}/.local/bin", Position::Prepend, true),
             entry("/opt/y/bin", Position::Append, false),
         ];
+        let zsh = render(&entries, Shell::Zsh);
         assert_eq!(
-            render(&entries),
+            zsh,
             "# [path]\n\
              path=(${path:#${HOME}/.local/bin})\n\
              [[ -d ${HOME}/.local/bin ]] && export PATH=${HOME}/.local/bin:${PATH}\n\
@@ -575,8 +683,31 @@ mod tests {
              export PATH=${PATH}:/opt/y/bin\n\
              path=(${path:#${HOME}/.cargo/bin})\n"
         );
-        assert_eq!(render(&[]), "");
-        assert_eq!(render(&entries), render(&entries));
+        assert_eq!(render(&[], Shell::Zsh), "");
+        assert_eq!(render(&entries, Shell::Zsh), zsh);
+
+        // bash gets the same lines but for each removal, in its own words.
+        let bash = render(&entries, Shell::Bash);
+        let removal = |dir: &str| {
+            format!(
+                "PATH=:${{PATH//:/::}}:; PATH=${{PATH//\":{dir}:\"/}}; PATH=${{PATH//::/:}}; \
+                 PATH=${{PATH#:}}; PATH=${{PATH%:}}"
+            )
+        };
+        let mut expected = zsh;
+        for dir in [
+            "${HOME}/.local/bin",
+            "${HOME}/bin",
+            "/opt/x/bin",
+            "/opt/y/bin",
+            "${HOME}/.cargo/bin",
+        ] {
+            expected = expected.replace(&format!("path=(${{path:#{dir}}})"), &removal(dir));
+        }
+        assert_eq!(bash, expected);
+        assert!(!bash.contains("path=("), "{bash}");
+        assert_eq!(render(&[], Shell::Bash), "");
+        assert_eq!(render(&entries, Shell::Bash), bash);
     }
 
     #[test]
@@ -584,10 +715,13 @@ mod tests {
         // The first-declared prepend is written last, so with nothing after
         // it the block would end on its gate.
         assert_eq!(
-            render(&[
-                entry("${HOME}/.local/bin", Position::Prepend, true),
-                entry("${HOME}/bin", Position::Prepend, false),
-            ]),
+            render(
+                &[
+                    entry("${HOME}/.local/bin", Position::Prepend, true),
+                    entry("${HOME}/bin", Position::Prepend, false),
+                ],
+                Shell::Zsh
+            ),
             "# [path]\n\
              path=(${path:#${HOME}/bin})\n\
              export PATH=${HOME}/bin:${PATH}\n\
@@ -597,19 +731,30 @@ mod tests {
         );
         // The last append, with no removal after it, is the same case.
         assert_eq!(
-            render(&[entry("/opt/x/bin", Position::Append, true)]),
+            render(&[entry("/opt/x/bin", Position::Append, true)], Shell::Zsh),
             "# [path]\n\
              path=(${path:#/opt/x/bin})\n\
              [[ -d /opt/x/bin ]] && export PATH=${PATH}:/opt/x/bin\n\
              export PATH=${PATH}\n"
         );
-        // A block that ends on anything else gets no extra line.
+        // bash's block closes the same way.
         assert!(
-            !render(&[
-                entry("/opt/x/bin", Position::Append, true),
-                entry("/opt/y/bin", Position::Remove, false),
-            ])
-            .ends_with(SETTLE)
+            render(&[entry("/opt/x/bin", Position::Append, true)], Shell::Bash).ends_with(
+                "[[ -d /opt/x/bin ]] && export PATH=${PATH}:/opt/x/bin\nexport PATH=${PATH}\n"
+            )
         );
+        // A block that ends on anything else gets no extra line.
+        for shell in Shell::ALL {
+            assert!(
+                !render(
+                    &[
+                        entry("/opt/x/bin", Position::Append, true),
+                        entry("/opt/y/bin", Position::Remove, false),
+                    ],
+                    shell
+                )
+                .ends_with(SETTLE)
+            );
+        }
     }
 }

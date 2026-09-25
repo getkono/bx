@@ -358,9 +358,11 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
     for place in Place::ALL {
         let here: Vec<&(&EnvDecl, Resolution<Var>)> = resolved
             .iter()
+            // A variable that lands in `environment.d` carries no `shells`
+            // (the load refuses one), so this keeps only the other shell's
+            // variables out of zsh's files.
             .filter(|(decl, _)| {
-                decl.kind.places().contains(&place)
-                    && (place == Place::EnvironmentD || decl.shells.includes(Shell::Zsh))
+                decl.kind.places().contains(&place) && decl.shells.includes(Shell::Zsh)
             })
             .collect();
         let entries = if place == Place::Zshenv { path } else { &[] };
@@ -1935,6 +1937,57 @@ mod tests {
             region.body,
             Body::Generated(Gen::Source(zshrc_fragment.path.clone()))
         );
+    }
+
+    #[test]
+    fn zsh_s_interactive_row_names_every_declaration_kept_from_zsh() {
+        let both = resolved(
+            &format!(
+                "{}{}shells = [\"bash\"]\n{}shells = [\"zsh\"]\n\
+                 [[function]]\nname = \"fb\"\nbody = \"echo b\"\nshells = [\"bash\"]\n\
+                 [[function]]\nname = \"off\"\nbody = \"x\"\nshells = [\"bash\"]\nenabled = false\n\
+                 [[source]]\nname = \"sb\"\npath = \"~/.bash_extra\"\nshells = [\"bash\"]\n\
+                 [[activation]]\nname = \"ab\"\ncommand = [\"a\", \"{{shell}}\"]\n\
+                 shells = [\"bash\"]\n\
+                 [[activation]]\nname = \"bonly\"\nbash = [\"b\", \"init\"]\n\
+                 [[activation]]\nname = \"both\"\ncommand = [\"c\", \"{{shell}}\"]\n",
+                env("EDITOR", "nvim", "interactive"),
+                env("BONLY", "1", "login"),
+                env("ZONLY", "1", "interactive"),
+            ),
+            None,
+        )
+        .unwrap();
+        let zshrc = target_at(&both, "~/.local/share/bx/zshrc.zsh");
+        let Body::Generated(generator) = &zshrc.body else {
+            panic!("{:?}", zshrc.body);
+        };
+        // Every enabled entry `shells` keeps from zsh, in declaration-kind
+        // order, then the activation that reaches zsh with no zsh command.
+        // The disabled function, the zsh-only variable and the shared
+        // activation are not named.
+        assert_eq!(
+            generator.note().as_deref(),
+            Some(
+                "not in zsh: env `BONLY`, function `fb`, source `sb`, activation `ab`; \
+                 activation `bonly` declares no zsh command, so it is not run for zsh"
+            )
+        );
+        // The bash-only variable reaches none of zsh's files.
+        assert!(
+            !keys(&both).iter().any(|key| key.ends_with("zprofile.zsh")),
+            "{:?}",
+            keys(&both)
+        );
+    }
+
+    /// The ready target at `path`.
+    fn target_at<'r>(resolved: &'r Resolved, path: &str) -> &'r Target {
+        let index = keys(resolved)
+            .iter()
+            .position(|key| key == path)
+            .unwrap_or_else(|| panic!("{path}: {:?}", keys(resolved)));
+        ready(resolved, index)
     }
 
     /// One `[[plugin]]` entry, as TOML.

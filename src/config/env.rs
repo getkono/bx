@@ -13,9 +13,11 @@
 //! ```
 //!
 //! `shells` keeps the variable to the shells it lists
-//! ([`crate::shell::Shells`]); `environment.d` is no shell's, so a variable
-//! landing there lands there whatever it says, and a `gui` variable may not
-//! carry it.
+//! ([`crate::shell::Shells`]). `environment.d` is no shell's: every program
+//! the session starts inherits what it sets, whichever shell that is. So a
+//! variable that lands there — `kind = "environment"` or `"gui"` — may not
+//! carry `shells`; keep one shell's variable out of the other with
+//! `kind = "login"` or `"interactive"`.
 //!
 //! `when` gates the variable on one condition from the closed set
 //! [`super::when`] defines. A runtime condition wraps the variable's line in a
@@ -212,13 +214,15 @@ pub fn parse_env(table: &Table, file: &Path, text: &str) -> Result<EnvDecl, Erro
     };
 
     let shells = Shells::parse_in(&ctx, table, &format!("`{name}`"))?;
-    if kind == EnvKind::Gui && table.get(Shells::KEY).is_some() {
+    if kind.places().contains(&Place::EnvironmentD) && table.get(Shells::KEY).is_some() {
         return Err(ctx.bad(
             table,
             Shells::KEY,
             format!(
-                "`{name}`: a variable of `kind = \"gui\"` lands in `environment.d` alone, which \
-                 no shell reads; drop `shells`"
+                "`{name}`: a variable of `kind = {raw_kind:?}` lands in `environment.d`, which \
+                 is no shell's: every program the session starts inherits it, whichever shell \
+                 it is, so it cannot be kept to one; drop `shells`, or give it \
+                 `kind = \"login\"` or `\"interactive\"`"
             ),
         ));
     }
@@ -506,10 +510,19 @@ mod tests {
             assert!(err.contains(expected), "{err}");
             assert!(err.contains("`A`"), "{err}");
         }
-        let err =
-            parse("[[env]]\nname = \"A\"\nvalue = \"1\"\nkind = \"gui\"\nshells = [\"zsh\"]\n")
-                .expect_err("refused");
-        assert!(err.contains("no shell reads"), "{err}");
+        // A variable that lands in `environment.d` reaches every shell the
+        // session starts, so it cannot be kept to one.
+        for kind in ["gui", "environment"] {
+            let err = parse(&format!(
+                "[[env]]\nname = \"A\"\nvalue = \"1\"\nkind = \"{kind}\"\nshells = [\"bash\"]\n"
+            ))
+            .expect_err("refused");
+            assert!(
+                err.contains(&format!("`kind = \"{kind}\"` lands in `environment.d`")),
+                "{err}"
+            );
+            assert!(err.contains("drop `shells`"), "{err}");
+        }
     }
 
     #[test]

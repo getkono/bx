@@ -79,7 +79,7 @@ shells = ["zsh"]
 [[env]]
 name = "TERMINAL"
 value = "foot"
-kind = "environment"
+kind = "login"
 shells = ["bash"]
 
 [aliases]

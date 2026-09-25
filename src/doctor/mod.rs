@@ -503,6 +503,27 @@ install = \"sudo dnf install bx-no-such-tool\"
     }
 
     #[test]
+    fn a_set_aside_journal_is_named_as_well() {
+        let home = guarded_home();
+        let state = crate::state::StateDir::resolve(home.path());
+        std::fs::create_dir_all(state.root()).unwrap();
+        std::fs::write(state.root().join("journal.mpk.corrupt"), b"old").unwrap();
+        std::fs::write(state.root().join("journal.mpk.corrupt.1"), b"older").unwrap();
+
+        let (out, code) = doctor_of(&home, "", OsStr::new(""), &Every::unreachable());
+
+        assert_eq!(
+            out,
+            "  ! ~/.local/state/bx/journal.mpk.corrupt is a damaged state file bx set aside, and \
+             bx never deletes one; look at it, then move it out of the state directory\n  \
+             ! ~/.local/state/bx/journal.mpk.corrupt.1 is a damaged state file bx set aside, \
+             and bx never deletes one; look at it, then move it out of the state directory\n\
+             Doctor: 2 finding(s).\n"
+        );
+        assert_eq!(code, Exit::Pending);
+    }
+
+    #[test]
     fn a_state_file_that_is_not_a_regular_file_stops_every_state_read() {
         let home = guarded_home();
         let state = crate::state::StateDir::resolve(home.path());

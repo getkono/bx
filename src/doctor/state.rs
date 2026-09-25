@@ -20,7 +20,9 @@ use super::Finding;
 use crate::paths;
 use crate::plan;
 use crate::recover::{self, Interrupted};
-use crate::state::{Fingerprints, Health, LedgerView, Loaded, SharedLock, StateDir, Unlisted};
+use crate::state::{
+    self, Fingerprints, Health, LedgerView, Loaded, SharedLock, StateDir, Unlisted,
+};
 
 /// What reading the state directory found, split by the check that reports it.
 #[derive(Debug, Default)]
@@ -78,6 +80,19 @@ pub fn check(state: &StateDir, home: &Path) -> Found {
         }
         Err(error) => found.damage.push(unread(at(&state.fingerprints()), &error)),
     }
+    // The journal has no lockless reader that lists its quarantines, and
+    // `recover::pending` moves nothing aside, so the ones recovery made are
+    // listed here directly.
+    match state::quarantines(&state.journal()) {
+        Ok(aside) => found.damage.extend(set_aside(&aside, &at)),
+        Err(why) => {
+            unlisted = unlisted.or(Some(Unlisted {
+                path: state.root().to_path_buf(),
+                kind: why.kind(),
+                cause: why.to_string(),
+            }));
+        }
+    }
     if let Some(unlisted) = unlisted {
         found.damage.push(Finding {
             subject: at(&unlisted.path),
@@ -120,8 +135,12 @@ fn health(subject: &str, health: &Health, then: &str) -> Option<Finding> {
 
 /// A finding for every copy of a damaged file that is standing aside.
 fn quarantined<T>(loaded: &Loaded<T>, at: &dyn Fn(&Path) -> String) -> Vec<Finding> {
-    loaded
-        .quarantined
+    set_aside(&loaded.quarantined, at)
+}
+
+/// A finding for each set-aside copy in `aside`.
+fn set_aside(aside: &[PathBuf], at: &dyn Fn(&Path) -> String) -> Vec<Finding> {
+    aside
         .iter()
         .map(|path: &PathBuf| Finding {
             subject: at(path),

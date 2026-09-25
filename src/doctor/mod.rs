@@ -28,8 +28,11 @@
 //! 6. [`sources`] — a declared optional source whose file is not readable.
 //! 7. [`systemd`] — a declared unit file systemd has not reloaded, that is not
 //!    enabled, that it could not load, or that has failed.
+//! 8. [`references`] — a path a written target declares in `references` that
+//!    is not on disk.
 
 pub mod modes;
+pub mod references;
 pub mod sources;
 pub mod state;
 pub mod systemd;
@@ -88,6 +91,12 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
     findings.extend(modes::check(inputs.targets(), home));
     findings.extend(sources::check(inputs.targets(), home, &sources::readable));
     findings.extend(systemd::check(&units, probes.systemd));
+    findings.extend(references::check(
+        inputs.targets(),
+        &state.ledger,
+        home,
+        &references::exists,
+    ));
     Report { findings }
 }
 
@@ -562,6 +571,42 @@ install = \"sudo dnf install bx-no-such-tool\"
              the next `bx apply` sets it aside and rolls nothing back\nDoctor: 1 finding(s).\n"
         );
         assert_eq!(std::fs::read(state.journal()).unwrap(), b"garbage");
+    }
+
+    #[test]
+    fn a_missing_reference_of_an_applied_target_reports_last_and_twice_the_same() {
+        let home = guarded_home();
+        // Declared first, so the output's order is the checks' and not the
+        // file's.
+        let layer = "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"[include]\\n\"\n\
+                     references = [\"~/.gitconfig.local\"]\n\
+                     [[target]]\npath = \"~/.config/systemd/user/a.service\"\n\
+                     content = \"[Service]\\n\"\n";
+        let (before, code) = doctor_of(&home, layer, OsStr::new(""), &Every::unit(disabled()));
+        assert_eq!(before, "Doctor: 0 finding(s).\n", "nothing applied yet");
+        assert_eq!(code, Exit::Converged);
+
+        crate::plan::run(&inputs(&home, layer), crate::plan::Mode::Apply, &mut |_| {
+            Ok(true)
+        })
+        .expect("apply runs");
+        let (first, code) = doctor_of(&home, layer, OsStr::new(""), &Every::unit(disabled()));
+        let (second, _) = doctor_of(&home, layer, OsStr::new(""), &Every::unit(disabled()));
+
+        assert_eq!(
+            first,
+            "  ! ~/.config/systemd/user/a.service  (~/.config/bx/bx.toml:5) is written but not \
+             enabled; `systemctl --user enable a.service` enables it\n\
+             \x20 ! ~/.gitconfig  (~/.config/bx/bx.toml:1) references ~/.gitconfig.local, which \
+             does not exist; create it, or drop it from `references`\n\
+             Doctor: 2 finding(s).\n"
+        );
+        assert_eq!(code, Exit::Pending);
+        assert_eq!(first, second, "two runs print the same bytes");
+
+        home.write(".gitconfig.local", "[user]\n");
+        let (after, _) = doctor_of(&home, layer, OsStr::new(""), &Every::unit(disabled()));
+        assert!(!after.contains("~/.gitconfig "), "{after}");
     }
 
     #[test]

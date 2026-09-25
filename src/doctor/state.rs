@@ -31,6 +31,10 @@ pub struct Found {
     pub damage: Vec<Finding>,
     /// Check 4: an interrupted session, or an `apply` running now.
     pub session: Vec<Finding>,
+    /// The ledger as it was read: what survived of a damaged one, and empty
+    /// when it could not be read at all, or when an irregular state file
+    /// stopped every read. Check 8 asks it which targets bx has written.
+    pub ledger: LedgerView,
 }
 
 /// Look at the state directory under `home` for both checks.
@@ -65,6 +69,7 @@ pub fn check(state: &StateDir, home: &Path) -> Found {
             ));
             found.damage.extend(quarantined(&loaded, &at));
             unlisted = unlisted.or(loaded.unlisted);
+            found.ledger = loaded.value;
         }
         Err(error) => found.damage.push(unread(at(&state.ledger()), &error)),
     }

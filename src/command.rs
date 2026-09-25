@@ -691,6 +691,48 @@ mod tests {
     }
 
     #[test]
+    fn applied_counts_an_activation_capture_as_a_change() {
+        // V1: the interactive file, its `~/.zshrc` region, and the capture.
+        let home = guarded_home();
+        home.write(".zshrc", "user\n");
+        let stub = home.child("stub");
+        std::fs::write(&stub, "#!/bin/sh\nprintf 'stub_hook() { :; }\\n'\n").expect("the stub");
+        std::fs::set_permissions(
+            &stub,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("executable");
+        seed(
+            home.path(),
+            &format!(
+                "[[activation]]\nname = \"stub\"\ncommand = [\"{}\"]\n",
+                stub.display()
+            ),
+        );
+        let mut out = Vec::new();
+
+        let exit = apply_with(&env(home.path()), true, &mut out, &mut never).expect("apply");
+
+        assert_eq!(exit, Exit::Converged);
+        assert!(
+            text(&out).contains("  + activation `stub`: run twice, output agreed; cached\n"),
+            "{}",
+            text(&out)
+        );
+        assert!(
+            text(&out).ends_with("Applied 3 change(s).\n"),
+            "{}",
+            text(&out)
+        );
+
+        // Recorded, so the next apply has nothing to count.
+        let mut again = Vec::new();
+        let exit = apply_with(&env(home.path()), true, &mut again, &mut never).expect("apply");
+        assert_eq!(exit, Exit::Converged);
+        assert!(!text(&again).contains("Applied"), "{}", text(&again));
+    }
+
+    #[test]
     fn an_external_apply_stopped_short_of_is_named_with_why_and_exits_pending() {
         let home = guarded_home();
         // The declared url leads nowhere that can be fetched from.

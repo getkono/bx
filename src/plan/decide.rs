@@ -482,9 +482,10 @@ pub(super) struct Op {
     planned: Observed,
     mode: Mode,
     /// Whether bx owns what it leaves. Every write does but one: the repo's
-    /// copy of a tracked target written onto this machine, which stays the
-    /// tool's — journalled like any write, so an interruption is rolled back,
-    /// and recorded in no ledger entry, so `rm` never touches it.
+    /// copy of a tracked target written over a copy this machine already had
+    /// and bx never claimed, which stays the tool's — journalled like any
+    /// write, so an interruption is rolled back, and recorded in no ledger
+    /// entry, so `rm` never touches it. See [`track_onto_machine`].
     claimed: bool,
     /// Whether this is a tracked target's copy on this machine carried into
     /// the repo, which only `sync` writes.
@@ -1233,15 +1234,16 @@ const TRACK_SHAPE: &str = "track mode carries this machine's whole file into the
 /// lost — that is every difference, which is what makes losing the cache safe:
 /// it costs a question, never an overwrite.
 ///
-/// # Decision: the machine's copy is never bx's
+/// # Decision: the machine's copy is compared with the agreement, never the ledger
 ///
-/// Where `apply` writes the repo's copy onto this machine, the write is
-/// journalled — an interruption is rolled back like any other — but claimed in
-/// no ledger entry. The tool rewrites the file as it pleases, and an entry
-/// would turn its next rewrite into "edited since bx last wrote it" and make
-/// `rm` put back bytes the tool has long replaced. So the machine's copy is
-/// compared with the agreement, never with the ledger, and `rm` leaves it
-/// alone.
+/// The tool rewrites the file as it pleases, so a rewrite is this machine's
+/// change to carry, never "edited since bx last wrote it": the machine's copy
+/// is compared with the agreement alone, whatever the ledger holds for it.
+///
+/// What the ledger holds is decided by [`track_onto_machine`]: the copy `apply`
+/// writes where this machine had none is claimed, so `rm` can take it away
+/// again; one written over a copy the tool already had is not, and `rm` leaves
+/// it alone.
 ///
 /// The repo's copy is the other way round: `sync` claims it as a whole file
 /// owned by bx, so the ledger keeps the bytes it held before tracking began,
@@ -1366,6 +1368,23 @@ fn decide_track(
 /// target onto this machine, where `observed` is: a create where there is
 /// nothing, and otherwise a modify at the mode the file already has, since
 /// the file is the tool's.
+///
+/// # Decision: `apply` claims the machine copy it creates
+///
+/// Where this machine has no copy, the write is claimed: the ledger records
+/// that nothing was there, and the directories the write made, so `rm`
+/// removes the file and those directories while the file still holds what bx
+/// wrote (Invariant 4). Once the tool has rewritten it, `rm` refuses to
+/// destroy those bytes, as it refuses over any edited file.
+///
+/// Where the ledger already holds an entry for the target — this machine got
+/// its copy from bx, or bx wrote it before it was tracked — the write is
+/// claimed too, so the entry, and the prior it keeps, survives the write
+/// rather than being dropped by it.
+///
+/// A write over a copy the tool already had, with no entry, is not claimed:
+/// the file was the tool's before bx wrote to it, and is left the tool's.
+/// The journal still holds its prior bytes, so an interruption is rolled back.
 fn track_onto_machine(
     target: &Target,
     observed: &Observed,
@@ -1418,7 +1437,7 @@ fn track_onto_machine(
         made: Made::Bytes(bytes.to_vec()),
         planned: observed.clone(),
         mode,
-        claimed: false,
+        claimed: observed.kind == Kind::Absent || ctx.ledger.get(&target.path).is_some(),
         carry: false,
     };
     Ok((row(action, diff, note), Some(op)))

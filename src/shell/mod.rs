@@ -90,14 +90,14 @@
 //! # bash
 //!
 //! bash gets its own file from the same [`Assembly`] and the same
-//! declarations: the variables, the activations' bash output, the sources,
+//! declarations: the variables, the `[path]` entries, the activations' bash output, the sources,
 //! the aliases, the functions and the history and shell options, each in
 //! bash's words, sourced from a fixed region in `~/.bashrc`; and the
 //! keybindings go to `~/.inputrc`. A declaration reaches every shell unless
 //! its `shells` ([`Shells`]) keeps it to some, and each shell's file's plan
 //! row names what does not reach it ([`omitted`]). What bash cannot read in
-//! zsh's words stays zsh's: plugins, the completion system's setup, hook
-//! registrations and `[path]`. [`bash`] holds both files, and the tests there
+//! zsh's words stays zsh's: plugins, the completion system's setup and hook
+//! registrations. [`bash`] holds both files, and the tests there
 //! run the file in bash to hold it to Invariant 2.
 //!
 //! # Activations
@@ -197,8 +197,9 @@ impl Shell {
 ///
 /// # The `shells` key
 ///
-/// `[[env]]`, `[[function]]`, `[[source]]` and `[[activation]]` entries each
-/// take an optional `shells = ["zsh"]`, naming the shells the declaration is
+/// `[[env]]`, `[[function]]`, `[[source]]` and `[[activation]]` entries, and
+/// a `[path]` entry written as an inline table, each take an optional
+/// `shells = ["zsh"]`, naming the shells the declaration is
 /// kept to. Without it a declaration reaches every shell, so zsh and bash are
 /// configured alike from one declaration. A name that is not a shell bx
 /// generates for, or an empty list, fails the load; a declaration restricted
@@ -308,8 +309,9 @@ impl Shells {
 /// declarations of `merged` that do not reach it, or `None` when every one
 /// does.
 ///
-/// It names every `[[env]]` a shell could read, `[[function]]`, `[[source]]`
-/// and `[[activation]]` whose `shells` leaves `shell` out, then every
+/// It names every `[[env]]` a shell could read, `[path]` entry,
+/// `[[function]]`, `[[source]]` and `[[activation]]` whose `shells` leaves
+/// `shell` out, then every
 /// activation that reaches `shell` but declares no command for it and so is
 /// not rendered there. Decided from the declarations alone, so the note is
 /// the same on every machine.
@@ -325,6 +327,13 @@ pub fn omitted(shell: Shell, merged: &crate::config::Config) -> Option<String> {
                 e.enabled && e.kind != crate::config::env::EnvKind::Gui && kept_out(e.shells)
             })
             .map(|e| format!("env `{}`", e.name)),
+    );
+    names.extend(
+        merged
+            .path
+            .iter()
+            .filter(|entry| entry.enabled && kept_out(entry.shells))
+            .map(|entry| format!("path `{}`", entry.dir)),
     );
     names.extend(
         merged

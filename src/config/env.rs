@@ -70,7 +70,7 @@ use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
 use crate::env_guard::is_variable_name;
 use crate::paths::Portable;
-use crate::shell::Shells;
+use crate::shell::{Shell, Shells};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[env]]";
@@ -358,8 +358,9 @@ pub struct Fragment {
     pub syntax: Syntax,
     /// Each variable, value already substituted.
     pub vars: Vec<Var>,
-    /// The `[path]` entries, written after every variable. Only the `zshenv`
-    /// fragment holds any; see [`super::path`].
+    /// The `[path]` entries, written after every variable in zsh's words.
+    /// Only the `zshenv` fragment holds any, and only those that reach zsh;
+    /// see [`super::path`].
     pub path: Vec<PathEntry>,
 }
 
@@ -402,7 +403,7 @@ impl Fragment {
                 }
             }
         }
-        out.push_str(&path::render(&self.path));
+        out.push_str(&path::render(&self.path, Shell::Zsh));
         out
     }
 }

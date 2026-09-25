@@ -1,8 +1,9 @@
 //! zsh and bash are configured alike from one set of declarations.
 //!
 //! One configuration declares every kind of shell declaration bash and zsh
-//! share — variables of each kind a shell reads, functions, optional sources,
-//! aliases and tool activations — and one of each kept to a single shell.
+//! share — variables of each kind a shell reads, `PATH` entries, functions,
+//! optional sources, aliases and tool activations — and one of each kept to a
+//! single shell.
 //! `bx apply` writes it through the real binary, and the declarations each
 //! shell's generated files carry are read back from their bytes: the two sets
 //! are equal but for the entries kept to one shell, and a second `apply`
@@ -82,6 +83,15 @@ value = "foot"
 kind = "login"
 shells = ["bash"]
 
+[path]
+prepend = [
+    "~/bin",
+    { dir = "~/.local/bin", if_exists = true },
+    { dir = "~/.zsh-only/bin", shells = ["zsh"] },
+]
+append = [{ dir = "/opt/bash-only/bin", shells = ["bash"] }, "/opt/tool/bin"]
+remove = ["~/.cargo/bin"]
+
 [aliases]
 ll = "ls -la"
 
@@ -129,13 +139,59 @@ name = "act_bash"
 bash = ["stub", "init", "bash"]
 "#;
 
+/// What bash's line taking a directory out of `PATH` opens and closes with.
+const BASH_REMOVAL: (&str, &str) = (
+    "PATH=:${PATH//:/::}:; PATH=${PATH//\":",
+    ":\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}",
+);
+
+/// The `PATH` edit `line` makes, in either shell's words, as `path-in DIR`
+/// or `path-out DIR`; `None` for any other line, and for the line that only
+/// settles a block's status.
+fn path_edit(line: &str) -> Option<String> {
+    let line = match line.strip_prefix("[[ -d ") {
+        Some(gated) => gated.split_once(" ]] && ")?.1,
+        None => line,
+    };
+    let removed = line
+        .strip_prefix("path=(${path:#")
+        .and_then(|rest| rest.strip_suffix("})"))
+        .or_else(|| {
+            line.strip_prefix(BASH_REMOVAL.0)
+                .and_then(|rest| rest.strip_suffix(BASH_REMOVAL.1))
+        });
+    if let Some(dir) = removed {
+        return Some(format!("path-out {dir}"));
+    }
+    let list = line.strip_prefix("export PATH=")?;
+    let dir = list
+        .strip_suffix(":${PATH}")
+        .or_else(|| list.strip_prefix("${PATH}:"))?;
+    Some(format!("path-in {dir}"))
+}
+
+/// Every `PATH` edit `text` makes, in order.
+fn path_edits(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim_start)
+        .filter_map(path_edit)
+        .collect()
+}
+
 /// The declarations `text` carries, each as `kind name`: the variables it
-/// exports, the functions it defines — a hooked one under its declared name —
-/// the files it sources, the aliases and the activations.
+/// exports, the `PATH` edits it makes, the functions it defines — a hooked
+/// one under its declared name — the files it sources, the aliases and the
+/// activations.
 fn declarations(text: &str) -> BTreeSet<String> {
     text.lines()
         .map(str::trim_start)
         .filter_map(|line| {
+            if ["export PATH=", "[[ -d ", "PATH=:", "path=("]
+                .iter()
+                .any(|opening| line.starts_with(opening))
+            {
+                return path_edit(line);
+            }
             if let Some(rest) = line.strip_prefix("export ") {
                 let name = rest.split('=').next()?;
                 return Some(format!("env {name}"));
@@ -200,11 +256,19 @@ fn zsh_and_bash_render_the_same_declarations_but_those_kept_to_one_shell() {
     };
     let zsh_only = set(&[
         "env VISUAL",
+        "path-in ${HOME}/.zsh-only/bin",
+        "path-out ${HOME}/.zsh-only/bin",
         "function hook_zsh",
         "source ~/.zplug/init.zsh",
         "activation act_zsh",
     ]);
-    let bash_only = set(&["env TERMINAL", "function fn_bash", "activation act_bash"]);
+    let bash_only = set(&[
+        "env TERMINAL",
+        "path-in /opt/bash-only/bin",
+        "path-out /opt/bash-only/bin",
+        "function fn_bash",
+        "activation act_bash",
+    ]);
 
     // The sets are equal but for the entries kept to one shell: each of
     // those reaches its own shell and not the other.
@@ -227,6 +291,13 @@ fn zsh_and_bash_render_the_same_declarations_but_those_kept_to_one_shell() {
             "env PAGER",
             "env EDITOR",
             "env MISE_JOBS",
+            "path-in ${HOME}/bin",
+            "path-out ${HOME}/bin",
+            "path-in ${HOME}/.local/bin",
+            "path-out ${HOME}/.local/bin",
+            "path-in /opt/tool/bin",
+            "path-out /opt/tool/bin",
+            "path-out ${HOME}/.cargo/bin",
             "alias ll",
             "function mkcd",
             "function venv",
@@ -235,9 +306,24 @@ fn zsh_and_bash_render_the_same_declarations_but_those_kept_to_one_shell() {
         ])
     );
 
+    // Each shell edits PATH in the same order, but for the entries kept to
+    // the other.
+    let zshenv = String::from_utf8_lossy(&zsh_bytes[0]);
+    let bashrc = String::from_utf8_lossy(&bash_bytes[0]);
+    let without = |edits: Vec<String>, kept: &str| -> Vec<String> {
+        edits
+            .into_iter()
+            .filter(|edit| !edit.ends_with(kept))
+            .collect()
+    };
+    assert_eq!(
+        without(path_edits(&zshenv), " ${HOME}/.zsh-only/bin"),
+        without(path_edits(&bashrc), " /opt/bash-only/bin"),
+        "zsh:\n{zshenv}\nbash:\n{bashrc}"
+    );
+
     // Each shell ran its own activation command.
     let zshrc = String::from_utf8_lossy(&zsh_bytes[2]);
-    let bashrc = String::from_utf8_lossy(&bash_bytes[0]);
     assert!(zshrc.contains("stub_zsh() { :; }") && !zshrc.contains("stub_bash"));
     assert!(bashrc.contains("stub_bash() { :; }") && !bashrc.contains("stub_zsh"));
 

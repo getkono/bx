@@ -32,8 +32,11 @@
 //!    enabled, that it could not load, or that has failed.
 //! 8. [`references`] — a path a written target declares in `references` that
 //!    is not on disk.
+//! 9. [`orphans`] — a `.bx-` temporary file an interrupted write left beside
+//!    a destination, which no journal names and recovery never removes.
 
 pub mod modes;
+pub mod orphans;
 pub mod references;
 pub mod sources;
 pub mod state;
@@ -98,6 +101,12 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
         &state.ledger,
         home,
         &references::exists,
+    ));
+    findings.extend(orphans::check(
+        inputs.targets(),
+        &state.ledger,
+        inputs.state(),
+        home,
     ));
     Report { findings }
 }
@@ -378,6 +387,7 @@ install = \"sudo dnf install bx-no-such-tool\"
         std::fs::create_dir_all(state.root()).unwrap();
         std::fs::write(state.fingerprints(), b"not MessagePack").unwrap();
         interrupt(home.path());
+        home.write(".config/systemd/user/.bx-Ab3dEf", "");
         let systemd = Every::unit(disabled());
 
         let (first, code) = doctor_of(&home, EVERY_CHECK, OsStr::new(""), &systemd);
@@ -400,7 +410,10 @@ install = \"sudo dnf install bx-no-such-tool\"
              readable, so the shell skips the line that sources it\n\
              \x20 ! ~/.config/systemd/user/a.service  (~/.config/bx/bx.toml:1) is written but \
              not enabled; `systemctl --user enable a.service` enables it\n\
-             Doctor: 7 finding(s).\n"
+             \x20 ! ~/.config/systemd/user/.bx-Ab3dEf is a temporary file a bx write left when \
+             it was interrupted before its journal named it, so recovery never removes it and \
+             nothing reads it; look at it, then delete it\n\
+             Doctor: 8 finding(s).\n"
         );
         assert_eq!(code, Exit::Pending);
         assert_eq!(first, second, "two runs print the same bytes");

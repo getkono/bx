@@ -48,12 +48,23 @@ name  = "PAGER"
 value = "less"
 kind  = "environment"
 
-# Over SSH, a lighter editor for commit messages and `sudoedit`.
 [[env]]
-name  = "VISUAL"
-value = "vi"
+name  = "MANPAGER"
+value = "less -R --use-color"
+kind  = "environment"
+
+# Over SSH, no alternate screen, and quit when the output fits.
+[[env]]
+name  = "LESS"
+value = "-F -X"
 kind  = "interactive"
 when  = "ssh"
+
+# The input method, for programs the graphical session starts.
+[[env]]
+name  = "GTK_IM_MODULE"
+value = "ibus"
+kind  = "gui"
 
 # ===========================================================================
 # PATH — the first prepended entry ends up first

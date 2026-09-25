@@ -45,6 +45,13 @@
 //! then removed from every layer that declares it; a conflict keeps its
 //! declaration, so nothing about it changes. The body file in the repo is left
 //! where it is: it may be a file the user wrote, and deleting it is theirs.
+//!
+//! A `tree = "…"` entry is one declaration of many files, so `rm` hands a tree
+//! back whole or not at all: on the tree's path it releases every file and the
+//! table together, unless one file would be a conflict, which leaves the whole
+//! tree managed; on a file inside it, it releases nothing and names `exclude`.
+//! `add` likewise refuses to copy a file into a tree's root, where the tree
+//! would declare it beside the `[[target]]` `add` writes.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -164,6 +171,52 @@ pub struct Context {
     layers: Vec<Layer>,
     resolved: Resolved,
     roots: RootSet,
+    trees: Vec<TreeDecl>,
+}
+
+/// A `tree = "…"` entry some layer declares, as `add` and `rm` need it.
+///
+/// Loading expands a tree into ordinary targets and keeps nothing of the tree
+/// itself, so this is read back from each layer's own parse. The files are
+/// the expanded targets carrying the tree's origin: exactly those the tree
+/// declares, and not an explicit target that happens to lie beneath its path.
+#[derive(Debug, Clone)]
+struct TreeDecl {
+    /// Where the tree lands, as the resolved configuration names it.
+    path: Portable,
+    /// Its directory in the config repo, repo-relative.
+    root: PathBuf,
+    /// Where it was written.
+    origin: Origin,
+    /// Every file it declares, by resolved path.
+    files: BTreeSet<Portable>,
+}
+
+/// Every tree `layers` declare, in layer order.
+fn trees_of(layers: &[Layer], values: &ResolvedValues) -> Result<Vec<TreeDecl>, Error> {
+    let mut found = Vec::new();
+    for layer in layers {
+        let (text, _) = open_layer(&layer.file)?;
+        for tree in config::parse_str(&text, &layer.file, values.home())?.trees {
+            let Some(path) = resolved_path(tree.path.as_str(), values) else {
+                continue;
+            };
+            let files = layer
+                .config
+                .targets
+                .iter()
+                .filter(|target| target.origin == tree.origin)
+                .filter_map(|target| resolved_path(target.path.as_str(), values))
+                .collect();
+            found.push(TreeDecl {
+                path,
+                root: tree.root,
+                origin: tree.origin,
+                files,
+            });
+        }
+    }
+    Ok(found)
 }
 
 impl Context {
@@ -184,6 +237,7 @@ impl Context {
         let roots = RootSet::from_values(&resolved.values)
             .owning(&[state.root().to_path_buf()])
             .with_config_repos(std::slice::from_ref(&repo));
+        let trees = trees_of(&layers, &resolved.values)?;
         Ok(Self {
             home,
             repo,
@@ -191,6 +245,7 @@ impl Context {
             layers,
             resolved,
             roots,
+            trees,
         })
     }
 
@@ -732,6 +787,20 @@ fn decide_file(
                 ));
             }
             let body = Path::new(FILES_DIR).join(rel);
+            // A copy inside a tree's root is a file that tree declares from
+            // the next load on, so the `[[target]]` appended beside it would
+            // declare one path twice in one layer — or deliver the copy to
+            // a second place — and no command would load the repo after.
+            if let Some(tree) = ctx.trees.iter().find(|tree| body.starts_with(&tree.root)) {
+                return Ok(refused(format!(
+                    "cannot be copied to {}: that is inside `tree = \"{}\"` at {}, which would \
+                     declare it as well; to have the tree deliver it, copy it into {} yourself",
+                    body.display(),
+                    tree.root.display(),
+                    tree.origin,
+                    tree.root.display(),
+                )));
+            }
             let in_repo = ctx.repo.join(&body);
             let reuse = match fs::observe(&in_repo)? {
                 present if present.kind == Kind::Absent => false,
@@ -1101,8 +1170,9 @@ fn undeclare(
 /// layer, and every ledger entry there — so a target whose declaration was
 /// deleted by hand is still handed back. [`restore::restore`] decides and
 /// restores each; each one it released is then removed from every layer
-/// declaring it. A conflict is left declared and untouched. Nothing to do is
-/// an empty result, which is what makes a second `rm` a no-op.
+/// declaring it. A conflict is left declared and untouched, and a tree is
+/// handed back whole or not at all ([`hold_trees`]). Nothing to do is an
+/// empty result, which is what makes a second `rm` a no-op.
 ///
 /// # Errors
 ///
@@ -1110,7 +1180,7 @@ fn undeclare(
 pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
     let ledger = LedgerView::read(&ctx.state, &ctx.home)?.value;
     let found = declarations(ctx, target)?;
-    let targets: BTreeSet<Portable> = found
+    let mut targets: BTreeSet<Portable> = found
         .iter()
         .map(|declaration| declaration.target.clone())
         .chain(
@@ -1120,16 +1190,36 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
                 .filter(|path| beneath(path, target)),
         )
         .collect();
-    if targets.is_empty() {
+    let held = hold_trees(ctx, &ledger, target, &mut targets)?;
+    if targets.is_empty() && held.is_empty() {
         return Ok(Vec::new());
     }
     let targets: Vec<Portable> = targets.into_iter().collect();
-    let restored = restore::restore(&ctx.state, &ctx.home, &targets)?;
+    let restored = if targets.is_empty() {
+        Vec::new()
+    } else {
+        restore::restore(&ctx.state, &ctx.home, &targets)?
+    };
 
-    let released: BTreeSet<&Portable> = restored
+    let conflicts: BTreeSet<&Portable> = restored
+        .iter()
+        .filter(|done| done.is_conflict())
+        .map(Restored::target)
+        .collect();
+    // A tree's declaration is every one of its files' declaration, so it goes
+    // only when none of them is a conflict: a conflict is left declared.
+    let kept: BTreeSet<&Portable> = ctx
+        .trees
+        .iter()
+        .filter(|tree| tree.files.iter().any(|file| conflicts.contains(file)))
+        .map(|tree| &tree.path)
+        .collect();
+    let released: BTreeSet<Portable> = restored
         .iter()
         .filter(|done| !done.is_conflict())
         .map(Restored::target)
+        .filter(|path| !kept.contains(path))
+        .cloned()
         .collect();
     let layers: BTreeSet<&Path> = found
         .iter()
@@ -1138,21 +1228,23 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
         .collect();
     if !layers.is_empty() {
         let _lock = lock(&ctx.state)?;
+        let named: BTreeSet<&Portable> = released.iter().collect();
         for layer in layers {
-            undeclare(layer, &released, &ctx.resolved.values)?;
+            undeclare(layer, &named, &ctx.resolved.values)?;
         }
     }
 
-    Ok(restored
+    let mut removals: Vec<Removal> = restored
         .into_iter()
+        .chain(held)
         .map(|done| {
-            let mine: Vec<&Declaration> = if done.is_conflict() {
-                Vec::new()
-            } else {
+            let mine: Vec<&Declaration> = if released.contains(done.target()) {
                 found
                     .iter()
                     .filter(|declaration| declaration.target == *done.target())
                     .collect()
+            } else {
+                Vec::new()
             };
             Removal {
                 undeclared: mine.iter().map(|d| d.layer.clone()).collect(),
@@ -1160,7 +1252,90 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
                 restored: done,
             }
         })
-        .collect())
+        .collect();
+    removals.sort_by(|a, b| a.restored.target().cmp(b.restored.target()));
+    Ok(removals)
+}
+
+/// Take out of `targets` every file of a tree that `rm` must leave managed,
+/// returning each as a conflict that says why.
+///
+/// A tree declares its files together, and its declaration is one table, so
+/// `rm` hands a tree back whole or not at all:
+///
+/// - Asked about a path strictly inside a tree, `rm` releases none of the
+///   files the tree declares there. Undeclaring them would mean editing the
+///   tree, and restoring them while the tree still declares them would have
+///   the next `apply` write them straight back; the note names `exclude` and
+///   the tree's own path instead.
+/// - Asked about the tree's path or above it, `rm` releases the tree only when
+///   restoring none of its files would be a conflict, as
+///   [`restore::plan_restore`] reads them now. When one would, every file of
+///   the tree stays as it is, and so does its declaration.
+///
+/// A file the tree no longer declares — removed from the repo since bx wrote
+/// it — is not held: nothing declares it, and `rm` hands it back as it would
+/// any file with no declaration.
+fn hold_trees(
+    ctx: &Context,
+    ledger: &LedgerView,
+    target: &Portable,
+    targets: &mut BTreeSet<Portable>,
+) -> Result<Vec<Restored>, Error> {
+    let mut held = Vec::new();
+    for tree in &ctx.trees {
+        let mine: Vec<Portable> = targets
+            .iter()
+            .filter(|path| tree.files.contains(*path))
+            .cloned()
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let whole = beneath(&tree.path, target);
+        let mut own: Vec<(Portable, String)> = Vec::new();
+        if whole {
+            for file in &mine {
+                let Some(entry) = ledger.get(file) else {
+                    continue;
+                };
+                if let restore::Restoration::Conflict { note, .. } =
+                    restore::plan_restore(entry, &ctx.home)?
+                {
+                    own.push((file.clone(), note));
+                }
+            }
+            if own.is_empty() {
+                continue;
+            }
+            targets.remove(&tree.path);
+        }
+        let note = if whole {
+            format!(
+                "is left as it is: the tree at {} is released whole, and {} conflicts",
+                tree.origin, own[0].0
+            )
+        } else {
+            format!(
+                "is declared by the tree at {}; add an `exclude` pattern there to stop managing \
+                 it, or `bx rm {}` to release the whole tree",
+                tree.origin, tree.path
+            )
+        };
+        for file in mine {
+            targets.remove(&file);
+            let note = own
+                .iter()
+                .find(|(path, _)| *path == file)
+                .map_or_else(|| note.clone(), |(_, own)| own.clone());
+            held.push(Restored::Conflict {
+                dest: file.render(&ctx.home),
+                target: file,
+                note,
+            });
+        }
+    }
+    Ok(held)
 }
 
 #[cfg(test)]
@@ -1947,5 +2122,181 @@ mod tests {
         assert!(matches!(err, Error::RepoMissing(_)), "{err}");
         assert!(err.to_string().contains("bx init"), "{err}");
         assert!(out.is_empty());
+    }
+
+    /// A layer declaring the tree `files/.config/x` at `~/.config/x` — laid
+    /// out as `add` lays out its copies — holding `a` and `sub/b`.
+    const TREE: &str = "[[target]]\npath = \"~/.config/x\"\ntree = \"files/.config/x\"\n";
+
+    fn tree_repo() -> GuardedHome {
+        let home = repo(TREE);
+        plant(&home, ".config/bx/files/.config/x/a", b"a\n", 0o644);
+        plant(&home, ".config/bx/files/.config/x/sub/b", b"b\n", 0o644);
+        home
+    }
+
+    fn rm_text(home: &GuardedHome, arg: &str) -> (Exit, String) {
+        let mut out = Vec::new();
+        let exit =
+            crate::command::rm(&env(home.path()), home.path(), Some(arg), &mut out).expect("rm");
+        (exit, String::from_utf8(out).expect("UTF-8"))
+    }
+
+    #[test]
+    fn add_refuses_to_copy_a_file_into_a_tree_s_root() {
+        let home = tree_repo();
+        apply_yes(&home);
+        plant(&home, ".config/x/new", b"new\n", 0o644);
+
+        let rows = add_rel(&home, ".config/x/new");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                if note.contains("inside `tree = \"files/.config/x\"`")
+                    && note.contains("copy it into files/.config/x yourself")),
+            "{rows:?}"
+        );
+        assert_eq!(layer(&home), TREE, "nothing declared");
+        assert!(!body(&home, ".config/x/new").exists(), "nothing copied");
+        assert!(ledger(&home).get(&target(&home, ".config/x/new")).is_none());
+        assert_eq!(plan_exit(&home).0, Exit::Converged, "the repo still loads");
+
+        // A file the tree already delivers is declared, and adds as it did.
+        let rows = add_rel(&home, ".config/x/a");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Unchanged { .. }]),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn add_refuses_a_copy_into_a_tree_root_that_lands_elsewhere() {
+        // The tree mirrors `files/.config/x` to `~/.y`: a copy of `~/.config/x/new`
+        // would be delivered to `~/.y/new` as well.
+        let home = repo("[[target]]\npath = \"~/.y\"\ntree = \"files/.config/x\"\n");
+        plant(&home, ".config/bx/files/.config/x/a", b"a\n", 0o644);
+        plant(&home, ".config/x/new", b"new\n", 0o644);
+
+        let rows = add_rel(&home, ".config/x/new");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { .. }]),
+            "{rows:?}"
+        );
+        assert!(!body(&home, ".config/x/new").exists());
+    }
+
+    #[test]
+    fn rm_on_a_tree_s_path_retires_the_whole_tree() {
+        let home = tree_repo();
+        apply_yes(&home);
+        assert!(home.child(".config/x/sub/b").exists());
+
+        let removals = rm_rel(&home, ".config/x");
+        let rows: Vec<(&str, bool, usize)> = removals
+            .iter()
+            .map(|r| {
+                (
+                    r.restored.target().as_str(),
+                    matches!(r.restored, Restored::Removed { .. }),
+                    r.undeclared.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("~/.config/x", false, 1),
+                ("~/.config/x/a", true, 0),
+                ("~/.config/x/sub/b", true, 0),
+            ],
+            "{removals:?}"
+        );
+        assert!(!home.child(".config/x/a").exists());
+        assert!(!home.child(".config/x/sub/b").exists());
+        assert_eq!(layer(&home), "", "the tree's table is gone");
+        assert!(
+            body(&home, ".config/x/a").exists(),
+            "the repo's files stay where they are"
+        );
+        assert_eq!(ledger(&home).iter().count(), 0);
+        assert_eq!(plan_exit(&home).0, Exit::Converged);
+        assert!(
+            rm_rel(&home, ".config/x").is_empty(),
+            "a second rm is a no-op"
+        );
+    }
+
+    #[test]
+    fn rm_on_a_tree_s_path_with_a_conflicting_file_leaves_the_whole_tree() {
+        let home = tree_repo();
+        apply_yes(&home);
+        std::fs::write(home.child(".config/x/a"), b"hand edit\n").expect("edit");
+
+        let (exit, text) = rm_text(&home, "~/.config/x");
+        assert_eq!(exit, Exit::Pending);
+        assert!(text.starts_with("  ! ~/.config/x/a  "), "{text}");
+        assert!(
+            text.contains("  ! ~/.config/x/sub/b  is left as it is: the tree at "),
+            "{text}"
+        );
+        assert!(
+            text.contains("and ~/.config/x/a conflicts; still managed"),
+            "{text}"
+        );
+        assert!(!text.contains("no longer declared"), "{text}");
+        assert_eq!(layer(&home), TREE, "the tree stays declared");
+        assert_eq!(
+            std::fs::read(home.child(".config/x/a")).expect("read"),
+            b"hand edit\n"
+        );
+        assert_eq!(
+            std::fs::read(home.child(".config/x/sub/b")).expect("read"),
+            b"b\n",
+            "the rest of the tree is not handed back either"
+        );
+        let owned = ledger(&home);
+        assert!(owned.get(&target(&home, ".config/x/a")).is_some());
+        assert!(owned.get(&target(&home, ".config/x/sub/b")).is_some());
+    }
+
+    #[test]
+    fn rm_on_a_file_a_tree_declares_releases_nothing_and_names_exclude() {
+        let home = tree_repo();
+        apply_yes(&home);
+
+        let (exit, text) = rm_text(&home, "~/.config/x/sub");
+        assert_eq!(exit, Exit::Pending);
+        assert!(
+            text.starts_with("  ! ~/.config/x/sub/b  is declared by the tree at "),
+            "{text}"
+        );
+        assert!(
+            text.contains("add an `exclude` pattern there to stop managing it, or `bx rm ~/.config/x` to release the whole tree; still managed"),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert_eq!(layer(&home), TREE);
+        assert!(home.child(".config/x/sub/b").exists());
+        assert!(
+            ledger(&home)
+                .get(&target(&home, ".config/x/sub/b"))
+                .is_some()
+        );
+        assert_eq!(plan_exit(&home).0, Exit::Converged);
+    }
+
+    #[test]
+    fn rm_inside_a_tree_hands_back_a_file_the_tree_no_longer_declares() {
+        let home = tree_repo();
+        apply_yes(&home);
+        std::fs::remove_file(body(&home, ".config/x/sub/b")).expect("drop from the repo");
+
+        let (exit, text) = rm_text(&home, "~/.config/x/sub/b");
+        assert_eq!(exit, Exit::Converged, "{text}");
+        assert!(
+            text.starts_with("  - ~/.config/x/sub/b  removed the file bx created"),
+            "{text}"
+        );
+        assert!(!home.child(".config/x/sub/b").exists());
+        assert_eq!(layer(&home), TREE);
     }
 }

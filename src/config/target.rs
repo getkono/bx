@@ -292,9 +292,10 @@ pub enum Gen {
     /// one; see [`Interactive`]. Boxed, because it carries every interactive
     /// declaration and would otherwise size every target's body to it.
     Interactive(Box<Interactive>),
-    /// bash's generated interactive file; see [`crate::shell::bash`]. Not an
-    /// environment fragment: the plan judges only the history file it names.
-    /// Boxed for the reason [`Gen::Interactive`] is.
+    /// bash's generated interactive file; see [`crate::shell::bash`]. Judged
+    /// as [`Gen::Interactive`] is: by its `env` phase, its one environment
+    /// fragment, and the history file it names. Boxed for the reason
+    /// [`Gen::Interactive`] is.
     Bash(Box<crate::shell::bash::Bash>),
     /// `~/.inputrc`, the declared keybindings in readline's syntax; see
     /// [`crate::shell::bash::render_inputrc`]. Readline's syntax has no
@@ -319,15 +320,17 @@ impl Gen {
         }
     }
 
-    /// What the generator's plan row says beside its bytes: for the
-    /// interactive file, the functions held back from it, each with what
-    /// would release it. `None` for every other generator, and for an
-    /// interactive file holding every function it declares.
+    /// What the generator's plan row says beside its bytes: for zsh's and
+    /// bash's interactive files, the functions and sources held back from it,
+    /// each with what would release it, and the declarations that do not
+    /// reach that shell. `None` for every other generator, and for an
+    /// interactive file with nothing to say.
     #[must_use]
     pub fn note(&self) -> Option<String> {
         match self {
             Self::Interactive(file) => file.note(),
-            Self::Env(_) | Self::Source(_) | Self::Bash(_) | Self::Inputrc(_) => None,
+            Self::Bash(file) => file.note(),
+            Self::Env(_) | Self::Source(_) | Self::Inputrc(_) => None,
         }
     }
 }
@@ -382,6 +385,9 @@ pub struct Interactive {
     /// plan attaches them ([`Interactive::with_activations`]): resolution
     /// runs no tool, so it cannot know their output.
     activations: activation::Plan,
+    /// What the file's plan row says of the declarations that do not reach
+    /// zsh ([`crate::shell::omitted`]), if any.
+    omitted: Option<String>,
 }
 
 impl Interactive {
@@ -398,7 +404,16 @@ impl Interactive {
             keybindings: Keybindings::default(),
             sources: Vec::new(),
             activations: activation::Plan::default(),
+            omitted: None,
         }
+    }
+
+    /// The file with `omitted` as what its plan row says of the declarations
+    /// that do not reach zsh.
+    #[must_use]
+    pub fn with_omitted(mut self, omitted: Option<String>) -> Self {
+        self.omitted = omitted;
+        self
     }
 
     /// The file with `activations` in its `activations` and `completions`
@@ -481,6 +496,7 @@ impl Interactive {
         let notes: Vec<String> = [
             crate::shell::function::note(&held(&self.functions)),
             crate::shell::source::note(&held(&self.sources)),
+            self.omitted.clone(),
         ]
         .into_iter()
         .flatten()
@@ -597,7 +613,7 @@ impl Interactive {
 /// a comment, and a command that sets nothing and returns 0. The comment's
 /// words predate declared sources and are kept, so a file written before them
 /// is not rewritten for a comment.
-const SETTLE: &str = "\n# bx: done, whichever plugins were found\ntrue\n";
+pub(crate) const SETTLE: &str = "\n# bx: done, whichever plugins were found\ntrue\n";
 
 /// Resolve the name a config author wrote as `generated = "…"`.
 ///

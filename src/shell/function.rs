@@ -8,11 +8,24 @@
 //! body    = '''
 //! mkdir -p -- "$1" && cd -- "$1"
 //! '''                             # required; `{{value}}` is substituted
+//! bash    = '''…'''               # optional; bash's own body
 //! tool    = "fzf"                 # optional; the tool the body runs, never a gate
 //! hook    = "chpwd"               # optional; one of zsh's own hook points
 //! when    = "interactive"         # optional, only with `hook`; gates the registration
+//! shells  = ["zsh"]               # optional; default every shell
 //! enabled = true                  # default true
 //! ```
+//!
+//! # Every shell
+//!
+//! A function is defined in every shell's generated file unless `shells`
+//! keeps it to some. A body is never translated between shells: `body` is
+//! written for zsh and, unless `bash` gives bash its own, for bash as well,
+//! substituted the same way. A hook is zsh's alone, so a hooked function
+//! must either be kept to zsh with `shells = ["zsh"]` or give bash its
+//! equivalent as `bash`, which bash's file defines under the function's own
+//! name and registers nowhere; anything else fails the load. A `bash` body on
+//! a function `shells` keeps out of bash fails the load too.
 //!
 //! Entries are listed in the order written, keyed by `name`. A name declared
 //! twice in one layer fails the load, naming both lines; a later layer's entry

@@ -7,8 +7,13 @@
 //! path    = "~/.keychain/{{hostname}}-sh"       # required; `{{value}}` is substituted
 //! phase   = "activations"                       # default "plugins"
 //! when    = "interactive"                       # optional; gates the line
+//! shells  = ["zsh"]                             # optional; default every shell
 //! enabled = true                                # default true
 //! ```
+//!
+//! A source lands in zsh's and bash's generated files alike, the same line in
+//! the same phase, unless `shells` keeps it to some — a zsh plugin manager's
+//! file, say, is `shells = ["zsh"]`.
 //!
 //! This is the escape hatch for the `[ -f FILE ] && source FILE` lines a shell
 //! configuration otherwise scatters about — a tool's own completion file, an
@@ -60,7 +65,8 @@
 //! `when` is one condition from the closed set [`crate::config::when`]
 //! defines, and it gates the line: `has:TOOL` is decided while `plan` renders,
 //! dropping the line when the tool is missing, and any other condition wraps
-//! it in a guarded block.
+//! it in a guarded block, its test in the words of the shell whose file it
+//! is.
 //!
 //! # Invariant 2
 //!

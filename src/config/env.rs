@@ -9,7 +9,13 @@
 //! kind    = "environment"                  # environment | gui | login | interactive
 //! enabled = true                           # default true
 //! when    = "has:sccache"                  # optional; see below
+//! shells  = ["zsh"]                        # optional; default every shell
 //! ```
+//!
+//! `shells` keeps the variable to the shells it lists
+//! ([`crate::shell::Shells`]); `environment.d` is no shell's, so a variable
+//! landing there lands there whatever it says, and a `gui` variable may not
+//! carry it.
 //!
 //! `when` gates the variable on one condition from the closed set
 //! [`super::when`] defines. A runtime condition wraps the variable's line in a
@@ -28,6 +34,10 @@
 //! | `gui`         | GUI-launched programs only          | `environment.d`                       |
 //! | `login`       | login shells only                   | `~/.zprofile`                         |
 //! | `interactive` | interactive shells only             | the generated interactive file        |
+//!
+//! That table is zsh's. bash reads every `environment`, `login` and
+//! `interactive` variable from its own generated interactive file, in that
+//! order, a `login` one only in a login shell; see [`crate::shell::bash`].
 //!
 //! `environment.d` is a fragment bx owns whole,
 //! [`ENVIRONMENT_D`]. Every shell startup file is the user's, so bx never
@@ -375,11 +385,7 @@ impl Fragment {
         };
         let mut out = String::from(HEADER);
         for var in &self.vars {
-            let line = format!(
-                "{export}{}={}\n",
-                var.name,
-                quoted(&home_spelled(&var.value))
-            );
+            let line = format!("{export}{}", assignment(var));
             match var.when.as_ref().map(|when| when.gate(present)) {
                 None | Some(Gate::Always) => out.push_str(&line),
                 Some(Gate::Never) => {}
@@ -395,6 +401,13 @@ impl Fragment {
         out.push_str(&path::render(&self.path));
         out
     }
+}
+
+/// `NAME=VALUE` and a newline for `var`, its value spelled and quoted as
+/// [`Fragment::render`] writes it: the words zsh and bash read alike.
+#[must_use]
+pub fn assignment(var: &Var) -> String {
+    format!("{}={}\n", var.name, quoted(&home_spelled(&var.value)))
 }
 
 /// `value` with every `:`-separated entry that is `~` or opens with `~/`

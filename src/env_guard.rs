@@ -1318,8 +1318,9 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///   where `TEST` is byte for byte one a runtime `when` condition renders
 ///   ([`crate::config::when::is_opener`]): a fixed option or `SSH_CONNECTION`
 ///   test, or a set-or-equals test on one variable name against a
-///   double-quoted literal with no `$`, `` ` ``, `\`, `"` or `!`. It reads a
-///   variable and assigns none. Not in an `environment.d` fragment, which
+///   double-quoted literal with no `$`, `` ` ``, `\`, `"` or `!`, in zsh's
+///   words or bash's, bash's login test optionally joined by `&&` to one
+///   more of them. It reads a variable and assigns none. Not in an `environment.d` fragment, which
 ///   runs no test, and not inside another block;
 /// * **a guarded block's close** — optional blanks, then `fi`, closing the one
 ///   open block. A `fi` with no block open is refused, and so is a block left

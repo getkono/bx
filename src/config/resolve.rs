@@ -201,7 +201,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         })
         .collect::<Result<Vec<_>, Error>>()?;
     targets.extend(place_envs(merged, &values)?);
-    targets.extend(crate::shell::bash::place(merged, values.home())?);
+    targets.extend(crate::shell::bash::place(merged, &values)?);
 
     refuse_shared_files(&targets)?;
     refuse_overlapping_externals(&merged.externals, &targets)?;
@@ -416,7 +416,8 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
                         .with_keybindings(keybindings.clone())
                         .with_aliases(declared)
                         .with_functions(bodies.clone())
-                        .with_sources(sourced.clone()),
+                        .with_sources(sourced.clone())
+                        .with_omitted(crate::shell::omitted(Shell::Zsh, merged)),
                 )),
                 other => other,
             };
@@ -549,7 +550,10 @@ fn placed_target(
 /// # Errors
 ///
 /// [`Error::BadValue`] for a repo defect, as [`place_envs`] lists.
-fn resolve_env(decl: &EnvDecl, values: &ResolvedValues) -> Result<Resolution<Var>, Error> {
+pub(crate) fn resolve_env(
+    decl: &EnvDecl,
+    values: &ResolvedValues,
+) -> Result<Resolution<Var>, Error> {
     let block = |reason, hint| {
         Ok(Resolution::Blocked(BlockedEntry {
             key: decl.name.clone(),
@@ -611,7 +615,10 @@ fn resolve_env(decl: &EnvDecl, values: &ResolvedValues) -> Result<Resolution<Var
 /// ranked as [`resolve_target`] ranks one target's: a switched-off declaration
 /// first, then an unusable answer, then an unanswered value. Every name of the
 /// winning class is named, in declaration order.
-fn held_together(held: &[&BlockedEntry], values: &ResolvedValues) -> (BlockReason, String) {
+pub(crate) fn held_together(
+    held: &[&BlockedEntry],
+    values: &ResolvedValues,
+) -> (BlockReason, String) {
     let mut disabled = Vec::new();
     let mut invalid = Vec::new();
     let mut invalid_hints: Vec<&str> = Vec::new();
@@ -1890,6 +1897,8 @@ mod tests {
                 "~/.config/environment.d/50-bx.conf",
                 "~/.local/share/bx/zshrc.zsh",
                 "~/.zshrc",
+                "~/.local/share/bx/bashrc.bash",
+                "~/.bashrc",
             ]
         );
         let env_d = ready(&resolved, 1);
@@ -1937,7 +1946,16 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(keys(&both), vec!["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]);
+        // The variable reaches bash's file too; the plugin, zsh's alone.
+        assert_eq!(
+            keys(&both),
+            vec![
+                "~/.local/share/bx/zshrc.zsh",
+                "~/.zshrc",
+                "~/.local/share/bx/bashrc.bash",
+                "~/.bashrc",
+            ]
+        );
         let file = ready(&both, 0);
         assert_eq!(file.origin.line, 5, "the variable's line");
         let Body::Generated(Gen::Interactive(interactive)) = &file.body else {
@@ -2150,15 +2168,26 @@ mod tests {
             None,
         )
         .unwrap();
-        // zshenv holds only Y; environment.d holds X, Y and Z.
+        // zshenv and bash's file hold only Y; environment.d holds X, Y and
+        // Z.
         assert_eq!(
             keys(&both),
             vec![
                 "~/.local/share/bx/zshenv.zsh",
                 "~/.zshenv",
                 "~/.config/environment.d/50-bx.conf",
+                "~/.local/share/bx/bashrc.bash",
+                "~/.bashrc",
             ]
         );
+        // bash's file is held back by Y as zshenv is, and its region is not.
+        assert_eq!(
+            blocked(&both, 3).reason,
+            BlockReason::DisabledValue {
+                names: vec!["c".to_string()]
+            }
+        );
+        ready(&both, 4);
         assert_eq!(
             blocked(&both, 2).reason,
             BlockReason::DisabledValue {

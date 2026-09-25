@@ -89,20 +89,25 @@
 //!
 //! # bash
 //!
-//! bash gets its own, smaller file from the same [`Assembly`]: the shared
-//! aliases in the `aliases` phase and the history and shell options in the
-//! `options` phase, each in bash's words, sourced from a fixed region in
-//! `~/.bashrc`; and the keybindings go to `~/.inputrc`. [`bash`] holds both,
-//! and the tests there run the file in bash to hold it to Invariant 2.
+//! bash gets its own file from the same [`Assembly`] and the same
+//! declarations: the variables, the activations' bash output, the sources,
+//! the aliases, the functions and the history and shell options, each in
+//! bash's words, sourced from a fixed region in `~/.bashrc`; and the
+//! keybindings go to `~/.inputrc`. A declaration reaches every shell unless
+//! its `shells` ([`Shells`]) keeps it to some, and each shell's file's plan
+//! row names what does not reach it ([`omitted`]). What bash cannot read in
+//! zsh's words stays zsh's: plugins, the completion system's setup, hook
+//! registrations and `[path]`. [`bash`] holds both files, and the tests there
+//! run the file in bash to hold it to Invariant 2.
 //!
 //! # Activations
 //!
 //! A tool's own shell integration — `brew shellenv`, `mise activate zsh`,
-//! `starship init zsh` — is run by [`activation::plan`] rather than at every
-//! shell start, trusted once two runs agree, and cached against the content
-//! of the tool's binary, so the `activations` and `completions` phases hold
-//! text and start no process. There is no form that runs a tool at shell
-//! start.
+//! `starship init {shell}` — is run by [`activation::plan`] rather than at
+//! every shell start, once per shell it has a command for, trusted once two
+//! runs agree, and cached against the content of the tool's binary, so the
+//! `activations` and `completions` phases hold text and start no process.
+//! There is no form that runs a tool at shell start.
 
 pub mod activation;
 pub mod alias;
@@ -299,20 +304,68 @@ impl Shells {
     }
 }
 
-/// The note a shell's generated file's plan row carries for the declarations
-/// kept out of it: each `(what, name)` named, or `None` when there is none.
+/// The note `shell`'s generated file's plan row carries for the enabled
+/// declarations of `merged` that do not reach it, or `None` when every one
+/// does.
 ///
-/// `what` is the declaration's kind as messages spell it — `env`,
-/// `function`, `source`, `activation`.
+/// It names every `[[env]]` a shell could read, `[[function]]`, `[[source]]`
+/// and `[[activation]]` whose `shells` leaves `shell` out, then every
+/// activation that reaches `shell` but declares no command for it and so is
+/// not rendered there. Decided from the declarations alone, so the note is
+/// the same on every machine.
 #[must_use]
-pub fn omitted_note(shell: Shell, omitted: &[(&str, String)]) -> Option<String> {
-    (!omitted.is_empty()).then(|| {
-        let names: Vec<String> = omitted
+pub fn omitted(shell: Shell, merged: &crate::config::Config) -> Option<String> {
+    let kept_out = |shells: Shells| !shells.includes(shell);
+    let mut names: Vec<String> = Vec::new();
+    names.extend(
+        merged
+            .envs
             .iter()
-            .map(|(what, name)| format!("{what} `{name}`"))
-            .collect();
-        format!("not in {}: {}", shell.name(), names.join(", "))
-    })
+            .filter(|e| {
+                e.enabled && e.kind != crate::config::env::EnvKind::Gui && kept_out(e.shells)
+            })
+            .map(|e| format!("env `{}`", e.name)),
+    );
+    names.extend(
+        merged
+            .functions
+            .iter()
+            .filter(|f| f.enabled && kept_out(f.shells))
+            .map(|f| format!("function `{}`", f.name)),
+    );
+    names.extend(
+        merged
+            .sources
+            .iter()
+            .filter(|s| s.enabled && kept_out(s.shells))
+            .map(|s| format!("source `{}`", s.name)),
+    );
+    names.extend(
+        merged
+            .activations
+            .iter()
+            .filter(|a| a.enabled && kept_out(a.shells))
+            .map(|a| format!("activation `{}`", a.name)),
+    );
+    let mut notes = Vec::new();
+    if !names.is_empty() {
+        notes.push(format!("not in {}: {}", shell.name(), names.join(", ")));
+    }
+    notes.extend(
+        merged
+            .activations
+            .iter()
+            .filter(|a| a.enabled && !kept_out(a.shells) && a.command_for(shell).is_none())
+            .map(|a| {
+                format!(
+                    "activation `{}` declares no {} command, so it is not run for {}",
+                    a.name,
+                    shell.name(),
+                    shell.name()
+                )
+            }),
+    );
+    (!notes.is_empty()).then(|| notes.join("; "))
 }
 
 /// One named section of the generated interactive shell file.

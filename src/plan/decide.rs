@@ -2666,6 +2666,79 @@ mod tests {
         }
 
         #[test]
+        fn declared_keybindings_reach_the_interactive_file_twice_alike_and_rm_restores_it() {
+            const KEYBINDINGS: &str = "[keybindings]\nalt-b = \"backward-word\"\n\
+                                       home = \"beginning-of-line\"\n";
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            let first = apply(&home, KEYBINDINGS);
+            assert_eq!(
+                rows(&first),
+                vec![
+                    ("~/.local/share/bx/zshrc.zsh", Action::Create),
+                    ("~/.zshrc", Action::Modify),
+                ]
+            );
+            let written = read(&home, ".local/share/bx/zshrc.zsh");
+            assert_eq!(
+                written,
+                format!(
+                    "{}\n# bx phase: keybindings\n\
+                     if [[ -n ${{terminfo[khome]-}} ]]; then \
+                     bindkey -- \"${{terminfo[khome]}}\" beginning-of-line; fi\n\
+                     bindkey -- '^[[H' beginning-of-line\n\
+                     bindkey -- '^[b' backward-word\n",
+                    interactive("")
+                )
+            );
+
+            // Idempotent: an empty second plan, and nothing rewritten.
+            let second = plan(&home, KEYBINDINGS);
+            assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&second)
+            );
+            assert!(!apply(&home, KEYBINDINGS).executed);
+            assert_eq!(read(&home, ".local/share/bx/zshrc.zsh"), written);
+
+            // Reversible: `rm` puts back the bytes each file held before bx.
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
+                .iter()
+                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+                .collect();
+            crate::restore::restore(&state, home.path(), &targets).expect("rm");
+            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
+            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+        }
+
+        #[test]
+        fn binding_no_key_places_nothing_and_an_unknown_one_fails_the_load() {
+            let home = guarded_home();
+            assert_eq!(rows(&plan(&home, "[keybindings]\n")), vec![]);
+            for (layer, needle) in [
+                (
+                    "[keybindings]\nctrl-a = \"beginning-of-line\"\n",
+                    "unknown key `ctrl-a` in [keybindings]",
+                ),
+                (
+                    "[keybindings]\nhome = \"kill-line\"\n",
+                    "found \"kill-line\"",
+                ),
+            ] {
+                crate::plan::tests::seed(home.path(), layer);
+                let err = crate::plan::Inputs::load(&crate::plan::tests::env(home.path()))
+                    .expect_err(layer)
+                    .to_string();
+                assert!(err.contains(needle), "{layer}: {err}");
+            }
+        }
+
+        #[test]
         fn declaring_no_history_zsh_reads_places_nothing() {
             let home = guarded_home();
             for layer in [

@@ -69,6 +69,7 @@ use super::{Config, Error, Origin};
 use crate::paths::Portable;
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
+use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::PluginDecl;
 use crate::shell::source::SourceDecl;
 
@@ -255,6 +256,11 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 /// its own too. It holds no placeholder either, so it never holds the file
 /// back, and a variable that does holds the history back with it.
 ///
+/// The declared `[keybindings]` land in that file's `keybindings` phase, and
+/// binding any key places the file on its own, as a history does. A binding
+/// holds no placeholder, and a variable that holds the file back holds its
+/// keybindings back with it.
+///
 /// The enabled `[aliases]` and `[[alias]]` entries land in that file's
 /// `aliases` phase, and an enabled alias places the file on its own as a
 /// plugin does. Its `when = "has:TOOL"` is decided when the file is rendered,
@@ -288,12 +294,20 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
         (&merged.envs, &merged.path, &merged.plugins, &merged.history);
     let (aliases, functions, sources): (&[AliasDecl], &[FunctionDecl], &[SourceDecl]) =
         (&merged.aliases, &merged.functions, &merged.sources);
-    // The history's origin, when it says anything zsh reads: what places the
-    // interactive file when nothing else does.
-    let zsh_history = history
+    let keybindings: &Keybindings = &merged.keybindings;
+    // The history's origin, when it says anything zsh reads, or else the
+    // keybindings', when any key is bound: what places the interactive file
+    // when nothing else does.
+    let table_origin = history
         .origin
         .as_ref()
-        .filter(|_| !history.render_zsh().is_empty());
+        .filter(|_| !history.render_zsh().is_empty())
+        .or_else(|| {
+            keybindings
+                .origin
+                .as_ref()
+                .filter(|_| !keybindings.is_empty())
+        });
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
@@ -316,7 +330,7 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
         let plugin = interactive.iter().find(|p| p.enabled);
         let alias = declared.iter().find(|a| a.enabled);
         let function = defined.iter().find(|f| f.enabled);
-        let history_origin = zsh_history.filter(|_| place == Place::Zshrc);
+        let table_here = table_origin.filter(|_| place == Place::Zshrc);
         let source = optional.iter().find(|s| s.enabled);
         let origin = match (
             here.first(),
@@ -324,7 +338,7 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
             plugin,
             alias,
             function,
-            history_origin,
+            table_here,
             source,
         ) {
             (Some((first, _)), ..) => first.origin.clone(),
@@ -332,7 +346,7 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
             (None, None, Some(plugin), ..) => plugin.origin.clone(),
             (None, None, None, Some(alias), ..) => alias.origin.clone(),
             (None, None, None, None, Some(function), ..) => function.origin.clone(),
-            (None, None, None, None, None, Some(history), _) => history.clone(),
+            (None, None, None, None, None, Some(table), _) => table.clone(),
             (None, None, None, None, None, None, Some(source)) => source.origin.clone(),
             (None, None, None, None, None, None, None) => continue,
         };
@@ -362,6 +376,7 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
                 Gen::Interactive(file) => Gen::Interactive(Box::new(
                     file.with_plugins(interactive)?
                         .with_history(history.clone())
+                        .with_keybindings(keybindings.clone())
                         .with_aliases(declared)
                         .with_functions(bodies.clone())
                         .with_sources(sourced.clone()),

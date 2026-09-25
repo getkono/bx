@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::Function;
+use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::PluginDecl;
 use crate::shell::source::Source;
 use crate::shell::{Assembly, Phase};
@@ -256,13 +257,15 @@ impl Gen {
 /// [`History::render_zsh`] renders it; every enabled alias lands in the
 /// `aliases` phase, as the line [`crate::shell::alias::AliasDecl::render`]
 /// renders for it; every enabled `[[function]]` whose body resolved lands in
-/// the `functions` phase, as [`Function::render`] renders it; and every
-/// enabled `[[source]]` whose path resolved lands in the phase it names, after
-/// that phase's own declarations, as the one guarded line [`Source::render`]
-/// renders. No phase but `env` holds an environment assignment (Invariant 2):
-/// the `options` phase assigns only zsh's own unexported history parameters,
-/// which [`super::history`]'s tests hold it to, and the `functions` phase
-/// assigns only zsh's hook arrays, which no process inherits.
+/// the `functions` phase, as [`Function::render`] renders it; the declared
+/// `[keybindings]` land in the `keybindings` phase, as
+/// [`Keybindings::render_zsh`] renders them; and every enabled `[[source]]`
+/// whose path resolved lands in the phase it names, after that phase's own
+/// declarations, as the one guarded line [`Source::render`] renders. No phase
+/// but `env` holds an environment assignment (Invariant 2): the `options`
+/// phase assigns only zsh's own unexported history parameters, which
+/// [`super::history`]'s tests hold it to, and the `functions` phase assigns
+/// only zsh's hook arrays, which no process inherits.
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what
@@ -281,14 +284,16 @@ pub struct Interactive {
     /// The enabled functions, each resolved or held back in its own
     /// position, in the merged configuration's order.
     functions: Vec<Resolution<Function>>,
+    /// The declared keybindings, rendered into the `keybindings` phase.
+    keybindings: Keybindings,
     /// The enabled declared optional sources, each resolved or held back in
     /// its own position, in the merged configuration's order.
     sources: Vec<Resolution<Source>>,
 }
 
 impl Interactive {
-    /// The file holding `env`, and no plugin, history, alias, function or
-    /// source.
+    /// The file holding `env`, and no plugin, history, alias, function,
+    /// keybinding or source.
     #[must_use]
     pub fn new(env: super::env::Fragment) -> Self {
         Self {
@@ -297,8 +302,16 @@ impl Interactive {
             history: History::default(),
             aliases: Vec::new(),
             functions: Vec::new(),
+            keybindings: Keybindings::default(),
             sources: Vec::new(),
         }
+    }
+
+    /// The file with `keybindings` in its `keybindings` phase.
+    #[must_use]
+    pub fn with_keybindings(mut self, keybindings: Keybindings) -> Self {
+        self.keybindings = keybindings;
+        self
     }
 
     /// The file with `history` in its `options` phase.
@@ -419,8 +432,9 @@ impl Interactive {
     /// with plugins alone has no `env` phase, a history declaring nothing zsh
     /// reads adds no `options` phase, a file whose every alias is gated on a
     /// missing tool has no `aliases` phase, and a file whose every function is
-    /// held back has no `functions` phase. The bytes are a function of the
-    /// variables, the plugins, the history, the aliases, the functions, the
+    /// held back has no `functions` phase, and a file binding no key has no
+    /// `keybindings` phase. The bytes are a function of the variables, the
+    /// plugins, the history, the aliases, the functions, the keybindings, the
     /// sources and `present`'s answers alone: never of whether a plugin's or a
     /// source's file exists.
     ///
@@ -451,6 +465,7 @@ impl Interactive {
         crate::shell::alias::contribute(&mut assembly, &self.aliases, present);
         // The held-back functions are the note's to name, not the bytes'.
         crate::shell::function::contribute(&mut assembly, &self.functions, present);
+        crate::shell::keybindings::contribute(&mut assembly, &self.keybindings);
         // Last, so each source follows its phase's own declarations; the
         // held-back ones are the note's to name.
         let sourced = crate::shell::source::contribute(&mut assembly, &self.sources, present);

@@ -37,7 +37,7 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::{alias, function, plugin, source};
+use crate::shell::{alias, function, keybindings, plugin, source};
 use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
@@ -98,6 +98,9 @@ pub struct Config {
     pub history: history::History,
     /// `[shell-options]`: a table, merged key by key. See [`shell_options`].
     pub shell_options: shell_options::ShellOptions,
+    /// `[keybindings]`: a table, merged key by key. See
+    /// [`crate::shell::keybindings`].
+    pub keybindings: crate::shell::keybindings::Keybindings,
     /// List entries that restate only their natural key and `enabled`.
     ///
     /// A **toggle**: it flips the flag on an entry an earlier layer introduced
@@ -465,6 +468,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     found: item.type_name(),
                 })?;
                 config.shell_options = shell_options::parse_shell_options(table, file, text)?;
+            }
+            "keybindings" => {
+                let table = item.as_table().ok_or_else(|| Error::WrongType {
+                    origin: section_origin(root, name, file, text),
+                    key: name.to_string(),
+                    expected: "a table `[keybindings]`",
+                    found: item.type_name(),
+                })?;
+                config.keybindings = keybindings::parse_keybindings(table, file, text)?;
             }
             "aliases" => {
                 let table = item.as_table().ok_or_else(|| Error::WrongType {

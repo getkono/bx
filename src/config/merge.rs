@@ -155,6 +155,7 @@ use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
+use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::{self, PluginDecl};
 use crate::shell::source::SourceDecl;
 
@@ -1207,6 +1208,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut secrets = Secrets::default();
     let mut history = History::default();
     let mut shell_options = ShellOptions::default();
+    let mut keybindings = Keybindings::default();
 
     // Values first, across every layer. A value never depends on a target, and
     // a target's key depends on the values — the final ones, because the file a
@@ -1227,9 +1229,10 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
         secrets.absorb(&layer.config.secrets);
-        // Both tables hold no placeholder, so they fold here too, key by key.
+        // These tables hold no placeholder, so they fold here too, key by key.
         history.absorb(&layer.config.history);
         shell_options.absorb(&layer.config.shell_options);
+        keybindings.absorb(&layer.config.keybindings);
 
         values.absorb(layer.config.values.iter().cloned());
         envs.absorb(layer.config.envs.iter().cloned());
@@ -1311,6 +1314,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         secrets,
         history,
         shell_options,
+        keybindings,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
         conflicts: clashes
@@ -2216,6 +2220,37 @@ mod tests {
         );
         assert_eq!(merged.shell_options.checkwinsize, Some(true));
         assert_eq!(merged.shell_options.histappend, Some(false));
+    }
+
+    #[test]
+    fn keybindings_merge_key_by_key_the_last_layer_winning() {
+        use crate::shell::keybindings::{Action, Key};
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[keybindings]\nhome = \"beginning-of-line\"\nalt-f = \"forward-word\"\n",
+            ),
+            global("modules/k.toml", "[keybindings]\nalt-f = \"end-of-line\"\n"),
+            local("[keybindings]\nend = \"end-of-line\"\n"),
+        ])
+        .expect("merges");
+        let keybindings = merged.keybindings;
+        assert_eq!(keybindings.get(Key::Home), Some(Action::BeginningOfLine));
+        assert_eq!(
+            keybindings.get(Key::AltF),
+            Some(Action::EndOfLine),
+            "the later layer wins"
+        );
+        assert_eq!(keybindings.get(Key::End), Some(Action::EndOfLine));
+        assert_eq!(keybindings.get(Key::AltB), None);
+        assert!(
+            keybindings
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.to_string().contains("local.toml")),
+            "{:?}",
+            keybindings.origin
+        );
     }
 
     #[test]

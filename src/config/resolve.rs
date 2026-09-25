@@ -67,6 +67,7 @@ use super::target::{Attach, Body, Direction, Format, Gen, Interactive, KeyPath, 
 use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
+use crate::shell::Shell;
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
 use crate::shell::keybindings::Keybindings;
@@ -209,7 +210,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         })
         .collect::<Result<Vec<_>, Error>>()?;
     targets.extend(place_envs(merged, &values)?);
-    targets.extend(crate::shell::bash::place(merged, values.home())?);
+    targets.extend(crate::shell::bash::place(merged, &values)?);
 
     refuse_shared_files(&targets)?;
     refuse_overlapping_externals(&merged.externals, &targets)?;
@@ -310,8 +311,21 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
     let (envs, path, plugins, history): (&[EnvDecl], &[PathEntry], &[PluginDecl], &History) =
         (&merged.envs, &merged.path, &merged.plugins, &merged.history);
+    // Only what reaches zsh: a declaration kept to bash is bash's file's.
+    let functions: Vec<FunctionDecl> = merged
+        .functions
+        .iter()
+        .filter(|f| f.shells.includes(Shell::Zsh))
+        .cloned()
+        .collect();
+    let sources: Vec<SourceDecl> = merged
+        .sources
+        .iter()
+        .filter(|s| s.shells.includes(Shell::Zsh))
+        .cloned()
+        .collect();
     let (aliases, functions, sources): (&[AliasDecl], &[FunctionDecl], &[SourceDecl]) =
-        (&merged.aliases, &merged.functions, &merged.sources);
+        (&merged.aliases, &functions, &sources);
     let keybindings: &Keybindings = &merged.keybindings;
     // The history's origin, when it says anything zsh reads, or else the
     // keybindings', when any key is bound: what places the interactive file
@@ -331,7 +345,7 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
     let activation_origin = merged
         .activations
         .iter()
-        .find(|a| a.enabled)
+        .find(|a| a.enabled && a.command_for(Shell::Zsh).is_some())
         .map(|a| &a.origin);
     let resolved = envs
         .iter()
@@ -344,7 +358,12 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
     for place in Place::ALL {
         let here: Vec<&(&EnvDecl, Resolution<Var>)> = resolved
             .iter()
-            .filter(|(decl, _)| decl.kind.places().contains(&place))
+            // A variable that lands in `environment.d` carries no `shells`
+            // (the load refuses one), so this keeps only the other shell's
+            // variables out of zsh's files.
+            .filter(|(decl, _)| {
+                decl.kind.places().contains(&place) && decl.shells.includes(Shell::Zsh)
+            })
             .collect();
         let entries = if place == Place::Zshenv { path } else { &[] };
         let (interactive, declared, defined, optional) = if place == Place::Zshrc {
@@ -409,7 +428,8 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
                         .with_keybindings(keybindings.clone())
                         .with_aliases(declared)
                         .with_functions(bodies.clone())
-                        .with_sources(sourced.clone()),
+                        .with_sources(sourced.clone())
+                        .with_omitted(crate::shell::omitted(Shell::Zsh, merged)),
                 )),
                 other => other,
             };
@@ -542,7 +562,10 @@ fn placed_target(
 /// # Errors
 ///
 /// [`Error::BadValue`] for a repo defect, as [`place_envs`] lists.
-fn resolve_env(decl: &EnvDecl, values: &ResolvedValues) -> Result<Resolution<Var>, Error> {
+pub(crate) fn resolve_env(
+    decl: &EnvDecl,
+    values: &ResolvedValues,
+) -> Result<Resolution<Var>, Error> {
     let block = |reason, hint| {
         Ok(Resolution::Blocked(BlockedEntry {
             key: decl.name.clone(),
@@ -604,7 +627,10 @@ fn resolve_env(decl: &EnvDecl, values: &ResolvedValues) -> Result<Resolution<Var
 /// ranked as [`resolve_target`] ranks one target's: a switched-off declaration
 /// first, then an unusable answer, then an unanswered value. Every name of the
 /// winning class is named, in declaration order.
-fn held_together(held: &[&BlockedEntry], values: &ResolvedValues) -> (BlockReason, String) {
+pub(crate) fn held_together(
+    held: &[&BlockedEntry],
+    values: &ResolvedValues,
+) -> (BlockReason, String) {
     let mut disabled = Vec::new();
     let mut invalid = Vec::new();
     let mut invalid_hints: Vec<&str> = Vec::new();
@@ -1883,6 +1909,8 @@ mod tests {
                 "~/.config/environment.d/50-bx.conf",
                 "~/.local/share/bx/zshrc.zsh",
                 "~/.zshrc",
+                "~/.local/share/bx/bashrc.bash",
+                "~/.bashrc",
             ]
         );
         let env_d = ready(&resolved, 1);
@@ -1911,6 +1939,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn zsh_s_interactive_row_names_every_declaration_kept_from_zsh() {
+        let both = resolved(
+            &format!(
+                "{}{}shells = [\"bash\"]\n{}shells = [\"zsh\"]\n\
+                 [[function]]\nname = \"fb\"\nbody = \"echo b\"\nshells = [\"bash\"]\n\
+                 [[function]]\nname = \"off\"\nbody = \"x\"\nshells = [\"bash\"]\nenabled = false\n\
+                 [[source]]\nname = \"sb\"\npath = \"~/.bash_extra\"\nshells = [\"bash\"]\n\
+                 [[activation]]\nname = \"ab\"\ncommand = [\"a\", \"{{shell}}\"]\n\
+                 shells = [\"bash\"]\n\
+                 [[activation]]\nname = \"bonly\"\nbash = [\"b\", \"init\"]\n\
+                 [[activation]]\nname = \"both\"\ncommand = [\"c\", \"{{shell}}\"]\n",
+                env("EDITOR", "nvim", "interactive"),
+                env("BONLY", "1", "login"),
+                env("ZONLY", "1", "interactive"),
+            ),
+            None,
+        )
+        .unwrap();
+        let zshrc = target_at(&both, "~/.local/share/bx/zshrc.zsh");
+        let Body::Generated(generator) = &zshrc.body else {
+            panic!("{:?}", zshrc.body);
+        };
+        // Every enabled entry `shells` keeps from zsh, in declaration-kind
+        // order, then the activation that reaches zsh with no zsh command.
+        // The disabled function, the zsh-only variable and the shared
+        // activation are not named.
+        assert_eq!(
+            generator.note().as_deref(),
+            Some(
+                "not in zsh: env `BONLY`, function `fb`, source `sb`, activation `ab`; \
+                 activation `bonly` declares no zsh command, so it is not run for zsh"
+            )
+        );
+        // The bash-only variable reaches none of zsh's files.
+        assert!(
+            !keys(&both).iter().any(|key| key.ends_with("zprofile.zsh")),
+            "{:?}",
+            keys(&both)
+        );
+    }
+
+    /// The ready target at `path`.
+    fn target_at<'r>(resolved: &'r Resolved, path: &str) -> &'r Target {
+        let index = keys(resolved)
+            .iter()
+            .position(|key| key == path)
+            .unwrap_or_else(|| panic!("{path}: {:?}", keys(resolved)));
+        ready(resolved, index)
+    }
+
     /// One `[[plugin]]` entry, as TOML.
     fn plugin(name: &str, terminal: bool) -> String {
         format!(
@@ -1930,7 +2009,16 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(keys(&both), vec!["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]);
+        // The variable reaches bash's file too; the plugin, zsh's alone.
+        assert_eq!(
+            keys(&both),
+            vec![
+                "~/.local/share/bx/zshrc.zsh",
+                "~/.zshrc",
+                "~/.local/share/bx/bashrc.bash",
+                "~/.bashrc",
+            ]
+        );
         let file = ready(&both, 0);
         assert_eq!(file.origin.line, 5, "the variable's line");
         let Body::Generated(Gen::Interactive(interactive)) = &file.body else {
@@ -2143,15 +2231,26 @@ mod tests {
             None,
         )
         .unwrap();
-        // zshenv holds only Y; environment.d holds X, Y and Z.
+        // zshenv and bash's file hold only Y; environment.d holds X, Y and
+        // Z.
         assert_eq!(
             keys(&both),
             vec![
                 "~/.local/share/bx/zshenv.zsh",
                 "~/.zshenv",
                 "~/.config/environment.d/50-bx.conf",
+                "~/.local/share/bx/bashrc.bash",
+                "~/.bashrc",
             ]
         );
+        // bash's file is held back by Y as zshenv is, and its region is not.
+        assert_eq!(
+            blocked(&both, 3).reason,
+            BlockReason::DisabledValue {
+                names: vec!["c".to_string()]
+            }
+        );
+        ready(&both, 4);
         assert_eq!(
             blocked(&both, 2).reason,
             BlockReason::DisabledValue {

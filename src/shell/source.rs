@@ -7,8 +7,13 @@
 //! path    = "~/.keychain/{{hostname}}-sh"       # required; `{{value}}` is substituted
 //! phase   = "activations"                       # default "plugins"
 //! when    = "interactive"                       # optional; gates the line
+//! shells  = ["zsh"]                             # optional; default every shell
 //! enabled = true                                # default true
 //! ```
+//!
+//! A source lands in zsh's and bash's generated files alike, the same line in
+//! the same phase, unless `shells` keeps it to some — a zsh plugin manager's
+//! file, say, is `shells = ["zsh"]`.
 //!
 //! This is the escape hatch for the `[ -f FILE ] && source FILE` lines a shell
 //! configuration otherwise scatters about — a tool's own completion file, an
@@ -60,7 +65,8 @@
 //! `when` is one condition from the closed set [`crate::config::when`]
 //! defines, and it gates the line: `has:TOOL` is decided while `plan` renders,
 //! dropping the line when the tool is missing, and any other condition wraps
-//! it in a guarded block.
+//! it in a guarded block, its test in the words of the shell whose file it
+//! is.
 //!
 //! # Invariant 2
 //!
@@ -75,7 +81,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::Table;
 
 use super::plugin::{guarded, unsourceable};
-use super::{Assembly, Phase};
+use super::{Assembly, Phase, Shell, Shells};
 use crate::config::resolve::{BlockReason, BlockedEntry, Resolution};
 use crate::config::values::{self, ResolvedValues, Unresolved};
 use crate::config::when::{self, Gate, When};
@@ -85,7 +91,7 @@ use crate::config::{Ctx, Error, Origin};
 pub(crate) const SECTION: &str = "[[source]]";
 
 /// Every key a `[[source]]` entry may carry.
-const KEYS: [&str; 5] = ["name", "path", "phase", "when", "enabled"];
+const KEYS: [&str; 6] = ["name", "path", "phase", "when", "shells", "enabled"];
 
 /// The phases a source may load in, in load order.
 pub const PHASES: [Phase; 7] = [
@@ -112,6 +118,8 @@ pub struct SourceDecl {
     pub phase: Phase,
     /// The condition it is gated on, if any.
     pub when: Option<When>,
+    /// The shells whose generated file sources it.
+    pub shells: Shells,
     /// `false` in any layer removes the source from the resolved
     /// configuration.
     pub enabled: bool,
@@ -149,8 +157,19 @@ impl Source {
     /// asked while `plan` and `apply` render, never by the generated shell.
     #[must_use]
     pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+        self.render_in(Shell::Zsh, present)
+    }
+
+    /// [`Source::render`] for `shell`: the same line, and a runtime condition
+    /// asked in that shell's words ([`When::test_bash`] for bash).
+    #[must_use]
+    pub fn render_in(&self, shell: Shell, present: &dyn Fn(&str) -> bool) -> String {
         let line = self.line();
-        match self.when.as_ref().map(|when| when.gate(present)) {
+        let gate = |when: &When| match shell {
+            Shell::Zsh => when.gate(present),
+            Shell::Bash => when.gate_bash(present),
+        };
+        match self.when.as_ref().map(gate) {
             None | Some(Gate::Always) => line,
             Some(Gate::Never) => String::new(),
             Some(Gate::Test(test)) => {
@@ -237,11 +256,14 @@ pub fn parse_source(table: &Table, file: &Path, text: &str) -> Result<SourceDecl
         Some(raw) => Some(When::parse(raw).map_err(|problem| ctx.bad(table, "when", problem))?),
     };
 
+    let shells = Shells::parse_in(&ctx, table, &format!("source `{name}`"))?;
+
     Ok(SourceDecl {
         name,
         path,
         phase,
         when,
+        shells,
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
     })
@@ -335,12 +357,13 @@ fn resolve_one(decl: &SourceDecl, values: &ResolvedValues) -> Result<Resolution<
 pub fn contribute(
     assembly: &mut Assembly,
     sources: &[Resolution<Source>],
+    shell: Shell,
     present: &dyn Fn(&str) -> bool,
 ) -> bool {
     let mut wrote = false;
     for source in sources {
         if let Resolution::Ready(source) = source {
-            let body = source.render(present);
+            let body = source.render_in(shell, present);
             if !body.is_empty() {
                 // No source loads in the terminal slot, so this never refuses.
                 let _ = assembly.contribute(source.phase, source.name.clone(), body);
@@ -429,7 +452,7 @@ mod tests {
 
     fn render_all(sources: &[Resolution<Source>], present: &dyn Fn(&str) -> bool) -> String {
         let mut assembly = Assembly::new();
-        contribute(&mut assembly, sources, present);
+        contribute(&mut assembly, sources, Shell::Zsh, present);
         assembly.render()
     }
 
@@ -438,7 +461,8 @@ mod tests {
         let config = load(
             "[[source]]\nname = \"keychain\"\npath = \"~/.keychain/{{host}}-sh\"\n\
              phase = \"activations\"\nwhen = \"interactive\"\n\
-             [[source]]\nname = \"fzf\"\npath = \"~/.fzf.zsh\"\nenabled = false\n",
+             [[source]]\nname = \"fzf\"\npath = \"~/.fzf.zsh\"\nenabled = false\n\
+             shells = [\"zsh\"]\n",
         )
         .expect("parses");
         assert_eq!(
@@ -449,6 +473,7 @@ mod tests {
                     path: "~/.keychain/{{host}}-sh".to_string(),
                     phase: Phase::Activations,
                     when: Some(When::Interactive),
+                    shells: Shells::EVERY,
                     enabled: true,
                     origin: origin(1),
                 },
@@ -457,6 +482,7 @@ mod tests {
                     path: "~/.fzf.zsh".to_string(),
                     phase: DEFAULT_PHASE,
                     when: None,
+                    shells: Shells::only(Shell::Zsh),
                     enabled: false,
                     origin: origin(6),
                 },
@@ -696,8 +722,27 @@ mod tests {
             Resolution::Ready(source("bat", "~/bat", Phase::Aliases, Some("has:bat"))),
         ];
         let mut assembly = Assembly::new();
-        assert!(contribute(&mut assembly, &sources, &|_| false));
+        assert!(contribute(&mut assembly, &sources, Shell::Zsh, &|_| false));
         let rendered = assembly.render();
+        // bash reads the same lines, and asks a runtime condition in its own
+        // words.
+        let mut bash = Assembly::new();
+        assert!(contribute(&mut bash, &sources, Shell::Bash, &|_| false));
+        assert_eq!(bash.render(), rendered);
+        let login = [Resolution::Ready(source(
+            "l",
+            "~/l",
+            Phase::Plugins,
+            Some("login"),
+        ))];
+        let mut bash = Assembly::new();
+        contribute(&mut bash, &login, Shell::Bash, &|_| false);
+        assert!(
+            bash.render()
+                .ends_with("if shopt -q login_shell; then\n  [[ -r ~/l ]] && source ~/l\nfi\n"),
+            "{}",
+            bash.render()
+        );
         assert_eq!(
             rendered,
             "# Generated by bx. Edit the config repo, not this file.\n\
@@ -723,7 +768,7 @@ mod tests {
             Some("has:bat"),
         ))];
         let mut empty = Assembly::new();
-        assert!(!contribute(&mut empty, &gated, &|_| false));
+        assert!(!contribute(&mut empty, &gated, Shell::Zsh, &|_| false));
         assert!(empty.is_empty());
     }
 

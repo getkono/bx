@@ -1611,11 +1611,13 @@ mod tests {
                 "bx.toml",
                 "[[function]]\nname = \"a\"\nbody = \"one\"\n\
                  [[function]]\nname = \"b\"\nbody = \"two\"\n\
-                 [[function]]\nname = \"c\"\nbody = \"three\"\nhook = \"chpwd\"\nenabled = false\n",
+                 [[function]]\nname = \"c\"\nbody = \"three\"\nhook = \"chpwd\"\nenabled = false\n\
+                 shells = [\"zsh\"]\n",
             ),
             global(
                 "modules/m.toml",
-                "[[function]]\nname = \"a\"\nbody = \"replaced\"\nhook = \"precmd\"\n",
+                "[[function]]\nname = \"a\"\nbody = \"replaced\"\nhook = \"precmd\"\n\
+                 shells = [\"zsh\"]\n",
             ),
             local(
                 "[[function]]\nname = \"b\"\nenabled = false\n\
@@ -1854,7 +1856,7 @@ mod tests {
             .map(|a| {
                 (
                     a.name.as_str(),
-                    a.program(),
+                    a.command[0].as_str(),
                     a.phase.name(),
                     a.origin.file.as_path(),
                 )

@@ -201,19 +201,43 @@ pub const CLOSER: &str = "fi";
 /// of the runtime conditions renders — exactly, byte for byte.
 ///
 /// The guard asks this of every line it reads, so the only openers it accepts
-/// are the ones [`When::test`] can produce: the test is read back into a
-/// condition and rendered again, and anything that does not come back
-/// identical is not an opener.
+/// are the ones [`When::test`] or [`When::test_bash`] can produce, and the
+/// one [`login_opener_bash`] writes: the test is read back into a condition
+/// and rendered again, and anything that does not come back identical is not
+/// an opener.
 #[must_use]
 pub fn is_opener(line: &str) -> bool {
     line.strip_prefix("if ")
         .and_then(|rest| rest.strip_suffix("; then"))
+        .map(|test| test.strip_prefix(LOGIN_AND_BASH).unwrap_or(test))
         .and_then(read_test)
         .is_some()
 }
 
-/// The runtime condition `test` is the rendering of, if it is one.
+/// What opens bash's test of a login shell joined to one more test.
+const LOGIN_AND_BASH: &str = "shopt -q login_shell && ";
+
+/// The line that opens a bash block holding what only a login shell sees:
+/// bash's login test alone, or joined to `test` — a runtime condition's bash
+/// test — so a login-only line gated on its own condition is still one block,
+/// never one nested in another.
+#[must_use]
+pub fn login_opener_bash(test: Option<&str>) -> String {
+    match test {
+        None => opener(&When::Login.test_bash().unwrap_or_default()),
+        Some(test) => opener(&format!("{LOGIN_AND_BASH}{test}")),
+    }
+}
+
+/// The runtime condition `test` is the rendering of, in either shell's
+/// words, if it is one.
 fn read_test(test: &str) -> Option<When> {
+    if let Some(bash) = [When::Interactive, When::Login]
+        .into_iter()
+        .find(|when| when.test_bash().as_deref() == Some(test))
+    {
+        return Some(bash);
+    }
     let inner = test.strip_prefix("[[ ")?.strip_suffix(" ]]")?;
     let candidate = match inner {
         "-o interactive" => When::Interactive,
@@ -452,8 +476,30 @@ mod tests {
             "if [[ -n ${SSH_CONNECTION-} ]]; then",
             "if [[ -n ${X+x} ]]; then",
             "if [[ ${X-} == \"a b\" ]]; then",
+            // bash's words for the two tests bash asks differently.
+            "if [[ $- == *i* ]]; then",
+            "if shopt -q login_shell; then",
+            // bash's login block, joined to one more test.
+            "if shopt -q login_shell && [[ -n ${SSH_CONNECTION-} ]]; then",
+            "if shopt -q login_shell && [[ $- == *i* ]]; then",
         ] {
             assert!(is_opener(line), "{line}");
+        }
+        assert_eq!(
+            login_opener_bash(None),
+            "if shopt -q login_shell; then".to_string()
+        );
+        let ssh = When::Ssh.test_bash().expect("a runtime test");
+        assert!(is_opener(&login_opener_bash(Some(&ssh))));
+        for line in [
+            "if shopt -q login_shell && true; then",
+            "if shopt -q login_shell &&  [[ -o login ]]; then",
+            "if [[ -o login ]] && shopt -q login_shell; then",
+            "if shopt -q extglob; then",
+            "if [[ $- == *x* ]]; then",
+            "if shopt -q login_shell && shopt -q login_shell && [[ -o login ]]; then",
+        ] {
+            assert!(!is_opener(line), "{line}");
         }
         for line in [
             "if [[ -o interactive ]]; then :",

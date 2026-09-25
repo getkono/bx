@@ -621,6 +621,8 @@ pub fn run(
 /// path it was written with, so one blocked on a missing tool or an unanswered
 /// value in its body still declares its file; one whose path itself waits on a
 /// value cannot be matched, and its file is reported until the value is given.
+/// A generated fragment held back on an unanswered value is named by its key,
+/// which is its path, so it declares its file the same way.
 ///
 /// A tracked target also declares its repo copy, which `sync` claims in the
 /// ledger: the file in the repo its `file` names, whether the target is ready
@@ -652,9 +654,9 @@ fn undeclared_rows(
         .collect();
     let mut declared: BTreeSet<&str> = targets
         .iter()
-        .filter_map(|resolution| match resolution {
-            Resolution::Ready(target) => Some(target.path.as_str()),
-            Resolution::Blocked(_) => None,
+        .map(|resolution| match resolution {
+            Resolution::Ready(target) => target.path.as_str(),
+            Resolution::Blocked(entry) => entry.key.as_str(),
         })
         .chain(blocked)
         .chain(copies.iter().map(Portable::as_str))
@@ -4408,6 +4410,54 @@ pub(crate) mod tests {
 
             let report = plan(&inputs(&home, &blocked));
             assert_eq!(report.actions(), vec![Action::Blocked]);
+        }
+
+        #[test]
+        fn a_fragment_held_back_on_an_unanswered_value_still_declares_its_file() {
+            let home = guarded_home();
+            let env = |value: &str| {
+                format!("[[env]]\nname = \"EDITOR\"\nvalue = \"{value}\"\nkind = \"interactive\"\n")
+            };
+            apply(&inputs(&home, &env("nvim")));
+            let fragment = config::env::Place::Zshrc.fragment();
+            assert!(
+                ledger(&home)
+                    .iter()
+                    .any(|(path, _)| path.as_str() == fragment),
+                "the fragment is bx's"
+            );
+            let held = format!(
+                "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n{}",
+                env("{{who}}")
+            );
+
+            let report = plan(&inputs(&home, &held));
+            assert!(
+                !report.actions().contains(&Action::Undeclared),
+                "{:?}",
+                report.changes
+            );
+            assert!(report.actions().contains(&Action::Blocked));
+
+            // Edited by hand while held back, it is still not a conflict
+            // telling the user to `bx rm` a file the configuration declares.
+            let path = home.path().join(fragment.trim_start_matches("~/"));
+            std::fs::write(&path, "edited\n").expect("the edit");
+            let report = plan(&inputs(&home, &held));
+            assert!(
+                !report.actions().contains(&Action::Conflict),
+                "{:?}",
+                report.changes
+            );
+            assert!(
+                report
+                    .changes
+                    .iter()
+                    .filter_map(|change| change.note.as_deref())
+                    .all(|note| !note.contains("bx rm")),
+                "{:?}",
+                report.changes
+            );
         }
 
         #[test]

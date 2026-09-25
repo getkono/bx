@@ -84,10 +84,15 @@ pub enum Resolution<T> {
 
 /// Why an entry could not be resolved.
 ///
-/// The shared reason enum. Entries C2 and E1 add `MissingTool { tool }` to it
-/// rather than introducing a parallel blocked type, which is why
-/// `report::Action::Blocked` is documented as "a prerequisite is absent" rather
-/// than as one specific prerequisite.
+/// The shared reason enum: a later reason extends it rather than introducing a
+/// parallel blocked type, which is why `report::Action::Blocked` is documented
+/// as "a prerequisite is absent" rather than as one specific prerequisite.
+///
+/// An absent tool is deliberately not a reason. A target's `requires` never
+/// blocks it — its file is written on its own content and mode alone, and
+/// `bx doctor` names the tool — so no variant here says a tool is missing. A
+/// target whose whole content is the output of running an absent tool would
+/// need one; that case is reserved, and nothing produces it yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockReason {
     /// One or more declared values this entry references have no answer.

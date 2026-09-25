@@ -22,10 +22,11 @@
 //!                                               #   one line, not blank; no body key
 //!                                               #   beside it, the line *is* the body
 //! direction  = "apply"                          # apply | track; default apply
+//!                                               #   track needs a `file` body
 //! format     = "opaque"                         # opaque | jsonc | env.d; default opaque
 //!                                               #   jsonc and env.d need attach = "own"
 //! owns       = ["agent.default_model"]          # required and non-empty iff format = "jsonc"
-//! requires   = ["starship"]                     # default []
+//! requires   = ["starship"]                     # default []; reported, never a gate
 //! references = ["~/.gitconfig.local"]           # default []
 //! enabled    = true                             # default true
 //! ```
@@ -38,6 +39,16 @@
 //! what `toml_edit` edits surgically without reflowing a nested table — and what
 //! a human types. A companion key without its discriminant is an error, so the
 //! flat form cannot silently ignore a key.
+//!
+//! # `requires` never gates
+//!
+//! `requires` names the tools a target configures, by a bare name looked up on
+//! `PATH` or by an absolute path. A target is written whether or not they are
+//! installed: its file is decided on its own content and mode alone, so a
+//! tool's configuration is already in place when the tool arrives, and nothing
+//! has to be run again. `bx doctor` names every required tool that is not an
+//! executable, in the same finding as a `[[tool]]` entry of the same name; see
+//! [`crate::doctor::tools`].
 //!
 //! # A tree
 //!
@@ -126,7 +137,8 @@ pub struct Target {
     pub direction: Direction,
     /// How much of the file bx claims.
     pub format: Format,
-    /// Tool names this target is gated on.
+    /// The tools this target configures. Never a gate: `bx doctor` reports
+    /// the absent ones, and the target is written either way.
     pub requires: Vec<String>,
     /// Paths named inside the content, so drift in them can be reported.
     pub references: Vec<Portable>,
@@ -646,13 +658,18 @@ pub enum Attach {
     },
 }
 
-/// Whether bx writes a file or only watches it.
+/// Which copy of a file leads: the config repo's, or this machine's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Direction {
-    /// bx writes it.
+    /// The repo's copy leads: bx writes it onto the machine.
     #[default]
     Apply,
-    /// The tool writes it; bx reports drift and never touches it.
+    /// This machine's copy leads, because a tool rewrites it — a plugin
+    /// manager's lock file. `bx sync` carries a change made here into the
+    /// repo's copy and commits it; `apply` writes the repo's copy here only
+    /// where this machine's did not change since the two last agreed; and a
+    /// change on both sides is a conflict for a human. It needs a `file` body,
+    /// whole and opaque; see `plan::decide`.
     Track,
 }
 

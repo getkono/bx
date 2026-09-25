@@ -37,6 +37,11 @@ pub enum Action {
     Create,
     /// bx owns the target and its content differs; it will be updated.
     Modify,
+    /// A tracked target this machine changed: `bx sync` carries the machine's
+    /// copy into the config repo and commits it. Not `apply`'s work, so it is
+    /// neither pending nor in need of attention, and a bare `apply` over it
+    /// still reports a converged machine.
+    Sync,
     /// The target exists, differs, and bx does not own it — or bx owns it but
     /// the user has since edited it. Reported and skipped, never overwritten.
     Conflict,
@@ -55,14 +60,18 @@ pub enum Action {
     /// the whole apply exit 1. The blocked entry names the values and the
     /// `bx init` invocation that sets them, so the report is actionable.
     ///
-    /// An **absent tool** is produced from [`crate::detect::Presence::is_usable`].
-    /// It matters most
-    /// where a tool is configured entirely by environment and bx's output is a
-    /// shell fragment naming a binary: writing `RUSTC_WRAPPER=/usr/bin/sccache`
-    /// when sccache is absent does not degrade gracefully, it breaks every
-    /// `cargo build` on the machine. [`env_guard`](crate::env_guard) cannot
-    /// catch that — it checks where a value points, never whether what it
-    /// points at exists, which is a question only the filesystem can answer.
+    /// An **absent tool** is decided by [`crate::detect::Presence::is_usable`],
+    /// and it never blocks a target's own file: a target's `requires` is
+    /// reported by `bx doctor` and gates nothing, so a tool's configuration is
+    /// written before the tool is installed. What an absent tool does hold
+    /// back is a line or a step that would *run* it. A `when = "has:TOOL"`
+    /// line is left out of its shared file, which is still written, so writing
+    /// `RUSTC_WRAPPER=/usr/bin/sccache` where sccache is absent — which breaks
+    /// every `cargo build` on the machine rather than degrading — never
+    /// happens. [`env_guard`](crate::env_guard) cannot catch that: it checks
+    /// where a value points, never whether what it points at exists, which is
+    /// a question only the filesystem can answer. An activation step whose
+    /// tool is absent is this action, since its output is the tool's to print.
     Blocked,
 }
 
@@ -75,6 +84,7 @@ impl Action {
             Self::Undeclared => '*',
             Self::Create => '+',
             Self::Modify => '~',
+            Self::Sync => '<',
             Self::Conflict => '!',
             Self::Blocked => '?',
         }
@@ -106,6 +116,7 @@ impl fmt::Display for Action {
             Self::Undeclared => "undeclared",
             Self::Create => "create",
             Self::Modify => "modify",
+            Self::Sync => "sync",
             Self::Conflict => "conflict",
             Self::Blocked => "blocked",
         };
@@ -154,8 +165,9 @@ impl Exit {
 
 /// A one-line tally, rendered as the last line of `plan`.
 ///
-/// [`Action::Undeclared`] is counted only when there is one, so the line a
-/// configuration with nothing undeclared prints is the one it always printed.
+/// [`Action::Undeclared`], and tracked targets waiting for `bx sync`, are each
+/// counted only when there is one, so a configuration with nothing undeclared
+/// that tracks nothing prints the line it always printed.
 #[must_use]
 pub fn summary(actions: &[Action]) -> String {
     let count = |want: Action| actions.iter().filter(|a| **a == want).count();
@@ -163,8 +175,12 @@ pub fn summary(actions: &[Action]) -> String {
         0 => String::new(),
         n => format!(" {n} undeclared,"),
     };
+    let sync = match count(Action::Sync) {
+        0 => String::new(),
+        n => format!(", {n} to sync"),
+    };
     format!(
-        "Plan: {} to create, {} to modify, {} conflict, {} blocked,{undeclared} {} unchanged.",
+        "Plan: {} to create, {} to modify, {} conflict, {} blocked,{undeclared} {} unchanged{sync}.",
         count(Action::Create),
         count(Action::Modify),
         count(Action::Conflict),
@@ -184,6 +200,7 @@ mod tests {
             Action::Undeclared,
             Action::Create,
             Action::Modify,
+            Action::Sync,
             Action::Conflict,
             Action::Blocked,
         ];
@@ -201,6 +218,7 @@ mod tests {
         assert_eq!(Action::Blocked.symbol(), '?');
         assert_eq!(Action::Unchanged.symbol(), '=');
         assert_eq!(Action::Undeclared.symbol(), '*');
+        assert_eq!(Action::Sync.symbol(), '<');
     }
 
     #[test]
@@ -211,6 +229,7 @@ mod tests {
         assert!(!Action::Blocked.is_pending());
         assert!(!Action::Unchanged.is_pending());
         assert!(!Action::Undeclared.is_pending());
+        assert!(!Action::Sync.is_pending());
     }
 
     #[test]
@@ -220,6 +239,7 @@ mod tests {
         for a in [
             Action::Create,
             Action::Modify,
+            Action::Sync,
             Action::Unchanged,
             Action::Undeclared,
         ] {
@@ -233,6 +253,7 @@ mod tests {
         // reordering that looks cosmetic would resort plan output.
         let mut actions = [
             Action::Blocked,
+            Action::Sync,
             Action::Create,
             Action::Unchanged,
             Action::Conflict,
@@ -247,6 +268,7 @@ mod tests {
                 Action::Undeclared,
                 Action::Create,
                 Action::Modify,
+                Action::Sync,
                 Action::Conflict,
                 Action::Blocked,
             ]
@@ -261,6 +283,7 @@ mod tests {
         assert_eq!(Action::Create.to_string(), "create");
         assert_eq!(Action::Modify.to_string(), "modify");
         assert_eq!(Action::Undeclared.to_string(), "undeclared");
+        assert_eq!(Action::Sync.to_string(), "sync");
     }
 
     #[test]
@@ -340,6 +363,16 @@ mod tests {
             summary(&[Action::Undeclared, Action::Undeclared, Action::Unchanged]),
             "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 2 undeclared, 1 unchanged."
         );
+    }
+
+    #[test]
+    fn a_tracked_target_waiting_for_sync_is_counted_only_when_there_is_one() {
+        assert_eq!(
+            summary(&[Action::Sync, Action::Unchanged]),
+            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 1 unchanged, 1 to sync."
+        );
+        // Not pending, and not a conflict: apply has nothing to do about it.
+        assert_eq!(Exit::from_actions(&[Action::Sync]), Exit::Converged);
     }
 
     #[test]

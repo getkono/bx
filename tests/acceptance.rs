@@ -135,18 +135,6 @@ impl Machine {
         );
         home.write(".zshrc", ZSHRC);
         home.write(".bashrc", BASHRC);
-        // The plugin manager already wrote its lock file, as the repo has it:
-        // a tracked file bx watches and never claims. Workaround for #116:
-        // `rm` leaves behind a tracked file that `apply` wrote, so without
-        // this seed the rm test would fail on that defect. Drop the seed
-        // (this block) once #116 lands, so `apply` writes the tracked file
-        // and `rm` is held to removing it.
-        std::fs::create_dir_all(home.child(".config/nvim")).expect("~/.config/nvim");
-        std::fs::copy(
-            example().join("home/.config/nvim/lazy-lock.json"),
-            home.child(".config/nvim/lazy-lock.json"),
-        )
-        .expect("the lock file");
 
         Self {
             home,
@@ -359,12 +347,35 @@ impl Snapshot {
 
     /// The snapshot without bx's `.bx-` temporary files, and the paths of
     /// those it left out. A workaround for #117; see its two call sites.
+    ///
+    /// Also without each directory that holds nothing but such a file: the
+    /// directories staged for a write killed before its intent was journalled,
+    /// which recovery cannot see either. A workaround for #119: once it lands,
+    /// drop this second half, so the rollback is held to removing them.
     fn without_orphans(self) -> (Self, Vec<PathBuf>) {
-        let (orphans, kept): (BTreeMap<_, _>, BTreeMap<_, _>) =
+        let (orphans, mut kept): (BTreeMap<_, _>, BTreeMap<_, _>) =
             self.0.into_iter().partition(|(path, _)| {
                 path.file_name()
                     .is_some_and(|name| name.to_string_lossy().starts_with(".bx-"))
             });
+        let mut staged: Vec<PathBuf> = orphans
+            .keys()
+            .flat_map(|orphan| orphan.ancestors().skip(1))
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect();
+        // Innermost first, so a directory is judged once those beneath it
+        // that held only the orphan are already gone.
+        staged.sort_by(|a, b| (b.components().count(), b).cmp(&(a.components().count(), a)));
+        staged.dedup();
+        for dir in staged {
+            let holds_more = kept
+                .keys()
+                .any(|path| path != &dir && path.starts_with(&dir));
+            if !holds_more && matches!(kept.get(&dir), Some(Entry::Dir { .. })) {
+                kept.remove(&dir);
+            }
+        }
         (Self(kept), orphans.into_keys().collect())
     }
 

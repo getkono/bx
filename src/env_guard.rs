@@ -497,6 +497,20 @@ enum Kind {
     /// argument is a second path, or a second assignment, that no check reads.
     /// No `:`, `=`, `~` or URL either. Needs no root.
     Program,
+    /// A command line a tool hands to a shell to run: `EDITOR`, `PAGER`,
+    /// `MANPAGER`. Its first word, up to the first blank, is judged exactly as
+    /// a [`Kind::Program`] is. Everything after it is judged as
+    /// [`Kind::Arguments`] are, so `sh -c 'col -bx | bat -l man -p'` is one.
+    /// Needs no root.
+    CommandLine,
+    /// Words a tool reads as its own command-line options — `LESS`. Nothing
+    /// in them is held to a grammar of its own, because no grammar covers
+    /// every tool's options. What is judged is what a shell running them
+    /// could make of them ([`refuses_arguments`]): no `$`, backquote or
+    /// backslash, whose meaning a later shell decides, no path that points
+    /// inside a directory bx owns or its config repo, and no relocating name,
+    /// which a shell could assign with or without an `=`. Needs no root.
+    Arguments,
     /// A list a shell or a tool searches. Every entry absolute, non-empty and
     /// outside bx's own directories, whatever its shape, because an empty
     /// entry or `.` *is* the current directory. A reference to the list's own
@@ -542,6 +556,13 @@ enum Setting {
     /// A locale name: one bare word — a letter or digit, then letters, digits,
     /// `.`, `_`, `+` and `-`.
     Locale,
+    /// An input-method module a toolkit loads by name — `ibus`, `fcitx`,
+    /// `fcitx5`, `uim` — for `GTK_IM_MODULE` and its kin: one bare word, the
+    /// same shape a locale is, and not a locale.
+    InputMethod,
+    /// X's input-method modifier, `XMODIFIERS`: exactly `@im=` and then an
+    /// [`Setting::InputMethod`] name, as in `@im=ibus`.
+    ImModifier,
 }
 
 impl Setting {
@@ -556,7 +577,8 @@ impl Setting {
                 .strip_suffix(['K', 'M', 'G', 'T'])
                 .is_some_and(|digits| is_decimal(digits, 6)),
             Self::OneOf(words) => words.contains(&value),
-            Self::Locale => is_bare_word(value),
+            Self::Locale | Self::InputMethod => is_bare_word(value),
+            Self::ImModifier => value.strip_prefix("@im=").is_some_and(is_bare_word),
         }
     }
 }
@@ -573,9 +595,10 @@ fn is_decimal(text: &str, digits: usize) -> bool {
 /// **This table is the guard's whole name space**: a name it does not list is
 /// [`Reason::NotEmittable`], whatever it is given. It must grow with the
 /// generators, one name at a time, each with the kind its tool documents —
-/// and a name whose tool reads it as a command line (`MAKEFLAGS`, `RUSTFLAGS`,
-/// `LESS`) or as either a word or a path (`CARGO_BUILD_TARGET` takes a
-/// `.json` target file) needs a kind that can judge that before it is added.
+/// and a name whose tool reads it as something no kind judges (`MAKEFLAGS`
+/// and `RUSTFLAGS` hold assignments and paths their tool reads its own way,
+/// and `CARGO_BUILD_TARGET` takes either a word or a `.json` target file)
+/// needs a kind that can judge that before it is added.
 ///
 /// * `XDG_CACHE_HOME` and `XDG_DATA_HOME`, and the 23 relocating exports of
 ///   the operator fragment the module's tests hold the guard to:
@@ -585,14 +608,17 @@ fn is_decimal(text: &str, digits: usize) -> bool {
 ///   `DATA_DIR` is an anchor too. `CACHE_DIR` is a location, because npm's
 ///   find-cache-dir reads it and writes beneath it. `SCCACHE_DIR` is
 ///   sccache's cache, the module's motivating case.
-/// * `EDITOR`, `VISUAL`, `PAGER`, `BROWSER`, `TERMINAL` — the program a tool
-///   runs to edit, page, browse or open a terminal — and `RUSTC_WRAPPER`, the
-///   program cargo runs `rustc` through.
+/// * `BROWSER` and `TERMINAL` — the program a tool runs to browse or open a
+///   terminal — and `RUSTC_WRAPPER`, the program cargo runs `rustc` through.
+/// * `EDITOR`, `VISUAL`, `PAGER` and `MANPAGER`, the command line a tool runs
+///   through a shell to edit or page, and `LESS`, the options `less` reads.
 /// * `PATH` and `INFOPATH`, searched for programs and documents.
 /// * `SSH_AUTH_SOCK`, the running ssh agent.
 /// * `SCCACHE_CACHE_SIZE` (a size), `MISE_JOBS` (a count), `UV_NO_CACHE` and
 ///   `MISE_VERBOSE` (switches), `CARGO_TERM_COLOR` (`auto`, `always` or
-///   `never`) and `LANG` (a locale).
+///   `never`), `LANG`, `LC_ALL` and the twelve `LC_*` categories (locales),
+///   `GTK_IM_MODULE`, `QT_IM_MODULE`, `SDL_IM_MODULE` and `GLFW_IM_MODULE`
+///   (input-method modules) and `XMODIFIERS` (`@im=` and a module).
 ///
 /// `SHELL`, `MANPATH` and `HOME` would belong here and do not: each is a
 /// [`SHELL_NAMES`] entry, which may not be assigned at all.
@@ -615,15 +641,32 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ),
     ("DATA_DIR", Kind::Anchor),
     ("DOTNET_CLI_HOME", Kind::Location),
-    ("EDITOR", Kind::Program),
+    ("EDITOR", Kind::CommandLine),
+    ("GLFW_IM_MODULE", Kind::Setting(Setting::InputMethod)),
     ("GOCACHE", Kind::Location),
     ("GOMODCACHE", Kind::Location),
     ("GOPATH", Kind::LocationList),
+    ("GTK_IM_MODULE", Kind::Setting(Setting::InputMethod)),
     ("HOMEBREW_CACHE", Kind::Location),
     ("HOMEBREW_LOGS", Kind::Location),
     ("HOMEBREW_TEMP", Kind::Location),
     ("INFOPATH", Kind::SearchList),
     ("LANG", Kind::Setting(Setting::Locale)),
+    ("LC_ADDRESS", Kind::Setting(Setting::Locale)),
+    ("LC_ALL", Kind::Setting(Setting::Locale)),
+    ("LC_COLLATE", Kind::Setting(Setting::Locale)),
+    ("LC_CTYPE", Kind::Setting(Setting::Locale)),
+    ("LC_IDENTIFICATION", Kind::Setting(Setting::Locale)),
+    ("LC_MEASUREMENT", Kind::Setting(Setting::Locale)),
+    ("LC_MESSAGES", Kind::Setting(Setting::Locale)),
+    ("LC_MONETARY", Kind::Setting(Setting::Locale)),
+    ("LC_NAME", Kind::Setting(Setting::Locale)),
+    ("LC_NUMERIC", Kind::Setting(Setting::Locale)),
+    ("LC_PAPER", Kind::Setting(Setting::Locale)),
+    ("LC_TELEPHONE", Kind::Setting(Setting::Locale)),
+    ("LC_TIME", Kind::Setting(Setting::Locale)),
+    ("LESS", Kind::Arguments),
+    ("MANPAGER", Kind::CommandLine),
     ("MISE_CACHE_DIR", Kind::Location),
     ("MISE_DATA_DIR", Kind::Location),
     ("MISE_JOBS", Kind::Setting(Setting::Count)),
@@ -631,22 +674,25 @@ const EMITTABLE: &[(&str, Kind)] = &[
     ("NPM_CONFIG_CACHE", Kind::Location),
     ("NUGET_HTTP_CACHE_PATH", Kind::Location),
     ("NUGET_PACKAGES", Kind::Location),
-    ("PAGER", Kind::Program),
+    ("PAGER", Kind::CommandLine),
     ("PATH", Kind::SearchList),
     ("PIP_CACHE_DIR", Kind::Location),
     ("PNPM_CONFIG_STORE_DIR", Kind::Location),
+    ("QT_IM_MODULE", Kind::Setting(Setting::InputMethod)),
     ("RUSTC_WRAPPER", Kind::Program),
     ("RUSTUP_HOME", Kind::Location),
     ("SCCACHE_CACHE_SIZE", Kind::Setting(Setting::Size)),
     ("SCCACHE_DIR", Kind::Location),
     ("SCRATCH_HOME", Kind::Anchor),
+    ("SDL_IM_MODULE", Kind::Setting(Setting::InputMethod)),
     ("SSH_AUTH_SOCK", Kind::Socket),
     ("TERMINAL", Kind::Program),
     ("UV_CACHE_DIR", Kind::Location),
     ("UV_NO_CACHE", Kind::Setting(Setting::Switch)),
-    ("VISUAL", Kind::Program),
+    ("VISUAL", Kind::CommandLine),
     ("XDG_CACHE_HOME", Kind::Location),
     ("XDG_DATA_HOME", Kind::Location),
+    ("XMODIFIERS", Kind::Setting(Setting::ImModifier)),
     ("ZIG_GLOBAL_CACHE_DIR", Kind::Location),
 ];
 
@@ -1104,7 +1150,9 @@ fn admissible_root(declared: &Path, normalised: &Path) -> bool {
 /// directories rather than around them, write a path of plain characters with
 /// no `..`, move it inside a declared root, point it beneath a declared root
 /// rather than at one, write an absolute path,
-/// give a program no arguments, give a setting a value it accepts, define the
+/// give a program no arguments, begin a command line with a program, write a
+/// command line with nothing a later shell expands, set no relocating variable
+/// inside a command line, give a setting a value it accepts, define the
 /// referenced variable earlier, give the guard a home, fix the line
 /// that assigned it, shorten it — so a caller that only knew *which* variable
 /// was rejected could not say what to do about it. The messages name no data:
@@ -1209,6 +1257,23 @@ pub enum Reason {
     /// bare command name: an argument, a `:` list, a URL, nothing at all.
     #[error("is not one program — an absolute path or a bare command name, with no arguments")]
     NotAProgram,
+    /// A command line whose first word is not one program: nothing, a
+    /// relative path, an option, a URL.
+    #[error("does not begin with one program — an absolute path or a bare command name")]
+    NotACommandLine,
+    /// A command line or options holding `$`, a backquote, a backslash, a
+    /// `~NAME`, or a glob or brace in a path: the shell that runs it expands
+    /// them later, into words nothing judged.
+    #[error(
+        "holds an expansion the shell running it performs later, so what it names cannot be shown"
+    )]
+    LaterExpansion,
+    /// A command line or options naming a variable that moves a tool's
+    /// config, data or cache ([`is_relocating`]) — `env XDG_CONFIG_HOME=…
+    /// nvim`, `for HOME in …`, `read HOME` — which a shell running it could
+    /// assign where the guard would never judge it.
+    #[error("names a variable that relocates a tool's files, which its command line could assign")]
+    RelocatingAssignment,
     /// A setting given a value it does not accept.
     #[error("is not a value this setting accepts")]
     NotASetting,
@@ -1401,6 +1466,9 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///   contain bx's own directories and may be a root;
 /// * a **program** is one absolute path outside bx's own directories, or one
 ///   bare command name;
+/// * a **command line** begins with one program, and the rest is judged as
+///   **options** are: nothing a later shell expands, no path inside bx's own
+///   directories, and no assignment to a relocating name;
 /// * a **search list** has every entry absolute and outside bx's own
 ///   directories, its inherited self standing in for itself;
 /// * a **socket** is an absolute path outside bx's own directories;
@@ -1707,6 +1775,8 @@ fn judge(
             .refuses_everything()
             .or_else(|| within(resolved, |value| refuses_anchor(value, exported, roots))),
         Kind::Program => within(resolved, |value| refuses_program(value, roots)),
+        Kind::CommandLine => within(resolved, |value| refuses_command_line(value, roots)),
+        Kind::Arguments => within(resolved, |value| refuses_arguments(value, roots)),
         Kind::Socket => within(resolved, anchored),
         Kind::Setting(setting) => within(resolved, |value| {
             (!setting.admits(value)).then_some(Reason::NotASetting)
@@ -1738,6 +1808,110 @@ fn refuses_program(value: &str, roots: &RootSet) -> Option<Reason> {
     } else {
         Some(Reason::NotAProgram)
     }
+}
+
+/// Why `value` is not a command line bx may name, or `None` if it is.
+///
+/// Its first word, up to the first blank, is one program ([`refuses_program`]),
+/// and what follows is judged as [`refuses_arguments`] judges options. A first
+/// word that is not one program is [`Reason::NotACommandLine`], whose sentence
+/// does not tell the user to drop the arguments a command line may have.
+fn refuses_command_line(value: &str, roots: &RootSet) -> Option<Reason> {
+    let (program, rest) = value.split_once(BLANKS).unwrap_or((value, ""));
+    match refuses_program(program, roots) {
+        Some(Reason::NotAProgram) => Some(Reason::NotACommandLine),
+        Some(reason) => Some(reason),
+        None => refuses_arguments(rest, roots),
+    }
+}
+
+/// The characters that end a word of a command line as a shell splits it, or
+/// that begin an assignment's value or a list's next entry, where a `~`
+/// expands again.
+const WORD_BREAKS: &str = " \t;|&<>()=:";
+
+/// The characters that end a word of a command line as a shell splits it:
+/// [`WORD_BREAKS`] but `=` and `:`, which a path's own directories may hold.
+const COMMAND_BREAKS: &str = " \t;|&<>()";
+
+/// The characters a shell expands in a path into names nothing judged.
+const GLOBS: &str = "*?[]{}";
+
+/// Why the words `text` holds may not be handed to a shell as a command line's
+/// arguments, or `None` if they may.
+///
+/// No grammar is imposed on the words: every tool reads its own options its
+/// own way. What is judged is only what could make one point inside a
+/// directory bx owns, or relocate a tool's files, lexically and without
+/// knowing the tool:
+///
+/// * a `$`, a backquote or a backslash is [`Reason::LaterExpansion`]: a later
+///   shell substitutes, or unescapes, words nothing judged;
+/// * quotes are dropped before anything is read, because a shell joins what
+///   they hold to the word around them and never splits a word at one — so
+///   `sh -c 'col -bx | bat'` is read as `sh -c col -bx | bat`, and
+///   `/x/.local/state/b"x"` as the path it spells;
+/// * each word, split at blanks, shell operators, `=` and `:`, that opens with
+///   `~` or `~/` stands for a path under the home, and one that opens with
+///   any other `~` for another user's home, which cannot be shown
+///   ([`Reason::LaterExpansion`]); a word holding a `/` names the path from
+///   that `/` on, so `-o/x/log` is read as `/x/log`. A path holding a glob or
+///   a brace is [`Reason::LaterExpansion`], and any other path is judged by
+///   [`refuses_bx_location`] alone. A relative path is relative to wherever
+///   the tool runs, which no lexical check can know, and so is every bare
+///   word; neither is refused;
+/// * each whole word, split at blanks and shell operators alone, is judged
+///   the same way from its first `/` or leading `~/`, because a path's own
+///   directories may hold `=` or `:`: with the home `/tmp/a:b`, the pieces of
+///   `/tmp/a:b/.local/state/bx/ledger` are `/tmp/a` and `b/…`, and only the
+///   whole word shows it inside bx's state directory;
+/// * any name a shell could assign — each run of ASCII letters, digits and
+///   `_` — that [`is_relocating`] is [`Reason::RelocatingAssignment`],
+///   wherever it stands and whatever follows it. A shell assigns a name
+///   without an `=` too — `for HOME in …`, `read HOME`, `printf -v HOME` —
+///   so `env XDG_CONFIG_HOME=/elsewhere nvim` and
+///   `sh -c 'read HOME </x; export HOME; nvim'` cannot move what the guard
+///   refuses to move in a fragment. A word that merely mentions such a name
+///   is refused with them: no lexical check tells the two apart.
+fn refuses_arguments(text: &str, roots: &RootSet) -> Option<Reason> {
+    if text.contains(['$', '`', '\\']) {
+        return Some(Reason::LaterExpansion);
+    }
+    let text: String = text.chars().filter(|c| !matches!(c, '\'' | '"')).collect();
+    let pieces = text
+        .split(|c| WORD_BREAKS.contains(c))
+        .map(|piece| (piece, true));
+    let words = text
+        .split(|c| COMMAND_BREAKS.contains(c))
+        .map(|word| (word, false));
+    for (word, piece) in pieces.chain(words) {
+        if let Some(reason) = refuses_argument_path(word, piece, roots) {
+            return Some(reason);
+        }
+    }
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(is_relocating)
+        .then_some(Reason::RelocatingAssignment)
+}
+
+/// Why the path one word of a command line names may not be handed to a
+/// shell, or `None` if it may, as [`refuses_arguments`] reads it. `piece` says
+/// whether the word was split at `=` and `:` too, where a `~` expands again,
+/// so that any other `~` opening it is another user's home; a whole word
+/// opening with such a `~` is read from its first `/`, as its pieces are.
+fn refuses_argument_path(word: &str, piece: bool, roots: &RootSet) -> Option<Reason> {
+    let path = match word.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match roots.home() {
+            Some(home) => format!("{}{rest}", home.display()),
+            None => return Some(Reason::NoHome),
+        },
+        Some(_) if piece => return Some(Reason::LaterExpansion),
+        _ => word[word.find('/')?..].to_string(),
+    };
+    if path.contains(|c| GLOBS.contains(c)) {
+        return Some(Reason::LaterExpansion);
+    }
+    refuses_bx_location(Path::new(&path), roots)
 }
 
 /// A character of a bare word: an ASCII letter or digit, `.`, `_`, `+` or `-`.
@@ -3068,6 +3242,23 @@ mod tests {
             ),
             NotAProgram => (
                 "is not one program — an absolute path or a bare command name, with no arguments"
+                    .to_string(),
+                Some(NotACommandLine),
+            ),
+            NotACommandLine => (
+                "does not begin with one program — an absolute path or a bare command name"
+                    .to_string(),
+                Some(LaterExpansion),
+            ),
+            LaterExpansion => (
+                "holds an expansion the shell running it performs later, so what it names \
+                 cannot be shown"
+                    .to_string(),
+                Some(RelocatingAssignment),
+            ),
+            RelocatingAssignment => (
+                "names a variable that relocates a tool's files, which its command line \
+                 could assign"
                     .to_string(),
                 Some(NotASetting),
             ),
@@ -4600,8 +4791,53 @@ mod tests {
 
     #[test]
     fn programs_and_settings_have_their_kinds() {
-        for name in ["RUSTC_WRAPPER", "EDITOR", "VISUAL", "PAGER"] {
+        for name in ["RUSTC_WRAPPER", "BROWSER", "TERMINAL"] {
             assert_eq!(emittable(name), Some(Kind::Program), "{name}");
+        }
+        for name in ["EDITOR", "VISUAL", "PAGER", "MANPAGER"] {
+            assert_eq!(emittable(name), Some(Kind::CommandLine), "{name}");
+        }
+        assert_eq!(emittable("LESS"), Some(Kind::Arguments));
+        for name in [
+            "LC_ALL",
+            "LC_ADDRESS",
+            "LC_COLLATE",
+            "LC_CTYPE",
+            "LC_IDENTIFICATION",
+            "LC_MEASUREMENT",
+            "LC_MESSAGES",
+            "LC_MONETARY",
+            "LC_NAME",
+            "LC_NUMERIC",
+            "LC_PAPER",
+            "LC_TELEPHONE",
+            "LC_TIME",
+        ] {
+            assert_eq!(
+                emittable(name),
+                Some(Kind::Setting(Setting::Locale)),
+                "{name}"
+            );
+        }
+        for name in [
+            "GTK_IM_MODULE",
+            "QT_IM_MODULE",
+            "SDL_IM_MODULE",
+            "GLFW_IM_MODULE",
+        ] {
+            assert_eq!(
+                emittable(name),
+                Some(Kind::Setting(Setting::InputMethod)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            emittable("XMODIFIERS"),
+            Some(Kind::Setting(Setting::ImModifier))
+        );
+        // Command-line-shaped names no kind judges stay unlisted.
+        for name in ["MAKEFLAGS", "RUSTFLAGS", "LESSOPEN", "LANGUAGE", "LC_FOO"] {
+            assert_eq!(emittable(name), None, "{name}");
         }
         assert_eq!(
             emittable("SCCACHE_CACHE_SIZE"),
@@ -5407,7 +5643,7 @@ mod tests {
         for content in [
             "export EDITOR=\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
             "export EDITOR=\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
-            "export PAGER=\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
+            "export RUSTC_WRAPPER=\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
         ] {
             cases.push((content, rooted()));
             cases.push((content, RootSet::strict()));
@@ -5484,7 +5720,10 @@ mod tests {
 
     #[test]
     fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
-        use Reason::{BxOwnedDirectory, NotAProgram, NotAbsolute, NotEmittable, ReservedName};
+        use Reason::{
+            BxOwnedDirectory, NotACommandLine, NotAProgram, NotAbsolute, NotEmittable,
+            RelocatingAssignment, ReservedName,
+        };
         let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
         // 1: a bare word a tool reads as a path. `BASH_ENV` and `ENV` are also
         // names a starting shell acts on, so they are reserved first.
@@ -5502,26 +5741,42 @@ mod tests {
                 );
             }
         }
-        // 2: a program given arguments.
-        for value in [
-            "\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
-            "\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
+        // 2: a program given arguments. `EDITOR` is a command line since
+        // issue #112, whose arguments are judged for what they point at and
+        // what they assign; a program is still one word.
+        for (value, reason) in [
+            (
+                "\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
+                BxOwnedDirectory,
+            ),
+            (
+                "\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
+                RelocatingAssignment,
+            ),
         ] {
             for roots in [rooted(), RootSet::strict()] {
                 assert_eq!(
                     reason_of(&check("EDITOR", value, &roots)),
+                    Some(reason),
+                    "{value}"
+                );
+                assert_eq!(
+                    reason_of(&check("RUSTC_WRAPPER", value, &roots)),
                     Some(NotAProgram),
                     "{value}"
                 );
             }
         }
+        // A flag that points a tool at a file of its own outside bx's
+        // directories is the user's command line to write: the maintainer's
+        // ruling on #112 judges arguments only for bx's directories.
         assert_eq!(
-            reason_of(&check(
+            check(
                 "PAGER",
                 "\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
                 &rooted()
-            )),
-            Some(NotAProgram)
+            ),
+            Verdict::Allowed
         );
         // 3: a state directory a later line moves. Since round 6 the move is
         // what is refused.
@@ -5535,7 +5790,8 @@ mod tests {
         );
         // 4: no URL is exempt, for any kind that holds a path.
         for (name, value, reason) in [
-            ("EDITOR", "x://ed", NotAProgram),
+            ("EDITOR", "x://ed", NotACommandLine),
+            ("BROWSER", "x://ed", NotAProgram),
             ("RIPGREP_CONFIG_PATH", "cfg://rc", NotEmittable),
             ("GIT_CONFIG_SYSTEM", "https://x:/etc/evil", NotEmittable),
             ("CARGO_HOME", "cfg://rc", NotAbsolute),
@@ -5638,7 +5894,8 @@ mod tests {
             ("SOMETHING", "''"),
             ("X", "true"),
             ("GIT_EDITOR", "vim"),
-            ("MANPAGER", "less"),
+            ("GIT_PAGER", "less"),
+            ("LESSOPEN", "\"|lesspipe.sh %s\""),
             ("CC", "gcc"),
             ("JAVA_HOME", "/usr/lib/jvm/java-21"),
             ("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt"),
@@ -5684,7 +5941,7 @@ mod tests {
             "/home/other/.local/state/bx/nvim",
         ] {
             assert_eq!(
-                check("EDITOR", value, &rooted()),
+                check("BROWSER", value, &rooted()),
                 Verdict::Allowed,
                 "{value}"
             );
@@ -5711,17 +5968,247 @@ mod tests {
             ("$NOWHERE", UnresolvedReference),
         ] {
             assert_eq!(
-                reason_of(&check("EDITOR", value, &rooted())),
+                reason_of(&check("BROWSER", value, &rooted())),
                 Some(reason),
                 "{value:?}"
             );
+            // A command line's first word is judged as a program is, and only
+            // the sentence of the grammar refusal differs.
+            let as_command_line = match reason {
+                NotAProgram => Reason::NotACommandLine,
+                other => other,
+            };
+            let first_word_only = !value.contains(' ');
+            if first_word_only {
+                assert_eq!(
+                    reason_of(&check("EDITOR", value, &rooted())),
+                    Some(as_command_line),
+                    "{value:?}"
+                );
+            }
         }
         // With no home, a `~` or `$HOME` program cannot be shown to be outside
         // bx's state directory, and does not resolve.
         for value in ["~/bin/nvim", "$HOME/bin/nvim"] {
+            for name in ["TERMINAL", "VISUAL"] {
+                assert_eq!(
+                    reason_of(&check(name, value, &RootSet::strict())),
+                    Some(Reason::NoHome),
+                    "{name}={value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_line_is_one_program_and_arguments_that_point_nowhere_bx_owns() {
+        use Reason::{
+            BxOwnedDirectory, InsideConfigRepo, LaterExpansion, NoHome, NotACommandLine,
+            NotAbsolute, RelocatingAssignment,
+        };
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        // What the reference dotfiles set, and the shapes beside it.
+        for (name, value) in [
+            ("MANPAGER", "\"sh -c 'col -bx | bat -l man -p'\""),
+            ("MANPAGER", "'sh -c \"col -bx | bat -l man -p\"'"),
+            ("MANPAGER", "less"),
+            ("EDITOR", "nvim"),
+            ("EDITOR", "\"code --wait\""),
+            ("VISUAL", "\"nvim -u /etc/xdg/nvim/init.lua\""),
+            ("PAGER", "\"less -R\""),
+            ("PAGER", "\"/usr/bin/less -R  -F\""),
+            ("EDITOR", "\"nvim ~/notes/todo.md\""),
+            ("EDITOR", "\"emacsclient -c -a ''\""),
+            ("EDITOR", "\"nvim relative/.local/state/bx\""),
+            ("PAGER", "\"env LESSCHARSET=utf-8 less\""),
+            ("MANPAGER", "'nvim +Man!'"),
+        ] {
+            for roots in [rooted(), home_rooted.clone()] {
+                assert_eq!(
+                    check(name, value, &roots),
+                    Verdict::Allowed,
+                    "{name}={value}"
+                );
+            }
+        }
+        // With no home, a `~` argument cannot be shown to be outside bx's
+        // state directory; every other argument above is judged the same.
+        assert_eq!(
+            reason_of(&check(
+                "EDITOR",
+                "\"nvim ~/notes/todo.md\"",
+                &RootSet::strict()
+            )),
+            Some(NoHome)
+        );
+        assert_eq!(
+            check(
+                "MANPAGER",
+                "\"sh -c 'col -bx | bat -l man -p'\"",
+                &RootSet::strict()
+            ),
+            Verdict::Allowed
+        );
+        for (value, reason) in [
+            // The first word is a program, or nothing is.
+            ("\" nvim\"", NotACommandLine),
+            ("\"-R less\"", NotACommandLine),
+            ("\"./nvim --wait\"", NotAbsolute),
+            ("\"x://ed --wait\"", NotACommandLine),
+            (
+                "\"/var/home/example/.local/state/bx/nvim -R\"",
+                BxOwnedDirectory,
+            ),
+            // An argument inside bx's directories, however it is spelled.
+            (
+                "\"nvim /var/home/example/.local/state/bx/ledger\"",
+                BxOwnedDirectory,
+            ),
+            ("\"nvim ~/.local/state/bx/ledger\"", BxOwnedDirectory),
+            ("\"nvim ~/.local/share/bx/env.zsh\"", BxOwnedDirectory),
+            ("\"nvim ~/.config/bx/bx.toml\"", InsideConfigRepo),
+            (
+                "\"less -o/var/home/example/.local/state/bx/log\"",
+                BxOwnedDirectory,
+            ),
+            (
+                "\"less --log-file=/var/home/example/.local/state/bx/log\"",
+                BxOwnedDirectory,
+            ),
+            (
+                "'sh -c \"tee /var/home/example/.local/state/b\"x\"/j\"'",
+                BxOwnedDirectory,
+            ),
+            (
+                "\"sh -c 'cat>/var/home/example/.local/state/bx/j'\"",
+                BxOwnedDirectory,
+            ),
+            (
+                "\"nvim /var/home/example/.local/../.local/state/bx\"",
+                BxOwnedDirectory,
+            ),
+            // Anything a later shell expands.
+            ("'nvim $HOME/.local/state/bx'", LaterExpansion),
+            ("'nvim `pwd`'", LaterExpansion),
+            ("'nvim a\\ b'", LaterExpansion),
+            ("\"nvim ~other/x\"", LaterExpansion),
+            ("\"nvim /var/home/example/.local/state/b*\"", LaterExpansion),
+            ("\"nvim /var/home/example/.local/state/b?\"", LaterExpansion),
+            (
+                "\"nvim /var/home/example/.local/state/{bx,x}\"",
+                LaterExpansion,
+            ),
+            // A relocating assignment, wherever it stands.
+            (
+                "\"env XDG_CONFIG_HOME=/etc/evil nvim\"",
+                RelocatingAssignment,
+            ),
+            ("\"env CARGO_HOME=/tmp/c nvim\"", RelocatingAssignment),
+            ("\"sh -c 'HOME=/tmp nvim'\"", RelocatingAssignment),
+            ("\"sh -c 'x;TMPDIR=/tmp nvim'\"", RelocatingAssignment),
+            // A shell assigns a name without an `=` too.
+            (
+                "\"sh -c 'for XDG_CONFIG_HOME in /etc/evil; do export XDG_CONFIG_HOME; nvim; done'\"",
+                RelocatingAssignment,
+            ),
+            (
+                "\"sh -c 'read HOME </etc/h; export HOME; nvim'\"",
+                RelocatingAssignment,
+            ),
+            (
+                "\"sh -c 'printf -v CARGO_HOME /etc/evil; nvim'\"",
+                RelocatingAssignment,
+            ),
+            (
+                "\"sh -c 'CARGO_HOME[1]=/etc/evil nvim'\"",
+                RelocatingAssignment,
+            ),
+            ("\"sh -c 'CARGO_HOME+=/evil nvim'\"", RelocatingAssignment),
+        ] {
+            for roots in [rooted(), home_rooted.clone()] {
+                assert_eq!(
+                    reason_of(&check("EDITOR", value, &roots)),
+                    Some(reason),
+                    "{value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_argument_is_judged_whole_when_its_homes_directories_hold_a_break() {
+        use Reason::{BxOwnedDirectory, InsideConfigRepo};
+        for home in ["/tmp/a:b", "/tmp/a=b", "/tmp/a:b=c"] {
+            let roots = RootSet::new(Path::new(home), &[PathBuf::from("~")]);
+            for (value, reason) in [
+                (
+                    format!("\"nvim {home}/.local/state/bx/ledger\""),
+                    BxOwnedDirectory,
+                ),
+                (
+                    format!("\"less --log-file={home}/.local/state/bx/log\""),
+                    BxOwnedDirectory,
+                ),
+                (
+                    format!("\"less -o{home}/.local/share/bx/env.zsh\""),
+                    BxOwnedDirectory,
+                ),
+                (
+                    format!("\"sh -c 'cat>{home}/.config/bx/bx.toml'\""),
+                    InsideConfigRepo,
+                ),
+                (
+                    "\"nvim ~/.local/state/bx/ledger\"".to_string(),
+                    BxOwnedDirectory,
+                ),
+            ] {
+                assert_eq!(
+                    reason_of(&check("EDITOR", &value, &roots)),
+                    Some(reason),
+                    "{home}: {value}"
+                );
+                let options = value.replacen("nvim ", "", 1).replacen("less ", "", 1);
+                assert_eq!(
+                    reason_of(&check("LESS", &options, &roots)),
+                    Some(reason),
+                    "{home}: {options}"
+                );
+            }
+            for value in [
+                format!("\"nvim {home}/notes/todo.md\""),
+                format!("\"less --log-file={home}/log\""),
+                "\"nvim ~/notes:x/todo.md\"".to_string(),
+            ] {
+                assert_eq!(check("EDITOR", &value, &roots), Verdict::Allowed, "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn options_are_judged_as_a_command_lines_arguments_are() {
+        use Reason::{BxOwnedDirectory, LaterExpansion, RelocatingAssignment};
+        for value in [
+            "-R",
+            "\"-R -F -X\"",
+            "\"--RAW-CONTROL-CHARS --quit-if-one-screen\"",
+            "\"-R --use-color -Dd+r\"",
+            "''",
+            "",
+        ] {
+            assert_eq!(check("LESS", value, &rooted()), Verdict::Allowed, "{value}");
+        }
+        for (value, reason) in [
+            (
+                "\"-R -o/var/home/example/.local/state/bx/log\"",
+                BxOwnedDirectory,
+            ),
+            ("'-R $HOME'", LaterExpansion),
+            ("\"-R XDG_STATE_HOME=/tmp\"", RelocatingAssignment),
+            ("\"-R XDG_STATE_HOME\"", RelocatingAssignment),
+        ] {
             assert_eq!(
-                reason_of(&check("VISUAL", value, &RootSet::strict())),
-                Some(Reason::NoHome),
+                reason_of(&check("LESS", value, &rooted())),
+                Some(reason),
                 "{value}"
             );
         }
@@ -5805,6 +6292,104 @@ mod tests {
                 Some(Reason::NotASetting),
                 "{name}={value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn locales_and_input_methods_admit_their_words_and_refuse_every_path() {
+        let locales = [
+            "LC_ALL",
+            "LC_ADDRESS",
+            "LC_COLLATE",
+            "LC_CTYPE",
+            "LC_IDENTIFICATION",
+            "LC_MEASUREMENT",
+            "LC_MESSAGES",
+            "LC_MONETARY",
+            "LC_NAME",
+            "LC_NUMERIC",
+            "LC_PAPER",
+            "LC_TELEPHONE",
+            "LC_TIME",
+        ];
+        let modules = [
+            "GTK_IM_MODULE",
+            "QT_IM_MODULE",
+            "SDL_IM_MODULE",
+            "GLFW_IM_MODULE",
+        ];
+        // A setting needs no root, so every set admits the same values.
+        for roots in [rooted(), RootSet::strict()] {
+            for name in locales {
+                for value in ["en_US.UTF-8", "C.UTF-8", "C", "POSIX", "de_DE.utf8"] {
+                    assert_eq!(
+                        check(name, value, &roots),
+                        Verdict::Allowed,
+                        "{name}={value}"
+                    );
+                }
+            }
+            for name in modules {
+                for value in ["ibus", "fcitx", "fcitx5", "uim", "xim"] {
+                    assert_eq!(
+                        check(name, value, &roots),
+                        Verdict::Allowed,
+                        "{name}={value}"
+                    );
+                }
+            }
+            // Written bare, the `=` is outside the value grammar, so bx's
+            // `[[env]]` renderer quotes it.
+            for value in ["\"@im=ibus\"", "'@im=fcitx'", "\"@im=fcitx5\""] {
+                assert_eq!(
+                    check("XMODIFIERS", value, &roots),
+                    Verdict::Allowed,
+                    "{value}"
+                );
+            }
+            // Anything shaped like a path, a list or an option is refused.
+            let refused = [
+                "/usr/lib/locale/x",
+                "\"a/b\"",
+                "en_US:C",
+                "\"en US\"",
+                "..",
+                "-x",
+                "",
+            ];
+            for name in locales.iter().chain(&modules) {
+                for value in refused {
+                    assert_eq!(
+                        reason_of(&check(name, value, &roots)),
+                        Some(Reason::NotASetting),
+                        "{name}={value}"
+                    );
+                }
+            }
+            for value in refused.iter().chain(&[
+                "ibus",
+                "\"@im=\"",
+                "\"@im=/usr/lib/ibus\"",
+                "\"@im=a:b\"",
+                "\"@IM=ibus\"",
+                "\"@im=ibus x\"",
+                "\"x@im=ibus\"",
+            ]) {
+                assert_eq!(
+                    reason_of(&check("XMODIFIERS", value, &roots)),
+                    Some(Reason::NotASetting),
+                    "{value}"
+                );
+            }
+        }
+        // None of them moves anything, so none is searched for in a tool's
+        // activation output.
+        for name in locales
+            .iter()
+            .chain(&modules)
+            .chain(&["XMODIFIERS", "LESS", "MANPAGER"])
+        {
+            assert!(!is_relocating(name), "{name}");
         }
     }
 
@@ -6696,7 +7281,7 @@ mod tests {
         }
         // A program keeps its own, stricter rule.
         assert_eq!(
-            reason_of(&check("EDITOR", "\"/usr/bin/a b\"", &rooted())),
+            reason_of(&check("RUSTC_WRAPPER", "\"/usr/bin/a b\"", &rooted())),
             Some(NotAProgram)
         );
     }
@@ -8064,7 +8649,8 @@ mod tests {
             ),
             ("export EDITOR=/usr/bin/nvim\n", vec![]),
             ("export EDITOR=nvim\n", vec![]),
-            ("export EDITOR=\n", vec![(1, Reason::NotAProgram)]),
+            ("export EDITOR=\n", vec![(1, Reason::NotACommandLine)]),
+            ("export TERMINAL=\n", vec![(1, Reason::NotAProgram)]),
             ("export RUSTC_WRAPPER=/usr/bin/sccache\n", vec![]),
             (
                 "export SSH_AUTH_SOCK=/run/user/1000/ssh-agent.socket\n",
@@ -8846,8 +9432,10 @@ mod tests {
     /// shell's own `XDG_STATE_HOME`, and an `XDG_CONFIG_HOME` whose `/bx`
     /// lands in it escapes. The names the shell manages are its own business.
     /// The commands, search lists and socket written out below need no root: a
-    /// command escapes with a second word or a relative or owned path, and a
-    /// list or socket with any relative or owned entry.
+    /// command escapes with a second word or a relative or owned path, a
+    /// command line with a relative or owned program or an argument naming an
+    /// owned path, options with a word naming one, and a list or socket with
+    /// any relative or owned entry.
     fn escapes(
         name: &str,
         value: &str,
@@ -8883,9 +9471,48 @@ mod tests {
             let path = paths::normalize(Path::new(entry));
             path.is_absolute() && owned.iter().any(|dir| dir.starts_with(&path))
         };
+        // An argument escapes when a path in it — from its first `/`, or
+        // from a leading `~`, in a whole word or in a piece of one — lands
+        // inside bx's directories, or when it names `HOME`, an `XDG_` name or
+        // one the round-5 review saw a tool read as a location, which a shell
+        // assigns with an `=` or without one (`for HOME in`, `read HOME`).
+        // Quotes join words, so they are dropped first.
+        let argument_escapes = |text: &str| {
+            let text: String = text.chars().filter(|c| !matches!(c, '\'' | '"')).collect();
+            let assigns_location = text.split(|c: char| " \t;|&<>()=".contains(c)).any(|word| {
+                word == "HOME"
+                    || word.starts_with("XDG_")
+                    || R5_READ_AS_LOCATIONS.iter().any(|(known, _)| *known == word)
+            });
+            // A path's own directories may hold `=` or `:`, so each word a
+            // shell splits is read whole as well as in pieces.
+            let words = text.split(|c: char| " \t;|&<>()".contains(c));
+            assigns_location
+                || text
+                    .split(|c: char| " \t;|&<>()=:".contains(c))
+                    .chain(words)
+                    .any(|word| {
+                        let path = match word.strip_prefix('~') {
+                            Some(rest) => format!("{}{rest}", home.display()),
+                            None => match word.find('/') {
+                                Some(at) => word[at..].to_string(),
+                                None => return false,
+                            },
+                        };
+                        let path = paths::normalize(Path::new(&path));
+                        owned.iter().any(|dir| path.starts_with(dir))
+                    })
+        };
         let entries: Vec<&str> = value.split(':').collect();
         if TEST_SEARCHED_OR_REACHED.contains(&name) {
             entries.iter().any(|entry| unanchored(entry))
+        } else if TEST_RUN_AS_COMMAND_LINES.contains(&name) {
+            // A tool hands the value to a shell, so its first word is a
+            // program and the rest are that program's arguments.
+            let (program, rest) = value.split_once([' ', '\t']).unwrap_or((value, ""));
+            (pathish(program) && unanchored(program)) || argument_escapes(rest)
+        } else if TEST_READ_AS_OPTIONS.contains(&name) {
+            argument_escapes(value)
         } else if TEST_RUN_AS_COMMANDS.contains(&name) {
             // A tool runs the value through a shell, so a second word is an
             // argument no check looked at.
@@ -8911,17 +9538,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_oracle_reads_a_whole_argument_the_guards_split_would_miss() {
+        // With `:` or `=` in the home's own name, a piece split at them is
+        // never inside bx's directories; only the whole word is. The oracle
+        // and the guard must both see it, and agree on what stays outside.
+        for home in ["/tmp/a:b", "/tmp/a=b"] {
+            let roots = RootSet::new(Path::new(home), &[PathBuf::from("~")]);
+            let after = HashMap::new();
+            for (name, value, owned) in [
+                (
+                    "EDITOR",
+                    format!("nvim {home}/.local/state/bx/ledger"),
+                    true,
+                ),
+                (
+                    "PAGER",
+                    format!("less --log-file={home}/.config/bx/x"),
+                    true,
+                ),
+                ("LESS", format!("-R -o{home}/.local/state/bx/log"), true),
+                ("EDITOR", format!("nvim {home}/notes/todo.md"), false),
+                ("LESS", format!("-R -o{home}/log"), false),
+            ] {
+                assert_eq!(
+                    escapes(name, &value, &roots, &after, Path::new(home)),
+                    owned,
+                    "{name}={value}"
+                );
+                let quoted = format!("\"{value}\"");
+                assert_eq!(
+                    check(name, &quoted, &roots) != Verdict::Allowed,
+                    owned,
+                    "{name}={quoted}"
+                );
+            }
+        }
+    }
+
     /// Names a tool runs as a command, written out here independently of the
     /// guard's table: a value escapes when it has a second word, or when a
     /// path in it is relative or inside bx's state directory.
-    const TEST_RUN_AS_COMMANDS: &[&str] = &[
-        "BROWSER",
-        "EDITOR",
-        "PAGER",
-        "RUSTC_WRAPPER",
-        "TERMINAL",
-        "VISUAL",
-    ];
+    const TEST_RUN_AS_COMMANDS: &[&str] = &["BROWSER", "RUSTC_WRAPPER", "TERMINAL"];
+
+    /// Names a tool hands to a shell as a whole command line, written out here
+    /// independently of the guard's table: a value escapes when its first word
+    /// is a relative or owned path, or when an argument names a path inside
+    /// bx's directories.
+    const TEST_RUN_AS_COMMAND_LINES: &[&str] = &["EDITOR", "MANPAGER", "PAGER", "VISUAL"];
+
+    /// Names a tool reads as its own options, written out here independently
+    /// of the guard's table: a value escapes when a word names a path inside
+    /// bx's directories.
+    const TEST_READ_AS_OPTIONS: &[&str] = &["LESS"];
 
     /// Lists a shell or a tool searches, and a socket it connects to, written
     /// out independently of the guard's table: every entry must be absolute
@@ -9358,8 +10027,19 @@ mod tests {
                 "export EDITOR=\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
                 RootSet::strict(),
             ),
+            // Review of #113: a shell assigns a name without an `=` too.
             (
-                "export PAGER=\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
+                "export EDITOR=\"sh -c 'for XDG_CONFIG_HOME in /etc/evil; do export XDG_CONFIG_HOME; nvim; done'\"",
+                rooted.clone(),
+            ),
+            (
+                "export EDITOR=\"sh -c 'read HOME </etc/h; export HOME; nvim'\"",
+                rooted.clone(),
+            ),
+            // `PAGER` is a command line since #112, so the program given an
+            // argument is `RUSTC_WRAPPER`, which cargo runs as one word.
+            (
+                "export RUSTC_WRAPPER=\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
                 rooted.clone(),
             ),
             (

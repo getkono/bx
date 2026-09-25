@@ -22,6 +22,17 @@ use std::fmt;
 pub enum Action {
     /// Already converged. Hidden unless the user asks for detail.
     Unchanged,
+    /// bx wrote this file, the ledger still owns it, and no enabled target
+    /// declares it any more: its `[[target]]` was deleted or switched off, or
+    /// the repo file a `tree` mirrored was removed.
+    ///
+    /// Reported and left alone. Nothing is written and nothing is deleted —
+    /// bx is additive-only — so the row names `bx rm` as the way to release
+    /// the file, and it stays until the user runs it. Not pending work and not
+    /// a decision bx is waiting on, so `apply` twice still converges. A file
+    /// that has drifted from what bx wrote is reported as a
+    /// [`Action::Conflict`] instead, as drift is for a declared target.
+    Undeclared,
     /// The target does not exist and will be created.
     Create,
     /// bx owns the target and its content differs; it will be updated.
@@ -61,6 +72,7 @@ impl Action {
     pub const fn symbol(self) -> char {
         match self {
             Self::Unchanged => '=',
+            Self::Undeclared => '*',
             Self::Create => '+',
             Self::Modify => '~',
             Self::Conflict => '!',
@@ -91,6 +103,7 @@ impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let word = match self {
             Self::Unchanged => "unchanged",
+            Self::Undeclared => "undeclared",
             Self::Create => "create",
             Self::Modify => "modify",
             Self::Conflict => "conflict",
@@ -140,11 +153,18 @@ impl Exit {
 }
 
 /// A one-line tally, rendered as the last line of `plan`.
+///
+/// [`Action::Undeclared`] is counted only when there is one, so the line a
+/// configuration with nothing undeclared prints is the one it always printed.
 #[must_use]
 pub fn summary(actions: &[Action]) -> String {
     let count = |want: Action| actions.iter().filter(|a| **a == want).count();
+    let undeclared = match count(Action::Undeclared) {
+        0 => String::new(),
+        n => format!(" {n} undeclared,"),
+    };
     format!(
-        "Plan: {} to create, {} to modify, {} conflict, {} blocked, {} unchanged.",
+        "Plan: {} to create, {} to modify, {} conflict, {} blocked,{undeclared} {} unchanged.",
         count(Action::Create),
         count(Action::Modify),
         count(Action::Conflict),
@@ -161,6 +181,7 @@ mod tests {
     fn every_action_has_a_distinct_symbol() {
         let all = [
             Action::Unchanged,
+            Action::Undeclared,
             Action::Create,
             Action::Modify,
             Action::Conflict,
@@ -179,6 +200,7 @@ mod tests {
         assert_eq!(Action::Conflict.symbol(), '!');
         assert_eq!(Action::Blocked.symbol(), '?');
         assert_eq!(Action::Unchanged.symbol(), '=');
+        assert_eq!(Action::Undeclared.symbol(), '*');
     }
 
     #[test]
@@ -188,13 +210,19 @@ mod tests {
         assert!(!Action::Conflict.is_pending());
         assert!(!Action::Blocked.is_pending());
         assert!(!Action::Unchanged.is_pending());
+        assert!(!Action::Undeclared.is_pending());
     }
 
     #[test]
     fn conflicts_and_blocked_targets_need_a_decision() {
         assert!(Action::Conflict.needs_attention());
         assert!(Action::Blocked.needs_attention());
-        for a in [Action::Create, Action::Modify, Action::Unchanged] {
+        for a in [
+            Action::Create,
+            Action::Modify,
+            Action::Unchanged,
+            Action::Undeclared,
+        ] {
             assert!(!a.needs_attention(), "{a} should not need attention");
         }
     }
@@ -208,6 +236,7 @@ mod tests {
             Action::Create,
             Action::Unchanged,
             Action::Conflict,
+            Action::Undeclared,
             Action::Modify,
         ];
         actions.sort_unstable();
@@ -215,6 +244,7 @@ mod tests {
             actions,
             [
                 Action::Unchanged,
+                Action::Undeclared,
                 Action::Create,
                 Action::Modify,
                 Action::Conflict,
@@ -230,6 +260,7 @@ mod tests {
         assert_eq!(Action::Unchanged.to_string(), "unchanged");
         assert_eq!(Action::Create.to_string(), "create");
         assert_eq!(Action::Modify.to_string(), "modify");
+        assert_eq!(Action::Undeclared.to_string(), "undeclared");
     }
 
     #[test]
@@ -244,6 +275,16 @@ mod tests {
         assert_eq!(Exit::from_actions(&[]), Exit::Converged);
         assert_eq!(
             Exit::from_actions(&[Action::Unchanged, Action::Unchanged]),
+            Exit::Converged
+        );
+    }
+
+    #[test]
+    fn an_undeclared_file_alone_exits_zero() {
+        // bx will never act on it and nothing is wrong with it: `apply` twice
+        // must still converge while the user decides whether to `bx rm` it.
+        assert_eq!(
+            Exit::from_actions(&[Action::Unchanged, Action::Undeclared]),
             Exit::Converged
         );
     }
@@ -290,6 +331,14 @@ mod tests {
         assert_eq!(
             summary(&actions),
             "Plan: 2 to create, 1 to modify, 1 conflict, 1 blocked, 3 unchanged."
+        );
+    }
+
+    #[test]
+    fn the_summary_counts_undeclared_files_only_when_there_are_some() {
+        assert_eq!(
+            summary(&[Action::Undeclared, Action::Undeclared, Action::Unchanged]),
+            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 2 undeclared, 1 unchanged."
         );
     }
 

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::{Change, Diff, Error, region};
+use crate::config::Origin;
 use crate::config::env::Syntax;
 use crate::config::resolve::Resolution;
 use crate::config::secrets::Secrets;
@@ -515,7 +516,7 @@ pub(super) fn decide(
     let shown = match action {
         Action::Create | Action::Modify => true,
         Action::Conflict => observed.kind == Kind::File,
-        Action::Unchanged | Action::Blocked => false,
+        Action::Unchanged | Action::Undeclared | Action::Blocked => false,
     };
     // A secret's plaintext, and whatever is on disk where it goes, are never
     // shown: the plan is printed, piped and pasted.
@@ -820,7 +821,7 @@ fn decide_link(
         Action::Conflict if observed.kind == Kind::Symlink => {
             Some(Diff::link(observed.link.as_deref(), Some(&text)))
         }
-        Action::Conflict | Action::Unchanged | Action::Blocked => None,
+        Action::Conflict | Action::Unchanged | Action::Undeclared | Action::Blocked => None,
     };
     let note = match action {
         Action::Create => join([created_dirs(&observed, ctx.home, ctx.declared), note]),
@@ -1161,6 +1162,103 @@ fn ownership(
             conflict("its mode changed since bx wrote it".to_string())
         }
         _ => (action, note),
+    }
+}
+
+/// The row for a ledger entry no enabled target or external declares: a file
+/// bx wrote whose declaration is gone, reported and never acted on.
+///
+/// The row is [`Action::Undeclared`] while what is on disk is still what bx
+/// left, or nothing at all, and names `bx rm` as the way to release it. When
+/// the destination has drifted since — edited, retargeted, its mode changed,
+/// or something of another kind in its place — it is an [`Action::Conflict`]
+/// saying why, as drift is for a declared target: nothing is overwritten
+/// either way, and the note still names `bx rm`. A checkout's commit is git's
+/// to read, so a clone is judged by whether its directory is there alone.
+///
+/// No diff: bx no longer knows what it would write, and it writes nothing.
+/// A destination that cannot be observed is reported as undeclared with the
+/// reason, rather than stopping a run over a file nothing declares.
+pub(super) fn decide_undeclared(entry: &LedgerEntry, origin: &Origin, home: &Path) -> Change {
+    let path = entry.path.as_str();
+    let release = format!(
+        "the configuration no longer declares it, so bx leaves it as it is; `bx rm {}` \
+         releases it",
+        rm_argument(path)
+    );
+    let (action, why) = match fs::observe(&entry.path.render(home)) {
+        Err(error) => (
+            Action::Undeclared,
+            Some(format!("bx cannot look at it now: {error}")),
+        ),
+        Ok(observed) => match drift(entry, &observed) {
+            Some(why) => (Action::Conflict, Some(why)),
+            None if observed.kind == Kind::Absent => (
+                Action::Undeclared,
+                Some("it is no longer on disk".to_string()),
+            ),
+            None => (Action::Undeclared, None),
+        },
+    };
+    Change {
+        target: path.to_string(),
+        origin: origin.clone(),
+        action,
+        diff: None,
+        note: join([why, Some(release)]),
+    }
+}
+
+/// How `observed` differs from what `entry` says bx left there, or `None`
+/// when it is still bx's, or gone.
+fn drift(entry: &LedgerEntry, observed: &Observed) -> Option<String> {
+    let expected = match entry.mechanism {
+        Mechanism::Dir | Mechanism::Clone => Kind::Dir,
+        Mechanism::Link => Kind::Symlink,
+        Mechanism::Own | Mechanism::Region { .. } | Mechanism::Include { .. } => Kind::File,
+    };
+    match observed.kind {
+        Kind::Absent => return None,
+        kind if kind != expected => {
+            return Some(format!(
+                "bx left {} here, and something else is there now",
+                attached_as(&entry.mechanism)
+            ));
+        }
+        _ => {}
+    }
+    match entry.mechanism {
+        Mechanism::Own if observed.digest() != Some(entry.written) => {
+            Some("edited since bx last wrote it".to_string())
+        }
+        Mechanism::Own if observed.mode != Some(entry.mode) => {
+            Some("its mode changed since bx wrote it".to_string())
+        }
+        Mechanism::Region { .. } | Mechanism::Include { .. }
+            if observed.digest() != Some(entry.written) =>
+        {
+            Some("edited since bx last wrote it".to_string())
+        }
+        Mechanism::Dir if observed.mode != Some(entry.mode) => Some(format!(
+            "its mode changed since bx set it to {}",
+            entry.mode
+        )),
+        Mechanism::Link if observed.link_digest() != Some(entry.written) => {
+            Some("retargeted since bx made it".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// `path` as one word a shell passes to `bx rm` unchanged: bare when it holds
+/// nothing a shell would read, single-quoted otherwise. A leading `~/` stays
+/// inside the quotes, which `bx rm` reads as the home itself.
+fn rm_argument(path: &str) -> std::borrow::Cow<'_, str> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "~/._-+,@%=:".contains(c);
+    if !path.is_empty() && path.chars().all(plain) && !path[1..].contains('~') {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(crate::shell::alias::quote(path))
     }
 }
 
@@ -3083,7 +3181,8 @@ mod tests {
         fn an_inputrc_a_dropped_target_wrote_is_left_alone() {
             // PR #102 note D1: the ledger records a `[[target]]`'s file as
             // owned whole, as it does the inputrc bx generates, so dropping
-            // the target planned `~/.inputrc` rewritten with no bindings.
+            // the target planned `~/.inputrc` rewritten with no bindings. It
+            // is reported as undeclared instead (#100), and never written.
             let bindings = "set editing-mode vi\n";
             let target =
                 "[[target]]\npath = \"~/.inputrc\"\ncontent = \"set editing-mode vi\\n\"\n";
@@ -3095,14 +3194,7 @@ mod tests {
             assert_eq!(read(&home, ".inputrc"), bindings);
 
             let dropped = plan(&home, "");
-            assert!(
-                dropped
-                    .changes
-                    .iter()
-                    .all(|change| change.target != "~/.inputrc"),
-                "{:?}",
-                rows(&dropped)
-            );
+            assert_eq!(rows(&dropped), [("~/.inputrc", Action::Undeclared)]);
             assert!(!apply(&home, "").executed);
             assert_eq!(read(&home, ".inputrc"), bindings);
         }

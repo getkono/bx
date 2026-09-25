@@ -1749,6 +1749,49 @@ mod tests {
         }
 
         #[test]
+        fn a_declined_sync_over_only_a_carry_writes_nothing_and_pushes_nothing() {
+            let home = guarded_home();
+            let repo = tracking(&home);
+            std::fs::write(repo.join("notes"), "mine\n").expect("a local commit");
+            commit_all(home.path(), &repo, "mine");
+            let before = rev(home.path(), &home.child("remote.git"), "master");
+            home.write(".lock", "b\n");
+            let tty = Env {
+                stdin_tty: true,
+                ..env(home.path())
+            };
+
+            let mut out = Vec::new();
+            let mut asked = 0;
+            let exit = sync_with(&tty, false, &mut out, &git(home.path()), &mut || {
+                asked += 1;
+                Ok(false)
+            })
+            .expect("a declined sync");
+
+            assert_eq!(asked, 1, "the carry is asked about");
+            assert_eq!(exit, Exit::Pending, "{}", text(&out));
+            assert!(text(&out).contains("  < ~/.lock"), "{}", text(&out));
+            assert!(
+                text(&out).ends_with(
+                    "Nothing was written.\nPushed nothing: 1 commit(s) wait for an apply that \
+                     leaves nothing undone; run `bx sync` again.\n"
+                ),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(
+                std::fs::read(repo.join("files/lock")).expect("the repo copy"),
+                b"a\n"
+            );
+            assert!(clean(&home, &repo));
+            assert_eq!(
+                rev(home.path(), &home.child("remote.git"), "master"),
+                before
+            );
+        }
+
+        #[test]
         fn two_machines_that_both_changed_a_tracked_target_are_a_conflict_and_push_nothing() {
             let home = guarded_home();
             tracking(&home);

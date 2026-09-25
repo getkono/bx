@@ -770,6 +770,10 @@ pub fn exit(report: &Report, mode: Mode) -> Exit {
                 Exit::Converged
             }
         }
+        // A `sync` that wrote nothing — declined, or refused for want of a
+        // terminal — left every carry it announced undone, and carrying is
+        // `sync`'s own work, as it is not a bare `apply`'s.
+        Mode::Sync if actions.contains(&Action::Sync) => Exit::Pending,
         Mode::Plan | Mode::Apply | Mode::Sync => Exit::from_actions(&actions),
     }
 }

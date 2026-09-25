@@ -529,6 +529,12 @@ pub fn push(git: &Git, pulled: &Pulled) -> Result<(), Error> {
 /// `sync` has to apply what this one did not; nor does one that skipped a
 /// conflicted or blocked target, because the configuration being pushed was
 /// not wholly applied here.
+///
+/// A carry into the repo ([`Action::Sync`]) is not pending for a bare `apply`,
+/// which never writes it, but it is `sync`'s own work: an unwritten one is
+/// work this run left undone, exactly as an unwritten create is.
+///
+/// [`Action::Sync`]: crate::report::Action::Sync
 #[must_use]
 pub fn may_push(report: &Report) -> bool {
     report.interrupted.is_none()
@@ -538,10 +544,9 @@ pub fn may_push(report: &Report) -> bool {
             .iter()
             .any(|change| change.action.needs_attention())
         && (report.executed
-            || !report
-                .changes
-                .iter()
-                .any(|change| change.action.is_pending()))
+            || !report.changes.iter().any(|change| {
+                change.action.is_pending() || change.action == crate::report::Action::Sync
+            }))
 }
 
 /// Refuse a state directory that lies inside the config repo, lexically.
@@ -1312,6 +1317,15 @@ pub(crate) mod tests {
         assert!(may_push(&Report {
             executed: true,
             ..pending.clone()
+        }));
+        let carry = Report {
+            changes: vec![row(Action::Sync), row(Action::Unchanged)],
+            ..Report::default()
+        };
+        assert!(!may_push(&carry), "a declined carry");
+        assert!(may_push(&Report {
+            executed: true,
+            ..carry
         }));
         assert!(!may_push(&Report {
             recovered: Some(crate::recover::Outcome::Nothing),

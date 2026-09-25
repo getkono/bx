@@ -47,8 +47,26 @@
 //! dropped, so a later `plan` starts from nothing rather than reusing output a
 //! different binary produced.
 //!
-//! Commands run in bx's own process environment, with no input. bx does not
-//! build the environment the interactive shell will have before running one.
+//! Commands run in bx's own process environment, with no input, and with
+//! `PATH` set to exactly the search path the tool was looked up along. bx
+//! does not build the environment the interactive shell will have before
+//! running one.
+//!
+//! # The `PATH` a tool ran with
+//!
+//! A tool that puts itself on `PATH` prints the value it inherited:
+//! `mise activate zsh` begins `export PATH='<its dirs>:<bx's PATH>'`. Cached
+//! as printed, that would freeze whichever `PATH` the last capture ran under
+//! into every shell, overwrite what `[path]` declares, and differ between
+//! machines. So before an output is cached or judged, every occurrence of the
+//! exact `PATH` value the tool ran with — standing as a whole value or list
+//! entry, not as part of a longer path — is replaced by a reference to the
+//! shell's own `$PATH`, quoted for the context it stands in: `"$PATH"` bare,
+//! `${PATH}` inside double quotes, `'"$PATH"'` inside single quotes and
+//! `'"$PATH"$'` inside `$'…'`. mise's line then prepends its directories to
+//! the live `PATH` of the shell that runs it. The context is found by a
+//! reading of quotes, escapes, comments, `$(…)` and backticks, not of here-
+//! documents, whose bodies are read as ordinary lines.
 //!
 //! # Plan and apply
 //!
@@ -100,7 +118,7 @@
 //! `every_assignment_to_a_relocating_variable_is_judged_by_the_guard` holds
 //! the search.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -318,6 +336,10 @@ pub trait Host {
     ///
     /// [`RunError`] when it did not run to a successful exit within its bounds.
     fn run(&self, program: &Path, args: &[String]) -> Result<Vec<u8>, RunError>;
+
+    /// The `PATH` every [`Host::run`] gives the tool, which its output's
+    /// copies of are replaced with a reference to the shell's own `$PATH`.
+    fn path(&self) -> &OsStr;
 }
 
 /// The machine bx is running on, searched along one `PATH`.
@@ -360,6 +382,7 @@ impl Host for System {
         let deadline = Instant::now() + self.timeout;
         let mut child = Command::new(program)
             .args(args)
+            .env("PATH", &self.path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -413,6 +436,10 @@ impl Host for System {
             });
         }
         Ok(out)
+    }
+
+    fn path(&self) -> &OsStr {
+        &self.path
     }
 }
 
@@ -667,7 +694,9 @@ impl Entry {
 /// The digest of everything an activation's output is a function of: the
 /// binary's content, where it was found, and the command.
 fn inputs(content: &ContentHash, binary: &Path, command: &[String]) -> ContentHash {
-    let mut bytes = b"bx.activation.v1\0".to_vec();
+    // v2: an entry's output holds `$PATH` where the tool printed the `PATH` it
+    // ran with; a v1 entry held that value frozen, and is never reused.
+    let mut bytes = b"bx.activation.v2\0".to_vec();
     let mut field = |value: &[u8]| {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
         bytes.extend_from_slice(value);
@@ -767,6 +796,8 @@ fn decide(decl: &ActivationDecl, cache: &Fingerprints, host: &impl Host) -> Outc
         Ok(text) if !text.contains('\0') => text,
         _ => return Outcome::Omitted(Omission::NotText),
     };
+    // Before it is cached, and so before the guard judges it, reused or not.
+    let output = live_path(&output, host.path());
     let entry = Entry {
         inputs,
         output: output.clone(),
@@ -777,6 +808,156 @@ fn decide(decl: &ActivationDecl, cache: &Fingerprints, host: &impl Host) -> Outc
         entry,
         replaces: previous.is_some(),
     }
+}
+
+/// How the text being copied is quoted, innermost last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quoting {
+    /// Top level: unquoted.
+    Plain,
+    /// Unquoted inside `$(…)`, holding this many unclosed `(`.
+    Substitution(usize),
+    /// Unquoted inside `` `…` ``.
+    Backtick,
+    /// Inside `"…"`.
+    Double,
+    /// Inside `'…'`.
+    Single,
+    /// Inside `$'…'`.
+    AnsiC,
+}
+
+/// Whether `c` may stand beside a `PATH` value that is a whole value or list
+/// entry: nothing, a blank, a list separator, a quote or an operator. Any
+/// other character makes it part of a longer path.
+fn is_edge(c: Option<char>) -> bool {
+    c.is_none_or(|c| c.is_whitespace() || ":'\"=;&|(){}`<>".contains(c))
+}
+
+/// `output` with every occurrence of the value `path`, standing as a whole
+/// value or list entry, replaced by a reference to the shell's own `$PATH`
+/// quoted for the context it stands in. An empty or non-UTF-8 `path` is
+/// never found. See the module documentation.
+fn live_path(output: &str, path: &OsStr) -> String {
+    let Some(path) = path.to_str().filter(|path| !path.is_empty()) else {
+        return output.to_string();
+    };
+    let mut out = String::with_capacity(output.len());
+    let mut stack = vec![Quoting::Plain];
+    let mut comment = false;
+    // Where the single-quoted span being copied began in `out`, and whether
+    // it is closed around a reference and not yet reopened.
+    let mut opened = 0;
+    let mut closed = false;
+    let mut chars = output.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let top = stack.last().copied().unwrap_or(Quoting::Plain);
+        if output[at..].starts_with(path)
+            && is_edge(output[..at].chars().next_back())
+            && is_edge(output[at + path.len()..].chars().next())
+        {
+            match top {
+                Quoting::Single => {
+                    if !closed {
+                        if out.len() == opened {
+                            // Nothing quoted yet: drop the opening quote.
+                            out.pop();
+                        } else {
+                            out.push('\'');
+                        }
+                    }
+                    out.push_str("\"$PATH\"");
+                    closed = true;
+                }
+                Quoting::AnsiC => out.push_str("'\"$PATH\"$'"),
+                Quoting::Double => out.push_str("${PATH}"),
+                _ => out.push_str("\"$PATH\""),
+            }
+            while chars.next_if(|&(next, _)| next < at + path.len()).is_some() {}
+            continue;
+        }
+        if comment {
+            comment = c != '\n';
+            out.push(c);
+            continue;
+        }
+        let next = chars.peek().map(|&(_, next)| next);
+        match (top, c) {
+            (Quoting::Single, '\'') => {
+                stack.pop();
+                if !closed {
+                    out.push('\'');
+                }
+                closed = false;
+            }
+            (Quoting::Single, _) => {
+                if closed {
+                    out.push('\'');
+                    closed = false;
+                }
+                out.push(c);
+            }
+            (_, '\\') if top != Quoting::Single => {
+                out.push(c);
+                if let Some((_, escaped)) = chars.next() {
+                    out.push(escaped);
+                }
+            }
+            (Quoting::AnsiC, '\'') | (Quoting::Double, '"') | (Quoting::Backtick, '`') => {
+                stack.pop();
+                out.push(c);
+            }
+            (Quoting::AnsiC, _) => out.push(c),
+            (_, '$') if next == Some('(') => {
+                stack.push(Quoting::Substitution(0));
+                out.push(c);
+                out.extend(chars.next().map(|(_, open)| open));
+            }
+            (_, '`') => {
+                stack.push(Quoting::Backtick);
+                out.push(c);
+            }
+            (Quoting::Double, _) => out.push(c),
+            (_, '$') if next == Some('\'') => {
+                stack.push(Quoting::AnsiC);
+                out.push(c);
+                out.extend(chars.next().map(|(_, open)| open));
+            }
+            (_, '\'') => {
+                stack.push(Quoting::Single);
+                out.push(c);
+                opened = out.len();
+            }
+            (_, '"') => {
+                stack.push(Quoting::Double);
+                out.push(c);
+            }
+            // A comment begins only where a word would.
+            (_, '#')
+                if output[..at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|before| before.is_whitespace() || ";&|()`".contains(before)) =>
+            {
+                comment = true;
+                out.push(c);
+            }
+            (Quoting::Substitution(depth), '(') => {
+                stack.pop();
+                stack.push(Quoting::Substitution(depth + 1));
+                out.push(c);
+            }
+            (Quoting::Substitution(depth), ')') => {
+                stack.pop();
+                if depth > 0 {
+                    stack.push(Quoting::Substitution(depth - 1));
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Commands and keywords whose operands may be names they assign, by value or
@@ -1261,6 +1442,8 @@ mod tests {
         outputs: RefCell<Outputs>,
         /// Every run, in order.
         runs: RefCell<Vec<PathBuf>>,
+        /// The `PATH` every run is given; empty unless a test sets it.
+        path: OsString,
     }
 
     impl Fake {
@@ -1334,6 +1517,10 @@ mod tests {
             } else {
                 queue.front().cloned().expect("an output")
             }
+        }
+
+        fn path(&self) -> &OsStr {
+            &self.path
         }
     }
 
@@ -2061,13 +2248,117 @@ mod tests {
         }
     }
 
-    /// A tool named `tool` on a search path of its own: a link to `sh`, so the
-    /// test starts a real process without writing an executable.
+    /// A tool named `tool` first on a search path of its own: a link to `sh`,
+    /// so the test starts a real process without writing an executable. The
+    /// system directories follow it, so the scripts it runs find `head`.
     fn linked_sh() -> (tempfile::TempDir, System) {
         let dir = tempfile::TempDir::new().expect("tempdir");
         std::os::unix::fs::symlink("/bin/sh", dir.path().join("tool")).expect("link");
-        let system = System::new(dir.path().as_os_str(), Duration::from_secs(5));
+        let system = System::new(searched(&dir, "/usr/bin:/bin"), Duration::from_secs(5));
         (dir, system)
+    }
+
+    /// `dir`, then `rest`, as one search path.
+    fn searched(dir: &tempfile::TempDir, rest: &str) -> OsString {
+        format!("{}:{rest}", dir.path().display()).into()
+    }
+
+    #[test]
+    fn a_tool_that_prints_the_path_it_ran_with_is_cached_referring_to_the_live_path() {
+        // D1: a tool that echoes its PATH, run under two different ones. What
+        // it prints differs; what is cached and rendered does not.
+        let (dir, system) = linked_sh();
+        let decls = [decl(
+            "tool",
+            &[
+                "tool",
+                "-c",
+                "printf \"export PATH='/opt/t/bin:%s'\\nexport X=\\\"%s\\\"\\n\" \"$PATH\" \"$PATH\"",
+            ],
+        )];
+        let other = System::new(searched(&dir, "/bin:/usr/bin"), Duration::from_secs(5));
+        let raw = other
+            .run(&dir.path().join("tool"), &decls[0].command[1..])
+            .expect("ran");
+        assert!(
+            String::from_utf8(raw).unwrap().contains(":/bin:/usr/bin'"),
+            "the tool really printed the PATH it ran with"
+        );
+        let expected = "# bx activation: tool\neval 'export PATH='\\''/opt/t/bin:'\\''\"$PATH\"\n\
+                        export X=\"${PATH}\"\n'\n";
+        let roots = RootSet::strict();
+        let mut caches = Vec::new();
+        for system in [&system, &other] {
+            let planned = plan(&decls, &Fingerprints::default(), &roots, system);
+            assert_eq!(planned.steps()[0].body().as_deref(), Some(expected));
+            let mut cache = Fingerprints::default();
+            planned.record(&mut cache);
+            caches.push(cache);
+        }
+        assert_eq!(caches[0], caches[1], "the cache holds no PATH either");
+    }
+
+    #[test]
+    fn the_path_is_replaced_by_a_reference_quoted_for_where_it_stands() {
+        let p = OsStr::new("/a:/b");
+        let cases = [
+            // mise's own line, and one that prepends a directory.
+            ("export PATH='/a:/b'\n", "export PATH=\"$PATH\"\n"),
+            (
+                "export PATH='/m/bin:/a:/b'\n",
+                "export PATH='/m/bin:'\"$PATH\"\n",
+            ),
+            ("x='/a:/b:/z'", "x=\"$PATH\"':/z'"),
+            ("x='p /a:/b q /a:/b'", "x='p '\"$PATH\"' q '\"$PATH\""),
+            ("x=\"/m:/a:/b\"", "x=\"/m:${PATH}\""),
+            ("x=/m:/a:/b", "x=/m:\"$PATH\""),
+            (
+                "x=$'/a:/b' y=$'\\'/a:/b'",
+                "x=$''\"$PATH\"$'' y=$'\\''\"$PATH\"$''",
+            ),
+            ("x=\"$(echo '/a:/b')\"", "x=\"$(echo \"$PATH\")\""),
+            (
+                "x=\"$(echo \"/a:/b\")\" '/a:/b'",
+                "x=\"$(echo \"${PATH}\")\" \"$PATH\"",
+            ),
+            ("x=`echo /a:/b`", "x=`echo \"$PATH\"`"),
+            ("x=$(( (1) )) '/a:/b'", "x=$(( (1) )) \"$PATH\""),
+            // A comment's quote opens nothing; the value in it is replaced too.
+            ("# it's /a:/b\nx='/a:/b'", "# it's \"$PATH\"\nx=\"$PATH\""),
+            ("echo ${#a} '/a:/b'", "echo ${#a} \"$PATH\""),
+            // An escaped quote opens nothing.
+            ("x=\\' '/a:/b'", "x=\\' \"$PATH\""),
+            ("x=\"\\\" /a:/b\"", "x=\"\\\" ${PATH}\""),
+            // Part of a longer path is not the value.
+            ("x='/a:/b/c' y=/z/a:/b", "x='/a:/b/c' y=/z/a:/b"),
+        ];
+        for (output, expected) in cases {
+            assert_eq!(live_path(output, p), expected, "{output}");
+        }
+        // Nothing to find in an empty or unreadable PATH.
+        assert_eq!(live_path("x=''", OsStr::new("")), "x=''");
+        let unreadable = <OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/a\xff");
+        assert_eq!(live_path("x=/a", unreadable), "x=/a");
+    }
+
+    #[test]
+    fn the_captured_mise_activation_prepends_to_the_live_path() {
+        // The fixture was captured with this PATH.
+        let (_, mise) = REAL_OUTPUTS[0];
+        assert!(mise.starts_with("export PATH='/usr/local/bin:/usr/bin:/bin'\n"));
+        let mut host = Fake::default().tool("mise", b"mise", &[mise]);
+        host.path = "/usr/local/bin:/usr/bin:/bin".into();
+        let planned = plan(
+            &[decl("mise", &["mise", "activate", "zsh"])],
+            &Fingerprints::default(),
+            &RootSet::strict(),
+            &host,
+        );
+        let Outcome::Captured { output, .. } = &planned.steps()[0].outcome else {
+            panic!("{:?}", planned.steps()[0].outcome);
+        };
+        let rest = mise.split_once('\n').unwrap().1;
+        assert_eq!(output, &format!("export PATH=\"$PATH\"\n{rest}"));
     }
 
     #[test]
@@ -2124,7 +2415,7 @@ mod tests {
             run(&system, "exit 4").unwrap_err().to_string(),
             "it exited with exit status: 4"
         );
-        let quick = System::new(dir.path().as_os_str(), Duration::from_millis(200));
+        let quick = System::new(searched(&dir, "/usr/bin:/bin"), Duration::from_millis(200));
         assert_eq!(
             run(&quick, "sleep 5"),
             Err(RunError::TimedOut(Duration::from_millis(200)))

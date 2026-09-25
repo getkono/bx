@@ -154,6 +154,7 @@ use super::values::{
 };
 use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
+use crate::shell::activation::{self, ActivationDecl};
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
 use crate::shell::keybindings::Keybindings;
@@ -288,6 +289,21 @@ impl Keyed for SourceDecl {
     }
 }
 
+impl Keyed for ActivationDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 impl Keyed for ToolDecl {
     fn key(&self) -> &str {
         &self.name
@@ -364,6 +380,8 @@ pub enum Section {
     Plugin,
     /// `[[source]]`, keyed by `name`.
     Source,
+    /// `[[activation]]`, keyed by `name`.
+    Activation,
     /// `[[external]]`, keyed by `path`.
     External,
     /// `[[tool]]`, keyed by `name`.
@@ -382,6 +400,7 @@ impl Section {
             Self::Function => "function",
             Self::Plugin => "plugin",
             Self::Source => "source",
+            Self::Activation => "activation",
             Self::Tool => "tool",
             Self::External => "external",
         }
@@ -398,6 +417,7 @@ impl Section {
             Self::Function => crate::shell::function::SECTION,
             Self::Plugin => plugin::SECTION,
             Self::Source => crate::shell::source::SECTION,
+            Self::Activation => activation::SECTION,
             Self::Tool => super::tool::SECTION,
             Self::External => super::external::SECTION,
         }
@@ -414,6 +434,7 @@ impl Section {
             | Self::Function
             | Self::Plugin
             | Self::Source
+            | Self::Activation
             | Self::Tool => "name",
         }
     }
@@ -432,6 +453,7 @@ impl Section {
             Self::Function => "a `body`",
             Self::Plugin => "a `source`",
             Self::Source => "a `path`",
+            Self::Activation => "a `command`",
             Self::Tool => "an `install`",
             Self::External => "a `url` and a `rev`",
         }
@@ -816,6 +838,7 @@ impl Merged<Target, TargetKey> {
                 | Section::Function
                 | Section::Plugin
                 | Section::Source
+                | Section::Activation
                 | Section::Tool
                 | Section::External => {}
             }
@@ -1227,6 +1250,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut functions: Merged<FunctionDecl> = Merged::default();
     let mut plugins: Merged<PluginDecl> = Merged::default();
     let mut sources: Merged<SourceDecl> = Merged::default();
+    let mut activations: Merged<ActivationDecl> = Merged::default();
     let mut tools: Merged<ToolDecl> = Merged::default();
     let mut externals: Merged<External> = Merged::default();
     let mut secrets = Secrets::default();
@@ -1247,9 +1271,10 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // substituted only once the values are final; and so does a plugin, keyed
     // by its name, which holds no placeholder; and so does a declared optional
     // source, keyed by its name, whose path is substituted only once the
-    // values are final; and so does an external, keyed by its path, which
-    // holds no placeholder; and so does a declared tool, keyed by its name,
-    // which holds no placeholder either.
+    // values are final; and so does a tool activation, keyed by its name,
+    // which holds no placeholder; and so does an external, keyed by its path,
+    // which holds no placeholder; and so does a declared tool, keyed by its
+    // name, which holds no placeholder either.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1266,6 +1291,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         functions.absorb(layer.config.functions.iter().cloned());
         plugins.absorb(layer.config.plugins.iter().cloned());
         sources.absorb(layer.config.sources.iter().cloned());
+        activations.absorb(layer.config.activations.iter().cloned());
         tools.absorb(layer.config.tools.iter().cloned());
         externals.absorb(layer.config.externals.iter().cloned());
 
@@ -1279,6 +1305,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Function => functions.toggle(toggle)?,
                 Section::Plugin => plugins.toggle(toggle)?,
                 Section::Source => sources.toggle(toggle)?,
+                Section::Activation => activations.toggle(toggle)?,
                 Section::Tool => tools.toggle(toggle)?,
                 Section::External => externals.toggle(toggle)?,
                 Section::Target => {}
@@ -1341,6 +1368,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         plugins,
         // Nor to a declared optional source.
         sources: sources.into_enabled(),
+        // Nor to a tool activation.
+        activations: activations.into_enabled(),
         // Nor to a declared tool.
         tools: tools.into_enabled(),
         secrets,
@@ -1799,6 +1828,63 @@ mod tests {
     }
 
     #[test]
+    fn activations_merge_by_name_and_a_toggle_flips_one() {
+        let merged = merge(&[
+            global(
+                "bx.toml",
+                "[[activation]]\nname = \"mise\"\ncommand = [\"mise\", \"activate\", \"zsh\"]\n\
+                 [[activation]]\nname = \"starship\"\ncommand = [\"starship\", \"init\", \"zsh\"]\n\
+                 [[activation]]\nname = \"zoxide\"\ncommand = [\"zoxide\", \"init\", \"zsh\"]\n\
+                 enabled = false\n",
+            ),
+            global(
+                "modules/m.toml",
+                "[[activation]]\nname = \"mise\"\ncommand = [\"/opt/mise\", \"activate\", \"zsh\"]\n\
+                 phase = \"completions\"\n",
+            ),
+            local(
+                "[[activation]]\nname = \"starship\"\nenabled = false\n\
+                 [[activation]]\nname = \"zoxide\"\nenabled = true\n",
+            ),
+        ])
+        .unwrap();
+        let activations: Vec<(&str, &str, &str, &Path)> = merged
+            .activations
+            .iter()
+            .map(|a| {
+                (
+                    a.name.as_str(),
+                    a.program(),
+                    a.phase.name(),
+                    a.origin.file.as_path(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            activations,
+            vec![
+                (
+                    "mise",
+                    "/opt/mise",
+                    "completions",
+                    Path::new("modules/m.toml")
+                ),
+                ("zoxide", "zoxide", "activations", Path::new("bx.toml")),
+            ]
+        );
+
+        let message = failure(&[
+            global(
+                "bx.toml",
+                "[[activation]]\nname = \"a\"\ncommand = [\"a\"]\n",
+            ),
+            local("[[activation]]\nname = \"z\"\nenabled = true\n"),
+        ]);
+        assert!(message.contains("`z`"), "{message}");
+        assert!(message.contains("a `command`"), "{message}");
+    }
+
+    #[test]
     fn a_second_terminal_claimant_fails_the_merge_unless_a_layer_switches_one_off() {
         let claimants = "[[plugin]]\nname = \"zsh-syntax-highlighting\"\n\
                          source = \"~/zsh/zsh-syntax-highlighting.zsh\"\nterminal = true\n";
@@ -2038,6 +2124,7 @@ mod tests {
             (Section::Function, "function", "[[function]]", "name"),
             (Section::Plugin, "plugin", "[[plugin]]", "name"),
             (Section::Source, "source", "[[source]]", "name"),
+            (Section::Activation, "activation", "[[activation]]", "name"),
             (Section::Tool, "tool", "[[tool]]", "name"),
             (Section::External, "external", "[[external]]", "path"),
         ] {

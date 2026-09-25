@@ -87,6 +87,14 @@
 //! output's code runs later — `eval "$(mise hook-env)"` — is the tool's own
 //! behaviour at runtime, outside what bx emits.
 //!
+//! # bash
+//!
+//! bash gets its own, smaller file from the same [`Assembly`]: the shared
+//! aliases in the `aliases` phase and the history and shell options in the
+//! `options` phase, each in bash's words, sourced from a fixed region in
+//! `~/.bashrc`; and the keybindings go to `~/.inputrc`. [`bash`] holds both,
+//! and the tests there run the file in bash to hold it to Invariant 2.
+//!
 //! # Activations
 //!
 //! A tool's own shell integration — `brew shellenv`, `mise activate zsh`,
@@ -98,6 +106,7 @@
 
 pub mod activation;
 pub mod alias;
+pub mod bash;
 pub mod function;
 pub mod keybindings;
 pub mod plugin;

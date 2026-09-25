@@ -104,7 +104,7 @@ or a login banner without anyone parsing its output:
   environment variable that moves a tool's config, data, or cache outside a root
   you declared. It sets only variables it knows how to judge, and judges each
   value for what it is — a location, a list of locations, an anchor, a program,
-  a search list, a socket or a setting: declare your scratch mount as a root
+  a command line, a tool's options, a search list, a socket or a setting: declare your scratch mount as a root
   and your toolchain caches may live there; declare nothing and no location,
   list of locations or anchor is allowed at all. The other kinds say what a
   tool runs, where it looks and what it connects to rather than where its files

@@ -22,6 +22,7 @@
 //!                                               #   one line, not blank; no body key
 //!                                               #   beside it, the line *is* the body
 //! direction  = "apply"                          # apply | track; default apply
+//!                                               #   track needs a `file` body
 //! format     = "opaque"                         # opaque | jsonc | env.d; default opaque
 //!                                               #   jsonc and env.d need attach = "own"
 //! owns       = ["agent.default_model"]          # required and non-empty iff format = "jsonc"
@@ -605,13 +606,18 @@ pub enum Attach {
     },
 }
 
-/// Whether bx writes a file or only watches it.
+/// Which copy of a file leads: the config repo's, or this machine's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Direction {
-    /// bx writes it.
+    /// The repo's copy leads: bx writes it onto the machine.
     #[default]
     Apply,
-    /// The tool writes it; bx reports drift and never touches it.
+    /// This machine's copy leads, because a tool rewrites it — a plugin
+    /// manager's lock file. `bx sync` carries a change made here into the
+    /// repo's copy and commits it; `apply` writes the repo's copy here only
+    /// where this machine's did not change since the two last agreed; and a
+    /// change on both sides is a conflict for a human. It needs a `file` body,
+    /// whole and opaque; see `plan::decide`.
     Track,
 }
 

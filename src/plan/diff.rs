@@ -38,6 +38,10 @@ pub struct Diff {
 pub enum DiffKind {
     /// A unified diff, headed by the target's portable path.
     Text(String),
+    /// Several unified diffs of one target, each headed as [`DiffKind::Text`]
+    /// is: a tracked target both sides changed, shown as what this machine
+    /// and what the repo each did since the last sync.
+    Texts(Vec<String>),
     /// Only the mode differs; the bytes are identical.
     Mode {
         /// The mode on disk.
@@ -137,6 +141,20 @@ impl Diff {
         after: &[u8],
         mode: Option<(Mode, Mode)>,
     ) -> Option<Self> {
+        Self::labelled(target, ("on disk", "bx"), before, after, mode)
+    }
+
+    /// [`Diff::between`], with the two sides named `labels` in the file
+    /// headers rather than `on disk` and `bx`: a tracked target's sides are
+    /// the repo's copy and this machine's, and neither is what bx wants.
+    #[must_use]
+    pub(super) fn labelled(
+        target: &str,
+        labels: (&str, &str),
+        before: Option<&[u8]>,
+        after: &[u8],
+        mode: Option<(Mode, Mode)>,
+    ) -> Option<Self> {
         if before == Some(after) {
             return mode.map(|(from, to)| Self {
                 kind: DiffKind::Mode { from, to },
@@ -152,11 +170,44 @@ impl Diff {
             summary(Why::TooLarge)
         } else {
             match (std::str::from_utf8(old), std::str::from_utf8(after)) {
-                (Ok(old), Ok(new)) => DiffKind::Text(unified(target, old, new)),
+                (Ok(old), Ok(new)) => DiffKind::Text(unified(target, labels, old, new)),
                 _ => summary(Why::Binary),
             }
         };
         Some(Self { kind })
+    }
+
+    /// A tracked target both sides changed since `base`, the bytes they last
+    /// agreed on: what this machine did to it and what the repo did to it, as
+    /// two diffs. Where either cannot be shown line by line, the one line
+    /// that says how the repo's copy and this machine's differ.
+    #[must_use]
+    pub(super) fn diverged(target: &str, base: &[u8], machine: &[u8], repo: &[u8]) -> Self {
+        let side =
+            |label, after| Self::labelled(target, ("last sync", label), Some(base), after, None);
+        match (side("this machine", machine), side("repo", repo)) {
+            (
+                Some(Self {
+                    kind: DiffKind::Text(mine),
+                }),
+                Some(Self {
+                    kind: DiffKind::Text(theirs),
+                }),
+            ) => Self {
+                kind: DiffKind::Texts(vec![mine, theirs]),
+            },
+            _ => Self {
+                kind: DiffKind::Summary {
+                    before: Some(repo.len()),
+                    after: machine.len(),
+                    why: if repo.len().max(machine.len()).max(base.len()) > TEXT_LIMIT {
+                        Why::TooLarge
+                    } else {
+                        Why::Binary
+                    },
+                },
+            },
+        }
     }
 
     /// [`Diff::between`] for content that must not be printed: a secret's
@@ -199,7 +250,7 @@ impl Diff {
 /// was none, or rolled back to where there was none. `similar` has no hunk for
 /// that, and without the headers the diff was the empty string, which a row
 /// rendered as one blank indented line under nothing.
-fn unified(target: &str, old: &str, new: &str) -> String {
+fn unified(target: &str, (from, to): (&str, &str), old: &str, new: &str) -> String {
     let old: Vec<&str> = old.split_inclusive('\n').collect();
     let new: Vec<&str> = new.split_inclusive('\n').collect();
     let diff = TextDiff::configure()
@@ -209,7 +260,7 @@ fn unified(target: &str, old: &str, new: &str) -> String {
     let mut unified = diff.unified_diff();
     unified.context_radius(CONTEXT);
     let mut out = String::new();
-    let _ = writeln!(out, "--- {target} (on disk)\n+++ {target} (bx)");
+    let _ = writeln!(out, "--- {target} ({from})\n+++ {target} ({to})");
     for hunk in unified.iter_hunks() {
         let _ = writeln!(out, "{}", hunk.header());
         for change in hunk.iter_changes() {
@@ -394,6 +445,30 @@ fn banner(report: &Report) -> Option<String> {
     })
 }
 
+/// The lines of one unified diff as [`unified`] wrote it, indented and styled.
+fn unified_rows(out: &mut String, text: &str, palette: Palette) {
+    // Split on `\n` alone, as `unified` wrote it: a `\r` is part of its
+    // line, and is shown escaped with every other control character.
+    let lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
+    for (index, line) in lines.enumerate() {
+        let style = match line.as_bytes().first() {
+            // The first two lines are the `---` and `+++` file headers.
+            _ if index < 2 => Some(HEADER),
+            Some(b'+') => Some(ADDED),
+            Some(b'-') => Some(REMOVED),
+            Some(b'@') => Some(QUIET),
+            _ => None,
+        };
+        let line = escape(line);
+        out.push_str(DIFF_INDENT);
+        match style {
+            Some(style) => out.push_str(&palette.paint(style, &line)),
+            None => out.push_str(&line),
+        }
+        out.push('\n');
+    }
+}
+
 /// One change — `  {symbol} {target}  ({origin}) {note}` — then its diff.
 fn row(out: &mut String, change: &Change, palette: Palette, home: &Path) {
     let style = if change.action.needs_attention() {
@@ -420,26 +495,10 @@ fn row(out: &mut String, change: &Change, palette: Palette, home: &Path) {
         return;
     };
     match &diff.kind {
-        DiffKind::Text(text) => {
-            // Split on `\n` alone, as `unified` wrote it: a `\r` is part of its
-            // line, and is shown escaped with every other control character.
-            let lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
-            for (index, line) in lines.enumerate() {
-                let style = match line.as_bytes().first() {
-                    // The first two lines are the `---` and `+++` file headers.
-                    _ if index < 2 => Some(HEADER),
-                    Some(b'+') => Some(ADDED),
-                    Some(b'-') => Some(REMOVED),
-                    Some(b'@') => Some(QUIET),
-                    _ => None,
-                };
-                let line = escape(line);
-                out.push_str(DIFF_INDENT);
-                match style {
-                    Some(style) => out.push_str(&palette.paint(style, &line)),
-                    None => out.push_str(&line),
-                }
-                out.push('\n');
+        DiffKind::Text(text) => unified_rows(out, text, palette),
+        DiffKind::Texts(texts) => {
+            for text in texts {
+                unified_rows(out, text, palette);
             }
         }
         DiffKind::Mode { from, to } => {

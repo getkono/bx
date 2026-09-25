@@ -32,13 +32,20 @@ use crate::sync;
 /// `out` cannot be written. A check that cannot ask what it needs — systemd's
 /// user session unreachable — is a finding, not an error.
 pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
-    doctor_with(env, out, &systemd::Systemctl::default())
+    doctor_with(
+        env,
+        out,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &systemd::Systemctl::default(),
+    )
 }
 
-/// [`doctor`], asking systemd through `systemd`.
+/// [`doctor`], looking for declared tools along `path` and asking systemd
+/// through `systemd`.
 fn doctor_with(
     env: &Env,
     out: &mut dyn Write,
+    path: &std::ffi::OsStr,
     systemd: &dyn systemd::Query,
 ) -> Result<Exit, Error> {
     let inputs = Inputs::load(env)?;
@@ -46,6 +53,7 @@ fn doctor_with(
     let report = doctor::run(
         &inputs,
         &Probes {
+            path,
             unit_dir: &unit_dir,
             systemd,
         },
@@ -1266,7 +1274,8 @@ mod tests {
         home.write(".config/systemd/user/b.service", "x");
 
         let mut out = Vec::new();
-        let exit = doctor_with(&env, &mut out, &AllFailed).expect("doctor");
+        let exit =
+            doctor_with(&env, &mut out, std::ffi::OsStr::new(""), &AllFailed).expect("doctor");
 
         assert_eq!(exit, Exit::Pending);
         assert_eq!(

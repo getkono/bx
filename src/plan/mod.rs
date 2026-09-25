@@ -613,7 +613,7 @@ pub fn exit(report: &Report, mode: Mode) -> Exit {
 /// ends at a regular file, and skips anything else unread, so a FIFO or a link
 /// to a device there is never opened. It was judged before this ran, by
 /// [`Inputs::load`].
-fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
+pub(crate) fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
     fn walk(dir: &Path, local: &Path) -> Result<(), Error> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             // Unreadable or absent: there is nothing bx can enumerate here, and
@@ -924,7 +924,7 @@ pub(crate) mod tests {
 
     /// Every path under `root` except those beneath a `skip` prefix, with the
     /// bytes of each regular file and every mode.
-    fn snapshot(root: &Path, skip: &[&str]) -> Vec<Entry> {
+    pub(crate) fn snapshot(root: &Path, skip: &[&str]) -> Vec<Entry> {
         let mut found = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {

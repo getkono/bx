@@ -67,6 +67,7 @@ use super::target::{Attach, Body, Direction, Format, Gen, Interactive, KeyPath, 
 use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
 use super::{Config, Error, Origin};
 use crate::paths::Portable;
+use crate::shell::Shell;
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
 use crate::shell::keybindings::Keybindings;
@@ -300,8 +301,21 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
 fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
     let (envs, path, plugins, history): (&[EnvDecl], &[PathEntry], &[PluginDecl], &History) =
         (&merged.envs, &merged.path, &merged.plugins, &merged.history);
+    // Only what reaches zsh: a declaration kept to bash is bash's file's.
+    let functions: Vec<FunctionDecl> = merged
+        .functions
+        .iter()
+        .filter(|f| f.shells.includes(Shell::Zsh))
+        .cloned()
+        .collect();
+    let sources: Vec<SourceDecl> = merged
+        .sources
+        .iter()
+        .filter(|s| s.shells.includes(Shell::Zsh))
+        .cloned()
+        .collect();
     let (aliases, functions, sources): (&[AliasDecl], &[FunctionDecl], &[SourceDecl]) =
-        (&merged.aliases, &merged.functions, &merged.sources);
+        (&merged.aliases, &functions, &sources);
     let keybindings: &Keybindings = &merged.keybindings;
     // The history's origin, when it says anything zsh reads, or else the
     // keybindings', when any key is bound: what places the interactive file
@@ -321,7 +335,7 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
     let activation_origin = merged
         .activations
         .iter()
-        .find(|a| a.enabled)
+        .find(|a| a.enabled && a.command_for(Shell::Zsh).is_some())
         .map(|a| &a.origin);
     let resolved = envs
         .iter()
@@ -334,7 +348,10 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
     for place in Place::ALL {
         let here: Vec<&(&EnvDecl, Resolution<Var>)> = resolved
             .iter()
-            .filter(|(decl, _)| decl.kind.places().contains(&place))
+            .filter(|(decl, _)| {
+                decl.kind.places().contains(&place)
+                    && (place == Place::EnvironmentD || decl.shells.includes(Shell::Zsh))
+            })
             .collect();
         let entries = if place == Place::Zshenv { path } else { &[] };
         let (interactive, declared, defined, optional) = if place == Place::Zshrc {

@@ -159,6 +159,162 @@ pub(crate) mod testing {
     }
 }
 
+/// A shell bx generates configuration for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Shell {
+    /// zsh.
+    Zsh,
+    /// bash.
+    Bash,
+}
+
+impl Shell {
+    /// Every shell, in the order messages list them.
+    pub const ALL: [Self; 2] = [Self::Zsh, Self::Bash];
+
+    /// The shell's name, as `bx.toml` and its own `init` commands spell it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Zsh => "zsh",
+            Self::Bash => "bash",
+        }
+    }
+
+    /// The shell a config author spelled, if it is one.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|shell| shell.name() == raw)
+    }
+}
+
+/// The shells one declaration renders into.
+///
+/// # The `shells` key
+///
+/// `[[env]]`, `[[function]]`, `[[source]]` and `[[activation]]` entries each
+/// take an optional `shells = ["zsh"]`, naming the shells the declaration is
+/// kept to. Without it a declaration reaches every shell, so zsh and bash are
+/// configured alike from one declaration. A name that is not a shell bx
+/// generates for, or an empty list, fails the load; a declaration restricted
+/// away from a shell is named on that shell's generated file's plan row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Shells {
+    /// Whether it reaches zsh.
+    zsh: bool,
+    /// Whether it reaches bash.
+    bash: bool,
+}
+
+impl Default for Shells {
+    fn default() -> Self {
+        Self::EVERY
+    }
+}
+
+impl Shells {
+    /// Every shell: what a declaration with no `shells` key reaches.
+    pub const EVERY: Self = Self {
+        zsh: true,
+        bash: true,
+    };
+
+    /// The key, as a config author writes it.
+    pub const KEY: &'static str = "shells";
+
+    /// Only `shell`.
+    #[must_use]
+    pub const fn only(shell: Shell) -> Self {
+        Self {
+            zsh: matches!(shell, Shell::Zsh),
+            bash: matches!(shell, Shell::Bash),
+        }
+    }
+
+    /// Whether the declaration reaches `shell`.
+    #[must_use]
+    pub const fn includes(self, shell: Shell) -> bool {
+        match shell {
+            Shell::Zsh => self.zsh,
+            Shell::Bash => self.bash,
+        }
+    }
+
+    /// Read `shells` from `table`, or [`Shells::EVERY`] when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::config::Error::WrongType`] for a value that is not an array
+    /// of strings, and [`crate::config::Error::BadValue`] for an empty list
+    /// or a name that is not a shell bx generates for.
+    pub(crate) fn parse_in(
+        ctx: &crate::config::Ctx<'_>,
+        table: &toml_edit::Table,
+        owner: &str,
+    ) -> Result<Self, crate::config::Error> {
+        if table.get(Self::KEY).is_none() {
+            return Ok(Self::EVERY);
+        }
+        let names = ctx.str_array_at(table, Self::KEY)?;
+        Self::from_names(&names)
+            .map_err(|problem| ctx.bad(table, Self::KEY, format!("{owner}: {problem}")))
+    }
+
+    /// The shells `names` spell.
+    ///
+    /// # Errors
+    ///
+    /// Why the list names no shell, or names one bx does not generate for.
+    pub fn from_names(names: &[String]) -> Result<Self, String> {
+        let known = || {
+            Shell::ALL
+                .iter()
+                .map(|shell| format!("{:?}", shell.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if names.is_empty() {
+            return Err(format!(
+                "`shells` names no shell; list one or more of {}, or set `enabled = false`",
+                known()
+            ));
+        }
+        let mut shells = Self {
+            zsh: false,
+            bash: false,
+        };
+        for name in names {
+            match Shell::parse(name) {
+                Some(Shell::Zsh) => shells.zsh = true,
+                Some(Shell::Bash) => shells.bash = true,
+                None => {
+                    return Err(format!(
+                        "{name:?} is not a shell bx generates for; `shells` lists {}",
+                        known()
+                    ));
+                }
+            }
+        }
+        Ok(shells)
+    }
+}
+
+/// The note a shell's generated file's plan row carries for the declarations
+/// kept out of it: each `(what, name)` named, or `None` when there is none.
+///
+/// `what` is the declaration's kind as messages spell it — `env`,
+/// `function`, `source`, `activation`.
+#[must_use]
+pub fn omitted_note(shell: Shell, omitted: &[(&str, String)]) -> Option<String> {
+    (!omitted.is_empty()).then(|| {
+        let names: Vec<String> = omitted
+            .iter()
+            .map(|(what, name)| format!("{what} `{name}`"))
+            .collect();
+        format!("not in {}: {}", shell.name(), names.join(", "))
+    })
+}
+
 /// One named section of the generated interactive shell file.
 ///
 /// Declared in load order, so the derived `Ord` is the load order.

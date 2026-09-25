@@ -574,16 +574,17 @@ impl Interactive {
         // An activation lands only in `activations` or `completions`, neither
         // of which refuses a contribution.
         self.activations
-            .contribute(&mut assembly)
+            .contribute(&mut assembly, crate::shell::Shell::Zsh)
             .expect("an activation never claims the terminal slot");
-        let activated = self
-            .activations
-            .steps()
-            .iter()
-            .any(|step| step.body().is_some());
+        let activated = self.activations.renders(crate::shell::Shell::Zsh);
         // Last, so each source follows its phase's own declarations; the
         // held-back ones are the note's to name.
-        let sourced = crate::shell::source::contribute(&mut assembly, &self.sources, present);
+        let sourced = crate::shell::source::contribute(
+            &mut assembly,
+            &self.sources,
+            crate::shell::Shell::Zsh,
+            present,
+        );
         let mut out = assembly.render();
         if !self.plugins.is_empty() || sourced || activated {
             out.push_str(SETTLE);
@@ -2896,6 +2897,9 @@ mod tests {
                 .map(|(name, phase)| activation::ActivationDecl {
                     name: (*name).to_string(),
                     command: vec![(*name).to_string()],
+                    zsh: None,
+                    bash: None,
+                    shells: crate::shell::Shells::EVERY,
                     phase: *phase,
                     enabled: true,
                     origin: super::super::super::Origin {

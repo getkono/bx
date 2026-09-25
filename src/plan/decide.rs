@@ -3157,6 +3157,7 @@ mod tests {
                          body = '''\nmkdir -p -- \"$1\" && cd -- \"$1\"\n'''\n\
                          [[function]]\nname = \"goproj\"\nbody = \"cd -- {{proj}}\"\n\
                          [[function]]\nname = \"track\"\nbody = \"return 0\"\nhook = \"chpwd\"\n\
+                         shells = [\"zsh\"]\n\
                          [[function]]\nname = \"off\"\nbody = \"x\"\nenabled = false\n";
             let registration = "(( ${+chpwd_functions} )) && \
                                 (( ${chpwd_functions[(Ie)__bx_hook_track]} )) || \

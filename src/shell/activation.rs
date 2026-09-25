@@ -7,13 +7,31 @@
 //! ```toml
 //! [[activation]]
 //! name    = "starship"                        # required; the natural key
-//! command = ["starship", "init", "zsh"]       # required; argv, run without a shell
+//! command = ["starship", "init", "{shell}"]   # argv, run without a shell
+//! bash    = ["starship", "init", "bash"]      # optional; bash's own command
+//! zsh     = ["starship", "init", "zsh"]       # optional; zsh's own command
+//! shells  = ["zsh", "bash"]                   # optional; default every shell
 //! phase   = "completions"                     # activations | completions; default activations
 //! enabled = true                              # default true
 //! ```
 //!
 //! `command[0]` is the tool: a bare program name looked up on `PATH`, or an
 //! absolute path. Either way it holds only characters a bare shell word holds.
+//!
+//! # One command per shell
+//!
+//! A tool's integration is shell code, so each shell runs its own command
+//! and caches its own output. The command a shell runs is, first, the one
+//! its own key (`zsh` or `bash`) declares; else `command` with every
+//! `{shell}` spelled as the shell's name — `starship init {shell}` is
+//! `starship init zsh` for zsh and `starship init bash` for bash; else, for
+//! zsh alone, `command` as written, since a `command` naming no shell is the
+//! zsh integration it always was. A shell left with no command — bash, for a
+//! `command` naming no `{shell}` and no `bash` key — is never given another
+//! shell's output: the activation is not rendered there, and that shell's
+//! generated file's plan row says so. `shells` keeps the activation to the
+//! shells it lists, and a per-shell key for a shell it leaves out fails the
+//! load. At least one of `command`, `zsh` and `bash` is required.
 //!
 //! There is no never-cacheable form. A shell start spawns no process
 //! (invariant 6), so an activation that must be fresh in every shell is not an
@@ -29,8 +47,9 @@
 //!
 //! [`plan`] resolves `command[0]` against `PATH` and hashes the **content** of
 //! the binary it finds. The cache entry — [`Fingerprints`] key
-//! `activation:<name>` — pairs a digest of that content, the resolved path and
-//! the whole command with the output they produced. While the digest matches,
+//! `activation:<name>` for zsh's command and `activation-bash:<name>` for
+//! bash's — pairs a digest of that content, the resolved path and the whole
+//! command with the output they produced. While the digest matches,
 //! the output is reused verbatim and **no process is started**. A binary that
 //! was upgraded, replaced or moved changes the digest, whatever its
 //! modification time says, and the command runs again.
@@ -129,7 +148,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use toml_edit::Table;
 
-use super::{Assembly, Phase};
+use super::{Assembly, Phase, Shell, Shells};
 use crate::config::{Ctx, Error, Origin};
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
@@ -140,10 +159,20 @@ use crate::state::{ContentHash, Fingerprint, Fingerprints};
 pub(crate) const SECTION: &str = "[[activation]]";
 
 /// Every key an `[[activation]]` entry may carry.
-const KEYS: [&str; 4] = ["name", "command", "phase", "enabled"];
+const KEYS: [&str; 7] = [
+    "name", "command", "zsh", "bash", "shells", "phase", "enabled",
+];
 
-/// The prefix of every cache key this module owns.
+/// The prefix of every cache key this module owns for zsh's commands.
 pub const KEY_PREFIX: &str = "activation:";
+
+/// The prefix of every cache key this module owns for bash's commands. Not an
+/// extension of [`KEY_PREFIX`], so no activation name can spell one shell's
+/// key as another's.
+pub const BASH_KEY_PREFIX: &str = "activation-bash:";
+
+/// What a `command` word spells the shell with.
+pub const SHELL_PLACEHOLDER: &str = "{shell}";
 
 /// How long one run of an activation's command may take.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
@@ -168,8 +197,16 @@ const PHASES: [(&str, Phase); 2] = [
 pub struct ActivationDecl {
     /// The activation's name, its natural key.
     pub name: String,
-    /// The command, `command[0]` being the tool. Never empty.
+    /// The command every shell runs, `{shell}` spelled as the shell's name,
+    /// `command[0]` being the tool. Empty when only per-shell commands are
+    /// declared.
     pub command: Vec<String>,
+    /// zsh's own command, in place of `command`.
+    pub zsh: Option<Vec<String>>,
+    /// bash's own command, in place of `command`.
+    pub bash: Option<Vec<String>>,
+    /// The shells whose generated file it lands in.
+    pub shells: Shells,
     /// The phase its output lands in.
     pub phase: Phase,
     /// `false` in any layer removes the activation from the resolved
@@ -180,17 +217,50 @@ pub struct ActivationDecl {
 }
 
 impl ActivationDecl {
-    /// The [`Fingerprints`] key the activation's cache entry lives under.
+    /// The [`Fingerprints`] key zsh's cache entry lives under.
     #[must_use]
     pub fn key(&self) -> String {
-        format!("{KEY_PREFIX}{}", self.name)
+        self.key_for(Shell::Zsh)
     }
 
-    /// The tool, `command[0]`.
+    /// The [`Fingerprints`] key `shell`'s cache entry lives under.
     #[must_use]
-    pub fn program(&self) -> &str {
-        &self.command[0]
+    pub fn key_for(&self, shell: Shell) -> String {
+        match shell {
+            Shell::Zsh => format!("{KEY_PREFIX}{}", self.name),
+            Shell::Bash => format!("{BASH_KEY_PREFIX}{}", self.name),
+        }
     }
+
+    /// The command `shell` runs, or `None` when the activation is kept out
+    /// of `shell` or declares no command for it. See the module's
+    /// *One command per shell*.
+    #[must_use]
+    pub fn command_for(&self, shell: Shell) -> Option<Vec<String>> {
+        if !self.shells.includes(shell) {
+            return None;
+        }
+        let own = match shell {
+            Shell::Zsh => self.zsh.as_ref(),
+            Shell::Bash => self.bash.as_ref(),
+        };
+        if let Some(own) = own {
+            return Some(spelled(own, shell));
+        }
+        if self.command.is_empty() {
+            return None;
+        }
+        let names_shell = self.command.iter().any(|w| w.contains(SHELL_PLACEHOLDER));
+        (names_shell || shell == Shell::Zsh).then(|| spelled(&self.command, shell))
+    }
+}
+
+/// `command` with every `{shell}` spelled as `shell`'s name.
+fn spelled(command: &[String], shell: Shell) -> Vec<String> {
+    command
+        .iter()
+        .map(|word| word.replace(SHELL_PLACEHOLDER, shell.name()))
+        .collect()
 }
 
 /// Whether `c` may appear in a word written bare.
@@ -223,17 +293,44 @@ pub fn parse_activation(table: &Table, file: &Path, text: &str) -> Result<Activa
         ));
     }
 
-    if table.get("command").is_none() {
+    if ["command", "zsh", "bash"]
+        .iter()
+        .all(|key| table.get(key).is_none())
+    {
         return Err(Error::MissingKey {
             origin: ctx.origin().clone(),
             section: SECTION,
             key: "command",
         });
     }
-    let command = ctx.str_array_at(table, "command")?;
-    if let Some(problem) = unrunnable(&command) {
-        return Err(ctx.bad(table, "command", format!("`{name}`: {problem}")));
-    }
+    let shells = Shells::parse_in(&ctx, table, &format!("`{name}`"))?;
+    let checked = |key: &str, shell: Option<Shell>| -> Result<Option<Vec<String>>, Error> {
+        if table.get(key).is_none() {
+            return Ok(None);
+        }
+        if let Some(shell) = shell.filter(|shell| !shells.includes(*shell)) {
+            return Err(ctx.bad(
+                table,
+                key,
+                format!(
+                    "`{name}`: `{key}` is the command {} runs, and `shells` keeps the \
+                     activation out of {}; drop one",
+                    shell.name(),
+                    shell.name()
+                ),
+            ));
+        }
+        // Checked as written: the tool's name holds no `{`, so no placeholder
+        // spells it, and spelling one in an argument adds no NUL.
+        let command = ctx.str_array_at(table, key)?;
+        match unrunnable(&command) {
+            Some(problem) => Err(ctx.bad(table, key, format!("`{name}`: {problem}"))),
+            None => Ok(Some(command)),
+        }
+    };
+    let command = checked("command", None)?.unwrap_or_default();
+    let zsh = checked("zsh", Some(Shell::Zsh))?;
+    let bash = checked("bash", Some(Shell::Bash))?;
 
     let phase = match ctx.str_at(table, "phase")? {
         None => Phase::Activations,
@@ -255,6 +352,9 @@ pub fn parse_activation(table: &Table, file: &Path, text: &str) -> Result<Activa
     Ok(ActivationDecl {
         name,
         command,
+        zsh,
+        bash,
+        shells,
         phase,
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
@@ -550,11 +650,13 @@ pub enum Outcome {
     Omitted(Omission),
 }
 
-/// One activation, decided.
+/// One activation's command for one shell, decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     /// The declaration.
     pub decl: ActivationDecl,
+    /// The shell whose command this is.
+    pub shell: Shell,
     /// What was decided.
     pub outcome: Outcome,
 }
@@ -588,8 +690,13 @@ impl Step {
             }
             Outcome::Omitted(why) => format!("omitted: {why}"),
         };
+        // zsh's steps read as they did before bash had any.
+        let shell = match self.shell {
+            Shell::Zsh => String::new(),
+            Shell::Bash => " for bash".to_string(),
+        };
         format!(
-            "{} activation `{}`: {what}",
+            "{} activation `{}`{shell}: {what}",
             self.action().symbol(),
             self.decl.name
         )
@@ -608,34 +715,44 @@ impl Step {
     }
 }
 
-/// Every enabled activation, decided in declaration order.
+/// Every enabled activation, decided in declaration order, one step per shell
+/// it has a command for.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
-    /// One step per enabled activation.
+    /// One step per enabled activation and shell it has a command for.
     steps: Vec<Step>,
 }
 
 impl Plan {
-    /// The steps, in declaration order.
+    /// The steps, in declaration order, each activation's zsh step before its
+    /// bash one.
     #[must_use]
     pub fn steps(&self) -> &[Step] {
         &self.steps
     }
 
-    /// Add every step that renders anything to its phase, in declaration
-    /// order.
+    /// Add every step for `shell` that renders anything to its phase, in
+    /// declaration order.
     ///
     /// # Errors
     ///
     /// Whatever [`Assembly::contribute`] refuses. An activation lands only in
     /// `activations` or `completions`, neither of which refuses anything.
-    pub fn contribute(&self, assembly: &mut Assembly) -> Result<(), super::Error> {
-        for step in &self.steps {
+    pub fn contribute(&self, assembly: &mut Assembly, shell: Shell) -> Result<(), super::Error> {
+        for step in self.steps.iter().filter(|step| step.shell == shell) {
             if let Some(body) = step.body() {
                 assembly.contribute(step.decl.phase, step.decl.name.clone(), body)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether any step for `shell` renders anything.
+    #[must_use]
+    pub fn renders(&self, shell: Shell) -> bool {
+        self.steps
+            .iter()
+            .any(|step| step.shell == shell && step.body().is_some())
     }
 
     /// Bring `cache` up to date with the plan: record every capture, and
@@ -645,7 +762,7 @@ impl Plan {
     pub fn record(&self, cache: &mut Fingerprints) {
         let mut kept = Vec::new();
         for step in &self.steps {
-            let key = step.decl.key();
+            let key = step.decl.key_for(step.shell);
             match &step.outcome {
                 Outcome::Reused { .. } => kept.push(key),
                 Outcome::Captured { entry, .. } => {
@@ -658,7 +775,10 @@ impl Plan {
         let stale: Vec<String> = cache
             .iter()
             .map(|(key, _)| key)
-            .filter(|key| key.starts_with(KEY_PREFIX) && !kept.contains(key))
+            .filter(|key| {
+                (key.starts_with(KEY_PREFIX) || key.starts_with(BASH_KEY_PREFIX))
+                    && !kept.contains(key)
+            })
             .cloned()
             .collect();
         for key in stale {
@@ -725,18 +845,22 @@ pub fn plan(
     let steps = decls
         .iter()
         .filter(|decl| decl.enabled)
-        .map(|decl| {
-            let outcome = decide(decl, cache, host);
-            let refused = match &outcome {
-                Outcome::Reused { output } | Outcome::Captured { output, .. } => {
-                    judged(output, roots)
-                }
-                Outcome::Omitted(_) => None,
-            };
-            Step {
-                decl: decl.clone(),
-                outcome: refused.map_or(outcome, Outcome::Omitted),
-            }
+        .flat_map(|decl| {
+            Shell::ALL.into_iter().filter_map(move |shell| {
+                let command = decl.command_for(shell)?;
+                let outcome = decide(&decl.key_for(shell), &command, cache, host);
+                let refused = match &outcome {
+                    Outcome::Reused { output } | Outcome::Captured { output, .. } => {
+                        judged(output, roots)
+                    }
+                    Outcome::Omitted(_) => None,
+                };
+                Some(Step {
+                    decl: decl.clone(),
+                    shell,
+                    outcome: refused.map_or(outcome, Outcome::Omitted),
+                })
+            })
         })
         .collect();
     Plan { steps }
@@ -752,16 +876,18 @@ fn judged(output: &str, roots: &RootSet) -> Option<Omission> {
     })
 }
 
-/// Decide one activation, before the guard judges its output.
-fn decide(decl: &ActivationDecl, cache: &Fingerprints, host: &impl Host) -> Outcome {
-    let binary = match host.locate(decl.program()) {
+/// Decide one shell's `command` of an activation, cached under `key`, before
+/// the guard judges its output.
+fn decide(key: &str, command: &[String], cache: &Fingerprints, host: &impl Host) -> Outcome {
+    let program = &command[0];
+    let binary = match host.locate(program) {
         Presence::Present { path } => path,
         Presence::NotExecutable { path } => {
             return Outcome::Omitted(Omission::NotExecutable { path });
         }
         Presence::Missing => {
             return Outcome::Omitted(Omission::Absent {
-                program: decl.program().to_string(),
+                program: program.clone(),
             });
         }
     };
@@ -769,9 +895,9 @@ fn decide(decl: &ActivationDecl, cache: &Fingerprints, host: &impl Host) -> Outc
         Ok(content) => content,
         Err(reason) => return Outcome::Omitted(Omission::Unreadable { reason }),
     };
-    let inputs = inputs(&content, &binary, &decl.command);
+    let inputs = inputs(&content, &binary, command);
 
-    let previous = cache.get(&decl.key());
+    let previous = cache.get(key);
     if let Some(entry) = previous.and_then(Entry::decode)
         && entry.inputs == inputs
     {
@@ -780,7 +906,7 @@ fn decide(decl: &ActivationDecl, cache: &Fingerprints, host: &impl Host) -> Outc
         };
     }
 
-    let args = &decl.command[1..];
+    let args = &command[1..];
     let first = match host.run(&binary, args) {
         Ok(out) => out,
         Err(e) => return Outcome::Omitted(Omission::Failed(e)),
@@ -1416,6 +1542,9 @@ mod tests {
         ActivationDecl {
             name: name.to_string(),
             command: command.iter().map(ToString::to_string).collect(),
+            zsh: None,
+            bash: None,
+            shells: Shells::EVERY,
             phase: Phase::Activations,
             enabled: true,
             origin: Origin {
@@ -1528,7 +1657,7 @@ mod tests {
     fn apply(decls: &[ActivationDecl], cache: &mut Fingerprints, host: &Fake) -> (Plan, String) {
         let plan = plan(decls, cache, &RootSet::strict(), host);
         let mut assembly = Assembly::new();
-        plan.contribute(&mut assembly)
+        plan.contribute(&mut assembly, Shell::Zsh)
             .expect("activations never claim the terminal slot");
         plan.record(cache);
         (plan, assembly.render())
@@ -1549,6 +1678,9 @@ mod tests {
                 ActivationDecl {
                     name: "starship".to_string(),
                     command: vec!["starship".into(), "init".into(), "zsh".into()],
+                    zsh: None,
+                    bash: None,
+                    shells: Shells::EVERY,
                     phase: Phase::Completions,
                     enabled: false,
                     origin: Origin {
@@ -1562,6 +1694,9 @@ mod tests {
                         "/home/linuxbrew/.linuxbrew/bin/brew".into(),
                         "shellenv".into()
                     ],
+                    zsh: None,
+                    bash: None,
+                    shells: Shells::EVERY,
                     phase: Phase::Activations,
                     enabled: true,
                     origin: Origin {
@@ -1572,6 +1707,136 @@ mod tests {
             ]
         );
         assert_eq!(decls[0].key(), "activation:starship");
+        assert_eq!(decls[0].key_for(Shell::Bash), "activation-bash:starship");
+    }
+
+    #[test]
+    fn each_shell_runs_its_own_command_and_none_runs_another_shell_s() {
+        let decls = parse(
+            "[[activation]]\nname = \"starship\"\ncommand = [\"starship\", \"init\", \"{shell}\"]\n\
+             [[activation]]\nname = \"mise\"\ncommand = [\"mise\", \"activate\", \"zsh\"]\n\
+             [[activation]]\nname = \"fzf\"\ncommand = [\"fzf\", \"--{shell}\"]\n\
+             bash = [\"fzf\", \"--bash\", \"--no-extra\"]\n\
+             [[activation]]\nname = \"zonly\"\ncommand = [\"z\", \"{shell}\"]\nshells = [\"zsh\"]\n\
+             [[activation]]\nname = \"bonly\"\nbash = [\"b\", \"init\"]\n",
+        )
+        .expect("parses");
+        let commands = |shell| -> Vec<Option<String>> {
+            decls
+                .iter()
+                .map(|decl| decl.command_for(shell).map(|c| c.join(" ")))
+                .collect()
+        };
+        assert_eq!(
+            commands(Shell::Zsh),
+            [
+                Some("starship init zsh".to_string()),
+                Some("mise activate zsh".to_string()),
+                Some("fzf --zsh".to_string()),
+                Some("z zsh".to_string()),
+                None,
+            ]
+        );
+        assert_eq!(
+            commands(Shell::Bash),
+            [
+                Some("starship init bash".to_string()),
+                None,
+                Some("fzf --bash --no-extra".to_string()),
+                None,
+                Some("b init".to_string()),
+            ]
+        );
+
+        // Each shell's step is decided, cached and rendered on its own.
+        let host = Fake::default()
+            .tool("starship", b"s", &["starship_hook\n"])
+            .tool("mise", b"m", &["mise_hook\n"])
+            .tool("fzf", b"f", &["fzf_hook\n"])
+            .tool("z", b"z", &["z_hook\n"])
+            .tool("b", b"b", &["b_hook\n"]);
+        let mut cache = Fingerprints::default();
+        let decided = plan(&decls, &cache, &RootSet::strict(), &host);
+        let steps: Vec<(String, Shell)> = decided
+            .steps()
+            .iter()
+            .map(|step| (step.decl.name.clone(), step.shell))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("starship".to_string(), Shell::Zsh),
+                ("starship".to_string(), Shell::Bash),
+                ("mise".to_string(), Shell::Zsh),
+                ("fzf".to_string(), Shell::Zsh),
+                ("fzf".to_string(), Shell::Bash),
+                ("zonly".to_string(), Shell::Zsh),
+                ("bonly".to_string(), Shell::Bash),
+            ]
+        );
+        assert_eq!(
+            decided.steps()[1].line(),
+            "+ activation `starship` for bash: run twice, output agreed; cached"
+        );
+        let mut bash = Assembly::new();
+        decided
+            .contribute(&mut bash, Shell::Bash)
+            .expect("contributes");
+        let bash = bash.render();
+        for name in ["starship", "fzf", "bonly"] {
+            assert!(
+                bash.contains(&format!("# bx activation: {name}\n")),
+                "{bash}"
+            );
+        }
+        for name in ["mise", "zonly"] {
+            assert!(
+                !bash.contains(&format!("# bx activation: {name}\n")),
+                "{bash}"
+            );
+        }
+        assert!(decided.renders(Shell::Bash) && decided.renders(Shell::Zsh));
+        decided.record(&mut cache);
+        let mut keys: Vec<&String> = cache.iter().map(|(key, _)| key).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "activation-bash:bonly",
+                "activation-bash:fzf",
+                "activation-bash:starship",
+                "activation:fzf",
+                "activation:mise",
+                "activation:starship",
+                "activation:zonly",
+            ]
+        );
+        // A second plan reuses every entry, for both shells, and runs nothing.
+        let runs = host.runs();
+        let again = plan(&decls, &cache, &RootSet::strict(), &host);
+        assert_eq!(host.runs(), runs);
+        assert!(
+            again
+                .steps()
+                .iter()
+                .all(|step| step.action() == Action::Unchanged)
+        );
+        // Dropping bash forgets bash's entries alone.
+        let zsh_only: Vec<ActivationDecl> = decls
+            .iter()
+            .cloned()
+            .map(|decl| ActivationDecl {
+                shells: Shells::only(Shell::Zsh),
+                bash: None,
+                ..decl
+            })
+            .collect();
+        plan(&zsh_only, &cache, &RootSet::strict(), &host).record(&mut cache);
+        assert!(
+            cache.iter().all(|(key, _)| key.starts_with(KEY_PREFIX)),
+            "{:?}",
+            cache.iter().map(|(key, _)| key).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1613,6 +1878,24 @@ mod tests {
                 "must be a program name",
             ),
             ("name = \"a\"\ncommand = [\"a\", \"x\\u0000\"]\n", "NUL"),
+            (
+                "name = \"a\"\ncommand = [\"{shell}\"]\n",
+                "must be a program name",
+            ),
+            ("name = \"a\"\nbash = []\n", "is empty"),
+            ("name = \"a\"\nzsh = [\"a b\"]\n", "must be a program name"),
+            (
+                "name = \"a\"\nbash = [\"a\"]\nshells = [\"zsh\"]\n",
+                "keeps the activation out of bash",
+            ),
+            (
+                "name = \"a\"\nzsh = [\"a\"]\nshells = [\"bash\"]\n",
+                "keeps the activation out of zsh",
+            ),
+            (
+                "name = \"a\"\ncommand = [\"a\"]\nshells = [\"fish\"]\n",
+                "not a shell bx generates for",
+            ),
             (
                 "name = \"a\"\ncommand = [\"a\"]\nphase = \"terminal\"\n",
                 "not a phase",
@@ -2161,6 +2444,7 @@ mod tests {
         let output = "export A='1'\nB=2; echo \"$(x)\" '\\''\n}\n'unterminated\n";
         let step = Step {
             decl: decl("t", &["t"]),
+            shell: Shell::Zsh,
             outcome: Outcome::Reused {
                 output: output.to_string(),
             },
@@ -2178,6 +2462,7 @@ mod tests {
         assert_eq!(
             Step {
                 decl: decl("o", &["o"]),
+                shell: Shell::Bash,
                 outcome: Outcome::Omitted(Omission::NotText),
             }
             .body(),
@@ -2190,6 +2475,7 @@ mod tests {
         let Some(zsh) = installed_zsh() else { return };
         let step = |name: &str, output: &str| Step {
             decl: decl(name, &[name]),
+            shell: Shell::Zsh,
             outcome: Outcome::Reused {
                 output: output.to_string(),
             },
@@ -2204,7 +2490,7 @@ mod tests {
         ];
         let mut assembly = Assembly::new();
         Plan { steps }
-            .contribute(&mut assembly)
+            .contribute(&mut assembly, Shell::Zsh)
             .expect("contributes");
         let dir = tempfile::TempDir::new().expect("tempdir");
         let file = dir.path().join("zshrc.zsh");

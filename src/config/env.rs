@@ -58,12 +58,13 @@ use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
 use crate::env_guard::is_variable_name;
 use crate::paths::Portable;
+use crate::shell::Shells;
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[env]]";
 
 /// Every key an `[[env]]` entry may carry.
-const KEYS: [&str; 5] = ["name", "value", "kind", "enabled", "when"];
+const KEYS: [&str; 6] = ["name", "value", "kind", "enabled", "when", "shells"];
 
 /// The directory bx's generated shell fragments live in.
 pub const FRAGMENT_DIR: &str = "~/.local/share/bx";
@@ -127,6 +128,9 @@ pub struct EnvDecl {
     pub kind: EnvKind,
     /// The one condition it is gated on, if any.
     pub when: Option<When>,
+    /// The shells whose startup files it lands in. `environment.d` is no
+    /// shell's, so a variable landing there lands there whatever this says.
+    pub shells: Shells,
     /// `false` in any layer removes the variable from the resolved
     /// configuration.
     pub enabled: bool,
@@ -197,11 +201,24 @@ pub fn parse_env(table: &Table, file: &Path, text: &str) -> Result<EnvDecl, Erro
         }
     };
 
+    let shells = Shells::parse_in(&ctx, table, &format!("`{name}`"))?;
+    if kind == EnvKind::Gui && table.get(Shells::KEY).is_some() {
+        return Err(ctx.bad(
+            table,
+            Shells::KEY,
+            format!(
+                "`{name}`: a variable of `kind = \"gui\"` lands in `environment.d` alone, which \
+                 no shell reads; drop `shells`"
+            ),
+        ));
+    }
+
     Ok(EnvDecl {
         name,
         value,
         kind,
         when,
+        shells,
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
     })
@@ -446,6 +463,7 @@ mod tests {
                 value: "{{scratch}}/sccache".to_string(),
                 kind: EnvKind::Environment,
                 when: None,
+                shells: Shells::EVERY,
                 enabled: false,
                 origin: Origin {
                     file: PathBuf::from("/repo/bx.toml"),
@@ -453,6 +471,32 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn shells_restricts_a_variable_and_an_unknown_shell_fails_the_load() {
+        let envs = parse(
+            "[[env]]\nname = \"A\"\nvalue = \"1\"\nkind = \"interactive\"\nshells = [\"zsh\"]\n\
+             [[env]]\nname = \"B\"\nvalue = \"1\"\nkind = \"login\"\nshells = [\"bash\", \"zsh\"]\n",
+        )
+        .expect("parses");
+        assert_eq!(envs[0].shells, Shells::only(crate::shell::Shell::Zsh));
+        assert_eq!(envs[1].shells, Shells::EVERY);
+        for (shells, expected) in [
+            ("[\"fish\"]", "\"fish\" is not a shell bx generates for"),
+            ("[]", "`shells` names no shell"),
+        ] {
+            let err = parse(&format!(
+                "[[env]]\nname = \"A\"\nvalue = \"1\"\nkind = \"interactive\"\nshells = {shells}\n"
+            ))
+            .expect_err("refused");
+            assert!(err.contains(expected), "{err}");
+            assert!(err.contains("`A`"), "{err}");
+        }
+        let err =
+            parse("[[env]]\nname = \"A\"\nvalue = \"1\"\nkind = \"gui\"\nshells = [\"zsh\"]\n")
+                .expect_err("refused");
+        assert!(err.contains("no shell reads"), "{err}");
     }
 
     #[test]

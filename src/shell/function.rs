@@ -107,7 +107,7 @@ use std::path::Path;
 
 use toml_edit::Table;
 
-use super::{Assembly, Phase};
+use super::{Assembly, Phase, Shell, Shells};
 use crate::config::resolve::{BlockReason, BlockedEntry, Resolution};
 use crate::config::values::{self, ResolvedValues, Unresolved};
 use crate::config::when::{self, Gate, When};
@@ -117,7 +117,9 @@ use crate::config::{Ctx, Error, Origin};
 pub(crate) const SECTION: &str = "[[function]]";
 
 /// Every key a `[[function]]` entry may carry.
-const KEYS: [&str; 6] = ["name", "body", "tool", "hook", "when", "enabled"];
+const KEYS: [&str; 8] = [
+    "name", "body", "bash", "tool", "hook", "when", "shells", "enabled",
+];
 
 /// The prefix of every name bx gives a function itself.
 const RESERVED: &str = "__bx_";
@@ -205,12 +207,17 @@ pub struct FunctionDecl {
     pub name: String,
     /// The body as written, `{{name}}` references and all.
     pub body: String,
+    /// bash's own body, when it differs from `body`: written in bash's file in
+    /// its place, and the bash equivalent of a hooked function.
+    pub bash: Option<String>,
     /// The tool the body runs, if the author named one. Never a gate.
     pub tool: Option<String>,
     /// The hook point the function registers on, if any.
     pub hook: Option<Hook>,
     /// The condition the registration is gated on. Only with `hook`.
     pub when: Option<When>,
+    /// The shells whose generated file defines it.
+    pub shells: Shells,
     /// `false` in any layer removes the function from the resolved configuration.
     pub enabled: bool,
     /// Where the entry was written.
@@ -311,11 +318,30 @@ pub fn parse_function(table: &Table, file: &Path, text: &str) -> Result<Function
         return Err(ctx.bad(table, "name", problem));
     }
     let body = ctx.required_str(table, "body")?.to_string();
-    if let Some(problem) = unwritable(&body) {
-        return Err(ctx.bad(table, "body", format!("function `{name}`: {problem}")));
+    let checked = |key: &str, body: &str| {
+        if let Some(problem) = unwritable(body) {
+            return Err(ctx.bad(table, key, format!("function `{name}`: {problem}")));
+        }
+        if let Err(problem) = values::placeholders(body) {
+            return Err(ctx.bad(table, key, format!("function `{name}`: {problem}")));
+        }
+        Ok(())
+    };
+    checked("body", &body)?;
+    let bash = ctx.str_at(table, "bash")?.map(str::to_string);
+    if let Some(bash) = &bash {
+        checked("bash", bash)?;
     }
-    if let Err(problem) = values::placeholders(&body) {
-        return Err(ctx.bad(table, "body", format!("function `{name}`: {problem}")));
+    let shells = Shells::parse_in(&ctx, table, &format!("function `{name}`"))?;
+    if bash.is_some() && !shells.includes(Shell::Bash) {
+        return Err(ctx.bad(
+            table,
+            "bash",
+            format!(
+                "function `{name}`: `bash` is the body bash's file defines, and `shells` keeps \
+                 the function out of bash; drop one"
+            ),
+        ));
     }
     let tool = match ctx.str_at(table, "tool")? {
         None => None,
@@ -348,13 +374,30 @@ pub fn parse_function(table: &Table, file: &Path, text: &str) -> Result<Function
             ),
         ));
     }
+    if let Some(hook) = hook
+        && shells.includes(Shell::Bash)
+        && bash.is_none()
+    {
+        return Err(ctx.bad(
+            table,
+            "hook",
+            format!(
+                "function `{name}`: `hook = {:?}` is one of zsh's own hook points, which bash \
+                 has no equivalent of; keep the function to zsh with `shells = [\"zsh\"]`, or \
+                 give bash its own body with `bash = '''…'''`",
+                hook.name()
+            ),
+        ));
+    }
 
     Ok(FunctionDecl {
         name,
         body,
+        bash,
         tool,
         hook,
         when,
+        shells,
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
     })
@@ -413,6 +456,36 @@ pub fn resolve(
         .iter()
         .filter(|decl| decl.enabled)
         .map(|decl| resolve_one(decl, values))
+        .collect()
+}
+
+/// Substitute every enabled function bash's file defines, as bash defines it.
+///
+/// A function kept out of bash is left out. Each other one is resolved as
+/// [`resolve`] resolves it, from its `bash` body when it declares one and its
+/// `body` otherwise, and registers on no hook: bash has none of zsh's hook
+/// points, so a hooked function reaches bash only through the `bash` body its
+/// declaration must then carry, defined under its own name.
+///
+/// # Errors
+///
+/// As [`resolve`].
+pub fn resolve_bash(
+    decls: &[FunctionDecl],
+    values: &ResolvedValues,
+) -> Result<Vec<Resolution<Function>>, Error> {
+    decls
+        .iter()
+        .filter(|decl| decl.enabled && decl.shells.includes(Shell::Bash))
+        .map(|decl| {
+            let bash = FunctionDecl {
+                body: decl.bash.clone().unwrap_or_else(|| decl.body.clone()),
+                hook: None,
+                when: None,
+                ..decl.clone()
+            };
+            resolve_one(&bash, values)
+        })
         .collect()
 }
 
@@ -564,7 +637,8 @@ mod tests {
         let config = load(
             "[[function]]\nname = \"venv\"\nbody = '''\nsource .venv/bin/activate\n'''\n\
              tool = \"python3\"\nhook = \"chpwd\"\nwhen = \"interactive\"\n\
-             [[function]]\nname = \"x\"\nbody = \"y\"\nenabled = false\n",
+             bash = \"source .venv/bin/activate\"\n\
+             [[function]]\nname = \"x\"\nbody = \"y\"\nenabled = false\nshells = [\"zsh\"]\n",
         )
         .expect("parses");
         let file = PathBuf::from(FILE);
@@ -574,9 +648,11 @@ mod tests {
                 FunctionDecl {
                     name: "venv".to_string(),
                     body: "source .venv/bin/activate\n".to_string(),
+                    bash: Some("source .venv/bin/activate".to_string()),
                     tool: Some("python3".to_string()),
                     hook: Some(Hook::Chpwd),
                     when: Some(When::Interactive),
+                    shells: Shells::EVERY,
                     enabled: true,
                     origin: Origin {
                         file: file.clone(),
@@ -586,11 +662,13 @@ mod tests {
                 FunctionDecl {
                     name: "x".to_string(),
                     body: "y".to_string(),
+                    bash: None,
                     tool: None,
                     hook: None,
                     when: None,
+                    shells: Shells::only(Shell::Zsh),
                     enabled: false,
-                    origin: Origin { file, line: 9 },
+                    origin: Origin { file, line: 10 },
                 },
             ]
         );
@@ -693,6 +771,30 @@ mod tests {
                 "give it a `hook`",
             ),
             (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nhook = \"chpwd\"\n",
+                "bash has no equivalent of; keep the function to zsh",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nhook = \"chpwd\"\nshells = [\"bash\"]\n",
+                "bash has no equivalent of",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nbash = \"b\"\nshells = [\"zsh\"]\n",
+                "keeps the function out of bash",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nbash = \"\"\n",
+                "the body is empty",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nbash = \"{{x\"\n",
+                "unterminated placeholder",
+            ),
+            (
+                "[[function]]\nname = \"f\"\nbody = \"a\"\nshells = [\"fish\"]\n",
+                "not a shell bx generates for",
+            ),
+            (
                 "[[function]]\nname = \"f\"\nbody = \"a\"\nenabled = \"no\"\n",
                 "a boolean",
             ),
@@ -737,6 +839,7 @@ mod tests {
                     [[value]]\nname = \"b\"\nkind = \"string\"\n\
                     [[function]]\nname = \"first\"\nbody = \"echo {{a}}\"\n\
                     [[function]]\nname = \"needs_b\"\nbody = \"echo {{b}}\"\nhook = \"precmd\"\n\
+                    shells = [\"zsh\"]\n\
                     [[function]]\nname = \"last\"\nbody = \"echo plain\"\n";
         let functions = resolved(text).expect("an unset value is not a load error");
         let rendered = render_all(&functions, &|_| true);
@@ -889,11 +992,39 @@ mod tests {
     }
 
     #[test]
+    fn bash_defines_its_own_body_under_the_name_and_registers_no_hook() {
+        let text = "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\"\n\
+                    [[function]]\nname = \"plain\"\nbody = \"echo {{a}}\"\n\
+                    [[function]]\nname = \"zonly\"\nbody = \"echo z\"\nhook = \"precmd\"\n\
+                    shells = [\"zsh\"]\n\
+                    [[function]]\nname = \"both\"\nbody = \"echo zsh\"\nhook = \"chpwd\"\n\
+                    bash = \"echo {{a}} bash\"\n\
+                    [[function]]\nname = \"bonly\"\nbody = \"echo b\"\nshells = [\"bash\"]\n";
+        let config = load(text).expect("parses");
+        let values = ResolvedValues::resolve(
+            config.values,
+            &config.value_assignments,
+            Path::new("/home/u"),
+        )
+        .expect("values");
+        let bash = resolve_bash(&config.functions, &values).expect("resolves");
+        assert_eq!(
+            render_all(&bash, &|_| true),
+            "# Generated by bx. Edit the config repo, not this file.\n\
+             \n# bx phase: functions\n\
+             function plain {\necho x\n}\n\
+             function both {\necho x bash\n}\n\
+             function bonly {\necho b\n}\n"
+        );
+    }
+
+    #[test]
     fn re_resolving_and_re_rendering_is_byte_identical_and_in_declared_order() {
         let text = "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\"\n\
                     [[function]]\nname = \"zz\"\nbody = \"echo {{a}}\"\nhook = \"precmd\"\n\
+                    shells = [\"zsh\"]\n\
                     [[function]]\nname = \"aa\"\nbody = \"echo a\"\nhook = \"precmd\"\n\
-                    when = \"interactive\"\n\
+                    when = \"interactive\"\nbash = \"echo a\"\n\
                     [[function]]\nname = \"mm\"\nbody = \"echo m\"\n";
         let render = || render_all(&resolved(text).expect("resolves"), &|_| true);
         let first = render();

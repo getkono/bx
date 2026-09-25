@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::{Change, Diff, Error, region};
+use crate::config::Origin;
 use crate::config::env::Syntax;
 use crate::config::resolve::Resolution;
 use crate::config::secrets::Secrets;
@@ -671,7 +672,7 @@ pub(super) fn decide(
         Action::Conflict => observed.kind == Kind::File,
         // Only a tracked target is carried into the repo, and it is decided
         // by `decide_track`.
-        Action::Unchanged | Action::Sync | Action::Blocked => false,
+        Action::Unchanged | Action::Sync | Action::Undeclared | Action::Blocked => false,
     };
     // A secret's plaintext, and whatever is on disk where it goes, are never
     // shown: the plan is printed, piped and pasted.
@@ -980,7 +981,11 @@ fn decide_link(
         Action::Conflict if observed.kind == Kind::Symlink => {
             Some(Diff::link(observed.link.as_deref(), Some(&text)))
         }
-        Action::Conflict | Action::Unchanged | Action::Sync | Action::Blocked => None,
+        Action::Conflict
+        | Action::Unchanged
+        | Action::Sync
+        | Action::Undeclared
+        | Action::Blocked => None,
     };
     let note = match action {
         Action::Create => join([created_dirs(&observed, ctx.home, ctx.declared), note]),
@@ -1490,10 +1495,12 @@ fn track_into_repo(
 /// A line number in the note is still the file's own: the phase is found in
 /// the file's bytes, and each line is counted from the top of the file.
 ///
-/// bash's interactive file holds no environment fragment at all: its alias
-/// lines set nothing and its `options` phase assigns only bash's own history
-/// variables, unexported, which [`crate::shell::bash`]'s tests hold it to. So
-/// the one thing judged in it is the history file it names, as zsh's is.
+/// bash's interactive file is judged the same way: by its `env` and `path`
+/// phases, its one environment fragment, and the history file it names. Its alias lines
+/// set nothing, its functions and sources are held to what zsh's are, its
+/// activations to the relocation rule, and its `options` phase assigns only
+/// bash's own history variables, unexported, which [`crate::shell::bash`]'s
+/// tests hold it to.
 /// `~/.inputrc` is readline's syntax and names no variable.
 fn guard_generated(
     generator: &Gen,
@@ -1516,7 +1523,15 @@ fn guard_generated(
                 guard_history_file("zsh", file.history().zsh_file.as_ref(), roots),
             ])
         }
-        Gen::Bash(file) => guard_history_file("bash", file.history().bash_file.as_ref(), roots),
+        // The fragment is the file's first bytes, so its lines are numbered
+        // as the file's own.
+        Gen::Bash(file) => {
+            let env = file.env(present);
+            join([
+                guard_fragment(&env, roots),
+                guard_history_file("bash", file.history().bash_file.as_ref(), roots),
+            ])
+        }
         Gen::Source(_) | Gen::Inputrc(_) => None,
     }
 }
@@ -1603,6 +1618,127 @@ fn ownership(
     }
 }
 
+/// The row for a ledger entry no enabled target or external declares: a file
+/// bx wrote whose declaration is gone, reported and never acted on.
+///
+/// The row is [`Action::Undeclared`] while what is on disk is still what bx
+/// left, or nothing at all, and names `bx rm` as the way to release it. When
+/// the destination has drifted since — edited, retargeted, its mode changed,
+/// or something of another kind in its place — it is an [`Action::Conflict`]
+/// saying why, as drift is for a declared target, and nothing is overwritten
+/// either way. `bx rm` refuses to restore over the same drift, so such a note
+/// says so rather than promising a release; a file whose mode alone changed
+/// is still one `bx rm` hands back. A checkout's commit is git's to read, so a
+/// clone is judged by whether its directory is there alone, and `bx rm` says
+/// itself when a checkout holds work it will not remove.
+///
+/// No diff: bx no longer knows what it would write, and it writes nothing.
+/// A destination that cannot be observed is reported as undeclared with the
+/// reason, rather than stopping a run over a file nothing declares.
+pub(super) fn decide_undeclared(entry: &LedgerEntry, origin: &Origin, home: &Path) -> Change {
+    let path = entry.path.as_str();
+    let rm = rm_argument(path);
+    let undeclared = "the configuration no longer declares it, so bx leaves it as it is";
+    let release = format!("{undeclared}; `bx rm {rm}` releases it");
+    let (action, why, release) = match fs::observe(&entry.path.render(home)) {
+        Err(error) => (
+            Action::Undeclared,
+            Some(format!("bx cannot look at it now: {error}")),
+            release,
+        ),
+        Ok(observed) => match drift(entry, &observed) {
+            Some(Drift { why, released }) => (
+                Action::Conflict,
+                Some(why),
+                if released {
+                    release
+                } else {
+                    format!("{undeclared}, and `bx rm {rm}` will not restore over the change")
+                },
+            ),
+            None if observed.kind == Kind::Absent => (
+                Action::Undeclared,
+                Some("it is no longer on disk".to_string()),
+                release,
+            ),
+            None => (Action::Undeclared, None, release),
+        },
+    };
+    Change {
+        target: path.to_string(),
+        origin: origin.clone(),
+        action,
+        diff: None,
+        note: join([why, Some(release)]),
+    }
+}
+
+/// How a destination differs from what its ledger entry says bx left there.
+struct Drift {
+    /// Why it is not what bx left, as a row says it.
+    why: String,
+    /// Whether `bx rm` still hands it back: only when a file bx owns whole
+    /// still holds bx's bytes, and its mode alone changed.
+    released: bool,
+}
+
+/// How `observed` differs from what `entry` says bx left there, or `None`
+/// when it is still bx's, or gone.
+fn drift(entry: &LedgerEntry, observed: &Observed) -> Option<Drift> {
+    let refused = |why: String| {
+        Some(Drift {
+            why,
+            released: false,
+        })
+    };
+    let expected = match entry.mechanism {
+        Mechanism::Dir | Mechanism::Clone => Kind::Dir,
+        Mechanism::Link => Kind::Symlink,
+        Mechanism::Own | Mechanism::Region { .. } | Mechanism::Include { .. } => Kind::File,
+    };
+    match observed.kind {
+        Kind::Absent => return None,
+        kind if kind != expected => {
+            return refused(format!(
+                "bx left {} here, and something else is there now",
+                attached_as(&entry.mechanism)
+            ));
+        }
+        _ => {}
+    }
+    match entry.mechanism {
+        Mechanism::Own | Mechanism::Region { .. } | Mechanism::Include { .. }
+            if observed.digest() != Some(entry.written) =>
+        {
+            refused("edited since bx last wrote it".to_string())
+        }
+        Mechanism::Own if observed.mode != Some(entry.mode) => Some(Drift {
+            why: "its mode changed since bx wrote it".to_string(),
+            released: true,
+        }),
+        Mechanism::Dir if observed.mode != Some(entry.mode) => refused(format!(
+            "its mode changed since bx set it to {}",
+            entry.mode
+        )),
+        Mechanism::Link if observed.link_digest() != Some(entry.written) => {
+            refused("retargeted since bx made it".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// `path` as one word a shell passes to `bx rm` unchanged: bare when it holds
+/// nothing a shell would read, single-quoted otherwise. A leading `~/` stays
+/// inside the quotes, which `bx rm` reads as the home itself.
+fn rm_argument(path: &str) -> std::borrow::Cow<'_, str> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "~/._-+,@%=:".contains(c);
+    if !path.is_empty() && path.chars().all(plain) && !path[1..].contains('~') {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(crate::shell::alias::quote(path))
+    }
+}
+
 /// How a ledger mechanism reads in a note.
 pub(super) const fn attached_as(mechanism: &Mechanism) -> &'static str {
     match mechanism {
@@ -1672,6 +1808,166 @@ mod tests {
                 file: PathBuf::from("/repo/bx.toml"),
                 line: 3,
             },
+        }
+    }
+
+    mod undeclared {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use super::*;
+        use crate::state::{ContentHash, Prior};
+        use crate::testing::GuardedHome;
+
+        /// An entry saying bx left `written` at `~/rel`, attached as
+        /// `mechanism`, at `mode`.
+        fn entry(
+            home: &GuardedHome,
+            rel: &str,
+            written: &[u8],
+            mode: u32,
+            mechanism: Mechanism,
+        ) -> LedgerEntry {
+            LedgerEntry {
+                path: Portable::parse_in(&format!("~/{rel}"), home.path()).expect("portable"),
+                written: ContentHash::of(written),
+                mode: Mode::from_bits(mode),
+                mechanism,
+                prior: Prior::Absent,
+                created_dirs: Vec::new(),
+                superseded: Vec::new(),
+                superseded_absent: false,
+            }
+        }
+
+        fn decided(home: &GuardedHome, entry: &LedgerEntry) -> (Action, String) {
+            let change = decide_undeclared(entry, &Origin::unknown(Path::new("/l")), home.path());
+            assert_eq!(change.diff, None, "an undeclared row never has a diff");
+            (change.action, change.note.expect("a note"))
+        }
+
+        fn why(home: &GuardedHome, entry: &LedgerEntry) -> (Action, String) {
+            let (action, note) = decided(home, entry);
+            let why = note
+                .split_once("; the configuration")
+                .map_or_else(String::new, |(why, _)| why.to_string());
+            (action, why)
+        }
+
+        #[test]
+        fn a_region_is_judged_by_the_whole_file_and_not_its_mode() {
+            let home = guarded_home();
+            home.write(".r", "mine\n");
+            std::fs::set_permissions(home.child(".r"), std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+            let region = Mechanism::Region { comment: '#' };
+            let kept = entry(&home, ".r", b"mine\n", 0o644, region.clone());
+            assert_eq!(why(&home, &kept), (Action::Undeclared, String::new()));
+
+            let edited = entry(&home, ".r", b"other\n", 0o600, region);
+            assert_eq!(
+                why(&home, &edited),
+                (
+                    Action::Conflict,
+                    "edited since bx last wrote it".to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn a_file_whose_mode_changed_is_a_conflict() {
+            let home = guarded_home();
+            home.write(".a", "a\n");
+            std::fs::set_permissions(home.child(".a"), std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+            let owned = entry(&home, ".a", b"a\n", 0o644, Mechanism::Own);
+            assert_eq!(
+                why(&home, &owned),
+                (
+                    Action::Conflict,
+                    "its mode changed since bx wrote it".to_string()
+                )
+            );
+            // `bx rm` hands back a file whose bytes are still bx's, whatever
+            // its mode, so the note still says it does.
+            let (_, note) = decided(&home, &owned);
+            assert!(note.ends_with("`bx rm ~/.a` releases it"), "{note}");
+        }
+
+        #[test]
+        fn a_directory_is_judged_by_its_mode() {
+            let home = guarded_home();
+            std::fs::create_dir(home.child("d")).expect("mkdir");
+            std::fs::set_permissions(home.child("d"), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+            let same = entry(&home, "d", b"", 0o700, Mechanism::Dir);
+            assert_eq!(why(&home, &same), (Action::Undeclared, String::new()));
+
+            let set = entry(&home, "d", b"", 0o755, Mechanism::Dir);
+            assert_eq!(
+                why(&home, &set),
+                (
+                    Action::Conflict,
+                    "its mode changed since bx set it to 0755".to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn a_link_is_judged_by_its_text() {
+            let home = guarded_home();
+            std::os::unix::fs::symlink("there", home.child("l")).expect("a link");
+            let same = entry(&home, "l", b"there", 0o777, Mechanism::Link);
+            assert_eq!(why(&home, &same), (Action::Undeclared, String::new()));
+
+            let moved = entry(&home, "l", b"elsewhere", 0o777, Mechanism::Link);
+            assert_eq!(
+                why(&home, &moved),
+                (Action::Conflict, "retargeted since bx made it".to_string())
+            );
+        }
+
+        #[test]
+        fn a_checkout_is_judged_by_whether_its_directory_is_there() {
+            let home = guarded_home();
+            std::fs::create_dir(home.child("c")).expect("mkdir");
+            let clone = entry(&home, "c", b"any commit", 0o755, Mechanism::Clone);
+            assert_eq!(why(&home, &clone), (Action::Undeclared, String::new()));
+        }
+
+        #[test]
+        fn something_of_another_kind_in_its_place_is_a_conflict() {
+            let home = guarded_home();
+            std::fs::create_dir(home.child(".a")).expect("mkdir");
+            let owned = entry(&home, ".a", b"a\n", 0o644, Mechanism::Own);
+            assert_eq!(
+                why(&home, &owned),
+                (
+                    Action::Conflict,
+                    "bx left the whole file here, and something else is there now".to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn a_destination_bx_cannot_look_at_is_reported_with_the_reason() {
+            let home = guarded_home();
+            home.write(".f", "a file\n");
+            let beneath = entry(&home, ".f/x", b"x\n", 0o644, Mechanism::Own);
+            let (action, note) = decided(&home, &beneath);
+            // Observing beneath a regular file either fails, which is named,
+            // or finds nothing there; neither stops the run or is a conflict.
+            assert_eq!(action, Action::Undeclared, "{note}");
+            assert!(note.ends_with("`bx rm ~/.f/x` releases it"), "{note}");
+        }
+
+        #[test]
+        fn the_rm_argument_is_quoted_only_where_a_shell_would_read_it() {
+            assert_eq!(rm_argument("~/.config/x-y_z.toml"), "~/.config/x-y_z.toml");
+            assert_eq!(rm_argument("~/a b"), "'~/a b'");
+            assert_eq!(rm_argument("~/it's"), r"'~/it'\''s'");
+            assert_eq!(rm_argument("~/a~b"), "'~/a~b'");
+            assert_eq!(rm_argument("~/$HOME"), "'~/$HOME'");
+            assert_eq!(rm_argument(""), "''");
         }
     }
 
@@ -2977,6 +3273,7 @@ mod tests {
                 vec![
                     ("~/.local/share/bx/zprofile.zsh", Action::Unchanged),
                     ("~/.local/share/bx/zshrc.zsh", Action::Unchanged),
+                    ("~/.local/share/bx/bashrc.bash", Action::Unchanged),
                 ]
             );
         }
@@ -2990,6 +3287,8 @@ mod tests {
                 vec![
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Create),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
             );
         }
@@ -3022,11 +3321,14 @@ mod tests {
             .concat();
 
             let first = apply(&home, &layer);
+            // The variable reaches bash too; the plugins are zsh's alone.
             assert_eq!(
                 rows(&first),
                 vec![
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Modify),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
             );
             let written = read(&home, ".local/share/bx/zshrc.zsh");
@@ -3569,7 +3871,8 @@ mod tests {
         fn an_inputrc_a_dropped_target_wrote_is_left_alone() {
             // PR #102 note D1: the ledger records a `[[target]]`'s file as
             // owned whole, as it does the inputrc bx generates, so dropping
-            // the target planned `~/.inputrc` rewritten with no bindings.
+            // the target planned `~/.inputrc` rewritten with no bindings. It
+            // is reported as undeclared instead (#100), and never written.
             let bindings = "set editing-mode vi\n";
             let target =
                 "[[target]]\npath = \"~/.inputrc\"\ncontent = \"set editing-mode vi\\n\"\n";
@@ -3581,14 +3884,7 @@ mod tests {
             assert_eq!(read(&home, ".inputrc"), bindings);
 
             let dropped = plan(&home, "");
-            assert!(
-                dropped
-                    .changes
-                    .iter()
-                    .all(|change| change.target != "~/.inputrc"),
-                "{:?}",
-                rows(&dropped)
-            );
+            assert_eq!(rows(&dropped), [("~/.inputrc", Action::Undeclared)]);
             assert!(!apply(&home, "").executed);
             assert_eq!(read(&home, ".inputrc"), bindings);
         }
@@ -3643,6 +3939,7 @@ mod tests {
                          body = '''\nmkdir -p -- \"$1\" && cd -- \"$1\"\n'''\n\
                          [[function]]\nname = \"goproj\"\nbody = \"cd -- {{proj}}\"\n\
                          [[function]]\nname = \"track\"\nbody = \"return 0\"\nhook = \"chpwd\"\n\
+                         shells = [\"zsh\"]\n\
                          [[function]]\nname = \"off\"\nbody = \"x\"\nenabled = false\n";
             let registration = "(( ${+chpwd_functions} )) && \
                                 (( ${chpwd_functions[(Ie)__bx_hook_track]} )) || \
@@ -3661,7 +3958,29 @@ mod tests {
                 vec![
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Modify),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
+            );
+            // bash defines what reaches it, and its row names the function
+            // held back and the one kept to zsh.
+            let bash_note = row(&first, "~/.local/share/bx/bashrc.bash")
+                .note
+                .as_deref()
+                .expect("a note");
+            assert!(
+                bash_note.contains("function `goproj` held back: "),
+                "{bash_note}"
+            );
+            assert!(
+                bash_note.ends_with("; not in bash: function `track`"),
+                "{bash_note}"
+            );
+            assert_eq!(
+                read(&home, ".local/share/bx/bashrc.bash"),
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: functions\n\
+                 function mkcd {\nmkdir -p -- \"$1\" && cd -- \"$1\"\n}\n"
             );
             let note = row(&first, "~/.local/share/bx/zshrc.zsh")
                 .note
@@ -3810,7 +4129,17 @@ mod tests {
                 vec![
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Modify),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
+            );
+            // bash sources the same line, and settles the same way.
+            assert_eq!(
+                read(&home, ".local/share/bx/bashrc.bash"),
+                format!(
+                    "# Generated by bx. Edit the config repo, not this file.\n\
+                     \n# bx phase: plugins\n[[ -r ~/.fzf.zsh ]] && source ~/.fzf.zsh\n{settle}"
+                )
             );
             let note = row(&first, "~/.local/share/bx/zshrc.zsh")
                 .note
@@ -3900,7 +4229,19 @@ mod tests {
                     ("~/.zprofile", Action::Create),
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Modify),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
+            );
+            // bash reads every variable a zsh would, in zsh's load order,
+            // a login one only in a login shell; the GUI one is not a shell's.
+            assert_eq!(
+                read(&home, ".local/share/bx/bashrc.bash"),
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: env\n\
+                 export LANG=C.UTF-8\n\
+                 if shopt -q login_shell; then\n  export PAGER=less\nfi\n\
+                 export EDITOR=nvim\n"
             );
 
             let header = "# Generated by bx from [[env]]. Edit the config repo, not this file.\n";
@@ -4022,14 +4363,19 @@ mod tests {
                     ("~/.config/environment.d/50-bx.conf", Action::Create),
                     ("~/.local/share/bx/zshrc.zsh", Action::Blocked),
                     ("~/.zshrc", Action::Create),
+                    // bash's file holds EDITOR too, so it waits with zsh's.
+                    ("~/.local/share/bx/bashrc.bash", Action::Blocked),
+                    ("~/.bashrc", Action::Create),
                 ]
             );
-            let note = row(&report, "~/.local/share/bx/zshrc.zsh")
-                .note
-                .as_deref()
-                .expect("a hint");
-            assert!(note.contains("editor"), "{note}");
-            assert!(note.contains("bx init"), "{note}");
+            for file in [
+                "~/.local/share/bx/zshrc.zsh",
+                "~/.local/share/bx/bashrc.bash",
+            ] {
+                let note = row(&report, file).note.as_deref().expect("a hint");
+                assert!(note.contains("editor"), "{note}");
+                assert!(note.contains("bx init"), "{note}");
+            }
         }
 
         /// One `[[env]]` entry gated on `when`.
@@ -4151,6 +4497,12 @@ mod tests {
                 let note = change.note.as_deref().expect("a note");
                 assert!(note.starts_with("line 3: CARGO_HOME "), "{note}");
             }
+            // bash's file holds the same line, judged the same way, named by
+            // its own line in that file.
+            let bash = row(&report, "~/.local/share/bx/bashrc.bash");
+            assert_eq!(bash.action, Action::Blocked);
+            let note = bash.note.as_deref().expect("a note");
+            assert!(note.starts_with("line 5: CARGO_HOME "), "{note}");
             // Nothing else is held back by it.
             assert_eq!(
                 row(&report, "~/.local/share/bx/zshrc.zsh").action,
@@ -4311,13 +4663,14 @@ mod tests {
                 .iter()
                 .map(|(target, _)| target.clone())
                 .collect();
-            assert_eq!(targets.len(), 7);
+            assert_eq!(targets.len(), 9);
             crate::restore::restore(&state, home.path(), &targets).expect("restore");
 
             assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
             for rel in [
                 ".zshenv",
                 ".zprofile",
+                ".bashrc",
                 ".config/environment.d",
                 ".local/share/bx",
             ] {
@@ -4345,6 +4698,19 @@ mod tests {
              export PATH=${PATH}:/opt/tool/bin\n\
              path=(${path:#${HOME}/.cargo/bin})\n";
 
+        /// The lines [`PATH_SECTION`] puts in bash's file's `path` phase:
+        /// zsh's, each removal in bash's words.
+        const BASH_PATH_LINES: &str = "# [path]\n\
+             PATH=:${PATH//:/::}:; PATH=${PATH//\":${CARGO_HOME}/bin:\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}\n\
+             export PATH=${CARGO_HOME}/bin:${PATH}\n\
+             PATH=:${PATH//:/::}:; PATH=${PATH//\":${HOME}/.local/bin:\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}\n\
+             [[ -d ${HOME}/.local/bin ]] && export PATH=${HOME}/.local/bin:${PATH}\n\
+             PATH=:${PATH//:/::}:; PATH=${PATH//\":${HOME}/bin:\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}\n\
+             export PATH=${HOME}/bin:${PATH}\n\
+             PATH=:${PATH//:/::}:; PATH=${PATH//\":/opt/tool/bin:\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}\n\
+             export PATH=${PATH}:/opt/tool/bin\n\
+             PATH=:${PATH//:/::}:; PATH=${PATH//\":${HOME}/.cargo/bin:\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}\n";
+
         /// [`PATH_SECTION`] with the variable it reads, under a declared
         /// root.
         fn with_path() -> String {
@@ -4358,7 +4724,7 @@ mod tests {
         }
 
         #[test]
-        fn path_entries_land_once_in_the_zshenv_fragment_after_its_variables() {
+        fn path_entries_land_once_in_the_zshenv_fragment_and_bash_s_file_after_their_variables() {
             let home = guarded_home();
             home.write(".zshenv", "# my own\nexport FOO=1\n");
             let layer = with_path();
@@ -4373,6 +4739,8 @@ mod tests {
                     ("~/.config/environment.d/50-bx.conf", Action::Create),
                     ("~/.local/share/bx/zshrc.zsh", Action::Create),
                     ("~/.zshrc", Action::Create),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
             );
             let header = "# Generated by bx from [[env]]. Edit the config repo, not this file.\n";
@@ -4383,6 +4751,18 @@ mod tests {
                 format!(
                     "{header}export LANG=C.UTF-8\n\
                      export CARGO_HOME=/var/mnt/scratch/example/cargo\n{PATH_LINES}"
+                )
+            );
+            // bash's file: its variables, then the same PATH lines in its
+            // own words.
+            assert_eq!(
+                read(&home, ".local/share/bx/bashrc.bash"),
+                format!(
+                    "# Generated by bx. Edit the config repo, not this file.\n\
+                     \n# bx phase: env\nexport LANG=C.UTF-8\n\
+                     export CARGO_HOME=/var/mnt/scratch/example/cargo\n\
+                     export EDITOR=nvim\n\
+                     \n# bx phase: path\n{BASH_PATH_LINES}"
                 )
             );
             // And nowhere else.
@@ -4401,6 +4781,7 @@ mod tests {
 
             // Applying twice: an empty second plan, and the same bytes.
             let written = read(&home, ".local/share/bx/zshenv.zsh");
+            let bash_written = read(&home, ".local/share/bx/bashrc.bash");
             let second = plan(&home, &layer);
             assert!(
                 second
@@ -4412,6 +4793,7 @@ mod tests {
             );
             assert!(!apply(&home, &layer).executed);
             assert_eq!(read(&home, ".local/share/bx/zshenv.zsh"), written);
+            assert_eq!(read(&home, ".local/share/bx/bashrc.bash"), bash_written);
 
             // A line the user adds beside the region is theirs, and a change
             // of entries rewrites only bx's fragment.
@@ -4432,7 +4814,7 @@ mod tests {
         }
 
         #[test]
-        fn a_path_section_alone_places_the_zshenv_fragment_and_its_region() {
+        fn a_path_section_alone_places_the_zshenv_fragment_bash_s_file_and_their_regions() {
             let home = guarded_home();
             let layer = "[path]\nprepend = [\"~/bin\"]\n";
             let report = plan(&home, layer);
@@ -4441,6 +4823,8 @@ mod tests {
                 vec![
                     ("~/.local/share/bx/zshenv.zsh", Action::Create),
                     ("~/.zshenv", Action::Create),
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
                 ]
             );
             apply(&home, layer);
@@ -4449,13 +4833,68 @@ mod tests {
                 "# Generated by bx from [[env]]. Edit the config repo, not this file.\n\
                  # [path]\npath=(${path:#${HOME}/bin})\nexport PATH=${HOME}/bin:${PATH}\n"
             );
-            // Taking the section out leaves the fragment setting nothing.
+            assert_eq!(
+                read(&home, ".local/share/bx/bashrc.bash"),
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: path\n# [path]\n\
+                 PATH=:${PATH//:/::}:; PATH=${PATH//\":${HOME}/bin:\"/}; PATH=${PATH//::/:}; \
+                 PATH=${PATH#:}; PATH=${PATH%:}\nexport PATH=${HOME}/bin:${PATH}\n"
+            );
+            // Taking the section out leaves both files setting nothing.
             let emptied = apply(&home, "");
             assert_eq!(
                 rows(&emptied),
-                vec![("~/.local/share/bx/zshenv.zsh", Action::Modify)]
+                vec![
+                    ("~/.local/share/bx/zshenv.zsh", Action::Modify),
+                    ("~/.local/share/bx/bashrc.bash", Action::Modify),
+                ]
             );
             assert!(!read(&home, ".local/share/bx/zshenv.zsh").contains("PATH"));
+            assert!(!read(&home, ".local/share/bx/bashrc.bash").contains("PATH"));
+        }
+
+        #[test]
+        fn an_entry_kept_to_one_shell_reaches_only_its_file_and_the_other_row_names_it() {
+            let home = guarded_home();
+            let layer = "[path]\nprepend = [\"~/both\", { dir = \"~/z\", shells = [\"zsh\"] }, \
+                         { dir = \"~/b\", shells = [\"bash\"] }]\n";
+            let report = apply(&home, layer);
+            let zshenv = read(&home, ".local/share/bx/zshenv.zsh");
+            let bashrc = read(&home, ".local/share/bx/bashrc.bash");
+            assert!(zshenv.contains("${HOME}/both") && bashrc.contains("${HOME}/both"));
+            assert!(zshenv.contains("${HOME}/z:") && !bashrc.contains("${HOME}/z"));
+            assert!(bashrc.contains("${HOME}/b:") && !zshenv.contains("${HOME}/b:"));
+            let note = row(&report, "~/.local/share/bx/bashrc.bash")
+                .note
+                .clone()
+                .expect("a note");
+            assert!(note.ends_with("; not in bash: path `~/z`"), "{note}");
+            // An entry kept to bash alone places bash's file and not zsh's.
+            let home = guarded_home();
+            let only_bash = "[path]\nappend = [{ dir = \"/opt/b\", shells = [\"bash\"] }]\n";
+            assert_eq!(
+                rows(&plan(&home, only_bash)),
+                vec![
+                    ("~/.local/share/bx/bashrc.bash", Action::Create),
+                    ("~/.bashrc", Action::Create),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_reference_bash_s_file_cannot_read_holds_it_back_naming_its_own_line() {
+            let home = guarded_home();
+            let layer = format!(
+                "{}[path]\nprepend = [\"${{NOWHERE}}/bin\"]\n",
+                env("LANG", "C.UTF-8", "environment"),
+            );
+            let report = plan(&home, &layer);
+            let change = row(&report, "~/.local/share/bx/bashrc.bash");
+            assert_eq!(change.action, Action::Blocked);
+            let note = change.note.as_deref().expect("a note");
+            // The header, the env phase's heading and variable, the path
+            // phase's heading and comment, then the removal on line 8.
+            assert!(note.starts_with("line 8: PATH "), "{note}");
         }
 
         #[test]

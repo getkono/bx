@@ -743,11 +743,13 @@ mod tests {
         std::fs::remove_file(files.join("init.lua")).expect("a removed repo file");
         std::fs::remove_file(files.join("added")).expect("a removed repo file");
         let removed = run(&home, Apply);
-        assert!(
+        assert_eq!(
             removed
                 .iter()
-                .all(|(target, _)| !target.ends_with("init.lua")),
-            "{removed:?}"
+                .filter(|(target, _)| target.ends_with("init.lua"))
+                .collect::<Vec<_>>(),
+            [&("~/.config/x/init.lua".to_string(), Action::Undeclared)],
+            "reported, as a file bx wrote that nothing declares any more"
         );
         assert_eq!(
             std::fs::read_to_string(dest.join("init.lua")).expect("still there"),

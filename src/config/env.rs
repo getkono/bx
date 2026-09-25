@@ -9,7 +9,15 @@
 //! kind    = "environment"                  # environment | gui | login | interactive
 //! enabled = true                           # default true
 //! when    = "has:sccache"                  # optional; see below
+//! shells  = ["zsh"]                        # optional; default every shell
 //! ```
+//!
+//! `shells` keeps the variable to the shells it lists
+//! ([`crate::shell::Shells`]). `environment.d` is no shell's: every program
+//! the session starts inherits what it sets, whichever shell that is. So a
+//! variable that lands there — `kind = "environment"` or `"gui"` — may not
+//! carry `shells`; keep one shell's variable out of the other with
+//! `kind = "login"` or `"interactive"`.
 //!
 //! `when` gates the variable on one condition from the closed set
 //! [`super::when`] defines. A runtime condition wraps the variable's line in a
@@ -28,6 +36,10 @@
 //! | `gui`         | GUI-launched programs only          | `environment.d`                       |
 //! | `login`       | login shells only                   | `~/.zprofile`                         |
 //! | `interactive` | interactive shells only             | the generated interactive file        |
+//!
+//! That table is zsh's. bash reads every `environment`, `login` and
+//! `interactive` variable from its own generated interactive file, in that
+//! order, a `login` one only in a login shell; see [`crate::shell::bash`].
 //!
 //! `environment.d` is a fragment bx owns whole,
 //! [`ENVIRONMENT_D`]. Every shell startup file is the user's, so bx never
@@ -58,12 +70,13 @@ use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
 use crate::env_guard::is_variable_name;
 use crate::paths::Portable;
+use crate::shell::{Shell, Shells};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[env]]";
 
 /// Every key an `[[env]]` entry may carry.
-const KEYS: [&str; 5] = ["name", "value", "kind", "enabled", "when"];
+const KEYS: [&str; 6] = ["name", "value", "kind", "enabled", "when", "shells"];
 
 /// The directory bx's generated shell fragments live in.
 pub const FRAGMENT_DIR: &str = "~/.local/share/bx";
@@ -127,6 +140,9 @@ pub struct EnvDecl {
     pub kind: EnvKind,
     /// The one condition it is gated on, if any.
     pub when: Option<When>,
+    /// The shells whose startup files it lands in. `environment.d` is no
+    /// shell's, so a variable landing there lands there whatever this says.
+    pub shells: Shells,
     /// `false` in any layer removes the variable from the resolved
     /// configuration.
     pub enabled: bool,
@@ -197,11 +213,26 @@ pub fn parse_env(table: &Table, file: &Path, text: &str) -> Result<EnvDecl, Erro
         }
     };
 
+    let shells = Shells::parse_in(&ctx, table, &format!("`{name}`"))?;
+    if kind.places().contains(&Place::EnvironmentD) && table.get(Shells::KEY).is_some() {
+        return Err(ctx.bad(
+            table,
+            Shells::KEY,
+            format!(
+                "`{name}`: a variable of `kind = {raw_kind:?}` lands in `environment.d`, which \
+                 is no shell's: every program the session starts inherits it, whichever shell \
+                 it is, so it cannot be kept to one; drop `shells`, or give it \
+                 `kind = \"login\"` or `\"interactive\"`"
+            ),
+        ));
+    }
+
     Ok(EnvDecl {
         name,
         value,
         kind,
         when,
+        shells,
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
     })
@@ -327,8 +358,9 @@ pub struct Fragment {
     pub syntax: Syntax,
     /// Each variable, value already substituted.
     pub vars: Vec<Var>,
-    /// The `[path]` entries, written after every variable. Only the `zshenv`
-    /// fragment holds any; see [`super::path`].
+    /// The `[path]` entries, written after every variable in zsh's words.
+    /// Only the `zshenv` fragment holds any, and only those that reach zsh;
+    /// see [`super::path`].
     pub path: Vec<PathEntry>,
 }
 
@@ -358,11 +390,7 @@ impl Fragment {
         };
         let mut out = String::from(HEADER);
         for var in &self.vars {
-            let line = format!(
-                "{export}{}={}\n",
-                var.name,
-                quoted(&home_spelled(&var.value))
-            );
+            let line = format!("{export}{}", assignment(var));
             match var.when.as_ref().map(|when| when.gate(present)) {
                 None | Some(Gate::Always) => out.push_str(&line),
                 Some(Gate::Never) => {}
@@ -375,9 +403,16 @@ impl Fragment {
                 }
             }
         }
-        out.push_str(&path::render(&self.path));
+        out.push_str(&path::render(&self.path, Shell::Zsh));
         out
     }
+}
+
+/// `NAME=VALUE` and a newline for `var`, its value spelled and quoted as
+/// [`Fragment::render`] writes it: the words zsh and bash read alike.
+#[must_use]
+pub fn assignment(var: &Var) -> String {
+    format!("{}={}\n", var.name, quoted(&home_spelled(&var.value)))
 }
 
 /// `value` with every `:`-separated entry that is `~` or opens with `~/`
@@ -446,6 +481,7 @@ mod tests {
                 value: "{{scratch}}/sccache".to_string(),
                 kind: EnvKind::Environment,
                 when: None,
+                shells: Shells::EVERY,
                 enabled: false,
                 origin: Origin {
                     file: PathBuf::from("/repo/bx.toml"),
@@ -453,6 +489,41 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn shells_restricts_a_variable_and_an_unknown_shell_fails_the_load() {
+        let envs = parse(
+            "[[env]]\nname = \"A\"\nvalue = \"1\"\nkind = \"interactive\"\nshells = [\"zsh\"]\n\
+             [[env]]\nname = \"B\"\nvalue = \"1\"\nkind = \"login\"\nshells = [\"bash\", \"zsh\"]\n",
+        )
+        .expect("parses");
+        assert_eq!(envs[0].shells, Shells::only(crate::shell::Shell::Zsh));
+        assert_eq!(envs[1].shells, Shells::EVERY);
+        for (shells, expected) in [
+            ("[\"fish\"]", "\"fish\" is not a shell bx generates for"),
+            ("[]", "`shells` names no shell"),
+        ] {
+            let err = parse(&format!(
+                "[[env]]\nname = \"A\"\nvalue = \"1\"\nkind = \"interactive\"\nshells = {shells}\n"
+            ))
+            .expect_err("refused");
+            assert!(err.contains(expected), "{err}");
+            assert!(err.contains("`A`"), "{err}");
+        }
+        // A variable that lands in `environment.d` reaches every shell the
+        // session starts, so it cannot be kept to one.
+        for kind in ["gui", "environment"] {
+            let err = parse(&format!(
+                "[[env]]\nname = \"A\"\nvalue = \"1\"\nkind = \"{kind}\"\nshells = [\"bash\"]\n"
+            ))
+            .expect_err("refused");
+            assert!(
+                err.contains(&format!("`kind = \"{kind}\"` lands in `environment.d`")),
+                "{err}"
+            );
+            assert!(err.contains("drop `shells`"), "{err}");
+        }
     }
 
     #[test]

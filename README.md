@@ -60,10 +60,11 @@ and secrets, not just the flag list.
 
 ### Reading a plan
 
-Five symbols, and none of them is "destroy". A tool that only adds never has
-one, so those slots go to the two cases that actually matter for a tool that
-must not be invasive: something it does not own is in the way, and the tool it
-is configuring for is not on this machine.
+Six symbols, and none of them is "destroy". A tool that only adds never has
+one, so those slots go to the cases that actually matter for a tool that must
+not be invasive: something it does not own is in the way, the tool it is
+configuring for is not on this machine, and a file it wrote is no longer
+declared.
 
 ```
   +  create     it does not exist yet
@@ -74,6 +75,8 @@ is configuring for is not on this machine.
                 where you cannot run it. Reported and skipped until you
                 install it — writing the config anyway would break your
                 shell or your builds, not just that one tool.
+  *  undeclared bx wrote it, and the configuration no longer declares it.
+                Left exactly as it is; `bx rm` releases it.
   =  unchanged  already converged (hidden unless you ask)
 ```
 

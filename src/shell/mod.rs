@@ -89,20 +89,25 @@
 //!
 //! # bash
 //!
-//! bash gets its own, smaller file from the same [`Assembly`]: the shared
-//! aliases in the `aliases` phase and the history and shell options in the
-//! `options` phase, each in bash's words, sourced from a fixed region in
-//! `~/.bashrc`; and the keybindings go to `~/.inputrc`. [`bash`] holds both,
-//! and the tests there run the file in bash to hold it to Invariant 2.
+//! bash gets its own file from the same [`Assembly`] and the same
+//! declarations: the variables, the `[path]` entries, the activations' bash output, the sources,
+//! the aliases, the functions and the history and shell options, each in
+//! bash's words, sourced from a fixed region in `~/.bashrc`; and the
+//! keybindings go to `~/.inputrc`. A declaration reaches every shell unless
+//! its `shells` ([`Shells`]) keeps it to some, and each shell's file's plan
+//! row names what does not reach it ([`omitted`]). What bash cannot read in
+//! zsh's words stays zsh's: plugins, the completion system's setup and hook
+//! registrations. [`bash`] holds both files, and the tests there
+//! run the file in bash to hold it to Invariant 2.
 //!
 //! # Activations
 //!
 //! A tool's own shell integration — `brew shellenv`, `mise activate zsh`,
-//! `starship init zsh` — is run by [`activation::plan`] rather than at every
-//! shell start, trusted once two runs agree, and cached against the content
-//! of the tool's binary, so the `activations` and `completions` phases hold
-//! text and start no process. There is no form that runs a tool at shell
-//! start.
+//! `starship init {shell}` — is run by [`activation::plan`] rather than at
+//! every shell start, once per shell it has a command for, trusted once two
+//! runs agree, and cached against the content of the tool's binary, so the
+//! `activations` and `completions` phases hold text and start no process.
+//! There is no form that runs a tool at shell start.
 
 pub mod activation;
 pub mod alias;
@@ -157,6 +162,219 @@ pub(crate) mod testing {
         assert!(output.status.success(), "{script}: {output:?}");
         output.stdout
     }
+}
+
+/// A shell bx generates configuration for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Shell {
+    /// zsh.
+    Zsh,
+    /// bash.
+    Bash,
+}
+
+impl Shell {
+    /// Every shell, in the order messages list them.
+    pub const ALL: [Self; 2] = [Self::Zsh, Self::Bash];
+
+    /// The shell's name, as `bx.toml` and its own `init` commands spell it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Zsh => "zsh",
+            Self::Bash => "bash",
+        }
+    }
+
+    /// The shell a config author spelled, if it is one.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|shell| shell.name() == raw)
+    }
+}
+
+/// The shells one declaration renders into.
+///
+/// # The `shells` key
+///
+/// `[[env]]`, `[[function]]`, `[[source]]` and `[[activation]]` entries, and
+/// a `[path]` entry written as an inline table, each take an optional
+/// `shells = ["zsh"]`, naming the shells the declaration is
+/// kept to. Without it a declaration reaches every shell, so zsh and bash are
+/// configured alike from one declaration. A name that is not a shell bx
+/// generates for, or an empty list, fails the load; a declaration restricted
+/// away from a shell is named on that shell's generated file's plan row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Shells {
+    /// Whether it reaches zsh.
+    zsh: bool,
+    /// Whether it reaches bash.
+    bash: bool,
+}
+
+impl Default for Shells {
+    fn default() -> Self {
+        Self::EVERY
+    }
+}
+
+impl Shells {
+    /// Every shell: what a declaration with no `shells` key reaches.
+    pub const EVERY: Self = Self {
+        zsh: true,
+        bash: true,
+    };
+
+    /// The key, as a config author writes it.
+    pub const KEY: &'static str = "shells";
+
+    /// Only `shell`.
+    #[must_use]
+    pub const fn only(shell: Shell) -> Self {
+        Self {
+            zsh: matches!(shell, Shell::Zsh),
+            bash: matches!(shell, Shell::Bash),
+        }
+    }
+
+    /// Whether the declaration reaches `shell`.
+    #[must_use]
+    pub const fn includes(self, shell: Shell) -> bool {
+        match shell {
+            Shell::Zsh => self.zsh,
+            Shell::Bash => self.bash,
+        }
+    }
+
+    /// Read `shells` from `table`, or [`Shells::EVERY`] when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::config::Error::WrongType`] for a value that is not an array
+    /// of strings, and [`crate::config::Error::BadValue`] for an empty list
+    /// or a name that is not a shell bx generates for.
+    pub(crate) fn parse_in(
+        ctx: &crate::config::Ctx<'_>,
+        table: &toml_edit::Table,
+        owner: &str,
+    ) -> Result<Self, crate::config::Error> {
+        if table.get(Self::KEY).is_none() {
+            return Ok(Self::EVERY);
+        }
+        let names = ctx.str_array_at(table, Self::KEY)?;
+        Self::from_names(&names)
+            .map_err(|problem| ctx.bad(table, Self::KEY, format!("{owner}: {problem}")))
+    }
+
+    /// The shells `names` spell.
+    ///
+    /// # Errors
+    ///
+    /// Why the list names no shell, or names one bx does not generate for.
+    pub fn from_names(names: &[String]) -> Result<Self, String> {
+        let known = || {
+            Shell::ALL
+                .iter()
+                .map(|shell| format!("{:?}", shell.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if names.is_empty() {
+            return Err(format!(
+                "`shells` names no shell; list one or more of {}, or set `enabled = false`",
+                known()
+            ));
+        }
+        let mut shells = Self {
+            zsh: false,
+            bash: false,
+        };
+        for name in names {
+            match Shell::parse(name) {
+                Some(Shell::Zsh) => shells.zsh = true,
+                Some(Shell::Bash) => shells.bash = true,
+                None => {
+                    return Err(format!(
+                        "{name:?} is not a shell bx generates for; `shells` lists {}",
+                        known()
+                    ));
+                }
+            }
+        }
+        Ok(shells)
+    }
+}
+
+/// The note `shell`'s generated file's plan row carries for the enabled
+/// declarations of `merged` that do not reach it, or `None` when every one
+/// does.
+///
+/// It names every `[[env]]` a shell could read, `[path]` entry,
+/// `[[function]]`, `[[source]]` and `[[activation]]` whose `shells` leaves
+/// `shell` out, then every
+/// activation that reaches `shell` but declares no command for it and so is
+/// not rendered there. Decided from the declarations alone, so the note is
+/// the same on every machine.
+#[must_use]
+pub fn omitted(shell: Shell, merged: &crate::config::Config) -> Option<String> {
+    let kept_out = |shells: Shells| !shells.includes(shell);
+    let mut names: Vec<String> = Vec::new();
+    names.extend(
+        merged
+            .envs
+            .iter()
+            .filter(|e| {
+                e.enabled && e.kind != crate::config::env::EnvKind::Gui && kept_out(e.shells)
+            })
+            .map(|e| format!("env `{}`", e.name)),
+    );
+    names.extend(
+        merged
+            .path
+            .iter()
+            .filter(|entry| entry.enabled && kept_out(entry.shells))
+            .map(|entry| format!("path `{}`", entry.dir)),
+    );
+    names.extend(
+        merged
+            .functions
+            .iter()
+            .filter(|f| f.enabled && kept_out(f.shells))
+            .map(|f| format!("function `{}`", f.name)),
+    );
+    names.extend(
+        merged
+            .sources
+            .iter()
+            .filter(|s| s.enabled && kept_out(s.shells))
+            .map(|s| format!("source `{}`", s.name)),
+    );
+    names.extend(
+        merged
+            .activations
+            .iter()
+            .filter(|a| a.enabled && kept_out(a.shells))
+            .map(|a| format!("activation `{}`", a.name)),
+    );
+    let mut notes = Vec::new();
+    if !names.is_empty() {
+        notes.push(format!("not in {}: {}", shell.name(), names.join(", ")));
+    }
+    notes.extend(
+        merged
+            .activations
+            .iter()
+            .filter(|a| a.enabled && !kept_out(a.shells) && a.command_for(shell).is_none())
+            .map(|a| {
+                format!(
+                    "activation `{}` declares no {} command, so it is not run for {}",
+                    a.name,
+                    shell.name(),
+                    shell.name()
+                )
+            }),
+    );
+    (!notes.is_empty()).then(|| notes.join("; "))
 }
 
 /// One named section of the generated interactive shell file.

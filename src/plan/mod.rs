@@ -3563,6 +3563,35 @@ pub(crate) mod tests {
             );
         }
 
+        #[test]
+        fn a_side_whose_directory_cannot_hold_it_is_a_conflict_with_no_write() {
+            let home = guarded_home();
+            // This machine's copy would go inside a file.
+            put(&home.child(".blocked"), "a file\n");
+            put(&copy(home.path(), "in"), "repo\n");
+            // The repo's copy would go inside a file.
+            put(&home.child(".config/bx/stuck"), "a file\n");
+            put(&home.child(".out"), "machine\n");
+            let inputs = inputs(
+                &home,
+                "[[target]]\npath = \"~/.blocked/in\"\nfile = \"files/in\"\n\
+                 direction = \"track\"\n\
+                 [[target]]\npath = \"~/.out\"\nfile = \"stuck/out\"\ndirection = \"track\"\n",
+            );
+            let planned = plan(&inputs);
+            assert_eq!(planned.actions(), vec![Action::Conflict; 2]);
+            for change in &planned.changes {
+                assert!(
+                    change
+                        .note
+                        .as_deref()
+                        .is_some_and(|n| n.contains("not a directory") || n.contains("cannot")),
+                    "{change:?}"
+                );
+            }
+            assert!(!sync(&inputs).executed);
+        }
+
         /// The home the sync crash child runs in. Passed per command.
         const SYNC_CRASH_HOME: &str = "BX_PLAN_SYNC_CRASH_HOME";
 

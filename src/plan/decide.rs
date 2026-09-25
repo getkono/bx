@@ -1229,7 +1229,8 @@ fn decide_track(
             return Ok((change, op, agreement));
         }
         (Some(m), None) => {
-            let (change, op) = track_into_repo(shown, rel, copy, &repo, m, &machine, ctx, row)?;
+            let (change, op) =
+                track_into_repo(shown, rel, (copy, &repo), m, machine.mode, ctx, row)?;
             let agreement = op.is_some().then(|| agreed(m, When::Synced)).flatten();
             return Ok((change, op, agreement));
         }
@@ -1237,7 +1238,8 @@ fn decide_track(
     };
     match ctx.bases.get(&target.path).map(Vec::as_slice) {
         Some(base) if base == r => {
-            let (change, op) = track_into_repo(shown, rel, copy, &repo, m, &machine, ctx, row)?;
+            let (change, op) =
+                track_into_repo(shown, rel, (copy, &repo), m, machine.mode, ctx, row)?;
             let agreement = op.is_some().then(|| agreed(m, When::Synced)).flatten();
             Ok((change, op, agreement))
         }
@@ -1326,23 +1328,21 @@ fn track_onto_machine(
 }
 
 /// The row, and the write only `sync` makes, that carries this machine's copy
-/// `bytes` of a tracked target into the repo's copy at `rel`, observed as
-/// `repo`.
+/// `bytes`, at `machine_mode`, of a tracked target into the repo's copy at
+/// `rel`: `copy` is that copy's ledger key and what is there now.
 ///
 /// A copy the repo already has keeps its mode; a new one takes the mode of
 /// this machine's, so a private file is not made readable in the repo.
-#[allow(clippy::too_many_arguments)]
 fn track_into_repo(
     shown: &str,
     rel: &Path,
-    copy: Portable,
-    repo: &Observed,
+    (copy, repo): (Portable, &Observed),
     bytes: &[u8],
-    machine: &Observed,
+    machine_mode: Option<Mode>,
     ctx: &Ctx<'_>,
     row: impl Fn(Action, Option<Diff>, Option<String>) -> Change,
 ) -> Result<(Change, Option<Op>), Error> {
-    let mode = repo.mode.or(machine.mode).unwrap_or(Mode::DEFAULT_FILE);
+    let mode = repo.mode.or(machine_mode).unwrap_or(Mode::DEFAULT_FILE);
     let outcome = fs::compare(repo, &Desired { bytes, mode }, ctx.home);
     let unusable = repo.parent.as_ref().and_then(|parent| {
         let reason = parent.unusable()?;

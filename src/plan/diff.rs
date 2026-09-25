@@ -696,6 +696,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_diverged_side_that_cannot_be_shown_summarises_repo_against_machine() {
+        let binary = Diff::diverged("~/.a", b"base\n", &[0xff], b"repo\n");
+        assert_eq!(
+            binary.kind,
+            DiffKind::Summary {
+                before: Some(5),
+                after: 1,
+                why: Why::Binary
+            }
+        );
+        let big = vec![b'x'; TEXT_LIMIT + 1];
+        let large = Diff::diverged("~/.a", b"base\n", b"mine\n", &big);
+        assert_eq!(
+            large.kind,
+            DiffKind::Summary {
+                before: Some(TEXT_LIMIT + 1),
+                after: 5,
+                why: Why::TooLarge
+            }
+        );
+    }
+
     /// A home no test touches: rendering is pure.
     const HOME: &str = "/var/home/example";
 

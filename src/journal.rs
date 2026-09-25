@@ -1781,8 +1781,14 @@ impl Session {
     /// nowhere, and the rollback could neither remove the one nor prune the
     /// other (#119). Journalled first, the destination is still `before`
     /// until the publish, and the rollback removes the temporary file and
-    /// prunes each directory that stands empty, exactly as it does for a
-    /// refused publish; one that was never made is already gone.
+    /// prunes the directories above it that it leaves empty
+    /// ([`prune_beneath`]). A directory the Intent names and the rollback
+    /// finds without the temporary file in it is not shown to be bx's — a
+    /// crash before the stage made nothing, and the user may have made it
+    /// since — so it is left. A write refused after its stage cannot leave
+    /// that evidence behind, because the refused write drops its temporary
+    /// file, so it removes the directories its stage made itself before
+    /// returning the refusal ([`unmake`]).
     ///
     /// A directory this write invents that the loader would refuse — the home,
     /// or above it — is made and left unclaimed, by the Intent and by the
@@ -2033,8 +2039,10 @@ impl Session {
     /// The Intent names the parents a write will invent before `fs::stage`
     /// invents them, read from disk; the two differ only when the disk
     /// changed in between. Refused, the session is poisoned with the Intent
-    /// durable, and the rollback prunes what it names where it stands empty —
-    /// never a directory with anything in it. Carried on, the ledger entry
+    /// durable, and the caller removes every directory the stage made where
+    /// it stands empty ([`unmake`]) — never a directory with anything in it —
+    /// including one the Intent does not name, which no rollback or `rm`
+    /// would ever reach. Carried on, the ledger entry
     /// would claim a set the journal does not, which is the disagreement
     /// between a rollback and an `rm` [`Session::write`] exists to prevent.
     ///

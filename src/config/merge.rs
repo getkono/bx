@@ -148,6 +148,7 @@ use super::path::PathEntry;
 use super::secrets::Secrets;
 use super::shell_options::ShellOptions;
 use super::target::Target;
+use super::tool::ToolDecl;
 use super::values::{
     Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan, statements_named,
 };
@@ -303,6 +304,21 @@ impl Keyed for ActivationDecl {
     }
 }
 
+impl Keyed for ToolDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 impl Keyed for External {
     /// The checkout's directory, as its one normalised spelling. Nothing in
     /// an external is substituted, so the path written is the directory.
@@ -368,6 +384,8 @@ pub enum Section {
     Activation,
     /// `[[external]]`, keyed by `path`.
     External,
+    /// `[[tool]]`, keyed by `name`.
+    Tool,
 }
 
 impl Section {
@@ -383,6 +401,7 @@ impl Section {
             Self::Plugin => "plugin",
             Self::Source => "source",
             Self::Activation => "activation",
+            Self::Tool => "tool",
             Self::External => "external",
         }
     }
@@ -399,6 +418,7 @@ impl Section {
             Self::Plugin => plugin::SECTION,
             Self::Source => crate::shell::source::SECTION,
             Self::Activation => activation::SECTION,
+            Self::Tool => super::tool::SECTION,
             Self::External => super::external::SECTION,
         }
     }
@@ -414,7 +434,8 @@ impl Section {
             | Self::Function
             | Self::Plugin
             | Self::Source
-            | Self::Activation => "name",
+            | Self::Activation
+            | Self::Tool => "name",
         }
     }
 
@@ -433,6 +454,7 @@ impl Section {
             Self::Plugin => "a `source`",
             Self::Source => "a `path`",
             Self::Activation => "a `command`",
+            Self::Tool => "an `install`",
             Self::External => "a `url` and a `rev`",
         }
     }
@@ -817,6 +839,7 @@ impl Merged<Target, TargetKey> {
                 | Section::Plugin
                 | Section::Source
                 | Section::Activation
+                | Section::Tool
                 | Section::External => {}
             }
         }
@@ -1228,6 +1251,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut plugins: Merged<PluginDecl> = Merged::default();
     let mut sources: Merged<SourceDecl> = Merged::default();
     let mut activations: Merged<ActivationDecl> = Merged::default();
+    let mut tools: Merged<ToolDecl> = Merged::default();
     let mut externals: Merged<External> = Merged::default();
     let mut secrets = Secrets::default();
     let mut history = History::default();
@@ -1249,7 +1273,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // source, keyed by its name, whose path is substituted only once the
     // values are final; and so does a tool activation, keyed by its name,
     // which holds no placeholder; and so does an external, keyed by its path,
-    // which holds no placeholder.
+    // which holds no placeholder; and so does a declared tool, keyed by its
+    // name, which holds no placeholder either.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1267,6 +1292,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         plugins.absorb(layer.config.plugins.iter().cloned());
         sources.absorb(layer.config.sources.iter().cloned());
         activations.absorb(layer.config.activations.iter().cloned());
+        tools.absorb(layer.config.tools.iter().cloned());
         externals.absorb(layer.config.externals.iter().cloned());
 
         for toggle in &layer.config.toggles {
@@ -1280,6 +1306,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Plugin => plugins.toggle(toggle)?,
                 Section::Source => sources.toggle(toggle)?,
                 Section::Activation => activations.toggle(toggle)?,
+                Section::Tool => tools.toggle(toggle)?,
                 Section::External => externals.toggle(toggle)?,
                 Section::Target => {}
             }
@@ -1343,6 +1370,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         sources: sources.into_enabled(),
         // Nor to a tool activation.
         activations: activations.into_enabled(),
+        // Nor to a declared tool.
+        tools: tools.into_enabled(),
         secrets,
         history,
         shell_options,
@@ -2098,6 +2127,7 @@ mod tests {
             (Section::Plugin, "plugin", "[[plugin]]", "name"),
             (Section::Source, "source", "[[source]]", "name"),
             (Section::Activation, "activation", "[[activation]]", "name"),
+            (Section::Tool, "tool", "[[tool]]", "name"),
             (Section::External, "external", "[[external]]", "path"),
         ] {
             assert_eq!(section.key(), key);

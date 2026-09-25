@@ -106,7 +106,7 @@ use std::path::{Path, PathBuf};
 use crate::fs::Mode;
 
 pub use dir::StateDir;
-pub(crate) use dir::move_aside;
+pub(crate) use dir::{move_aside, quarantines};
 pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use ledger::RestoreRef;

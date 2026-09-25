@@ -72,9 +72,14 @@
 //! binary's content, and written only when the environment guard approves
 //! every assignment it makes to a variable that relocates a tool.
 //!
-//! [`doctor`] reads the same resolved targets without deciding them, and asks
-//! read-only questions about what is on disk — whether systemd has reloaded,
-//! enabled, or failed a unit file bx wrote — changing nothing itself.
+//! [`doctor`] reads the same resolved configuration without deciding it, and
+//! asks read-only questions about the machine — whether each declared tool is
+//! on `PATH`, whether a required value is unanswered, whether a state file is
+//! damaged or a session was interrupted, whether a directory is wider than a
+//! private file in it, whether a declared optional source is there, and
+//! whether systemd has reloaded, enabled, or failed a unit file bx wrote —
+//! changing nothing itself and installing nothing: a declared tool's install
+//! command is printed, never run.
 //!
 //! # How one repo serves many accounts
 //!

@@ -19,7 +19,7 @@ use crate::doctor::{self, Probes, systemd};
 use crate::init;
 use crate::paths;
 use crate::plan::{self, Env, Error, Inputs, Mode, Palette, Report, View};
-use crate::report::Exit;
+use crate::report::{Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
 use crate::sync;
@@ -32,13 +32,20 @@ use crate::sync;
 /// `out` cannot be written. A check that cannot ask what it needs — systemd's
 /// user session unreachable — is a finding, not an error.
 pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
-    doctor_with(env, out, &systemd::Systemctl::default())
+    doctor_with(
+        env,
+        out,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &systemd::Systemctl::default(),
+    )
 }
 
-/// [`doctor`], asking systemd through `systemd`.
+/// [`doctor`], looking for declared tools along `path` and asking systemd
+/// through `systemd`.
 fn doctor_with(
     env: &Env,
     out: &mut dyn Write,
+    path: &std::ffi::OsStr,
     systemd: &dyn systemd::Query,
 ) -> Result<Exit, Error> {
     let inputs = Inputs::load(env)?;
@@ -46,6 +53,7 @@ fn doctor_with(
     let report = doctor::run(
         &inputs,
         &Probes {
+            path,
             unit_dir: &unit_dir,
             systemd,
         },
@@ -110,22 +118,24 @@ fn apply_with(
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, Error> {
-    let report = converge(env, yes, out, ask)?;
+    let report = converge(env, Mode::Apply, yes, out, ask)?;
     Ok(plan::exit(&report, Mode::Apply))
 }
 
 /// `bx apply`'s body: load, show the plan, obtain approval, write, and say
 /// what was done. Shared with [`sync`], so the change list `sync` asks about
-/// is `apply`'s own.
+/// is `apply`'s own; `sync` runs it in [`Mode::Sync`], which also carries each
+/// tracked target this machine changed into the repo.
 fn converge(
     env: &Env,
+    mode: Mode,
     yes: bool,
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Report, Error> {
     let inputs = Inputs::load(env)?;
     let mut shown = false;
-    let report = plan::run(&inputs, Mode::Apply, &mut |report| {
+    let report = plan::run(&inputs, mode, &mut |report| {
         emit(out, report, View::Plan, env)?;
         shown = true;
         if yes {
@@ -147,7 +157,7 @@ fn converge(
         let written = report
             .actions()
             .into_iter()
-            .filter(|action| action.is_pending())
+            .filter(|action| action.is_pending() || (mode == Mode::Sync && *action == Action::Sync))
             .count();
         writeln!(out, "Applied {written} change(s).").map_err(Error::Output)?;
         // A row apply stopped short of was announced as work and shown so; its
@@ -174,6 +184,9 @@ fn converge(
 /// [`sync::pull`] runs first and refuses a diverged branch, a missing
 /// upstream, and a push that would carry a state file, all before anything is
 /// changed. The apply is [`apply`]'s, with its one confirmation and its `yes`.
+/// The apply runs in [`Mode::Sync`], so each tracked target this machine
+/// changed is carried into the repo, and [`sync::commit_carried`] commits
+/// those files in one commit before the push.
 /// The push follows only when [`sync::may_push`] says the apply left nothing
 /// undone: a declined apply, one that left a target in conflict or blocked,
 /// or one that only recovered an interrupted session, pushes nothing, and the
@@ -206,26 +219,44 @@ fn sync_with(
         )
         .map_err(sync::Error::Output)?;
     }
-    let report = converge(env, yes, out, ask)?;
-    if pulled.ahead > 0 {
+    if pulled.recovered > 0 {
+        writeln!(
+            out,
+            "Committed {} tracked file(s) an interrupted bx sync carried into the repo.",
+            pulled.recovered
+        )
+        .map_err(sync::Error::Output)?;
+    }
+    let report = converge(env, Mode::Sync, yes, out, ask)?;
+    let committed = sync::commit_carried(env, git, &pulled.repo)?;
+    if committed > 0 {
+        writeln!(
+            out,
+            "Committed {committed} tracked file(s) to {}.",
+            pulled.branch
+        )
+        .map_err(sync::Error::Output)?;
+    }
+    // Every carried file is in the one commit `commit_carried` made.
+    let ahead = pulled.ahead + u64::from(committed > 0);
+    if ahead > 0 {
         if sync::may_push(&report) {
             sync::push(git, &pulled)?;
             writeln!(
                 out,
-                "Pushed {} commit(s) to {}.",
-                pulled.ahead, pulled.upstream.short
+                "Pushed {ahead} commit(s) to {}.",
+                pulled.upstream.short
             )
         } else {
             writeln!(
                 out,
-                "Pushed nothing: {} commit(s) wait for an apply that leaves nothing undone; run \
-                 `bx sync` again.",
-                pulled.ahead
+                "Pushed nothing: {ahead} commit(s) wait for an apply that leaves nothing undone; \
+                 run `bx sync` again."
             )
         }
         .map_err(sync::Error::Output)?;
     }
-    Ok(plan::exit(&report, Mode::Apply))
+    Ok(plan::exit(&report, Mode::Sync))
 }
 
 /// `bx init`: create the repo when there is none, answer this account's unset
@@ -1310,7 +1341,8 @@ mod tests {
         home.write(".config/systemd/user/b.service", "x");
 
         let mut out = Vec::new();
-        let exit = doctor_with(&env, &mut out, &AllFailed).expect("doctor");
+        let exit =
+            doctor_with(&env, &mut out, std::ffi::OsStr::new(""), &AllFailed).expect("doctor");
 
         assert_eq!(exit, Exit::Pending);
         assert_eq!(
@@ -1635,6 +1667,220 @@ mod tests {
                 ),
                 Err(sync::Error::Output(_))
             ));
+        }
+
+        /// `~/.lock`, tracked, with its repo copy at `files/lock`.
+        const TRACKED: &str =
+            "[[target]]\npath = \"~/.lock\"\nfile = \"files/lock\"\ndirection = \"track\"\n";
+
+        /// A config repo tracking `~/.lock`, both copies `a\n` and pushed, and
+        /// a first sync that records their agreement.
+        fn tracking(home: &crate::testing::GuardedHome) -> std::path::PathBuf {
+            let repo = cloned(home, TRACKED);
+            std::fs::create_dir_all(repo.join("files")).expect("files");
+            std::fs::write(repo.join("files/lock"), "a\n").expect("the repo copy");
+            commit_all(home.path(), &repo, "track");
+            run(home.path(), &repo, &["push", "--quiet"]);
+            home.write(".lock", "a\n");
+            let exit = sync_with(
+                &env(home.path()),
+                true,
+                &mut Vec::new(),
+                &git(home.path()),
+                &mut never,
+            )
+            .expect("the agreeing sync");
+            assert_eq!(exit, Exit::Converged);
+            repo
+        }
+
+        fn clean(home: &crate::testing::GuardedHome, repo: &Path) -> bool {
+            run(home.path(), repo, &["status", "--porcelain"]).is_empty()
+        }
+
+        #[test]
+        fn a_tracked_change_is_left_by_apply_and_committed_once_and_pushed_by_sync() {
+            let home = guarded_home();
+            let repo = tracking(&home);
+            home.write(".lock", "b\n");
+
+            let mut out = Vec::new();
+            let exit = apply_with(&env(home.path()), true, &mut out, &mut never).expect("apply");
+            assert_eq!(exit, Exit::Converged, "{}", text(&out));
+            assert!(text(&out).contains("  < ~/.lock"), "{}", text(&out));
+            assert!(clean(&home, &repo), "a bare apply left the repo modified");
+
+            let before = rev(home.path(), &repo, "HEAD");
+            let mut out = Vec::new();
+            let exit = sync_with(
+                &env(home.path()),
+                true,
+                &mut out,
+                &git(home.path()),
+                &mut never,
+            )
+            .expect("sync");
+            assert_eq!(exit, Exit::Converged, "{}", text(&out));
+            assert!(
+                text(&out).ends_with(
+                    "Applied 1 change(s).\nCommitted 1 tracked file(s) to master.\n\
+                     Pushed 1 commit(s) to origin/master.\n"
+                ),
+                "{}",
+                text(&out)
+            );
+            assert!(clean(&home, &repo));
+            assert_eq!(
+                run(home.path(), &repo, &["rev-parse", "HEAD~1"]),
+                before,
+                "one commit"
+            );
+            assert_eq!(
+                run(home.path(), &repo, &["log", "-1", "--format=%B"]),
+                "chore: carry tracked files back from bx sync\n\nfiles/lock"
+            );
+            assert_eq!(run(home.path(), &repo, &["show", "HEAD:files/lock"]), "b");
+            assert_eq!(
+                rev(home.path(), &home.child("remote.git"), "master"),
+                rev(home.path(), &repo, "HEAD")
+            );
+
+            let mut again = Vec::new();
+            sync_with(
+                &env(home.path()),
+                true,
+                &mut again,
+                &git(home.path()),
+                &mut never,
+            )
+            .expect("a second sync");
+            assert!(!text(&again).contains("Committed"), "{}", text(&again));
+        }
+
+        #[test]
+        fn a_declined_sync_over_only_a_carry_writes_nothing_and_pushes_nothing() {
+            let home = guarded_home();
+            let repo = tracking(&home);
+            std::fs::write(repo.join("notes"), "mine\n").expect("a local commit");
+            commit_all(home.path(), &repo, "mine");
+            let before = rev(home.path(), &home.child("remote.git"), "master");
+            home.write(".lock", "b\n");
+            let tty = Env {
+                stdin_tty: true,
+                ..env(home.path())
+            };
+
+            let mut out = Vec::new();
+            let mut asked = 0;
+            let exit = sync_with(&tty, false, &mut out, &git(home.path()), &mut || {
+                asked += 1;
+                Ok(false)
+            })
+            .expect("a declined sync");
+
+            assert_eq!(asked, 1, "the carry is asked about");
+            assert_eq!(exit, Exit::Pending, "{}", text(&out));
+            assert!(text(&out).contains("  < ~/.lock"), "{}", text(&out));
+            assert!(
+                text(&out).ends_with(
+                    "Nothing was written.\nPushed nothing: 1 commit(s) wait for an apply that \
+                     leaves nothing undone; run `bx sync` again.\n"
+                ),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(
+                std::fs::read(repo.join("files/lock")).expect("the repo copy"),
+                b"a\n"
+            );
+            assert!(clean(&home, &repo));
+            assert_eq!(
+                rev(home.path(), &home.child("remote.git"), "master"),
+                before
+            );
+        }
+
+        #[test]
+        fn two_machines_that_both_changed_a_tracked_target_are_a_conflict_and_push_nothing() {
+            let home = guarded_home();
+            tracking(&home);
+            let other = other(&home);
+            std::fs::write(other.join("files/lock"), "theirs\n").expect("their copy");
+            commit_all(home.path(), &other, "elsewhere");
+            run(home.path(), &other, &["push", "--quiet"]);
+            let theirs = rev(home.path(), &other, "HEAD");
+            home.write(".lock", "mine\n");
+
+            let mut out = Vec::new();
+            let exit = sync_with(
+                &env(home.path()),
+                true,
+                &mut out,
+                &git(home.path()),
+                &mut never,
+            )
+            .expect("a sync with a conflict");
+            assert_eq!(exit, Exit::Pending, "{}", text(&out));
+            let shown = text(&out);
+            assert!(shown.contains("  ! ~/.lock"), "{shown}");
+            assert!(shown.contains("+++ ~/.lock (this machine)"), "{shown}");
+            assert!(shown.contains("+mine"), "{shown}");
+            assert!(shown.contains("+++ ~/.lock (repo)"), "{shown}");
+            assert!(shown.contains("+theirs"), "{shown}");
+            assert!(!shown.contains("Committed"), "{shown}");
+            assert_eq!(std::fs::read(home.child(".lock")).expect("kept"), b"mine\n");
+            assert_eq!(
+                rev(home.path(), &home.child("remote.git"), "master"),
+                theirs
+            );
+        }
+
+        #[test]
+        fn copies_an_interrupted_sync_wrote_and_never_committed_are_committed_first() {
+            let home = guarded_home();
+            let repo = tracking(&home);
+            home.write(".lock", "b\n");
+            // A sync that wrote the copy and stopped before its commit.
+            let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+            assert!(
+                plan::run(&inputs, Mode::Sync, &mut |_| Ok(true))
+                    .expect("the carrying run")
+                    .executed
+            );
+            assert!(!clean(&home, &repo));
+            // Something the user left in the working tree is not bx's to commit.
+            std::fs::write(repo.join("notes"), "mine\n").expect("notes");
+
+            let mut out = Vec::new();
+            let exit = sync_with(
+                &env(home.path()),
+                true,
+                &mut out,
+                &git(home.path()),
+                &mut never,
+            )
+            .expect("the recovering sync");
+            assert_eq!(exit, Exit::Converged, "{}", text(&out));
+            assert!(
+                text(&out).starts_with(
+                    "Committed 1 tracked file(s) an interrupted bx sync carried into the repo.\n"
+                ),
+                "{}",
+                text(&out)
+            );
+            assert!(text(&out).ends_with("Pushed 1 commit(s) to origin/master.\n"));
+            assert_eq!(
+                run(home.path(), &repo, &["status", "--porcelain"]),
+                "?? notes"
+            );
+            assert_eq!(
+                run(
+                    home.path(),
+                    &home.child("remote.git"),
+                    &["show", "master:files/lock"]
+                ),
+                "b"
+            );
         }
     }
 }

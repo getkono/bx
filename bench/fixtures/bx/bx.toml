@@ -1,0 +1,157 @@
+# An example bx configuration repository — the global layer.
+#
+# It is shaped like a real dotfiles repository ported to bx: owned files, a
+# directory tree, a symlink, a git external, an encrypted secret, and one set of
+# shell declarations that bx renders for zsh and for bash alike. Nothing in it
+# names an account, a machine, a mount or a key; everything that differs per
+# account is a declared value, answered in that account's own local.toml:
+#
+#   # ~/.local/state/bx/local.toml — never committed
+#   [values]
+#   git_name  = "Your Name"
+#   git_email = "you@example.com"
+#
+# Layers merge in this order: this file, then modules/*.toml in filename order,
+# then local.toml. Managed file bodies live under home/, mirroring the path
+# each lands at.
+#
+# `bx apply` with this repository is what the end-to-end test in
+# tests/acceptance.rs runs, and what `mise run bench` measures.
+
+# ===========================================================================
+# Values — the shape of what differs per account, never its content
+# ===========================================================================
+
+[[value]]
+name        = "git_name"
+description = "The name git records as the author of your commits"
+kind        = "string"
+required    = true
+
+[[value]]
+name        = "git_email"
+description = "The email address git records as the author of your commits"
+kind        = "email"
+required    = true
+
+# ===========================================================================
+# Environment — declared by when a variable must be visible
+# ===========================================================================
+
+[[env]]
+name  = "EDITOR"
+value = "nvim"
+kind  = "environment"
+
+[[env]]
+name  = "PAGER"
+value = "less"
+kind  = "environment"
+
+[[env]]
+name  = "MANPAGER"
+value = "less -R --use-color"
+kind  = "environment"
+
+# Over SSH, no alternate screen, and quit when the output fits.
+[[env]]
+name  = "LESS"
+value = "-F -X"
+kind  = "interactive"
+when  = "ssh"
+
+# The input method, for programs the graphical session starts.
+[[env]]
+name  = "GTK_IM_MODULE"
+value = "ibus"
+kind  = "gui"
+
+# ===========================================================================
+# PATH — the first prepended entry ends up first
+# ===========================================================================
+
+[path]
+prepend = [
+    { dir = "~/.local/bin", if_exists = true },
+    { dir = "~/.cargo/bin", if_exists = true },
+    { dir = "~/bin", if_exists = true },
+]
+
+# ===========================================================================
+# History, shell options and keybindings
+# ===========================================================================
+
+[history]
+size         = 10000
+duplicates   = "all"
+ignore_space = true
+share        = true
+
+[history.file]
+zsh = "~/.zsh_history"
+
+[shell-options]
+histappend   = true
+checkwinsize = true
+
+[keybindings]
+home      = "beginning-of-line"
+end       = "end-of-line"
+alt-right = "forward-word"
+alt-f     = "forward-word"
+alt-left  = "backward-word"
+alt-b     = "backward-word"
+
+# ===========================================================================
+# Aliases — every body reaches the alias exactly as written
+# ===========================================================================
+
+[aliases]
+g      = "git"
+sudo   = "sudo "
+reload = "exec $SHELL"
+v      = "nvim"
+la     = "ls -alhF --group-directories-first"
+ls     = "ls --color=auto"
+grep   = "grep --color=auto"
+dutop  = "du -hsx -- * | sort -rh | head -10"
+
+[[alias]]
+name    = "cat"
+command = "bat --paging=never"
+when    = "has:bat"
+
+# ===========================================================================
+# Functions
+# ===========================================================================
+
+[[function]]
+name = "mkcd"
+body = '''
+mkdir -p -- "$1" && cd -- "$1"
+'''
+
+# A terminal multiplexer's pane title: the running command's name. A zsh hook,
+# so bash, which has no preexec, is left out.
+[[function]]
+name   = "pane_title"
+hook   = "preexec"
+when   = "env:ZELLIJ"
+shells = ["zsh"]
+body   = '''
+print -n -- "\e]0;${1%% *}\a"
+'''
+
+# ===========================================================================
+# Home layout
+# ===========================================================================
+
+[[target]]
+path = "~/.ssh"
+dir  = true
+mode = "0700"
+
+# An empty file bx delivers and keeps.
+[[target]]
+path    = "~/.hushlogin"
+content = ""

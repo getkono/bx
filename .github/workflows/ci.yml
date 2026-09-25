@@ -307,9 +307,11 @@ jobs:
       MISE_AUTO_INSTALL: "false"
     steps:
       - uses: actions/checkout@v4
-      # The measurement needs no cargo, but a pinned toolchain keeps any tool
-      # mise does build from source off the runner image's mood (issue #55).
+      # The bench applies the example configuration with the real binary, and
+      # `mise run bench` builds it first, so the job needs the toolchain: a
+      # measurement taken without a binary would pass by measuring nothing.
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       # hyperfine is the only tool this job calls; the rest of the table would
       # be built from source for nothing.
       - uses: jdx/mise-action@v2

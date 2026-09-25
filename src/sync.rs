@@ -32,6 +32,16 @@
 //! never merges, rebases, resets or force-pushes: a diverged history is a
 //! human's to reconcile, and `sync` is run again once they have.
 //!
+//! # Tracked targets are committed here, and only here
+//!
+//! A `direction = "track"` target's copy on this machine leads, and the apply
+//! `sync` runs is [`plan::Mode::Sync`], which alone writes each tracked copy
+//! this machine changed into the config repo. [`commit_carried`] then commits
+//! exactly those files, in one commit whose message names no host, account or
+//! time, and the push publishes it with everything else. A bare `bx apply`
+//! never writes a repo copy, so the config repo is never left modified outside
+//! a sync.
+//!
 //! # State never leaves the machine
 //!
 //! The state directory holds this account's answers, the bytes bx displaced
@@ -42,13 +52,14 @@
 //! `journal.mpk`, or a content-addressed blob in a `restore/` directory. That
 //! is a guard on four literal names, not a secret scanner.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::paths;
 use crate::plan::{self, Env, Report};
-use crate::state::StateDir;
+use crate::state::{ContentHash, LedgerView, Mechanism, StateDir};
 
 /// Variables that make git operate on a repository other than the one it is
 /// run in. Removed from every child, so `-C REPO` is what decides.
@@ -345,17 +356,22 @@ pub struct Pulled {
     pub ahead: u64,
     /// Commits the branch was fast-forwarded by.
     pub fast_forwarded: u64,
+    /// Tracked copies an interrupted sync left written and uncommitted, which
+    /// were committed before the fetch; counted in [`Pulled::ahead`].
+    pub recovered: usize,
 }
 
 /// Fetch the config repo's upstream and fast-forward its branch to it.
 ///
 /// In order, and stopping at the first refusal: the state directory must lie
 /// outside the config repo; the config repo must be a git repository of its
-/// own, on a branch with an upstream; the upstream is fetched; a branch that
-/// has diverged from it is refused; a branch with commits to push is refused
-/// when one carries a state file; and a branch that is behind is
-/// fast-forwarded. Nothing is changed before the fast-forward, which git makes
-/// only when the working tree allows it.
+/// own, on a branch with an upstream; tracked copies an interrupted sync wrote
+/// and never committed are committed ([`commit_carried`]); the upstream is
+/// fetched; a branch that has diverged from it is refused; a branch with
+/// commits to push is refused when one carries a state file; and a branch
+/// that is behind is fast-forwarded. Nothing but that commit is changed
+/// before the fast-forward, which git makes only when the working tree allows
+/// it.
 ///
 /// # Errors
 ///
@@ -377,6 +393,10 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
             _ => Error::Detached(repo.clone()),
         })?;
     let upstream = upstream(git, &repo, &branch)?;
+    // Tracked copies an interrupted sync wrote and never committed are
+    // committed before anything moves the branch, so the branch is never
+    // fast-forwarded under a working tree holding half a sync.
+    let recovered = commit_carried(env, git, &repo)?;
 
     git.remote(&repo, &["fetch", "--quiet", &upstream.remote])?;
     let (ahead, behind) = counts(git, &repo)?;
@@ -400,7 +420,91 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
         upstream,
         ahead,
         fast_forwarded: behind,
+        recovered,
     })
+}
+
+/// The message of every commit [`commit_carried`] makes: fixed text, so two
+/// syncs that carry the same files make the same commit message, whichever
+/// machine and account ran them and whenever they ran.
+const CARRIED_SUBJECT: &str = "chore: carry tracked files back from bx sync";
+
+/// Commit every tracked target's copy that `sync` wrote into the config repo
+/// and git has not committed yet, in one commit, and return how many files it
+/// holds.
+///
+/// A copy is one bx wrote when the ledger records a whole file bx owns inside
+/// the repo and the file still holds exactly the bytes it recorded: `sync` is
+/// the only thing that writes one, so an edit of the user's to a repo file is
+/// never committed here, and neither is any other change in the working tree
+/// or the index — the commit names its paths and takes only theirs.
+///
+/// Run twice by `bx sync`: before the fetch, so copies an interrupted `sync`
+/// wrote and never committed are committed whole before anything moves the
+/// branch, and after the apply, for this run's own. A run that stopped
+/// between the two leaves either every copy written and none committed, or
+/// every copy committed: the session that writes them is rolled back whole,
+/// and a commit is one ref update.
+///
+/// The message is [`CARRIED_SUBJECT`] and the repo-relative paths in byte
+/// order, one per line: no host, account or time. The commit runs the user's
+/// own hooks and signing, like any commit they make.
+///
+/// # Errors
+///
+/// [`Error::Plan`] when the ledger cannot be read, and [`Error::Git`] when
+/// git refuses a step, as a failing hook makes it.
+pub fn commit_carried(env: &Env, git: &Git, repo: &Path) -> Result<usize, Error> {
+    let state = StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
+    let ledger = LedgerView::read(&state, &env.home)
+        .map_err(plan::Error::from)?
+        .value;
+    let root = paths::normalize(repo);
+    let written: BTreeSet<String> = ledger
+        .iter()
+        .filter(|(_, entry)| entry.mechanism == Mechanism::Own)
+        .filter_map(|(path, entry)| {
+            let dest = paths::normalize(&path.render(&env.home));
+            let rel = dest.strip_prefix(&root).ok()?.to_str()?.to_string();
+            let still =
+                std::fs::read(&dest).is_ok_and(|bytes| ContentHash::of(&bytes) == entry.written);
+            (still && !rel.is_empty()).then_some(rel)
+        })
+        .collect();
+    if written.is_empty() {
+        return Ok(0);
+    }
+    let written: Vec<&str> = written.iter().map(String::as_str).collect();
+    // Staged first and then asked about, so a copy git has never seen and one
+    // it has are the same question: what the index now holds that `HEAD` does
+    // not.
+    let mut add = vec!["add", "--"];
+    add.extend(&written);
+    git.query(repo, &add)?;
+    let mut staged = vec![
+        "diff",
+        "--cached",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        "--",
+    ];
+    staged.extend(&written);
+    let changed: BTreeSet<String> = git
+        .query(repo, &staged)?
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect();
+    if changed.is_empty() {
+        return Ok(0);
+    }
+    let paths: Vec<&str> = changed.iter().map(String::as_str).collect();
+    let message = format!("{CARRIED_SUBJECT}\n\n{}\n", paths.join("\n"));
+    let mut commit = vec!["commit", "--quiet", "-m", &message, "--"];
+    commit.extend(&paths);
+    git.remote(repo, &commit)?;
+    Ok(paths.len())
 }
 
 /// Push the branch [`pull`] found to its upstream, never forcing.
@@ -618,7 +722,14 @@ pub(crate) mod tests {
     /// `git` for a test: the tempdir home's configuration and nothing from the
     /// system's, so a developer's `/etc/gitconfig` cannot change the result.
     pub(crate) fn git(home: &Path) -> Git {
-        Git::new(&env(home)).with_env("GIT_CONFIG_NOSYSTEM", "1")
+        Git::new(&env(home))
+            .with_env("GIT_CONFIG_NOSYSTEM", "1")
+            // The identity a commit `sync` makes is the user's; the test's
+            // is fixed here rather than read from a home that has none.
+            .with_env("GIT_AUTHOR_NAME", "bx test")
+            .with_env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .with_env("GIT_COMMITTER_NAME", "bx test")
+            .with_env("GIT_COMMITTER_EMAIL", "test@example.invalid")
     }
 
     /// Run `git args` in `dir` with the test identity, and return its output.

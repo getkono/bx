@@ -14,8 +14,9 @@
 //! key this version does not know is a load error, as everywhere else.
 //!
 //! The table merges key by key, the last layer that sets a key winning.
-//! [`ShellOptions::render_bash`] is the declaration in bash's words, for the
-//! entry that generates bash's own interactive file to place.
+//! [`ShellOptions::render_bash`] is the declaration in bash's words, and
+//! lands in the `options` phase of bash's generated interactive file
+//! ([`crate::shell::bash`]).
 //!
 //! # Invariant 2
 //!
@@ -26,7 +27,7 @@ use std::path::Path;
 
 use toml_edit::Table;
 
-use super::{Ctx, Error};
+use super::{Ctx, Error, Origin};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[shell-options]";
@@ -43,6 +44,8 @@ pub struct ShellOptions {
     pub checkwinsize: Option<bool>,
     /// bash's `histappend`.
     pub histappend: Option<bool>,
+    /// Where the table that last set a key was written.
+    pub origin: Option<Origin>,
 }
 
 impl ShellOptions {
@@ -54,6 +57,9 @@ impl ShellOptions {
         }
         if let Some(on) = later.histappend {
             self.histappend = Some(on);
+        }
+        if let Some(origin) = &later.origin {
+            self.origin = Some(origin.clone());
         }
     }
 
@@ -94,9 +100,14 @@ impl ShellOptions {
 pub fn parse_shell_options(table: &Table, file: &Path, text: &str) -> Result<ShellOptions, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);
     ctx.reject_unknown_keys(table, &KEYS)?;
-    Ok(ShellOptions {
+    let options = ShellOptions {
         checkwinsize: ctx.bool_at(table, "checkwinsize")?,
         histappend: ctx.bool_at(table, "histappend")?,
+        origin: None,
+    };
+    Ok(ShellOptions {
+        origin: (options != ShellOptions::default()).then(|| ctx.origin().clone()),
+        ..options
     })
 }
 
@@ -120,12 +131,17 @@ mod tests {
             ShellOptions {
                 checkwinsize: Some(true),
                 histappend: Some(true),
+                origin: Some(Origin {
+                    file: "/repo/bx.toml".into(),
+                    line: 1,
+                }),
             }
         );
         assert_eq!(options.render_bash(), "shopt -s checkwinsize histappend\n");
         let mixed = ShellOptions {
             checkwinsize: Some(false),
             histappend: Some(true),
+            origin: None,
         };
         assert_eq!(
             mixed.render_bash(),
@@ -163,12 +179,18 @@ mod tests {
 
     #[test]
     fn a_later_layer_wins_key_by_key() {
+        let at = |line| Origin {
+            file: "/repo/bx.toml".into(),
+            line,
+        };
         let mut merged = ShellOptions {
             checkwinsize: Some(true),
             histappend: Some(true),
+            origin: Some(at(1)),
         };
         merged.absorb(&ShellOptions {
             histappend: Some(false),
+            origin: Some(at(9)),
             ..ShellOptions::default()
         });
         assert_eq!(
@@ -176,8 +198,13 @@ mod tests {
             ShellOptions {
                 checkwinsize: Some(true),
                 histappend: Some(false),
+                origin: Some(at(9)),
             }
         );
+        // A layer setting nothing changes nothing, its origin included.
+        let before = merged.clone();
+        merged.absorb(&ShellOptions::default());
+        assert_eq!(merged, before);
     }
 
     #[test]
@@ -188,6 +215,7 @@ mod tests {
         let options = ShellOptions {
             checkwinsize: Some(false),
             histappend: Some(true),
+            origin: None,
         };
         // `shopt -p` fails when any option it prints is off.
         let probe = "shopt -p checkwinsize histappend || :\n";

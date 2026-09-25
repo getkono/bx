@@ -197,7 +197,8 @@ pub fn link_text(text: &str, home: &Path) -> PathBuf {
 /// Every variant so far is produced by the `[[env]]` placement graph
 /// ([`super::env`]), which also carries the `[[plugin]]` entries, the
 /// declared aliases, the declared functions and the declared optional sources
-/// into the interactive file, and
+/// into the interactive file, or by bash's placement
+/// ([`crate::shell::bash::place`]), and
 /// none is named by a config author: a fragment carries the variables
 /// resolution placed in it, which no `generated = "…"` string could spell. A
 /// generator a config author may name adds its variant here and its arm in
@@ -216,6 +217,14 @@ pub enum Gen {
     /// one; see [`Interactive`]. Boxed, because it carries every interactive
     /// declaration and would otherwise size every target's body to it.
     Interactive(Box<Interactive>),
+    /// bash's generated interactive file; see [`crate::shell::bash`]. Not an
+    /// environment fragment: the plan judges only the history file it names.
+    /// Boxed for the reason [`Gen::Interactive`] is.
+    Bash(Box<crate::shell::bash::Bash>),
+    /// `~/.inputrc`, the declared keybindings in readline's syntax; see
+    /// [`crate::shell::bash::render_inputrc`]. Readline's syntax has no
+    /// environment variable to judge.
+    Inputrc(Keybindings),
 }
 
 impl Gen {
@@ -230,6 +239,8 @@ impl Gen {
             Self::Env(fragment) => fragment.render(present),
             Self::Source(fragment) => super::env::source_line(fragment),
             Self::Interactive(file) => file.render(present),
+            Self::Bash(file) => file.render(present),
+            Self::Inputrc(keybindings) => crate::shell::bash::render_inputrc(keybindings),
         }
     }
 
@@ -241,7 +252,7 @@ impl Gen {
     pub fn note(&self) -> Option<String> {
         match self {
             Self::Interactive(file) => file.note(),
-            Self::Env(_) | Self::Source(_) => None,
+            Self::Env(_) | Self::Source(_) | Self::Bash(_) | Self::Inputrc(_) => None,
         }
     }
 }

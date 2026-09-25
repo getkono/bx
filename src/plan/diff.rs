@@ -54,6 +54,18 @@ pub enum DiffKind {
         /// The text of the link bx would leave.
         to: Option<String>,
     },
+    /// A declared git external's checkout: the commit on disk, `None` where
+    /// there is no checkout yet, and the commit bx would leave checked out
+    /// from `url`. A checkout's files are git's to show, so the commit is the
+    /// whole of what changes.
+    Checkout {
+        /// The commit checked out now.
+        from: Option<String>,
+        /// The commit bx would check out.
+        to: String,
+        /// Where it comes from.
+        url: String,
+    },
     /// The content differs and is not shown line by line.
     Summary {
         /// How many bytes are on disk, or `None` when there is no file.
@@ -96,6 +108,19 @@ impl Diff {
             kind: DiffKind::Link {
                 from: from.map(text),
                 to: to.map(text),
+            },
+        }
+    }
+
+    /// The diff of a git external's checkout: the commit on disk, `None` where
+    /// there is none, and the commit bx would check out from `url`.
+    #[must_use]
+    pub(super) fn checkout(from: Option<&str>, to: &str, url: &str) -> Self {
+        Self {
+            kind: DiffKind::Checkout {
+                from: from.map(str::to_string),
+                to: to.to_string(),
+                url: url.to_string(),
             },
         }
     }
@@ -430,6 +455,16 @@ fn row(out: &mut String, change: &Change, palette: Palette, home: &Path) {
                 }
             }
         }
+        // One line per side, escaped: the url is configuration text and the
+        // commit on disk is what git printed.
+        DiffKind::Checkout { from, to, url } => {
+            if let Some(from) = from {
+                let line = format!("- commit {}", escape(from));
+                let _ = writeln!(out, "{DIFF_INDENT}{}", palette.paint(REMOVED, &line));
+            }
+            let line = format!("+ commit {} from {}", escape(to), escape(url));
+            let _ = writeln!(out, "{DIFF_INDENT}{}", palette.paint(ADDED, &line));
+        }
         DiffKind::Summary { before, after, why } => {
             let before = before.map_or_else(|| "no file".to_string(), |len| format!("{len} bytes"));
             let why = match why {
@@ -689,6 +724,30 @@ mod tests {
         assert!(rendered.contains("  ~ ~/.a  (~/.config/bx/bx.toml:1)\n    mode 0644 -> 0600\n"));
         assert!(rendered.contains("    binary content: no file -> 2 bytes\n"));
         assert!(rendered.contains("    too large to show: 4 bytes -> 262145 bytes\n"));
+    }
+
+    #[test]
+    fn a_checkout_renders_the_commit_on_each_side_and_its_url_escaped() {
+        let mut advance = change("~/.zsh/a", 1, Action::Modify);
+        advance.diff = Some(Diff::checkout(Some("aaa"), "bbb", "https://h/o/a"));
+        let mut clone = change("~/.zsh/b", 2, Action::Create);
+        clone.diff = Some(Diff::checkout(None, "ccc", "https://h/o/\x1b[2Jb"));
+        let report = Report {
+            changes: vec![advance, clone],
+            ..Report::default()
+        };
+
+        let rendered = render(&report, View::Plan, Palette::PLAIN, Path::new(HOME));
+
+        assert!(
+            rendered.contains("    - commit aaa\n    + commit bbb from https://h/o/a\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  + ~/.zsh/b  (~/.config/bx/bx.toml:2)\n    + commit ccc from "),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\x1b'), "{rendered:?}");
     }
 
     #[test]

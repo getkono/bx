@@ -19,6 +19,7 @@
 mod decide;
 mod diff;
 mod execute;
+pub(crate) mod external;
 mod region;
 
 use std::ffi::{OsStr, OsString};
@@ -37,7 +38,8 @@ use crate::journal::{self, Session, SessionKind};
 use crate::paths;
 use crate::recover::{self, Interrupted};
 use crate::report::{Action, Exit};
-use crate::state::{self, LedgerView, Mechanism, SharedLock, StateDir};
+use crate::state::{self, ExclusiveLock, LedgerView, Mechanism, SharedLock, StateDir};
+use crate::sync::Git;
 
 /// Which half of the traversal is running.
 ///
@@ -125,6 +127,10 @@ pub struct Inputs {
     resolved: Resolved,
     roots: RootSet,
     progress: bool,
+    /// The `git` a declared external is looked at and moved with: the user's
+    /// own, seeing the home and config home this run resolved, and unable to
+    /// ask anything.
+    git: Git,
 }
 
 impl Inputs {
@@ -155,7 +161,15 @@ impl Inputs {
             resolved,
             roots,
             progress: env.stderr_tty,
+            git: Git::new(env).unattended(),
         })
+    }
+
+    /// The same inputs, looking at externals through `git`.
+    #[cfg(test)]
+    pub(crate) fn with_git(mut self, git: Git) -> Self {
+        self.git = git;
+        self
     }
 
     /// The resolved configuration.
@@ -227,6 +241,12 @@ pub struct Report {
     /// What recovery did, when an `apply` found an interrupted session, was
     /// approved, recovered it, and stopped there.
     pub recovered: Option<recover::Outcome>,
+    /// The rows an executed `apply` stopped short of, by index into
+    /// [`Report::changes`], in order. Each such row has been turned
+    /// [`Action::Blocked`] with the reason as its note. Only a declared
+    /// external can stop: its fetch can fail, and only the fetch shows whether
+    /// its `rev` is a fast-forward.
+    pub stopped: Vec<usize>,
 }
 
 impl Report {
@@ -435,23 +455,58 @@ pub fn run(
     let decided = decide::decide_all(&targets, &ctx)?;
     report.changes = decided.changes;
     let ops = decided.ops;
+    // Every declared external after every target, in configuration order.
+    let (rows, clones) = external::decide_all(
+        &inputs.resolved.externals,
+        &external::Ctx {
+            ledger: &ledger,
+            home: &inputs.home,
+            git: &inputs.git,
+        },
+    )?;
+    let first_external = report.changes.len();
+    report.changes.extend(rows);
 
     match mode {
         Mode::Plan => Ok(report),
         Mode::Apply => {
-            if ops.is_empty() || !approve(&report)? {
+            if (ops.is_empty() && clones.is_empty()) || !approve(&report)? {
                 return Ok(report);
             }
-            let scope = ops.iter().map(|op| op.target().clone()).collect();
-            let mut session =
-                Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;
-            // Before the first write, so a file staged beneath a declared
-            // directory is held to the directory's declared mode.
-            for (dir, mode) in &decided.declared {
-                session.declare_dir(dir, *mode);
+            // Every target first, so a clone beneath a directory a target
+            // creates is made inside it rather than before it.
+            if !ops.is_empty() {
+                let scope = ops.iter().map(|op| op.target().clone()).collect();
+                let mut session =
+                    Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;
+                // Before the first write, so a file staged beneath a declared
+                // directory is held to the directory's declared mode.
+                for (dir, mode) in &decided.declared {
+                    session.declare_dir(dir, *mode);
+                }
+                let progress = execute::progress(ops.len(), inputs.progress);
+                execute::execute(ops, session, &progress)?;
             }
-            let progress = execute::progress(ops.len(), inputs.progress);
-            execute::execute(ops, session, &progress)?;
+            if !clones.is_empty() {
+                inputs.state.ensure()?;
+                let lock = ExclusiveLock::acquire(&inputs.state)?;
+                let progress = execute::progress(clones.len(), inputs.progress);
+                let stopped = external::execute(
+                    clones,
+                    &inputs.state,
+                    &inputs.home,
+                    &inputs.git,
+                    &lock,
+                    &progress,
+                )?;
+                for (at, note) in stopped {
+                    let at = first_external + at;
+                    report.changes[at].action = Action::Blocked;
+                    report.changes[at].diff = None;
+                    report.changes[at].note = Some(note);
+                    report.stopped.push(at);
+                }
+            }
             report.executed = true;
             Ok(report)
         }

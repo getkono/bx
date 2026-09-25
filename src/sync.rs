@@ -211,6 +211,47 @@ impl Git {
         }
     }
 
+    /// `git` on `PATH`, seeing `home` and git's own default for the config
+    /// home.
+    ///
+    /// For a caller that has the home and not the whole [`Env`]: `bx rm`'s
+    /// checks on a checkout, which read only that repository.
+    #[must_use]
+    pub fn at_home(home: &Path) -> Self {
+        Self {
+            program: OsString::from("git"),
+            home: home.to_path_buf(),
+            xdg_config_home: None,
+            extra: Vec::new(),
+        }
+    }
+
+    /// The same `git`, unable to ask anybody anything.
+    ///
+    /// A declared external is cloned and fetched with nobody necessarily at
+    /// the terminal, so a missing credential has to fail rather than wait.
+    /// Every child runs with its standard input closed, and:
+    ///
+    /// * `GIT_TERMINAL_PROMPT=0`, so git never asks on the terminal;
+    /// * `GIT_ASKPASS` and `SSH_ASKPASS` set to `false`, and
+    ///   `SSH_ASKPASS_REQUIRE=force`, so any question git or ssh would put —
+    ///   a user name, a password, a key's passphrase, an unknown host key —
+    ///   goes to a program that answers nothing and fails;
+    /// * `GCM_INTERACTIVE=never`, so Git Credential Manager does not open a
+    ///   window.
+    ///
+    /// A credential helper that answers without asking, an ssh agent, and the
+    /// user's own ssh and git configuration all still work: nothing here
+    /// replaces a program or a setting, it only takes the prompts away.
+    #[must_use]
+    pub fn unattended(self) -> Self {
+        self.with_env("GIT_TERMINAL_PROMPT", "0")
+            .with_env("GIT_ASKPASS", "false")
+            .with_env("SSH_ASKPASS", "false")
+            .with_env("SSH_ASKPASS_REQUIRE", "force")
+            .with_env("GCM_INTERACTIVE", "never")
+    }
+
     /// Set `name` to `value` in every child as well.
     #[must_use]
     pub fn with_env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
@@ -266,8 +307,9 @@ impl Git {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// A read-only question.
-    fn query(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
+    /// Run `git args` in `repo` with its standard input closed: a read-only
+    /// question, or any command that must not ask one.
+    pub(crate) fn query(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         self.output(repo, &args, Stdio::null())
     }
@@ -997,6 +1039,50 @@ pub(crate) mod tests {
                 "{name} is not removed"
             );
         }
+    }
+
+    #[test]
+    fn an_unattended_git_takes_every_prompt_away_and_closes_stdin() {
+        let home = guarded_home();
+        let command = git(home.path())
+            .unattended()
+            .command(home.path(), &[OsStr::new("status")]);
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for (name, value) in [
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_ASKPASS", "false"),
+            ("SSH_ASKPASS", "false"),
+            ("SSH_ASKPASS_REQUIRE", "force"),
+            ("GCM_INTERACTIVE", "never"),
+        ] {
+            assert!(
+                envs.contains(&(name.to_string(), Some(value.to_string()))),
+                "{name}: {envs:?}"
+            );
+        }
+        // And with no helper to answer, asking git for a credential fails
+        // rather than waits.
+        let asked = git(home.path())
+            .unattended()
+            .query(home.path(), &["credential", "fill"]);
+        assert!(asked.is_err(), "{asked:?}");
+    }
+
+    #[test]
+    fn a_git_at_a_home_sees_that_home_and_no_config_home() {
+        let home = guarded_home();
+        let command = Git::at_home(home.path()).command(home.path(), &[]);
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("HOME"), Some(home.path().as_os_str()))));
+        assert!(envs.contains(&(OsStr::new("XDG_CONFIG_HOME"), None)));
     }
 
     #[test]

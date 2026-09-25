@@ -171,6 +171,9 @@ pub struct Context {
     layers: Vec<Layer>,
     resolved: Resolved,
     roots: RootSet,
+    /// The `git` `rm` asks whether a checkout bx cloned holds anything of
+    /// the user's.
+    git: crate::sync::Git,
     trees: Vec<TreeDecl>,
 }
 
@@ -245,6 +248,7 @@ impl Context {
             layers,
             resolved,
             roots,
+            git: crate::sync::Git::new(env),
             trees,
         })
     }
@@ -1198,7 +1202,7 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
     let restored = if targets.is_empty() {
         Vec::new()
     } else {
-        restore::restore(&ctx.state, &ctx.home, &targets)?
+        restore::restore_with(&ctx.state, &ctx.home, &targets, &ctx.git)?
     };
 
     let conflicts: BTreeSet<&Portable> = restored
@@ -1270,7 +1274,7 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
 ///   the tree's own path instead.
 /// - Asked about the tree's path or above it, `rm` releases the tree only when
 ///   restoring none of its files would be a conflict, as
-///   [`restore::plan_restore`] reads them now. When one would, every file of
+///   [`restore::plan_restore_with`] reads them now. When one would, every file of
 ///   the tree stays as it is, and so does its declaration.
 ///
 /// A file the tree no longer declares — removed from the repo since bx wrote
@@ -1300,7 +1304,7 @@ fn hold_trees(
                     continue;
                 };
                 if let restore::Restoration::Conflict { note, .. } =
-                    restore::plan_restore(entry, &ctx.home)?
+                    restore::plan_restore_with(entry, &ctx.home, &ctx.git)?
                 {
                     own.push((file.clone(), note));
                 }

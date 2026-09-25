@@ -1158,13 +1158,14 @@ fn ownership(
 }
 
 /// How a ledger mechanism reads in a note.
-const fn attached_as(mechanism: &Mechanism) -> &'static str {
+pub(super) const fn attached_as(mechanism: &Mechanism) -> &'static str {
     match mechanism {
         Mechanism::Own => "the whole file",
         Mechanism::Region { .. } => "a managed region",
         Mechanism::Include { .. } => "an include line",
         Mechanism::Dir => "a directory",
         Mechanism::Link => "a symlink",
+        Mechanism::Clone => "a git checkout",
     }
 }
 
@@ -2348,6 +2349,7 @@ mod tests {
             }),
             "an include line"
         );
+        assert_eq!(attached_as(&Mechanism::Clone), "a git checkout");
     }
 
     mod env_placement {

@@ -3642,11 +3642,13 @@ pub(crate) mod tests {
             let report = plan(&inputs);
             assert_eq!(report.actions(), vec![Action::Unchanged, Action::Conflict]);
             let note = report.changes[1].note.as_deref().expect("a note");
-            assert!(
-                note.starts_with("edited since bx last wrote it; "),
-                "{note}"
+            // `bx rm` refuses to restore over an edit, so the note does not
+            // promise that it releases the file.
+            assert_eq!(
+                note,
+                "edited since bx last wrote it; the configuration no longer declares it, so bx \
+                 leaves it as it is, and `bx rm ~/.a` will not restore over the change"
             );
-            assert!(note.contains("`bx rm ~/.a`"), "{note}");
             assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
 
             assert!(!apply(&inputs).executed);

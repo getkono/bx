@@ -3035,6 +3035,98 @@ mod tests {
         }
 
         #[test]
+        fn a_declared_source_arrives_guarded_in_its_phase_whether_or_not_its_file_exists() {
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            let layer = "[[value]]\nname = \"host\"\nkind = \"string\"\n\n\
+                         [[source]]\nname = \"keychain\"\npath = \"~/.keychain/{{host}}-sh\"\n\
+                         phase = \"activations\"\n\
+                         [[source]]\nname = \"fzf\"\npath = \"~/.fzf.zsh\"\n\
+                         [[source]]\nname = \"off\"\npath = \"~/off\"\nenabled = false\n";
+            let settle = "\n# bx: done, whichever plugins were found\ntrue\n";
+
+            // Sources alone place the file and its region. The one waiting on
+            // `host` is held back and named in the file's row; the other is
+            // written as its guarded line, and the file settles to 0.
+            let first = apply(&home, layer);
+            assert_eq!(
+                rows(&first),
+                vec![
+                    ("~/.local/share/bx/zshrc.zsh", Action::Create),
+                    ("~/.zshrc", Action::Modify),
+                ]
+            );
+            let note = row(&first, "~/.local/share/bx/zshrc.zsh")
+                .note
+                .as_deref()
+                .expect("a note naming the held-back source");
+            assert!(note.contains("source `keychain` held back: "), "{note}");
+            assert!(note.contains("bx init"), "{note}");
+            assert_eq!(
+                read(&home, ".local/share/bx/zshrc.zsh"),
+                format!(
+                    "{}\n# bx phase: plugins\n[[ -r ~/.fzf.zsh ]] && source ~/.fzf.zsh\n{settle}",
+                    interactive("")
+                )
+            );
+
+            // The file's presence is never an input: creating it changes no
+            // plan, and nothing bx wrote reads it.
+            home.write(".fzf.zsh", "print -r -- fzf\n");
+            let present = plan(&home, layer);
+            assert!(
+                present
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&present)
+            );
+
+            // Answering the value is a change the next plan shows, and the
+            // source arrives substituted, in the phase it names.
+            home.write(".local/state/bx/local.toml", "[values]\nhost = \"box-1\"\n");
+            let answered = plan(&home, layer);
+            let file = row(&answered, "~/.local/share/bx/zshrc.zsh");
+            assert_eq!(file.action, Action::Modify);
+            assert_eq!(file.note, None, "nothing is held back");
+            apply(&home, layer);
+            assert_eq!(
+                read(&home, ".local/share/bx/zshrc.zsh"),
+                format!(
+                    "{}\n# bx phase: activations\n\
+                     [[ -r ~/.keychain/box-1-sh ]] && source ~/.keychain/box-1-sh\n\
+                     \n# bx phase: plugins\n[[ -r ~/.fzf.zsh ]] && source ~/.fzf.zsh\n{settle}",
+                    interactive("")
+                )
+            );
+            let settled = plan(&home, layer);
+            assert!(
+                settled
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&settled)
+            );
+
+            // Reversible: `rm` puts back the bytes each file held before bx.
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
+                .iter()
+                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+                .collect();
+            crate::restore::restore(&state, home.path(), &targets).expect("rm");
+            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
+            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+            assert_eq!(
+                read(&home, ".fzf.zsh"),
+                "print -r -- fzf\n",
+                "never touched"
+            );
+        }
+
+        #[test]
         fn each_kind_lands_only_in_its_native_files_and_a_second_plan_is_empty() {
             let home = guarded_home();
             home.write(".zshrc", "alias ll='ls -l'\n");

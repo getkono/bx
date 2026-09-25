@@ -66,7 +66,11 @@
 //! even when a parent exported them, and `setopt` lines. The history
 //! file is judged by the plan against bx's own directories, and that module's
 //! tests run the phase in zsh to establish that those three are the only
-//! parameters it changes and that it exports nothing.
+//! parameters it changes and that it exports nothing. A declared optional
+//! source [`source`] renders is the same guarded line a plugin is, in
+//! whichever phase between `activations` and `options` it names — never
+//! `env`, `path`, `completion` or the terminal slot — and its tests hold it to
+//! a test and a `source` word for word.
 //!
 //! A tool's activation output assigns variables of its own — `MISE_SHELL`,
 //! `STARSHIP_SHELL`, a function's locals, ZLE's `BUFFER` — and none of those
@@ -94,6 +98,7 @@ pub mod activation;
 pub mod alias;
 pub mod function;
 pub mod plugin;
+pub mod source;
 
 /// Running generated shell text in a real shell, for the submodules' tests.
 #[cfg(test)]

@@ -47,6 +47,8 @@ you integrate is your choice, so any threshold here would be arbitrary.
   activates each tool for both.
 - **Primed.** Each fixture runs once before timing so `compinit`'s dump exists,
   and hyperfine warms up further before recording.
+- **Medians.** Each fixture's time is the median of its runs, so a start the
+  scheduler happened to delay does not move the number the gate reads.
 
 The example's external and secret are switched off in the bench's
 `local.toml`: one would clone over the network and the other needs a key, and

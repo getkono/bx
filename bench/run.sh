@@ -154,16 +154,19 @@ results, budget, spawns = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
 labels = {"overhead": ["baseline", "bx"], "net": ["legacy", "bx"]}
 
 
-def means(name):
+def medians(name):
     with open(f"{results}/{name}.json") as fh:
         data = json.load(fh)["results"]
     # The -n labels are not echoed back in the JSON, so pair by position: the
-    # results are in the order the commands were given.
-    return {label: r["mean"] * 1000 for label, r in zip(labels[name], data)}
+    # results are in the order the commands were given. The median, not the
+    # mean: a start the scheduler delayed moves the mean by its whole delay
+    # and the median not at all, and the gate is about bx, not about the
+    # machine's other load.
+    return {label: r["median"] * 1000 for label, r in zip(labels[name], data)}
 
 
-over = means("overhead")
-net = means("net")
+over = medians("overhead")
+net = medians("net")
 overhead = over["bx"] - over["baseline"]
 saved = net["legacy"] - net["bx"]
 

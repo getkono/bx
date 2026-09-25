@@ -448,11 +448,13 @@ fn fragment_target(place: Place, path: Portable, generator: Gen, origin: &Origin
 /// A place `placed` already names — ready, or held back under the fragment's
 /// path — is left to it. Each vacated fragment is attributed to `ledger`, the
 /// record that put it in the plan. bash's generated file and `~/.inputrc`
-/// follow, vacated the same way ([`crate::shell::bash::vacated`]).
+/// follow, vacated the same way ([`crate::shell::bash::vacated`]), but only
+/// where `generated` says their own generator wrote them.
 #[must_use]
 pub fn vacated_fragments(
     placed: &[Resolution<Target>],
     recorded: impl Fn(&Portable) -> bool,
+    generated: impl Fn(&Portable, &str) -> bool,
     home: &Path,
     ledger: &Path,
 ) -> Vec<Resolution<Target>> {
@@ -460,7 +462,7 @@ pub fn vacated_fragments(
         file: ledger.to_path_buf(),
         line: 0,
     };
-    let bash = crate::shell::bash::vacated(placed, &recorded, home, &origin);
+    let bash = crate::shell::bash::vacated(placed, &generated, home, &origin);
     Place::ALL
         .into_iter()
         .filter_map(|place| {
@@ -1977,7 +1979,7 @@ mod tests {
     #[test]
     fn a_recorded_interactive_file_nothing_places_is_planned_empty() {
         let ledger = Path::new("/var/home/example/.local/state/bx/ledger");
-        let every = vacated_fragments(&[], |_| true, &home(), ledger);
+        let every = vacated_fragments(&[], |_| true, |_, _| true, &home(), ledger);
         let Some(Resolution::Ready(file)) = every.iter().find(|resolution| {
             matches!(resolution, Resolution::Ready(target)
                 if target.path.as_str() == "~/.local/share/bx/zshrc.zsh")
@@ -2011,7 +2013,7 @@ mod tests {
         // Only zsh's fragments are recorded: bash's files are
         // `shell::bash::vacated`'s to test.
         let zsh = |path: &Portable| path.as_str().ends_with(".zsh");
-        let every = vacated_fragments(&placed.targets, zsh, &home(), ledger);
+        let every = vacated_fragments(&placed.targets, zsh, |_, _| false, &home(), ledger);
         let paths: Vec<String> = every
             .iter()
             .map(|resolution| match resolution {
@@ -2038,7 +2040,9 @@ mod tests {
             ]
         );
         // Nothing bx has not written is planned.
-        assert!(vacated_fragments(&placed.targets, |_| false, &home(), ledger).is_empty());
+        assert!(
+            vacated_fragments(&placed.targets, |_| false, |_, _| false, &home(), ledger).is_empty()
+        );
     }
 
     #[test]

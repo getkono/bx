@@ -45,7 +45,7 @@
 //! # When a declaration goes away
 //!
 //! [`vacated`] plans the file and `~/.inputrc` with nothing declared in them
-//! once nothing places either but bx wrote it before, as
+//! once nothing places either but bx's generator for it wrote it before, as
 //! [`crate::config::resolve::vacated_fragments`] does for zsh's fragments; the
 //! region is left sourcing a file that sets nothing, and `bx rm` restores
 //! each file from the ledger.
@@ -224,31 +224,42 @@ pub fn place(merged: &Config, home: &Path) -> Result<Vec<Resolution<Target>>, Er
 }
 
 /// [`FILE`] and [`INPUTRC`] with nothing declared in them, for each one
-/// `placed` does not name but `recorded` says bx wrote as a file it owns
-/// whole, attributed to `origin`.
+/// `placed` does not name but `generated` says bx wrote with the generator
+/// that makes it, attributed to `origin`.
 ///
 /// Without it, removing every alias would leave them defined in every bash
 /// that starts, and unbinding every key would leave the keys bound, with no
 /// plan row saying so.
+///
+/// `generated(path, header)` answers whether bx wrote `path` as a file it
+/// owns whole and the bytes there open with `header`, the line that file's
+/// generator writes first. Owning the file whole is not enough: a
+/// `[[target]]` the user once declared at `~/.inputrc` is owned whole too,
+/// and once dropped it is left alone as every dropped target is, never
+/// rewritten to an inputrc with no bindings in it.
 #[must_use]
 pub fn vacated(
     placed: &[Resolution<Target>],
-    recorded: &dyn Fn(&Portable) -> bool,
+    generated: &dyn Fn(&Portable, &str) -> bool,
     home: &Path,
     origin: &Origin,
 ) -> Vec<Resolution<Target>> {
     [
-        (FILE, Gen::Bash(Box::default())),
-        (INPUTRC, Gen::Inputrc(Keybindings::default())),
+        (FILE, super::HEADER, Gen::Bash(Box::default())),
+        (
+            INPUTRC,
+            INPUTRC_HEADER,
+            Gen::Inputrc(Keybindings::default()),
+        ),
     ]
     .into_iter()
-    .filter_map(|(raw, generator)| {
+    .filter_map(|(raw, header, generator)| {
         let path = Portable::parse_in(raw, home).ok()?;
         let named = placed.iter().any(|resolution| match resolution {
             Resolution::Ready(target) => target.path == path,
             Resolution::Blocked(entry) => entry.key == path.to_string(),
         });
-        (!named && recorded(&path))
+        (!named && generated(&path, header))
             .then(|| Resolution::Ready(target(path, generator, Attach::Own, origin)))
     })
     .collect()
@@ -470,7 +481,7 @@ mod tests {
             file: PathBuf::from("/state/ledger"),
             line: 0,
         };
-        let every = vacated(&[], &|_| true, home, &origin);
+        let every = vacated(&[], &|_, _| true, home, &origin);
         assert_eq!(
             described(&every),
             vec![
@@ -487,9 +498,31 @@ mod tests {
             ]
         );
         // Never one bx did not write, and never one still placed.
-        assert!(vacated(&[], &|_| false, home, &origin).is_empty());
+        assert!(vacated(&[], &|_, _| false, home, &origin).is_empty());
         let placed = place(&load(SOURCE), home).expect("places");
-        assert!(vacated(&placed, &|_| true, home, &origin).is_empty());
+        assert!(vacated(&placed, &|_, _| true, home, &origin).is_empty());
+        // Each file is asked after with its own generator's header, so one
+        // bx owns whole but some other declaration wrote is left alone.
+        let inputrc_only = |path: &Portable, header: &str| {
+            path.as_str() == INPUTRC && render_inputrc(&Keybindings::default()).starts_with(header)
+        };
+        assert_eq!(
+            described(&vacated(&[], &inputrc_only, home, &origin))
+                .into_iter()
+                .map(|(path, _, _)| path)
+                .collect::<Vec<_>>(),
+            vec![INPUTRC.to_string()]
+        );
+        let bash_only = |path: &Portable, header: &str| {
+            path.as_str() == FILE && Bash::default().render(&|_| true).starts_with(header)
+        };
+        assert_eq!(
+            described(&vacated(&[], &bash_only, home, &origin))
+                .into_iter()
+                .map(|(path, _, _)| path)
+                .collect::<Vec<_>>(),
+            vec![FILE.to_string()]
+        );
     }
 
     #[test]

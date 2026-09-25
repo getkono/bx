@@ -3080,6 +3080,34 @@ mod tests {
         }
 
         #[test]
+        fn an_inputrc_a_dropped_target_wrote_is_left_alone() {
+            // PR #102 note D1: the ledger records a `[[target]]`'s file as
+            // owned whole, as it does the inputrc bx generates, so dropping
+            // the target planned `~/.inputrc` rewritten with no bindings.
+            let bindings = "set editing-mode vi\n";
+            let target =
+                "[[target]]\npath = \"~/.inputrc\"\ncontent = \"set editing-mode vi\\n\"\n";
+            let home = guarded_home();
+            assert_eq!(
+                row(&apply(&home, target), "~/.inputrc").action,
+                Action::Create
+            );
+            assert_eq!(read(&home, ".inputrc"), bindings);
+
+            let dropped = plan(&home, "");
+            assert!(
+                dropped
+                    .changes
+                    .iter()
+                    .all(|change| change.target != "~/.inputrc"),
+                "{:?}",
+                rows(&dropped)
+            );
+            assert!(!apply(&home, "").executed);
+            assert_eq!(read(&home, ".inputrc"), bindings);
+        }
+
+        #[test]
         fn an_inputrc_bx_did_not_write_is_a_conflict_left_as_it_is() {
             let home = guarded_home();
             home.write(".inputrc", "set bell-style none\n");

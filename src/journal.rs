@@ -428,7 +428,9 @@ pub struct Intent {
     pub target: Portable,
     /// The destination, rendered absolute, so recovery needs no configuration.
     pub dest: PathBuf,
-    /// The staging path [`crate::fs::stage`] chose, or `None` for a removal.
+    /// The staging path [`crate::fs::temp_beside`] chose before the write
+    /// staged anything, or `None` for a removal. It may not exist: a session
+    /// stopped between this Intent and the stage never made it.
     ///
     /// Recorded rather than recomputed: recovery unlinks the one path the
     /// journal names and can therefore never remove a file bx cannot prove it
@@ -441,8 +443,9 @@ pub struct Intent {
     pub before: Prior,
     /// What the write leaves there.
     pub after: Written,
-    /// Parent directories this write invented, deepest first — the order a
-    /// reversal removes them in.
+    /// Parent directories this write invents, deepest first — the order a
+    /// reversal removes them in. Named before they are made, so one may not
+    /// exist yet; a reversal removes each only where it stands empty.
     pub created_dirs: Vec<PathBuf>,
     /// How bx attached to the target, or `None` when the session is *releasing*
     /// it: the restore half of `bx rm` leaves nothing for bx to own.

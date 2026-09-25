@@ -1706,10 +1706,10 @@ impl Session {
     /// A removal's `created_dirs` are what it prunes and what its Intent
     /// records, so each must be a strict parent of the destination below the
     /// home — the loader's rule — or the removal is [`Error::StrayCreatedDir`],
-    /// before anything is observed, stored or touched. A **write's** claims do
-    /// not exist yet: [`crate::fs::stage`] invents them. They go through the
-    /// same rule in [`Session::write`], at the first point they exist and
-    /// still before the Intent that records them, and one that fails it is
+    /// before anything is observed, stored or touched. A **write's** claims are
+    /// not declared: [`crate::fs::stage_as`] invents them. They go through the
+    /// same rule in [`Session::write`], when it reads them from disk before the
+    /// Intent that records them, and one that fails it is
     /// dropped from the claim rather than refused — so neither entry point can
     /// write a `created_dirs` the loader refuses, and no account is refused a
     /// write for a directory bx had to make to reach the destination.
@@ -1755,11 +1755,24 @@ impl Session {
         }
     }
 
-    /// The write path: stage, fill, record, journal, publish, done.
+    /// The write path: record, journal, stage, fill, publish, done.
     ///
     /// Staged against `planned`, the observation plan compared, and with the
     /// session's one set of created directories, so every later write in the
     /// session knows a directory an earlier one made.
+    ///
+    /// The Intent is durable **before** `fs::stage` makes anything: it names
+    /// the temporary file by a name [`fs::temp_beside`] chose, and the
+    /// parents `stage` will invent, read from disk the way a directory
+    /// target's Intent reads them. Journalled after `stage`, a crash or a
+    /// refusal anywhere in between — the fill, which writes the whole content
+    /// and is where a file-size limit or a full disk lands, or the Intent's
+    /// own append — left the temporary file and those directories recorded
+    /// nowhere, and the rollback could neither remove the one nor prune the
+    /// other (#119). Journalled first, the destination is still `before`
+    /// until the publish, and the rollback removes the temporary file and
+    /// prunes each directory that stands empty, exactly as it does for a
+    /// refused publish; one that was never made is already gone.
     ///
     /// A directory this write invents that the loader would refuse — the home,
     /// or above it — is made and left unclaimed, by the Intent and by the
@@ -1816,19 +1829,24 @@ impl Session {
         // exists at `0755` for an instant — a window a descriptor opened
         // inside would outlive. See `r3 round 6` decision R3R6-1.
         self.make_shared_ancestors(&dest)?;
-        let staged = fs::stage(&dest, mode, planned, &mut self.created)?;
-        let temp = staged.temp_path().to_path_buf();
-        self.crash.reached(index, Phase::AfterStage);
+        // Every refusal `stage` would make, made now, so a write that could
+        // not begin is refused with nothing announced. The observation is the
+        // prior the Intent stores: `stage_as` looks again and refuses unless
+        // it is the same file with the same stamp.
+        let observed = fs::refuse_stage(&dest, planned, &self.created)?;
+        // Named before anything is made, so the Intent can name it: see the
+        // method's documentation.
+        let temp = fs::temp_beside(&dest)?;
 
-        let filled = staged.fill(bytes)?;
-        self.crash.reached(index, Phase::AfterFill);
-
-        // What this write may *claim* of what it made. `refusal` puts an
-        // Intent's `created_dirs` through `stray_created_dir` exactly as it
-        // does a removal's, and one entry that fails makes the whole journal
-        // unreadable — so a session that announced one could never be rolled
-        // back. `admit` cannot make this check: a write's claims do not exist
-        // until `fs::stage` has made the parents.
+        // What this write will *claim* of what it makes: the parents
+        // `fs::stage` will invent, read before it invents them, as a
+        // directory target's Intent reads them before `fs::ensure_dir` runs.
+        // `stage` must then make exactly these, or the write is refused
+        // below. `refusal` puts an Intent's `created_dirs` through
+        // `stray_created_dir` exactly as it does a removal's, and one entry
+        // that fails makes the whole journal unreadable — so a session that
+        // announced one could never be rolled back. `admit` cannot make this
+        // check: a write's claims are not declared up front.
         //
         // The one rule a made directory can break here is being the home or
         // above it, which happens when the home does not exist and the state
@@ -1854,8 +1872,9 @@ impl Session {
         // only place the property is checked rather than argued"; that was a
         // true statement about the code and a false one about the tests, which
         // constrained it nowhere until the seam above existed (`r3 round 7`,
-        // CL1).
-        let created_dirs = self.claimable(&dest, filled.created_dirs());
+        // CL1). `missing_parents` leaves the same directories out of what is
+        // read beforehand, and `claimable` drops them from what `stage` made.
+        let created_dirs = missing_parents(&dest, &self.home, &self.created);
         // Assembled now, while the writer still holds the prior, and handed to
         // the ledger only once the write has landed. `None` is the restore half
         // of `bx rm`: bx is handing the target back, so there is nothing left for
@@ -1875,7 +1894,17 @@ impl Session {
                     // receiver being evaluated before the argument — true of
                     // Rust, and not something this file should need a reader
                     // to know (`r3 round 7`, CL3).
-                    let entry = filled.new_entry(&self.home, mechanism.clone())?;
+                    //
+                    // Assembled from the observation rather than a staged
+                    // write, because none exists yet: the same fields
+                    // `fs::Filled::new_entry` fills in, from the same prior.
+                    let entry = NewEntry::new(
+                        target.clone(),
+                        ContentHash::of(bytes),
+                        mode,
+                        mechanism.clone(),
+                        observed.prior_bytes(),
+                    );
                     entry.with_created_dirs(portable_dirs(&created_dirs, &self.home)?)
                 }),
                 Some(mechanism.clone()),
@@ -1892,25 +1921,33 @@ impl Session {
         }
         // Durable before the Intent frame that names it, and therefore before
         // anything can displace it.
-        let before = store_prior(&self.state, filled.prior())?;
+        let before = store_prior(&self.state, &observed)?;
 
         let ledger_written = self.ledger.get(&target).map(|entry| entry.written);
         self.journal.append(&Record::Intent(Intent {
             target: target.clone(),
-            dest,
-            temp: Some(temp),
+            dest: dest.clone(),
+            temp: Some(temp.clone()),
             before,
             after: Written::Present {
-                digest: filled.written(),
-                mode: filled.mode(),
+                digest: ContentHash::of(bytes),
+                mode,
             },
-            created_dirs,
+            created_dirs: created_dirs.clone(),
             mechanism,
             ledger_written,
             dir: false,
             link: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
+
+        // Only now, with the temporary file and the directories named in a
+        // durable Intent: see the method's documentation.
+        let staged = fs::stage_as(&dest, &temp, mode, planned, &mut self.created)?;
+        self.crash.reached(index, Phase::AfterStage);
+        self.refuse_unannounced(&dest, &created_dirs, staged.created_dirs())?;
+        let filled = staged.fill(bytes)?;
+        self.crash.reached(index, Phase::AfterFill);
 
         #[cfg(test)]
         if let Some(meddle) = self.before_publish {
@@ -1970,6 +2007,39 @@ impl Session {
         created_dirs
     }
 
+    /// Refuse a staged write that claims other directories than its Intent
+    /// announced.
+    ///
+    /// The Intent names the parents a write will invent before `fs::stage`
+    /// invents them, read from disk; the two differ only when the disk
+    /// changed in between. Refused, the session is poisoned with the Intent
+    /// durable, and the rollback prunes what it names where it stands empty —
+    /// never a directory with anything in it. Carried on, the ledger entry
+    /// would claim a set the journal does not, which is the disagreement
+    /// between a rollback and an `rm` [`Session::write`] exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Write`] with [`crate::fs::Error::Changed`] naming `dest`.
+    fn refuse_unannounced(
+        &self,
+        dest: &Path,
+        announced: &[PathBuf],
+        made: &[PathBuf],
+    ) -> Result<(), Error> {
+        let claimed = self.claimable(dest, made);
+        if claimed == announced {
+            return Ok(());
+        }
+        Err(fs::Error::Changed {
+            path: dest.to_path_buf(),
+            detail: format!(
+                "bx meant to create {announced:?} on the way to it, and created {claimed:?}"
+            ),
+        }
+        .into())
+    }
+
     /// Tell the ledger about a write that has landed: record the entry, or,
     /// for a write that hands the target back, drop it.
     fn settle_entry(&mut self, target: &Portable, entry: Option<NewEntry>) -> Result<(), Error> {
@@ -1999,14 +2069,16 @@ impl Session {
         Ok(())
     }
 
-    /// The link path: stage, record, journal, publish, done — the file path
+    /// The link path: record, journal, stage, publish, done — the file path
     /// with a link in place of a file, and nothing to fill.
     ///
-    /// Staged against `planned` through [`crate::fs::stage_link`], which
+    /// Staged against `planned` through [`crate::fs::stage_link_as`], which
     /// refuses anything but nothing or a link, and a destination that changed
     /// since plan. The prior is a link's text, stored in `restore/` before the
     /// Intent that names it, and the Intent is marked [`Intent::link`], so a
-    /// rollback puts back a link rather than a file holding its text.
+    /// rollback puts back a link rather than a file holding its text. As in
+    /// `write`, the Intent names the temporary link and the directories made
+    /// for it before either exists.
     fn write_link(
         &mut self,
         target: Portable,
@@ -2016,25 +2088,23 @@ impl Session {
         ownership: &Ownership,
     ) -> Result<(), Error> {
         let index = self.written;
-        // As in `write`: plan's verdict before any directory is made.
+        // As in `write`: plan's verdict before any directory is made, and
+        // every refusal `stage_link` would make before anything is announced.
         refuse_unplanned(&dest, planned)?;
         self.make_shared_ancestors(&dest)?;
-        let staged = fs::stage_link(&dest, text, planned, &mut self.created)?;
-        let temp = staged.temp_path().to_path_buf();
-        self.crash.reached(index, Phase::AfterStage);
-        // A link is complete when it is made: there is no content to fill.
-        self.crash.reached(index, Phase::AfterFill);
-
-        let created_dirs = self.claimable(&dest, staged.created_dirs());
+        let observed = fs::refuse_stage_link(&dest, planned, &self.created)?;
+        let temp = fs::temp_beside(&dest)?;
+        let created_dirs = missing_parents(&dest, &self.home, &self.created);
+        let written = fs::link::digest(text);
         let (entry, mechanism) = match ownership {
             Ownership::Owned(mechanism) => (
                 Some(
                     NewEntry::new(
                         target.clone(),
-                        staged.written(),
+                        written,
                         Mode::LINK,
                         mechanism.clone(),
-                        link_prior_bytes(staged.prior()),
+                        link_prior_bytes(&observed),
                     )
                     .with_created_dirs(portable_dirs(&created_dirs, &self.home)?),
                 ),
@@ -2046,25 +2116,31 @@ impl Session {
         if let Some(entry) = &entry {
             self.ledger.check_record(entry)?;
         }
-        let before = store_link_prior(&self.state, staged.prior())?;
+        let before = store_link_prior(&self.state, &observed)?;
 
         let ledger_written = self.ledger.get(&target).map(|entry| entry.written);
         self.journal.append(&Record::Intent(Intent {
             target: target.clone(),
-            dest,
-            temp: Some(temp),
+            dest: dest.clone(),
+            temp: Some(temp.clone()),
             before,
             after: Written::Present {
-                digest: staged.written(),
+                digest: written,
                 mode: Mode::LINK,
             },
-            created_dirs,
+            created_dirs: created_dirs.clone(),
             mechanism,
             ledger_written,
             dir: false,
             link: true,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
+
+        let staged = fs::stage_link_as(&dest, &temp, text, planned, &mut self.created)?;
+        self.crash.reached(index, Phase::AfterStage);
+        self.refuse_unannounced(&dest, &created_dirs, staged.created_dirs())?;
+        // A link is complete when it is made: there is no content to fill.
+        self.crash.reached(index, Phase::AfterFill);
 
         #[cfg(test)]
         if let Some(meddle) = self.before_publish {
@@ -2436,19 +2512,20 @@ impl Session {
 /// test can stop at one.
 ///
 /// Six in `apply`, and each is a real durability boundary rather than a
-/// convenient line: before anything exists; after a temporary file exists at
-/// its final mode but holds nothing; after its content is `fsync`ed but the
-/// destination is untouched; after the intent is durable; after the destination
-/// is replaced; after the completion is durable. Two in `finish`, where every
+/// convenient line: before anything exists; after the intent is durable and
+/// before anything it names is made; after a temporary file exists at its
+/// final mode but holds nothing; after its content is `fsync`ed but the
+/// destination is untouched; after the destination is replaced; after the
+/// completion is durable. Two in `finish`, where every
 /// write has landed: after the `End` frame is durable and before the claimed
 /// directories are pruned, and after the ledger is saved. A `finish` boundary
 /// is reached with the number of writes as its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     BeforeStage,
+    AfterIntent,
     AfterStage,
     AfterFill,
-    AfterIntent,
     AfterPublish,
     AfterDone,
     AfterEnd,
@@ -2459,9 +2536,9 @@ enum Phase {
 #[cfg(test)]
 const PHASES: [Phase; 6] = [
     Phase::BeforeStage,
+    Phase::AfterIntent,
     Phase::AfterStage,
     Phase::AfterFill,
-    Phase::AfterIntent,
     Phase::AfterPublish,
     Phase::AfterDone,
 ];

@@ -33,8 +33,8 @@ pub mod mode;
 
 pub use atomic::{
     CreatedDirs, Desired, EnsuredDir, Error, Filled, Observed, Outcome, Parent, ParentState,
-    Staged, Stamp, TEMP_PREFIX, Unpublished, compare, compare_dir, ensure_dir, observe, set_mode,
-    stage, write_atomically,
+    Staged, Stamp, TEMP_PREFIX, Unpublished, compare, compare_dir, ensure_dir, observe,
+    refuse_stage, set_mode, stage, stage_as, temp_beside, write_atomically,
 };
-pub use link::{StagedLink, stage_link};
+pub use link::{StagedLink, refuse_stage_link, stage_link, stage_link_as};
 pub use mode::{Kind, Mode, ModeError};

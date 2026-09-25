@@ -77,10 +77,59 @@ pub fn stage_link(
     planned: &Observed,
     created: &mut CreatedDirs,
 ) -> Result<StagedLink, Error> {
+    stage_link_in(dest, None, text, planned, created)
+}
+
+/// [`stage_link`], with the temporary link at `temp`, a name
+/// [`crate::fs::temp_beside`] chose for `dest` before anything was made — as
+/// [`crate::fs::stage_as`] is to [`crate::fs::stage`].
+///
+/// # Errors
+///
+/// What [`stage_link`] returns, and [`Error::Write`] when `temp` is not a
+/// [`TEMP_PREFIX`] name beside `dest` or something is already there.
+pub fn stage_link_as(
+    dest: &Path,
+    temp: &Path,
+    text: &Path,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+) -> Result<StagedLink, Error> {
+    stage_link_in(dest, Some(temp), text, planned, created)
+}
+
+/// Every refusal [`stage_link`] makes before it creates anything, made
+/// without creating anything, and the fresh observation it made them against
+/// — as [`crate::fs::refuse_stage`] is to [`crate::fs::stage`].
+///
+/// # Errors
+///
+/// What [`stage_link`] documents, but for making the parents and the link.
+pub fn refuse_stage_link(
+    dest: &Path,
+    planned: &Observed,
+    created: &CreatedDirs,
+) -> Result<Observed, Error> {
+    atomic::refuse_to_prepare(dest, planned, created, refuse_unlinkable).map(|(_, prior)| prior)
+}
+
+/// [`stage_link`] and [`stage_link_as`].
+fn stage_link_in(
+    dest: &Path,
+    temp: Option<&Path>,
+    text: &Path,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+) -> Result<StagedLink, Error> {
     let (dest, prior, created_dirs) = atomic::prepare(dest, planned, created, refuse_unlinkable)?;
     let dir = atomic::parent_of(&dest)?;
-    let temp = tempfile::Builder::new()
-        .prefix(TEMP_PREFIX)
+    let mut builder = tempfile::Builder::new();
+    match temp {
+        // Exactly this name: `symlink` fails on one that is taken.
+        Some(temp) => builder.prefix(atomic::temp_name(dir, temp)?).rand_bytes(0),
+        None => builder.prefix(TEMP_PREFIX),
+    };
+    let temp = builder
         .make_in(dir, |path| std::os::unix::fs::symlink(text, path))
         .map_err(|source| Error::Write {
             path: dir.to_path_buf(),

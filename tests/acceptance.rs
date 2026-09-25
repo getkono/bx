@@ -345,41 +345,6 @@ impl Snapshot {
         Self(entries)
     }
 
-    /// The snapshot without bx's `.bx-` temporary files, and the paths of
-    /// those it left out: an orphan an interrupted write leaves, which
-    /// `bx doctor` names and nothing but a human removes.
-    ///
-    /// Also without each directory that holds nothing but such a file: the
-    /// directories staged for a write killed before its intent was journalled,
-    /// which recovery cannot see either. A workaround for #119: once it lands,
-    /// drop this second half, so the rollback is held to removing them.
-    fn without_orphans(self) -> (Self, Vec<PathBuf>) {
-        let (orphans, mut kept): (BTreeMap<_, _>, BTreeMap<_, _>) =
-            self.0.into_iter().partition(|(path, _)| {
-                path.file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(".bx-"))
-            });
-        let mut staged: Vec<PathBuf> = orphans
-            .keys()
-            .flat_map(|orphan| orphan.ancestors().skip(1))
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .collect();
-        // Innermost first, so a directory is judged once those beneath it
-        // that held only the orphan are already gone.
-        staged.sort_by(|a, b| (b.components().count(), b).cmp(&(a.components().count(), a)));
-        staged.dedup();
-        for dir in staged {
-            let holds_more = kept
-                .keys()
-                .any(|path| path != &dir && path.starts_with(&dir));
-            if !holds_more && matches!(kept.get(&dir), Some(Entry::Dir { .. })) {
-                kept.remove(&dir);
-            }
-        }
-        (Self(kept), orphans.into_keys().collect())
-    }
-
     /// The paths whose entries differ between `self` and `other`, for a
     /// failure message that says where rather than dumping both.
     fn differences(&self, other: &Self) -> Vec<PathBuf> {
@@ -680,37 +645,28 @@ fn an_interrupted_apply_is_detected_and_rolled_back() {
         rollback.stdout()
     );
     assert!(!machine.state().join("journal.mpk").exists());
-    // The one byte recovery leaves by design: a write staged before the
-    // intent naming it was journalled is a `.bx-` file the journal never
-    // recorded, and recovery unlinks only what the journal names. Such an
-    // orphan is `bx doctor`'s to report, and it does, by name. The limit
-    // stops bx while it fills a staged file, before the intent naming it, so
-    // there is exactly one, and the doctor assertion is never vacuous.
-    let (rolled_back, orphans) = machine.the_accounts().without_orphans();
-    assert_eq!(orphans.len(), 1, "one write orphaned: {orphans:?}");
-    doctor_names(&machine, &orphans);
+    // Nothing is left behind: every write journals its temporary file and the
+    // directories it will make before it makes them, so wherever the limit
+    // stops bx — in a fill, or in the journal's own append — the rollback
+    // removes the one and prunes the others (#119). No `.bx-` orphan
+    // survives it, so `bx doctor` names none.
     assert_same(
         &before,
-        &rolled_back,
+        &machine.the_accounts(),
         "the rollback left the home different from before the session",
     );
+    doctor_names(&machine, &[]);
 
     // The one after it converges.
     machine.apply();
     machine.bx(&["plan"]).converged();
 
     // And what it converged to is recorded exactly: rm still restores the
-    // home as it was before the interrupted run, but for the orphan the
-    // rollback left, which nothing but a human removes.
+    // home as it was before the interrupted run.
     machine.rm_everything();
-    let (restored, left) = machine.the_accounts().without_orphans();
-    assert_eq!(
-        left, orphans,
-        "the orphan is left where it was, and no other"
-    );
     assert_same(
         &before,
-        &restored,
+        &machine.the_accounts(),
         "rm after a recovered apply left the home different",
     );
 }

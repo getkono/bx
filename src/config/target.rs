@@ -2208,6 +2208,129 @@ mod tests {
         }
     }
 
+    /// A tree entry, plus whatever else the test needs.
+    fn tree(extra: &str) -> String {
+        format!("[[target]]\npath = \"~/.config/nvim\"\ntree = \"files/nvim\"\n{extra}")
+    }
+
+    /// Parse the first `[[target]]` out of a document as an entry.
+    fn entry(text: &str) -> Result<Entry, Error> {
+        let doc = Document::parse(text).expect("valid TOML");
+        let table = doc["target"]
+            .as_array_of_tables()
+            .and_then(|tables| tables.get(0))
+            .expect("one [[target]]");
+        parse_entry(table, Path::new("bx.toml"), text, home())
+    }
+
+    fn tree_message(text: &str) -> String {
+        entry(text)
+            .expect_err("should have been rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn a_tree_parses_with_its_companion_keys() {
+        let text = tree(
+            "exclude = [\"*.md\", \"docs/**\"]\nmode = \"0600\"\ndirection = \"track\"\n\
+             requires = [\"nvim\"]\nenabled = false\n",
+        );
+        let Entry::Tree(parsed) = entry(&text).expect("parses") else {
+            panic!("a tree");
+        };
+        assert_eq!(parsed.path.as_str(), "~/.config/nvim");
+        assert_eq!(parsed.root, PathBuf::from("files/nvim"));
+        assert_eq!(
+            parsed
+                .exclude
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["*.md", "docs/**"]
+        );
+        assert_eq!(parsed.mode, Mode::parse_octal("0600").ok());
+        assert_eq!(parsed.direction, Direction::Track);
+        assert_eq!(parsed.requires, ["nvim"]);
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.origin.line, 1);
+
+        let Entry::Tree(bare) = entry(&tree("")).expect("parses") else {
+            panic!("a tree");
+        };
+        assert_eq!(
+            (bare.mode, bare.direction, bare.enabled),
+            (None, Direction::Apply, true)
+        );
+        assert!(bare.exclude.is_empty());
+        assert!(matches!(entry(&with("")), Ok(Entry::Target(_))));
+    }
+
+    #[test]
+    fn a_tree_root_is_normalised_and_confined_to_the_repo() {
+        let Entry::Tree(parsed) = entry(&tree("").replace("files/nvim", "files/./nvim/")).unwrap()
+        else {
+            panic!("a tree");
+        };
+        assert_eq!(parsed.root, PathBuf::from("files/nvim"));
+
+        for root in ["../out", "/etc", "~/x", ".", "files/{{acct}}"] {
+            let message = tree_message(&tree("").replace("files/nvim", root));
+            assert!(message.contains("`tree`"), "{root}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_tree_is_one_body_among_the_others() {
+        for body in [
+            "file = \"f\"",
+            "content = \"x\"",
+            "symlink = \"x\"",
+            "dir = true",
+        ] {
+            let message = tree_message(&tree(&format!("{body}\n")));
+            assert!(message.contains("exactly one body"), "{body}: {message}");
+            assert!(message.contains("`tree`"), "{body}: {message}");
+        }
+        let message = tree_message(&tree("attach = \"include\"\ninclude = \"x\"\n"));
+        assert!(message.contains("`tree` would never be read"), "{message}");
+    }
+
+    #[test]
+    fn a_tree_refuses_the_keys_that_describe_one_file() {
+        for (extra, key) in [
+            ("attach = \"region\"\ncomment = \"#\"\n", "attach"),
+            ("format = \"env.d\"\n", "format"),
+            ("format = \"jsonc\"\nowns = [\"a\"]\n", "format"),
+            ("references = [\"~/.x\"]\n", "references"),
+            ("exclude = [\"[a]\"]\n", "exclude"),
+            ("exclude = \"*.md\"\n", "exclude"),
+        ] {
+            let message = tree_message(&tree(extra));
+            assert!(message.contains(key), "{extra}: {message}");
+        }
+    }
+
+    #[test]
+    fn exclude_needs_a_tree() {
+        let message = message(&with("exclude = [\"*.md\"]\n"));
+        assert!(
+            message.contains("only means something beside `tree`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn parse_target_refuses_a_tree_it_cannot_expand() {
+        let message = message(&tree(""));
+        assert!(message.contains("loaded from"), "{message}");
+    }
+
+    #[test]
+    fn a_target_with_no_body_names_tree_among_the_body_keys() {
+        let message = message("[[target]]\npath = \"~/.x\"\n");
+        assert!(message.contains("`dir` or `tree`"), "{message}");
+    }
+
     /// A symlink target, plus whatever else the test needs.
     fn symlink(text: &str, extra: &str) -> String {
         format!("[[target]]\npath = \"~/.local/bin/tool\"\nsymlink = {text:?}\n{extra}")

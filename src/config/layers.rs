@@ -372,7 +372,7 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
     layer_paths(repo, state_dir)?
         .iter()
         .map(|path| {
-            let mut layer = load_layer(path, home)?;
+            let mut layer = load_layer(path, repo, home)?;
             if *path == local {
                 layer.kind = LayerKind::Local;
             }

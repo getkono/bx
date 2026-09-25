@@ -2039,6 +2039,85 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_the_user_made_after_a_crash_before_the_stage_is_left() {
+        // The Intent names its directories before the stage makes them, so a
+        // crash between the two leaves it naming directories bx never made.
+        // The user makes them afterwards, empty: nothing of bx's is in them,
+        // so nothing shows bx made them, and the rollback leaves every one.
+        let guard = guarded_home();
+        let home = guard.child("deep");
+        plant_crash_fixture(&home);
+        let index = crash_requests(&home)
+            .iter()
+            .position(|request| {
+                matches!(request.content, Content::Bytes { .. })
+                    && !request.dest.parent().expect("a parent").exists()
+            })
+            .expect("the fixture writes beneath a directory it has to make");
+        assert!(
+            !spawn_crash_child(&home, index, "after-intent")
+                .status
+                .success()
+        );
+
+        let state = StateDir::resolve(&home);
+        let loaded = crate::journal::load(&state.journal()).expect("load");
+        let intent = loaded.intents().last().expect("the write's intent");
+        assert!(!intent.created_dirs.is_empty(), "the Intent predicted them");
+        assert!(
+            intent.created_dirs.iter().all(|dir| !dir.exists()),
+            "and the crash came before the stage made any",
+        );
+        for dir in intent.created_dirs.iter().rev() {
+            std::fs::create_dir(dir).expect("the user makes it");
+        }
+
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { .. }
+        ));
+        assert!(
+            intent.created_dirs.iter().all(|dir| dir.is_dir()),
+            "the user's directories are left",
+        );
+    }
+
+    #[test]
+    fn a_predicted_directory_without_the_named_temp_file_is_left_even_when_empty() {
+        // Emptiness is not the evidence, the temporary file is. With it gone
+        // before the rollback, the deepest predicted directory stands empty
+        // and holds nothing of bx's, so it and every directory above it are
+        // left for `bx doctor`, exactly as a directory the user made would be.
+        let guard = guarded_home();
+        let home = guard.child("deep");
+        plant_crash_fixture(&home);
+        let index = crash_requests(&home)
+            .iter()
+            .position(|request| {
+                matches!(request.content, Content::Bytes { .. })
+                    && !request.dest.parent().expect("a parent").exists()
+            })
+            .expect("the fixture writes beneath a directory it has to make");
+        assert!(
+            !spawn_crash_child(&home, index, "after-stage")
+                .status
+                .success()
+        );
+        let state = StateDir::resolve(&home);
+        let loaded = crate::journal::load(&state.journal()).expect("load");
+        let intent = loaded.intents().last().expect("the write's intent");
+        let temp = intent.temp.clone().expect("a staged temp");
+        assert_eq!(temp.parent(), Some(intent.created_dirs[0].as_path()));
+        std::fs::remove_file(&temp).expect("the temp goes");
+
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { .. }
+        ));
+        assert!(intent.created_dirs.iter().all(|dir| dir.is_dir()));
+    }
+
+    #[test]
     fn nothing_to_recover_is_not_an_error() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());

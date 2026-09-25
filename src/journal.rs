@@ -1323,6 +1323,11 @@ pub struct Session {
     /// between. See `r3 round 7` decision R3R7-2.
     #[cfg(test)]
     before_stage: Option<fn(&Path)>,
+    /// Called with the destination after a write's Intent is durable and
+    /// before [`crate::fs::stage_as`] makes anything, so a test can change
+    /// the parents the Intent predicted the way a racing process would.
+    #[cfg(test)]
+    after_intent: Option<fn(&Path)>,
     /// Held, never read: dropping it releases the state directory.
     _lock: ExclusiveLock,
 }
@@ -1550,6 +1555,8 @@ impl Session {
             before_unlink: None,
             #[cfg(test)]
             before_stage: None,
+            #[cfg(test)]
+            after_intent: None,
             _lock: lock,
         })
     }
@@ -1944,6 +1951,10 @@ impl Session {
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
+        #[cfg(test)]
+        if let Some(meddle) = self.after_intent {
+            meddle(&dest);
+        }
         // Only now, with the temporary file and the directories named in a
         // durable Intent: see the method's documentation.
         let staged = fs::stage_as(&dest, &temp, mode, planned, &mut self.created)?;
@@ -2145,6 +2156,10 @@ impl Session {
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
+        #[cfg(test)]
+        if let Some(meddle) = self.after_intent {
+            meddle(&dest);
+        }
         let staged = fs::stage_link_as(&dest, &temp, text, planned, &mut self.created)?;
         self.crash.reached(index, Phase::AfterStage);
         let made = staged.created_dirs().to_vec();
@@ -3945,6 +3960,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pruning_beneath_follows_only_the_chain_above_what_was_removed() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let root = dir.path();
+        let chain = [root.join("a/b"), root.join("a")];
+        std::fs::create_dir_all(&chain[0]).expect("mkdir");
+
+        // Removed from `a/b`: both go.
+        prune_beneath(&chain[0].join(".bx-0"), &chain).expect("prune");
+        assert!(!root.join("a").exists(), "the whole chain went");
+
+        // An absent directory breaks the chain: `a` stands empty and is not
+        // shown made by anything beneath it.
+        std::fs::create_dir(root.join("a")).expect("the user's");
+        prune_beneath(&chain[0].join(".bx-0"), &chain).expect("prune");
+        assert!(root.join("a").is_dir(), "never made, so never pruned");
+
+        // So does a directory that is not the parent of what was removed.
+        std::fs::create_dir(&chain[0]).expect("mkdir");
+        prune_beneath(&root.join("elsewhere/.bx-0"), &chain).expect("prune");
+        assert!(chain[0].is_dir(), "not beneath it");
+
+        // And one that is not empty.
+        std::fs::write(chain[0].join("kept"), "the user's").expect("write");
+        prune_beneath(&chain[0].join(".bx-0"), &chain).expect("prune");
+        assert!(chain[0].is_dir() && root.join("a").is_dir());
+    }
+
+    #[test]
+    fn a_made_directory_is_removed_only_when_it_is_there_and_empty() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let made = dir.path().join("made");
+        assert!(
+            !remove_made_dir(&made).expect("absent"),
+            "nothing to remove"
+        );
+        std::fs::write(&made, "a file").expect("write");
+        assert!(!remove_made_dir(&made).expect("a file"), "not a directory");
+        std::fs::remove_file(&made).expect("rm");
+        std::fs::create_dir(&made).expect("mkdir");
+        assert!(remove_made_dir(&made).expect("empty"));
+        assert!(!made.exists());
+    }
+
+    #[test]
     fn pruning_a_directory_that_is_already_gone_is_not_an_error() {
         let dir = tempfile::tempdir().expect("a tempdir");
         prune_dirs(&[dir.path().join("never-existed")]).expect("prune");
@@ -5255,6 +5314,88 @@ pub(crate) mod tests {
                 "{made:?}: {err:?}"
             );
         }
+    }
+
+    /// Lose the parent of the destination's parent between the prediction
+    /// and the stage: `.config` existed when the Intent was written, so it
+    /// names only `.config/app`, and the stage then makes both.
+    fn lose_config(dest: &Path) {
+        let config = dest
+            .parent()
+            .and_then(Path::parent)
+            .expect("the destination's grandparent");
+        std::fs::remove_dir(config).expect("the user removes it, empty");
+    }
+
+    #[test]
+    fn a_write_refused_for_an_unannounced_directory_removes_what_it_made() {
+        // D2. The stage made `.config` again, which the Intent never named and
+        // the refused write leaves in no ledger: no rollback or `rm` would ever
+        // remove it, so the refusal itself does, with `.config/app` under it.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let config = home.child(".config");
+        std::fs::create_dir(&config).expect("the user's, at prediction");
+        let (portable, dest) = target(home.path(), ".config/app/x.conf");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session.after_intent = Some(lose_config);
+        let err = session
+            .apply(Request {
+                target: portable,
+                dest: dest.clone(),
+                content: Content::Bytes {
+                    bytes: b"bx\n".to_vec(),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_FILE,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect_err("the stage made a directory the Intent did not name");
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Changed { path, .. }) if *path == dest),
+            "got {err}"
+        );
+        assert!(!config.exists(), "what the stage made is gone again");
+        assert!(
+            std::fs::read_dir(home.path())
+                .expect("the home")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".bx-")),
+            "and so is the temporary file",
+        );
+    }
+
+    #[test]
+    fn a_link_refused_for_an_unannounced_directory_removes_what_it_made() {
+        // D2, the link path.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let config = home.child(".config");
+        std::fs::create_dir(&config).expect("the user's, at prediction");
+        let (portable, dest) = target(home.path(), ".config/app/link");
+
+        let mut session =
+            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        session.after_intent = Some(lose_config);
+        let err = session
+            .apply(Request {
+                target: portable,
+                dest: dest.clone(),
+                content: Content::Link {
+                    text: PathBuf::from("elsewhere"),
+                    planned: fs::observe(&dest).expect("plan's observation"),
+                },
+                mode: Mode::LINK,
+                ownership: Ownership::Owned(Mechanism::Own),
+            })
+            .expect_err("the stage made a directory the Intent did not name");
+        assert!(
+            matches!(&err, Error::Write(fs::Error::Changed { path, .. }) if *path == dest),
+            "got {err}"
+        );
+        assert!(!config.exists(), "what the stage made is gone again");
     }
 
     #[test]

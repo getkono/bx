@@ -310,6 +310,33 @@ dir = true
     }
 
     #[test]
+    fn a_directory_that_cannot_be_listed_names_nothing_and_the_rest_still_do() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = guarded_home();
+        home.write(".bx-zz", "");
+        home.write(".config/a/.bx-hidden", "");
+        let unlistable = home.child(".config/a");
+        std::fs::set_permissions(&unlistable, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        if std::fs::read_dir(&unlistable).is_ok() {
+            std::fs::set_permissions(&unlistable, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+            return crate::journal::tests::cannot_build(
+                "a_directory_that_cannot_be_listed_names_nothing_and_the_rest_still_do",
+                crate::journal::tests::WRITES_THROUGH_PERMISSIONS,
+            );
+        }
+
+        let found = subjects(&home, LAYER);
+        // Before any assertion, so the tempdir can be removed whatever happens.
+        std::fs::set_permissions(&unlistable, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod back");
+
+        assert_eq!(found, ["~/.bx-zz"]);
+    }
+
+    #[test]
     fn nothing_is_named_while_an_apply_holds_the_lock() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());

@@ -148,6 +148,7 @@ use super::path::PathEntry;
 use super::secrets::Secrets;
 use super::shell_options::ShellOptions;
 use super::target::Target;
+use super::tool::ToolDecl;
 use super::values::{
     Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan, statements_named,
 };
@@ -287,6 +288,21 @@ impl Keyed for SourceDecl {
     }
 }
 
+impl Keyed for ToolDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
 impl Keyed for External {
     /// The checkout's directory, as its one normalised spelling. Nothing in
     /// an external is substituted, so the path written is the directory.
@@ -350,6 +366,8 @@ pub enum Section {
     Source,
     /// `[[external]]`, keyed by `path`.
     External,
+    /// `[[tool]]`, keyed by `name`.
+    Tool,
 }
 
 impl Section {
@@ -364,6 +382,7 @@ impl Section {
             Self::Function => "function",
             Self::Plugin => "plugin",
             Self::Source => "source",
+            Self::Tool => "tool",
             Self::External => "external",
         }
     }
@@ -379,6 +398,7 @@ impl Section {
             Self::Function => crate::shell::function::SECTION,
             Self::Plugin => plugin::SECTION,
             Self::Source => crate::shell::source::SECTION,
+            Self::Tool => super::tool::SECTION,
             Self::External => super::external::SECTION,
         }
     }
@@ -393,7 +413,8 @@ impl Section {
             | Self::Alias
             | Self::Function
             | Self::Plugin
-            | Self::Source => "name",
+            | Self::Source
+            | Self::Tool => "name",
         }
     }
 
@@ -411,6 +432,7 @@ impl Section {
             Self::Function => "a `body`",
             Self::Plugin => "a `source`",
             Self::Source => "a `path`",
+            Self::Tool => "an `install`",
             Self::External => "a `url` and a `rev`",
         }
     }
@@ -794,6 +816,7 @@ impl Merged<Target, TargetKey> {
                 | Section::Function
                 | Section::Plugin
                 | Section::Source
+                | Section::Tool
                 | Section::External => {}
             }
         }
@@ -1204,6 +1227,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut functions: Merged<FunctionDecl> = Merged::default();
     let mut plugins: Merged<PluginDecl> = Merged::default();
     let mut sources: Merged<SourceDecl> = Merged::default();
+    let mut tools: Merged<ToolDecl> = Merged::default();
     let mut externals: Merged<External> = Merged::default();
     let mut secrets = Secrets::default();
     let mut history = History::default();
@@ -1224,7 +1248,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     // by its name, which holds no placeholder; and so does a declared optional
     // source, keyed by its name, whose path is substituted only once the
     // values are final; and so does an external, keyed by its path, which
-    // holds no placeholder.
+    // holds no placeholder; and so does a declared tool, keyed by its name,
+    // which holds no placeholder either.
     for layer in layers {
         refuse_committed_answers(layer)?;
         refuse_misplaced_secrets(layer)?;
@@ -1241,6 +1266,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         functions.absorb(layer.config.functions.iter().cloned());
         plugins.absorb(layer.config.plugins.iter().cloned());
         sources.absorb(layer.config.sources.iter().cloned());
+        tools.absorb(layer.config.tools.iter().cloned());
         externals.absorb(layer.config.externals.iter().cloned());
 
         for toggle in &layer.config.toggles {
@@ -1253,6 +1279,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Function => functions.toggle(toggle)?,
                 Section::Plugin => plugins.toggle(toggle)?,
                 Section::Source => sources.toggle(toggle)?,
+                Section::Tool => tools.toggle(toggle)?,
                 Section::External => externals.toggle(toggle)?,
                 Section::Target => {}
             }
@@ -1314,6 +1341,8 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         plugins,
         // Nor to a declared optional source.
         sources: sources.into_enabled(),
+        // Nor to a declared tool.
+        tools: tools.into_enabled(),
         secrets,
         history,
         shell_options,
@@ -2009,6 +2038,7 @@ mod tests {
             (Section::Function, "function", "[[function]]", "name"),
             (Section::Plugin, "plugin", "[[plugin]]", "name"),
             (Section::Source, "source", "[[source]]", "name"),
+            (Section::Tool, "tool", "[[tool]]", "name"),
             (Section::External, "external", "[[external]]", "path"),
         ] {
             assert_eq!(section.key(), key);

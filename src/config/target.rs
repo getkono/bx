@@ -40,6 +40,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::shell::activation;
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::Function;
 use crate::shell::keybindings::Keybindings;
@@ -261,7 +262,10 @@ impl Gen {
 /// `[keybindings]` land in the `keybindings` phase, as
 /// [`Keybindings::render_zsh`] renders them; and every enabled `[[source]]`
 /// whose path resolved lands in the phase it names, after that phase's own
-/// declarations, as the one guarded line [`Source::render`] renders. No phase
+/// declarations, as the one guarded line [`Source::render`] renders; and every
+/// declared tool activation the plan reused or captured lands in the phase it
+/// names, as the one `eval` of a literal [`activation::Step::body`] renders,
+/// before any source in that phase. No phase
 /// but `env` holds an environment assignment (Invariant 2): the `options`
 /// phase assigns only zsh's own unexported history parameters, which
 /// [`super::history`]'s tests hold it to, and the `functions` phase assigns
@@ -289,6 +293,10 @@ pub struct Interactive {
     /// The enabled declared optional sources, each resolved or held back in
     /// its own position, in the merged configuration's order.
     sources: Vec<Resolution<Source>>,
+    /// The declared tool activations, as `plan` decided them. Empty until the
+    /// plan attaches them ([`Interactive::with_activations`]): resolution
+    /// runs no tool, so it cannot know their output.
+    activations: activation::Plan,
 }
 
 impl Interactive {
@@ -304,7 +312,17 @@ impl Interactive {
             functions: Vec::new(),
             keybindings: Keybindings::default(),
             sources: Vec::new(),
+            activations: activation::Plan::default(),
         }
+    }
+
+    /// The file with `activations` in its `activations` and `completions`
+    /// phases: every step that reused or captured an output, in declaration
+    /// order. An omitted step adds nothing.
+    #[must_use]
+    pub fn with_activations(mut self, activations: activation::Plan) -> Self {
+        self.activations = activations;
+        self
     }
 
     /// The file with `keybindings` in its `keybindings` phase.
@@ -435,11 +453,13 @@ impl Interactive {
     /// held back has no `functions` phase, and a file binding no key has no
     /// `keybindings` phase. The bytes are a function of the variables, the
     /// plugins, the history, the aliases, the functions, the keybindings, the
-    /// sources and `present`'s answers alone: never of whether a plugin's or a
-    /// source's file exists.
+    /// sources, the activations the plan attached and `present`'s answers
+    /// alone: never of whether a plugin's or a source's file exists.
     ///
-    /// A file holding a plugin or a source line closes with [`SETTLE`]. A
-    /// guarded line whose file is absent returns 1, and a file sourced at
+    /// A file holding a plugin, a source line or an activation closes with
+    /// [`SETTLE`]. A guarded line whose file is absent returns 1, an
+    /// activation's `eval` returns whatever the tool's code last did, and a
+    /// file sourced at
     /// startup returns the status of its last command, so a file ending on one
     /// would stop a shell running under `ERR_EXIT` before its prompt — and
     /// show every other shell a failed status at its first prompt.
@@ -466,11 +486,21 @@ impl Interactive {
         // The held-back functions are the note's to name, not the bytes'.
         crate::shell::function::contribute(&mut assembly, &self.functions, present);
         crate::shell::keybindings::contribute(&mut assembly, &self.keybindings);
+        // An activation lands only in `activations` or `completions`, neither
+        // of which refuses a contribution.
+        self.activations
+            .contribute(&mut assembly)
+            .expect("an activation never claims the terminal slot");
+        let activated = self
+            .activations
+            .steps()
+            .iter()
+            .any(|step| step.body().is_some());
         // Last, so each source follows its phase's own declarations; the
         // held-back ones are the note's to name.
         let sourced = crate::shell::source::contribute(&mut assembly, &self.sources, present);
         let mut out = assembly.render();
-        if !self.plugins.is_empty() || sourced {
+        if !self.plugins.is_empty() || sourced || activated {
             out.push_str(SETTLE);
         }
         out
@@ -2512,6 +2542,96 @@ mod tests {
             assert_eq!(
                 both.note().as_deref(),
                 Some("function `f` held back: answer a; source `s` held back: answer b")
+            );
+        }
+
+        /// A machine on which every tool is `/usr/bin/<name>` and prints
+        /// `<name>_init` — except `absent`, which is not on it.
+        struct Echo;
+
+        impl activation::Host for Echo {
+            fn locate(&self, program: &str) -> crate::detect::Presence {
+                if program == "absent" {
+                    return crate::detect::Presence::Missing;
+                }
+                crate::detect::Presence::Present {
+                    path: PathBuf::from(format!("/usr/bin/{program}")),
+                }
+            }
+            fn hash(&self, path: &Path) -> Result<crate::state::ContentHash, String> {
+                Ok(crate::state::ContentHash::of(
+                    path.as_os_str().as_encoded_bytes(),
+                ))
+            }
+            fn run(&self, program: &Path, _: &[String]) -> Result<Vec<u8>, activation::RunError> {
+                let name = program.file_name().expect("a name").to_string_lossy();
+                Ok(format!("{name}_init\n").into_bytes())
+            }
+        }
+
+        fn activations(decls: &[(&str, Phase)]) -> activation::Plan {
+            let decls: Vec<activation::ActivationDecl> = decls
+                .iter()
+                .map(|(name, phase)| activation::ActivationDecl {
+                    name: (*name).to_string(),
+                    command: vec![(*name).to_string()],
+                    phase: *phase,
+                    enabled: true,
+                    origin: super::super::super::Origin {
+                        file: PathBuf::from("/repo/bx.toml"),
+                        line: 1,
+                    },
+                })
+                .collect();
+            activation::plan(
+                &decls,
+                &crate::state::Fingerprints::default(),
+                &crate::env_guard::RootSet::strict(),
+                &Echo,
+            )
+        }
+
+        #[test]
+        fn activations_land_in_their_phases_before_a_source_there_and_the_file_settles() {
+            let file = Interactive::new(fragment(Vec::new()))
+                .with_sources(vec![sourced(
+                    "late",
+                    "~/late.zsh",
+                    Phase::Activations,
+                    None,
+                )])
+                .with_activations(activations(&[
+                    ("starship", Phase::Completions),
+                    ("absent", Phase::Activations),
+                    ("mise", Phase::Activations),
+                ]));
+            assert_eq!(
+                render(&file),
+                "# Generated by bx. Edit the config repo, not this file.\n\
+                 \n# bx phase: activations\n\
+                 # bx activation: mise\n\
+                 eval 'mise_init\n'\n\
+                 [[ -r ~/late.zsh ]] && source ~/late.zsh\n\
+                 \n# bx phase: completions\n\
+                 # bx activation: starship\n\
+                 eval 'starship_init\n'\n\
+                 \n# bx: done, whichever plugins were found\ntrue\n"
+            );
+
+            // An activation alone closes the file too; one that was omitted
+            // adds nothing, not even the closing line.
+            let alone = render(
+                &Interactive::new(fragment(Vec::new()))
+                    .with_activations(activations(&[("mise", Phase::Activations)])),
+            );
+            assert!(alone.ends_with("\n# bx: done, whichever plugins were found\ntrue\n"));
+            let omitted = render(
+                &Interactive::new(fragment(Vec::new()))
+                    .with_activations(activations(&[("absent", Phase::Activations)])),
+            );
+            assert_eq!(
+                omitted,
+                "# Generated by bx. Edit the config repo, not this file.\n"
             );
         }
 

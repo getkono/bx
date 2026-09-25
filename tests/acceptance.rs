@@ -346,7 +346,8 @@ impl Snapshot {
     }
 
     /// The snapshot without bx's `.bx-` temporary files, and the paths of
-    /// those it left out. A workaround for #117; see its two call sites.
+    /// those it left out: an orphan an interrupted write leaves, which
+    /// `bx doctor` names and nothing but a human removes.
     ///
     /// Also without each directory that holds nothing but such a file: the
     /// directories staged for a write killed before its intent was journalled,
@@ -682,16 +683,12 @@ fn an_interrupted_apply_is_detected_and_rolled_back() {
     // The one byte recovery leaves by design: a write staged before the
     // intent naming it was journalled is a `.bx-` file the journal never
     // recorded, and recovery unlinks only what the journal names. Such an
-    // orphan is `bx doctor`'s to report, which it does not yet (#117).
-    // Workaround for #117, one of two sites (the other follows the `rm`
-    // below; both call `without_orphans`). Once #117 lands, replace this
-    // tolerance with an assertion that `bx doctor` reports each orphan as a
-    // finding, and assert the same at the second site.
+    // orphan is `bx doctor`'s to report, and it does, by name. The limit
+    // stops bx while it fills a staged file, before the intent naming it, so
+    // there is exactly one, and the doctor assertion is never vacuous.
     let (rolled_back, orphans) = machine.the_accounts().without_orphans();
-    assert!(
-        orphans.len() <= 1,
-        "more than one write orphaned: {orphans:?}"
-    );
+    assert_eq!(orphans.len(), 1, "one write orphaned: {orphans:?}");
+    doctor_names(&machine, &orphans);
     assert_same(
         &before,
         &rolled_back,
@@ -703,16 +700,51 @@ fn an_interrupted_apply_is_detected_and_rolled_back() {
     machine.bx(&["plan"]).converged();
 
     // And what it converged to is recorded exactly: rm still restores the
-    // home as it was before the interrupted run. Workaround for #117, second
-    // site: the orphan the rollback left is still there, so it is filtered
-    // out. Once #117 lands, replace the filter with the same doctor-finding
-    // assertion as the first site.
+    // home as it was before the interrupted run, but for the orphan the
+    // rollback left, which nothing but a human removes.
     machine.rm_everything();
+    let (restored, left) = machine.the_accounts().without_orphans();
+    assert_eq!(
+        left, orphans,
+        "the orphan is left where it was, and no other"
+    );
     assert_same(
         &before,
-        &machine.the_accounts().without_orphans().0,
+        &restored,
         "rm after a recovered apply left the home different",
     );
+}
+
+/// Assert `bx doctor` names each of `orphans`, home-relative paths, as an
+/// orphaned temporary file, and names no other.
+#[track_caller]
+fn doctor_names(machine: &Machine, orphans: &[PathBuf]) {
+    let doctor = machine.bx(&["doctor"]);
+    let stdout = doctor.stdout();
+    let named: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains(" is a temporary file a bx write left "))
+        .collect();
+    let expected: Vec<String> = orphans
+        .iter()
+        .map(|orphan| {
+            format!(
+                "  ! ~/{} is a temporary file a bx write left ",
+                orphan.display()
+            )
+        })
+        .collect();
+    assert_eq!(
+        named.len(),
+        expected.len(),
+        "doctor named {named:?}, not {orphans:?}"
+    );
+    for (line, prefix) in named.iter().zip(&expected) {
+        assert!(
+            line.starts_with(prefix.as_str()),
+            "{line:?} is not {prefix:?}"
+        );
+    }
 }
 
 /// Run `shell -i -c SCRIPT` on the machine.

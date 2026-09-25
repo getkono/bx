@@ -59,6 +59,7 @@
 use std::path::Path;
 
 use super::env::{EnvDecl, Fragment, Place, Syntax, Var};
+use super::external::External;
 use super::history::History;
 use super::merge::Conflict;
 use super::path::PathEntry;
@@ -154,6 +155,11 @@ pub struct Resolved {
     /// Blocked targets keep their position, so the order `bx plan` reports in is
     /// the configuration's own order with nothing silently moved to the end.
     pub targets: Vec<Resolution<Target>>,
+    /// Every enabled `[[external]]`, in the resolved configuration's order.
+    ///
+    /// Nothing in one is substituted, so none is ever held back: an external
+    /// the configuration can name is ready, and one it cannot failed the load.
+    pub externals: Vec<External>,
     /// The merged `[secrets]` table: nothing in it is substituted.
     pub secrets: super::secrets::Secrets,
 }
@@ -174,8 +180,9 @@ pub struct Resolved {
 /// a reference to a value no layer declares, or a committed `default` it
 /// cannot hold; for a `[[source]]` path referencing a value no layer declares,
 /// or made unwritable by a committed `default`; for two enabled plugins that
-/// claim the terminal slot; and
-/// for two ready targets that name one file.
+/// claim the terminal slot; for two ready targets that name one file; and for
+/// an external whose checkout overlaps another external's or a ready target's
+/// path.
 pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
@@ -194,10 +201,12 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
     targets.extend(place_envs(merged, &values)?);
 
     refuse_shared_files(&targets)?;
+    refuse_overlapping_externals(&merged.externals, &targets)?;
 
     Ok(Resolved {
         values,
         targets,
+        externals: merged.externals.clone(),
         secrets: merged.secrets.clone(),
     })
 }
@@ -613,6 +622,100 @@ fn refuse_shared_files(targets: &[Resolution<Target>]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Refuse an external whose checkout overlaps another external's or a ready
+/// target's path.
+///
+/// A checkout is a directory git owns whole. A target at or beneath it would
+/// be a file bx writes into somebody else's working tree, leaving it with
+/// uncommitted changes that stop every later move to a new `rev`. One external
+/// beneath another is the same thing from git's side: the inner clone is an
+/// untracked directory in the outer. And an external at or above a target's
+/// path would clone over, or into the parent of, a file bx already writes.
+///
+/// The one overlap allowed is an external strictly beneath a `dir` target:
+/// that target only makes sure the directory exists, and a clone inside it
+/// changes nothing it claims.
+///
+/// Decided lexically on the normalised paths, as every other path comparison
+/// in resolution is, and over ready targets only: a held-back target's file is
+/// not known yet.
+///
+/// # Errors
+///
+/// [`Error::BadValue`] at the later entry's origin, naming the other one.
+fn refuse_overlapping_externals(
+    externals: &[External],
+    targets: &[Resolution<Target>],
+) -> Result<(), Error> {
+    for (index, later) in externals.iter().enumerate() {
+        if let Some(earlier) = externals[..index]
+            .iter()
+            .find(|earlier| overlap(&earlier.path, &later.path).is_some())
+        {
+            return Err(Error::BadValue {
+                origin: later.origin.clone(),
+                message: format!(
+                    "external `{}` overlaps external `{}` at {}; one checkout inside \
+                     another is an untracked directory in it",
+                    later.path, earlier.path, earlier.origin
+                ),
+            });
+        }
+    }
+
+    for target in targets.iter().filter_map(|resolution| match resolution {
+        Resolution::Ready(target) => Some(target),
+        Resolution::Blocked(_) => None,
+    }) {
+        for external in externals {
+            let allowed = matches!(target.body, Body::Dir)
+                && overlap(&target.path, &external.path) == Some(Overlap::Beneath);
+            if overlap(&external.path, &target.path).is_some() && !allowed {
+                return Err(Error::BadValue {
+                    origin: external.origin.clone(),
+                    message: format!(
+                        "external `{}` overlaps the target `{}` at {}; a checkout is a \
+                         directory git owns whole, so no target may be written at, inside \
+                         or above it",
+                        external.path, target.path, target.origin
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How one normalised path lies relative to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlap {
+    /// The two are one path.
+    Same,
+    /// The second lies strictly beneath the first.
+    Beneath,
+    /// The first lies strictly beneath the second.
+    Above,
+}
+
+/// Whether `a` and `b` are one path or one lies beneath the other, and which.
+fn overlap(a: &Portable, b: &Portable) -> Option<Overlap> {
+    let beneath = |outer: &str, inner: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/') || outer.ends_with('/'))
+    };
+    let (a, b) = (a.as_str(), b.as_str());
+    if a == b {
+        Some(Overlap::Same)
+    } else if beneath(a, b) {
+        Some(Overlap::Beneath)
+    } else if beneath(b, a) {
+        Some(Overlap::Above)
+    } else {
+        None
+    }
 }
 
 /// Substitute one target, or explain why it cannot be.
@@ -1607,6 +1710,94 @@ mod tests {
             Resolution::Blocked(entry) => entry,
             Resolution::Ready(target) => panic!("unexpectedly ready: {}", target.path),
         }
+    }
+
+    /// One `[[external]]` entry, as TOML.
+    fn external(path: &str) -> String {
+        format!(
+            "[[external]]\npath = \"{path}\"\nurl = \"https://h/o/a\"\nrev = \"{}\"\n",
+            "a".repeat(40)
+        )
+    }
+
+    #[test]
+    fn enabled_externals_resolve_in_order_as_written() {
+        let resolved = resolved(
+            &format!(
+                "{}{}{}enabled = false\n",
+                external("~/b"),
+                external("~/a"),
+                external("~/off")
+            ),
+            None,
+        )
+        .unwrap();
+        let paths: Vec<&str> = resolved.externals.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["~/b", "~/a"]);
+        assert!(resolved.targets.is_empty(), "an external is not a target");
+    }
+
+    #[test]
+    fn an_external_overlapping_another_is_refused_naming_both() {
+        for (first, second) in [("~/a", "~/a/b"), ("~/a/b", "~/a")] {
+            let err = resolved(&format!("{}{}", external(first), external(second)), None)
+                .expect_err("one checkout inside another");
+            assert!(err.starts_with("bx.toml:5: "), "{err}");
+            assert!(
+                err.contains(&format!(
+                    "external `{second}` overlaps external `{first}` at bx.toml:1"
+                )),
+                "{err}"
+            );
+        }
+        // A shared prefix that is not a parent is no overlap.
+        assert!(resolved(&format!("{}{}", external("~/a"), external("~/ab")), None).is_ok());
+    }
+
+    #[test]
+    fn an_external_overlapping_a_ready_target_is_refused() {
+        for (target, body) in [
+            ("~/a", "content = \"x\""),
+            ("~/a/file", "content = \"x\""),
+            ("~/a/sub", "dir = true"),
+            ("~/a", "dir = true"),
+        ] {
+            let text = format!(
+                "{}[[target]]\npath = \"{target}\"\n{body}\n",
+                external("~/a")
+            );
+            let err = resolved(&text, None).expect_err(&format!("{target} with {body}"));
+            assert!(err.starts_with("bx.toml:1: "), "{target}: {err}");
+            assert!(
+                err.contains(&format!("overlaps the target `{target}` at bx.toml:5")),
+                "{target}: {err}"
+            );
+        }
+        // A file target above the checkout would be cloned into.
+        let above = format!(
+            "{}[[target]]\npath = \"~/x\"\ncontent = \"x\"\n",
+            external("~/x/b")
+        );
+        let err = resolved(&above, None).unwrap_err();
+        assert!(err.contains("overlaps the target `~/x`"), "{err}");
+        // A sibling is no overlap.
+        let sibling = format!(
+            "{}[[target]]\npath = \"~/x/a\"\ncontent = \"x\"\n",
+            external("~/x/b")
+        );
+        assert!(resolved(&sibling, None).is_ok());
+    }
+
+    #[test]
+    fn an_external_beneath_a_dir_target_or_beside_a_blocked_one_resolves() {
+        let text = format!(
+            "{ABC}{}[[target]]\npath = \"~/x\"\ndir = true\n\
+             [[target]]\npath = \"~/x/b/{{{{b}}}}\"\ncontent = \"x\"\n",
+            external("~/x/b")
+        );
+        let resolved = resolved(&text, None).unwrap();
+        assert_eq!(resolved.externals.len(), 1);
+        assert!(matches!(resolved.targets[1], Resolution::Blocked(_)));
     }
 
     /// One `[[env]]` entry, as TOML.

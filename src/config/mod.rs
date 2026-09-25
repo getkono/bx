@@ -21,6 +21,7 @@
 //! together, and a silent no-op is the failure mode this tool exists to end.
 
 pub mod env;
+pub mod external;
 pub mod history;
 pub mod layers;
 pub mod merge;
@@ -64,6 +65,8 @@ const MODULES_DIR: &str = "modules";
 pub struct Config {
     /// `[[target]]`, keyed by `path`.
     pub targets: Vec<Target>,
+    /// `[[external]]`, keyed by `path`. See [`external`].
+    pub externals: Vec<external::External>,
     /// `[[value]]`, keyed by `name`.
     pub values: Vec<ValueDecl>,
     /// `[values]`, in document order. Parsed, never resolved.
@@ -379,6 +382,27 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     }
                 }
             }
+            "external" => {
+                for table in entries(root, name, item, file, text)? {
+                    match merge::toggle_of(table, merge::Section::External, file, text)? {
+                        // Keyed by its one normalised spelling, as the full
+                        // entry is, so `~/a/./b` reaches the entry at `~/a/b`.
+                        Some(mut toggle) => {
+                            toggle.key = external::parse_path(&toggle.key, home)
+                                .map_err(|message| Error::BadValue {
+                                    origin: toggle.origin.clone(),
+                                    message,
+                                })?
+                                .as_str()
+                                .to_string();
+                            config.toggles.push(toggle);
+                        }
+                        None => config
+                            .externals
+                            .push(external::parse_external(table, file, text, home)?),
+                    }
+                }
+            }
             "value" => {
                 for table in entries(root, name, item, file, text)? {
                     match merge::toggle_of(table, merge::Section::Value, file, text)? {
@@ -510,6 +534,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|t| (t.path.as_str(), &t.origin))
             .chain(toggles_in(&config, merge::Section::Target))
+            .collect(),
+    )?;
+    check_unique(
+        "external",
+        config
+            .externals
+            .iter()
+            .map(|e| (e.path.as_str(), &e.origin))
+            .chain(toggles_in(&config, merge::Section::External))
             .collect(),
     )?;
     check_unique(

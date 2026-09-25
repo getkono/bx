@@ -306,12 +306,6 @@ impl Interactive {
         self
     }
 
-    /// The declared keybindings.
-    #[must_use]
-    pub const fn keybindings(&self) -> &Keybindings {
-        &self.keybindings
-    }
-
     /// The file with `history` in its `options` phase.
     #[must_use]
     pub fn with_history(mut self, history: History) -> Self {

@@ -733,8 +733,12 @@ fn tracked(inputs: &Inputs) -> Vec<&Portable> {
 /// state directory holds; and losing it is what the cache's contract allows,
 /// because [`decide`]'s tracked decision reads a missing agreement as "cannot
 /// tell which side moved" and asks a human rather than overwriting either
-/// side. The ledger is the wrong home: an entry there is a claim that bx owns
-/// the machine's copy, which it deliberately does not.
+/// side. The ledger is the wrong home: an entry there claims a file and holds
+/// the bytes `rm` puts back, and bx claims the machine's copy only where
+/// `apply` created it, while every tracked target has an agreement. Keeping it
+/// in the ledger would claim a copy the tool had before bx wrote to it, so
+/// `rm` would replace the tool's later bytes with ones the tool no longer
+/// holds.
 ///
 /// What it keeps is bounded, and is the bytes themselves only while they are
 /// small: see [`decide::Base::fingerprint`].

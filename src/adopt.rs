@@ -46,10 +46,13 @@
 //! declaration, so nothing about it changes. The body file in the repo is left
 //! where it is: it may be a file the user wrote, and deleting it is theirs.
 //!
-//! A tracked target (`direction = "track"`) is handed back through its repo
-//! copy, the one file of it bx writes: the copy gets back the bytes it held
-//! before `sync` first carried this machine's copy into it, and the machine's
-//! own file, which bx never claims, is left as it is.
+//! A tracked target (`direction = "track"`) is handed back through what bx
+//! claimed of its two copies: the repo copy gets back the bytes it held before
+//! `sync` first carried this machine's copy into it, and a machine copy
+//! `apply` created where this machine had none is removed, with the
+//! directories made for it. A machine copy the tool had before bx wrote to it
+//! is never claimed, and is left as it is. Where either copy would conflict,
+//! neither is restored and the target stays declared.
 //!
 //! A `tree = "…"` entry is one declaration of many files, so `rm` hands a tree
 //! back whole or not at all: on the tree's path it releases every file and the
@@ -1214,8 +1217,9 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
                 .map(|(path, _)| path.clone())
                 .filter(|path| beneath(path, target)),
         )
-        // A tracked file a tree declares has no ledger entry of its own, and
-        // no table naming it: its repo copy is what `rm` hands back.
+        // A tracked file a tree declares has no table naming it, and a ledger
+        // entry of its own only where `apply` created it: its repo copy is
+        // what `rm` hands back, with that entry where there is one.
         .chain(
             ctx.resolved
                 .targets
@@ -1296,33 +1300,54 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
 /// target in order, with each tracked target handed back through its repo
 /// copy, and a row after them for each repo copy restored.
 ///
-/// # Decision: `rm` restores a tracked target's repo copy, never its machine copy
+/// # Decision: `rm` restores a tracked target's two copies by what bx claimed of each
 ///
-/// bx never claims a tracked target's copy on this machine — the tool writes
-/// it — so there is nothing there for `rm` to put back, and it is left as it
-/// is. What bx did write is the repo copy, each time `sync` carried this
-/// machine's copy into it, and the ledger holds the bytes that copy had before
-/// bx first wrote it; `rm` puts those back, exactly as it restores any file bx
-/// wrote, and refuses to when the copy changed since bx last wrote it — as it
-/// does after another machine's sync brought a newer one. Such a conflict
-/// keeps the tracked target declared, like any conflict.
+/// What bx wrote of a tracked target is the repo copy, each time `sync`
+/// carried this machine's copy into it, and the machine copy `apply` created
+/// where this machine had none. The ledger holds what each held before bx
+/// first wrote it, and `rm` puts that back — removing a machine copy bx
+/// created, and the directories it made for it — exactly as it restores any
+/// file bx wrote. It refuses to when a copy changed since bx last wrote it: as
+/// it does after another machine's sync brought a newer repo copy, or after
+/// the tool rewrote the machine copy bx created. Such a conflict keeps the
+/// tracked target declared, like any conflict.
 ///
-/// A tracked target the ledger does hold an entry for was applied before it
-/// was tracked; that entry is restored by its own rules as well.
+/// A machine copy bx never claimed — the tool had it before bx wrote to it —
+/// has nothing for `rm` to put back, and is left as it is.
+///
+/// # Decision: a tracked target is handed back whole or not at all
+///
+/// Where either copy would conflict, `rm` restores neither, as it holds a tree
+/// ([`hold_trees`]): restoring the one that does not would leave the target
+/// declared with one side handed back, and the next `sync` or `apply` would
+/// write it straight back.
 fn restore_tracking(
     ctx: &Context,
     ledger: &LedgerView,
     targets: &[Portable],
 ) -> Result<Vec<Restored>, Error> {
     let copies: Vec<Option<Portable>> = targets.iter().map(|t| ctx.tracked_copy(t)).collect();
+    let mut held: Vec<Option<String>> = Vec::with_capacity(targets.len());
+    for (target, copy) in targets.iter().zip(&copies) {
+        held.push(match copy {
+            Some(copy) => conflict_before_restore(ctx, ledger, target, Some(copy))?,
+            None => None,
+        });
+    }
     let mut restoring: Vec<Portable> = targets
         .iter()
         .zip(&copies)
-        .filter(|(target, copy)| copy.is_none() || ledger.get(target).is_some())
-        .map(|(target, _)| target.clone())
+        .zip(&held)
+        .filter(|((target, copy), held)| {
+            held.is_none() && (copy.is_none() || ledger.get(target).is_some())
+        })
+        .map(|((target, _), _)| target.clone())
         .collect();
-    for copy in copies.iter().flatten() {
-        if ledger.get(copy).is_some() && !restoring.contains(copy) {
+    for (copy, held) in copies.iter().zip(&held) {
+        if let (Some(copy), None) = (copy, held)
+            && ledger.get(copy).is_some()
+            && !restoring.contains(copy)
+        {
             restoring.push(copy.clone());
         }
     }
@@ -1341,13 +1366,21 @@ fn restore_tracking(
             .and_then(|at| done.get(at))
     };
     let mut out = Vec::with_capacity(targets.len());
-    for (target, copy) in targets.iter().zip(&copies) {
+    for ((target, copy), held) in targets.iter().zip(&copies).zip(held) {
         let own = result(target).cloned();
         let Some(copy) = copy else {
             out.extend(own);
             continue;
         };
         let dest = target.render(&ctx.home);
+        if let Some(note) = held {
+            out.push(Restored::Conflict {
+                target: target.clone(),
+                dest,
+                note,
+            });
+            continue;
+        }
         out.push(match (own, result(copy)) {
             (_, Some(Restored::Conflict { note, .. })) => Restored::Conflict {
                 target: target.clone(),
@@ -1368,6 +1401,34 @@ fn restore_tracking(
         }
     }
     Ok(out)
+}
+
+/// Why restoring `file`, and its repo copy `copy` where it is tracked, would
+/// be a conflict, as [`restore::plan_restore_with`] reads each ledger entry
+/// now: the first one's note, a copy's naming the copy. `None` when neither
+/// would, or when the ledger holds no entry for either.
+fn conflict_before_restore(
+    ctx: &Context,
+    ledger: &LedgerView,
+    file: &Portable,
+    copy: Option<&Portable>,
+) -> Result<Option<String>, Error> {
+    let entries = [Some(file), copy]
+        .into_iter()
+        .flatten()
+        .filter_map(|path| Some((path, ledger.get(path)?)));
+    for (path, entry) in entries {
+        if let restore::Restoration::Conflict { note, .. } =
+            restore::plan_restore_with(entry, &ctx.home, &ctx.git)?
+        {
+            return Ok(Some(if path == file {
+                note
+            } else {
+                format!("its repo copy {path} {note}")
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Take out of `targets` every file of a tree that `rm` must leave managed,
@@ -1412,22 +1473,8 @@ fn hold_trees(
                 // A tracked file is handed back through its repo copy too, so
                 // a copy that would conflict holds the tree as the file would.
                 let copy = ctx.tracked_copy(file);
-                let entries = [Some(file), copy.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|path| Some((path, ledger.get(path)?)));
-                for (path, entry) in entries {
-                    if let restore::Restoration::Conflict { note, .. } =
-                        restore::plan_restore_with(entry, &ctx.home, &ctx.git)?
-                    {
-                        let note = if path == file {
-                            note
-                        } else {
-                            format!("its repo copy {path} {note}")
-                        };
-                        own.push((file.clone(), note));
-                        break;
-                    }
+                if let Some(note) = conflict_before_restore(ctx, ledger, file, copy.as_ref())? {
+                    own.push((file.clone(), note));
                 }
             }
             if own.is_empty() {
@@ -2521,6 +2568,146 @@ mod tests {
             std::fs::read(home.child(".lock")).expect("kept"),
             b"machine\n"
         );
+    }
+
+    /// `~/.config/tool/lock`, tracked, with its repo copy at `files/lock`:
+    /// nested, so the write onto a fresh machine makes a directory.
+    const TRACKED_NESTED: &str = "[[target]]\npath = \"~/.config/tool/lock\"\n\
+                                  file = \"files/lock\"\ndirection = \"track\"\n";
+
+    /// A fresh machine tracking `~/.config/tool/lock`: only the repo has it,
+    /// until `apply` writes it here.
+    fn tracked_onto_a_fresh_machine() -> GuardedHome {
+        let home = repo(TRACKED_NESTED);
+        plant(&home, ".config/bx/files/lock", b"repo\n", 0o644);
+        apply_yes(&home);
+        assert_eq!(
+            std::fs::read(home.child(".config/tool/lock")).expect("written"),
+            b"repo\n"
+        );
+        home
+    }
+
+    #[test]
+    fn rm_of_a_tracked_target_apply_created_removes_it_and_its_directories() {
+        let home = tracked_onto_a_fresh_machine();
+        assert_eq!(
+            plan_exit(&home).0,
+            Exit::Converged,
+            "a second plan is empty"
+        );
+
+        let (exit, text) = rm_text(&home, "~/.config/tool");
+        assert_eq!(exit, Exit::Converged, "{text}");
+        assert!(
+            text.starts_with("  - ~/.config/tool/lock  removed the file bx created"),
+            "{text}"
+        );
+        assert!(
+            !home.child(".config/tool").exists(),
+            "the home is as it was"
+        );
+        assert_eq!(
+            std::fs::read(body(&home, "lock")).expect("the copy"),
+            b"repo\n",
+            "bx never wrote the repo copy"
+        );
+        assert_eq!(layer(&home), "");
+        assert_eq!(ledger(&home).iter().count(), 0);
+        assert!(
+            rm_rel(&home, ".config/tool").is_empty(),
+            "a second rm is a no-op"
+        );
+    }
+
+    #[test]
+    fn rm_of_a_tracked_tree_apply_created_removes_every_file_and_its_directories() {
+        let layer_text = "[[target]]\npath = \"~/.config/x\"\ntree = \"files/.config/x\"\n\
+                          direction = \"track\"\n";
+        let home = repo(layer_text);
+        plant(&home, ".config/bx/files/.config/x/a", b"a\n", 0o644);
+        plant(&home, ".config/bx/files/.config/x/sub/b", b"b\n", 0o644);
+        apply_yes(&home);
+        assert_eq!(
+            std::fs::read(home.child(".config/x/sub/b")).expect("written"),
+            b"b\n"
+        );
+        assert_eq!(
+            plan_exit(&home).0,
+            Exit::Converged,
+            "a second plan is empty"
+        );
+
+        let (exit, text) = rm_text(&home, "~/.config/x");
+        assert_eq!(exit, Exit::Converged, "{text}");
+        assert!(
+            text.contains("  - ~/.config/x/a  removed the file bx created")
+                && text.contains("  - ~/.config/x/sub/b  removed the file bx created"),
+            "{text}"
+        );
+        assert!(!home.child(".config/x").exists(), "the home is as it was");
+        assert_eq!(
+            std::fs::read(body(&home, ".config/x/a")).expect("a"),
+            b"a\n",
+            "bx never wrote the repo copies"
+        );
+        assert_eq!(
+            std::fs::read(body(&home, ".config/x/sub/b")).expect("b"),
+            b"b\n"
+        );
+        assert_eq!(layer(&home), "");
+        assert_eq!(ledger(&home).iter().count(), 0);
+        assert!(
+            rm_rel(&home, ".config/x").is_empty(),
+            "a second rm is a no-op"
+        );
+    }
+
+    #[test]
+    fn a_repo_change_written_over_a_copy_bx_created_keeps_it_claimed() {
+        let home = tracked_onto_a_fresh_machine();
+        std::fs::write(body(&home, "lock"), b"newer\n").expect("a pulled change");
+        apply_yes(&home);
+        assert_eq!(
+            std::fs::read(home.child(".config/tool/lock")).expect("written"),
+            b"newer\n"
+        );
+
+        let (exit, text) = rm_text(&home, "~/.config/tool/lock");
+        assert_eq!(exit, Exit::Converged, "{text}");
+        assert!(
+            !home.child(".config/tool").exists(),
+            "the home is as it was"
+        );
+    }
+
+    #[test]
+    fn rm_of_a_tracked_copy_the_tool_rewrote_is_a_conflict_that_changes_nothing() {
+        let home = tracked_onto_a_fresh_machine();
+        plant(&home, ".config/tool/lock", b"tool\n", 0o644);
+        sync_apply(&home);
+        assert_eq!(
+            std::fs::read(body(&home, "lock")).expect("carried"),
+            b"tool\n"
+        );
+
+        let (exit, text) = rm_text(&home, "~/.config/tool/lock");
+        assert_eq!(exit, Exit::Pending, "{text}");
+        assert!(
+            text.starts_with("  ! ~/.config/tool/lock  has been edited since bx wrote it"),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert_eq!(
+            std::fs::read(home.child(".config/tool/lock")).expect("kept"),
+            b"tool\n"
+        );
+        assert_eq!(
+            std::fs::read(body(&home, "lock")).expect("the copy"),
+            b"tool\n",
+            "the repo copy is not handed back without the machine copy"
+        );
+        assert_eq!(layer(&home), TRACKED_NESTED, "still declared");
     }
 
     #[test]

@@ -48,8 +48,9 @@
 //!
 //! zsh reads it from the generated interactive file's `options` phase, which
 //! every interactive zsh sources through `~/.zshrc`, login or not.
-//! [`History::render_bash`] is the same declaration in bash's names, for the
-//! entry that generates bash's own interactive file to place.
+//! [`History::render_bash`] is the same declaration in bash's names, and lands
+//! in the `options` phase of bash's generated interactive file, which
+//! `~/.bashrc` sources ([`crate::shell::bash`]).
 //!
 //! # Invariant 2
 //!

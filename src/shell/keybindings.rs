@@ -38,8 +38,7 @@
 //! [`Keybindings::render_readline`] is the same declaration in `~/.inputrc`'s
 //! words: the same bindings, in the same order, under the same action names.
 //! An inputrc has no terminfo lookup, so each key is bound to its literal
-//! sequence. Nothing attaches it to a file yet; the entry that generates
-//! bash's own files places it.
+//! sequence. [`crate::shell::bash`] writes it to `~/.inputrc`.
 //!
 //! # Invariant 2
 //!

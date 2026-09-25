@@ -487,12 +487,21 @@ pub fn run(
         .iter()
         .map(|target| with_activations(target.clone(), &report.activations))
         .collect();
+    let owned = |path: &paths::Portable| {
+        ledger
+            .get(path)
+            .is_some_and(|entry| entry.mechanism == Mechanism::Own)
+    };
     targets.extend(resolve::vacated_fragments(
         &inputs.resolved.targets,
-        |path| {
-            ledger
-                .get(path)
-                .is_some_and(|entry| entry.mechanism == Mechanism::Own)
+        owned,
+        // bash's files sit where a `[[target]]` may have put a file bx owns
+        // whole too, `~/.inputrc` above all, so only bytes that open with
+        // the generator's own header say the generator wrote them.
+        |path, header| {
+            owned(path)
+                && std::fs::read(path.render(&inputs.home))
+                    .is_ok_and(|bytes| bytes.starts_with(header.as_bytes()))
         },
         &inputs.home,
         &inputs.state.ledger(),

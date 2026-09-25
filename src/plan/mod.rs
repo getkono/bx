@@ -464,9 +464,13 @@ pub fn run(
     let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
     // Every declared activation is decided here, once, against the cache as
     // it stands, read without a lock: what the interactive file is rendered
-    // with below is what `apply` records, and nothing decides them again.
-    let cache = Fingerprints::read(&inputs.state)?.value;
-    report.activations = activation::plan(&inputs.activations, &cache, &inputs.roots, &inputs.host);
+    // with below is what `apply` records, and nothing decides them again. A
+    // configuration declaring none never opens the cache at all.
+    if !inputs.activations.is_empty() {
+        let cache = Fingerprints::read(&inputs.state)?.value;
+        report.activations =
+            activation::plan(&inputs.activations, &cache, &inputs.roots, &inputs.host);
+    }
     let ctx = decide::Ctx {
         ledger: &ledger,
         home: &inputs.home,
@@ -558,7 +562,9 @@ pub fn run(
             }
             // Last, so a cache entry is never saved for output a failed write
             // left out of the file: losing it costs only a re-run.
-            record_activations(&inputs.state, &report.activations)?;
+            if !inputs.activations.is_empty() {
+                record_activations(&inputs.state, &report.activations)?;
+            }
             report.executed = true;
             Ok(report)
         }
@@ -589,6 +595,10 @@ fn with_activations(
 /// the activation entries, so nothing another writer recorded is lost. An
 /// unchanged store is not written, so an `apply` that captured nothing
 /// leaves `fingerprints.mpk` byte-identical.
+///
+/// Called only for a configuration that declares an activation, so one that
+/// declares none never touches the store; the entries of activations since
+/// removed are forgotten by the next `apply` that records any.
 fn record_activations(state: &StateDir, activations: &activation::Plan) -> Result<(), Error> {
     state.ensure()?;
     let lock = ExclusiveLock::acquire(state)?;

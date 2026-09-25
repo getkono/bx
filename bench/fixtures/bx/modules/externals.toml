@@ -1,0 +1,6 @@
+# A git repository bx keeps checked out at one pinned commit. It moves only
+# when `rev` changes.
+[[external]]
+path = "~/.local/share/zsh/zsh-autosuggestions"
+url  = "https://github.com/zsh-users/zsh-autosuggestions"
+rev  = "e52ee8ca55bcc56a17c828767a3f98f22a68d4eb" # v0.7.1

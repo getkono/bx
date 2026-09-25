@@ -1,4 +1,4 @@
-//! Check 7: a declared optional source ([`crate::shell::source`]) whose file
+//! Check 6: a declared optional source ([`crate::shell::source`]) whose file
 //! is not there to source.
 //!
 //! The question is the one the generated line asks — `[[ -r FILE ]]` — put

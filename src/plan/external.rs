@@ -537,9 +537,13 @@ fn deepest_first(dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// made: a branch bx created would carry commits past `rev` that `rm` could
 /// not tell from the user's. The fetch takes every branch, as a clone would,
 /// and then `rev` by id when no branch holds it.
+///
+/// The repository is made in the object format `rev` is written in, since git
+/// refuses to fetch between formats: a 64-hex `rev` is SHA-256, and a 40-hex
+/// one SHA-1 whatever the user's `init.defaultObjectFormat` says.
 fn populate(git: &Git, dest: &Path, url: &str, rev: &str) -> Outcome {
     let run = |args: &[&str]| git.query(dest, args).map(drop).map_err(|e| problem(&e));
-    run(&["init", "--quiet"])?;
+    run(&["init", "--quiet", object_format(rev)])?;
     run(&["remote", "add", "origin", url])?;
     fetch(git, dest, rev)?;
     run(&[
@@ -554,6 +558,15 @@ fn populate(git: &Git, dest: &Path, url: &str, rev: &str) -> Outcome {
         Ok(head) if head == rev => Ok(()),
         Ok(head) => Err(format!("git checked out {head}, not {rev}")),
         Err(error) => Err(problem(&error)),
+    }
+}
+
+/// The `git init` option for the object format a full commit id `rev` is in.
+fn object_format(rev: &str) -> &'static str {
+    if rev.len() == 64 {
+        "--object-format=sha256"
+    } else {
+        "--object-format=sha1"
     }
 }
 
@@ -954,6 +967,49 @@ mod tests {
         let again = apply(&home, &layer(&up.first));
         assert_eq!(again.actions(), [Action::Unchanged]);
         assert!(!again.executed, "nothing to do");
+    }
+
+    #[test]
+    fn a_clone_is_made_in_the_object_format_its_rev_is_written_in() {
+        // A SHA-256 upstream: a 64-hex rev is cloned into a SHA-256 checkout.
+        let home = guarded_home();
+        let up = upstream(&home);
+        let dir = home.child("upstream");
+        std::fs::remove_dir_all(&dir).expect("the SHA-1 upstream");
+        std::fs::create_dir(&dir).expect("the upstream");
+        git_run(
+            home.path(),
+            &dir,
+            &["init", "--quiet", "-b", "master", "--object-format=sha256"],
+        );
+        std::fs::write(dir.join("a.zsh"), "one\n").expect("a file");
+        commit_all(home.path(), &dir, "first");
+        let rev = git_run(home.path(), &dir, &["rev-parse", "HEAD"]);
+        assert_eq!(rev.len(), 64);
+
+        let applied = apply(&home, &layer(&rev));
+        assert!(applied.stopped.is_empty(), "{applied:?}");
+        assert_eq!(checked_out(&home), rev);
+        assert_eq!(
+            git_run(
+                home.path(),
+                &home.child(AT),
+                &["rev-parse", "--show-object-format"]
+            ),
+            "sha256"
+        );
+        assert_eq!(plan(&home, &layer(&rev)).actions(), [Action::Unchanged]);
+        drop(up);
+
+        // A 40-hex rev is SHA-1 even where the user's git makes SHA-256.
+        let home = guarded_home();
+        let up = upstream(&home);
+        let mut config = std::fs::read_to_string(home.child(".gitconfig")).expect("the config");
+        config.push_str("[init]\n\tdefaultObjectFormat = sha256\n");
+        std::fs::write(home.child(".gitconfig"), config).expect("~/.gitconfig");
+        let applied = apply(&home, &layer(&up.first));
+        assert!(applied.stopped.is_empty(), "{applied:?}");
+        assert_eq!(checked_out(&home), up.first);
     }
 
     #[test]

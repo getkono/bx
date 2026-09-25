@@ -1948,19 +1948,25 @@ impl Session {
         // durable Intent: see the method's documentation.
         let staged = fs::stage_as(&dest, &temp, mode, planned, &mut self.created)?;
         self.crash.reached(index, Phase::AfterStage);
-        self.refuse_unannounced(&dest, &created_dirs, staged.created_dirs())?;
-        let filled = staged.fill(bytes)?;
-        self.crash.reached(index, Phase::AfterFill);
+        let made = staged.created_dirs().to_vec();
+        let published = (|| -> Result<(), Error> {
+            self.refuse_unannounced(&dest, &created_dirs, staged.created_dirs())?;
+            let filled = staged.fill(bytes)?;
+            self.crash.reached(index, Phase::AfterFill);
 
-        #[cfg(test)]
-        if let Some(meddle) = self.before_publish {
-            meddle(filled.dest());
-        }
-        // Nothing is recorded yet, so a refused publish leaves no ledger entry
-        // to withdraw: the refusal's cause is all there is to hand on.
-        filled
-            .publish()
-            .map_err(crate::fs::Unpublished::into_error)?;
+            #[cfg(test)]
+            if let Some(meddle) = self.before_publish {
+                meddle(filled.dest());
+            }
+            // Nothing is recorded yet, so a refused publish leaves no ledger
+            // entry to withdraw: the refusal's cause is all there is to hand on.
+            filled
+                .publish()
+                .map_err(crate::fs::Unpublished::into_error)?;
+            Ok(())
+        })();
+        // The temporary file went with the refused write; see `unmake`.
+        published.or_else(|error| unmake(&made, error))?;
         // Only now is there something to own, or to stop owning. Told any
         // earlier, the ledger would describe a write whose publish then failed.
         self.settle_entry(&target, entry)?;
@@ -2141,17 +2147,23 @@ impl Session {
 
         let staged = fs::stage_link_as(&dest, &temp, text, planned, &mut self.created)?;
         self.crash.reached(index, Phase::AfterStage);
-        self.refuse_unannounced(&dest, &created_dirs, staged.created_dirs())?;
-        // A link is complete when it is made: there is no content to fill.
-        self.crash.reached(index, Phase::AfterFill);
+        let made = staged.created_dirs().to_vec();
+        let published = (|| -> Result<(), Error> {
+            self.refuse_unannounced(&dest, &created_dirs, staged.created_dirs())?;
+            // A link is complete when it is made: there is no content to fill.
+            self.crash.reached(index, Phase::AfterFill);
 
-        #[cfg(test)]
-        if let Some(meddle) = self.before_publish {
-            meddle(staged.dest());
-        }
-        staged
-            .publish()
-            .map_err(crate::fs::Unpublished::into_error)?;
+            #[cfg(test)]
+            if let Some(meddle) = self.before_publish {
+                meddle(staged.dest());
+            }
+            staged
+                .publish()
+                .map_err(crate::fs::Unpublished::into_error)?;
+            Ok(())
+        })();
+        // As in `write`.
+        published.or_else(|error| unmake(&made, error))?;
         self.settle_entry(&target, entry)?;
         self.crash.reached(index, Phase::AfterPublish);
 
@@ -2868,6 +2880,81 @@ pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Roll back the directories an interrupted write announced it would make,
+/// given that this rollback has just removed `below` — the write's own
+/// temporary file, its published destination, or a directory target's own
+/// directory — from the deepest of them.
+///
+/// An Intent names its directories **before** they are made, so a crash
+/// between the Intent and the stage leaves it naming directories bx never
+/// made. Standing empty proves nothing: one the user made after that crash is
+/// empty too. What proves a directory bx's is that it held bx's own artefact
+/// and nothing else, so each is removed only when the one entry this Intent
+/// names inside it — `below`, then each directory removed before it — was
+/// directly inside it and has just gone, and it now stands empty. The walk
+/// stops at the first that is not: one never made (absent), one holding
+/// anything else, or one the chain does not reach, such as the parent of a
+/// declared directory this Intent does not name. A predicted directory that
+/// is fully empty is therefore left, for `bx doctor` to report.
+///
+/// `dirs` is deepest first, as [`Intent::created_dirs`] is.
+///
+/// # Errors
+///
+/// [`Error::Io`] for a failure that is neither "not empty" nor "not a
+/// directory".
+pub(crate) fn prune_beneath(below: &Path, dirs: &[PathBuf]) -> Result<(), Error> {
+    let mut child = below;
+    for dir in dirs {
+        if child.parent() != Some(dir.as_path()) || !remove_made_dir(dir)? {
+            break;
+        }
+        child = dir;
+    }
+    Ok(())
+}
+
+/// Remove `dir` if it is an empty directory, and say whether this call
+/// removed it. Unlike [`remove_if_empty`], one already absent is **not**
+/// removed: nothing shows it was ever made.
+///
+/// # Errors
+///
+/// What [`remove_if_empty`] returns.
+pub(crate) fn remove_made_dir(dir: &Path) -> Result<bool, Error> {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return Ok(false);
+    }
+    remove_if_empty(dir)
+}
+
+/// Hand on `error`, the refusal of a staged write, once the directories the
+/// stage just made — `made`, deepest first — are removed where they stand
+/// empty.
+///
+/// The stage made them in this process a moment ago, so they are bx's without
+/// any record to show it; the refused write dropped its temporary file on the
+/// way here. Left standing, one the Intent did not predict (a parent deleted
+/// between the prediction and the stage) is in neither the journal nor the
+/// ledger, and no rollback or `rm` would ever remove it; one it did predict no
+/// longer holds the temporary file, so the rollback could not show it was made
+/// (see [`prune_beneath`]). `rmdir` only, stopping at the first that is not
+/// empty, as [`prune_dirs`] does. A failure to remove one is logged and the
+/// refusal is still what is returned: it is the cause the user needs.
+///
+/// # Errors
+///
+/// `error`, always.
+fn unmake(made: &[PathBuf], error: Error) -> Result<(), Error> {
+    if let Err(prune) = prune_dirs(made) {
+        tracing::warn!(
+            %prune,
+            "a directory a refused write made could not be removed; it is left for bx doctor",
+        );
+    }
+    Err(error)
 }
 
 /// Remove a directory bx created if it is empty, and say whether it is gone.

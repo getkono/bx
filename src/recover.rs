@@ -565,17 +565,25 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         // decision 11 keeps for `bx doctor`, and stopping every writing
         // command over it would make a leftover bx does not need a reason to
         // write nothing. `pending` names it in the write's note.
+        //
+        // Whether it was there to remove is what shows the directories the
+        // Intent names were made: see `journal::prune_beneath`.
+        let mut temp_removed = None;
         if !complete
             && !matches!(step, Step::Blocked)
             && let Some(temp) = &intent.temp
-            && let Err(error) = journal::unlink(temp)
         {
-            tracing::warn!(
-                temp = %temp.display(),
-                %error,
-                "an interrupted write's temporary file could not be removed; \
-                 it is left for bx doctor, and the rollback goes on",
-            );
+            let present = std::fs::symlink_metadata(temp).is_ok();
+            match journal::unlink(temp) {
+                Ok(()) if present => temp_removed = Some(temp),
+                Ok(()) => {}
+                Err(error) => tracing::warn!(
+                    temp = %temp.display(),
+                    %error,
+                    "an interrupted write's temporary file could not be removed; \
+                     it is left for bx doctor, and the rollback goes on",
+                ),
+            }
         }
         match step {
             Step::Blocked => {
@@ -583,9 +591,18 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 continue;
             }
             Step::Skip => continue,
+            // The Intent names its directories before they are made, so a
+            // crash before the stage leaves it naming directories bx never
+            // made, and the user may have made one since. Only a directory
+            // that held this write's own temporary file, or the next
+            // directory in that chain, is bx's to prune; with no temporary
+            // file removed there is nothing to show any of them was made,
+            // and every one is left.
             Step::Keep => {
-                if intent.creates() {
-                    journal::prune_dirs(&intent.created_dirs)?;
+                if intent.creates()
+                    && let Some(temp) = temp_removed
+                {
+                    journal::prune_beneath(temp, &intent.created_dirs)?;
                 }
             }
             // Both act against the observation `decide` judged, never a fresh
@@ -598,18 +615,20 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             // itself, as for `Session::remove` and [`fs::Filled::publish`].
             // A directory the session created goes only while it is empty,
             // and its parents after it: bx never removes what is inside one,
-            // so an edit inside it since `decide` looked is never lost.
-            Step::Unlink { .. } if intent.dir => journal::prune_dirs(
-                &std::iter::once(intent.dest.clone())
-                    .chain(intent.created_dirs.iter().cloned())
-                    .collect::<Vec<_>>(),
-            )?,
+            // so an edit inside it since `decide` looked is never lost. Its
+            // parents go only in the chain above what this rollback removed,
+            // as for `Step::Keep`.
+            Step::Unlink { .. } if intent.dir => {
+                if journal::remove_made_dir(&intent.dest)? {
+                    journal::prune_beneath(&intent.dest, &intent.created_dirs)?;
+                }
+            }
             Step::Unlink { observed } => {
                 #[cfg(test)]
                 tests::before_act(&intent.dest);
                 journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
                 journal::unlink(&intent.dest)?;
-                journal::prune_dirs(&intent.created_dirs)?;
+                journal::prune_beneath(&intent.dest, &intent.created_dirs)?;
             }
             Step::Rewrite {
                 bytes,

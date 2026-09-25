@@ -29,7 +29,7 @@ use crate::fs::{self, Desired, Kind, Mode, Observed};
 use crate::journal::{Content, Ownership, Request};
 use crate::paths::{self, Portable};
 use crate::report::Action;
-use crate::state::{LedgerEntry, LedgerView, Mechanism};
+use crate::state::{ContentHash, Fingerprint, LedgerEntry, LedgerView, Mechanism};
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +47,121 @@ pub(super) struct Ctx<'a> {
     pub secrets: &'a Secrets,
     /// The directories decided so far that apply leaves at a declared mode.
     pub declared: &'a Declared,
+    /// The bytes each tracked target's two sides last agreed on.
+    pub bases: &'a Bases,
+}
+
+/// What each tracked target's copy on this machine and copy in the repo last
+/// agreed on, keyed by the target: what "changed since the last sync" is
+/// measured from. Read from the fingerprint cache — see [`super::bases`].
+pub(super) type Bases = BTreeMap<Portable, Base>;
+
+/// What a tracked target's two sides last agreed on, as the fingerprint cache
+/// keeps it: the bytes themselves while they are small, and otherwise only
+/// their digest. See [`Base::fingerprint`] for why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Base {
+    /// The agreed bytes, kept whole so a conflict can show each side's diff
+    /// from them.
+    Bytes(Vec<u8>),
+    /// The SHA-256 of agreed bytes larger than [`Base::KEPT_WHOLE`].
+    Digest([u8; 32]),
+}
+
+impl Base {
+    /// The largest agreement kept whole, in bytes.
+    pub(super) const KEPT_WHOLE: usize = 64 * 1024;
+
+    /// The tag of an agreement kept whole.
+    const BYTES: u8 = b'=';
+
+    /// The tag of an agreement kept as a digest.
+    const DIGEST: u8 = b'#';
+
+    /// The agreement on `bytes`, as it is kept.
+    pub(super) fn of(bytes: &[u8]) -> Self {
+        if bytes.len() <= Self::KEPT_WHOLE {
+            Self::Bytes(bytes.to_vec())
+        } else {
+            Self::Digest(*ContentHash::of(bytes).as_bytes())
+        }
+    }
+
+    /// Whether `bytes` are what was agreed on.
+    pub(super) fn holds(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Bytes(agreed) => agreed == bytes,
+            Self::Digest(digest) => digest == ContentHash::of(bytes).as_bytes(),
+        }
+    }
+
+    /// The fingerprint-cache entry this agreement is kept as: a tag byte, then
+    /// the bytes or the digest.
+    ///
+    /// # Decision: small agreements are kept whole, large ones as a digest
+    ///
+    /// Deciding which side moved needs only a comparison, which a digest
+    /// answers. Showing a conflict does not: issue #32 asks for *both sides'
+    /// diffs*, each measured from the last agreement, and a diff needs the
+    /// bytes it is measured from. Nothing else holds them — the repo's copy
+    /// may have been rewritten by another machine since, and the machine's by
+    /// the tool — so the cache keeps them.
+    ///
+    /// The fingerprint cache is for short inputs, so what it keeps is bounded:
+    /// an agreement of at most [`Base::KEPT_WHOLE`] bytes is kept whole, and a
+    /// larger one only as its digest, whose conflict shows the one diff
+    /// between the two sides instead. A plugin manager's lock file, the
+    /// target track mode exists for, is a few kilobytes.
+    pub(super) fn fingerprint(&self) -> Fingerprint {
+        let mut kept = Vec::new();
+        match self {
+            Self::Bytes(bytes) => {
+                kept.push(Self::BYTES);
+                kept.extend_from_slice(bytes);
+            }
+            Self::Digest(digest) => {
+                kept.push(Self::DIGEST);
+                kept.extend_from_slice(digest);
+            }
+        }
+        Fingerprint::raw(kept)
+    }
+
+    /// The agreement a fingerprint-cache entry keeps, or `None` for one in no
+    /// shape [`Base::fingerprint`] writes — which reads as no agreement, and
+    /// so costs a question rather than an overwrite.
+    pub(super) fn from_fingerprint(fingerprint: &Fingerprint) -> Option<Self> {
+        match fingerprint.as_bytes().split_first()? {
+            (&Self::BYTES, bytes) if bytes.len() <= Self::KEPT_WHOLE => {
+                Some(Self::Bytes(bytes.to_vec()))
+            }
+            (&Self::DIGEST, digest) => Some(Self::Digest(digest.try_into().ok()?)),
+            _ => None,
+        }
+    }
+}
+
+/// When the bytes a tracked target's two sides hold become the bytes they
+/// last agreed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum When {
+    /// Already: both sides hold them.
+    Now,
+    /// Once `apply` has written the repo's copy onto this machine.
+    Applied,
+    /// Once `sync` has carried this machine's copy into the repo.
+    Synced,
+}
+
+/// What a tracked target's two sides will agree on, and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Agreed {
+    /// The tracked target.
+    pub target: Portable,
+    /// The bytes both sides hold once [`Agreed::when`] has happened.
+    pub bytes: Vec<u8>,
+    /// What has to happen first.
+    pub when: When,
 }
 
 /// The directories whose targets apply leaves at a declared mode — created,
@@ -66,6 +181,13 @@ pub(super) struct Decided {
     /// The writes, in the order `apply` makes them: every directory first,
     /// shallowest first, then every file in configuration order.
     pub ops: Vec<Op>,
+    /// The writes only `sync` makes, after every one of [`Decided::ops`]:
+    /// each tracked target's copy on this machine carried into the repo, in
+    /// configuration order.
+    pub carries: Vec<Op>,
+    /// What each tracked target's two sides will agree on, in configuration
+    /// order.
+    pub agreed: Vec<Agreed>,
     /// The directories the session is to declare before its first write.
     pub declared: Declared,
 }
@@ -130,8 +252,22 @@ pub(super) fn decide_all(
         declared: &declared,
         ..*ctx
     };
+    let mut carries = Vec::new();
+    let mut agreed = Vec::new();
     for (at, resolution) in resolutions.iter().enumerate() {
         if rows[at].is_some() {
+            continue;
+        }
+        if let Resolution::Ready(target) = resolution
+            && target.direction == Direction::Track
+        {
+            let (change, op, agreement) = decide_track(target, &files)?;
+            rows[at] = Some(change);
+            match op {
+                Some(op) if op.carry => carries.push(op),
+                op => ops.extend(op),
+            }
+            agreed.extend(agreement);
             continue;
         }
         let (change, op) = decide(resolution, &files)?;
@@ -141,6 +277,8 @@ pub(super) fn decide_all(
     Ok(Decided {
         changes: rows.into_iter().flatten().collect(),
         ops,
+        carries,
+        agreed,
         declared,
     })
 }
@@ -342,6 +480,14 @@ pub(super) struct Op {
     made: Made,
     planned: Observed,
     mode: Mode,
+    /// Whether bx owns what it leaves. Every write does but one: the repo's
+    /// copy of a tracked target written onto this machine, which stays the
+    /// tool's — journalled like any write, so an interruption is rolled back,
+    /// and recorded in no ledger entry, so `rm` never touches it.
+    claimed: bool,
+    /// Whether this is a tracked target's copy on this machine carried into
+    /// the repo, which only `sync` writes.
+    carry: bool,
 }
 
 /// What an [`Op`] leaves at its destination.
@@ -404,7 +550,11 @@ impl Op {
             dest: self.dest,
             content,
             mode: self.mode,
-            ownership: Ownership::Owned(mechanism),
+            ownership: if self.claimed {
+                Ownership::Owned(mechanism)
+            } else {
+                Ownership::Released
+            },
         }
     }
 }
@@ -433,6 +583,10 @@ pub(super) fn decide(
             return Ok((change, None));
         }
     };
+    if target.direction == Direction::Track {
+        let (change, op, _) = decide_track(target, ctx)?;
+        return Ok((change, op));
+    }
     // A generator may hold part of its content back, and every row of its
     // target says so, whatever the row's action.
     let held = match &target.body {
@@ -515,7 +669,9 @@ pub(super) fn decide(
     let shown = match action {
         Action::Create | Action::Modify => true,
         Action::Conflict => observed.kind == Kind::File,
-        Action::Unchanged | Action::Blocked => false,
+        // Only a tracked target is carried into the repo, and it is decided
+        // by `decide_track`.
+        Action::Unchanged | Action::Sync | Action::Blocked => false,
     };
     // A secret's plaintext, and whatever is on disk where it goes, are never
     // shown: the plan is printed, piped and pasted.
@@ -551,6 +707,8 @@ pub(super) fn decide(
         },
         planned: observed,
         mode,
+        claimed: true,
+        carry: false,
     });
     Ok((change, op))
 }
@@ -714,6 +872,8 @@ fn decide_dir(
         made: Made::Dir,
         planned: observed,
         mode,
+        claimed: true,
+        carry: false,
     });
     Ok((change, op))
 }
@@ -820,7 +980,7 @@ fn decide_link(
         Action::Conflict if observed.kind == Kind::Symlink => {
             Some(Diff::link(observed.link.as_deref(), Some(&text)))
         }
-        Action::Conflict | Action::Unchanged | Action::Blocked => None,
+        Action::Conflict | Action::Unchanged | Action::Sync | Action::Blocked => None,
     };
     let note = match action {
         Action::Create => join([created_dirs(&observed, ctx.home, ctx.declared), note]),
@@ -833,6 +993,8 @@ fn decide_link(
         made: Made::Link(text),
         planned: observed,
         mode: Mode::LINK,
+        claimed: true,
+        carry: false,
     });
     Ok((change, op))
 }
@@ -1024,12 +1186,289 @@ fn unsupported(target: &Target) -> Option<&'static str> {
             Some("a managed region is not supported until entry C1")
         }
         (Attach::Include { .. }, _, _) => Some("an include line is not supported until entry C1"),
-        (_, Direction::Track, _) => Some("track mode is not supported until entry C4"),
         (_, _, Format::Jsonc { .. }) => Some("owning JSONC keys is not supported until entry C3"),
-        (Attach::Own | Attach::Region { .. }, Direction::Apply, Format::Opaque | Format::EnvD) => {
-            None
+        (Attach::Region { .. }, Direction::Track, _) | (_, Direction::Track, Format::EnvD) => {
+            Some(TRACK_SHAPE)
+        }
+        (
+            Attach::Own | Attach::Region { .. },
+            Direction::Apply | Direction::Track,
+            Format::Opaque | Format::EnvD,
+        ) => None,
+    }
+}
+
+/// Why a tracked target of any shape but a whole file is blocked.
+const TRACK_SHAPE: &str = "track mode carries this machine's whole file into the config repo, \
+                           so it needs a `file` body, attach = \"own\" and format = \"opaque\"";
+
+/// Decide one tracked target: the machine's copy leads, and the repo's
+/// follows.
+///
+/// # Decision: both sides are compared with what they last agreed on
+///
+/// A tracked target has two copies — this machine's, at its path, which the
+/// tool rewrites, and the repo's, at its `file` body — and [`Ctx::bases`]
+/// holds the bytes the two last agreed on. Which one moved decides the row:
+///
+/// | this machine | the repo | row |
+/// | --- | --- | --- |
+/// | the same bytes as the repo | | unchanged, and they now agree |
+/// | nothing | nothing | unchanged: there is nothing to track yet |
+/// | nothing | a copy | create: `apply` writes the repo's copy here |
+/// | a copy | nothing | sync: `sync` carries this machine's copy into the repo |
+/// | changed since they agreed | as they agreed | sync |
+/// | as they agreed | changed since they agreed | modify: `apply` writes the repo's copy here |
+/// | changed since they agreed | changed since they agreed | conflict, with both sides' diffs (the one diff between them past [`Base::KEPT_WHOLE`]) |
+/// | differs from the repo, with no agreement recorded | | conflict |
+///
+/// A conflict waits for a human: bx never merges the two, and never picks one
+/// over the other when it cannot tell which one moved. With no agreement
+/// recorded — the first sync on this machine, or a fingerprint cache that was
+/// lost — that is every difference, which is what makes losing the cache safe:
+/// it costs a question, never an overwrite.
+///
+/// # Decision: the machine's copy is never bx's
+///
+/// Where `apply` writes the repo's copy onto this machine, the write is
+/// journalled — an interruption is rolled back like any other — but claimed in
+/// no ledger entry. The tool rewrites the file as it pleases, and an entry
+/// would turn its next rewrite into "edited since bx last wrote it" and make
+/// `rm` put back bytes the tool has long replaced. So the machine's copy is
+/// compared with the agreement, never with the ledger, and `rm` leaves it
+/// alone.
+///
+/// The repo's copy is the other way round: `sync` claims it as a whole file
+/// owned by bx, so the ledger keeps the bytes it held before tracking began,
+/// and `rm` puts them back.
+fn decide_track(
+    target: &Target,
+    ctx: &Ctx<'_>,
+) -> Result<(Change, Option<Op>, Option<Agreed>), Error> {
+    let row = |action, diff, note: Option<String>| Change {
+        target: target.path.as_str().to_string(),
+        origin: target.origin.clone(),
+        action,
+        diff,
+        note,
+    };
+    let blocked = |note: &str| {
+        Ok((
+            row(Action::Blocked, None, Some(note.to_string())),
+            None,
+            None,
+        ))
+    };
+    if let Some(note) = unsupported(target) {
+        return blocked(note);
+    }
+    let Body::File(rel) = &target.body else {
+        return blocked(TRACK_SHAPE);
+    };
+    let copy_dest = ctx.repo.join(rel);
+    let copy =
+        Portable::from_path(&copy_dest, ctx.home).map_err(|source| fs::Error::NotPortable {
+            path: copy_dest.clone(),
+            source,
+        })?;
+    let dest = target.path.render(ctx.home);
+    let machine = fs::observe(&dest)?;
+    let repo = fs::observe(&copy_dest)?;
+    let shown = target.path.as_str();
+    let conflict = |why: String, diff| Ok((row(Action::Conflict, diff, Some(why)), None, None));
+
+    for (side, observed) in [
+        ("this machine's copy", &machine),
+        ("the repo's copy", &repo),
+    ] {
+        if !matches!(observed.kind, Kind::File | Kind::Absent) {
+            return conflict(
+                format!("{side} is not a regular file, so bx cannot track it"),
+                None,
+            );
         }
     }
+    let agreed = |bytes: &[u8], when| {
+        Some(Agreed {
+            target: target.path.clone(),
+            bytes: bytes.to_vec(),
+            when,
+        })
+    };
+    let (machine_bytes, repo_bytes) = (machine.bytes.as_deref(), repo.bytes.as_deref());
+    let (m, r) = match (machine_bytes, repo_bytes) {
+        (None, None) => {
+            let note = "neither this machine nor the repo has it yet".to_string();
+            return Ok((row(Action::Unchanged, None, Some(note)), None, None));
+        }
+        (Some(m), Some(r)) if m == r => {
+            return Ok((
+                row(Action::Unchanged, None, None),
+                None,
+                agreed(m, When::Now),
+            ));
+        }
+        (None, Some(r)) => {
+            let (change, op) = track_onto_machine(target, &machine, r, ctx, row)?;
+            let agreement = op.is_some().then(|| agreed(r, When::Applied)).flatten();
+            return Ok((change, op, agreement));
+        }
+        (Some(m), None) => {
+            let (change, op) =
+                track_into_repo(shown, rel, (copy, &repo), m, machine.mode, ctx, row)?;
+            let agreement = op.is_some().then(|| agreed(m, When::Synced)).flatten();
+            return Ok((change, op, agreement));
+        }
+        (Some(m), Some(r)) => (m, r),
+    };
+    match ctx.bases.get(&target.path) {
+        Some(base) if base.holds(r) => {
+            let (change, op) =
+                track_into_repo(shown, rel, (copy, &repo), m, machine.mode, ctx, row)?;
+            let agreement = op.is_some().then(|| agreed(m, When::Synced)).flatten();
+            Ok((change, op, agreement))
+        }
+        Some(base) if base.holds(m) => {
+            let (change, op) = track_onto_machine(target, &machine, r, ctx, row)?;
+            let agreement = op.is_some().then(|| agreed(r, When::Applied)).flatten();
+            Ok((change, op, agreement))
+        }
+        Some(base) => {
+            let why = "this machine and the repo both changed it since the last sync; bx merges \
+                       neither. Make the two copies the same by hand, and bx tracks it again";
+            let diff = match base {
+                Base::Bytes(base) => Some(Diff::diverged(shown, base, m, r)),
+                // Too large to have been kept whole: the one diff between the
+                // two sides is all there is to show.
+                Base::Digest(_) => {
+                    Diff::labelled(shown, ("repo", "this machine"), Some(r), m, None)
+                }
+            };
+            conflict(why.to_string(), diff)
+        }
+        None => conflict(
+            format!(
+                "differs from the repo's copy at {}, and no sync on this machine has recorded \
+                 which one changed; make the two the same by hand, and bx tracks it from there",
+                rel.display()
+            ),
+            Diff::labelled(shown, ("repo", "this machine"), Some(r), m, None),
+        ),
+    }
+}
+
+/// The row, and the write, that puts the repo's copy `bytes` of a tracked
+/// target onto this machine, where `observed` is: a create where there is
+/// nothing, and otherwise a modify at the mode the file already has, since
+/// the file is the tool's.
+fn track_onto_machine(
+    target: &Target,
+    observed: &Observed,
+    bytes: &[u8],
+    ctx: &Ctx<'_>,
+    row: impl Fn(Action, Option<Diff>, Option<String>) -> Change,
+) -> Result<(Change, Option<Op>), Error> {
+    let mode = observed
+        .mode
+        .unwrap_or_else(|| Mode::resolve(target.mode, Kind::File));
+    let outcome = fs::compare(observed, &Desired { bytes, mode }, ctx.home);
+    let unusable = observed.parent.as_ref().and_then(|parent| {
+        let reason = parent.unusable()?;
+        Some(portable_reason(&parent.path, reason, ctx.home))
+    });
+    let action = if observed.kind == Kind::Absent {
+        Action::Create
+    } else {
+        Action::Modify
+    };
+    let why = match (unusable, outcome.action) {
+        (Some(reason), _) => Some(reason),
+        (None, Action::Conflict) => Some(outcome.note.unwrap_or_default()),
+        (None, _) => locked_parent(observed, ctx.home, ctx.declared, Write::File),
+    };
+    if let Some(why) = why {
+        return Ok((row(Action::Conflict, None, Some(why)), None));
+    }
+    let diff = Diff::labelled(
+        target.path.as_str(),
+        ("this machine", "repo"),
+        observed.bytes.as_deref(),
+        bytes,
+        None,
+    );
+    let note = match action {
+        Action::Create => join([
+            Some("this machine has no copy; apply writes the repo's".to_string()),
+            created_dirs(observed, ctx.home, ctx.declared),
+            outcome.parent_note,
+        ]),
+        _ => join([
+            Some("the repo's copy changed since the last sync; apply writes it here".to_string()),
+            outcome.parent_note,
+        ]),
+    };
+    let op = Op {
+        target: target.path.clone(),
+        dest: observed.path.clone(),
+        made: Made::Bytes(bytes.to_vec()),
+        planned: observed.clone(),
+        mode,
+        claimed: false,
+        carry: false,
+    };
+    Ok((row(action, diff, note), Some(op)))
+}
+
+/// The row, and the write only `sync` makes, that carries this machine's copy
+/// `bytes`, at `machine_mode`, of a tracked target into the repo's copy at
+/// `rel`: `copy` is that copy's ledger key and what is there now.
+///
+/// A copy the repo already has keeps its mode; a new one takes the mode of
+/// this machine's, so a private file is not made readable in the repo.
+fn track_into_repo(
+    shown: &str,
+    rel: &Path,
+    (copy, repo): (Portable, &Observed),
+    bytes: &[u8],
+    machine_mode: Option<Mode>,
+    ctx: &Ctx<'_>,
+    row: impl Fn(Action, Option<Diff>, Option<String>) -> Change,
+) -> Result<(Change, Option<Op>), Error> {
+    let mode = repo.mode.or(machine_mode).unwrap_or(Mode::DEFAULT_FILE);
+    let outcome = fs::compare(repo, &Desired { bytes, mode }, ctx.home);
+    let unusable = repo.parent.as_ref().and_then(|parent| {
+        let reason = parent.unusable()?;
+        Some(portable_reason(&parent.path, reason, ctx.home))
+    });
+    let why = match (unusable, outcome.action) {
+        (Some(reason), _) => Some(reason),
+        (None, Action::Conflict) => Some(outcome.note.unwrap_or_default()),
+        (None, _) => locked_parent(repo, ctx.home, ctx.declared, Write::File),
+    };
+    if let Some(why) = why {
+        return Ok((row(Action::Conflict, None, Some(why)), None));
+    }
+    let diff = Diff::labelled(
+        shown,
+        ("repo", "this machine"),
+        repo.bytes.as_deref(),
+        bytes,
+        None,
+    );
+    let note = format!(
+        "this machine changed it; bx sync carries it into {} and commits it",
+        rel.display()
+    );
+    let op = Op {
+        target: copy,
+        dest: repo.path.clone(),
+        made: Made::Bytes(bytes.to_vec()),
+        planned: repo.clone(),
+        mode,
+        claimed: true,
+        carry: true,
+    };
+    Ok((row(Action::Sync, diff, Some(note)), Some(op)))
 }
 
 /// Judge a generated body against Invariant 2, as what it is.
@@ -1268,6 +1707,7 @@ mod tests {
             roots: &roots,
             secrets: &Secrets::default(),
             declared: &Declared::new(),
+            bases: &Bases::new(),
         };
         let shaped = |change: fn(&mut Target)| {
             let mut target = a_target(home.path(), "~/.a");
@@ -1278,7 +1718,7 @@ mod tests {
         };
         // An env.d fragment is written since entry B1, and a region around a
         // generated body; a region around a body a config author wrote is not.
-        let cases: [(Target, &str); 5] = [
+        let cases: [(Target, &str); 4] = [
             (
                 shaped(|t| t.attach = Attach::Region { comment: '#' }),
                 "entry C1",
@@ -1291,7 +1731,6 @@ mod tests {
                 }),
                 "entry C1",
             ),
-            (shaped(|t| t.direction = Direction::Track), "entry C4"),
             (
                 shaped(|t| {
                     t.format = Format::Jsonc {
@@ -1300,14 +1739,16 @@ mod tests {
                 }),
                 "entry C3",
             ),
-            // A directory is blocked by its shape like a file, before the
-            // destination is looked at.
+            // A tracked target is refused its JSONC keys for the same reason,
+            // before track mode reads anything.
             (
                 shaped(|t| {
-                    t.body = Body::Dir;
                     t.direction = Direction::Track;
+                    t.format = Format::Jsonc {
+                        owns: vec![KeyPath::parse("a.b").expect("a key path")],
+                    };
                 }),
-                "entry C4",
+                "entry C3",
             ),
         ];
 
@@ -1328,6 +1769,48 @@ mod tests {
     }
 
     #[test]
+    fn a_tracked_target_that_is_not_a_whole_file_is_blocked_before_anything_is_read() {
+        let home = guarded_home();
+        let ledger = LedgerView::default();
+        let roots = RootSet::strict();
+        let ctx = Ctx {
+            ledger: &ledger,
+            home: home.path(),
+            repo: &home.child(".config/bx"),
+            roots: &roots,
+            secrets: &Secrets::default(),
+            declared: &Declared::new(),
+            bases: &Bases::new(),
+        };
+        let tracked = |change: fn(&mut Target)| {
+            let mut target = a_target(home.path(), "~/.a");
+            target.direction = Direction::Track;
+            change(&mut target);
+            target
+        };
+        for target in [
+            tracked(|t| t.body = Body::Dir),
+            tracked(|t| t.body = Body::Inline("x\n".to_string())),
+            tracked(|t| t.body = Body::Symlink("~/.b".to_string())),
+            tracked(|t| {
+                t.body = Body::File(PathBuf::from("absent"));
+                t.format = Format::EnvD;
+            }),
+            tracked(|t| {
+                t.body = Body::Generated(Gen::Source(
+                    Portable::parse_in("~/.env", Path::new("/h")).expect("a path"),
+                ));
+                t.attach = Attach::Region { comment: '#' };
+            }),
+        ] {
+            let (change, op) = decide(&Resolution::Ready(target.clone()), &ctx).expect("no read");
+            assert_eq!(change.action, Action::Blocked, "{target:?}");
+            assert_eq!(op, None);
+            assert_eq!(change.note.as_deref(), Some(TRACK_SHAPE), "{target:?}");
+        }
+    }
+
+    #[test]
     fn only_a_create_or_a_modify_produces_a_write_and_it_is_the_decided_one() {
         let home = guarded_home();
         home.write(".mine", "user\n");
@@ -1340,6 +1823,7 @@ mod tests {
             roots: &roots,
             secrets: &Secrets::default(),
             declared: &Declared::new(),
+            bases: &Bases::new(),
         };
 
         let (change, op) =
@@ -1394,6 +1878,7 @@ mod tests {
                 roots: &roots,
                 secrets: &Secrets::default(),
                 declared: &Declared::new(),
+                bases: &Bases::new(),
             };
 
             let (change, op) =
@@ -2072,6 +2557,7 @@ mod tests {
             roots: &roots,
             secrets: &Secrets::default(),
             declared: &Declared::new(),
+            bases: &Bases::new(),
         };
         let mut target = a_target(home.path(), "/");
         target.body = Body::Dir;

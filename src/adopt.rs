@@ -46,10 +46,13 @@
 //! declaration, so nothing about it changes. The body file in the repo is left
 //! where it is: it may be a file the user wrote, and deleting it is theirs.
 //!
-//! A tracked target (`direction = "track"`) is handed back through its repo
-//! copy, the one file of it bx writes: the copy gets back the bytes it held
-//! before `sync` first carried this machine's copy into it, and the machine's
-//! own file, which bx never claims, is left as it is.
+//! A tracked target (`direction = "track"`) is handed back through what bx
+//! claimed of its two copies: the repo copy gets back the bytes it held before
+//! `sync` first carried this machine's copy into it, and a machine copy
+//! `apply` created where this machine had none is removed, with the
+//! directories made for it. A machine copy the tool had before bx wrote to it
+//! is never claimed, and is left as it is. Where either copy would conflict,
+//! neither is restored and the target stays declared.
 //!
 //! A `tree = "…"` entry is one declaration of many files, so `rm` hands a tree
 //! back whole or not at all: on the tree's path it releases every file and the

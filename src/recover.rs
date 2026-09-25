@@ -565,17 +565,25 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         // decision 11 keeps for `bx doctor`, and stopping every writing
         // command over it would make a leftover bx does not need a reason to
         // write nothing. `pending` names it in the write's note.
+        //
+        // Whether it was there to remove is what shows the directories the
+        // Intent names were made: see `journal::prune_beneath`.
+        let mut temp_removed = None;
         if !complete
             && !matches!(step, Step::Blocked)
             && let Some(temp) = &intent.temp
-            && let Err(error) = journal::unlink(temp)
         {
-            tracing::warn!(
-                temp = %temp.display(),
-                %error,
-                "an interrupted write's temporary file could not be removed; \
-                 it is left for bx doctor, and the rollback goes on",
-            );
+            let present = std::fs::symlink_metadata(temp).is_ok();
+            match journal::unlink(temp) {
+                Ok(()) if present => temp_removed = Some(temp),
+                Ok(()) => {}
+                Err(error) => tracing::warn!(
+                    temp = %temp.display(),
+                    %error,
+                    "an interrupted write's temporary file could not be removed; \
+                     it is left for bx doctor, and the rollback goes on",
+                ),
+            }
         }
         match step {
             Step::Blocked => {
@@ -583,9 +591,18 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 continue;
             }
             Step::Skip => continue,
+            // The Intent names its directories before they are made, so a
+            // crash before the stage leaves it naming directories bx never
+            // made, and the user may have made one since. Only a directory
+            // that held this write's own temporary file, or the next
+            // directory in that chain, is bx's to prune; with no temporary
+            // file removed there is nothing to show any of them was made,
+            // and every one is left.
             Step::Keep => {
-                if intent.creates() {
-                    journal::prune_dirs(&intent.created_dirs)?;
+                if intent.creates()
+                    && let Some(temp) = temp_removed
+                {
+                    journal::prune_beneath(temp, &intent.created_dirs)?;
                 }
             }
             // Both act against the observation `decide` judged, never a fresh
@@ -598,18 +615,20 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             // itself, as for `Session::remove` and [`fs::Filled::publish`].
             // A directory the session created goes only while it is empty,
             // and its parents after it: bx never removes what is inside one,
-            // so an edit inside it since `decide` looked is never lost.
-            Step::Unlink { .. } if intent.dir => journal::prune_dirs(
-                &std::iter::once(intent.dest.clone())
-                    .chain(intent.created_dirs.iter().cloned())
-                    .collect::<Vec<_>>(),
-            )?,
+            // so an edit inside it since `decide` looked is never lost. Its
+            // parents go only in the chain above what this rollback removed,
+            // as for `Step::Keep`.
+            Step::Unlink { .. } if intent.dir => {
+                if journal::remove_made_dir(&intent.dest)? {
+                    journal::prune_beneath(&intent.dest, &intent.created_dirs)?;
+                }
+            }
             Step::Unlink { observed } => {
                 #[cfg(test)]
                 tests::before_act(&intent.dest);
                 journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
                 journal::unlink(&intent.dest)?;
-                journal::prune_dirs(&intent.created_dirs)?;
+                journal::prune_beneath(&intent.dest, &intent.created_dirs)?;
             }
             Step::Rewrite {
                 bytes,
@@ -1713,29 +1732,14 @@ mod tests {
                     ),
                     "{case}"
                 );
-                // As for a file: a link staged before its Intent was durable
-                // is not the journal's to name, so it and the directories
-                // made for it can be left, beside its destination.
-                let orphan_possible = matches!(phase, "after-stage" | "after-fill");
+                // As for a file: the Intent names the temporary link and the
+                // directories made for it before either exists, so the
+                // rollback leaves neither at any boundary (#119).
                 let (links, config) = link_snapshot(&home);
                 assert_eq!(links, before.0, "{case}: not rolled back");
-                assert!(
-                    config == before.1 || orphan_possible,
-                    "{case}: ~/.config stands"
-                );
+                assert_eq!(config, before.1, "{case}: ~/.config stands");
                 let temps = leftover_temps(&home);
-                if orphan_possible {
-                    assert!(temps.len() <= 1, "{case}: {temps:?}");
-                    for temp in &temps {
-                        assert_eq!(
-                            temp.parent(),
-                            link_requests(&home)[index].dest.parent(),
-                            "{case}"
-                        );
-                    }
-                } else {
-                    assert!(temps.is_empty(), "{case}: {temps:?}");
-                }
+                assert!(temps.is_empty(), "{case}: {temps:?}");
             }
         }
     }
@@ -1946,7 +1950,11 @@ mod tests {
         // the destination is untouched.
         let early = guard.child("early");
         plant_crash_fixture(&early);
-        assert!(!spawn_crash_child(&early, 0, "after-fill").status.success());
+        assert!(
+            !spawn_crash_child(&early, 0, "before-stage")
+                .status
+                .success()
+        );
         let loaded = crate::journal::load(&StateDir::resolve(&early).journal()).expect("load");
         assert_eq!(
             loaded.intents().count(),
@@ -1969,12 +1977,144 @@ mod tests {
         let intents: Vec<&Intent> = loaded.intents().collect();
         assert_eq!(intents.len(), 1, "the intent is durable");
         assert_eq!(intents[0].dest, late.join(".bxrc"));
-        assert!(intents[0].temp.as_ref().expect("a staged temp").is_file());
+        // The intent precedes the stage (#119): it names a temporary file
+        // nothing has made yet, so a crash anywhere from here on leaves
+        // nothing the journal does not name.
+        let temp = intents[0].temp.as_ref().expect("a named temp");
+        assert_eq!(temp.parent(), Some(late.as_path()));
+        assert!(!temp.exists(), "the intent is durable before the stage");
         assert_eq!(
             peek(&late.join(".bxrc")).expect("the destination").0,
             b"before bx\n",
             "and the destination is still what it was",
         );
+        assert!(matches!(
+            recover(&StateDir::resolve(&late)).expect("recover"),
+            Outcome::RolledBack { .. }
+        ));
+        assert!(leftover_temps(&late).is_empty());
+    }
+
+    #[test]
+    fn a_crash_while_filling_leaves_no_directory_the_write_made() {
+        // #119. A write whose parents are missing, stopped once its temporary
+        // file and those parents exist and before any content does: the
+        // journal names both, so the rollback removes the one and prunes the
+        // others, and the home is as it was.
+        let guard = guarded_home();
+        let home = guard.child("deep");
+        plant_crash_fixture(&home);
+        let before = crash_snapshot(&home);
+        let index = crash_requests(&home)
+            .iter()
+            .position(|request| {
+                matches!(request.content, Content::Bytes { .. })
+                    && !request.dest.parent().expect("a parent").exists()
+            })
+            .expect("the fixture writes beneath a directory it has to make");
+        assert!(
+            !spawn_crash_child(&home, index, "after-stage")
+                .status
+                .success()
+        );
+
+        let state = StateDir::resolve(&home);
+        let loaded = crate::journal::load(&state.journal()).expect("load");
+        let intent = loaded.intents().last().expect("the write's intent");
+        let temp = intent.temp.clone().expect("a staged temp");
+        assert!(temp.is_file(), "the stage made it");
+        assert!(!intent.created_dirs.is_empty(), "and named what it made");
+        assert!(intent.created_dirs.iter().all(|dir| dir.is_dir()));
+
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { .. }
+        ));
+        assert!(leftover_temps(&home).is_empty(), "the temp file is gone");
+        assert!(
+            intent.created_dirs.iter().all(|dir| !dir.exists()),
+            "and every directory the write made",
+        );
+        assert_eq!(crash_snapshot(&home), before);
+    }
+
+    #[test]
+    fn a_directory_the_user_made_after_a_crash_before_the_stage_is_left() {
+        // The Intent names its directories before the stage makes them, so a
+        // crash between the two leaves it naming directories bx never made.
+        // The user makes them afterwards, empty: nothing of bx's is in them,
+        // so nothing shows bx made them, and the rollback leaves every one.
+        let guard = guarded_home();
+        let home = guard.child("deep");
+        plant_crash_fixture(&home);
+        let index = crash_requests(&home)
+            .iter()
+            .position(|request| {
+                matches!(request.content, Content::Bytes { .. })
+                    && !request.dest.parent().expect("a parent").exists()
+            })
+            .expect("the fixture writes beneath a directory it has to make");
+        assert!(
+            !spawn_crash_child(&home, index, "after-intent")
+                .status
+                .success()
+        );
+
+        let state = StateDir::resolve(&home);
+        let loaded = crate::journal::load(&state.journal()).expect("load");
+        let intent = loaded.intents().last().expect("the write's intent");
+        assert!(!intent.created_dirs.is_empty(), "the Intent predicted them");
+        assert!(
+            intent.created_dirs.iter().all(|dir| !dir.exists()),
+            "and the crash came before the stage made any",
+        );
+        for dir in intent.created_dirs.iter().rev() {
+            std::fs::create_dir(dir).expect("the user makes it");
+        }
+
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { .. }
+        ));
+        assert!(
+            intent.created_dirs.iter().all(|dir| dir.is_dir()),
+            "the user's directories are left",
+        );
+    }
+
+    #[test]
+    fn a_predicted_directory_without_the_named_temp_file_is_left_even_when_empty() {
+        // Emptiness is not the evidence, the temporary file is. With it gone
+        // before the rollback, the deepest predicted directory stands empty
+        // and holds nothing of bx's, so it and every directory above it are
+        // left for `bx doctor`, exactly as a directory the user made would be.
+        let guard = guarded_home();
+        let home = guard.child("deep");
+        plant_crash_fixture(&home);
+        let index = crash_requests(&home)
+            .iter()
+            .position(|request| {
+                matches!(request.content, Content::Bytes { .. })
+                    && !request.dest.parent().expect("a parent").exists()
+            })
+            .expect("the fixture writes beneath a directory it has to make");
+        assert!(
+            !spawn_crash_child(&home, index, "after-stage")
+                .status
+                .success()
+        );
+        let state = StateDir::resolve(&home);
+        let loaded = crate::journal::load(&state.journal()).expect("load");
+        let intent = loaded.intents().last().expect("the write's intent");
+        let temp = intent.temp.clone().expect("a staged temp");
+        assert_eq!(temp.parent(), Some(intent.created_dirs[0].as_path()));
+        std::fs::remove_file(&temp).expect("the temp goes");
+
+        assert!(matches!(
+            recover(&state).expect("recover"),
+            Outcome::RolledBack { .. }
+        ));
+        assert!(intent.created_dirs.iter().all(|dir| dir.is_dir()));
     }
 
     #[test]
@@ -2239,7 +2379,7 @@ mod tests {
         let guard = guarded_home();
         let home = guard.child("crashed");
         plant_crash_fixture(&home);
-        assert!(!spawn_crash_child(&home, 0, "after-intent").status.success());
+        assert!(!spawn_crash_child(&home, 0, "after-stage").status.success());
 
         let state = StateDir::resolve(&home);
         let loaded = crate::journal::load(&state.journal()).expect("load");
@@ -4486,7 +4626,7 @@ mod tests {
         let guard = guarded_home();
         let home = guard.child("crashed");
         plant_crash_fixture(&home);
-        assert!(!spawn_crash_child(&home, 0, "after-intent").status.success());
+        assert!(!spawn_crash_child(&home, 0, "after-stage").status.success());
         let state = StateDir::resolve(&home);
         let temp = crate::journal::load(&state.journal())
             .expect("load")
@@ -4719,63 +4859,28 @@ mod tests {
                 );
 
                 // 4. Byte- and mode-identical to the pre-run snapshot, the
-                //    directories included. At the two boundaries that can
-                //    orphan a staged file (step 5), the directories stage
-                //    invented for it may stand too — and only those: a
-                //    directory that existed before is at its mode either way.
-                let orphan_possible = matches!(phase, "after-stage" | "after-fill");
-                let orphan_dest = crash_requests(&home)[index].dest.clone();
-                let beside_orphans = |mut snapshot: Snapshot| {
-                    if orphan_possible {
-                        for (dir, mode) in &mut snapshot.dirs {
-                            let invented = before
-                                .dirs
-                                .iter()
-                                .any(|(was, prior)| was == dir && prior.is_none());
-                            if invented && orphan_dest.starts_with(&*dir) {
-                                *mode = None;
-                            }
-                        }
-                    }
-                    snapshot
-                };
+                //    directories included, at every boundary. The intent
+                //    names a write's temporary file and the directories it
+                //    will invent before the stage makes either, so no crash
+                //    leaves one the journal does not name (#119).
                 assert_eq!(
-                    beside_orphans(crash_snapshot(&home)),
+                    crash_snapshot(&home),
                     before,
                     "rollback at {index}:{phase} did not restore the fixture",
                 );
 
-                // 5. Nothing bx staged is left — with one honest exception. A
-                //    crash between `stage` and the intent that names the staged
-                //    path leaves a temporary file the journal never recorded,
-                //    and recovery removes only what the journal names:
-                //    unlinking by pattern in a directory the user owns is a
-                //    deletion bx cannot prove it is entitled to make. Such an
-                //    orphan is empty or unpublished, is attributable by its
-                //    `.bx-` prefix, and is `bx doctor`'s to report.
+                // 5. Nothing bx staged is left: recovery removes the one
+                //    temporary file each intent names, and never unlinks by
+                //    pattern in a directory the user owns.
                 let temps = leftover_temps(&home);
-                if orphan_possible {
-                    assert!(
-                        temps.len() <= 1,
-                        "at most the one staged file can be orphaned, got {temps:?}",
-                    );
-                    for temp in &temps {
-                        assert_eq!(
-                            temp.parent(),
-                            crash_requests(&home)[index].dest.parent(),
-                            "an orphan is beside its destination and nowhere else",
-                        );
-                    }
-                } else {
-                    assert!(
-                        temps.is_empty(),
-                        "a crash at {index}:{phase} left {temps:?}"
-                    );
-                    assert!(
-                        !home.join(".config").exists(),
-                        "the directories the session invented are gone too",
-                    );
-                }
+                assert!(
+                    temps.is_empty(),
+                    "a crash at {index}:{phase} left {temps:?}"
+                );
+                assert!(
+                    !home.join(".config").exists(),
+                    "the directories the session invented are gone too",
+                );
 
                 // 6. The journal is gone.
                 assert!(!state.journal().exists());
@@ -4783,7 +4888,7 @@ mod tests {
 
                 // 7. Recovery is idempotent.
                 assert_eq!(recover(&state).expect("recover twice"), Outcome::Nothing);
-                assert_eq!(beside_orphans(crash_snapshot(&home)), before);
+                assert_eq!(crash_snapshot(&home), before);
             }
         }
     }

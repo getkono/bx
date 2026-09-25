@@ -2852,23 +2852,10 @@ pub(crate) mod tests {
             assert_eq!(exit(&recovering, Mode::Apply), Exit::Pending, "{at}");
             // The next apply decides against the recovered disk.
             run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("the apply after recovery");
-            // The journal's one recorded exception, which its own crash harness
-            // pins: a crash between `stage` and the Intent naming the staged
-            // file orphans that one `.bx-` temporary, and recovery removes only
-            // what the journal names. Nothing else may differ.
-            let (orphans, rest): (Vec<Entry>, Vec<Entry>) = snapshot(&home, &OUTSIDE)
-                .into_iter()
-                .partition(|(path, _, _)| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with(fs::TEMP_PREFIX))
-                });
-            let orphan_possible = matches!(phase, "after-stage" | "after-fill");
-            assert!(
-                orphans.len() <= usize::from(orphan_possible),
-                "{at}: {orphans:?}"
-            );
-            assert_eq!(rest, want, "{at}");
+            // Nothing may differ, and no `.bx-` temporary is left: the Intent
+            // names a write's temporary file before the stage makes it, so
+            // recovery removes it wherever the crash landed (#119).
+            assert_eq!(snapshot(&home, &OUTSIDE), want, "{at}");
 
             let after = plan(&inputs);
             assert_eq!(after.interrupted, None, "{at}");

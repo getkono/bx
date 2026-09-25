@@ -2,12 +2,15 @@
 //! destination, which no journal names.
 //!
 //! A write stages its content in a temporary file beside the destination, and
-//! only then appends the intent that names it. A crash between the two leaves
-//! a file the journal never recorded. Recovery removes only the temporary
-//! file an intent names — unlinking by pattern in a directory the user owns is
-//! a deletion bx cannot prove it is entitled to make — so such an orphan
-//! survives every later `apply`. Its name is what attributes it: the prefix
-//! [`TEMP_PREFIX`] is reserved for exactly these files.
+//! the intent naming that file is durable before the file is made, so a crash
+//! mid-write leaves one the next rollback removes. What survives is a file no
+//! intent names: one a rollback could not unlink because its directory stopped
+//! letting bx write, one named by a journal that was set aside as unreadable,
+//! or one a bx that staged before journalling left. Recovery removes only the
+//! temporary file an intent names — unlinking by pattern in a directory the
+//! user owns is a deletion bx cannot prove it is entitled to make — so such an
+//! orphan survives every later `apply`. Its name is what attributes it: the
+//! prefix [`TEMP_PREFIX`] is reserved for exactly these files.
 //!
 //! Only the directories bx writes into are looked in: the directory of every
 //! declared target that is ready to be written, and of every target the

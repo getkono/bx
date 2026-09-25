@@ -77,10 +77,59 @@ pub fn stage_link(
     planned: &Observed,
     created: &mut CreatedDirs,
 ) -> Result<StagedLink, Error> {
+    stage_link_in(dest, None, text, planned, created)
+}
+
+/// [`stage_link`], with the temporary link at `temp`, a name
+/// [`crate::fs::temp_beside`] chose for `dest` before anything was made — as
+/// [`crate::fs::stage_as`] is to [`crate::fs::stage`].
+///
+/// # Errors
+///
+/// What [`stage_link`] returns, and [`Error::Write`] when `temp` is not a
+/// [`TEMP_PREFIX`] name beside `dest` or something is already there.
+pub fn stage_link_as(
+    dest: &Path,
+    temp: &Path,
+    text: &Path,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+) -> Result<StagedLink, Error> {
+    stage_link_in(dest, Some(temp), text, planned, created)
+}
+
+/// Every refusal [`stage_link`] makes before it creates anything, made
+/// without creating anything, and the fresh observation it made them against
+/// — as [`crate::fs::refuse_stage`] is to [`crate::fs::stage`].
+///
+/// # Errors
+///
+/// What [`stage_link`] documents, but for making the parents and the link.
+pub fn refuse_stage_link(
+    dest: &Path,
+    planned: &Observed,
+    created: &CreatedDirs,
+) -> Result<Observed, Error> {
+    atomic::refuse_to_prepare(dest, planned, created, refuse_unlinkable).map(|(_, prior)| prior)
+}
+
+/// [`stage_link`] and [`stage_link_as`].
+fn stage_link_in(
+    dest: &Path,
+    temp: Option<&Path>,
+    text: &Path,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+) -> Result<StagedLink, Error> {
     let (dest, prior, created_dirs) = atomic::prepare(dest, planned, created, refuse_unlinkable)?;
     let dir = atomic::parent_of(&dest)?;
-    let temp = tempfile::Builder::new()
-        .prefix(TEMP_PREFIX)
+    let mut builder = tempfile::Builder::new();
+    match temp {
+        // Exactly this name: `symlink` fails on one that is taken.
+        Some(temp) => builder.prefix(atomic::temp_name(dir, temp)?).rand_bytes(0),
+        None => builder.prefix(TEMP_PREFIX),
+    };
+    let temp = builder
         .make_in(dir, |path| std::os::unix::fs::symlink(text, path))
         .map_err(|source| Error::Write {
             path: dir.to_path_buf(),
@@ -359,6 +408,50 @@ mod tests {
                 durable::Event::SyncDir(root.path().to_path_buf()),
             ]
         );
+    }
+
+    #[test]
+    fn a_link_staged_as_a_chosen_name_is_there_and_a_taken_name_is_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dest = root.path().join("a/tool");
+        let planned = observe(&dest).expect("observe");
+        let prior = refuse_stage_link(&dest, &planned, &CreatedDirs::new()).expect("admitted");
+        assert_eq!(prior.kind, Kind::Absent);
+        assert!(!root.path().join("a").exists(), "the check makes nothing");
+
+        let temp = crate::fs::temp_beside(&dest).expect("a name");
+        let staged = stage_link_as(
+            &dest,
+            &temp,
+            Path::new("t"),
+            &planned,
+            &mut CreatedDirs::new(),
+        )
+        .expect("stage");
+        assert_eq!(staged.temp_path(), temp);
+        assert_eq!(staged.created_dirs(), [root.path().join("a")]);
+        assert_eq!(std::fs::read_link(&temp).expect("a link"), Path::new("t"));
+
+        // The same name again is taken, and the link there is not replaced.
+        let err = stage_link_as(
+            &dest,
+            &temp,
+            Path::new("other"),
+            &planned,
+            &mut CreatedDirs::new(),
+        )
+        .expect_err("taken");
+        assert!(matches!(err, Error::Write { .. }), "{err:?}");
+        assert_eq!(std::fs::read_link(&temp).expect("kept"), Path::new("t"));
+
+        // A file where plan saw nothing is refused before anything is made.
+        let file = root.path().join("file");
+        let planned = observe(&file).expect("observe");
+        std::fs::write(&file, b"x").expect("since");
+        assert!(matches!(
+            refuse_stage_link(&file, &planned, &CreatedDirs::new()),
+            Err(Error::Changed { .. })
+        ));
     }
 
     fn names(dir: &Path) -> Vec<String> {

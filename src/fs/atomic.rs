@@ -1147,9 +1147,10 @@ pub struct Staged(Pending);
 /// A write whose content is on disk and `fsync`ed, and which has not yet
 /// replaced the destination.
 ///
-/// The boundary a write-ahead journal records its intent at: before
-/// [`Filled::publish`] the destination is untouched, after it the destination
-/// is already the new content. Dropping this removes the temporary file and
+/// Before [`Filled::publish`] the destination is untouched, after it the
+/// destination is already the new content. A write-ahead journal records its
+/// intent earlier still, before [`stage_as`] makes anything, so the temporary
+/// file and the directories made for it are named before they exist. Dropping this removes the temporary file and
 /// leaves the destination exactly as it was.
 #[derive(Debug)]
 pub struct Filled {
@@ -1247,18 +1248,105 @@ pub fn stage(
     planned: &Observed,
     created: &mut CreatedDirs,
 ) -> Result<Staged, Error> {
+    stage_in(dest, None, mode, planned, created)
+}
+
+/// [`stage`], with the temporary file at `temp`, a name [`temp_beside`]
+/// chose for `dest` before anything was made.
+///
+/// For a write-ahead journal: it names the temporary file, and the
+/// directories this call will invent, in a durable record **before** the
+/// call makes either, so a crash at any point after it leaves nothing the
+/// journal does not name. `temp` is created exclusively and never replaced:
+/// a name something else took since is refused rather than reused.
+///
+/// # Errors
+///
+/// What [`stage`] returns, and [`Error::Write`] when `temp` is not a
+/// [`TEMP_PREFIX`] name beside `dest` or cannot be created as a new file.
+pub fn stage_as(
+    dest: &Path,
+    temp: &Path,
+    mode: Mode,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+) -> Result<Staged, Error> {
+    stage_in(dest, Some(temp), mode, planned, created)
+}
+
+/// A fresh temporary name for a write to `dest`: a [`TEMP_PREFIX`] file in
+/// the directory [`stage`] would make its own in, which nothing is at yet.
+///
+/// Chosen before anything is made so a journal can record it first; see
+/// [`stage_as`]. Random, from the standard library's per-process hash keys,
+/// so two writes to one directory never choose the same name in practice,
+/// and one that does is refused by the exclusive create rather than shared.
+///
+/// # Errors
+///
+/// [`Error::ParentComponent`] when `dest` has a `..` component and
+/// [`Error::NoParent`] when it has no parent component.
+pub fn temp_beside(dest: &Path) -> Result<PathBuf, Error> {
+    use std::hash::{BuildHasher as _, Hasher as _};
+
+    let dest = lexical(dest)?;
+    let dir = parent_of(&dest)?;
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write(dest.as_os_str().as_encoded_bytes());
+    Ok(dir.join(format!("{TEMP_PREFIX}{:016x}", hasher.finish())))
+}
+
+/// The file name `temp` has, when it is a [`TEMP_PREFIX`] name in `dir`: the
+/// only temporary file [`stage_as`] and [`crate::fs::link::stage_link_as`]
+/// will make.
+///
+/// # Errors
+///
+/// [`Error::Write`] naming `temp`, when it is anything else.
+pub(super) fn temp_name<'a>(dir: &Path, temp: &'a Path) -> Result<&'a std::ffi::OsStr, Error> {
+    match (temp.parent(), temp.file_name()) {
+        (Some(parent), Some(name))
+            if parent == dir && name.as_encoded_bytes().starts_with(TEMP_PREFIX.as_bytes()) =>
+        {
+            Ok(name)
+        }
+        _ => Err(Error::Write {
+            path: temp.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "not a {TEMP_PREFIX} name in {}, the destination's directory",
+                    dir.display()
+                ),
+            ),
+        }),
+    }
+}
+
+/// [`stage`] and [`stage_as`]: a temporary name of bx's choosing when `temp`
+/// is `None`, and `temp` itself otherwise.
+fn stage_in(
+    dest: &Path,
+    temp: Option<&Path>,
+    mode: Mode,
+    planned: &Observed,
+    created: &mut CreatedDirs,
+) -> Result<Staged, Error> {
     // Spelled as `observe` spells it, so `link/` is the link.
     let (dest, prior, created_dirs) = prepare(dest, planned, created, refuse_unwritable)?;
     let dest = dest.as_path();
     let dir = parent_of(dest)?;
 
-    let temp = tempfile::Builder::new()
-        .prefix(TEMP_PREFIX)
-        .tempfile_in(dir)
-        .map_err(|source| Error::Write {
-            path: dir.to_path_buf(),
-            source,
-        })?;
+    let mut builder = tempfile::Builder::new();
+    match temp {
+        // Exactly this name, created exclusively: no random suffix to add.
+        Some(temp) => builder.prefix(temp_name(dir, temp)?).rand_bytes(0),
+        None => builder.prefix(TEMP_PREFIX),
+    };
+    let temp = builder.tempfile_in(dir).map_err(|source| Error::Write {
+        path: dir.to_path_buf(),
+        source,
+    })?;
 
     // Before any content. `tempfile` creates at 0600 and `fchmod` is not masked
     // by the umask, so the file is at its final permission bits while it is
@@ -1302,6 +1390,13 @@ impl Staged {
     #[must_use]
     pub const fn prior(&self) -> &Observed {
         &self.0.prior
+    }
+
+    /// The parent directories this write invented and claims, deepest first:
+    /// the set [`Filled::created_dirs`] names once the content is written.
+    #[must_use]
+    pub fn created_dirs(&self) -> &[PathBuf] {
+        &self.0.created_dirs
     }
 
     /// Write the content and `fsync` it, without touching the destination.
@@ -2197,6 +2292,48 @@ pub(super) fn prepare(
     created: &mut CreatedDirs,
     refuse: fn(&Observed) -> Result<(), Error>,
 ) -> Result<(PathBuf, Observed, Vec<PathBuf>), Error> {
+    let (dest, prior) = refuse_to_prepare(dest, planned, created, refuse)?;
+    let dir = parent_of(&dest)?;
+    let made = create_missing_dirs(dir, created)?;
+    let created_dirs = created.record(made, None);
+    Ok((dest, prior, created_dirs))
+}
+
+/// Every refusal [`stage`] makes before it creates anything, made without
+/// creating anything, and the fresh observation it made them against.
+///
+/// For a write-ahead journal that records a write before [`stage_as`]
+/// makes it: a write `stage` would refuse outright — a destination `plan`
+/// refused or that changed since, a parent that does not resolve, a declared
+/// directory still wider than declared — is refused here with nothing
+/// recorded, so the journal never announces a write that could not begin.
+/// `stage_as` makes every one of these checks again; what can differ is only
+/// what changed on disk in between.
+///
+/// The observation is the prior the write displaces, as [`Staged::prior`]
+/// would report it: the check has just shown it to be the file `plan` saw.
+///
+/// # Errors
+///
+/// What [`stage`] documents, but for creating the parents and the temporary
+/// file.
+pub fn refuse_stage(
+    dest: &Path,
+    planned: &Observed,
+    created: &CreatedDirs,
+) -> Result<Observed, Error> {
+    refuse_to_prepare(dest, planned, created, refuse_unwritable).map(|(_, prior)| prior)
+}
+
+/// [`prepare`] up to the first thing it makes: every refusal, and the fresh
+/// observation. Shared by [`refuse_stage`] and
+/// [`crate::fs::link::refuse_stage_link`], which make no directory.
+pub(super) fn refuse_to_prepare(
+    dest: &Path,
+    planned: &Observed,
+    created: &CreatedDirs,
+    refuse: fn(&Observed) -> Result<(), Error>,
+) -> Result<(PathBuf, Observed), Error> {
     let dest = lexical(dest)?;
     if planned.path != dest {
         return Err(Error::Changed {
@@ -2217,9 +2354,7 @@ pub(super) fn prepare(
     let dir = parent_of(&dest)?;
     // Before creating anything, so a refusal leaves nothing behind.
     refuse_wider_than_declared(&dest, dir, created)?;
-    let made = create_missing_dirs(dir, created)?;
-    let created_dirs = created.record(made, None);
-    Ok((dest, prior, created_dirs))
+    Ok((dest, prior))
 }
 
 /// Refuse unless `prior.path` is still what [`observe`] found there: the same
@@ -7967,5 +8102,117 @@ mod tests {
             ),
             "`bx plan` prints this note, so it names no absolute home",
         );
+    }
+
+    #[test]
+    fn a_temp_name_chosen_first_is_a_fresh_bx_name_beside_the_destination() {
+        let home = guarded_home();
+        let dest = home.child(".config/app/x.conf");
+        let one = temp_beside(&dest).expect("a name");
+        let two = temp_beside(&dest).expect("another");
+        assert_eq!(one.parent(), dest.parent());
+        let name = one
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with(TEMP_PREFIX), "{name}");
+        assert_eq!(name.len(), TEMP_PREFIX.len() + 16, "{name}");
+        assert_ne!(one, two, "each write gets its own");
+        // Chosen, not made: nothing exists on the way to it yet.
+        assert!(!home.child(".config").exists());
+        assert!(matches!(
+            temp_beside(&home.child("a/../b")),
+            Err(Error::ParentComponent(_))
+        ));
+    }
+
+    #[test]
+    fn stage_as_makes_exactly_the_named_temp_and_the_parents_it_invents() {
+        let home = guarded_home();
+        let dest = home.child(".config/app/x.conf");
+        let temp = temp_beside(&dest).expect("a name");
+        let planned = observe(&dest).expect("observe");
+        let staged = stage_as(
+            &dest,
+            &temp,
+            Mode::DEFAULT_FILE,
+            &planned,
+            &mut CreatedDirs::new(),
+        )
+        .expect("stage");
+        assert_eq!(staged.temp_path(), temp);
+        assert!(temp.is_file());
+        assert_eq!(
+            staged.created_dirs(),
+            [home.child(".config/app"), home.child(".config")],
+            "deepest first, as the filled write names them",
+        );
+        let filled = staged.fill(b"x\n").expect("fill");
+        assert_eq!(
+            filled.created_dirs(),
+            [home.child(".config/app"), home.child(".config")]
+        );
+        filled.publish().expect("publish");
+        assert_eq!(std::fs::read(&dest).expect("read"), b"x\n");
+        assert!(!temp.exists(), "renamed over the destination");
+    }
+
+    #[test]
+    fn stage_as_refuses_a_name_that_is_taken_or_not_a_bx_name_beside_the_destination() {
+        let home = guarded_home();
+        let dest = home.child("x.conf");
+        let planned = observe(&dest).expect("observe");
+        let taken = temp_beside(&dest).expect("a name");
+        std::fs::write(&taken, b"theirs").expect("take it");
+        let elsewhere = home.child("sub").join(format!("{TEMP_PREFIX}x"));
+        for temp in [taken.clone(), home.child("x.conf.tmp"), elsewhere] {
+            let err = stage_as(
+                &dest,
+                &temp,
+                Mode::DEFAULT_FILE,
+                &planned,
+                &mut CreatedDirs::new(),
+            )
+            .expect_err("refused");
+            assert!(
+                matches!(err, Error::Write { .. }),
+                "{}: {err:?}",
+                temp.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&taken).expect("kept"),
+            b"theirs",
+            "never replaced"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn refuse_stage_refuses_what_stage_would_and_makes_nothing() {
+        let home = guarded_home();
+        let dest = home.child(".config/app/x.conf");
+        let planned = observe(&dest).expect("observe");
+        let prior = refuse_stage(&dest, &planned, &CreatedDirs::new()).expect("admitted");
+        assert_eq!(prior.kind, Kind::Absent);
+        assert!(!home.child(".config").exists(), "nothing made");
+
+        // A destination that changed since plan is refused as `stage` refuses it.
+        let file = home.child("f");
+        let planned = observe(&file).expect("observe");
+        std::fs::write(&file, b"since\n").expect("write");
+        assert!(matches!(
+            refuse_stage(&file, &planned, &CreatedDirs::new()),
+            Err(Error::Changed { .. })
+        ));
+        // And plan's own verdict: a directory is not a file bx can write.
+        let dir = home.child("d");
+        std::fs::create_dir(&dir).expect("mkdir");
+        let planned = observe(&dir).expect("observe");
+        assert!(matches!(
+            refuse_stage(&dir, &planned, &CreatedDirs::new()),
+            Err(Error::NotAFile { .. })
+        ));
     }
 }

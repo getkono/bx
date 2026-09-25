@@ -26,11 +26,13 @@
 //! An `apply` in flight has temporary files of its own that are not orphans,
 //! so while one holds the lock the check reports nothing, as check 4 already
 //! says to run `bx doctor` again once it finishes. The lock is asked before
-//! and after the directories are listed, and a file is reported only when it
-//! is still there after the second question: an `apply` that started after
-//! the first either still holds the lock at the second, or has finished and
-//! taken its temporary files with it. Doctor never removes an orphan; the
-//! finding says how to.
+//! and after the directories are listed, and the journal is read only after
+//! the second question. An `apply` that started after the first either still
+//! holds the lock at the second; or has finished and taken its temporary files
+//! with it, so a file is reported only when it is still there afterwards; or
+//! was killed, and then the intent naming its temporary file is already in the
+//! journal the check reads. Doctor never removes an orphan; the finding says
+//! how to.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -55,19 +57,22 @@ pub fn check(
     if !settled(state) {
         return Vec::new();
     }
-    let Some(named) = named(state) else {
-        return Vec::new();
-    };
     let candidates: Vec<PathBuf> = directories(targets, ledger, home)
         .iter()
         .flat_map(|dir| staged_in(dir))
-        .filter(|path| !named.contains(path))
         .collect();
     if !settled(state) {
         return Vec::new();
     }
+    // Read only now: an `apply` that started after the first probe and was
+    // killed before the second has left an intent naming its temporary file,
+    // and a journal read before the listing would not have seen it.
+    let Some(named) = named(state) else {
+        return Vec::new();
+    };
     candidates
         .into_iter()
+        .filter(|path| !named.contains(path))
         .filter(|path| std::fs::symlink_metadata(path).is_ok())
         .map(|path| Finding {
             subject: paths::to_portable(&path, home),

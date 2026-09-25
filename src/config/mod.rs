@@ -38,7 +38,7 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::{alias, function, keybindings, plugin, source};
+use crate::shell::{activation, alias, function, keybindings, plugin, source};
 use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
@@ -97,6 +97,10 @@ pub struct Config {
     /// `[[source]]`'s entries, keyed by `name`, in the order written: the
     /// declared optional sources. See [`crate::shell::source`].
     pub sources: Vec<crate::shell::source::SourceDecl>,
+    /// `[[activation]]`'s entries, keyed by `name`, in the order written: the
+    /// declared tool activations, run at `plan` time and cached. See
+    /// [`crate::shell::activation`].
+    pub activations: Vec<activation::ActivationDecl>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
@@ -544,6 +548,16 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     }
                 }
             }
+            "activation" => {
+                for table in entries(root, name, item, file, text)? {
+                    match merge::toggle_of(table, merge::Section::Activation, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => config
+                            .activations
+                            .push(activation::parse_activation(table, file, text)?),
+                    }
+                }
+            }
             unknown => {
                 return Err(Error::UnknownSection {
                     origin: section_origin(root, unknown, file, text),
@@ -635,6 +649,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|s| (s.name.as_str(), &s.origin))
             .chain(toggles_in(&config, merge::Section::Source))
+            .collect(),
+    )?;
+    check_unique(
+        "activation",
+        config
+            .activations
+            .iter()
+            .map(|a| (a.name.as_str(), &a.origin))
+            .chain(toggles_in(&config, merge::Section::Activation))
             .collect(),
     )?;
 
@@ -1531,6 +1554,39 @@ mod tests {
         // The entry's own parser runs: a malformed source is refused here.
         let bad = message("[[plugin]]\nname = \"a\"\nsource = \"a.zsh\"\n");
         assert!(bad.contains("must open with"), "{bad}");
+    }
+
+    #[test]
+    fn an_activation_section_parses_and_a_duplicate_name_is_rejected() {
+        let entry = "[[activation]]\nname = \"starship\"\ncommand = [\"starship\", \"init\", \"zsh\"]\n\
+                     phase = \"completions\"\n";
+        let config = parse_str(
+            &format!("{entry}[[activation]]\nname = \"mise\"\nenabled = false\n"),
+            Path::new("/repo/bx.toml"),
+            home(),
+        )
+        .expect("parses");
+        assert_eq!(config.activations.len(), 1);
+        assert_eq!(config.activations[0].name, "starship");
+        assert_eq!(
+            config.activations[0].command,
+            ["starship", "init", "zsh"].map(String::from)
+        );
+        assert_eq!(config.toggles.len(), 1);
+        assert_eq!(config.toggles[0].section, merge::Section::Activation);
+
+        let twice = message(&format!("{entry}{entry}"));
+        assert!(twice.contains("duplicate activation `starship`"), "{twice}");
+        let toggled = message(&format!(
+            "{entry}[[activation]]\nname = \"starship\"\nenabled = false\n"
+        ));
+        assert!(
+            toggled.contains("duplicate activation `starship`"),
+            "{toggled}"
+        );
+        // The entry's own parser runs: an empty command is refused here.
+        let bad = message("[[activation]]\nname = \"a\"\ncommand = []\n");
+        assert!(bad.contains("`command` is empty"), "{bad}");
     }
 
     #[test]

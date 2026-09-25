@@ -508,8 +508,8 @@ enum Kind {
     /// every tool's options. What is judged is what a shell running them
     /// could make of them ([`refuses_arguments`]): no `$`, backquote or
     /// backslash, whose meaning a later shell decides, no path that points
-    /// inside a directory bx owns or its config repo, and no assignment to a
-    /// relocating name. Needs no root.
+    /// inside a directory bx owns or its config repo, and no relocating name,
+    /// which a shell could assign with or without an `=`. Needs no root.
     Arguments,
     /// A list a shell or a tool searches. Every entry absolute, non-empty and
     /// outside bx's own directories, whatever its shape, because an empty
@@ -1268,10 +1268,11 @@ pub enum Reason {
         "holds an expansion the shell running it performs later, so what it names cannot be shown"
     )]
     LaterExpansion,
-    /// A command line or options assigning a name that moves a tool's config,
-    /// data or cache ([`is_relocating`]) — `env XDG_CONFIG_HOME=… nvim` — which
-    /// the guard would otherwise never judge.
-    #[error("assigns a variable that relocates a tool's files inside its command line")]
+    /// A command line or options naming a variable that moves a tool's
+    /// config, data or cache ([`is_relocating`]) — `env XDG_CONFIG_HOME=…
+    /// nvim`, `for HOME in …`, `read HOME` — which a shell running it could
+    /// assign where the guard would never judge it.
+    #[error("names a variable that relocates a tool's files, which its command line could assign")]
     RelocatingAssignment,
     /// A setting given a value it does not accept.
     #[error("is not a value this setting accepts")]
@@ -1824,6 +1825,10 @@ fn refuses_command_line(value: &str, roots: &RootSet) -> Option<Reason> {
 /// expands again.
 const WORD_BREAKS: &str = " \t;|&<>()=:";
 
+/// The characters that end a word of a command line as a shell splits it:
+/// [`WORD_BREAKS`] but `=` and `:`, which a path's own directories may hold.
+const COMMAND_BREAKS: &str = " \t;|&<>()";
+
 /// The characters a shell expands in a path into names nothing judged.
 const GLOBS: &str = "*?[]{}";
 
@@ -1850,41 +1855,58 @@ const GLOBS: &str = "*?[]{}";
 ///   [`refuses_bx_location`] alone. A relative path is relative to wherever
 ///   the tool runs, which no lexical check can know, and so is every bare
 ///   word; neither is refused;
-/// * a `NAME=` whose `NAME` [`is_relocating`] is
-///   [`Reason::RelocatingAssignment`], wherever it stands, so
-///   `env XDG_CONFIG_HOME=/elsewhere nvim` cannot move what the guard
-///   refuses to move in a fragment.
+/// * each whole word, split at blanks and shell operators alone, is judged
+///   the same way from its first `/` or leading `~/`, because a path's own
+///   directories may hold `=` or `:`: with the home `/tmp/a:b`, the pieces of
+///   `/tmp/a:b/.local/state/bx/ledger` are `/tmp/a` and `b/…`, and only the
+///   whole word shows it inside bx's state directory;
+/// * any name a shell could assign — each run of ASCII letters, digits and
+///   `_` — that [`is_relocating`] is [`Reason::RelocatingAssignment`],
+///   wherever it stands and whatever follows it. A shell assigns a name
+///   without an `=` too — `for HOME in …`, `read HOME`, `printf -v HOME` —
+///   so `env XDG_CONFIG_HOME=/elsewhere nvim` and
+///   `sh -c 'read HOME </x; export HOME; nvim'` cannot move what the guard
+///   refuses to move in a fragment. A word that merely mentions such a name
+///   is refused with them: no lexical check tells the two apart.
 fn refuses_arguments(text: &str, roots: &RootSet) -> Option<Reason> {
     if text.contains(['$', '`', '\\']) {
         return Some(Reason::LaterExpansion);
     }
     let text: String = text.chars().filter(|c| !matches!(c, '\'' | '"')).collect();
-    for word in text.split(|c| WORD_BREAKS.contains(c)) {
-        let path = match word.strip_prefix('~') {
-            Some(rest) if rest.is_empty() || rest.starts_with('/') => match roots.home() {
-                Some(home) => format!("{}{rest}", home.display()),
-                None => return Some(Reason::NoHome),
-            },
-            Some(_) => return Some(Reason::LaterExpansion),
-            None => match word.find('/') {
-                Some(at) => word[at..].to_string(),
-                None => continue,
-            },
-        };
-        if path.contains(|c| GLOBS.contains(c)) {
-            return Some(Reason::LaterExpansion);
-        }
-        if let Some(reason) = refuses_bx_location(Path::new(&path), roots) {
+    let pieces = text
+        .split(|c| WORD_BREAKS.contains(c))
+        .map(|piece| (piece, true));
+    let words = text
+        .split(|c| COMMAND_BREAKS.contains(c))
+        .map(|word| (word, false));
+    for (word, piece) in pieces.chain(words) {
+        if let Some(reason) = refuses_argument_path(word, piece, roots) {
             return Some(reason);
         }
     }
-    text.match_indices('=').find_map(|(at, _)| {
-        let before = &text[..at];
-        let start = before
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .map_or(0, |i| i + 1);
-        is_relocating(&before[start..]).then_some(Reason::RelocatingAssignment)
-    })
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(is_relocating)
+        .then_some(Reason::RelocatingAssignment)
+}
+
+/// Why the path one word of a command line names may not be handed to a
+/// shell, or `None` if it may, as [`refuses_arguments`] reads it. `piece` says
+/// whether the word was split at `=` and `:` too, where a `~` expands again,
+/// so that any other `~` opening it is another user's home; a whole word
+/// opening with such a `~` is read from its first `/`, as its pieces are.
+fn refuses_argument_path(word: &str, piece: bool, roots: &RootSet) -> Option<Reason> {
+    let path = match word.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match roots.home() {
+            Some(home) => format!("{}{rest}", home.display()),
+            None => return Some(Reason::NoHome),
+        },
+        Some(_) if piece => return Some(Reason::LaterExpansion),
+        _ => word[word.find('/')?..].to_string(),
+    };
+    if path.contains(|c| GLOBS.contains(c)) {
+        return Some(Reason::LaterExpansion);
+    }
+    refuses_bx_location(Path::new(&path), roots)
 }
 
 /// A character of a bare word: an ASCII letter or digit, `.`, `_`, `+` or `-`.
@@ -3203,7 +3225,8 @@ mod tests {
                 Some(RelocatingAssignment),
             ),
             RelocatingAssignment => (
-                "assigns a variable that relocates a tool's files inside its command line"
+                "names a variable that relocates a tool's files, which its command line \
+                 could assign"
                     .to_string(),
                 Some(NotASetting),
             ),
@@ -5983,6 +6006,24 @@ mod tests {
             ("\"env CARGO_HOME=/tmp/c nvim\"", RelocatingAssignment),
             ("\"sh -c 'HOME=/tmp nvim'\"", RelocatingAssignment),
             ("\"sh -c 'x;TMPDIR=/tmp nvim'\"", RelocatingAssignment),
+            // A shell assigns a name without an `=` too.
+            (
+                "\"sh -c 'for XDG_CONFIG_HOME in /etc/evil; do export XDG_CONFIG_HOME; nvim; done'\"",
+                RelocatingAssignment,
+            ),
+            (
+                "\"sh -c 'read HOME </etc/h; export HOME; nvim'\"",
+                RelocatingAssignment,
+            ),
+            (
+                "\"sh -c 'printf -v CARGO_HOME /etc/evil; nvim'\"",
+                RelocatingAssignment,
+            ),
+            (
+                "\"sh -c 'CARGO_HOME[1]=/etc/evil nvim'\"",
+                RelocatingAssignment,
+            ),
+            ("\"sh -c 'CARGO_HOME+=/evil nvim'\"", RelocatingAssignment),
         ] {
             for roots in [rooted(), home_rooted.clone()] {
                 assert_eq!(
@@ -5990,6 +6031,55 @@ mod tests {
                     Some(reason),
                     "{value}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn an_argument_is_judged_whole_when_its_homes_directories_hold_a_break() {
+        use Reason::{BxOwnedDirectory, InsideConfigRepo};
+        for home in ["/tmp/a:b", "/tmp/a=b", "/tmp/a:b=c"] {
+            let roots = RootSet::new(Path::new(home), &[PathBuf::from("~")]);
+            for (value, reason) in [
+                (
+                    format!("\"nvim {home}/.local/state/bx/ledger\""),
+                    BxOwnedDirectory,
+                ),
+                (
+                    format!("\"less --log-file={home}/.local/state/bx/log\""),
+                    BxOwnedDirectory,
+                ),
+                (
+                    format!("\"less -o{home}/.local/share/bx/env.zsh\""),
+                    BxOwnedDirectory,
+                ),
+                (
+                    format!("\"sh -c 'cat>{home}/.config/bx/bx.toml'\""),
+                    InsideConfigRepo,
+                ),
+                (
+                    "\"nvim ~/.local/state/bx/ledger\"".to_string(),
+                    BxOwnedDirectory,
+                ),
+            ] {
+                assert_eq!(
+                    reason_of(&check("EDITOR", &value, &roots)),
+                    Some(reason),
+                    "{home}: {value}"
+                );
+                let options = value.replacen("nvim ", "", 1).replacen("less ", "", 1);
+                assert_eq!(
+                    reason_of(&check("LESS", &options, &roots)),
+                    Some(reason),
+                    "{home}: {options}"
+                );
+            }
+            for value in [
+                format!("\"nvim {home}/notes/todo.md\""),
+                format!("\"less --log-file={home}/log\""),
+                "\"nvim ~/notes:x/todo.md\"".to_string(),
+            ] {
+                assert_eq!(check("EDITOR", &value, &roots), Verdict::Allowed, "{value}");
             }
         }
     }
@@ -6014,6 +6104,7 @@ mod tests {
             ),
             ("'-R $HOME'", LaterExpansion),
             ("\"-R XDG_STATE_HOME=/tmp\"", RelocatingAssignment),
+            ("\"-R XDG_STATE_HOME\"", RelocatingAssignment),
         ] {
             assert_eq!(
                 reason_of(&check("LESS", value, &rooted())),
@@ -9281,22 +9372,25 @@ mod tests {
             path.is_absolute() && owned.iter().any(|dir| dir.starts_with(&path))
         };
         // An argument escapes when a path in it — from its first `/`, or
-        // from a leading `~` — lands inside bx's directories, or when it
-        // assigns an `XDG_` name or one the round-5 review saw a tool read as
-        // a location. Quotes join words, so they are dropped first.
+        // from a leading `~`, in a whole word or in a piece of one — lands
+        // inside bx's directories, or when it names `HOME`, an `XDG_` name or
+        // one the round-5 review saw a tool read as a location, which a shell
+        // assigns with an `=` or without one (`for HOME in`, `read HOME`).
+        // Quotes join words, so they are dropped first.
         let argument_escapes = |text: &str| {
             let text: String = text.chars().filter(|c| !matches!(c, '\'' | '"')).collect();
-            let assigns_location = text.split([' ', '\t']).any(|word| {
-                word.split_once('=').is_some_and(|(assigned, _)| {
-                    assigned.starts_with("XDG_")
-                        || R5_READ_AS_LOCATIONS
-                            .iter()
-                            .any(|(known, _)| *known == assigned)
-                })
+            let assigns_location = text.split(|c: char| " \t;|&<>()=".contains(c)).any(|word| {
+                word == "HOME"
+                    || word.starts_with("XDG_")
+                    || R5_READ_AS_LOCATIONS.iter().any(|(known, _)| *known == word)
             });
+            // A path's own directories may hold `=` or `:`, so each word a
+            // shell splits is read whole as well as in pieces.
+            let words = text.split(|c: char| " \t;|&<>()".contains(c));
             assigns_location
                 || text
                     .split(|c: char| " \t;|&<>()=:".contains(c))
+                    .chain(words)
                     .any(|word| {
                         let path = match word.strip_prefix('~') {
                             Some(rest) => format!("{}{rest}", home.display()),
@@ -9341,6 +9435,44 @@ mod tests {
                     && entries.iter().any(|entry| {
                         unanchored(entry) || holds_bx(entry) || !roots.contains(Path::new(entry))
                     }))
+        }
+    }
+
+    #[test]
+    fn the_oracle_reads_a_whole_argument_the_guards_split_would_miss() {
+        // With `:` or `=` in the home's own name, a piece split at them is
+        // never inside bx's directories; only the whole word is. The oracle
+        // and the guard must both see it, and agree on what stays outside.
+        for home in ["/tmp/a:b", "/tmp/a=b"] {
+            let roots = RootSet::new(Path::new(home), &[PathBuf::from("~")]);
+            let after = HashMap::new();
+            for (name, value, owned) in [
+                (
+                    "EDITOR",
+                    format!("nvim {home}/.local/state/bx/ledger"),
+                    true,
+                ),
+                (
+                    "PAGER",
+                    format!("less --log-file={home}/.config/bx/x"),
+                    true,
+                ),
+                ("LESS", format!("-R -o{home}/.local/state/bx/log"), true),
+                ("EDITOR", format!("nvim {home}/notes/todo.md"), false),
+                ("LESS", format!("-R -o{home}/log"), false),
+            ] {
+                assert_eq!(
+                    escapes(name, &value, &roots, &after, Path::new(home)),
+                    owned,
+                    "{name}={value}"
+                );
+                let quoted = format!("\"{value}\"");
+                assert_eq!(
+                    check(name, &quoted, &roots) != Verdict::Allowed,
+                    owned,
+                    "{name}={quoted}"
+                );
+            }
         }
     }
 
@@ -9697,6 +9829,15 @@ mod tests {
             (
                 "export EDITOR=\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
                 RootSet::strict(),
+            ),
+            // Review of #113: a shell assigns a name without an `=` too.
+            (
+                "export EDITOR=\"sh -c 'for XDG_CONFIG_HOME in /etc/evil; do export XDG_CONFIG_HOME; nvim; done'\"",
+                rooted.clone(),
+            ),
+            (
+                "export EDITOR=\"sh -c 'read HOME </etc/h; export HOME; nvim'\"",
+                rooted.clone(),
             ),
             // `PAGER` is a command line since #112, so the program given an
             // argument is `RUSTC_WRAPPER`, which cargo runs as one word.

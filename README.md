@@ -1,5 +1,7 @@
 # bx
 
+> Project Status: Nearing alpha. Linux support is being stabilized first.
+
 `bx` is a single-binary Linux developer-environment manager. One `bx init` and
 one `bx apply` replace setting up mise, sccache, uv, git, ssh, gh, starship and
 the rest one tool at a time. Your configuration lives in a git repo you own;

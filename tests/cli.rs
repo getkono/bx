@@ -884,3 +884,35 @@ fn a_command_with_no_body_exits_one_saying_so_and_does_not_panic() {
         assert_eq!(stdout(&output), "");
     }
 }
+
+#[test]
+fn help_names_only_what_each_command_does() {
+    let home = guarded_home();
+
+    let help = bx(home.path(), &["--help"]);
+    assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
+    let text = stdout(&help);
+    assert!(
+        text.contains("List declared secrets, and whether each decrypts here"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Begin managing a config file, or a directory of them"),
+        "{text}"
+    );
+    assert!(text.contains("(not built yet)"), "{text}");
+    for unbuilt in ["rotate", "Set,", "a tool,", "or a secret"] {
+        assert!(!text.contains(unbuilt), "{unbuilt:?} in {text}");
+    }
+
+    let secret = bx(home.path(), &["secret", "--help"]);
+    assert_eq!(secret.status.code(), Some(0), "{}", stderr(&secret));
+    let commands: Vec<&str> = stdout(&secret)
+        .lines()
+        .skip_while(|line| *line != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert_eq!(commands, ["list", "help"]);
+}

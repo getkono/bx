@@ -1364,6 +1364,36 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_only_adopted_is_set_up_and_not_already_set_up() {
+        use crate::init::tests::Script;
+
+        // The repo is there, nothing is answered, and adopting leaves the plan
+        // with nothing to apply: the adoption is all this run did.
+        let home = guarded_home();
+        seed(home.path(), "");
+        home.write(".zshrc", "z\n");
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut script = Script {
+            pick: vec!["~/.zshrc"],
+            ..Script::default()
+        };
+        let mut out = Vec::new();
+
+        let exit = init_with(&tty, &[], false, &mut out, &mut script, &mut never).expect("init");
+
+        assert_eq!(exit, Exit::Converged);
+        assert!(text(&out).contains("  + ~/.zshrc  (copied to files/.zshrc)\n"));
+        assert!(
+            text(&out).ends_with(init_closing(Exit::Converged, true)),
+            "{}",
+            text(&out)
+        );
+    }
+
+    #[test]
     fn init_says_what_was_left_when_a_session_is_interrupted_after_the_pick() {
         use crate::init::tests::InterruptedWhileAsking;
 

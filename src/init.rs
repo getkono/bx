@@ -25,6 +25,13 @@
 //!    7). So while one stands, nothing is offered or adopted: the plan shows
 //!    the recovery, and the next `init` offers what this one did not.
 //!
+//! Steps 1 to 3 are [`answer`] and step 4 is [`adopt_offered`], two calls so
+//! that [`crate::command::init`] can say what the first wrote before the
+//! second puts its question. Every question comes before the writes of its
+//! own step, so one abandoned with Esc or Ctrl-C ([`Error::Canceled`]) leaves
+//! the earlier steps written and said, and nothing of its own: the next
+//! `init` finds them and goes on from there.
+//!
 //! Planning and applying are `bx apply`'s, with its approval rule, and are
 //! called by [`crate::command::init`] once this has run. So a second `init` on
 //! a converged machine asks nothing, writes nothing, and exits as `bx plan`
@@ -211,23 +218,19 @@ impl Ask for Terminal {
     }
 }
 
-/// What [`prepare`] did.
-#[derive(Debug, Default)]
-pub struct Prepared {
-    /// The config repo, when `init` created it.
-    pub created: Option<PathBuf>,
+/// What [`answer`] found and wrote.
+#[derive(Debug)]
+pub struct Answered {
+    /// The config repo.
+    pub repo: PathBuf,
+    /// Whether `init` created it; otherwise it was already there.
+    pub created: bool,
     /// `local.toml`, when `init` wrote it.
     pub saved: Option<PathBuf>,
-    /// What adopting each selection did, in the order selected.
-    pub adopted: Vec<Adoption>,
-    /// Whether discovery, or the rest of the adoptions, was left for the next
-    /// `init` because an interrupted session stands. Adopting takes the
-    /// state directory the way `bx add` does, which recovers that session,
-    /// and recovery is work the plan must announce first.
-    pub adoption_deferred: bool,
 }
 
-/// Everything `init` does before it plans; see the [module documentation](self).
+/// Steps 1 to 3 of the [module documentation](self): the answers, the config
+/// repo, and `local.toml`.
 ///
 /// `interactive` is whether questions may be asked: a terminal on standard
 /// input and no `--yes`.
@@ -235,15 +238,15 @@ pub struct Prepared {
 /// # Errors
 ///
 /// [`Error::BadSet`] and [`Error::Answer`] for a `--set` that cannot be used,
-/// and [`Error::Unset`] when a value is unset and `interactive` is false — all
-/// three before anything is written — and otherwise whatever loading, asking,
-/// writing or adopting returns.
-pub fn prepare(
+/// [`Error::Unset`] when a value is unset and `interactive` is false, and
+/// [`Error::Canceled`] when a question is abandoned — all four before anything
+/// is written — and otherwise whatever loading, asking or writing returns.
+pub fn answer(
     env: &Env,
     sets: &[String],
     interactive: bool,
     ask: &mut dyn Ask,
-) -> Result<Prepared, Error> {
+) -> Result<Answered, Error> {
     let home = &env.home;
     let repo = paths::config_root_in(home, env.xdg_config_home.as_deref());
     let state = StateDir::resolve_in(home, env.xdg_state_home.as_deref());
@@ -252,36 +255,57 @@ pub fn prepare(
     answers.set_all(sets)?;
     answers.ask_unset(interactive, ask)?;
 
-    let mut prepared = Prepared {
-        created: create_repo(&repo)?.then(|| repo.clone()),
+    Ok(Answered {
+        created: create_repo(&repo)?,
         saved: answers.save(&state)?,
-        adopted: Vec::new(),
-        adoption_deferred: false,
-    };
+        repo,
+    })
+}
 
-    if interactive {
+/// Step 4 of the [module documentation](self), for an interactive run: offer
+/// the config already on the machine and adopt each selection, handing each
+/// row to `done` as soon as it is adopted, so what was adopted before a later
+/// one failed has already been said.
+///
+/// Reports whether discovery, or the rest of the adoptions, was left for the
+/// next `init` because an interrupted session stands. Adopting takes the
+/// state directory the way `bx add` does, which recovers that session, and
+/// recovery is work the plan must announce first.
+///
+/// # Errors
+///
+/// [`Error::Canceled`] when the question is abandoned, before anything is
+/// adopted, and otherwise whatever discovering, asking, adopting or `done`
+/// returns.
+pub fn adopt_offered(
+    env: &Env,
+    ask: &mut dyn Ask,
+    done: &mut dyn FnMut(&Adoption) -> Result<(), Error>,
+) -> Result<bool, Error> {
+    let home = &env.home;
+    let state = StateDir::resolve_in(home, env.xdg_state_home.as_deref());
+    if recover::pending(&state)?.is_some() {
+        return Ok(true);
+    }
+    let config_home = paths::xdg_base(env.xdg_config_home.as_deref(), home, ".config");
+    let offered = adopt::discover(&adopt::Context::load(env)?, &config_home)?;
+    if offered.is_empty() {
+        return Ok(false);
+    }
+    for target in ask.adopt(&offered)? {
+        // Looked for again before each, because the prompt waited on a
+        // person while another bx could have been interrupted.
         if recover::pending(&state)?.is_some() {
-            prepared.adoption_deferred = true;
-            return Ok(prepared);
+            return Ok(true);
         }
-        let config_home = paths::xdg_base(env.xdg_config_home.as_deref(), home, ".config");
-        let offered = adopt::discover(&adopt::Context::load(env)?, &config_home)?;
-        if !offered.is_empty() {
-            for target in ask.adopt(&offered)? {
-                // Looked for again before each, because the prompt waited on a
-                // person while another bx could have been interrupted.
-                if recover::pending(&state)?.is_some() {
-                    prepared.adoption_deferred = true;
-                    break;
-                }
-                // Reloaded for each, so each adoption sees what the one before
-                // it declared.
-                let ctx = adopt::Context::load(env)?;
-                prepared.adopted.extend(adopt::add(&ctx, &target)?);
-            }
+        // Reloaded for each, so each adoption sees what the one before it
+        // declared.
+        let ctx = adopt::Context::load(env)?;
+        for row in adopt::add(&ctx, &target)? {
+            done(&row)?;
         }
     }
-    Ok(prepared)
+    Ok(false)
 }
 
 /// Create the config repo with [`HEADER`] as its `bx.toml`, when nothing is at
@@ -543,6 +567,42 @@ pub(crate) mod tests {
                 .cloned()
                 .collect())
         }
+    }
+
+    /// What [`prepare`] did.
+    #[derive(Debug, Default)]
+    struct Prepared {
+        /// The config repo, when `init` created it.
+        created: Option<PathBuf>,
+        /// `local.toml`, when `init` wrote it.
+        saved: Option<PathBuf>,
+        /// What adopting each selection did, in the order selected.
+        adopted: Vec<Adoption>,
+        /// Whether adoption was left for the next `init`.
+        adoption_deferred: bool,
+    }
+
+    /// [`answer`], then [`adopt_offered`] when `interactive`: everything
+    /// `init` does before it plans, as [`crate::command::init`] runs it.
+    fn prepare(
+        env: &Env,
+        sets: &[String],
+        interactive: bool,
+        ask: &mut dyn Ask,
+    ) -> Result<Prepared, Error> {
+        let answered = answer(env, sets, interactive, ask)?;
+        let mut prepared = Prepared {
+            created: answered.created.then_some(answered.repo),
+            saved: answered.saved,
+            ..Prepared::default()
+        };
+        if interactive {
+            prepared.adoption_deferred = adopt_offered(env, ask, &mut |row| {
+                prepared.adopted.push(row.clone());
+                Ok(())
+            })?;
+        }
+        Ok(prepared)
     }
 
     /// An [`Ask`] whose every question is abandoned, as Esc or Ctrl-C does.

@@ -183,7 +183,7 @@ fn converge(
             .map_err(Error::Output)?;
         }
     } else {
-        writeln!(out, "Nothing was written.").map_err(Error::Output)?;
+        writeln!(out, "Nothing was applied.").map_err(Error::Output)?;
     }
     Ok(report)
 }
@@ -287,13 +287,19 @@ fn sync_with(
 /// exactly as `bx apply` does.
 ///
 /// Questions are asked only when standard input is a terminal and `yes` is
-/// not given; see [`init::prepare`]. The plan and its approval are
+/// not given; see [`init::answer`]. The plan and its approval are
 /// [`apply`]'s, so `yes` is the same approval, and without it or a terminal
 /// nothing pending is written.
 ///
+/// It says what it found and each thing it wrote as it writes it, before the
+/// next question, and ends with where the machine stands. A question
+/// abandoned with Esc or Ctrl-C ends it with [`Exit::Canceled`], keeping what
+/// was already written: the next `init` picks up from there.
+///
 /// # Errors
 ///
-/// Whatever [`init::prepare`] returns, then as [`apply`].
+/// Whatever [`init::answer`] and [`init::adopt_offered`] return, then as
+/// [`apply`].
 pub fn init(
     env: &Env,
     sets: &[String],
@@ -312,43 +318,92 @@ fn init_with(
     ask: &mut dyn init::Ask,
     confirm: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, init::Error> {
-    let prepared = match init::prepare(env, sets, env.stdin_tty && !yes, ask) {
-        Ok(prepared) => prepared,
-        Err(init::Error::Canceled) => {
-            writeln!(
-                out,
-                "Canceled. Run `bx init` again to pick up where this stopped."
-            )
-            .map_err(init::Error::Output)?;
-            return Ok(Exit::Canceled);
-        }
+    let interactive = env.stdin_tty && !yes;
+    let answered = match init::answer(env, sets, interactive, ask) {
+        Ok(answered) => answered,
+        Err(init::Error::Canceled) => return init_canceled(out, "Nothing was written. "),
         Err(other) => return Err(other),
     };
-    let mut text = String::new();
-    if let Some(repo) = &prepared.created {
-        text.push_str(&format!(
-            "Created the config repo {} with bx.toml.\n",
-            paths::to_portable(repo, &env.home)
-        ));
-    }
-    if let Some(local) = &prepared.saved {
+    let repo = paths::to_portable(&answered.repo, &env.home);
+    let mut text = if answered.created {
+        format!("Created the config repo {repo} with bx.toml.\n")
+    } else {
+        format!("Using the config repo {repo}.\n")
+    };
+    if let Some(local) = &answered.saved {
         text.push_str(&format!(
             "Saved this account's answers to {}.\n",
             paths::to_portable(local, &env.home)
         ));
     }
-    for row in &prepared.adopted {
-        text.push_str(&adoption_row(row));
+    // Said before the next question is put, so someone who walks away from
+    // it has already been told what this run wrote.
+    say(out, &text)?;
+
+    let mut adopted = 0_usize;
+    if interactive {
+        let deferred = init::adopt_offered(env, ask, &mut |row| {
+            adopted += 1;
+            say(out, &adoption_row(row))
+        });
+        match deferred {
+            Ok(false) => {}
+            Ok(true) => say(
+                out,
+                "Offered nothing to adopt: an interrupted session must be recovered first, \
+                 as the plan shows. Run `bx init` again once it is.\n",
+            )?,
+            Err(init::Error::Canceled) => return init_canceled(out, "Nothing was adopted. "),
+            Err(other) => return Err(other),
+        }
     }
-    if prepared.adoption_deferred {
-        text.push_str(
-            "Offered nothing to adopt: an interrupted session must be recovered first, \
-             as the plan shows. Run `bx init` again once it is.\n",
-        );
-    }
+
+    let report = match converge(env, Mode::Apply, yes, out, confirm) {
+        Ok(report) => report,
+        Err(Error::Canceled) => return init_canceled(out, "Nothing was applied. "),
+        Err(other) => return Err(other.into()),
+    };
+    let exit = plan::exit(&report, Mode::Apply);
+    let did = answered.created || answered.saved.is_some() || adopted > 0 || report.executed;
+    say(out, init_closing(exit, did))?;
+    Ok(exit)
+}
+
+/// Write `text` and flush it, so it is on screen before a prompt waits.
+fn say(out: &mut dyn Write, text: &str) -> Result<(), init::Error> {
     out.write_all(text.as_bytes())
-        .map_err(init::Error::Output)?;
-    Ok(apply_with(env, yes, out, confirm)?)
+        .and_then(|()| out.flush())
+        .map_err(init::Error::Output)
+}
+
+/// What `init` says when a question is walked away from. `undone` is what
+/// that question stood before; everything earlier has already been said.
+fn init_canceled(out: &mut dyn Write, undone: &str) -> Result<Exit, init::Error> {
+    say(
+        out,
+        &format!("Canceled. {undone}Run `bx init` again to pick up where this stopped.\n"),
+    )?;
+    Ok(Exit::Canceled)
+}
+
+/// `init`'s last line: where the machine stands and what to run next. `did`
+/// is whether this run wrote anything at all.
+const fn init_closing(exit: Exit, did: bool) -> &'static str {
+    match (exit, did) {
+        (Exit::Converged, false) => {
+            "Already set up: nothing to answer and nothing to apply. Manage a file with \
+             `bx add PATH`; change an answer with `bx init --set NAME=VALUE`.\n"
+        }
+        (Exit::Converged, true) => {
+            "Set up. Manage a file with `bx add PATH`; change an answer with \
+             `bx init --set NAME=VALUE`.\n"
+        }
+        (Exit::Pending, _) => {
+            "Not finished: see the plan above, then run `bx init` or `bx apply` again.\n"
+        }
+        // Neither is an exit a plan produces.
+        (Exit::Error | Exit::Canceled, _) => "",
+    }
 }
 
 /// What an `apply` that recovered an interrupted session, and did nothing else,
@@ -861,7 +916,7 @@ mod tests {
         assert_eq!(exit, Exit::Pending, "a declined apply is still pending");
         assert_eq!(asked, 1);
         assert!(
-            text(&out).ends_with("Nothing was written.\n"),
+            text(&out).ends_with("Nothing was applied.\n"),
             "{}",
             text(&out)
         );
@@ -952,9 +1007,9 @@ mod tests {
         assert_eq!(exit, Exit::Canceled);
         assert_eq!(
             text(&out),
-            "Canceled. Run `bx init` again to pick up where this stopped.\n"
+            "Canceled. Nothing was written. Run `bx init` again to pick up where this stopped.\n"
         );
-        assert!(!home.child(".local/state/bx/local.toml").exists());
+        assert!(!home.child(".local/state/bx").exists());
         assert!(matches!(
             init_with(&tty, &[], false, &mut Refusing, &mut WalksAway, &mut never),
             Err(init::Error::Output(_))
@@ -980,11 +1035,144 @@ mod tests {
 
         assert_eq!(exit, Exit::Canceled);
         assert!(
-            text(&out).ends_with("Canceled. Nothing was applied.\n"),
+            text(&out).ends_with(
+                " unchanged.\nCanceled. Nothing was applied. Run `bx init` again to pick up \
+                 where this stopped.\n"
+            ),
             "{}",
             text(&out)
         );
         assert!(!home.child(".a").exists());
+    }
+
+    #[test]
+    fn init_walked_away_from_at_the_offer_has_already_said_what_it_wrote() {
+        use crate::init::tests::WalksAway;
+
+        // The reported case: a fresh machine, Esc at "Manage which of these".
+        let home = guarded_home();
+        home.write(".zshrc", "z\n");
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut out = Vec::new();
+
+        let exit = init_with(&tty, &[], false, &mut out, &mut WalksAway, &mut never)
+            .expect("a cancel is not an error");
+
+        assert_eq!(exit, Exit::Canceled);
+        assert_eq!(
+            text(&out),
+            "Created the config repo ~/.config/bx with bx.toml.\n\
+             Canceled. Nothing was adopted. Run `bx init` again to pick up where this stopped.\n"
+        );
+        assert!(home.child(".config/bx/bx.toml").exists());
+        assert!(!home.child(".config/bx/files").exists());
+
+        // And the next run does pick up: the repo is found, the offer is made.
+        let mut out = Vec::new();
+        let exit = init_with(&tty, &[], false, &mut out, &mut WalksAway, &mut never)
+            .expect("a cancel is not an error");
+        assert_eq!(exit, Exit::Canceled);
+        assert!(
+            text(&out).starts_with("Using the config repo ~/.config/bx.\nCanceled."),
+            "{}",
+            text(&out)
+        );
+    }
+
+    #[test]
+    fn init_says_each_adoption_before_a_later_step_fails() {
+        use crate::init::tests::Script;
+
+        let home = guarded_home();
+        seed(home.path(), &inline("~/.a", "a\\n"));
+        home.write(".zshrc", "z\n");
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut script = Script {
+            pick: vec!["~/.zshrc"],
+            ..Script::default()
+        };
+        let mut out = Vec::new();
+
+        let exit = init_with(&tty, &[], false, &mut out, &mut script, &mut || {
+            Err(Error::Canceled)
+        })
+        .expect("a cancel is not an error");
+
+        assert_eq!(exit, Exit::Canceled);
+        assert!(
+            text(&out).starts_with(
+                "Using the config repo ~/.config/bx.\n  + ~/.zshrc  (copied to files/.zshrc)\n"
+            ),
+            "{}",
+            text(&out)
+        );
+        assert!(
+            text(&out).ends_with(
+                "Canceled. Nothing was applied. Run `bx init` again to pick up where this \
+                 stopped.\n"
+            ),
+            "{}",
+            text(&out)
+        );
+    }
+
+    #[test]
+    fn init_ends_by_saying_where_the_machine_stands() {
+        const NEXT: &str =
+            "Manage a file with `bx add PATH`; change an answer with `bx init --set NAME=VALUE`.\n";
+        assert_eq!(
+            init_closing(Exit::Converged, false),
+            format!("Already set up: nothing to answer and nothing to apply. {NEXT}")
+        );
+        assert_eq!(
+            init_closing(Exit::Converged, true),
+            format!("Set up. {NEXT}")
+        );
+        for did in [false, true] {
+            assert_eq!(
+                init_closing(Exit::Pending, did),
+                "Not finished: see the plan above, then run `bx init` or `bx apply` again.\n"
+            );
+            assert_eq!(init_closing(Exit::Error, did), "");
+            assert_eq!(init_closing(Exit::Canceled, did), "");
+        }
+    }
+
+    #[test]
+    fn a_declined_init_is_not_finished_and_keeps_what_it_already_wrote() {
+        use crate::init::tests::Silent;
+
+        let home = guarded_home();
+        seed(home.path(), &inline("~/.a", "a\\n"));
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut out = Vec::new();
+
+        let exit = init_with(&tty, &[], false, &mut out, &mut Silent, &mut || Ok(false))
+            .expect("a declined init");
+
+        assert_eq!(exit, Exit::Pending);
+        assert!(
+            text(&out).starts_with("Using the config repo ~/.config/bx.\n  + ~/.a"),
+            "{}",
+            text(&out)
+        );
+        assert!(
+            text(&out).ends_with(
+                "Nothing was applied.\nNot finished: see the plan above, then run `bx init` or \
+                 `bx apply` again.\n"
+            ),
+            "{}",
+            text(&out)
+        );
     }
 
     #[test]
@@ -1006,7 +1194,9 @@ mod tests {
         assert_eq!(
             text(&out),
             "Created the config repo ~/.config/bx with bx.toml.\n\
-             Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
+             Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n\
+             Set up. Manage a file with `bx add PATH`; change an answer with \
+             `bx init --set NAME=VALUE`.\n"
         );
 
         let mut out = Vec::new();
@@ -1020,10 +1210,27 @@ mod tests {
         )
         .expect("init");
         assert_eq!(exit, Exit::Converged);
+        let second = text(&out).to_string();
         assert_eq!(
-            text(&out),
-            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
+            second,
+            "Using the config repo ~/.config/bx.\n\
+             Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n\
+             Already set up: nothing to answer and nothing to apply. Manage a file with \
+             `bx add PATH`; change an answer with `bx init --set NAME=VALUE`.\n"
         );
+
+        // Invariant 3: a third run says exactly what the second did.
+        let mut out = Vec::new();
+        init_with(
+            &env(home.path()),
+            &[],
+            false,
+            &mut out,
+            &mut Silent,
+            &mut never,
+        )
+        .expect("init");
+        assert_eq!(text(&out), second);
     }
 
     #[test]
@@ -1061,14 +1268,15 @@ mod tests {
         assert_eq!(asked, 1, "the plan was confirmed once, as bx apply asks");
         assert!(
             text(&out).starts_with(
-                "Saved this account's answers to ~/.local/state/bx/local.toml.\n  + ~/.zshrc  \
+                "Using the config repo ~/.config/bx.\n\
+                 Saved this account's answers to ~/.local/state/bx/local.toml.\n  + ~/.zshrc  \
                  (copied to files/.zshrc)\n  + ~/.greeting"
             ),
             "{}",
             text(&out)
         );
         assert!(
-            text(&out).ends_with("Applied 1 change(s).\n"),
+            text(&out).ends_with("Applied 1 change(s).\nSet up. Manage a file with `bx add PATH`; change an answer with `bx init --set NAME=VALUE`.\n"),
             "{}",
             text(&out)
         );
@@ -1109,7 +1317,7 @@ mod tests {
 
         assert!(
             text(&out).starts_with(
-                "Offered nothing to adopt: an interrupted session must be recovered first, \
+                "Using the config repo ~/.config/bx.\nOffered nothing to adopt: an interrupted session must be recovered first, \
                  as the plan shows. Run `bx init` again once it is.\n"
             ),
             "{}",
@@ -1665,7 +1873,7 @@ mod tests {
             assert_eq!(exit, Exit::Pending);
             assert!(
                 text(&out).ends_with(
-                    "Nothing was written.\nPushed nothing: 1 commit(s) wait for an apply that \
+                    "Nothing was applied.\nPushed nothing: 1 commit(s) wait for an apply that \
                      leaves nothing undone; run `bx sync` again.\n"
                 ),
                 "{}",
@@ -1937,7 +2145,7 @@ mod tests {
             assert!(text(&out).contains("  < ~/.lock"), "{}", text(&out));
             assert!(
                 text(&out).ends_with(
-                    "Nothing was written.\nPushed nothing: 1 commit(s) wait for an apply that \
+                    "Nothing was applied.\nPushed nothing: 1 commit(s) wait for an apply that \
                      leaves nothing undone; run `bx sync` again.\n"
                 ),
                 "{}",

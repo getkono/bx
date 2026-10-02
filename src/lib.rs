@@ -54,7 +54,9 @@
 //! holds the commands' bodies, `bx doctor`'s among them, so the binary only
 //! parses its arguments and dispatches. [`sync`] is the git on either side of
 //! `bx sync`'s apply: a fast-forward-only pull before it, and a push after it
-//! that never carries a state file.
+//! that never carries a state file. [`upgrade`] is `bx self-upgrade`: the
+//! installer a fresh install runs, fetched from master and run only while its
+//! digest is the one this release pins.
 //!
 //! [`shell`] is the generated interactive shell file's load order: eleven
 //! named phases assembled in one fixed order whatever order their content was
@@ -127,6 +129,7 @@ pub mod state;
 pub mod sync;
 #[doc(hidden)]
 pub mod testing;
+pub mod upgrade;
 pub mod version;
 
 /// The release `bx --version` opens with; [`version`] adds the build's facts.

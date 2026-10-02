@@ -1,14 +1,15 @@
 //! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
-//! `bx doctor`, `bx add`, `bx rm` and `bx secret list`, and the refusal of
-//! `bx shell-init` and `bx __complete`, which have none yet.
+//! `bx doctor`, `bx add`, `bx rm`, `bx secret list` and `bx self-upgrade`, and
+//! the refusal of `bx shell-init` and `bx __complete`, which have none yet.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
 //! or, for `doctor`, the read-only checks in [`crate::doctor`], for `add` and
 //! `rm`, [`crate::adopt`], for `init`, [`crate::init`] before the
 //! traversal, and for `sync`, [`crate::sync`] around it — writes the rendering
 //! to the output it is
-//! handed, and returns the exit status. `main` does nothing but call one of
-//! them.
+//! handed, and returns the exit status. `self-upgrade` reads no configuration:
+//! it is [`crate::upgrade`] run for the binary that is running. `main` does
+//! nothing but call one of them.
 
 use std::io::Write;
 use std::path::Path;
@@ -24,6 +25,25 @@ use crate::report::{Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
 use crate::sync;
+use crate::upgrade;
+
+/// `bx self-upgrade`: install the latest release over the running binary, as
+/// a fresh install would, or with `check` only report whether there is one.
+///
+/// # Errors
+///
+/// Whatever [`upgrade::run`] returns, and [`upgrade::Error::CurrentExe`] when
+/// the running binary cannot be found.
+pub fn self_upgrade(check: bool, force: bool, out: &mut dyn Write) -> Result<Exit, upgrade::Error> {
+    upgrade::run(
+        upgrade::Request { check, force },
+        crate::VERSION,
+        &upgrade::install_dir()?,
+        upgrade::INSTALLER_URL,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        out,
+    )
+}
 
 /// `bx doctor`: what a human should look at, changing nothing.
 ///

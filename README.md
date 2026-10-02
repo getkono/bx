@@ -28,6 +28,12 @@ no registry, so the long name is the one that is guaranteed to keep working:
 if `bx` ever collides with something on your machine, drop the short name and
 nothing else changes. (`fd` ships `fdfind` on Debian for the same reason.)
 
+To upgrade, run `bx self-upgrade`: it runs this same installer over the
+installed binary. `bx self-upgrade --check` only reports whether a newer
+release exists. Each release pins the installer's checksum, so if the installer
+has changed since your release, `bx self-upgrade` refuses and sends you here.
+Reinstall with the line above.
+
 ## Getting started
 
 ```bash
@@ -52,7 +58,7 @@ Answers you typed in a run that stopped at a later value question are not kept.
 
 ## Commands
 
-There are ten. You should not need a manual.
+There are eleven. You should not need a manual.
 
 | | |
 |---|---|
@@ -66,6 +72,7 @@ There are ten. You should not need a manual.
 | `bx secret list` | list declared secrets, and whether each decrypts here |
 | `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
 | `bx shell-init` | the one line for your shell rc — not built yet |
+| `bx self-upgrade` | install the latest release over this one; `--check` only looks |
 
 `init`, `apply` and `sync` take `--yes`, and `init` takes `--set NAME=VALUE`
 for each value it would ask for, so all three run without a terminal.

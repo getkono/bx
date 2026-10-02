@@ -653,8 +653,8 @@ fn init_on_a_fresh_machine_creates_the_repo_and_a_second_init_writes_nothing() {
             stdout(&again),
             "Using the config repo ~/.config/bx.\n\
              Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n\
-             Already set up: nothing to answer and nothing to apply. Manage a file with \
-             `bx add PATH`; change an answer with `bx init --set NAME=VALUE`.\n"
+             Already set up: nothing to apply. Manage a file with `bx add PATH`; change an \
+             answer with `bx init --set NAME=VALUE`.\n"
         );
         assert_eq!(snapshot(home.path()), before, "{args:?} wrote");
     }

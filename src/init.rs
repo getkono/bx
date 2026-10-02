@@ -270,15 +270,25 @@ pub fn answer(
     })
 }
 
+/// Whether [`adopt_offered`] left adoption to the next `init` because an
+/// interrupted session stands. Adopting takes the state directory the way
+/// `bx add` does, which recovers that session, and recovery is work the plan
+/// must announce first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deferred {
+    /// Nothing was left: everything picked was adopted.
+    No,
+    /// The session stood before anything was offered.
+    BeforeOffering,
+    /// The session appeared while the question waited, or between two
+    /// adoptions: what was picked and not yet adopted was left.
+    AfterPicking,
+}
+
 /// Step 4 of the [module documentation](self), for an interactive run: offer
 /// the config already on the machine and adopt each selection, handing each
 /// row to `done` as soon as it is adopted, so what was adopted before a later
 /// one failed has already been said.
-///
-/// Reports whether discovery, or the rest of the adoptions, was left for the
-/// next `init` because an interrupted session stands. Adopting takes the
-/// state directory the way `bx add` does, which recovers that session, and
-/// recovery is work the plan must announce first.
 ///
 /// # Errors
 ///
@@ -289,22 +299,22 @@ pub fn adopt_offered(
     env: &Env,
     ask: &mut dyn Ask,
     done: &mut dyn FnMut(&Adoption) -> Result<(), Error>,
-) -> Result<bool, Error> {
+) -> Result<Deferred, Error> {
     let home = &env.home;
     let state = StateDir::resolve_in(home, env.xdg_state_home.as_deref());
     if recover::pending(&state)?.is_some() {
-        return Ok(true);
+        return Ok(Deferred::BeforeOffering);
     }
     let config_home = paths::xdg_base(env.xdg_config_home.as_deref(), home, ".config");
     let offered = adopt::discover(&adopt::Context::load(env)?, &config_home)?;
     if offered.is_empty() {
-        return Ok(false);
+        return Ok(Deferred::No);
     }
     for target in ask.adopt(&offered)? {
         // Looked for again before each, because the prompt waited on a
         // person while another bx could have been interrupted.
         if recover::pending(&state)?.is_some() {
-            return Ok(true);
+            return Ok(Deferred::AfterPicking);
         }
         // Reloaded for each, so each adoption sees what the one before it
         // declared.
@@ -313,7 +323,7 @@ pub fn adopt_offered(
             done(&row)?;
         }
     }
-    Ok(false)
+    Ok(Deferred::No)
 }
 
 /// Refuse a `repo` that is, or links to, something other than a directory.
@@ -621,7 +631,7 @@ pub(crate) mod tests {
             prepared.adoption_deferred = adopt_offered(env, ask, &mut |row| {
                 prepared.adopted.push(row.clone());
                 Ok(())
-            })?;
+            })? != Deferred::No;
         }
         Ok(prepared)
     }
@@ -1081,7 +1091,7 @@ pub(crate) mod tests {
     }
 
     /// Picks everything offered, and a session is interrupted while it asks.
-    struct InterruptedWhileAsking<'a>(&'a GuardedHome);
+    pub(crate) struct InterruptedWhileAsking<'a>(pub(crate) &'a GuardedHome);
 
     impl Ask for InterruptedWhileAsking<'_> {
         fn value(&mut self, decl: &ValueDecl, _: Option<&str>) -> Result<String, Error> {

@@ -42,8 +42,19 @@ bx init         # guided setup — first machine or fifth, same command
 
 `init` finds the tools and config already on the machine, asks which of them to
 manage, asks for the handful of values that are yours alone, shows you the diff,
-and applies it on confirmation. It is idempotent and resumable — re-running it
-is the supported way to change your mind.
+and applies it on confirmation.
+
+It is idempotent and resumable. Run it again at any time: it says whether it
+created the config repo or found yours, asks only for values that still have no
+answer, offers whatever config is still unmanaged, and ends by saying where the
+machine stands. On a machine that is already set up it writes nothing unless
+you pick something it offers: the only question it puts is the offer of config
+you have not chosen to manage, and picking nothing is a fine answer. To change an answer you already gave,
+`bx init --set NAME=VALUE`.
+
+Esc or Ctrl-C at any question stops it there. What it had already written stays
+and has already been reported, and the next `bx init` picks up from that point.
+Answers you typed in a run that stopped at a later value question are not kept.
 
 ## Commands
 
@@ -106,6 +117,7 @@ or a login banner without anyone parsing its output:
 | `0` | converged — nothing to do |
 | `1` | error |
 | `2` | changes pending, or a conflict or blocked target needs a decision |
+| `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
 ## Requirements
 

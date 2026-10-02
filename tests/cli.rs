@@ -101,6 +101,10 @@ fn t23_plan_without_a_config_repo_exits_one_and_says_what_to_run() {
         "{}",
         stderr(&output)
     );
+    // The message and nothing about bx's own source or how to debug it.
+    for noise in ["Location:", "src/main.rs", "RUST_BACKTRACE"] {
+        assert!(!stderr(&output).contains(noise), "{}", stderr(&output));
+    }
 }
 
 #[test]
@@ -647,7 +651,10 @@ fn init_on_a_fresh_machine_creates_the_repo_and_a_second_init_writes_nothing() {
         assert_eq!(again.status.code(), Some(0), "{args:?}: {}", stderr(&again));
         assert_eq!(
             stdout(&again),
-            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
+            "Using the config repo ~/.config/bx.\n\
+             Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n\
+             Already set up: nothing to apply. Manage a file with `bx add PATH`; change an \
+             answer with `bx init --set NAME=VALUE`.\n"
         );
         assert_eq!(snapshot(home.path()), before, "{args:?} wrote");
     }
@@ -700,8 +707,10 @@ fn init_without_a_terminal_names_each_unset_value_and_its_flag_and_writes_nothin
     );
     assert_eq!(answered.status.code(), Some(0), "{}", stderr(&answered));
     assert!(
-        stdout(&answered)
-            .starts_with("Saved this account's answers to ~/.local/state/bx/local.toml.\n"),
+        stdout(&answered).starts_with(
+            "Using the config repo ~/.config/bx.\n\
+                 Saved this account's answers to ~/.local/state/bx/local.toml.\n"
+        ),
         "{}",
         stdout(&answered)
     );
@@ -747,7 +756,7 @@ fn init_with_pending_work_and_no_yes_or_terminal_refuses_as_apply_does() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        stdout(&output).starts_with("  + ~/.a"),
+        stdout(&output).starts_with("Using the config repo ~/.config/bx.\n  + ~/.a"),
         "{}",
         stdout(&output)
     );
@@ -756,7 +765,37 @@ fn init_with_pending_work_and_no_yes_or_terminal_refuses_as_apply_does() {
         "{}",
         stderr(&output)
     );
+    // It names no command and claims only what is true of every command that
+    // reaches it.
+    assert!(
+        stderr(&output).contains("nothing in the plan above was applied")
+            && !stderr(&output).contains("bx apply"),
+        "{}",
+        stderr(&output)
+    );
     assert!(!home.child(".a").exists());
+}
+
+#[test]
+fn init_over_a_file_where_the_repo_goes_refuses_it_and_does_not_say_to_run_init() {
+    let home = guarded_home();
+    std::fs::create_dir_all(home.child(".config")).expect("the config home");
+    std::fs::write(home.child(".config/bx"), "mine\n").expect("a file");
+    let before = snapshot(home.path());
+
+    for args in [&["init"][..], &["init", "--yes"]] {
+        let output = bx(home.path(), args);
+
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(stdout(&output), "", "{args:?}");
+        let said = stderr(&output);
+        assert!(said.contains("is not a directory"), "{args:?}: {said}");
+        assert!(
+            !said.contains("run `bx init` to create"),
+            "{args:?}: {said}"
+        );
+        assert_eq!(snapshot(home.path()), before, "{args:?} wrote");
+    }
 }
 
 /// `git args` in `dir`, against `home`'s configuration only.

@@ -136,6 +136,10 @@ pub enum Exit {
     Error = 1,
     /// Changes are pending, or a conflict or blocked target needs a decision.
     Pending = 2,
+    /// A prompt was abandoned with Esc or Ctrl-C. The shell's own status for
+    /// a command an interrupt ended, so a script can tell a person who walked
+    /// away from a failure and from work left pending.
+    Canceled = 130,
 }
 
 impl Exit {
@@ -291,6 +295,7 @@ mod tests {
         assert_eq!(Exit::Converged.code(), 0);
         assert_eq!(Exit::Error.code(), 1);
         assert_eq!(Exit::Pending.code(), 2);
+        assert_eq!(Exit::Canceled.code(), 130);
     }
 
     #[test]

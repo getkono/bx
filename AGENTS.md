@@ -85,8 +85,9 @@ wrong even if it passes CI.
   tools' TOML. Commands and hand-editing must be the same operation.
 - **tempfile + rustix** — atomic writes (temp in destination dir, fsync,
   rename), file modes, and the advisory state-dir lock.
-- **eyre + color-eyre** — application error reporting; `color_eyre::install()`
-  runs at startup in `main`.
+- **eyre + color-eyre** — application error reporting; `main` installs
+  color-eyre at startup with its location and backtrace-hint sections off, so
+  an error reads as its message chain alone.
 - **tracing + tracing-subscriber** — diagnostics. Use `tracing` macros, not
   `println!`, in library code. Verbosity via `BX_LOG` (e.g. `BX_LOG=bx=debug`).
 - **thiserror** — typed error enums for the library's public APIs.

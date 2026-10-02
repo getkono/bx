@@ -1,5 +1,5 @@
 //! The binary's surface for `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
-//! `bx add` and `bx rm`:
+//! `bx add`, `bx rm` and `bx self-upgrade`:
 //! exit codes, what reaches standard output, and what is written.
 //!
 //! Every invocation gets its home per command, from a guarded tempdir; nothing
@@ -885,4 +885,130 @@ fn the_short_and_long_version_flags_print_the_same_build_details() {
     {
         assert!(line.starts_with(label), "{line}");
     }
+}
+
+/// A `curl` on a tempdir `PATH` that serves this tree's `install.sh` and a
+/// `releases/latest` naming `latest`, and serves no release asset at all: a
+/// `bx self-upgrade` that tried to install would fail rather than replace the
+/// binary under test. Returns the `PATH` and the file each request is
+/// appended to.
+fn served(home: &Path, latest: &str) -> (std::ffi::OsString, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = home.join("served");
+    let bin = home.join("served-bin");
+    std::fs::create_dir_all(&root).expect("the served root");
+    std::fs::create_dir_all(&bin).expect("the stub directory");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"),
+        root.join("install.sh"),
+    )
+    .expect("the installer");
+    std::fs::write(
+        root.join("latest.json"),
+        format!("{{\"tag_name\": \"{latest}\"}}\n"),
+    )
+    .expect("the latest release");
+    let requests = root.join("requests");
+    let curl = bin.join("curl");
+    std::fs::write(
+        &curl,
+        format!(
+            "#!/bin/sh\n\
+             for url; do :; done\n\
+             printf '%s\\n' \"$url\" >>'{requests}'\n\
+             case \"$url\" in\n\
+             */install.sh) cat '{root}/install.sh' ;;\n\
+             */releases/latest) cat '{root}/latest.json' ;;\n\
+             *) echo \"404 $url\" >&2; exit 22 ;;\n\
+             esac\n",
+            requests = requests.display(),
+            root = root.display(),
+        ),
+    )
+    .expect("the stub curl");
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    // A test thread that forks while the stub is open for writing keeps it
+    // busy until its child execs; wait that out before bx runs it.
+    for _ in 0..200 {
+        match std::process::Command::new(&curl).arg("warm-up").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => {
+                other.expect("the stub curl runs");
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&requests);
+    let system = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&system)))
+        .expect("a PATH");
+    (path, requests)
+}
+
+/// `bx self-upgrade ARGS` with `path` as its `PATH`.
+fn self_upgrade(home: &Path, path: &std::ffi::OsStr, args: &[&str]) -> Output {
+    Command::cargo_bin("bx")
+        .expect("the bx binary")
+        .arg("self-upgrade")
+        .args(args)
+        .env("HOME", home)
+        .env("PATH", path)
+        .output()
+        .expect("run bx")
+}
+
+#[test]
+fn self_upgrade_check_exits_two_when_a_newer_release_exists_and_installs_nothing() {
+    let home = guarded_home();
+    let (path, requests) = served(home.path(), "v999.0.0");
+
+    let output = self_upgrade(home.path(), &path, &["--check"]);
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "bx v{} is installed; v999.0.0 is available. Run `bx self-upgrade`.\n",
+            bx::VERSION
+        )
+    );
+    let requests = std::fs::read_to_string(requests).expect("the requests");
+    assert!(!requests.contains("/download/"), "{requests}");
+}
+
+#[test]
+fn self_upgrade_at_the_latest_release_exits_zero_and_installs_nothing() {
+    let home = guarded_home();
+    let tag = format!("v{}", bx::VERSION);
+    let (path, requests) = served(home.path(), &tag);
+
+    let check = self_upgrade(home.path(), &path, &["--check"]);
+    assert_eq!(check.status.code(), Some(0), "{}", stderr(&check));
+    assert_eq!(stdout(&check), format!("bx {tag} is the latest release.\n"));
+
+    let upgrade = self_upgrade(home.path(), &path, &[]);
+    assert_eq!(upgrade.status.code(), Some(0), "{}", stderr(&upgrade));
+    assert_eq!(
+        stdout(&upgrade),
+        format!(
+            "bx {tag} is already the latest release, {tag}; nothing to do. `--force` reinstalls {tag}.\n"
+        )
+    );
+    let requests = std::fs::read_to_string(requests).expect("the requests");
+    assert!(!requests.contains("/download/"), "{requests}");
+}
+
+#[test]
+fn self_upgrade_check_and_force_are_exclusive() {
+    let home = guarded_home();
+    let output = bx(home.path(), &["self-upgrade", "--check", "--force"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("cannot be used with"),
+        "{}",
+        stderr(&output)
+    );
 }

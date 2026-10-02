@@ -1,6 +1,6 @@
 //! The `bx` binary.
 //!
-//! Ten commands, no manual. Everything the user needs to discover is reachable
+//! Eleven commands, no manual. Everything the user needs to discover is reachable
 //! from `--help`, dynamic completion, and the prompts in `bx init`.
 
 use std::io::Write as _;
@@ -58,6 +58,16 @@ enum Command {
     Doctor,
     /// Print the one line for your shell rc
     ShellInit { shell: String },
+    /// Install the latest release over this one, as a fresh install would
+    SelfUpgrade {
+        /// Only report whether a newer release exists: exit 0 when not, 2
+        /// when there is
+        #[arg(long, conflicts_with = "force")]
+        check: bool,
+        /// Reinstall the latest release even when this one is not older
+        #[arg(long)]
+        force: bool,
+    },
     /// Completion candidates for the current word (used by the shell)
     #[command(hide = true, name = "__complete")]
     Complete { args: Vec<String> },
@@ -77,8 +87,14 @@ fn main() -> Result<()> {
         .init();
 
     let command = Cli::parse().command;
-    let env = bx::plan::Env::from_process()?;
     let mut out = std::io::stdout().lock();
+    // Upgrading reads no configuration, so it does not need a usable home.
+    if let Some(Command::SelfUpgrade { check, force }) = command {
+        let exit = bx::command::self_upgrade(check, force, &mut out)?;
+        out.flush()?;
+        std::process::exit(exit.code());
+    }
+    let env = bx::plan::Env::from_process()?;
     let exit = match command {
         // No subcommand is the status view.
         None => bx::command::status(&env, &mut out)?,

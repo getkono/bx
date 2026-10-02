@@ -2,6 +2,12 @@
 # bx installer — https://github.com/getkono/bx
 #
 #   curl -fsSL https://raw.githubusercontent.com/getkono/bx/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/getkono/bx/master/install.sh | sh -s -- --latest
+#
+# Change this file only when you must. Every bx release pins its SHA-256
+# (bx::upgrade::INSTALLER_SHA256), and `bx self-upgrade` runs this exact file
+# from master only while it matches: any edit strands every released bx until
+# it is reinstalled by hand.
 #
 # This is the only install channel. bx is what you run *before* you have a
 # toolchain, so this script assumes nothing beyond a POSIX shell, curl or wget,
@@ -11,11 +17,13 @@
 # Environment:
 #   BX_VERSION      version to install, e.g. v1.2.3 (default: the latest release)
 #   BX_INSTALL_DIR  where to put the binary (default: ~/.local/bin)
+#
+# Arguments:
+#   --latest        print the latest release's tag and exit, installing nothing
 
 set -eu
 
 REPO="getkono/bx"
-INSTALL_DIR="${BX_INSTALL_DIR:-${HOME}/.local/bin}"
 
 die() {
 	printf '\033[31merror\033[0m: %s\n' "$1" >&2
@@ -25,6 +33,13 @@ die() {
 info() {
 	printf '\033[36m::\033[0m %s\n' "$1"
 }
+
+LATEST_ONLY=
+case "${1:-}" in
+"") ;;
+--latest) LATEST_ONLY=1 ;;
+*) die "unknown argument: $1. The only one is --latest." ;;
+esac
 
 # --- preflight ----------------------------------------------------------------
 
@@ -47,6 +62,22 @@ else
 	die "neither curl nor wget is available."
 fi
 
+latest_release() {
+	fetch_stdout "https://api.github.com/repos/${REPO}/releases/latest" |
+		sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+		head -n 1
+}
+
+# `--latest` answers on stdout and nothing else, so `bx self-upgrade` can read it.
+if [ -n "$LATEST_ONLY" ]; then
+	LATEST=$(latest_release)
+	[ -n "$LATEST" ] || die "could not determine the latest release."
+	printf '%s\n' "$LATEST"
+	exit 0
+fi
+
+INSTALL_DIR="${BX_INSTALL_DIR:-${HOME}/.local/bin}"
+
 command -v tar >/dev/null 2>&1 || die "tar is required."
 
 # Refuse to install without being able to verify what was downloaded. A tool
@@ -64,9 +95,7 @@ fi
 VERSION="${BX_VERSION:-}"
 if [ -z "$VERSION" ]; then
 	info "Resolving the latest release..."
-	VERSION=$(fetch_stdout "https://api.github.com/repos/${REPO}/releases/latest" |
-		sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-		head -n 1)
+	VERSION=$(latest_release)
 	[ -n "$VERSION" ] || die "could not determine the latest release. Set BX_VERSION to install a specific one."
 fi
 

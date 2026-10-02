@@ -1,7 +1,7 @@
 //! The `bx` binary.
 //!
 //! Ten commands, no manual. Everything the user needs to discover is reachable
-//! from `--help`, dynamic completion, and the prompts in `bx init`.
+//! from `--help` and the prompts in `bx init`.
 
 use std::io::Write as _;
 
@@ -30,7 +30,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Begin managing a tool, a config file, or a secret
+    /// Begin managing a config file, or a directory of them
     Add { target: Option<String> },
     /// Stop managing it, and restore the original
     Rm { target: Option<String> },
@@ -48,7 +48,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Set, list, and rotate secrets
+    /// List declared secrets, and whether each decrypts here
     Secret {
         #[command(subcommand)]
         action: SecretAction,
@@ -56,7 +56,7 @@ enum Command {
     /// Missing tools, unanswered values, damaged state, and what else needs a
     /// look; changes nothing
     Doctor,
-    /// Print the one line for your shell rc
+    /// Print the one line for your shell rc (not built yet)
     ShellInit { shell: String },
     /// Completion candidates for the current word (used by the shell)
     #[command(hide = true, name = "__complete")]
@@ -96,7 +96,14 @@ fn main() -> Result<()> {
         Some(Command::Rm { target }) => {
             bx::command::rm(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
         }
-        Some(_) => todo!("command dispatch"),
+        // Every command is named: one without a body is refused, not panicked
+        // on, and a new one without an arm does not compile.
+        Some(Command::ShellInit { .. }) => {
+            bx::command::not_built("bx shell-init", &mut std::io::stderr())?
+        }
+        Some(Command::Complete { .. }) => {
+            bx::command::not_built("bx __complete", &mut std::io::stderr())?
+        }
     };
     out.flush()?;
     std::process::exit(exit.code());

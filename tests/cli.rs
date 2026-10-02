@@ -916,3 +916,24 @@ fn help_names_only_what_each_command_does() {
         .collect();
     assert_eq!(commands, ["list", "help"]);
 }
+
+#[test]
+fn the_short_and_long_version_flags_print_the_same_build_details() {
+    let home = guarded_home();
+
+    let short = bx(home.path(), &["-V"]);
+    let long = bx(home.path(), &["--version"]);
+
+    assert_eq!(short.status.code(), Some(0), "{}", stderr(&short));
+    assert_eq!(long.status.code(), Some(0), "{}", stderr(&long));
+    assert_eq!(stdout(&short), stdout(&long));
+    let lines: Vec<&str> = stdout(&short).lines().collect();
+    assert_eq!(lines.len(), 5, "{}", stdout(&short));
+    assert_eq!(lines[0], format!("bx {}", bx::VERSION));
+    for (line, label) in lines[1..]
+        .iter()
+        .zip(["commit:  ", "profile: ", "rustc:   ", "built:   "])
+    {
+        assert!(line.starts_with(label), "{line}");
+    }
+}

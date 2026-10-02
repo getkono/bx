@@ -865,3 +865,22 @@ fn bare_bx_is_the_status_view_with_plan_exit_codes() {
         stdout(&output)
     );
 }
+
+#[test]
+fn a_command_with_no_body_exits_one_saying_so_and_does_not_panic() {
+    let home = guarded_home();
+
+    for (args, named) in [
+        (&["shell-init", "zsh"][..], "bx shell-init"),
+        (&["__complete", "x"][..], "bx __complete"),
+    ] {
+        let output = bx(home.path(), args);
+
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert_eq!(
+            stderr(&output),
+            format!("{named} is not built yet in this release of bx.\n")
+        );
+        assert_eq!(stdout(&output), "");
+    }
+}

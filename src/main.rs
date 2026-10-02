@@ -105,7 +105,14 @@ fn main() -> Result<()> {
         Some(Command::Rm { target }) => {
             bx::command::rm(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
         }
-        Some(_) => todo!("command dispatch"),
+        // Every command is named: one without a body is refused, not panicked
+        // on, and a new one without an arm does not compile.
+        Some(Command::ShellInit { .. }) => {
+            bx::command::not_built("bx shell-init", &mut std::io::stderr())?
+        }
+        Some(Command::Complete { .. }) => {
+            bx::command::not_built("bx __complete", &mut std::io::stderr())?
+        }
     };
     out.flush()?;
     std::process::exit(exit.code());

@@ -1,5 +1,6 @@
 //! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
-//! `bx doctor`, `bx add`, `bx rm` and `bx secret list`.
+//! `bx doctor`, `bx add`, `bx rm` and `bx secret list`, and the refusal of
+//! `bx shell-init` and `bx __complete`, which have none yet.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
 //! or, for `doctor`, the read-only checks in [`crate::doctor`], for `add` and
@@ -429,6 +430,20 @@ fn secret_list_with(
     }
     out.write_all(text.as_bytes()).map_err(Error::Output)?;
     Ok(if all { Exit::Converged } else { Exit::Pending })
+}
+
+/// A command the binary parses and this release has no body for: says so on
+/// `err`, in one line, and exits [`Exit::Error`].
+///
+/// `command` is the command as the user typed it, `bx shell-init`.
+///
+/// # Errors
+///
+/// [`Error::Output`] when `err` cannot be written.
+pub fn not_built(command: &str, err: &mut dyn Write) -> Result<Exit, Error> {
+    err.write_all(format!("{command} is not built yet in this release of bx.\n").as_bytes())
+        .map_err(Error::Output)?;
+    Ok(Exit::Error)
 }
 
 /// `bx add PATH`: adopt a file, or every regular file under a directory, byte
@@ -1232,6 +1247,22 @@ mod tests {
 
         assert!(matches!(
             secret_list(&env(home.path()), &mut Refusing),
+            Err(Error::Output(_))
+        ));
+    }
+
+    #[test]
+    fn a_command_with_no_body_is_refused_in_one_line_and_exits_one() {
+        let mut err = Vec::new();
+        let exit = not_built("bx shell-init", &mut err).expect("refused");
+        assert_eq!(exit, Exit::Error);
+        assert_eq!(
+            text(&err),
+            "bx shell-init is not built yet in this release of bx.\n"
+        );
+
+        assert!(matches!(
+            not_built("bx shell-init", &mut Refusing),
             Err(Error::Output(_))
         ));
     }

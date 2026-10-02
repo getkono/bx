@@ -127,6 +127,7 @@ pub mod state;
 pub mod sync;
 #[doc(hidden)]
 pub mod testing;
+pub mod version;
 
-/// The version reported by `bx --version`.
+/// The release `bx --version` opens with; [`version`] adds the build's facts.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

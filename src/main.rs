@@ -8,20 +8,11 @@ use std::io::Write as _;
 use clap::{Parser, Subcommand};
 use eyre::Result;
 
-/// `bx --version`: the release, and the commit it was built from. A user
-/// reporting a problem with a statically installed binary has no other way to
-/// say which build they have.
-const LONG_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("BX_COMMIT_HASH"),
-    " ",
-    env!("BX_COMMIT_DATE"),
-    ")"
-);
-
+// One version text for `-V` and `--version` alike: a user reporting a problem
+// with a statically installed binary has no other way to say which build they
+// have, whichever flag they reach for.
 #[derive(Parser)]
-#[command(name = "bx", version, long_version = LONG_VERSION, about, long_about = None)]
+#[command(name = "bx", version = bx::version::long_version(), about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

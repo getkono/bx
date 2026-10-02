@@ -366,7 +366,7 @@ fn init_with(
             )?,
             Ok(init::Deferred::AfterPicking) => say(
                 out,
-                "Adopted nothing further: a bx session is running or was interrupted, and \
+                "Adopted nothing more of what was picked: a bx session is running or was interrupted, and \
                  adopting waits for it. Run `bx init` again once it has finished or been \
                  recovered, and pick again.\n",
             )?,
@@ -1418,8 +1418,8 @@ mod tests {
 
         assert!(
             text(&out).starts_with(
-                "Using the config repo ~/.config/bx.\nAdopted nothing further: a bx session is \
-                 running or was interrupted, and adopting waits for it. Run `bx init` again \
+                "Using the config repo ~/.config/bx.\nAdopted nothing more of what was picked: a \
+                 bx session is running or was interrupted, and adopting waits for it. Run `bx init` again \
                  once it has finished or been recovered, and pick again.\n"
             ),
             "{}",

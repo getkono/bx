@@ -41,9 +41,9 @@ and applies it on confirmation.
 It is idempotent and resumable. Run it again at any time: it says whether it
 created the config repo or found yours, asks only for values that still have no
 answer, offers whatever config is still unmanaged, and ends by saying where the
-machine stands. On a machine that is already set up it writes nothing; the only
-question it puts is the offer of config you have not chosen to manage, and
-picking nothing is a fine answer. To change an answer you already gave,
+machine stands. On a machine that is already set up it writes nothing unless
+you pick something it offers: the only question it puts is the offer of config
+you have not chosen to manage, and picking nothing is a fine answer. To change an answer you already gave,
 `bx init --set NAME=VALUE`.
 
 Esc or Ctrl-C at any question stops it there. What it had already written stays

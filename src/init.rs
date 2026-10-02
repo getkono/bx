@@ -22,8 +22,9 @@
 //!    and each selection adopted through [`adopt::add`] — `bx add` itself.
 //!    Adopting takes the state directory as `bx add` does, which recovers an
 //!    interrupted session, and recovery is `apply`'s to announce (Invariant
-//!    7). So while one stands, nothing is offered or adopted: the plan shows
-//!    the recovery, and the next `init` offers what this one did not.
+//!    7). So while a journal stands — an interrupted session's, or a running
+//!    `apply`'s, which a journal alone cannot tell apart — nothing is offered
+//!    or adopted, and the next `init` offers what this one did not.
 //!
 //! Steps 1 to 3 are [`answer`] and step 4 is [`adopt_offered`], two calls so
 //! that [`crate::command::init`] can say what the first wrote before the
@@ -34,9 +35,10 @@
 //!
 //! Planning and applying are `bx apply`'s, with its approval rule, and are
 //! called by [`crate::command::init`] once this has run. So a second `init` on
-//! a converged machine writes nothing and exits as `bx plan` would: 0. The
-//! one question it may still put is the offer, because a declined offer is
-//! not remembered and config left unmanaged is offered again.
+//! a converged machine writes nothing unless something it offers is picked,
+//! and exits as `bx plan` would: 0. The one question it may still put is the
+//! offer, because a declined offer is not remembered and config left
+//! unmanaged is offered again.
 
 use std::path::{Path, PathBuf};
 
@@ -271,10 +273,10 @@ pub fn answer(
     })
 }
 
-/// Whether [`adopt_offered`] left adoption to the next `init` because an
-/// interrupted session stands. Adopting takes the state directory the way
-/// `bx add` does, which recovers that session, and recovery is work the plan
-/// must announce first.
+/// Whether [`adopt_offered`] left adoption to the next `init` because a
+/// journal stands, an interrupted session's or a running `apply`'s. Adopting
+/// takes the state directory the way `bx add` does, which would recover an
+/// interrupted session, and recovery is work the plan must announce first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deferred {
     /// Nothing was left: everything picked was adopted.

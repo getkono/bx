@@ -117,9 +117,14 @@ pub enum Error {
     /// The state directory failed, including another bx holding it.
     #[error(transparent)]
     State(#[from] state::Error),
-    /// A prompt failed or was interrupted.
+    /// A prompt failed.
     #[error("asking a question: {0}")]
     Prompt(#[source] inquire::InquireError),
+    /// A prompt was abandoned with Esc or Ctrl-C. Not a failure:
+    /// [`crate::command::init`] says so in a line and exits
+    /// [`crate::report::Exit::Canceled`].
+    #[error("canceled at a prompt")]
+    Canceled,
     /// Adopting a selection failed.
     #[error(transparent)]
     Adopt(#[from] adopt::Error),
@@ -134,6 +139,18 @@ pub enum Error {
     Output(#[source] std::io::Error),
 }
 
+impl Error {
+    /// What a prompt's failure is: [`Error::Canceled`] when it was abandoned,
+    /// [`Error::Prompt`] otherwise.
+    fn from_prompt(error: inquire::InquireError) -> Self {
+        if crate::plan::abandoned(&error) {
+            Self::Canceled
+        } else {
+            Self::Prompt(error)
+        }
+    }
+}
+
 /// The questions `init` asks, as a seam: [`Terminal`] asks them on the
 /// terminal, and a test answers them itself.
 pub trait Ask {
@@ -141,7 +158,8 @@ pub trait Ask {
     ///
     /// # Errors
     ///
-    /// [`Error::Prompt`] when the question cannot be asked or is abandoned.
+    /// [`Error::Canceled`] when the question is abandoned, and
+    /// [`Error::Prompt`] when it cannot be asked.
     fn value(&mut self, decl: &ValueDecl, problem: Option<&str>) -> Result<String, Error>;
 
     /// Which of `offered` to adopt. Nothing is selected until the user picks
@@ -149,7 +167,8 @@ pub trait Ask {
     ///
     /// # Errors
     ///
-    /// [`Error::Prompt`] when the question cannot be asked or is abandoned.
+    /// [`Error::Canceled`] when the question is abandoned, and
+    /// [`Error::Prompt`] when it cannot be asked.
     fn adopt(&mut self, offered: &[Portable]) -> Result<Vec<Portable>, Error>;
 }
 
@@ -174,7 +193,7 @@ impl Ask for Terminal {
         inquire::Text::new(&label)
             .with_help_message(&help)
             .prompt()
-            .map_err(Error::Prompt)
+            .map_err(Error::from_prompt)
     }
 
     fn adopt(&mut self, offered: &[Portable]) -> Result<Vec<Portable>, Error> {
@@ -184,7 +203,7 @@ impl Ask for Terminal {
                 "space selects, enter confirms; nothing is selected until you pick it",
             )
             .raw_prompt()
-            .map_err(Error::Prompt)?;
+            .map_err(Error::from_prompt)?;
         Ok(picked
             .into_iter()
             .map(|option| offered[option.index].clone())
@@ -524,6 +543,48 @@ pub(crate) mod tests {
                 .cloned()
                 .collect())
         }
+    }
+
+    /// An [`Ask`] whose every question is abandoned, as Esc or Ctrl-C does.
+    pub(crate) struct WalksAway;
+
+    impl Ask for WalksAway {
+        fn value(&mut self, _: &ValueDecl, _: Option<&str>) -> Result<String, Error> {
+            Err(Error::Canceled)
+        }
+
+        fn adopt(&mut self, _: &[Portable]) -> Result<Vec<Portable>, Error> {
+            Err(Error::Canceled)
+        }
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_are_a_cancel_and_every_other_prompt_failure_is_an_error() {
+        use inquire::InquireError;
+
+        for key in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            assert!(matches!(Error::from_prompt(key), Error::Canceled));
+        }
+        for key in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            assert!(matches!(
+                crate::plan::Error::from_prompt(key),
+                crate::plan::Error::Canceled
+            ));
+        }
+        assert!(matches!(
+            Error::from_prompt(InquireError::NotTTY),
+            Error::Prompt(InquireError::NotTTY)
+        ));
+        assert!(matches!(
+            crate::plan::Error::from_prompt(InquireError::NotTTY),
+            crate::plan::Error::Prompt(InquireError::NotTTY)
+        ));
     }
 
     /// An [`Ask`] that must never be asked anything.

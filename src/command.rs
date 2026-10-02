@@ -92,7 +92,9 @@ pub fn plan(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 ///
 /// [`Error::NeedsConfirmation`] when there is something to write, no `yes`,
 /// and no terminal to ask on; [`Error::Prompt`] when the prompt fails; and
-/// otherwise as [`status`], plus whatever recovery and the session return.
+/// otherwise as [`status`], plus whatever recovery and the session return. A
+/// prompt abandoned with Esc or Ctrl-C is not an error: it is said in a line
+/// and exits [`Exit::Canceled`].
 pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
     apply_with(env, yes, out, &mut confirm)
 }
@@ -108,7 +110,7 @@ fn confirm() -> Result<bool, Error> {
     inquire::Confirm::new("Apply these changes?")
         .with_default(false)
         .prompt()
-        .map_err(Error::Prompt)
+        .map_err(Error::from_prompt)
 }
 
 /// [`apply`], with the question asked through `ask`.
@@ -118,8 +120,16 @@ fn apply_with(
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, Error> {
-    let report = converge(env, Mode::Apply, yes, out, ask)?;
-    Ok(plan::exit(&report, Mode::Apply))
+    match converge(env, Mode::Apply, yes, out, ask) {
+        Ok(report) => Ok(plan::exit(&report, Mode::Apply)),
+        // The question comes before the first write, so walking away from it
+        // leaves the plan as it was shown.
+        Err(Error::Canceled) => {
+            writeln!(out, "Canceled. Nothing was applied.").map_err(Error::Output)?;
+            Ok(Exit::Canceled)
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// `bx apply`'s body: load, show the plan, obtain approval, write, and say
@@ -227,7 +237,20 @@ fn sync_with(
         )
         .map_err(sync::Error::Output)?;
     }
-    let report = converge(env, Mode::Sync, yes, out, ask)?;
+    let report = match converge(env, Mode::Sync, yes, out, ask) {
+        Ok(report) => report,
+        // Nothing was carried, so there is nothing to commit, and a push is
+        // for an apply that left nothing undone.
+        Err(Error::Canceled) => {
+            writeln!(
+                out,
+                "Canceled. Nothing was applied or pushed; run `bx sync` again."
+            )
+            .map_err(sync::Error::Output)?;
+            return Ok(Exit::Canceled);
+        }
+        Err(other) => return Err(other.into()),
+    };
     let committed = sync::commit_carried(env, git, &pulled.repo)?;
     if committed > 0 {
         writeln!(
@@ -289,7 +312,18 @@ fn init_with(
     ask: &mut dyn init::Ask,
     confirm: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, init::Error> {
-    let prepared = init::prepare(env, sets, env.stdin_tty && !yes, ask)?;
+    let prepared = match init::prepare(env, sets, env.stdin_tty && !yes, ask) {
+        Ok(prepared) => prepared,
+        Err(init::Error::Canceled) => {
+            writeln!(
+                out,
+                "Canceled. Run `bx init` again to pick up where this stopped."
+            )
+            .map_err(init::Error::Output)?;
+            return Ok(Exit::Canceled);
+        }
+        Err(other) => return Err(other),
+    };
     let mut text = String::new();
     if let Some(repo) = &prepared.created {
         text.push_str(&format!(
@@ -868,6 +902,88 @@ mod tests {
         .expect_err("the question failed");
 
         assert!(matches!(error, Error::NeedsConfirmation), "{error:?}");
+        assert!(!home.child(".a").exists());
+    }
+
+    #[test]
+    fn a_confirmation_walked_away_from_is_a_cancel_that_applies_nothing() {
+        let home = guarded_home();
+        seed(home.path(), &inline("~/.a", "a\\n"));
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut out = Vec::new();
+
+        let exit = apply_with(&tty, false, &mut out, &mut || Err(Error::Canceled))
+            .expect("a cancel is not an error");
+
+        assert_eq!(exit, Exit::Canceled);
+        assert!(
+            text(&out).ends_with(" unchanged.\nCanceled. Nothing was applied.\n"),
+            "{}",
+            text(&out)
+        );
+        assert!(!home.child(".a").exists());
+        assert!(matches!(
+            apply_with(&tty, false, &mut Refusing, &mut || Err(Error::Canceled)),
+            Err(Error::Output(_))
+        ));
+    }
+
+    #[test]
+    fn init_walked_away_from_at_a_question_is_a_cancel() {
+        use crate::init::tests::WalksAway;
+
+        let home = guarded_home();
+        seed(
+            home.path(),
+            "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n",
+        );
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut out = Vec::new();
+
+        let exit = init_with(&tty, &[], false, &mut out, &mut WalksAway, &mut never)
+            .expect("a cancel is not an error");
+
+        assert_eq!(exit, Exit::Canceled);
+        assert_eq!(
+            text(&out),
+            "Canceled. Run `bx init` again to pick up where this stopped.\n"
+        );
+        assert!(!home.child(".local/state/bx/local.toml").exists());
+        assert!(matches!(
+            init_with(&tty, &[], false, &mut Refusing, &mut WalksAway, &mut never),
+            Err(init::Error::Output(_))
+        ));
+    }
+
+    #[test]
+    fn init_walked_away_from_at_the_confirmation_is_apply_s_cancel() {
+        use crate::init::tests::Silent;
+
+        let home = guarded_home();
+        seed(home.path(), &inline("~/.a", "a\\n"));
+        let tty = Env {
+            stdin_tty: true,
+            ..env(home.path())
+        };
+        let mut out = Vec::new();
+
+        let exit = init_with(&tty, &[], false, &mut out, &mut Silent, &mut || {
+            Err(Error::Canceled)
+        })
+        .expect("a cancel is not an error");
+
+        assert_eq!(exit, Exit::Canceled);
+        assert!(
+            text(&out).ends_with("Canceled. Nothing was applied.\n"),
+            "{}",
+            text(&out)
+        );
         assert!(!home.child(".a").exists());
     }
 
@@ -1490,6 +1606,44 @@ mod tests {
                 text(&out)
             );
             assert_eq!(rev(home.path(), &home.child("remote.git"), "master"), mine);
+        }
+
+        #[test]
+        fn a_sync_walked_away_from_is_a_cancel_that_applies_and_pushes_nothing() {
+            let home = guarded_home();
+            let repo = cloned(&home, "");
+            std::fs::write(repo.join("bx.toml"), inline("~/.a", "a\\n")).expect("bx.toml");
+            commit_all(home.path(), &repo, "mine");
+            let before = rev(home.path(), &home.child("remote.git"), "master");
+            let tty = Env {
+                stdin_tty: true,
+                ..env(home.path())
+            };
+
+            let mut out = Vec::new();
+            let exit = sync_with(&tty, false, &mut out, &git(home.path()), &mut || {
+                Err(Error::Canceled)
+            })
+            .expect("a cancel is not an error");
+
+            assert_eq!(exit, Exit::Canceled);
+            assert!(
+                text(&out)
+                    .ends_with("Canceled. Nothing was applied or pushed; run `bx sync` again.\n"),
+                "{}",
+                text(&out)
+            );
+            assert!(!home.child(".a").exists());
+            assert_eq!(
+                rev(home.path(), &home.child("remote.git"), "master"),
+                before
+            );
+            assert!(matches!(
+                sync_with(&tty, false, &mut Refusing, &git(home.path()), &mut || {
+                    Err(Error::Canceled)
+                }),
+                Err(sync::Error::Plan(Error::Output(_)))
+            ));
         }
 
         #[test]

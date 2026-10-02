@@ -22,13 +22,23 @@
 //!    and each selection adopted through [`adopt::add`] — `bx add` itself.
 //!    Adopting takes the state directory as `bx add` does, which recovers an
 //!    interrupted session, and recovery is `apply`'s to announce (Invariant
-//!    7). So while one stands, nothing is offered or adopted: the plan shows
-//!    the recovery, and the next `init` offers what this one did not.
+//!    7). So while a journal stands — an interrupted session's, or a running
+//!    `apply`'s, which a journal alone cannot tell apart — nothing is offered
+//!    or adopted, and the next `init` offers what this one did not.
+//!
+//! Steps 1 to 3 are [`answer`] and step 4 is [`adopt_offered`], two calls so
+//! that [`crate::command::init`] can say what the first wrote before the
+//! second puts its question. Every question comes before the writes of its
+//! own step, so one abandoned with Esc or Ctrl-C ([`Error::Canceled`]) leaves
+//! the earlier steps written and said, and nothing of its own: the next
+//! `init` finds them and goes on from there.
 //!
 //! Planning and applying are `bx apply`'s, with its approval rule, and are
 //! called by [`crate::command::init`] once this has run. So a second `init` on
-//! a converged machine asks nothing, writes nothing, and exits as `bx plan`
-//! would: 0.
+//! a converged machine writes nothing unless something it offers is picked,
+//! and exits as `bx plan` would: 0. The one question it may still put is the
+//! offer, because a declined offer is not remembered and config left
+//! unmanaged is offered again.
 
 use std::path::{Path, PathBuf};
 
@@ -102,6 +112,13 @@ pub enum Error {
         /// Why.
         why: String,
     },
+    /// Something that is not a directory is where the config repo goes.
+    #[error(
+        "{} is not a directory, so it cannot be the config repo, and bx will not replace it; \
+         move it out of the way and run `bx init` again. Nothing was written",
+        .0.display()
+    )]
+    RepoNotADirectory(PathBuf),
     /// The config repo's directory could not be made.
     #[error("creating the config repo {}: {source}", .path.display())]
     CreateRepo {
@@ -117,9 +134,14 @@ pub enum Error {
     /// The state directory failed, including another bx holding it.
     #[error(transparent)]
     State(#[from] state::Error),
-    /// A prompt failed or was interrupted.
+    /// A prompt failed.
     #[error("asking a question: {0}")]
     Prompt(#[source] inquire::InquireError),
+    /// A prompt was abandoned with Esc or Ctrl-C. Not a failure:
+    /// [`crate::command::init`] says so in a line and exits
+    /// [`crate::report::Exit::Canceled`].
+    #[error("canceled at a prompt")]
+    Canceled,
     /// Adopting a selection failed.
     #[error(transparent)]
     Adopt(#[from] adopt::Error),
@@ -134,6 +156,18 @@ pub enum Error {
     Output(#[source] std::io::Error),
 }
 
+impl Error {
+    /// What a prompt's failure is: [`Error::Canceled`] when it was abandoned,
+    /// [`Error::Prompt`] otherwise.
+    fn from_prompt(error: inquire::InquireError) -> Self {
+        if crate::plan::abandoned(&error) {
+            Self::Canceled
+        } else {
+            Self::Prompt(error)
+        }
+    }
+}
+
 /// The questions `init` asks, as a seam: [`Terminal`] asks them on the
 /// terminal, and a test answers them itself.
 pub trait Ask {
@@ -141,7 +175,8 @@ pub trait Ask {
     ///
     /// # Errors
     ///
-    /// [`Error::Prompt`] when the question cannot be asked or is abandoned.
+    /// [`Error::Canceled`] when the question is abandoned, and
+    /// [`Error::Prompt`] when it cannot be asked.
     fn value(&mut self, decl: &ValueDecl, problem: Option<&str>) -> Result<String, Error>;
 
     /// Which of `offered` to adopt. Nothing is selected until the user picks
@@ -149,7 +184,8 @@ pub trait Ask {
     ///
     /// # Errors
     ///
-    /// [`Error::Prompt`] when the question cannot be asked or is abandoned.
+    /// [`Error::Canceled`] when the question is abandoned, and
+    /// [`Error::Prompt`] when it cannot be asked.
     fn adopt(&mut self, offered: &[Portable]) -> Result<Vec<Portable>, Error>;
 }
 
@@ -174,7 +210,7 @@ impl Ask for Terminal {
         inquire::Text::new(&label)
             .with_help_message(&help)
             .prompt()
-            .map_err(Error::Prompt)
+            .map_err(Error::from_prompt)
     }
 
     fn adopt(&mut self, offered: &[Portable]) -> Result<Vec<Portable>, Error> {
@@ -184,7 +220,7 @@ impl Ask for Terminal {
                 "space selects, enter confirms; nothing is selected until you pick it",
             )
             .raw_prompt()
-            .map_err(Error::Prompt)?;
+            .map_err(Error::from_prompt)?;
         Ok(picked
             .into_iter()
             .map(|option| offered[option.index].clone())
@@ -192,23 +228,19 @@ impl Ask for Terminal {
     }
 }
 
-/// What [`prepare`] did.
-#[derive(Debug, Default)]
-pub struct Prepared {
-    /// The config repo, when `init` created it.
-    pub created: Option<PathBuf>,
+/// What [`answer`] found and wrote.
+#[derive(Debug)]
+pub struct Answered {
+    /// The config repo.
+    pub repo: PathBuf,
+    /// Whether `init` created it; otherwise it was already there.
+    pub created: bool,
     /// `local.toml`, when `init` wrote it.
     pub saved: Option<PathBuf>,
-    /// What adopting each selection did, in the order selected.
-    pub adopted: Vec<Adoption>,
-    /// Whether discovery, or the rest of the adoptions, was left for the next
-    /// `init` because an interrupted session stands. Adopting takes the
-    /// state directory the way `bx add` does, which recovers that session,
-    /// and recovery is work the plan must announce first.
-    pub adoption_deferred: bool,
 }
 
-/// Everything `init` does before it plans; see the [module documentation](self).
+/// Steps 1 to 3 of the [module documentation](self): the answers, the config
+/// repo, and `local.toml`.
 ///
 /// `interactive` is whether questions may be asked: a terminal on standard
 /// input and no `--yes`.
@@ -216,62 +248,107 @@ pub struct Prepared {
 /// # Errors
 ///
 /// [`Error::BadSet`] and [`Error::Answer`] for a `--set` that cannot be used,
-/// and [`Error::Unset`] when a value is unset and `interactive` is false — all
-/// three before anything is written — and otherwise whatever loading, asking,
-/// writing or adopting returns.
-pub fn prepare(
+/// [`Error::Unset`] when a value is unset and `interactive` is false, and
+/// [`Error::Canceled`] when a question is abandoned — all four before anything
+/// is written — and otherwise whatever loading, asking or writing returns.
+pub fn answer(
     env: &Env,
     sets: &[String],
     interactive: bool,
     ask: &mut dyn Ask,
-) -> Result<Prepared, Error> {
+) -> Result<Answered, Error> {
     let home = &env.home;
     let repo = paths::config_root_in(home, env.xdg_config_home.as_deref());
     let state = StateDir::resolve_in(home, env.xdg_state_home.as_deref());
+    refuse_non_directory(&repo)?;
     let mut answers = Answers::load(&repo, &state, home)?;
 
     answers.set_all(sets)?;
     answers.ask_unset(interactive, ask)?;
 
-    let mut prepared = Prepared {
-        created: create_repo(&repo)?.then(|| repo.clone()),
+    Ok(Answered {
+        created: create_repo(&repo)?,
         saved: answers.save(&state)?,
-        adopted: Vec::new(),
-        adoption_deferred: false,
-    };
+        repo,
+    })
+}
 
-    if interactive {
+/// Whether [`adopt_offered`] left adoption to the next `init` because a
+/// journal stands, an interrupted session's or a running `apply`'s. Adopting
+/// takes the state directory the way `bx add` does, which would recover an
+/// interrupted session, and recovery is work the plan must announce first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deferred {
+    /// Nothing was left: everything picked was adopted.
+    No,
+    /// The session stood before anything was offered.
+    BeforeOffering,
+    /// The session appeared while the question waited, or between two
+    /// adoptions: what was picked and not yet adopted was left.
+    AfterPicking,
+}
+
+/// Step 4 of the [module documentation](self), for an interactive run: offer
+/// the config already on the machine and adopt each selection, handing each
+/// row to `done` as soon as it is adopted, so what was adopted before a later
+/// one failed has already been said.
+///
+/// # Errors
+///
+/// [`Error::Canceled`] when the question is abandoned, before anything is
+/// adopted, and otherwise whatever discovering, asking, adopting or `done`
+/// returns.
+pub fn adopt_offered(
+    env: &Env,
+    ask: &mut dyn Ask,
+    done: &mut dyn FnMut(&Adoption) -> Result<(), Error>,
+) -> Result<Deferred, Error> {
+    let home = &env.home;
+    let state = StateDir::resolve_in(home, env.xdg_state_home.as_deref());
+    if recover::pending(&state)?.is_some() {
+        return Ok(Deferred::BeforeOffering);
+    }
+    let config_home = paths::xdg_base(env.xdg_config_home.as_deref(), home, ".config");
+    let offered = adopt::discover(&adopt::Context::load(env)?, &config_home)?;
+    if offered.is_empty() {
+        return Ok(Deferred::No);
+    }
+    for target in ask.adopt(&offered)? {
+        // Looked for again before each, because the prompt waited on a
+        // person while another bx could have been interrupted.
         if recover::pending(&state)?.is_some() {
-            prepared.adoption_deferred = true;
-            return Ok(prepared);
+            return Ok(Deferred::AfterPicking);
         }
-        let config_home = paths::xdg_base(env.xdg_config_home.as_deref(), home, ".config");
-        let offered = adopt::discover(&adopt::Context::load(env)?, &config_home)?;
-        if !offered.is_empty() {
-            for target in ask.adopt(&offered)? {
-                // Looked for again before each, because the prompt waited on a
-                // person while another bx could have been interrupted.
-                if recover::pending(&state)?.is_some() {
-                    prepared.adoption_deferred = true;
-                    break;
-                }
-                // Reloaded for each, so each adoption sees what the one before
-                // it declared.
-                let ctx = adopt::Context::load(env)?;
-                prepared.adopted.extend(adopt::add(&ctx, &target)?);
-            }
+        // Reloaded for each, so each adoption sees what the one before it
+        // declared.
+        let ctx = adopt::Context::load(env)?;
+        for row in adopt::add(&ctx, &target)? {
+            done(&row)?;
         }
     }
-    Ok(prepared)
+    Ok(Deferred::No)
+}
+
+/// Refuse a `repo` that is, or links to, something other than a directory.
+///
+/// The loader reads such a path as no repo at all, and [`create_repo`] leaves
+/// whatever is there alone, so without this `init` would write its answers and
+/// then be told by the plan to run `bx init`. Anything else the path may be —
+/// absent, a directory, a dangling link, beneath a non-directory — is theirs
+/// to create, use or refuse.
+fn refuse_non_directory(repo: &Path) -> Result<(), Error> {
+    match std::fs::metadata(repo) {
+        Ok(meta) if !meta.is_dir() => Err(Error::RepoNotADirectory(repo.to_path_buf())),
+        _ => Ok(()),
+    }
 }
 
 /// Create the config repo with [`HEADER`] as its `bx.toml`, when nothing is at
 /// `repo`. Reports whether it did.
 ///
-/// Anything already at the path — a repo, an empty directory, or something
-/// that is not a directory at all — is left exactly as it is: a directory is
-/// a repo `init` must not rewrite, and anything else is the loader's to
-/// refuse.
+/// Anything already at the path — a repo, an empty directory, or a link — is
+/// left exactly as it is: a directory is a repo `init` must not rewrite, and
+/// anything else is the loader's to refuse.
 fn create_repo(repo: &Path) -> Result<bool, Error> {
     match std::fs::symlink_metadata(repo) {
         Ok(_) => return Ok(false),
@@ -526,6 +603,84 @@ pub(crate) mod tests {
         }
     }
 
+    /// What [`prepare`] did.
+    #[derive(Debug, Default)]
+    struct Prepared {
+        /// The config repo, when `init` created it.
+        created: Option<PathBuf>,
+        /// `local.toml`, when `init` wrote it.
+        saved: Option<PathBuf>,
+        /// What adopting each selection did, in the order selected.
+        adopted: Vec<Adoption>,
+        /// Whether adoption was left for the next `init`.
+        adoption_deferred: bool,
+    }
+
+    /// [`answer`], then [`adopt_offered`] when `interactive`: everything
+    /// `init` does before it plans, as [`crate::command::init`] runs it.
+    fn prepare(
+        env: &Env,
+        sets: &[String],
+        interactive: bool,
+        ask: &mut dyn Ask,
+    ) -> Result<Prepared, Error> {
+        let answered = answer(env, sets, interactive, ask)?;
+        let mut prepared = Prepared {
+            created: answered.created.then_some(answered.repo),
+            saved: answered.saved,
+            ..Prepared::default()
+        };
+        if interactive {
+            prepared.adoption_deferred = adopt_offered(env, ask, &mut |row| {
+                prepared.adopted.push(row.clone());
+                Ok(())
+            })? != Deferred::No;
+        }
+        Ok(prepared)
+    }
+
+    /// An [`Ask`] whose every question is abandoned, as Esc or Ctrl-C does.
+    pub(crate) struct WalksAway;
+
+    impl Ask for WalksAway {
+        fn value(&mut self, _: &ValueDecl, _: Option<&str>) -> Result<String, Error> {
+            Err(Error::Canceled)
+        }
+
+        fn adopt(&mut self, _: &[Portable]) -> Result<Vec<Portable>, Error> {
+            Err(Error::Canceled)
+        }
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_are_a_cancel_and_every_other_prompt_failure_is_an_error() {
+        use inquire::InquireError;
+
+        for key in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            assert!(matches!(Error::from_prompt(key), Error::Canceled));
+        }
+        for key in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            assert!(matches!(
+                crate::plan::Error::from_prompt(key),
+                crate::plan::Error::Canceled
+            ));
+        }
+        assert!(matches!(
+            Error::from_prompt(InquireError::NotTTY),
+            Error::Prompt(InquireError::NotTTY)
+        ));
+        assert!(matches!(
+            crate::plan::Error::from_prompt(InquireError::NotTTY),
+            crate::plan::Error::Prompt(InquireError::NotTTY)
+        ));
+    }
+
     /// An [`Ask`] that must never be asked anything.
     pub(crate) struct Silent;
 
@@ -584,6 +739,44 @@ pub(crate) mod tests {
             !bare.child(".config/bx/bx.toml").exists(),
             "an existing repo is not written"
         );
+    }
+
+    #[test]
+    fn a_repo_path_that_is_not_a_directory_is_refused_before_anything_is_written() {
+        // It was left alone, read as no repo, and then the plan told `bx init`
+        // to run `bx init`.
+        let home = guarded_home();
+        home.write(".config/bx", "mine\n");
+
+        for config_home in [None, Some(home.child("linked"))] {
+            // The second config home reaches the same file through a link.
+            if let Some(dir) = &config_home {
+                std::fs::create_dir_all(dir).expect("the config home");
+                std::os::unix::fs::symlink(home.child(".config/bx"), dir.join("bx"))
+                    .expect("a link to the file");
+            }
+            let env = Env {
+                xdg_config_home: config_home.map(Into::into),
+                ..env(home.path())
+            };
+            let error = prepare(&env, &["a=b".to_string()], false, &mut Silent)
+                .expect_err("not a directory");
+            assert!(matches!(error, Error::RepoNotADirectory(_)), "{error:?}");
+            assert!(
+                error.to_string().contains("is not a directory")
+                    && error.to_string().contains("Nothing was written"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(home.child(".config/bx")).expect("kept"),
+            "mine\n"
+        );
+        assert!(!home.child(".local/state/bx").exists());
+
+        // Each thing that is not that fault is left to whoever owns it.
+        refuse_non_directory(&home.child(".config/absent")).expect("absent");
+        refuse_non_directory(home.path()).expect("a directory");
     }
 
     #[test]
@@ -901,7 +1094,7 @@ pub(crate) mod tests {
     }
 
     /// Picks everything offered, and a session is interrupted while it asks.
-    struct InterruptedWhileAsking<'a>(&'a GuardedHome);
+    pub(crate) struct InterruptedWhileAsking<'a>(pub(crate) &'a GuardedHome);
 
     impl Ask for InterruptedWhileAsking<'_> {
         fn value(&mut self, decl: &ValueDecl, _: Option<&str>) -> Result<String, Error> {

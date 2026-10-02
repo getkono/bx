@@ -356,19 +356,47 @@ pub enum Error {
     /// A destination could not be observed.
     #[error(transparent)]
     Fs(#[from] crate::fs::Error),
-    /// `apply` has something to write, was not given `--yes`, and has no
-    /// terminal to ask on. The plan has been shown; nothing was written.
+    /// There is something to apply, no `--yes`, and no terminal to ask on.
+    /// The plan has been shown and none of it was applied. Names no command:
+    /// `init` and `sync` reach it too, and `init` has by then written the
+    /// answers it was given.
     #[error(
-        "bx apply writes only what was confirmed, and there is no terminal to ask on; \
-         nothing was written. Review the plan above and rerun with --yes"
+        "bx applies only what was confirmed, and there is no terminal to ask on; nothing \
+         in the plan above was applied. Review it and rerun with --yes"
     )]
     NeedsConfirmation,
-    /// The confirmation prompt failed or was interrupted.
+    /// The confirmation prompt failed.
     #[error("asking for confirmation: {0}")]
     Prompt(#[source] inquire::InquireError),
+    /// The confirmation prompt was abandoned with Esc or Ctrl-C. Not a
+    /// failure: the command says so in a line and exits [`Exit::Canceled`],
+    /// so this never reaches the error report.
+    #[error("canceled at the confirmation prompt")]
+    Canceled,
     /// The rendering could not be written to its output.
     #[error("writing the plan: {0}")]
     Output(#[source] std::io::Error),
+}
+
+/// Whether a prompt ended because the person at it pressed Esc or Ctrl-C,
+/// rather than because it could not be asked.
+pub(crate) const fn abandoned(error: &inquire::InquireError) -> bool {
+    matches!(
+        error,
+        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted
+    )
+}
+
+impl Error {
+    /// What a confirmation prompt's failure is: [`Error::Canceled`] when it
+    /// was [`abandoned`], [`Error::Prompt`] otherwise.
+    pub(crate) fn from_prompt(error: inquire::InquireError) -> Self {
+        if abandoned(&error) {
+            Self::Canceled
+        } else {
+            Self::Prompt(error)
+        }
+    }
 }
 
 impl From<config::Error> for Error {

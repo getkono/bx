@@ -34,8 +34,9 @@
 //!
 //! Planning and applying are `bx apply`'s, with its approval rule, and are
 //! called by [`crate::command::init`] once this has run. So a second `init` on
-//! a converged machine asks nothing, writes nothing, and exits as `bx plan`
-//! would: 0.
+//! a converged machine writes nothing and exits as `bx plan` would: 0. The
+//! one question it may still put is the offer, because a declined offer is
+//! not remembered and config left unmanaged is offered again.
 
 use std::path::{Path, PathBuf};
 

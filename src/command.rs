@@ -147,6 +147,9 @@ fn converge(
     let mut shown = false;
     let report = plan::run(&inputs, mode, &mut |report| {
         emit(out, report, View::Plan, env)?;
+        // On screen before the question about it is put, whatever buffers
+        // the output.
+        out.flush().map_err(Error::Output)?;
         shown = true;
         if yes {
             Ok(true)
@@ -352,15 +355,20 @@ fn init_with(
         });
         match deferred {
             Ok(init::Deferred::No) => {}
+            // A journal is all `adopt_offered` sees, and it may be a running
+            // `apply`'s as well as an interrupted one's, so neither line says
+            // which, nor that the plan will show it.
             Ok(init::Deferred::BeforeOffering) => say(
                 out,
-                "Offered nothing to adopt: an interrupted session must be recovered first, \
-                 as the plan shows. Run `bx init` again once it is.\n",
+                "Offered nothing to adopt: a bx session is running or was interrupted, and \
+                 adopting waits for it. Run `bx init` again once it has finished or been \
+                 recovered.\n",
             )?,
             Ok(init::Deferred::AfterPicking) => say(
                 out,
-                "Left the rest of what was picked for a later `bx init`: an interrupted \
-                 session must be recovered first, as the plan shows.\n",
+                "Adopted nothing further: a bx session is running or was interrupted, and \
+                 adopting waits for it. Run `bx init` again once it has finished or been \
+                 recovered, and pick again.\n",
             )?,
             Err(init::Error::Canceled) => {
                 return init_canceled(
@@ -1340,8 +1348,9 @@ mod tests {
 
         assert!(
             text(&out).starts_with(
-                "Using the config repo ~/.config/bx.\nOffered nothing to adopt: an interrupted session must be recovered first, \
-                 as the plan shows. Run `bx init` again once it is.\n"
+                "Using the config repo ~/.config/bx.\nOffered nothing to adopt: a bx session is \
+                 running or was interrupted, and adopting waits for it. Run `bx init` again \
+                 once it has finished or been recovered.\n"
             ),
             "{}",
             text(&out)
@@ -1379,9 +1388,9 @@ mod tests {
 
         assert!(
             text(&out).starts_with(
-                "Using the config repo ~/.config/bx.\nLeft the rest of what was picked for a \
-                 later `bx init`: an interrupted session must be recovered first, as the plan \
-                 shows.\n"
+                "Using the config repo ~/.config/bx.\nAdopted nothing further: a bx session is \
+                 running or was interrupted, and adopting waits for it. Run `bx init` again \
+                 once it has finished or been recovered, and pick again.\n"
             ),
             "{}",
             text(&out)
@@ -1461,8 +1470,8 @@ mod tests {
         assert!(
             at_confirm.starts_with(
                 "Using the config repo ~/.config/bx.\n  + ~/.zshrc  (copied to files/.zshrc)\n"
-            ),
-            "{at_confirm}"
+            ) && at_confirm.ends_with(" unchanged.\n"),
+            "the plan is on screen when it is put to the question: {at_confirm}"
         );
     }
 

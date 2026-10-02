@@ -101,6 +101,10 @@ fn t23_plan_without_a_config_repo_exits_one_and_says_what_to_run() {
         "{}",
         stderr(&output)
     );
+    // The message and nothing about bx's own source or how to debug it.
+    for noise in ["Location:", "src/main.rs", "RUST_BACKTRACE"] {
+        assert!(!stderr(&output).contains(noise), "{}", stderr(&output));
+    }
 }
 
 #[test]

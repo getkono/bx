@@ -79,7 +79,13 @@ enum SecretAction {
 }
 
 fn main() -> Result<()> {
-    color_eyre::install()?;
+    // An error is something to read, not to debug: where in bx it was
+    // propagated from and how to ask for a backtrace say nothing to the person
+    // whose config it refused.
+    color_eyre::config::HookBuilder::default()
+        .display_location_section(false)
+        .display_env_section(false)
+        .install()?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_env("BX_LOG"))
         .with_writer(std::io::stderr)

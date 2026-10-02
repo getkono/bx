@@ -12,5 +12,6 @@ image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
 
 [build.env]
 # The cross container has no git, so the release workflow exports the commit
-# hash on the host and forwards it here; build.rs prefers it over its own probe.
-passthrough = ["BX_BUILD_SHA"]
+# hash and its date on the host and forwards them here; build.rs prefers them
+# over its own probe.
+passthrough = ["BX_BUILD_SHA", "BX_BUILD_COMMIT_DATE"]

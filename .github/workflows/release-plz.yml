@@ -110,11 +110,14 @@ jobs:
         uses: taiki-e/install-action@cross
       - name: Build
         run: |
-          # The cross container has no git, so export the commit hash here and
-          # forward it via Cross.toml. Assign and export separately: `export`
-          # would mask a failing `git rev-parse` and ship an empty hash.
+          # The cross container has no git, so export the commit hash and its
+          # date here and forward them via Cross.toml. Assign and export
+          # separately: `export` would mask a failing git and ship an empty
+          # value.
           BX_BUILD_SHA="$(git rev-parse --short=12 HEAD)"
           export BX_BUILD_SHA
+          BX_BUILD_COMMIT_DATE="$(git log -1 --format=%cI)"
+          export BX_BUILD_COMMIT_DATE
           cross build --release --locked --target ${{ matrix.target }}
       - name: Package and checksum
         run: |

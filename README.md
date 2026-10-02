@@ -45,20 +45,24 @@ There are ten. You should not need a manual.
 
 | | |
 |---|---|
-| `bx` | status: what is managed, what drifted, what is pending, what your shell costs |
+| `bx` | status: every managed target, and what is pending, in conflict or blocked |
 | `bx init` | guided setup |
-| `bx add` | begin managing a tool, a config file, or a secret |
+| `bx add` | begin managing a config file, or a directory of them |
 | `bx rm` | stop managing it, and restore the original |
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
 | `bx sync` | pull, apply, push — no git knowledge required |
-| `bx secret` | set, list, rotate secrets and recipients |
-| `bx doctor` | drift, missing tools, broken seams, stale caches, shell cost |
-| `bx shell-init` | the one line for your shell rc |
+| `bx secret list` | list declared secrets, and whether each decrypts here |
+| `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
+| `bx shell-init` | the one line for your shell rc — not built yet |
 
-Every prompt has a flag equivalent, plus `--yes`, so the whole surface is
-scriptable. Tab completion is dynamic — it suggests your actual modules, files
-and secrets, not just the flag list.
+`init`, `apply` and `sync` take `--yes`, and `init` takes `--set NAME=VALUE`
+for each value it would ask for, so all three run without a terminal.
+
+`bx secret list` reads; nothing under `bx secret` writes. Who secrets are
+encrypted to is the `recipients` list under `[secrets]` in `bx.toml` or a
+module, edited by hand, and a secret is encrypted or re-encrypted to them with
+`age -e`.
 
 ### Reading a plan
 
@@ -156,10 +160,11 @@ or a login banner without anyone parsing its output:
 - **Nothing user-specific is ever committed.** Identity, hostnames, absolute
   paths, and per-machine choices are asked for at setup and stay on the machine.
 - **No cleartext secret is ever committed.** Secrets are encrypted at rest with
-  a key that never enters the repo, and a guard blocks any commit that would
-  leak one.
-- Secrets are delivered into each tool's *own* credential store or agent where
-  one exists; only failing that, into a private-mode file.
+  a key that never enters the repo, `bx` decrypts one only into its target,
+  and `bx add` refuses the files at a fixed list of paths known to hold
+  credentials. Nothing reads a file's content for one, and nothing scans what
+  you commit by hand.
+- A secret is delivered into a private-mode file.
 - Adopting existing config is lossless: your current files are taken verbatim,
   so a fresh machine reproduces the one you have, not a skeleton of it.
 

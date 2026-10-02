@@ -11,8 +11,9 @@ Windows code paths, targets, or documentation.
 - `src/main.rs` — thin binary entry point. Wires up `color_eyre` and
   `tracing_subscriber`, then delegates to the library. **Excluded from coverage**
   (the `coverage` task passes `--ignore-filename-regex 'src/main\.rs'`).
-- `build.rs` — embeds the build commit for `bx --version`. Best-effort; never
-  fail the build when git is unavailable.
+- `build.rs` — embeds the build's commit, profile, compiler and time for
+  `bx --version`, which `src/version.rs` lays out. Best-effort; never fail the
+  build when git is unavailable.
 - `bench/` — the hermetic shell-startup benchmark. See `bench/README.md`.
 - `install.sh` — the only distribution channel. POSIX sh, shellcheck-clean.
 

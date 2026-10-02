@@ -1,10 +1,12 @@
-//! Build script: captures the commit bx was built from and exposes it as a
-//! compile-time env var for `bx --version`.
+//! Build script: captures the commit bx was built from, the profile, the
+//! compiler and the build time, and exposes them as compile-time env vars for
+//! `bx --version` (see `src/version.rs`).
 //!
 //! Every fact is best-effort. In a source tarball, or a checkout with no `.git`,
 //! the value falls back to `"unknown"` rather than failing the build.
 
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     // A CI-provided hash wins over the local probe: the cross container that
@@ -20,12 +22,26 @@ fn main() {
         })
     });
 
+    // The commit date takes the same route, for the same reason.
+    let commit_date =
+        env_override("BX_BUILD_COMMIT_DATE").or_else(|| git(&["log", "-1", "--format=%cI"]));
+
     emit("BX_COMMIT_HASH", commit.as_deref().unwrap_or("unknown"));
     emit(
         "BX_COMMIT_DATE",
-        git(&["log", "-1", "--format=%cI"])
-            .as_deref()
-            .unwrap_or("unknown"),
+        commit_date.as_deref().unwrap_or("unknown"),
+    );
+    emit(
+        "BX_BUILD_PROFILE",
+        env_override("PROFILE").as_deref().unwrap_or("unknown"),
+    );
+    emit(
+        "BX_RUSTC_VERSION",
+        rustc_version().as_deref().unwrap_or("unknown"),
+    );
+    emit(
+        "BX_BUILD_EPOCH",
+        build_epoch().as_deref().unwrap_or("unknown"),
     );
 
     // Rebuild when HEAD moves so the embedded commit stays current. In a git
@@ -36,6 +52,30 @@ fn main() {
     }
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=BX_BUILD_SHA");
+    println!("cargo::rerun-if-env-changed=BX_BUILD_COMMIT_DATE");
+    println!("cargo::rerun-if-env-changed=SOURCE_DATE_EPOCH");
+}
+
+/// `rustc --version` of the compiler Cargo selected for this build.
+fn rustc_version() -> Option<String> {
+    let rustc = env_override("RUSTC").unwrap_or_else(|| "rustc".to_string());
+    let out = Command::new(rustc).arg("--version").output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// When this build ran, in seconds since the Unix epoch. `SOURCE_DATE_EPOCH`
+/// wins, so a reproducible build can pin it. Emitted raw: the library renders
+/// it, where the arithmetic is tested.
+fn build_epoch() -> Option<String> {
+    env_override("SOURCE_DATE_EPOCH")
+        .filter(|v| v.parse::<u64>().is_ok())
+        .or_else(|| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+            Some(now.as_secs().to_string())
+        })
 }
 
 /// A trimmed, non-empty environment variable, or `None`.

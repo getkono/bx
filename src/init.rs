@@ -109,6 +109,13 @@ pub enum Error {
         /// Why.
         why: String,
     },
+    /// Something that is not a directory is where the config repo goes.
+    #[error(
+        "{} is not a directory, so it cannot be the config repo, and bx will not replace it; \
+         move it out of the way and run `bx init` again. Nothing was written",
+        .0.display()
+    )]
+    RepoNotADirectory(PathBuf),
     /// The config repo's directory could not be made.
     #[error("creating the config repo {}: {source}", .path.display())]
     CreateRepo {
@@ -250,6 +257,7 @@ pub fn answer(
     let home = &env.home;
     let repo = paths::config_root_in(home, env.xdg_config_home.as_deref());
     let state = StateDir::resolve_in(home, env.xdg_state_home.as_deref());
+    refuse_non_directory(&repo)?;
     let mut answers = Answers::load(&repo, &state, home)?;
 
     answers.set_all(sets)?;
@@ -308,13 +316,26 @@ pub fn adopt_offered(
     Ok(false)
 }
 
+/// Refuse a `repo` that is, or links to, something other than a directory.
+///
+/// The loader reads such a path as no repo at all, and [`create_repo`] leaves
+/// whatever is there alone, so without this `init` would write its answers and
+/// then be told by the plan to run `bx init`. Anything else the path may be —
+/// absent, a directory, a dangling link, beneath a non-directory — is theirs
+/// to create, use or refuse.
+fn refuse_non_directory(repo: &Path) -> Result<(), Error> {
+    match std::fs::metadata(repo) {
+        Ok(meta) if !meta.is_dir() => Err(Error::RepoNotADirectory(repo.to_path_buf())),
+        _ => Ok(()),
+    }
+}
+
 /// Create the config repo with [`HEADER`] as its `bx.toml`, when nothing is at
 /// `repo`. Reports whether it did.
 ///
-/// Anything already at the path — a repo, an empty directory, or something
-/// that is not a directory at all — is left exactly as it is: a directory is
-/// a repo `init` must not rewrite, and anything else is the loader's to
-/// refuse.
+/// Anything already at the path — a repo, an empty directory, or a link — is
+/// left exactly as it is: a directory is a repo `init` must not rewrite, and
+/// anything else is the loader's to refuse.
 fn create_repo(repo: &Path) -> Result<bool, Error> {
     match std::fs::symlink_metadata(repo) {
         Ok(_) => return Ok(false),
@@ -705,6 +726,44 @@ pub(crate) mod tests {
             !bare.child(".config/bx/bx.toml").exists(),
             "an existing repo is not written"
         );
+    }
+
+    #[test]
+    fn a_repo_path_that_is_not_a_directory_is_refused_before_anything_is_written() {
+        // It was left alone, read as no repo, and then the plan told `bx init`
+        // to run `bx init`.
+        let home = guarded_home();
+        home.write(".config/bx", "mine\n");
+
+        for config_home in [None, Some(home.child("linked"))] {
+            // The second config home reaches the same file through a link.
+            if let Some(dir) = &config_home {
+                std::fs::create_dir_all(dir).expect("the config home");
+                std::os::unix::fs::symlink(home.child(".config/bx"), dir.join("bx"))
+                    .expect("a link to the file");
+            }
+            let env = Env {
+                xdg_config_home: config_home.map(Into::into),
+                ..env(home.path())
+            };
+            let error = prepare(&env, &["a=b".to_string()], false, &mut Silent)
+                .expect_err("not a directory");
+            assert!(matches!(error, Error::RepoNotADirectory(_)), "{error:?}");
+            assert!(
+                error.to_string().contains("is not a directory")
+                    && error.to_string().contains("Nothing was written"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(home.child(".config/bx")).expect("kept"),
+            "mine\n"
+        );
+        assert!(!home.child(".local/state/bx").exists());
+
+        // Each thing that is not that fault is left to whoever owns it.
+        refuse_non_directory(&home.child(".config/absent")).expect("absent");
+        refuse_non_directory(home.path()).expect("a directory");
     }
 
     #[test]

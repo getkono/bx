@@ -776,6 +776,28 @@ fn init_with_pending_work_and_no_yes_or_terminal_refuses_as_apply_does() {
     assert!(!home.child(".a").exists());
 }
 
+#[test]
+fn init_over_a_file_where_the_repo_goes_refuses_it_and_does_not_say_to_run_init() {
+    let home = guarded_home();
+    std::fs::create_dir_all(home.child(".config")).expect("the config home");
+    std::fs::write(home.child(".config/bx"), "mine\n").expect("a file");
+    let before = snapshot(home.path());
+
+    for args in [&["init"][..], &["init", "--yes"]] {
+        let output = bx(home.path(), args);
+
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(stdout(&output), "", "{args:?}");
+        let said = stderr(&output);
+        assert!(said.contains("is not a directory"), "{args:?}: {said}");
+        assert!(
+            !said.contains("run `bx init` to create"),
+            "{args:?}: {said}"
+        );
+        assert_eq!(snapshot(home.path()), before, "{args:?} wrote");
+    }
+}
+
 /// `git args` in `dir`, against `home`'s configuration only.
 fn git(home: &Path, dir: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")

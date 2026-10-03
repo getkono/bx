@@ -3,6 +3,11 @@
 # absent — it is an IDE component no task here runs, and requiring it made every
 # `cargo` invocation on a clean runner download it (see issue #55). A developer
 # who wants it runs `rustup component add rust-analyzer`.
+#
+# The channel is pinned to an exact release, not `stable`: a floating channel
+# let a new clippy lint turn master red with no change in this repository (see
+# issue #127). This file overrides the toolchain the CI workflows install, so
+# bumping it is a deliberate one-line change that brings its own lint fixes.
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]

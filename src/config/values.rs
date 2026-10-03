@@ -2259,7 +2259,13 @@ mod tests {
         // A value that is not a root is unaffected: it names a location, and
         // nothing is admitted on the strength of it.
         let plain = a_decl("brew_prefix", ValueKind::Path);
-        assert!(resolve(vec![plain], &[answer("brew_prefix", "/")]).is_ok());
+        let values = resolve(vec![plain], &[answer("brew_prefix", "/")])
+            .expect("`/` is an ordinary answer for a value that is not a root");
+        assert_eq!(
+            values.get("brew_prefix").map(|v| v.text.as_str()),
+            Some("/")
+        );
+        assert!(values.roots().is_empty(), "and it admits nothing");
     }
 
     #[test]

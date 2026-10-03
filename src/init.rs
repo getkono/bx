@@ -1155,7 +1155,13 @@ pub(crate) mod tests {
     fn nothing_to_offer_asks_nothing() {
         let home = guarded_home();
         seed(home.path(), "");
-        prepare(&env(home.path()), &[], true, &mut Silent).expect("init");
+        // `Silent` panics on any question, so reaching the result is what
+        // shows nothing was asked; the result shows nothing was done either.
+        let prepared = prepare(&env(home.path()), &[], true, &mut Silent).expect("init");
+        assert_eq!(prepared.created, None, "the seeded repo is left alone");
+        assert_eq!(prepared.saved, None, "no value, so no local.toml written");
+        assert!(prepared.adopted.is_empty());
+        assert!(!prepared.adoption_deferred, "nothing was offered to defer");
     }
 
     #[test]

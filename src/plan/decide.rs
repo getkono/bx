@@ -2405,6 +2405,69 @@ mod tests {
     }
 
     #[test]
+    fn an_agreement_of_up_to_64_kib_is_kept_whole_and_a_larger_one_as_its_digest() {
+        // Written out rather than read from `Base::KEPT_WHOLE`, so a change to
+        // the bound is a change a test names.
+        const SIXTY_FOUR_KIB: usize = 65_536;
+        let whole = vec![b'a'; SIXTY_FOUR_KIB];
+        let large = vec![b'a'; SIXTY_FOUR_KIB + 1];
+        assert_eq!(Base::of(&whole), Base::Bytes(whole.clone()));
+        assert_eq!(
+            Base::of(&large),
+            Base::Digest(*ContentHash::of(&large).as_bytes())
+        );
+        // Each reads back from the cache as it was kept; whole bytes past the
+        // bound are no shape the cache writes.
+        for base in [Base::of(&whole), Base::of(&large)] {
+            assert_eq!(Base::from_fingerprint(&base.fingerprint()), Some(base));
+        }
+        let mut past = vec![Base::BYTES];
+        past.extend_from_slice(&large);
+        assert_eq!(Base::from_fingerprint(&Fingerprint::raw(past)), None);
+    }
+
+    #[test]
+    fn a_symlink_create_names_every_directory_apply_creates_for_it() {
+        let home = guarded_home();
+        let inputs = crate::plan::tests::inputs(
+            &home,
+            "[[target]]\npath = \"~/.tool/deep/link\"\nsymlink = \"/opt/x\"\n",
+        );
+
+        let row = row_for(&plan_of(&inputs), "~/.tool/deep/link").clone();
+        assert_eq!(row.action, Action::Create, "{row:?}");
+        assert_eq!(
+            row.note.as_deref(),
+            Some("creates ~/.tool 0755, ~/.tool/deep 0755"),
+            "plan announces every directory apply makes for the link"
+        );
+        assert!(!home.child(".tool").exists(), "plan created a parent");
+    }
+
+    #[test]
+    fn a_tracked_copy_put_onto_this_machine_names_every_directory_apply_creates() {
+        let home = guarded_home();
+        home.write(".config/bx/files/tool.conf", "x\n");
+        let inputs = crate::plan::tests::inputs(
+            &home,
+            "[[target]]\npath = \"~/.tool/deep/tool.conf\"\nfile = \"files/tool.conf\"\n\
+             direction = \"track\"\n",
+        );
+
+        let row = row_for(&plan_of(&inputs), "~/.tool/deep/tool.conf").clone();
+        assert_eq!(row.action, Action::Create, "{row:?}");
+        assert_eq!(
+            row.note.as_deref(),
+            Some(
+                "this machine has no copy; apply writes the repo's; \
+                 creates ~/.tool 0755, ~/.tool/deep 0755"
+            ),
+            "plan announces every directory apply makes for the copy"
+        );
+        assert!(!home.child(".tool").exists(), "plan created a parent");
+    }
+
+    #[test]
     fn a_symlink_whose_parent_denies_its_owner_write_or_search_is_a_conflict() {
         // Making a link writes an entry in its parent, so `decide_link` asks
         // `locked_parent` as a file's write does: one parent on disk that
@@ -4552,7 +4615,30 @@ mod tests {
             let roots = RootSet::new(home.path(), &[PathBuf::from("~")]);
             let line = format!("SCRATCH_HOME={}\n", home.path().display());
             assert_eq!(guard_fragment(&line, &roots), None);
-            assert!(guard_environment_d(&line, &roots).is_some());
+            let refused = guard_environment_d(&line, &roots).expect("refused as exported");
+            assert!(refused.starts_with("line 1: SCRATCH_HOME "), "{refused}");
+        }
+
+        #[test]
+        fn a_region_write_is_recorded_as_a_region_and_not_the_whole_file() {
+            // Invariant 1: the bytes around a region are the user's. The
+            // ledger is what says so, and what a later write and `bx rm` read.
+            let home = guarded_home();
+            home.write(".zshrc", "alias ll='ls -l'\n");
+            apply(&home, &env("EDITOR", "nvim", "interactive"));
+            assert_eq!(
+                read(&home, ".zshrc"),
+                format!("alias ll='ls -l'\n{ZSHRC_REGION}")
+            );
+            let key = Portable::parse_in("~/.zshrc", home.path()).expect("a path");
+            let ledger =
+                LedgerView::read(&crate::state::StateDir::resolve(home.path()), home.path())
+                    .expect("the ledger")
+                    .value;
+            assert_eq!(
+                ledger.get(&key).map(|entry| entry.mechanism.clone()),
+                Some(Mechanism::Region { comment: '#' })
+            );
         }
 
         /// The `~/.zshrc` row an interactive declaration gets over `bytes`,

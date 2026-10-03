@@ -9,6 +9,30 @@ Conventional Commit messages.
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/getkono/bx/compare/v0.1.1...v0.1.2) - 2026-10-03
+
+### Added
+
+- add bx self-upgrade
+- *(install)* print the latest release with --latest
+
+### Fixed
+
+- restore green CI on clippy 1.99.0 and pin the Rust toolchain ([#149](https://github.com/getkono/bx/pull/149))
+- *(cli)* report build details from -V and --version
+
+### Other
+
+- *(deps)* remove dependencies nothing references ([#157](https://github.com/getkono/bx/pull/157))
+- run cargo-mutants on each pull request diff ([#156](https://github.com/getkono/bx/pull/156))
+- derive the no-user-specific-data needles from the running machine ([#155](https://github.com/getkono/bx/pull/155))
+- read source-scanning tests' files by module directory walk ([#154](https://github.com/getkono/bx/pull/154))
+- correct top-level documentation to the shipped behaviour ([#153](https://github.com/getkono/bx/pull/153))
+- bring CI, mise and hk gates into parity and keep coverage profiles out of the tree ([#152](https://github.com/getkono/bx/pull/152))
+- gate file length at 3743 lines against a shrinking baseline ([#151](https://github.com/getkono/bx/pull/151))
+- *(readme)* document bx self-upgrade
+- *(release)* forward the commit date into the cross build
+
 ## [0.1.1](https://github.com/getkono/bx/compare/v0.1.0...v0.1.1) - 2026-09-28
 
 ### Added

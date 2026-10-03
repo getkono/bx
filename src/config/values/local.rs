@@ -336,26 +336,30 @@ mod tests {
         // Held structurally: every function in this module takes and returns a
         // document and never a path, so there is nothing for it to open. The
         // assertion is on the source, so it fails the moment that stops being
-        // true.
-        let source = include_str!("local.rs");
-        let body = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the non-test half");
+        // true. The module is read whole, its submodules included, so splitting
+        // it does not take a file out of the scan.
+        for (path, source) in crate::testing::module_sources("config::values::local") {
+            let body = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("the non-test half");
 
-        for forbidden in [
-            "std::fs",
-            "std::io",
-            "File::",
-            "OpenOptions",
-            "write(",
-            "tempfile",
-            "rustix",
-        ] {
-            assert!(
-                !body.contains(forbidden),
-                "`{forbidden}` appeared: persisting a document belongs to the atomic writer"
-            );
+            for forbidden in [
+                "std::fs",
+                "std::io",
+                "File::",
+                "OpenOptions",
+                "write(",
+                "tempfile",
+                "rustix",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{}: `{forbidden}` appeared: persisting a document belongs to the \
+                     atomic writer",
+                    path.display()
+                );
+            }
         }
     }
 }

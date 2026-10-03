@@ -3297,15 +3297,40 @@ mod tests {
     /// So the census is re-derived from the enum at every run instead. Rust
     /// cannot enumerate an enum's variants without a derive macro, and adding
     /// a crate for it is not this module's decision — but the declaration is
-    /// right here in the source, and `include_str!` reads it at compile time.
-    /// `testing::tests::no_user_specific_literal_survives_under_src` already
-    /// establishes source-reading as how this repository holds a property no
-    /// type can carry.
+    /// in this module's source, and the census reads it from there at run
+    /// time. `testing::tests::no_user_specific_literal_survives_under_src`
+    /// already establishes source-reading as how this repository holds a
+    /// property no type can carry.
+    ///
+    /// The module is read whole — `env_guard.rs` and every file beneath
+    /// `env_guard/` — and the declaration is found by its content, a line that
+    /// is exactly `pub enum Reason {`, so splitting the module does not move
+    /// the enum out of the census's sight. Exactly one such line must exist.
     ///
     /// Returns names rather than a count, so the walk can say *which* variant
     /// it never reached.
     fn declared_reasons() -> Vec<&'static str> {
-        reasons_declared_in(include_str!("env_guard.rs"))
+        static DECLARATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let declaration = DECLARATION.get_or_init(|| {
+            let mut found = Vec::new();
+            for (path, source) in crate::testing::module_sources("env_guard") {
+                let mut offset = 0;
+                for line in source.split_inclusive('\n') {
+                    if line.trim() == "pub enum Reason {" {
+                        found.push((path.clone(), source[offset..].to_string()));
+                    }
+                    offset += line.len();
+                }
+            }
+            let sites: Vec<_> = found.iter().map(|(path, _)| path).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "the Reason enum is declared once in this module, found at {sites:?}"
+            );
+            found.remove(0).1
+        });
+        reasons_declared_in(declaration)
     }
 
     /// The same census, over any source text.
@@ -7647,89 +7672,65 @@ mod tests {
         // knows, passes each readable assignment of one through `check`, the
         // function `scan_with` calls per assignment, refuses every other
         // assigning form, and never writes an output with any refusal.
-        const KNOWN: [(&str, &str); 15] = [
-            ("adopt.rs", "use crate::env_guard::{self, Reason, RootSet};"),
-            ("config/env.rs", "use crate::env_guard::is_variable_name;"),
-            ("config/when.rs", "use crate::env_guard::is_variable_name;"),
-            ("config/path.rs", "use crate::env_guard::is_variable_name;"),
-            ("adopt.rs", "env_guard::scan_with(text, roots)"),
-            ("plan/decide.rs", "use crate::env_guard::{self, RootSet};"),
-            (
-                "plan/decide.rs",
-                "violations(&env_guard::scan_with(content, roots), before)",
-            ),
-            (
-                "plan/decide.rs",
-                "violations(&env_guard::scan_exported(content, roots), 0)",
-            ),
-            (
-                "plan/decide.rs",
-                "fn violations(found: &[env_guard::Violation], before: usize) -> Option<String> {",
-            ),
+        //
+        // A site is matched by its code alone, not by the file it sits in, so
+        // splitting a module moves a known site without failing here. `KNOWN`
+        // is a multiset: each entry is claimed by one site, so a line repeated
+        // into a further file is a new caller, as it was when sites were
+        // matched by file. "This module" is the `env_guard` module wherever
+        // its files are — `env_guard.rs` and everything beneath `env_guard/`.
+        const KNOWN: [&str; 16] = [
+            // `bx add`'s advisory scan.
+            "use crate::env_guard::{self, Reason, RootSet};",
+            "env_guard::scan_with(text, roots)",
+            // The name predicate, in `config::env`, `config::when` and
+            // `config::path`.
+            "use crate::env_guard::is_variable_name;",
+            "use crate::env_guard::is_variable_name;",
+            "use crate::env_guard::is_variable_name;",
+            // The plan's fragment judgements.
+            "use crate::env_guard::{self, RootSet};",
+            "violations(&env_guard::scan_with(content, roots), before)",
+            "violations(&env_guard::scan_exported(content, roots), 0)",
+            "fn violations(found: &[env_guard::Violation], before: usize) -> Option<String> {",
             // The interactive file's history path, judged beside its `env`
             // phase, which still goes through `scan_with` above.
-            (
-                "plan/decide.rs",
-                "env_guard::refuses_bx_location(&path, roots)",
-            ),
-            ("plan/mod.rs", "use crate::env_guard::RootSet;"),
-            (
-                "plan/mod.rs",
-                "let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();",
-            ),
-            (
-                "shell/activation.rs",
-                "use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};",
-            ),
-            (
-                "shell/activation.rs",
-                "if name.starts_with(|c: char| c.is_ascii_digit()) || !env_guard::is_relocating(&name) {",
-            ),
-            (
-                "shell/activation.rs",
-                "Use::Assigns(value) => match env_guard::check(&name, &value, roots) {",
-            ),
+            "env_guard::refuses_bx_location(&path, roots)",
+            "use crate::env_guard::RootSet;",
+            "let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();",
+            // Cached activation output: the name search, once over names as
+            // written and once over names a quote or escape splits, and the
+            // judgement of each assignment it finds.
+            "use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};",
+            "if name.starts_with(|c: char| c.is_ascii_digit()) || !env_guard::is_relocating(&name) {",
+            "if name.starts_with(|c: char| c.is_ascii_digit()) || !env_guard::is_relocating(&name) {",
+            "Use::Assigns(value) => match env_guard::check(&name, &value, roots) {",
         ];
         let live = "A generated body reaches bytes through the plan's judgement of it, and a \
                     new route has to be read before it is trusted: check that it passes every \
                     environment fragment through `scan_with` or `scan_exported`, as its syntax \
                     exports, before adding it to `KNOWN`.";
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let own = src.join("env_guard.rs");
+        let src = crate::testing::src_root();
+        let own = src.join("env_guard");
         let mut callers = Vec::new();
-        let mut seen = Vec::new();
-        let mut pending = vec![src.clone()];
-        while let Some(dir) = pending.pop() {
-            for entry in std::fs::read_dir(&dir).expect("src is readable") {
-                let path = entry.expect("a directory entry").path();
-                if path.is_dir() {
-                    pending.push(path);
+        let mut unclaimed: Vec<&str> = KNOWN.to_vec();
+        for path in crate::testing::rust_sources(&src) {
+            if path.with_extension("") == own || path.starts_with(&own) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a source file");
+            for (line, code) in code_only(&text) {
+                if code.trim() == "pub mod env_guard;" {
                     continue;
                 }
-                if path.extension().is_none_or(|ext| ext != "rs") || path == own {
+                if !names_the_guard(&code) {
                     continue;
                 }
-                let text = std::fs::read_to_string(&path).expect("a source file");
-                for (line, code) in code_only(&text) {
-                    if code.trim() == "pub mod env_guard;" {
-                        continue;
+                match unclaimed.iter().position(|known| *known == code.trim()) {
+                    Some(at) => {
+                        unclaimed.remove(at);
                     }
-                    if !names_the_guard(&code) {
-                        continue;
-                    }
-                    let relative = path.strip_prefix(&src).expect("beneath src");
-                    let site = (
-                        relative.to_string_lossy().into_owned(),
-                        code.trim().to_owned(),
-                    );
-                    if KNOWN
-                        .iter()
-                        .any(|&(file, known)| site.0 == file && site.1 == known)
-                    {
-                        seen.push(site);
-                    } else {
-                        callers.push(format!("{}:{line}", path.display()));
-                    }
+                    None => callers.push(format!("{}:{line}", path.display())),
                 }
             }
         }
@@ -7737,10 +7738,7 @@ mod tests {
             callers.is_empty(),
             "the guard has a new caller: {callers:?}. {live}"
         );
-        let gone: Vec<_> = KNOWN
-            .iter()
-            .filter(|&&(file, known)| !seen.iter().any(|(f, k)| f == file && k == known))
-            .collect();
+        let gone = unclaimed;
         assert!(
             gone.is_empty(),
             "a known site no longer names the guard: {gone:?}. Update `KNOWN`, and check the \

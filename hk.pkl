@@ -38,8 +38,14 @@ hooks {
       // install.sh runs on machines with nothing else on them; a shell bug
       // there is the one bug a user cannot work around.
       ["shellcheck"] {
-        glob = "*.sh"
-        check = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh"
+        glob = List("*.sh", "scripts/*")
+        check = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh scripts/line-check"
+      }
+      // No file may newly grow past the line limit; the files already over it
+      // sit on a baseline that only shrinks. Any staged file can cross it, so
+      // the step has no glob.
+      ["line-check"] {
+        check = "mise run line-check"
       }
     }
   }

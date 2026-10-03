@@ -113,11 +113,21 @@ jobs:
     runs-on: ubuntu-latest
     # install.sh runs on machines that have nothing else on them, so a bug there
     # is the one bug a user cannot work around. bench/run.sh gates the startup
-    # budget, so a bug there silently disables that gate.
+    # budget, so a bug there silently disables that gate. scripts/line-check is
+    # the file-length gate, which a bug would disable just as silently.
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the line check reads the base commit's baseline
       - name: ShellCheck
-        run: shellcheck install.sh bench/run.sh bench/stubs/gen.sh
+        run: shellcheck install.sh bench/run.sh bench/stubs/gen.sh scripts/line-check
+      # No file may newly exceed the line limit, and the baseline of files
+      # already over it may only shrink: it is held against the PR's base, or
+      # against master before the push on a push to master.
+      - name: Line check
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: scripts/line-check "$BASE"
       # An action ref that does not resolve fails every job that uses it at
       # `Set up job`, having run no step — so the jobs that would have caught a
       # problem are exactly the ones that never start. Nothing else here would

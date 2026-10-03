@@ -115,19 +115,28 @@ jobs:
     # is the one bug a user cannot work around. bench/run.sh gates the startup
     # budget, so a bug there silently disables that gate. scripts/line-check is
     # the file-length gate, which a bug would disable just as silently.
+    #
+    # Every check runs through the same mise task hk runs locally. shellcheck
+    # and actionlint are the only tools this job calls, and `mise run` would
+    # otherwise build the rest of the table from source first.
+    env:
+      MISE_AUTO_INSTALL: "false"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # the line check reads the base commit's baseline
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: shellcheck actionlint
       - name: ShellCheck
-        run: shellcheck install.sh bench/run.sh bench/stubs/gen.sh scripts/line-check
+        run: mise run shellcheck
       # No file may newly exceed the line limit, and the baseline of files
       # already over it may only shrink: it is held against the PR's base, or
       # against master before the push on a push to master.
       - name: Line check
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: scripts/line-check "$BASE"
+        run: mise run line-check "$BASE"
       # An action ref that does not resolve fails every job that uses it at
       # `Set up job`, having run no step — so the jobs that would have caught a
       # problem are exactly the ones that never start. Nothing else here would
@@ -252,13 +261,11 @@ jobs:
             esac
           done
           exit $status
-      # actionlint is deliberately *not* wired in here. It would not have
-      # caught the unresolvable ref — it was clean over this file while that
-      # ref stood — and at this head it reports a real pre-existing SC2155 in
-      # release-plz.yml, a file outside this change's scope. Adding it scoped
-      # to ci.yml alone would be a linter that skips the one workflow with a
-      # known finding, which is worse than not claiming the check. Wiring it in
-      # belongs with the change that fixes release-plz.yml.
+      # actionlint checks every workflow's syntax, expressions and `run:`
+      # scripts (through shellcheck). It does not check that an action ref
+      # resolves, which is why the step above exists beside it.
+      - name: actionlint
+        run: mise run actionlint
 
   coverage:
     name: Coverage
@@ -289,12 +296,10 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.11.30"
-      - name: Collect coverage data
-        run: cargo llvm-cov --no-report
-      - name: Generate lcov report and enforce threshold
-        run: cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' --lcov --output-path lcov.info --fail-under-lines 80
-      - name: Coverage summary
-        run: cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' --summary-only
+      # The same task pre-push runs: it enforces the threshold, prints the
+      # summary and writes lcov.info for the upload below.
+      - name: Coverage
+        run: mise run coverage
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:

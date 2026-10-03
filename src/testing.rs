@@ -228,9 +228,118 @@ impl std::fmt::Debug for GuardedHome {
     }
 }
 
+/// Every `.rs` file under `root`, recursively, sorted by path.
+#[cfg(test)]
+pub(crate) fn rust_sources(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The crate's `src/` directory, read by the tests that hold a property of
+/// the source text itself.
+#[cfg(test)]
+pub(crate) fn src_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// Every source file of the crate module `module` (`"config"`,
+/// `"config::values::local"`), as its path beneath `src/` and its text,
+/// sorted by path.
+///
+/// A module's source is its own file — `src/a/b.rs` — and every `.rs` file
+/// beneath `src/a/b/`, which is where its `mod.rs` and its submodules live.
+/// Reading the module rather than a list of file names is what keeps a test
+/// that scans source holding its property when the module is split into
+/// submodules: the new files are read because they are where Rust requires
+/// them to be, not because someone remembered to list them.
+///
+/// # Panics
+///
+/// When the module has no source file, so a renamed module fails the scan
+/// that reads it instead of leaving it scanning nothing.
+#[cfg(test)]
+pub(crate) fn module_sources(module: &str) -> Vec<(PathBuf, String)> {
+    let src = src_root();
+    let relative: PathBuf = module.split("::").collect();
+    let mut files = Vec::new();
+    let own = src.join(&relative).with_extension("rs");
+    if own.is_file() {
+        files.push(own);
+    }
+    let dir = src.join(&relative);
+    if dir.is_dir() {
+        files.extend(rust_sources(&dir));
+    }
+    assert!(
+        !files.is_empty(),
+        "the module `{module}` has no source file under {}",
+        src.display()
+    );
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            let beneath = path.strip_prefix(&src).expect("beneath src").to_path_buf();
+            (beneath, text)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_module_is_read_from_its_file_and_its_directory() {
+        // `config` is a directory module; `config::values` is both a file and
+        // a directory, so its submodule is read with it.
+        let paths = |module: &str| -> Vec<PathBuf> {
+            module_sources(module)
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect()
+        };
+        let config = paths("config");
+        assert!(
+            config.contains(&PathBuf::from("config/mod.rs")),
+            "{config:?}"
+        );
+        assert!(
+            config.contains(&PathBuf::from("config/values/local.rs")),
+            "{config:?}"
+        );
+        assert_eq!(
+            paths("config::values"),
+            vec![
+                PathBuf::from("config/values/local.rs"),
+                PathBuf::from("config/values.rs"),
+            ],
+            "sorted by path component, so a directory sorts before its sibling file"
+        );
+        assert_eq!(paths("paths"), vec![PathBuf::from("paths.rs")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no source file")]
+    fn a_module_with_no_source_is_refused() {
+        let _ = module_sources("no_such_module");
+    }
 
     #[test]
     fn the_guard_hands_out_a_tempdir() {
@@ -495,25 +604,6 @@ mod tests {
             "nothing user-specific may live under src/:\n  {}",
             offences.join("\n  ")
         );
-    }
-
-    /// Every `.rs` file under `root`, recursively, in no particular order.
-    fn rust_sources(root: &Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let entries = std::fs::read_dir(&dir)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
-            for entry in entries {
-                let path = entry.expect("a directory entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        out
     }
 
     /// `haystack` contains `needle` not preceded by an alphanumeric character.

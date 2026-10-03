@@ -3298,7 +3298,7 @@ mod tests {
     /// cannot enumerate an enum's variants without a derive macro, and adding
     /// a crate for it is not this module's decision — but the declaration is
     /// in this module's source, and the census reads it from there at run
-    /// time. `testing::tests::no_user_specific_literal_survives_under_src`
+    /// time. `testing::tests::no_user_specific_literal_survives_in_a_tracked_file`
     /// already establishes source-reading as how this repository holds a
     /// property no type can carry.
     ///

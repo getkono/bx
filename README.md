@@ -30,7 +30,8 @@ nothing else changes. (`fd` ships `fdfind` on Debian for the same reason.)
 
 To upgrade, run `bx self-upgrade`: it runs this same installer over the
 installed binary. `bx self-upgrade --check` only reports whether a newer
-release exists. Each release pins the installer's checksum, so if the installer
+release exists, exiting `2` when one does, and `bx self-upgrade --force`
+reinstalls the latest release even when yours is not older. Each release pins the installer's checksum, so if the installer
 has changed since your release, `bx self-upgrade` refuses and sends you here.
 Reinstall with the line above.
 
@@ -64,18 +65,21 @@ There are eleven. You should not need a manual.
 |---|---|
 | `bx` | status: every managed target, and what is pending, in conflict or blocked |
 | `bx init` | guided setup |
-| `bx add` | begin managing a config file, or a directory of them |
-| `bx rm` | stop managing it, and restore the original |
+| `bx add PATH` | begin managing a config file, or a directory of them |
+| `bx rm PATH` | stop managing it, and restore the original |
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
 | `bx sync` | pull, apply, push — no git knowledge required |
 | `bx secret list` | list declared secrets, and whether each decrypts here |
 | `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
 | `bx shell-init` | the one line for your shell rc — not built yet |
-| `bx self-upgrade` | install the latest release over this one; `--check` only looks |
+| `bx self-upgrade` | install the latest release over this one; `--check` only looks, `--force` reinstalls even when this one is not older |
 
 `init`, `apply` and `sync` take `--yes`, and `init` takes `--set NAME=VALUE`
 for each value it would ask for, so all three run without a terminal.
+
+`add` and `rm` need the file or directory to act on; without one they refuse
+and point you at `bx init`, which offers the config already on the machine.
 
 `bx secret list` reads; nothing under `bx secret` writes. Who secrets are
 encrypted to is the `recipients` list under `[secrets]` in `bx.toml` or a
@@ -118,6 +122,10 @@ or a login banner without anyone parsing its output:
 | `1` | error |
 | `2` | changes pending, or a conflict or blocked target needs a decision |
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
+
+The other commands use the same codes. `bx add` exits `2` when it refused a
+path, `bx rm` when a conflict left something as it was, and
+`bx self-upgrade --check` when a newer release exists.
 
 ## Requirements
 
@@ -189,11 +197,14 @@ or a login banner without anyone parsing its output:
 
 ### Drift is surfaced, never resolved behind your back
 
-- A managed file edited by hand stops `apply`, shows the diff, and asks whether
-  to keep the edit, discard it, or skip the module.
-- `doctor` reports config that points at things that do not exist, tools
-  installed but not reachable, caches at their limit, and integrations that have
-  gone stale.
+- A managed file edited by hand is a conflict: `plan` and `apply` report it,
+  and `apply` skips it, leaving your edit exactly as it is.
+- `doctor` reports a declared tool that is not on `PATH`, a required value with
+  no answer, a damaged state file, an interrupted or running session, a
+  directory wider than a private file in it, a declared optional source that is
+  not readable, a unit file systemd has not reloaded, enabled or loaded, or that
+  has failed, a declared reference that is not on disk, and a temporary file an
+  interrupted write left behind.
 
 ### Fast enough to forget
 
@@ -201,7 +212,7 @@ or a login banner without anyone parsing its output:
   and the budget is enforced by a benchmark in CI, not by good intentions.
 - The shell startup path spawns no process and parses no configuration file.
 - Where `bx` can make *your other tools* start faster without changing their
-  behaviour, it does — and tells you what it saved.
+  behaviour, it does.
 
 ## Configuration
 

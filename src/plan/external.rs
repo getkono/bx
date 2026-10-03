@@ -1381,6 +1381,106 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_that_cannot_be_made_at_apply_stops_the_clone_and_records_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Reopens `~/.zsh` so the tempdir home can be removed.
+        struct Reopen(std::path::PathBuf);
+        impl Drop for Reopen {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let home = guarded_home();
+        let up = upstream(&home);
+        let zsh = home.child(".zsh");
+        let mut reopen = None;
+        // Between plan and apply, the user makes the first parent plan said
+        // apply creates, at a mode that denies its owner write.
+        let applied = apply_after(&home, &layer(&up.first), || {
+            std::fs::create_dir(&zsh).expect("the user's directory");
+            std::fs::set_permissions(&zsh, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+            reopen = Some(Reopen(zsh.clone()));
+        });
+        if std::fs::create_dir(zsh.join("probe")).is_ok() {
+            crate::testing::skip_unconstructible("a directory its owner can write at 0500");
+            return;
+        }
+
+        let note = stopped_note(&applied);
+        assert!(
+            note.starts_with("~/.zsh/plugins cannot be created: "),
+            "{note}"
+        );
+        drop(reopen);
+        assert!(zsh.is_dir(), "the user's directory is left");
+        assert!(!home.child(".zsh/plugins").exists(), "nothing was made");
+        assert!(entry(&home).is_none(), "nothing recorded");
+    }
+
+    #[test]
+    fn missing_dirs_names_every_absent_parent_and_refuses_one_that_cannot_hold_a_clone() {
+        let home = guarded_home();
+        let at = |rel: &str| home.child(rel);
+        assert_eq!(
+            missing_dirs(&at("a/b/c"), home.path()),
+            Ok(vec![at("a/b"), at("a")]),
+            "deepest first, stopping at the home"
+        );
+        home.write("file", "x\n");
+        assert_eq!(
+            missing_dirs(&at("file/c"), home.path()),
+            Err("~/file is not a directory, so there is nowhere to clone it".to_string())
+        );
+        let beneath = missing_dirs(&at("file/b/c"), home.path()).expect_err("beneath a file");
+        assert!(
+            beneath.starts_with("~/file/b cannot be looked at: "),
+            "{beneath}"
+        );
+    }
+
+    #[test]
+    fn a_directory_inside_another_checkout_is_not_its_own_checkout() {
+        let home = guarded_home();
+        let outer = home.child("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).expect("the directories");
+        git_run(home.path(), &outer, &["init", "--quiet"]);
+        let git = git(home.path());
+
+        assert_eq!(own_checkout(&git, &outer), Ok(()));
+        let top = std::fs::canonicalize(&outer).expect("canonical");
+        assert_eq!(
+            own_checkout(&git, &inner),
+            Err(format!(
+                "is not a git checkout of its own (git answers from {}); bx left it as it is",
+                top.display()
+            ))
+        );
+        let unread = own_checkout(&Git::at_home(home.path()).with_env("PATH", ""), &outer)
+            .expect_err("no git to ask");
+        assert!(
+            unread.starts_with("is not a git checkout bx can read: ")
+                && unread.ends_with("bx needs git on PATH"),
+            "{unread}"
+        );
+    }
+
+    #[test]
+    fn a_git_failure_counting_local_commits_is_named() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let recorded = entry(&home).expect("recorded");
+        let missing = Git::at_home(home.path()).with_env("PATH", "");
+
+        let note = not_forward(&missing, &home.child(AT), &up.first, &up.side, &recorded);
+
+        assert!(note.contains("bx needs git on PATH"), "{note}");
+    }
+
+    #[test]
     fn a_checkout_that_changed_after_plan_is_not_fast_forwarded() {
         // Edited between plan and apply.
         let home = guarded_home();

@@ -79,8 +79,8 @@ wrong even if it passes CI.
   shell-startup path.
 - **inquire** — interactive prompts for `init` and confirmations. There is no
   TUI beyond these.
-- **similar** — diffs for `plan`. **anstyle / owo-colors** — styling that
-  respects `NO_COLOR`. **indicatif** — progress during `apply` only.
+- **similar** — diffs for `plan`. **anstyle** — styling that respects
+  `NO_COLOR`. **indicatif** — progress during `apply` only.
 - **age** — secrets, in-process, so the static binary needs no external
   `age`/`sops`. Default identity is the user's existing ssh ed25519 key.
 - **rmp-serde** — MessagePack for machine-owned state (ledger, fingerprints,

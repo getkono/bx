@@ -266,6 +266,65 @@ jobs:
           name: coverage-report
           path: lcov.info
 
+  mutants:
+    name: Mutation testing (diff)
+    runs-on: ubuntu-latest
+    # The whole crate is thousands of mutants, far past any CI budget, so a
+    # pull request is held only to the mutants its own diff introduces: new
+    # logic no test constrains is caught at review, where it is cheapest to
+    # pin down. Pushes to master have no diff to scope it to.
+    if: github.event_name == 'pull_request'
+    # A wall-clock cap: a diff too large to mutate in an hour fails here rather
+    # than holding a runner for the default six.
+    timeout-minutes: 60
+    # cargo-mutants is the only tool this job calls from the table; the rest
+    # would be built from source for nothing.
+    env:
+      MISE_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # the merge commit and its first parent, the base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: cargo:cargo-mutants
+      # The baseline runs the whole suite unmutated before any mutant, so the
+      # job needs every program `check` provisions, for the reasons written
+      # out there: zsh, the user-namespace provisions, bun and the pinned uv.
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Allow unprivileged user namespaces with subordinate ids
+        run: |
+          sudo apt-get install -y uidmap
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+          user=$(id -un)
+          for file in /etc/subuid /etc/subgid; do
+            grep -q "^$user:" "$file" 2>/dev/null || echo "$user:100000:65536" | sudo tee -a "$file"
+          done
+      - uses: oven-sh/setup-bun@v2
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.11.30"
+      # The checkout is the pull request merged into its base, so the merge
+      # commit's first parent is the base as it stands now, and this is the
+      # pull request's own change against it, whatever else master has gained.
+      - name: Diff against the base
+        run: git diff HEAD^1 HEAD > pr.diff
+      # A diff that touches no Rust has no mutants, which cargo-mutants reports
+      # and passes; a missed or timed-out mutant fails the job.
+      - name: Mutants
+        run: mise run mutants --in-diff pr.diff
+      - name: Upload mutants.out
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out
+          if-no-files-found: ignore
+
   bench:
     name: Shell startup budget
     runs-on: ubuntu-latest

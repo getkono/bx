@@ -1413,7 +1413,7 @@ impl Staged {
             path: temp_path.clone(),
             source,
         };
-        self.0.temp.write_all(bytes).map_err(&fail)?;
+        self.0.temp.write_all(bytes).map_err(fail)?;
         // After the content and before the sync, so the sync covers it. A
         // set-id bit set earlier would already be gone: the kernel clears
         // S_ISUID, and S_ISGID alongside group execute, on a write by a process
@@ -1436,7 +1436,7 @@ impl Staged {
         if self.0.mode.bits() & SPECIAL != 0 {
             verify_set_id_kept(self.0.temp.as_file(), self.0.mode, &self.0.dest)?;
         }
-        durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(&fail)?;
+        durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(fail)?;
         let written = ContentHash::of(bytes);
         Ok(Filled {
             pending: self.0,

@@ -1481,6 +1481,33 @@ mod tests {
     }
 
     #[test]
+    fn a_local_commit_count_git_answers_with_something_other_than_a_number_is_not_counted() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let recorded = entry(&home).expect("recorded");
+        let bin = home.child("bin");
+        std::fs::create_dir(&bin).expect("the stub's directory");
+        let stub = bin.join("git");
+        std::fs::write(&stub, "#!/bin/sh\necho many\n").expect("the stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let garbled = Git::at_home(home.path()).with_env("PATH", &bin);
+
+        let note = not_forward(&garbled, &home.child(AT), &up.first, &up.side, &recorded);
+
+        assert_eq!(
+            note,
+            format!(
+                "{} is not a fast-forward from {}; bx left it as it is",
+                up.side, up.first
+            )
+        );
+    }
+
+    #[test]
     fn a_checkout_that_changed_after_plan_is_not_fast_forwarded() {
         // Edited between plan and apply.
         let home = guarded_home();

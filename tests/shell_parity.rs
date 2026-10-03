@@ -21,16 +21,22 @@ use bx::testing::guarded_home;
 
 /// `bx` against `home`, with `~/bin` its whole `PATH`, so an activation's
 /// tool is the stub there and nothing else is found.
+///
+/// But for where a coverage build writes its profile: `cargo llvm-cov` names
+/// the file in `LLVM_PROFILE_FILE`, and an instrumented `bx` without it writes
+/// `default_*.profraw` into its working directory, which is the repository.
 fn bx(home: &Path, args: &[&str]) -> Output {
-    Command::cargo_bin("bx")
-        .expect("the bx binary")
+    let mut command = Command::cargo_bin("bx").expect("the bx binary");
+    command
         .args(args)
         .env_clear()
         .env("HOME", home)
         .env("PATH", home.join("bin"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("run bx")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    command.output().expect("run bx")
 }
 
 /// A tool that prints, for `stub init SHELL`, a function naming the shell.

@@ -26,3 +26,23 @@ git_tag_name = "v{{ version }}"
 # bx exposes a library target only so the binary can be tested through it; it
 # has no external consumers, so cargo-semver-checks would only add noise.
 semver_check = false
+
+[changelog]
+# release-plz's default parsers, with merge commits skipped ahead of them: a
+# merge records how a branch was integrated, and the commits it brings in are
+# listed on their own. Both shapes are skipped: GitHub's "Merge pull request
+# #N from …" and "Merge branch …", and this repository's Conventional form
+# "chore: merge …". Setting `commit_parsers` replaces the default list,
+# so the defaults are restated after the skips. Sections already released are
+# not rewritten.
+commit_parsers = [
+  { message = "^Merge (pull request|branch|remote-tracking branch) ", skip = true },
+  { message = "^chore: merge ", skip = true },
+  { message = "^feat", group = "added" },
+  { message = "^changed", group = "changed" },
+  { message = "^deprecated", group = "deprecated" },
+  { message = "^removed", group = "removed" },
+  { message = "^fix", group = "fixed" },
+  { message = "^security", group = "security" },
+  { message = ".*", group = "other" },
+]

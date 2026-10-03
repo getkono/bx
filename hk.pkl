@@ -2,8 +2,11 @@ amends "package://github.com/jdx/hk/releases/download/v1.57.0/hk@1.57.0#/Config.
 
 // hk git hooks — https://hk.jdx.dev
 //
+// commit-msg rejects a message that is not a Conventional Commit (convco).
 // pre-commit auto-fixes formatting then linting (formatting can affect lint
-// output); pre-push is the final gate (format-check, clippy, tests, coverage).
+// output), then checks shell scripts (shellcheck), workflows (actionlint) and
+// file length (line-check); pre-push is the final gate (format-check, clippy,
+// tests, coverage).
 // Every check step calls the mise task CI calls, so a gate has one definition.
 // cargo fmt/clippy operate on the whole workspace, so the *.rs glob only gates
 // *whether* a step runs — the commands take no file arguments. `depends`

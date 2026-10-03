@@ -222,3 +222,83 @@ fn interruption(journal: &str, interrupted: &Interrupted) -> Vec<Finding> {
     }));
     findings
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+    use crate::testing::guarded_home;
+
+    /// What check 3 says, as `(subject, note)` in order.
+    fn damage(state: &StateDir, home: &Path) -> Vec<(String, String)> {
+        check(state, home)
+            .damage
+            .into_iter()
+            .map(|finding| (finding.subject, finding.note))
+            .collect()
+    }
+
+    #[test]
+    fn a_ledger_or_fingerprints_that_cannot_be_read_is_named_with_the_reason() {
+        type File = fn(&StateDir) -> PathBuf;
+        let files: [(&str, File); 2] = [
+            ("ledger", StateDir::ledger),
+            ("fingerprints", StateDir::fingerprints),
+        ];
+        for (name, file) in files {
+            let home = guarded_home();
+            let state = StateDir::resolve(home.path());
+            // A directory where the file belongs is walked past as an
+            // ordinary part of the tree, and then cannot be read as a file.
+            std::fs::create_dir_all(file(&state)).expect("a directory in its place");
+
+            let found = damage(&state, home.path());
+
+            let subject = paths::to_portable(&file(&state), home.path());
+            assert_eq!(found.len(), 1, "{name}: {found:?}");
+            assert_eq!(found[0].0, subject, "{name}");
+            assert!(
+                found[0].1.starts_with("could not be read: "),
+                "{name}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_state_directory_that_cannot_be_listed_says_a_set_aside_copy_may_be_unseen() {
+        /// Reopens the state directory so the tempdir home can be removed.
+        struct Reopen(PathBuf);
+        impl Drop for Reopen {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        std::fs::create_dir_all(state.root()).expect("the state directory");
+        // Searchable, so each file can still be opened by name, but not
+        // readable, so no copy set aside beside it can be listed.
+        std::fs::set_permissions(state.root(), std::fs::Permissions::from_mode(0o300))
+            .expect("chmod");
+        let _reopen = Reopen(state.root().to_path_buf());
+        if std::fs::read_dir(state.root()).is_ok() {
+            crate::testing::skip_unconstructible("a directory its owner can list at 0300");
+            return;
+        }
+
+        let found = damage(&state, home.path());
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, paths::to_portable(state.root(), home.path()));
+        let note = &found[0].1;
+        assert!(note.starts_with("could not be listed ("), "{note}");
+        assert!(
+            note.ends_with(
+                "), so doctor cannot say whether a damaged state file was set aside there"
+            ),
+            "{note}"
+        );
+    }
+}

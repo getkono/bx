@@ -4552,7 +4552,8 @@ mod tests {
             let roots = RootSet::new(home.path(), &[PathBuf::from("~")]);
             let line = format!("SCRATCH_HOME={}\n", home.path().display());
             assert_eq!(guard_fragment(&line, &roots), None);
-            assert!(guard_environment_d(&line, &roots).is_some());
+            let refused = guard_environment_d(&line, &roots).expect("refused as exported");
+            assert!(refused.starts_with("line 1: SCRATCH_HOME "), "{refused}");
         }
 
         /// The `~/.zshrc` row an interactive declaration gets over `bytes`,

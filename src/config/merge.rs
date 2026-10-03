@@ -2251,8 +2251,29 @@ mod tests {
     }
 
     #[test]
-    fn values_in_the_local_layer_are_fine() {
-        assert!(merge(&[local("[values]\ngit_email = \"someone@example.invalid\"\n")]).is_ok());
+    fn values_in_the_local_layer_are_kept_as_answered() {
+        let merged = merge(&[local("[values]\ngit_email = \"someone@example.invalid\"\n")])
+            .expect("a local answer is accepted");
+        let answers: Vec<(&str, String, &Path)> = merged
+            .value_assignments
+            .iter()
+            .map(|a| {
+                (
+                    a.name.as_str(),
+                    a.value.to_string(),
+                    a.origin.file.as_path(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            [(
+                "git_email",
+                "someone@example.invalid".to_string(),
+                Path::new("local.toml")
+            )],
+            "the local layer's answer is the one kept, named by its file"
+        );
     }
 
     const RECIPIENTS: &str = "[secrets]\nrecipients = [\"ssh-ed25519 AAAAC3Nz one\"]\n";

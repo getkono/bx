@@ -754,7 +754,7 @@ mod tests {
             let dir = StateDir::resolve_in(home, xdg);
             let resolved = crate::paths::state_dir(home, xdg);
             assert_eq!(dir.root(), resolved);
-            assert_eq!(dir.local_toml(), crate::paths::local_layer_path(&resolved),);
+            assert_eq!(dir.local_toml(), crate::paths::local_layer_path(&resolved));
         }
     }
 

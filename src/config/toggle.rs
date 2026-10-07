@@ -13,10 +13,10 @@ use super::{Ctx, Error, Origin};
 ///
 /// An enum rather than the section's name, because [`Toggle`],
 /// [`super::Config`], [`super::Layer`] and [`super::merge::merge`] are all
-/// public: a section string with no arm in the
-/// merge would panic a library call, and a `&str` match has no exhaustiveness
-/// checking to stop one being written. The later entries that add keyed sections
-/// are exactly the callers that would have hit it.
+/// public: a section string with no arm in the merge would panic a library
+/// call, and a `&str` match has no exhaustiveness checking to stop one being
+/// written. The later entries that add keyed sections are exactly the callers
+/// that would have hit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     /// `[[target]]`, keyed by `path`.

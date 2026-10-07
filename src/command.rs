@@ -3221,7 +3221,9 @@ mod tests {
             let repo = cloned(&home, &layer());
             update(&home, true, &mut Vec::new()).expect("update");
             run(home.path(), &repo, &["push", "--quiet"]);
-            std::fs::write(repo.join("mine"), "x\n").expect("a file");
+            // A person's own edit, to bx.lock alone: theirs all the same.
+            let edited = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
+            std::fs::write(repo.join("bx.lock"), format!("{edited}# mine\n")).expect("an edit");
             commit_all(home.path(), &repo, "mine");
             let other = crate::sync::tests::other(&home);
             std::fs::write(other.join("notes"), "x\n").expect("a note");

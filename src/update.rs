@@ -312,11 +312,10 @@ pub fn look(
     if !ours {
         return found(Verdict::Unproven { tip });
     }
-    if !checkout::has_commit(git, &dest, from)
-        && git
-            .query(&dest, &["fetch", "--quiet", "--no-tags", "origin", from])
-            .is_err()
-    {
+    // Asked for by id whether or not it is here, which costs nothing when it
+    // is; what decides is whether it is here afterwards.
+    let _ = git.query(&dest, &["fetch", "--quiet", "--no-tags", "origin", from]);
+    if !checkout::has_commit(git, &dest, from) {
         // The remote no longer has the commit locked: its branch was
         // rewritten past it, whatever the new tip says.
         return found(Verdict::Rewritten { tip });
@@ -800,18 +799,9 @@ fn looked(
         .map(|external| look(&git(started), &env.home, external, inputs.lock(), &ledger))
         .collect();
 
-    let looked: Vec<String> = found.iter().map(|f| format!("{}: ", f.path)).collect();
-    let mut available: Vec<String> = std::fs::read_to_string(stamps.available())
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| !looked.iter().any(|prefix| line.starts_with(prefix)))
-        .map(str::to_string)
-        .collect();
-    available.extend(
-        found
-            .iter()
-            .filter(|found| found.moves_to().is_some())
-            .map(Found::summary),
+    let available = offered(
+        &std::fs::read_to_string(stamps.available()).unwrap_or_default(),
+        &found,
     );
     let summaries: String = found.iter().map(|f| format!("{}\n", f.summary())).collect();
     if background {
@@ -830,6 +820,25 @@ fn looked(
     } else {
         crate::report::Exit::Converged
     })
+}
+
+/// What `available` holds after a check that found `found`: each line of
+/// `previous` about an external it did not look at, then one line for each
+/// external it found new commits for.
+#[must_use]
+pub fn offered(previous: &str, found: &[Found]) -> Vec<String> {
+    let looked: Vec<String> = found.iter().map(|f| format!("{}: ", f.path)).collect();
+    previous
+        .lines()
+        .filter(|line| !looked.iter().any(|prefix| line.starts_with(prefix)))
+        .map(str::to_string)
+        .chain(
+            found
+                .iter()
+                .filter(|found| found.moves_to().is_some())
+                .map(Found::summary),
+        )
+        .collect()
 }
 
 /// `bx update --snooze`: put the next question off by one interval, and drop
@@ -1166,6 +1175,23 @@ mod tests {
         }
         assert_eq!(found("~/a", None, moves(B)).moves_to(), Some(B));
         assert_eq!(found("~/a", Some(A), Verdict::Current).moves_to(), None);
+    }
+
+    #[test]
+    fn a_check_replaces_only_the_lines_of_what_it_looked_at() {
+        let previous = "~/a: 1 new commit(s) on main\n~/b: 2 new commit(s) on main\n";
+        let found = [
+            found("~/a", Some(A), Verdict::Current),
+            found("~/c", None, moves(B)),
+        ];
+        assert_eq!(
+            offered(previous, &found),
+            [
+                "~/b: 2 new commit(s) on main".to_string(),
+                "~/c: locks main at 85919cd1ffa7".to_string(),
+            ]
+        );
+        assert!(offered("", &[]).is_empty());
     }
 
     #[test]

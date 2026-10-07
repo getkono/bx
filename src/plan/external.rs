@@ -457,7 +457,7 @@ fn clone(
             Ok(()) => made.push(dir.clone()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
-                journal::prune_dirs(&deepest_first(&made))?;
+                fs::remove::prune_dirs(&deepest_first(&made)).map_err(journal::Error::from)?;
                 return Ok(Err(format!(
                     "{} cannot be created: {error}",
                     paths::to_portable(dir, home)
@@ -517,7 +517,7 @@ fn clone(
                 })?;
             }
             let _ = ledger.withdraw(before);
-            journal::prune_dirs(&made)?;
+            fs::remove::prune_dirs(&made).map_err(journal::Error::from)?;
             ledger.save()?;
             Ok(Err(note))
         }

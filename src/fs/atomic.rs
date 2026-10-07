@@ -2310,15 +2310,46 @@ fn refuse_changed(then: &Observed, now: Option<(Kind, Stamp)>) -> Result<(), Err
     if now == was {
         return Ok(());
     }
-    let detail = match (was, now) {
-        (_, None) => "it has been removed",
-        (None, Some(_)) => "nothing was there, and something is now",
-        (Some(_), Some(_)) => "it has been modified or replaced",
-    };
     Err(Error::Changed {
         path: then.path.clone(),
-        detail: detail.to_string(),
+        detail: what_moved(was.is_some(), now.is_some()).to_string(),
     })
+}
+
+/// Refuse unless `now` is still what `planned` observed: the same path, the
+/// same kind and the same stamp, or still nothing at all.
+///
+/// [`refuse_changed`] for two observations rather than an observation and a
+/// fresh `lstat`: the journal's write paths and [`crate::recover`]'s rollback
+/// of a create check the destination they judged this way before acting on it.
+///
+/// # Errors
+///
+/// [`Error::Changed`] naming what moved.
+pub(crate) fn refuse_moved(planned: &Observed, now: &Observed) -> Result<(), Error> {
+    if planned.path != now.path {
+        return Err(Error::Changed {
+            path: now.path.clone(),
+            detail: format!("plan observed {}, not this path", planned.path.display()),
+        });
+    }
+    if (planned.kind, planned.stamp) == (now.kind, now.stamp) {
+        return Ok(());
+    }
+    Err(Error::Changed {
+        path: now.path.clone(),
+        detail: what_moved(planned.stamp.is_some(), now.stamp.is_some()).to_string(),
+    })
+}
+
+/// What [`Error::Changed`] says moved, from whether something was there when
+/// it was observed and whether something is there now.
+const fn what_moved(was: bool, is: bool) -> &'static str {
+    match (was, is) {
+        (_, false) => "it has been removed",
+        (false, true) => "nothing was there, and something is now",
+        (true, true) => "it has been modified or replaced",
+    }
 }
 
 /// Refuse a write over what `observed` found, when that is not a regular file

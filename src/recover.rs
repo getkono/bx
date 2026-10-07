@@ -83,7 +83,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::fs::{self, Kind, Mode};
+use crate::fs::{self, Kind, Mode, remove};
 use crate::journal::{self, Intent, Loaded, SessionKind, Written};
 use crate::paths::Portable;
 use crate::report::{Action, Exit};
@@ -126,6 +126,13 @@ pub enum Error {
         /// What could not be accounted for.
         conflicts: Vec<Unfinished>,
     },
+}
+
+/// A rollback's removal fails as the journal's own removals do.
+impl From<remove::Error> for Error {
+    fn from(error: remove::Error) -> Self {
+        Self::Journal(error.into())
+    }
 }
 
 /// What is at an interrupted write's destination, relative to the two states the
@@ -567,14 +574,14 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         // write nothing. `pending` names it in the write's note.
         //
         // Whether it was there to remove is what shows the directories the
-        // Intent names were made: see `journal::prune_beneath`.
+        // Intent names were made: see `fs::remove::prune_beneath`.
         let mut temp_removed = None;
         if !complete
             && !matches!(step, Step::Blocked)
             && let Some(temp) = &intent.temp
         {
             let present = std::fs::symlink_metadata(temp).is_ok();
-            match journal::unlink(temp) {
+            match remove::unlink(temp).map_err(journal::Error::from) {
                 Ok(()) if present => temp_removed = Some(temp),
                 Ok(()) => {}
                 Err(error) => tracing::warn!(
@@ -602,7 +609,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 if intent.creates()
                     && let Some(temp) = temp_removed
                 {
-                    journal::prune_beneath(temp, &intent.created_dirs)?;
+                    remove::prune_beneath(temp, &intent.created_dirs)?;
                 }
             }
             // Both act against the observation `decide` judged, never a fresh
@@ -619,16 +626,17 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             // parents go only in the chain above what this rollback removed,
             // as for `Step::Keep`.
             Step::Unlink { .. } if intent.dir => {
-                if journal::remove_made_dir(&intent.dest)? {
-                    journal::prune_beneath(&intent.dest, &intent.created_dirs)?;
+                if remove::remove_made_dir(&intent.dest)? {
+                    remove::prune_beneath(&intent.dest, &intent.created_dirs)?;
                 }
             }
             Step::Unlink { observed } => {
                 #[cfg(test)]
                 tests::before_act(&intent.dest);
-                journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
-                journal::unlink(&intent.dest)?;
-                journal::prune_beneath(&intent.dest, &intent.created_dirs)?;
+                fs::refuse_moved(&observed, &fs::observe(&intent.dest)?)
+                    .map_err(journal::Error::from)?;
+                remove::unlink(&intent.dest)?;
+                remove::prune_beneath(&intent.dest, &intent.created_dirs)?;
             }
             Step::Rewrite {
                 bytes,
@@ -651,7 +659,8 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             // judged too: one whose mode or presence changed since is refused
             // with [`fs::Error::Changed`] rather than chmod'd or made over it.
             Step::Chmod { mode, observed } => {
-                journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
+                fs::refuse_moved(&observed, &fs::observe(&intent.dest)?)
+                    .map_err(journal::Error::from)?;
                 fs::set_mode(&intent.dest, mode)?;
             }
             Step::MakeDir { mode, observed } => {
@@ -728,7 +737,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
              it was kept rather than deleted",
         );
     } else {
-        journal::unlink(&path)?;
+        remove::unlink(&path)?;
     }
 
     Ok(if complete {

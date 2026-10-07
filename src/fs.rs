@@ -30,6 +30,9 @@ pub mod atomic;
 pub(crate) mod durable;
 pub mod link;
 pub mod mode;
+pub(crate) mod remove;
+
+pub(crate) use atomic::refuse_moved;
 
 pub use atomic::{
     CreatedDirs, Desired, Drift, EnsuredDir, Error, Filled, Observed, Outcome, Parent, ParentState,

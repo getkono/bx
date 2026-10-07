@@ -132,7 +132,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs::{self, Mode, Observed};
+use crate::fs::remove::{open_dir, prune_dirs, remove_if_empty, sync_dir, unlink};
+use crate::fs::{self, Mode, Observed, refuse_moved};
 use crate::paths::Portable;
 use crate::state::{
     ContentHash, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior, PriorBytes,
@@ -334,6 +335,15 @@ pub enum Error {
     /// A destination could not be written.
     #[error(transparent)]
     Write(#[from] crate::fs::Error),
+}
+
+/// A durable removal that failed is reported as one of the session's own:
+/// [`Error::Io`], naming the path.
+impl From<fs::remove::Error> for Error {
+    fn from(error: fs::remove::Error) -> Self {
+        let fs::remove::Error { path, source } = error;
+        Self::Io { path, source }
+    }
 }
 
 /// What a session is for.
@@ -1782,7 +1792,7 @@ impl Session {
     /// other (#119). Journalled first, the destination is still `before`
     /// until the publish, and the rollback removes the temporary file and
     /// prunes the directories above it that it leaves empty
-    /// ([`prune_beneath`]). A directory the Intent names and the rollback
+    /// ([`fs::remove::prune_beneath`]). A directory the Intent names and the rollback
     /// finds without the temporary file in it is not shown to be bx's — a
     /// crash before the stage made nothing, and the user may have made it
     /// since — so it is left. A write refused after its stage cannot leave
@@ -2795,62 +2805,6 @@ fn portable_dirs(dirs: &[PathBuf], home: &Path) -> Result<Vec<Portable>, Error> 
         .collect()
 }
 
-/// Remove `path` if it is there, and `fsync` the directory it was in.
-///
-/// Absence is success: the whole recovery path is re-runnable, and a second run
-/// finds what the first removed already gone. A missing directory is the same
-/// absence, since nothing can be in it.
-///
-/// The directory is opened **before** the unlink and `fsync`ed after it, the
-/// order `fs::write_atomically` keeps for a rename. Removing an entry needs
-/// write and search permission on its directory, and opening the directory
-/// needs read, so in a `0300` directory an open placed after the unlink fails
-/// with the file already gone: an `Err` from a removal that happened. Opened
-/// first, that failure happens while the file is still in place.
-///
-/// # Errors
-///
-/// [`Error::Io`] wrapping the failing `open` of the directory, `unlink`, or
-/// `fsync`. Only a failing `fsync` is returned after the file was removed.
-pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
-    // `Path::parent` of a bare name is the empty path, which names the current
-    // directory the unlink resolves against, not a directory that is absent.
-    let dir = path.parent().map(|dir| {
-        if dir.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            dir
-        }
-    });
-    let opened = match dir {
-        None => None,
-        Some(dir) => match crate::fs::durable::Dir::open(dir) {
-            Ok(handle) => Some((dir, handle)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(Error::Io {
-                    path: dir.to_path_buf(),
-                    source,
-                });
-            }
-        },
-    };
-    match crate::fs::durable::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(Error::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    }
-    if let Some((dir, handle)) = &opened {
-        sync_dir(handle, dir)?;
-    }
-    Ok(())
-}
-
 /// Move a journal aside, durably, and never over one set aside earlier.
 ///
 /// The name is the number after the highest of `journal.mpk.corrupt`,
@@ -2882,74 +2836,6 @@ pub(crate) fn set_aside(path: &Path, lock: &ExclusiveLock) -> Result<PathBuf, Er
     Ok(aside)
 }
 
-/// Remove directories bx created, deepest first, stopping at the first that is
-/// not empty.
-///
-/// The stop is the point: a directory that has acquired anything else is no
-/// longer only bx's, and removing it would delete something bx did not put
-/// there. One that is no longer a directory at all stops the walk the same way.
-///
-/// # Errors
-///
-/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
-/// "not a directory".
-pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
-    for dir in dirs {
-        if !remove_if_empty(dir)? {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Roll back the directories an interrupted write announced it would make,
-/// given that this rollback has just removed `below` — the write's own
-/// temporary file, its published destination, or a directory target's own
-/// directory — from the deepest of them.
-///
-/// An Intent names its directories **before** they are made, so a crash
-/// between the Intent and the stage leaves it naming directories bx never
-/// made. Standing empty proves nothing: one the user made after that crash is
-/// empty too. What proves a directory bx's is that it held bx's own artefact
-/// and nothing else, so each is removed only when the one entry this Intent
-/// names inside it — `below`, then each directory removed before it — was
-/// directly inside it and has just gone, and it now stands empty. The walk
-/// stops at the first that is not: one never made (absent), one holding
-/// anything else, or one the chain does not reach, such as the parent of a
-/// declared directory this Intent does not name. A predicted directory that
-/// is fully empty is therefore left, for `bx doctor` to report.
-///
-/// `dirs` is deepest first, as [`Intent::created_dirs`] is.
-///
-/// # Errors
-///
-/// [`Error::Io`] for a failure that is neither "not empty" nor "not a
-/// directory".
-pub(crate) fn prune_beneath(below: &Path, dirs: &[PathBuf]) -> Result<(), Error> {
-    let mut child = below;
-    for dir in dirs {
-        if child.parent() != Some(dir.as_path()) || !remove_made_dir(dir)? {
-            break;
-        }
-        child = dir;
-    }
-    Ok(())
-}
-
-/// Remove `dir` if it is an empty directory, and say whether this call
-/// removed it. Unlike [`remove_if_empty`], one already absent is **not**
-/// removed: nothing shows it was ever made.
-///
-/// # Errors
-///
-/// What [`remove_if_empty`] returns.
-pub(crate) fn remove_made_dir(dir: &Path) -> Result<bool, Error> {
-    if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
-        return Ok(false);
-    }
-    remove_if_empty(dir)
-}
-
 /// Hand on `error`, the refusal of a staged write, once the directories the
 /// stage just made — `made`, deepest first — are removed where they stand
 /// empty.
@@ -2960,7 +2846,7 @@ pub(crate) fn remove_made_dir(dir: &Path) -> Result<bool, Error> {
 /// between the prediction and the stage) is in neither the journal nor the
 /// ledger, and no rollback or `rm` would ever remove it; one it did predict no
 /// longer holds the temporary file, so the rollback could not show it was made
-/// (see [`prune_beneath`]). `rmdir` only, stopping at the first that is not
+/// (see [`fs::remove::prune_beneath`]). `rmdir` only, stopping at the first that is not
 /// empty, as [`prune_dirs`] does. A failure to remove one is logged and the
 /// refusal is still what is returned: it is the cause the user needs.
 ///
@@ -2975,52 +2861,6 @@ fn unmake(made: &[PathBuf], error: Error) -> Result<(), Error> {
         );
     }
     Err(error)
-}
-
-/// Remove a directory bx created if it is empty, and say whether it is gone.
-///
-/// A path that is no longer a directory — a symlink the user put in its
-/// place, or a file where it or one of its parents was — still stands, and is
-/// no longer bx's: it is left, as [`hand_off_claims`] leaves it. `rmdir` never
-/// follows its last component, so that is decided by the one call that would
-/// otherwise remove it, with no window between a look and the removal.
-///
-/// # Errors
-///
-/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
-/// "not a directory".
-fn remove_if_empty(dir: &Path) -> Result<bool, Error> {
-    match std::fs::remove_dir(dir) {
-        Ok(()) => {
-            tracing::debug!(dir = %dir.display(), "removed a directory bx created");
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        // `ENOTEMPTY` and `EEXIST` are both permitted spellings of "it is
-        // not empty", and `std::io::ErrorKind` maps neither stably.
-        Err(e)
-            if matches!(
-                e.raw_os_error().map(rustix::io::Errno::from_raw_os_error),
-                Some(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::EXIST)
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(e)
-            if e.raw_os_error().map(rustix::io::Errno::from_raw_os_error)
-                == Some(rustix::io::Errno::NOTDIR) =>
-        {
-            tracing::debug!(
-                dir = %dir.display(),
-                "left a directory bx created that is no longer a directory",
-            );
-            Ok(false)
-        }
-        Err(source) => Err(Error::Io {
-            path: dir.to_path_buf(),
-            source,
-        }),
-    }
 }
 
 /// Remove each of `dirs` that is empty and that no entry `ledger` holds names,
@@ -3128,74 +2968,13 @@ pub(crate) fn hand_off_claims<'a>(
     Ok(())
 }
 
-/// Refuse unless `now` is still what `planned` observed: the same path, the
-/// same kind and the same stamp, or still nothing at all.
-///
-/// Shared with [`crate::recover`], whose rollback of a create checks the
-/// destination it judged the same way before unlinking it.
-///
-/// # Errors
-///
-/// [`Error::Write`] with [`crate::fs::Error::Changed`] naming what moved.
-pub(crate) fn refuse_moved(planned: &Observed, now: &Observed) -> Result<(), Error> {
-    if planned.path != now.path {
-        return Err(fs::Error::Changed {
-            path: now.path.clone(),
-            detail: format!("plan observed {}, not this path", planned.path.display()),
-        }
-        .into());
-    }
-    if (planned.kind, planned.stamp) == (now.kind, now.stamp) {
-        return Ok(());
-    }
-    let detail = match (planned.stamp, now.stamp) {
-        (_, None) => "it has been removed",
-        (None, Some(_)) => "nothing was there, and something is now",
-        (Some(_), Some(_)) => "it has been modified or replaced",
-    };
-    Err(fs::Error::Changed {
-        path: now.path.clone(),
-        detail: detail.to_string(),
-    }
-    .into())
-}
-
-/// Open a directory so that a rename or an unlink inside it can be made
-/// durable.
-///
-/// Call it **before** that operation and [`sync_dir`] after, never the two
-/// together afterwards: an open that fails after the operation reports an
-/// error for a change that has already happened. See [`unlink`].
-///
-/// # Errors
-///
-/// [`Error::Io`] naming `dir` for the failing `open`.
-pub(crate) fn open_dir(dir: &Path) -> Result<crate::fs::durable::Dir, Error> {
-    crate::fs::durable::Dir::open(dir).map_err(|source| Error::Io {
-        path: dir.to_path_buf(),
-        source,
-    })
-}
-
-/// `fsync` a directory [`open_dir`] opened, so a rename or an unlink made
-/// inside it since survives a power loss.
-///
-/// # Errors
-///
-/// [`Error::Io`] naming `dir` for the failing `fsync`.
-pub(crate) fn sync_dir(handle: &crate::fs::durable::Dir, dir: &Path) -> Result<(), Error> {
-    handle.sync().map_err(|source| Error::Io {
-        path: dir.to_path_buf(),
-        source,
-    })
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
     use std::os::unix::fs::PermissionsExt as _;
 
+    use crate::fs::remove::{prune_beneath, remove_made_dir};
     use crate::state::{LedgerView, Prior};
     use crate::testing::guarded_home;
 
@@ -4054,7 +3833,7 @@ pub(crate) mod tests {
         // cannot be opened to fsync the unlink.
         fs::set_mode(dir.path(), Mode::from_bits(0o300)).expect("chmod");
 
-        let result = unlink(&file);
+        let result = unlink(&file).map_err(Error::from);
         fs::set_mode(dir.path(), Mode::PRIVATE_DIR).expect("unlock for cleanup");
 
         match result {
@@ -6857,7 +6636,7 @@ pub(crate) mod tests {
                 WRITES_THROUGH_PERMISSIONS,
             );
         }
-        let err = prune_dirs(std::slice::from_ref(&child));
+        let err = prune_dirs(std::slice::from_ref(&child)).map_err(Error::from);
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
             .expect("chmod back");
         let err = err.expect_err("neither gone nor not empty");

@@ -118,6 +118,16 @@ pub mod placement;
 pub mod plugin;
 pub mod source;
 
+/// `text` as one single-quoted shell word that means exactly `text`, whatever
+/// it holds: an alias body, or a tool's cached activation output.
+///
+/// Each `'` becomes `'\''`; nothing else is touched, because nothing else has
+/// a meaning inside single quotes.
+#[must_use]
+pub fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 /// Running generated shell text in a real shell, for the submodules' tests.
 #[cfg(test)]
 pub(crate) mod testing {

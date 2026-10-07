@@ -147,7 +147,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Assembly, Phase, Shell, Shells};
+use super::{Assembly, Phase, Shell, Shells, quote};
 use crate::config::Origin;
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
@@ -242,11 +242,6 @@ fn spelled(command: &[String], shell: Shell) -> Vec<String> {
         .iter()
         .map(|word| word.replace(SHELL_PLACEHOLDER, shell.name()))
         .collect()
-}
-
-/// `text` as one single-quoted shell literal, whatever it holds.
-fn literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// Why running an activation's command produced no usable output.
@@ -571,7 +566,7 @@ impl Step {
         let comment = format!("# bx activation: {}\n", self.decl.name);
         match &self.outcome {
             Outcome::Reused { output } | Outcome::Captured { output, .. } => {
-                Some(format!("{comment}eval {}\n", literal(output)))
+                Some(format!("{comment}eval {}\n", quote(output)))
             }
             Outcome::Omitted(_) => None,
         }
@@ -2012,7 +2007,7 @@ mod tests {
             let mut cache = Fingerprints::default();
             let (plan, file) = apply(&[activation], &mut cache, &host);
             assert_eq!(plan.steps()[0].action(), Action::Create, "{command}");
-            assert!(file.contains(&literal(output)), "{command}");
+            assert!(file.contains(&quote(output)), "{command}");
         }
         // And one relocating assignment in any of them is still found.
         let (_, mise) = REAL_OUTPUTS[0];

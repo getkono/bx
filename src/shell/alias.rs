@@ -67,7 +67,7 @@
 //! `rendering_an_alias_sets_no_variable` runs the rendered bytes in zsh and
 //! holds them to that.
 
-use super::{Assembly, Phase};
+use super::{Assembly, Phase, quote};
 use crate::config::Origin;
 use crate::config::when::{self, Gate, When};
 
@@ -126,15 +126,6 @@ impl AliasDecl {
             }
         }
     }
-}
-
-/// `body` as one single-quoted shell word that means exactly `body`.
-///
-/// Each `'` becomes `'\''`; nothing else is touched, because nothing else has
-/// a meaning inside single quotes.
-#[must_use]
-pub fn quote(body: &str) -> String {
-    format!("'{}'", body.replace('\'', r"'\''"))
 }
 
 /// Add every enabled alias to `assembly`'s `aliases` phase, in declaration

@@ -1754,7 +1754,7 @@ fn rm_argument(path: &str) -> std::borrow::Cow<'_, str> {
     if !path.is_empty() && path.chars().all(plain) && !path[1..].contains('~') {
         std::borrow::Cow::Borrowed(path)
     } else {
-        std::borrow::Cow::Owned(crate::shell::alias::quote(path))
+        std::borrow::Cow::Owned(crate::shell::quote(path))
     }
 }
 

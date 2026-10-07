@@ -275,11 +275,7 @@ pub fn look(
     };
     let dest = external.path.render(home);
     let reference = format!("refs/heads/{}", follow.branch);
-    let recorded = ledger.get(&external.path).is_some_and(|entry| {
-        entry.mechanism == crate::state::Mechanism::Clone
-            && entry.written != crate::state::clone_written(None)
-    });
-    let ours = recorded
+    let ours = checkout::finished_clone(ledger, &external.path)
         && dest.is_dir()
         && checkout::own_checkout(git, &dest).is_ok()
         && matches!(checkout::origin_url(git, &dest), Ok(Some(url)) if url == external.url);
@@ -416,7 +412,55 @@ pub fn message(before: &Lock, after: &Lock) -> String {
             lines.push(format!("{path}: no longer followed"));
         }
     }
-    format!("chore(bx): update bx.lock\n\n{}\n", lines.join("\n"))
+    format!("{SUBJECT}\n\n{}\n", lines.join("\n"))
+}
+
+/// The subject of every commit `bx update` makes.
+pub const SUBJECT: &str = "chore(bx): update bx.lock";
+
+/// When the config repo's branch has diverged from its upstream only by
+/// commits `bx update` made — each with [`SUBJECT`] and touching `bx.lock`
+/// alone — move the branch back to the upstream, dropping them, and return
+/// how many. `None`, and nothing changed, when any other commit is local:
+/// that history is a person's to reconcile.
+///
+/// Dropping them loses nothing: the lock they held is proposed again from
+/// the upstream's, against the branches' tips as they are now.
+///
+/// # Errors
+///
+/// [`Error::Sync`] when git cannot list the commits or move the branch.
+pub fn drop_own_lock_commits(git: &Git, repo: &Path) -> Result<Option<usize>, Error> {
+    let listed = git.query(
+        repo,
+        &["rev-list", "--format=%P%x00%s", "@{upstream}..HEAD"],
+    )?;
+    let mut commits = Vec::new();
+    for pair in listed.lines().collect::<Vec<_>>().chunks(2) {
+        let [header, body] = pair else {
+            return Ok(None);
+        };
+        let Some(commit) = header.strip_prefix("commit ") else {
+            return Ok(None);
+        };
+        let (parents, subject) = body.split_once('\0').unwrap_or((body, ""));
+        if parents.split_whitespace().count() != 1 || subject != SUBJECT {
+            return Ok(None);
+        }
+        let touched = git.query(
+            repo,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", commit],
+        )?;
+        if touched != lock::FILE {
+            return Ok(None);
+        }
+        commits.push(commit.to_string());
+    }
+    if commits.is_empty() {
+        return Ok(None);
+    }
+    git.query(repo, &["reset", "--quiet", "--keep", "@{upstream}"])?;
+    Ok(Some(commits.len()))
 }
 
 /// Refuse a `bx.lock` with changes git has not committed, which a commit of
@@ -1186,6 +1230,16 @@ mod tests {
             None,
             "unreadable is never due"
         );
+
+        // Only "already gone" is quietly fine when a stamp is removed.
+        std::fs::create_dir(stamps.available()).unwrap();
+        std::fs::write(stamps.available().join("x"), "x").unwrap();
+        let err = stamps.set(2000, None, None, Some(&[])).unwrap_err();
+        assert!(err.to_string().contains("available"), "{err}");
+
+        let now = now();
+        assert!(now > 1_700_000_000, "seconds since the epoch: {now}");
+        assert!(now < 1_700_000_000 * 4, "{now}");
     }
 
     #[test]

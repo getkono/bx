@@ -432,7 +432,28 @@ fn update_with(
         .hold(update::HOLD_WAIT)?
         .ok_or(update::Error::Busy)?;
     update::refuse_edited_lock(git, &repo)?;
-    match sync::pull(env, git) {
+    // Diverged only by this machine's own unpushed lock commits: those are
+    // dropped and the lock proposed again on top of the upstream, once.
+    let pulled = match sync::pull(env, git) {
+        Err(diverged @ sync::Error::Diverged { .. }) => {
+            match update::drop_own_lock_commits(git, &repo)? {
+                Some(dropped) => {
+                    say(
+                        out,
+                        &format!(
+                            "Set aside {dropped} bx.lock commit(s) of this machine's that were never \
+                         pushed, so the config repo can catch up; bx update proposes the lock \
+                         again from there."
+                        ),
+                    )?;
+                    sync::pull(env, git)
+                }
+                None => Err(diverged),
+            }
+        }
+        other => other,
+    };
+    match pulled {
         Ok(pulled) if pulled.fast_forwarded > 0 => say(
             out,
             &format!(
@@ -3156,6 +3177,139 @@ mod tests {
             assert_eq!(
                 run(home.path(), &repo, &["log", "-1", "--format=%s"]),
                 "chore(bx): update bx.lock"
+            );
+        }
+
+        #[test]
+        fn a_branch_diverged_only_by_unpushed_lock_commits_catches_up_and_locks_again() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            run(home.path(), &repo, &["push", "--quiet"]);
+            // This machine locks a new commit and never pushes it; another
+            // machine pushes a change of its own.
+            publish(&home, &["skills/b/SKILL.md"]);
+            update(&home, true, &mut Vec::new()).expect("a local lock commit");
+            let other = crate::sync::tests::other(&home);
+            std::fs::write(other.join("notes"), "x\n").expect("a note");
+            commit_all(home.path(), &other, "elsewhere");
+            run(home.path(), &other, &["push", "--quiet"]);
+            let third = publish(&home, &["skills/c/SKILL.md"]);
+
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("caught up");
+            assert_eq!(exit, Exit::Converged, "{}", text(&out));
+            assert!(
+                text(&out).starts_with("Set aside 1 bx.lock commit(s)"),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(locked(&home).as_deref(), Some(third.as_str()));
+            assert_eq!(
+                run(home.path(), &repo, &["log", "--format=%s", "-2"]),
+                "chore(bx): update bx.lock\nelsewhere",
+                "on top of the upstream"
+            );
+            assert!(home.child(".claude/skills/c/SKILL.md").is_file());
+        }
+
+        #[test]
+        fn a_branch_diverged_by_a_persons_commit_is_left_for_them() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            run(home.path(), &repo, &["push", "--quiet"]);
+            std::fs::write(repo.join("mine"), "x\n").expect("a file");
+            commit_all(home.path(), &repo, "mine");
+            let other = crate::sync::tests::other(&home);
+            std::fs::write(other.join("notes"), "x\n").expect("a note");
+            commit_all(home.path(), &other, "elsewhere");
+            run(home.path(), &other, &["push", "--quiet"]);
+            let head = rev(home.path(), &repo, "HEAD");
+
+            let error = update(&home, true, &mut Vec::new()).expect_err("diverged");
+            assert!(
+                matches!(error, update::Error::Sync(sync::Error::Diverged { .. })),
+                "{error:?}"
+            );
+            assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing moved");
+        }
+
+        #[test]
+        fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            // An entry for an external nothing follows any more.
+            let mut lock = Lock::read(&repo, home.path()).expect("bx.lock");
+            let entry = lock
+                .iter()
+                .next()
+                .map(|(_, l)| l.clone())
+                .expect("an entry");
+            lock.set(
+                crate::paths::Portable::parse_in("~/gone", home.path()).expect("a path"),
+                entry,
+            );
+            std::fs::write(repo.join("bx.lock"), lock.render()).expect("bx.lock");
+            commit_all(home.path(), &repo, "an orphan");
+            let orphaned = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
+
+            let tty = Env {
+                stdin_tty: true,
+                ..env(home.path())
+            };
+            let mut out = Vec::new();
+            update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
+                Ok(false)
+            })
+            .expect("declined");
+            assert!(!text(&out).contains("Locked."), "{}", text(&out));
+            assert_eq!(
+                std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock"),
+                orphaned,
+                "declined: kept"
+            );
+
+            let mut out = Vec::new();
+            update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
+                Ok(true)
+            })
+            .expect("approved");
+            assert!(text(&out).contains("Locked."), "{}", text(&out));
+            let now = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
+            assert!(!now.contains("~/gone"), "{now}");
+            assert!(
+                run(home.path(), &repo, &["log", "-1", "--format=%B"])
+                    .contains("~/gone: no longer followed")
+            );
+        }
+
+        #[test]
+        fn a_checkout_lacking_nothing_is_not_fetched_by_id() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            let next = publish(&home, &["skills/b/SKILL.md"]);
+            // A remote that refuses a commit asked for by id, as protocol v0
+            // servers do by default: a checkout already holding the commit
+            // locked must not need to.
+            let config = home.child(".gitconfig");
+            let mut text_now = std::fs::read_to_string(&config).expect("~/.gitconfig");
+            text_now.push_str("[protocol]\n\tversion = 0\n");
+            std::fs::write(&config, text_now).expect("~/.gitconfig");
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("update");
+            assert_eq!(exit, Exit::Converged, "{}", text(&out));
+            assert_eq!(
+                locked(&home).as_deref(),
+                Some(next.as_str()),
+                "{}",
+                text(&out)
             );
         }
 

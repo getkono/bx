@@ -757,6 +757,15 @@ pub(crate) fn head(git: &Git, dest: &Path) -> Result<String, sync::Error> {
     git.query(dest, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
 }
 
+/// Whether the ledger records `path` as a clone bx made and finished: the one
+/// kind of directory bx fetches into, or reads an external's children from.
+#[must_use]
+pub(crate) fn finished_clone(ledger: &LedgerView, path: &Portable) -> bool {
+    ledger.get(path).is_some_and(|entry| {
+        entry.mechanism == Mechanism::Clone && entry.written != clone_written(None)
+    })
+}
+
 /// The url of `origin`, or `None` when there is no such remote.
 pub(crate) fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, sync::Error> {
     match git.query(dest, &["config", "--get", "remote.origin.url"]) {
@@ -1321,6 +1330,46 @@ mod tests {
             super::super::exit(&applied, Mode::Apply),
             crate::report::Exit::Pending
         );
+    }
+
+    #[test]
+    fn only_a_finished_clone_is_one_bx_reads_or_fetches_into() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("the state directory");
+        let other = Portable::parse_in("~/other", home.path()).expect("a path");
+        let record = |path: &Portable, written, mechanism| {
+            let lock = ExclusiveLock::acquire(&state).expect("the lock");
+            let mut ledger = Ledger::open(&state, &lock, home.path())
+                .expect("open")
+                .value;
+            ledger
+                .record(NewEntry::new(
+                    path.clone(),
+                    written,
+                    fs::Mode::DEFAULT_DIR,
+                    mechanism,
+                    PriorBytes::Absent,
+                ))
+                .expect("record");
+            ledger.save().expect("save");
+        };
+        let view = || {
+            LedgerView::read(&state, home.path())
+                .expect("the ledger")
+                .value
+        };
+        assert!(!finished_clone(&view(), &target(&home)), "no entry");
+        record(&target(&home), clone_written(None), Mechanism::Clone);
+        assert!(!finished_clone(&view(), &target(&home)), "unfinished");
+        record(
+            &target(&home),
+            clone_written(Some(&"a".repeat(40))),
+            Mechanism::Clone,
+        );
+        assert!(finished_clone(&view(), &target(&home)));
+        record(&other, clone_written(Some(&"a".repeat(40))), Mechanism::Own);
+        assert!(!finished_clone(&view(), &other), "another kind of entry");
     }
 
     #[test]
@@ -1997,13 +2046,15 @@ mod tests {
             Action::Unchanged,
             "the target keeps it"
         );
-        let conflicts: Vec<&str> = planned
+        let conflicts: Vec<&Change> = planned
             .changes
             .iter()
             .filter(|row| row.action == Action::Conflict)
-            .map(|row| row.target.as_str())
             .collect();
-        assert_eq!(conflicts, ["~/.claude/skills/a"], "{:?}", rows(&planned));
+        assert_eq!(conflicts.len(), 1, "{:?}", rows(&planned));
+        assert_eq!(conflicts[0].target, "~/.claude/skills/a");
+        let note = conflicts[0].note.as_deref().expect("a note");
+        assert!(note.contains("another declaration already puts"), "{note}");
     }
 
     #[test]

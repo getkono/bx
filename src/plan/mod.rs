@@ -580,7 +580,7 @@ pub fn run(
             &inputs.home,
             &inputs.git,
             &declared,
-            &|path| finished_clone(&ledger, path),
+            &|path| external::finished_clone(&ledger, path),
         )
     };
     targets.append(&mut expansion.targets);
@@ -694,13 +694,6 @@ pub fn run(
     }
 }
 
-/// Whether the ledger records `path` as a clone bx finished.
-fn finished_clone(ledger: &LedgerView, path: &Portable) -> bool {
-    ledger.get(path).is_some_and(|entry| {
-        entry.mechanism == Mechanism::Clone && entry.written != state::clone_written(None)
-    })
-}
-
 /// The path a target declares: its own, or a held-back one's key.
 fn declared_path(resolution: &Resolution<Target>) -> &str {
     match resolution {
@@ -744,7 +737,7 @@ fn link_pending(
             &inputs.home,
             &inputs.git,
             &mut taken,
-            finished_clone(&ledger, &external.path),
+            external::finished_clone(&ledger, &external.path),
         ) {
             Ok((children, taken_rows)) => {
                 targets.extend(children);

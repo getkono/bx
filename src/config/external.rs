@@ -900,6 +900,20 @@ mod tests {
             ("skills/*", "~/x/*", "require = \"a/b\"\n", "one file name"),
             ("skills/*", "~/x/*", "require = \"\"\n", "one file name"),
             ("skills/*", "~/x/*", "require = \"..\"\n", "one file name"),
+            ("skills/*", "~/x/*", "require = \".\"\n", "one file name"),
+            (
+                "skills/*",
+                "~/x/*",
+                "require = \"{{v}}\"\n",
+                "one file name",
+            ),
+            (
+                "skills/*",
+                "~/x/*",
+                "require = \"a\\u0001\"\n",
+                "one file name",
+            ),
+            ("a\\u0001b/*", "~/x/*", "", "control character"),
         ] {
             let err = linked(from, to, extra).unwrap_err();
             assert!(err.contains(says), "{from:?} {to:?} {extra:?}: {err}");

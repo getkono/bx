@@ -559,6 +559,28 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_inside_another_repository_has_no_children_of_its_own() {
+        let home = guarded_home();
+        let rev = checkout(&home, &["sub/s/a/f", "s/b/f"]);
+        // The external's path is a plain directory of the repository around
+        // it, which git would answer for if asked from there.
+        let inner = External {
+            path: Portable::parse_in("~/src/a/sub", home.path()).unwrap(),
+            ..external(&home, &rev, vec![link(&home, "s", "~/x", None)])
+        };
+        let expansion = expand(
+            &[inner],
+            &Lock::default(),
+            home.path(),
+            &git(home.path()),
+            &BTreeSet::new(),
+            &|_| true,
+        );
+        assert!(expansion.targets.is_empty(), "{:?}", links(&expansion));
+        assert_eq!(expansion.pending.len(), 1);
+    }
+
+    #[test]
     fn a_directory_bx_did_not_clone_is_never_read_or_linked_into() {
         let home = guarded_home();
         let rev = checkout(&home, &["s/a/f"]);

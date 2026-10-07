@@ -363,6 +363,9 @@ mod tests {
         assert!(lock.get(&portable("~/b")).is_none());
         assert!(!lock.is_empty());
         assert_eq!(lock.iter().count(), 1);
+        lock.retain(|_| false);
+        assert!(lock.is_empty());
+        assert!(Lock::default().is_empty());
     }
 
     #[test]

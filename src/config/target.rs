@@ -362,8 +362,8 @@ impl Gen {
 /// `[keybindings]` land in the `keybindings` phase, as
 /// [`Keybindings::render_zsh`] renders them; and every enabled `[[source]]`
 /// whose path resolved lands in the phase it names, after that phase's own
-/// declarations, as the one guarded line [`Source::render`] renders; and every
-/// declared tool activation the plan reused or captured lands in the phase it
+/// declarations, as the one guarded line [`Source::render_in`] renders; and
+/// every declared tool activation the plan reused or captured lands in the phase it
 /// names, as the one `eval` of a literal [`activation::Step::body`] renders,
 /// before any source in that phase. No phase
 /// but `env` holds an environment assignment (Invariant 2): the `options`

@@ -174,8 +174,6 @@ pub trait Keyed {
     /// As written. A target is merged by the file this names once substituted,
     /// which is not a function of the entry alone; see [`merge`].
     fn key(&self) -> &str;
-    /// The layer and line that last set this entry.
-    fn origin(&self) -> &Origin;
     /// Whether the entry survives into the resolved configuration.
     fn enabled(&self) -> bool;
     /// Flip the flag, as a toggle does.
@@ -188,9 +186,6 @@ impl Keyed for Target {
     fn key(&self) -> &str {
         self.path.as_str()
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -202,9 +197,6 @@ impl Keyed for Target {
 impl Keyed for ValueDecl {
     fn key(&self) -> &str {
         &self.name
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     // Unreachable from `merge`, which keeps disabled declarations with
     // `into_entries`; kept because `Keyed` requires it of a public list type.
@@ -220,9 +212,6 @@ impl Keyed for EnvDecl {
     fn key(&self) -> &str {
         &self.name
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -234,9 +223,6 @@ impl Keyed for EnvDecl {
 impl Keyed for AliasDecl {
     fn key(&self) -> &str {
         &self.name
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     fn enabled(&self) -> bool {
         self.enabled
@@ -250,9 +236,6 @@ impl Keyed for FunctionDecl {
     fn key(&self) -> &str {
         &self.name
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -264,9 +247,6 @@ impl Keyed for FunctionDecl {
 impl Keyed for PluginDecl {
     fn key(&self) -> &str {
         &self.name
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     fn enabled(&self) -> bool {
         self.enabled
@@ -280,9 +260,6 @@ impl Keyed for SourceDecl {
     fn key(&self) -> &str {
         &self.name
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -295,9 +272,6 @@ impl Keyed for ActivationDecl {
     fn key(&self) -> &str {
         &self.name
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -309,9 +283,6 @@ impl Keyed for ActivationDecl {
 impl Keyed for ToolDecl {
     fn key(&self) -> &str {
         &self.name
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     fn enabled(&self) -> bool {
         self.enabled
@@ -327,9 +298,6 @@ impl Keyed for External {
     fn key(&self) -> &str {
         self.path.as_str()
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -343,9 +311,6 @@ impl Keyed for PathEntry {
     /// are one entry.
     fn key(&self) -> &str {
         &self.shell
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     fn enabled(&self) -> bool {
         self.enabled

@@ -128,19 +128,13 @@ impl Source {
         guarded(&self.path)
     }
 
-    /// What the source contributes to the file: its line, the line inside a
-    /// guarded block, or nothing when `when` is `has:TOOL` and the tool is
-    /// missing.
+    /// What the source contributes to `shell`'s file: its line, the line
+    /// inside a guarded block, or nothing when `when` is `has:TOOL` and the
+    /// tool is missing. A runtime condition is asked in that shell's words
+    /// ([`When::test_bash`] for bash).
     ///
     /// `present` answers whether a `has:TOOL` tool is usable on this machine,
     /// asked while `plan` and `apply` render, never by the generated shell.
-    #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
-        self.render_in(Shell::Zsh, present)
-    }
-
-    /// [`Source::render`] for `shell`: the same line, and a runtime condition
-    /// asked in that shell's words ([`When::test_bash`] for bash).
     #[must_use]
     pub fn render_in(&self, shell: Shell, present: &dyn Fn(&str) -> bool) -> String {
         let line = self.line();

@@ -35,9 +35,9 @@ pub(crate) mod remove;
 pub(crate) use atomic::refuse_moved;
 
 pub use atomic::{
-    CreatedDirs, Desired, Drift, EnsuredDir, Error, Filled, Observed, Outcome, Parent, ParentState,
-    Staged, Stamp, TEMP_PREFIX, Unpublished, compare, compare_dir, ensure_dir, observe,
-    refuse_stage, set_mode, stage, stage_as, temp_beside, write_atomically,
+    CreatedDirs, Desired, Drift, Error, Filled, Observed, ParentState, Staged, Stamp, TEMP_PREFIX,
+    Unpublished, compare, compare_dir, ensure_dir, observe, refuse_stage, set_mode, stage,
+    stage_as, temp_beside, write_atomically,
 };
-pub use link::{StagedLink, refuse_stage_link, stage_link, stage_link_as};
-pub use mode::{Kind, Mode, ModeError};
+pub use link::{refuse_stage_link, stage_link, stage_link_as};
+pub use mode::{Kind, Mode};

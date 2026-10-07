@@ -52,7 +52,6 @@ pub fn digest(text: &Path) -> ContentHash {
 pub struct StagedLink {
     temp: NamedTempFile<()>,
     dest: PathBuf,
-    text: PathBuf,
     prior: Observed,
     created_dirs: Vec<PathBuf>,
 }
@@ -138,7 +137,6 @@ fn stage_link_in(
     Ok(StagedLink {
         temp,
         dest,
-        text: text.to_path_buf(),
         prior,
         created_dirs,
     })
@@ -179,18 +177,6 @@ impl StagedLink {
     #[must_use]
     pub fn temp_path(&self) -> &Path {
         self.temp.path()
-    }
-
-    /// What was at the destination before: nothing, or a link.
-    #[must_use]
-    pub const fn prior(&self) -> &Observed {
-        &self.prior
-    }
-
-    /// The digest of the text the link holds.
-    #[must_use]
-    pub fn written(&self) -> ContentHash {
-        digest(&self.text)
     }
 
     /// The parent directories this write invented and claims, deepest first,
@@ -465,11 +451,20 @@ mod tests {
             stage_link(&dest, Path::new("new"), &planned, &mut CreatedDirs::new()).expect("stage");
 
         assert_eq!(staged.dest(), dest);
-        assert_eq!(staged.prior().kind, Kind::Symlink);
-        assert_eq!(staged.prior().link.as_deref(), Some(Path::new("old")));
-        assert_eq!(staged.written(), digest(Path::new("new")));
-        assert_ne!(staged.written(), digest(Path::new("old")));
+        assert_eq!(
+            std::fs::read_link(staged.temp_path()).expect("the staged link"),
+            Path::new("new")
+        );
+        assert_eq!(
+            std::fs::read_link(&dest).expect("the link it replaces"),
+            Path::new("old")
+        );
         assert_eq!(staged.created_dirs(), [] as [PathBuf; 0]);
+        staged.publish().expect("publish");
+        assert_eq!(
+            std::fs::read_link(&dest).expect("published"),
+            Path::new("new")
+        );
     }
 
     #[test]

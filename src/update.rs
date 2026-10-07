@@ -85,6 +85,21 @@ pub enum Error {
          one by its `path`, or name none to update them all"
     )]
     NotFollowed(String),
+    /// This machine's unpushed lock commits and the upstream both changed
+    /// `bx.lock`.
+    #[error(
+        "this machine has {commits} unpushed bx.lock commit(s), and another machine pushed a \
+         bx.lock of its own; nothing was changed. To take the other machine's, run \
+         `git -C {} reset --keep @{{upstream}}`, then bx update again; to keep this one's, \
+         merge by hand and run bx sync",
+        .repo.display()
+    )]
+    LockDiverged {
+        /// How many of this machine's lock commits are unpushed.
+        commits: usize,
+        /// The config repo.
+        repo: PathBuf,
+    },
     /// Another `bx update` holds `update/check.lock`.
     #[error(
         "another bx update is running, in this shell or another; let it finish, then run \
@@ -417,49 +432,78 @@ pub fn message(before: &Lock, after: &Lock) -> String {
 /// The subject of every commit `bx update` makes.
 pub const SUBJECT: &str = "chore(bx): update bx.lock";
 
+/// What [`replay_own_lock_commits`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replay {
+    /// A local commit is not one `bx update` made; nothing was touched.
+    NotOwn,
+    /// This many of `bx update`'s commits now sit on top of the upstream.
+    Replayed(usize),
+    /// The upstream changed `bx.lock` too, so they could not be replayed;
+    /// the branch is as it was.
+    Conflicted(usize),
+}
+
 /// When the config repo's branch has diverged from its upstream only by
-/// commits `bx update` made — each with [`SUBJECT`] and touching `bx.lock`
-/// alone — move the branch back to the upstream, dropping them, and return
-/// how many. `None`, and nothing changed, when any other commit is local:
-/// that history is a person's to reconcile.
-///
-/// Dropping them loses nothing: the lock they held is proposed again from
-/// the upstream's, against the branches' tips as they are now.
+/// commits `bx update` made — each with [`SUBJECT`], one parent, and
+/// touching `bx.lock` alone — replay them on top of the upstream, as
+/// `git rebase` does. Every lock they held is kept, so nothing needs
+/// approving again. When the upstream changed `bx.lock` as well, the replay
+/// is abandoned and the branch left exactly as it was: which machine's lock
+/// to keep is a person's call. Any other local commit is left alone too.
 ///
 /// # Errors
 ///
-/// [`Error::Sync`] when git cannot list the commits or move the branch.
-pub fn drop_own_lock_commits(git: &Git, repo: &Path) -> Result<Option<usize>, Error> {
+/// [`Error::Sync`] when git cannot list the commits, or cannot put the
+/// branch back after a replay that failed.
+pub fn replay_own_lock_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
     let listed = git.query(
         repo,
         &["rev-list", "--format=%P%x00%s", "@{upstream}..HEAD"],
     )?;
-    let mut commits = Vec::new();
+    let mut commits = 0;
     for pair in listed.lines().collect::<Vec<_>>().chunks(2) {
         let [header, body] = pair else {
-            return Ok(None);
+            return Ok(Replay::NotOwn);
         };
         let Some(commit) = header.strip_prefix("commit ") else {
-            return Ok(None);
+            return Ok(Replay::NotOwn);
         };
         let (parents, subject) = body.split_once('\0').unwrap_or((body, ""));
         if parents.split_whitespace().count() != 1 || subject != SUBJECT {
-            return Ok(None);
+            return Ok(Replay::NotOwn);
         }
         let touched = git.query(
             repo,
             &["diff-tree", "--no-commit-id", "--name-only", "-r", commit],
         )?;
         if touched != lock::FILE {
-            return Ok(None);
+            return Ok(Replay::NotOwn);
         }
-        commits.push(commit.to_string());
+        commits += 1;
     }
-    if commits.is_empty() {
-        return Ok(None);
+    if commits == 0 {
+        return Ok(Replay::NotOwn);
     }
-    git.query(repo, &["reset", "--quiet", "--keep", "@{upstream}"])?;
-    Ok(Some(commits.len()))
+    // Through `commit`, so the user's own signing can ask what it asks.
+    let replayed = git.commit(
+        repo,
+        &[
+            "-c",
+            "rebase.autoStash=false",
+            "rebase",
+            "--quiet",
+            "--no-autosquash",
+            "@{upstream}",
+        ],
+    );
+    match replayed {
+        Ok(_) => Ok(Replay::Replayed(commits)),
+        Err(_) => {
+            git.query(repo, &["rebase", "--abort"])?;
+            Ok(Replay::Conflicted(commits))
+        }
+    }
 }
 
 /// Refuse a `bx.lock` with changes git has not committed, which a commit of
@@ -777,12 +821,16 @@ fn looked(
     // remote on its own.
     let started = std::time::Instant::now();
     let git = |started: std::time::Instant| {
-        let bound = if background {
-            started + BACKGROUND_BOUND
+        if background {
+            git.clone()
+                .unattended()
+                .with_deadline(started + BACKGROUND_BOUND)
+                .in_own_group()
         } else {
-            std::time::Instant::now() + LOOK_BOUND
-        };
-        git.clone().unattended().with_deadline(bound)
+            git.clone()
+                .unattended()
+                .with_deadline(std::time::Instant::now() + LOOK_BOUND)
+        }
     };
     let chosen: Vec<&External> = select(externals, names, &env.home)?
         .into_iter()
@@ -827,7 +875,13 @@ fn looked(
 /// external it found new commits for.
 #[must_use]
 pub fn offered(previous: &str, found: &[Found]) -> Vec<String> {
-    let looked: Vec<String> = found.iter().map(|f| format!("{}: ", f.path)).collect();
+    // A remote this check could not reach says nothing new about it, so what
+    // an earlier check offered stands.
+    let looked: Vec<String> = found
+        .iter()
+        .filter(|f| !matches!(f.verdict, Verdict::Unreachable(_)))
+        .map(|f| format!("{}: ", f.path))
+        .collect();
     previous
         .lines()
         .filter(|line| !looked.iter().any(|prefix| line.starts_with(prefix)))
@@ -852,6 +906,11 @@ pub fn snooze(
     out: &mut dyn std::io::Write,
 ) -> Result<crate::report::Exit, Error> {
     let inputs = crate::plan::Inputs::load(env)?;
+    // A check another shell is running would write its offer back after
+    // this clears it; a snooze waits it out, as it runs detached anyway.
+    let Some(_held) = Stamps::of(inputs.state()).hold(BACKGROUND_BOUND + HOLD_WAIT)? else {
+        return Err(Error::Busy);
+    };
     let interval = inputs.resolved().update.interval();
     let externals = &inputs.resolved().externals;
     let (ask, auto) = (
@@ -938,7 +997,14 @@ impl Stamps {
             })?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(Some(file)),
-            Err(_) => Ok(None),
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+            Err(errno) => Err(Error::Write {
+                path: path.clone(),
+                source: crate::fs::Error::Write {
+                    path,
+                    source: errno.into(),
+                },
+            }),
         }
     }
 
@@ -1180,18 +1246,31 @@ mod tests {
     #[test]
     fn a_check_replaces_only_the_lines_of_what_it_looked_at() {
         let previous = "~/a: 1 new commit(s) on main\n~/b: 2 new commit(s) on main\n";
-        let found = [
+        let looked = [
             found("~/a", Some(A), Verdict::Current),
             found("~/c", None, moves(B)),
         ];
         assert_eq!(
-            offered(previous, &found),
+            offered(previous, &looked),
             [
                 "~/b: 2 new commit(s) on main".to_string(),
                 "~/c: locks main at 85919cd1ffa7".to_string(),
             ]
         );
         assert!(offered("", &[]).is_empty());
+        let offline = [found(
+            "~/b",
+            Some(A),
+            Verdict::Unreachable("no route".to_string()),
+        )];
+        assert_eq!(
+            offered(previous, &offline),
+            [
+                "~/a: 1 new commit(s) on main".to_string(),
+                "~/b: 2 new commit(s) on main".to_string(),
+            ],
+            "a remote not reached withdraws nothing"
+        );
     }
 
     #[test]

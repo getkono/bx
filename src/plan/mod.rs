@@ -580,7 +580,7 @@ pub fn run(
             &inputs.home,
             &inputs.git,
             &declared,
-            &|path| external::finished_clone(&ledger, path),
+            &|path| external::bx_clone(&ledger, path),
         )
     };
     targets.append(&mut expansion.targets);
@@ -742,6 +742,9 @@ fn link_pending(
             Ok((children, taken_rows)) => {
                 targets.extend(children);
                 conflicts.extend(taken_rows);
+                // Its children carry the work from here, each in a row of
+                // its own; the rule itself writes nothing.
+                report.changes[first_row + pending.row].action = Action::Unchanged;
             }
             Err(note) => {
                 let at = first_row + pending.row;
@@ -770,7 +773,14 @@ fn link_pending(
         bases,
     };
     let decided = decide::decide_all(&targets, &ctx)?;
-    report.changes.extend(decided.changes);
+    for change in decided.changes {
+        // A child that is a conflict or blocked was never shown as one, so
+        // it is said with the rows apply stopped short of.
+        if change.action.needs_attention() {
+            report.stopped.push(report.changes.len());
+        }
+        report.changes.push(change);
+    }
     if !decided.ops.is_empty() {
         let scope = decided.ops.iter().map(|op| op.target().clone()).collect();
         let session = Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;

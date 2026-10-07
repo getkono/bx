@@ -433,22 +433,24 @@ fn update_with(
         .ok_or(update::Error::Busy)?;
     update::refuse_edited_lock(git, &repo)?;
     // Diverged only by this machine's own unpushed lock commits: those are
-    // dropped and the lock proposed again on top of the upstream, once.
+    // replayed on top of the upstream, keeping every lock they hold.
     let pulled = match sync::pull(env, git) {
         Err(diverged @ sync::Error::Diverged { .. }) => {
-            match update::drop_own_lock_commits(git, &repo)? {
-                Some(dropped) => {
+            match update::replay_own_lock_commits(git, &repo)? {
+                update::Replay::Replayed(replayed) => {
                     say(
                         out,
                         &format!(
-                            "Set aside {dropped} bx.lock commit(s) of this machine's that were never \
-                         pushed, so the config repo can catch up; bx update proposes the lock \
-                         again from there."
+                            "Replayed {replayed} unpushed bx.lock commit(s) of this machine's on \
+                             top of what another machine pushed."
                         ),
                     )?;
                     sync::pull(env, git)
                 }
-                None => Err(diverged),
+                update::Replay::Conflicted(commits) => {
+                    return Err(update::Error::LockDiverged { commits, repo });
+                }
+                update::Replay::NotOwn => Err(diverged),
             }
         }
         other => other,
@@ -563,7 +565,9 @@ fn update_with(
     let attention = found.iter().any(|found| {
         matches!(
             found.verdict,
-            update::Verdict::Rewritten { .. } | update::Verdict::Unreachable(_)
+            update::Verdict::Rewritten { .. }
+                | update::Verdict::Unproven { .. }
+                | update::Verdict::Unreachable(_)
         )
     });
     Ok(match plan::exit(&report, Mode::Apply) {
@@ -3201,17 +3205,53 @@ mod tests {
             let exit = update(&home, true, &mut out).expect("caught up");
             assert_eq!(exit, Exit::Converged, "{}", text(&out));
             assert!(
-                text(&out).starts_with("Set aside 1 bx.lock commit(s)"),
+                text(&out).starts_with("Replayed 1 unpushed bx.lock commit(s)"),
                 "{}",
                 text(&out)
             );
             assert_eq!(locked(&home).as_deref(), Some(third.as_str()));
             assert_eq!(
-                run(home.path(), &repo, &["log", "--format=%s", "-2"]),
-                "chore(bx): update bx.lock\nelsewhere",
-                "on top of the upstream"
+                run(home.path(), &repo, &["log", "--format=%s", "-3"]),
+                "chore(bx): update bx.lock\nchore(bx): update bx.lock\nelsewhere",
+                "kept, on top of the upstream"
             );
             assert!(home.child(".claude/skills/c/SKILL.md").is_file());
+        }
+
+        #[test]
+        fn lock_commits_both_machines_made_are_left_for_a_person() {
+            let home = guarded_home();
+            let first = upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            run(home.path(), &repo, &["push", "--quiet"]);
+            publish(&home, &["skills/b/SKILL.md"]);
+            update(&home, true, &mut Vec::new()).expect("a local lock commit");
+            // The other machine locked a commit of its own on the same line.
+            let other = crate::sync::tests::other(&home);
+            let theirs = std::fs::read_to_string(other.join("bx.lock"))
+                .expect("bx.lock")
+                .replace(&first, &"d".repeat(40));
+            std::fs::write(other.join("bx.lock"), theirs).expect("bx.lock");
+            commit_all(home.path(), &other, update::SUBJECT);
+            run(home.path(), &other, &["push", "--quiet"]);
+            let head = rev(home.path(), &repo, "HEAD");
+
+            let error = update(&home, true, &mut Vec::new()).expect_err("both changed it");
+            assert!(
+                matches!(error, update::Error::LockDiverged { commits: 1, .. }),
+                "{error:?}"
+            );
+            assert!(
+                error.to_string().contains("reset --keep @{upstream}"),
+                "{error}"
+            );
+            assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing moved");
+            assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
+            assert!(
+                !repo.join(".git/rebase-merge").exists(),
+                "no replay left open"
+            );
         }
 
         #[test]
@@ -3291,7 +3331,7 @@ mod tests {
         }
 
         #[test]
-        fn a_checkout_lacking_nothing_is_not_fetched_by_id() {
+        fn a_remote_refusing_a_commit_by_id_still_lets_a_checkout_holding_it_move() {
             let home = guarded_home();
             upstream(&home, &["skills/a/SKILL.md"]);
             cloned(&home, &layer());
@@ -3313,6 +3353,82 @@ mod tests {
                 "{}",
                 text(&out)
             );
+        }
+
+        #[test]
+        fn a_person_s_update_waits_briefly_then_says_another_runs() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(&home, &layer());
+            let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+            let _held = stamps.try_hold().expect("hold").expect("free");
+            let error = update(&home, true, &mut Vec::new()).expect_err("busy");
+            assert!(matches!(error, update::Error::Busy), "{error:?}");
+            let error = update::check(
+                &env(home.path()),
+                &[],
+                false,
+                &git(home.path()),
+                &mut Vec::new(),
+            )
+            .expect_err("busy");
+            assert!(matches!(error, update::Error::Busy), "{error:?}");
+            assert_eq!(locked(&home), None, "nothing looked at or locked");
+        }
+
+        #[test]
+        fn a_background_check_that_fails_says_why_and_waits_an_hour() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            std::fs::write(repo.join("bx.toml"), "[[external]\n").expect("a broken layer");
+            let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+            let before = update::now();
+            update::check(
+                &env(home.path()),
+                &[],
+                true,
+                &git(home.path()),
+                &mut Vec::new(),
+            )
+            .expect_err("the configuration does not load");
+            let last = std::fs::read_to_string(stamps.last_check()).expect("last-check");
+            assert!(last.starts_with("the check failed: "), "{last}");
+            let due = Stamps::read(&stamps.check_due()).expect("check-due");
+            assert!(
+                (before + 3600..=update::now() + 3600).contains(&due),
+                "an hour on: {due}"
+            );
+        }
+
+        #[test]
+        fn a_config_repo_git_does_not_manage_gets_its_lock_uncommitted() {
+            let home = guarded_home();
+            let first = upstream(&home, &["skills/a/SKILL.md"]);
+            crate::plan::tests::seed(home.path(), &layer());
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("update");
+            assert_eq!(exit, Exit::Converged, "{}", text(&out));
+            assert!(
+                text(&out).starts_with("The config repo is not a git repository"),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(locked(&home).as_deref(), Some(first.as_str()));
+        }
+
+        #[test]
+        fn a_refused_first_lock_commit_leaves_no_lock_behind() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            let hook = repo.join(".git/hooks/pre-commit");
+            std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("a hook");
+            crate::fs::set_mode(&hook, crate::fs::Mode::from_bits(0o755)).expect("executable");
+            update(&home, true, &mut Vec::new()).expect_err("the hook refuses");
+            assert!(!repo.join("bx.lock").exists());
+            assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
+            assert!(!home.child(AT).exists());
         }
 
         #[test]

@@ -766,6 +766,16 @@ pub(crate) fn finished_clone(ledger: &LedgerView, path: &Portable) -> bool {
     })
 }
 
+/// Whether the ledger records `path` as a clone of bx's, finished or not: a
+/// directory an apply clones into, or clones again, rather than someone
+/// else's.
+#[must_use]
+pub(crate) fn bx_clone(ledger: &LedgerView, path: &Portable) -> bool {
+    ledger
+        .get(path)
+        .is_some_and(|entry| entry.mechanism == Mechanism::Clone)
+}
+
 /// The url of `origin`, or `None` when there is no such remote.
 pub(crate) fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, sync::Error> {
     match git.query(dest, &["config", "--get", "remote.origin.url"]) {
@@ -1360,16 +1370,20 @@ mod tests {
                 .value
         };
         assert!(!finished_clone(&view(), &target(&home)), "no entry");
+        assert!(!bx_clone(&view(), &target(&home)), "no entry");
         record(&target(&home), clone_written(None), Mechanism::Clone);
         assert!(!finished_clone(&view(), &target(&home)), "unfinished");
+        assert!(bx_clone(&view(), &target(&home)), "bx's, unfinished");
         record(
             &target(&home),
             clone_written(Some(&"a".repeat(40))),
             Mechanism::Clone,
         );
         assert!(finished_clone(&view(), &target(&home)));
+        assert!(bx_clone(&view(), &target(&home)));
         record(&other, clone_written(Some(&"a".repeat(40))), Mechanism::Own);
         assert!(!finished_clone(&view(), &other), "another kind of entry");
+        assert!(!bx_clone(&view(), &other), "another kind of entry");
     }
 
     #[test]
@@ -2070,6 +2084,80 @@ mod tests {
             rows(&planned),
             [(format!("~/{AT}"), Action::Blocked)],
             "the link bx made is not reported as undeclared"
+        );
+    }
+
+    #[test]
+    fn a_pending_child_something_of_the_users_stands_at_is_reported_as_stopped() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(&home, &["skills/a/SKILL.md", "skills/b/SKILL.md"]);
+        lock(&home, URL, "master", &rev);
+        home.write(".claude/skills/b", "the user's own\n");
+        let applied = apply(&home, &linking("master"));
+        assert_eq!(
+            stopped(&applied),
+            ["~/.claude/skills/b"],
+            "{:?}",
+            rows(&applied)
+        );
+        assert_eq!(row(&applied, "~/.claude/skills/b").action, Action::Conflict);
+        assert_eq!(
+            row(&applied, "~/.claude/skills/*").action,
+            Action::Unchanged,
+            "the rule itself wrote nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.child(".claude/skills/b")).expect("kept"),
+            "the user's own\n"
+        );
+        assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn an_interrupted_clone_with_links_converges_in_one_apply() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(&home, &["skills/a/SKILL.md"]);
+        lock(&home, URL, "master", &rev);
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("the state directory");
+        {
+            let lock = ExclusiveLock::acquire(&state).expect("the lock");
+            let mut ledger = Ledger::open(&state, &lock, home.path())
+                .expect("open")
+                .value;
+            ledger
+                .record(NewEntry::new(
+                    target(&home),
+                    clone_written(None),
+                    fs::Mode::DEFAULT_DIR,
+                    Mechanism::Clone,
+                    PriorBytes::Absent,
+                ))
+                .expect("record");
+            ledger.save().expect("save");
+        }
+        std::fs::create_dir_all(home.child(AT).join(".git")).expect("a partial clone");
+        let layer = linking("master");
+
+        let planned = plan(&home, &layer);
+        assert_eq!(
+            row(&planned, "~/.claude/skills/*").action,
+            Action::Create,
+            "pending on the clone that replaces it: {:?}",
+            rows(&planned)
+        );
+        apply(&home, &layer);
+        assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+        let again = plan(&home, &layer);
+        assert!(
+            again
+                .changes
+                .iter()
+                .all(|row| row.action == Action::Unchanged),
+            "{:?}",
+            rows(&again)
         );
     }
 

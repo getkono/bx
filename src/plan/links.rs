@@ -108,8 +108,10 @@ pub(super) fn expand(
         };
         let dest = external.path.render(home);
         if !owned(&external.path) && dest.exists() {
-            // Someone else's directory, which the external's own row reports
-            // as a conflict: nothing is read from it or linked into it.
+            // A directory the ledger does not record as bx's clone, which the
+            // external's own row reports as a conflict: nothing is read from
+            // it or linked into it. An interrupted clone of bx's is bx's, and
+            // its links are pending on the clone that replaces it.
             expansion
                 .held
                 .extend(external.links.iter().map(|link| link.to.clone()));

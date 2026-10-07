@@ -908,7 +908,7 @@ pub fn snooze(
     let inputs = crate::plan::Inputs::load(env)?;
     // A check another shell is running would write its offer back after
     // this clears it; a snooze waits it out, as it runs detached anyway.
-    let Some(_held) = Stamps::of(inputs.state()).hold(BACKGROUND_BOUND + HOLD_WAIT)? else {
+    let Some(_held) = Stamps::of(inputs.state()).hold(SNOOZE_WAIT)? else {
         return Err(Error::Busy);
     };
     let interval = inputs.resolved().update.interval();
@@ -1031,6 +1031,10 @@ impl Stamps {
 
 /// How long a person's `bx update` waits for another to let go.
 pub const HOLD_WAIT: Duration = Duration::from_secs(2);
+
+/// How long `bx update --snooze` waits for a running check to let go: longer
+/// than [`BACKGROUND_BOUND`], which bounds the longest one.
+pub const SNOOZE_WAIT: Duration = Duration::from_secs(35);
 
 #[cfg(test)]
 mod tests {

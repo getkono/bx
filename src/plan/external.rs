@@ -2094,7 +2094,12 @@ mod tests {
         let rev = commit_upstream(&home, &["skills/a/SKILL.md", "skills/b/SKILL.md"]);
         lock(&home, URL, "master", &rev);
         home.write(".claude/skills/b", "the user's own\n");
-        let applied = apply(&home, &linking("master"));
+        // A second link, so each rule row is found by its own index.
+        let layer = format!(
+            "{}[[external.link]]\nfrom = \"skills/*\"\nto = \"~/.more/*\"\n",
+            linking("master")
+        );
+        let applied = apply(&home, &layer);
         assert_eq!(
             stopped(&applied),
             ["~/.claude/skills/b"],
@@ -2102,11 +2107,14 @@ mod tests {
             rows(&applied)
         );
         assert_eq!(row(&applied, "~/.claude/skills/b").action, Action::Conflict);
-        assert_eq!(
-            row(&applied, "~/.claude/skills/*").action,
-            Action::Unchanged,
-            "the rule itself wrote nothing"
-        );
+        for rule in ["~/.claude/skills/*", "~/.more/*"] {
+            assert_eq!(
+                row(&applied, rule).action,
+                Action::Unchanged,
+                "{rule}: the rule itself wrote nothing"
+            );
+        }
+        assert!(home.child(".more/b/SKILL.md").is_file());
         assert_eq!(
             std::fs::read_to_string(home.child(".claude/skills/b")).expect("kept"),
             "the user's own\n"

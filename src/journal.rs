@@ -1913,13 +1913,13 @@ impl Session {
                     //
                     // Assembled from the observation rather than a staged
                     // write, because none exists yet: the same fields
-                    // `fs::Filled::new_entry` fills in, from the same prior.
+                    // `NewEntry::for_write` fills in, from the same prior.
                     let entry = NewEntry::new(
                         target.clone(),
                         ContentHash::of(bytes),
                         mode,
                         mechanism.clone(),
-                        observed.prior_bytes(),
+                        PriorBytes::of(&observed),
                     );
                     entry.with_created_dirs(portable_dirs(&created_dirs, &self.home)?)
                 }),
@@ -2678,7 +2678,7 @@ impl Crash {
 /// [`Error::Write`] when the snapshot cannot be stored. It is `fsync`ed, along
 /// with the directory entry naming it, before this returns.
 fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
-    store_prior_bytes(state, observed.prior_bytes())
+    store_prior_bytes(state, PriorBytes::of(observed))
 }
 
 /// [`store_prior`] for a symlink target: the link's text is its bytes.
@@ -2774,7 +2774,7 @@ fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
 ///
 /// [`Error::Write`] with [`crate::fs::Error::NotPortable`] for one that cannot
 /// be, which a ledger would refuse to store. Unreachable from the one caller,
-/// which calls [`crate::fs::Filled::new_entry`] in the statement before: that
+/// which calls [`crate::state::NewEntry::for_write`] in the statement before: that
 /// makes the same conversion, for a superset of the same paths and against the
 /// same home, and returns its failure first. The order is a statement
 /// boundary, not an evaluation rule (`r3 round 7`, CL3). Kept rather than unwrapped — a panic in a writer's durability

@@ -15,12 +15,12 @@
 //!    but a declared setuid or setgid bit, which a write would clear.
 //! 4. the content written, the set-id bits added if declared and read back to
 //!    confirm the kernel kept them, then `fsync`ed.
-//! 5. the prior state recorded — [`Filled::new_entry`] assembles it and
+//! 5. the prior state recorded — [`crate::state::NewEntry::for_write`] assembles it and
 //!    [`crate::state::Ledger::record`] makes it durable — **before** the
 //!    rename, so a crash after the rename still has a recoverable prior state.
 //!    Steps 6 and 7 can still refuse or fail, so this record can outlive a
 //!    write that never lands; [`Unpublished`] names the write so its record
-//!    can be withdrawn, and [`Filled::new_entry`] says when and how.
+//!    can be withdrawn, and [`crate::state::NewEntry::for_write`] says when and how.
 //! 6. the destination `lstat`ed again and compared with what step 1 saw, and
 //!    the write refused if it changed.
 //! 7. `rename`.
@@ -170,8 +170,7 @@ use tempfile::NamedTempFile;
 
 use super::durable;
 use super::mode::{Kind, Mode};
-use crate::paths::Portable;
-use crate::state::{ContentHash, Mechanism, NewEntry, PriorBytes};
+use crate::state::ContentHash;
 
 /// The prefix every temporary file bx creates in a destination directory
 /// carries.
@@ -283,7 +282,7 @@ pub enum Error {
     ///
     /// From [`Filled::publish`] it arrives inside an [`Unpublished`], because
     /// "nothing was replaced" is not the whole obligation: a caller that
-    /// recorded a ledger entry before publishing, as [`Filled::new_entry`]
+    /// recorded a ledger entry before publishing, as [`crate::state::NewEntry::for_write`]
     /// requires, is holding an entry for a write that did not happen, and must
     /// withdraw it before it saves.
     #[error(
@@ -664,26 +663,6 @@ pub struct Observed {
 }
 
 impl Observed {
-    /// The prior state, in the shape [`crate::state::Ledger::record`] takes.
-    ///
-    /// The conversion lives here rather than in the ledger because this is the
-    /// only place that knows how the prior state was captured — one
-    /// `symlink_metadata` and one read, before anything was touched.
-    ///
-    /// Anything that is not a regular file becomes [`PriorBytes::Absent`]. That
-    /// is not a loss: a write only ever proceeds over a regular file or nothing
-    /// at all, so the other kinds never reach a `record` call.
-    #[must_use]
-    pub fn prior_bytes(&self) -> PriorBytes {
-        match (&self.bytes, self.mode) {
-            (Some(bytes), Some(mode)) => PriorBytes::Bytes {
-                bytes: bytes.clone(),
-                mode,
-            },
-            _ => PriorBytes::Absent,
-        }
-    }
-
     /// The digest of the bytes that are there now, for a regular file.
     ///
     /// For a mode-only `Modify` this is the `written` its ledger entry records:
@@ -1468,7 +1447,7 @@ impl Staged {
     /// Whatever [`Staged::fill`] or [`Filled::publish`] returns.
     pub fn commit(self, bytes: &[u8]) -> Result<(), Error> {
         // No ledger entry can exist for this write: `commit` never hands the
-        // caller a `Filled`, so `new_entry` was never reachable for it.
+        // caller a `Filled`, so `NewEntry::for_write` was never reachable for it.
         self.fill(bytes)?.publish().map_err(Unpublished::into_error)
     }
 
@@ -1534,73 +1513,6 @@ impl Filled {
         &self.pending.created_dirs
     }
 
-    /// The ledger entry for this write, assembled from what the writer knows.
-    ///
-    /// The writer supplies the prior bytes and their mode, the digest of what it
-    /// wrote, the mode it set, and the directories it invented. The caller
-    /// supplies the two facts only it has: the home directory to make the paths
-    /// portable against, and how bx attached to the file.
-    ///
-    /// Call it **before** [`Filled::publish`] and hand the result to
-    /// [`crate::state::Ledger::record`], which fsyncs the prior bytes into
-    /// `restore/` before it returns. A crash after the rename is then
-    /// recoverable, because the bytes that were displaced are already durable.
-    ///
-    /// # The entry is owed a withdrawal if the publish is refused
-    ///
-    /// That ordering is not a preference: the displaced bytes must be durable
-    /// before anything can displace them, so the record has to precede a rename
-    /// that may still fail. An entry recorded here therefore describes a write
-    /// that has not happened yet, and [`Filled::publish`] can refuse — a
-    /// destination changed after `stage` looked, a directory that cannot be
-    /// opened, a `rename` out of space.
-    ///
-    /// So a caller that records an entry **must withdraw it when the publish is
-    /// refused**, before it saves the ledger: take
-    /// [`crate::state::LedgerView::withdrawal`] for the entry's path before the
-    /// `record`, and hand it to [`crate::state::Ledger::withdraw`] on refusal.
-    /// That puts back the entry as it was before the record — on a re-record,
-    /// with the prior the user had before bx — rather than dropping the key,
-    /// which [`crate::state::Ledger::forget`] would do and which loses that
-    /// prior. [`Unpublished`] names the destination the entry is keyed on,
-    /// because `publish` consumes the `Filled`. A durable entry for a write
-    /// that never landed makes `bx rm` restore the recorded prior over content
-    /// bx never replaced, which is Invariant 4 inverted.
-    ///
-    /// Pinned by
-    /// `a_ledger_entry_for_a_refused_publish_is_withdrawn_through_what_the_refusal_names`
-    /// for a first record, and by
-    /// `a_refused_re_record_is_withdrawn_to_the_entry_it_replaced` for a
-    /// re-record.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NotPortable`] if the destination or a created directory is not
-    /// valid UTF-8, or `home` is not absolute: such a path has no key the
-    /// ledger could record it under without naming a different file.
-    pub fn new_entry(&self, home: &Path, mechanism: Mechanism) -> Result<NewEntry, Error> {
-        let portable = |path: &Path| {
-            Portable::from_path(path, home).map_err(|source| Error::NotPortable {
-                path: path.to_path_buf(),
-                source,
-            })
-        };
-        Ok(NewEntry::new(
-            portable(&self.pending.dest)?,
-            self.written(),
-            self.pending.mode,
-            mechanism,
-            self.pending.prior.prior_bytes(),
-        )
-        .with_created_dirs(
-            self.pending
-                .created_dirs
-                .iter()
-                .map(|dir| portable(dir))
-                .collect::<Result<_, _>>()?,
-        ))
-    }
-
     /// `rename` the temporary file onto the destination, then `fsync` the
     /// destination directory so the rename itself is durable.
     ///
@@ -1631,7 +1543,7 @@ impl Filled {
     ///
     /// [`Unpublished`], which names the destination as well as the cause, so a
     /// caller that recorded a ledger entry for this write before calling — as
-    /// [`Filled::new_entry`] requires — can withdraw it. `publish` consumes the
+    /// [`crate::state::NewEntry::for_write`] requires — can withdraw it. `publish` consumes the
     /// `Filled`, so the refusal is the only thing left that knows which write
     /// it was.
     ///
@@ -1696,17 +1608,17 @@ impl Filled {
 
 /// A write [`Filled::publish`] refused: why, and which write it was.
 ///
-/// The second half is the point. [`Filled::new_entry`] must be called before
+/// The second half is the point. [`crate::state::NewEntry::for_write`] must be called before
 /// `publish`, because the bytes a rename displaces have to be durable before
 /// anything displaces them — so by the time a publish is refused, a caller with
 /// a ledger has already recorded an entry for a write that did not happen. That
 /// record has to be withdrawn with [`crate::state::Ledger::withdraw`] before
 /// the ledger is saved, or `bx rm` will restore the recorded prior over content
-/// bx never replaced; see [`Filled::new_entry`].
+/// bx never replaced; see [`crate::state::NewEntry::for_write`].
 ///
 /// `publish` consumes the [`Filled`], so nothing the caller still holds names
 /// the write afterwards. This does: [`Unpublished::dest`] is the path
-/// [`Filled::new_entry`] keyed the entry on.
+/// [`crate::state::NewEntry::for_write`] keyed the entry on.
 ///
 /// # It is deliberately not an error type
 ///
@@ -3275,8 +3187,11 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Mutex;
 
+    use crate::paths::Portable;
     use crate::report::Action;
-    use crate::state::{ExclusiveLock, Ledger, LedgerView, Prior, StateDir};
+    use crate::state::{
+        ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, StateDir,
+    };
     use crate::testing::{GuardedHome, guarded_home};
 
     /// Serialises the one test that mutates the process `umask`.
@@ -6873,8 +6788,7 @@ mod tests {
                     .fill(b"Host *\n")
                     .unwrap_or_else(|e| panic!("{order}: fill: {e:?}"));
                 let claim = filled.created_dirs().to_vec();
-                let entry = filled
-                    .new_entry(home.path(), Mechanism::Own)
+                let entry = NewEntry::for_write(&filled, home.path(), Mechanism::Own)
                     .expect("a portable entry");
                 assert_eq!(
                     entry.created_dirs.len(),
@@ -7305,8 +7219,7 @@ mod tests {
             .fill(b"x")
             .expect("fill");
 
-        let err = filled
-            .new_entry(Path::new("relative/home"), Mechanism::Own)
+        let err = NewEntry::for_write(&filled, Path::new("relative/home"), Mechanism::Own)
             .expect_err("a relative home makes nothing portable");
         assert!(
             matches!(
@@ -7322,8 +7235,7 @@ mod tests {
         assert!(err.to_string().contains("cannot be recorded"), "{err}");
 
         // Under the real home the same write yields its entry.
-        let entry = filled
-            .new_entry(home.path(), Mechanism::Own)
+        let entry = NewEntry::for_write(&filled, home.path(), Mechanism::Own)
             .expect("portable under the real home");
         assert_eq!(entry.path.as_str(), "~/.config/tool/x.conf");
     }
@@ -7354,8 +7266,7 @@ mod tests {
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host old\n");
         let recorded = ledger
             .record(
-                filled
-                    .new_entry(home.path(), Mechanism::Own)
+                NewEntry::for_write(&filled, home.path(), Mechanism::Own)
                     .expect("a portable entry"),
             )
             .expect("record")
@@ -7406,9 +7317,8 @@ mod tests {
             .expect("stage")
             .fill(b"Host new\n")
             .expect("fill");
-        let entry = filled
-            .new_entry(home.path(), Mechanism::Own)
-            .expect("a portable entry");
+        let entry =
+            NewEntry::for_write(&filled, home.path(), Mechanism::Own).expect("a portable entry");
         let err = ledger
             .record(entry.clone())
             .expect_err("a link at the blob name is not bx's to replace");
@@ -7456,8 +7366,7 @@ mod tests {
         let withdrawal = ledger.withdrawal(&key);
         let recorded = ledger
             .record(
-                filled
-                    .new_entry(home.path(), Mechanism::Own)
+                NewEntry::for_write(&filled, home.path(), Mechanism::Own)
                     .expect("a portable entry"),
             )
             .expect("record")
@@ -7535,9 +7444,7 @@ mod tests {
             .expect("fill");
         ledger
             .record(
-                first
-                    .new_entry(home.path(), Mechanism::Own)
-                    .expect("a portable entry"),
+                NewEntry::for_write(&first, home.path(), Mechanism::Own).expect("a portable entry"),
             )
             .expect("record");
         first.publish().expect("publish");
@@ -7558,8 +7465,7 @@ mod tests {
             .expect("fill");
         let recorded = ledger
             .record(
-                second
-                    .new_entry(home.path(), Mechanism::Own)
+                NewEntry::for_write(&second, home.path(), Mechanism::Own)
                     .expect("a portable entry"),
             )
             .expect("record")
@@ -7631,8 +7537,7 @@ mod tests {
                 .expect("fill");
             ledger
                 .record(
-                    filled
-                        .new_entry(home.path(), Mechanism::Own)
+                    NewEntry::for_write(&filled, home.path(), Mechanism::Own)
                         .expect("a portable entry"),
                 )
                 .expect("record");
@@ -7708,8 +7613,7 @@ mod tests {
             .expect("fill");
         let recorded = ledger
             .record(
-                filled
-                    .new_entry(home.path(), Mechanism::Own)
+                NewEntry::for_write(&filled, home.path(), Mechanism::Own)
                     .expect("a portable entry"),
             )
             .expect("record")
@@ -7837,9 +7741,8 @@ mod tests {
             ],
             "deepest first, which is the order a reversal removes them in",
         );
-        let entry = filled
-            .new_entry(home.path(), Mechanism::Own)
-            .expect("a portable entry");
+        let entry =
+            NewEntry::for_write(&filled, home.path(), Mechanism::Own).expect("a portable entry");
         assert_eq!(
             entry
                 .created_dirs
@@ -7912,7 +7815,7 @@ mod tests {
             .expect("stage")
             .fill(b"x")
             .expect("fill");
-        assert_eq!(filled.prior().prior_bytes(), PriorBytes::Absent);
+        assert_eq!(PriorBytes::of(filled.prior()), PriorBytes::Absent);
         assert_eq!(filled.prior().digest(), None);
         assert!(filled.created_dirs().is_empty());
         assert_eq!(filled.written(), ContentHash::of(b"x"));
@@ -7926,7 +7829,7 @@ mod tests {
 
         for rel in ["d", "l"] {
             let observed = observe(&home.child(rel)).expect("observe");
-            assert_eq!(observed.prior_bytes(), PriorBytes::Absent, "{rel}");
+            assert_eq!(PriorBytes::of(&observed), PriorBytes::Absent, "{rel}");
             assert_eq!(observed.digest(), None, "{rel}");
         }
     }

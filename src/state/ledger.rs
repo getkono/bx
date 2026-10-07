@@ -27,7 +27,7 @@ use super::dir::{StateDir, ensure_dir};
 use super::hash::ContentHash;
 use super::lock::{ExclusiveLock, HeldLock};
 use super::store::{self, Loaded, Loss, Rejected};
-use crate::fs::{Mode, write_atomically};
+use crate::fs::{Filled, Mode, Observed, write_atomically};
 
 /// The envelope tag for `ledger.mpk`.
 const KIND: &str = "bx.ledger";
@@ -238,6 +238,24 @@ pub enum PriorBytes {
     },
 }
 
+impl PriorBytes {
+    /// What `observed` held, in the shape [`Ledger::record`] takes.
+    ///
+    /// Anything that is not a regular file becomes [`PriorBytes::Absent`]. That
+    /// is not a loss: a write only ever proceeds over a regular file or nothing
+    /// at all, so the other kinds never reach a `record` call.
+    #[must_use]
+    pub fn of(observed: &Observed) -> Self {
+        match (&observed.bytes, observed.mode) {
+            (Some(bytes), Some(mode)) => Self::Bytes {
+                bytes: bytes.clone(),
+                mode,
+            },
+            _ => Self::Absent,
+        }
+    }
+}
+
 /// A target to record, before its prior bytes have been stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewEntry {
@@ -301,6 +319,79 @@ impl NewEntry {
     pub fn with_created_dirs(mut self, dirs: Vec<crate::paths::Portable>) -> Self {
         self.created_dirs = dirs;
         self
+    }
+
+    /// The entry for a staged write, assembled from what the writer knows.
+    ///
+    /// The write supplies the prior bytes and their mode, the digest of what it
+    /// wrote, the mode it set, and the directories it invented. The caller
+    /// supplies the two facts only it has: the home directory to make the paths
+    /// portable against, and how bx attached to the file.
+    ///
+    /// Call it **before** [`Filled::publish`] and hand the result to
+    /// [`Ledger::record`], which fsyncs the prior bytes into `restore/` before
+    /// it returns. A crash after the rename is then recoverable, because the
+    /// bytes that were displaced are already durable.
+    ///
+    /// # The entry is owed a withdrawal if the publish is refused
+    ///
+    /// That ordering is not a preference: the displaced bytes must be durable
+    /// before anything can displace them, so the record has to precede a rename
+    /// that may still fail. An entry recorded here therefore describes a write
+    /// that has not happened yet, and [`Filled::publish`] can refuse — a
+    /// destination changed after `stage` looked, a directory that cannot be
+    /// opened, a `rename` out of space.
+    ///
+    /// So a caller that records an entry **must withdraw it when the publish is
+    /// refused**, before it saves the ledger: take [`LedgerView::withdrawal`]
+    /// for the entry's path before the `record`, and hand it to
+    /// [`Ledger::withdraw`] on refusal. That puts back the entry as it was
+    /// before the record — on a re-record, with the prior the user had before
+    /// bx — rather than dropping the key, which [`Ledger::forget`] would do and
+    /// which loses that prior. [`crate::fs::Unpublished`] names the destination
+    /// the entry is keyed on, because `publish` consumes the `Filled`. A
+    /// durable entry for a write that never landed makes `bx rm` restore the
+    /// recorded prior over content bx never replaced, which is Invariant 4
+    /// inverted.
+    ///
+    /// Pinned by
+    /// `a_ledger_entry_for_a_refused_publish_is_withdrawn_through_what_the_refusal_names`
+    /// for a first record, and by
+    /// `a_refused_re_record_is_withdrawn_to_the_entry_it_replaced` for a
+    /// re-record.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::fs::Error::NotPortable`] if the destination or a created
+    /// directory is not valid UTF-8, or `home` is not absolute: such a path has
+    /// no key the ledger could record it under without naming a different file.
+    pub fn for_write(
+        filled: &Filled,
+        home: &Path,
+        mechanism: Mechanism,
+    ) -> Result<Self, crate::fs::Error> {
+        let portable = |path: &Path| {
+            crate::paths::Portable::from_path(path, home).map_err(|source| {
+                crate::fs::Error::NotPortable {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })
+        };
+        Ok(Self::new(
+            portable(filled.dest())?,
+            filled.written(),
+            filled.mode(),
+            mechanism,
+            PriorBytes::of(filled.prior()),
+        )
+        .with_created_dirs(
+            filled
+                .created_dirs()
+                .iter()
+                .map(|dir| portable(dir))
+                .collect::<Result<_, _>>()?,
+        ))
     }
 }
 

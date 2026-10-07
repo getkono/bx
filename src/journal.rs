@@ -135,6 +135,7 @@ use serde::{Deserialize, Serialize};
 use crate::fs::remove::{open_dir, prune_dirs, remove_if_empty, sync_dir, unlink};
 use crate::fs::{self, Mode, Observed, refuse_moved};
 use crate::paths::Portable;
+use crate::state::restore;
 use crate::state::{
     ContentHash, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior, PriorBytes,
     RestoreRef, StateDir,
@@ -2688,7 +2689,7 @@ impl Crash {
 /// [`Error::Write`] when the snapshot cannot be stored. It is `fsync`ed, along
 /// with the directory entry naming it, before this returns.
 fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
-    store_prior_bytes(state, PriorBytes::of(observed))
+    Ok(restore::store(state, PriorBytes::of(observed))?)
 }
 
 /// [`store_prior`] for a symlink target: the link's text is its bytes.
@@ -2697,7 +2698,7 @@ fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
 ///
 /// As [`store_prior`].
 fn store_link_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
-    store_prior_bytes(state, link_prior_bytes(observed))
+    Ok(restore::store(state, link_prior_bytes(observed))?)
 }
 
 /// What a symlink target displaces, in the shape a ledger entry records: the
@@ -2712,27 +2713,6 @@ fn link_prior_bytes(observed: &Observed) -> PriorBytes {
         },
         None => PriorBytes::Absent,
     }
-}
-
-/// Store `prior` under its digest in `restore/`, durably.
-fn store_prior_bytes(state: &StateDir, prior: PriorBytes) -> Result<Prior, Error> {
-    let PriorBytes::Bytes { bytes, mode } = prior else {
-        return Ok(Prior::Absent);
-    };
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let reference = RestoreRef {
-        digest: ContentHash::of(&bytes),
-        mode,
-        len,
-    };
-    let path = state.restore().join(reference.blob_name());
-    // The ledger's own blob store's test, the same function: a content-addressed
-    // name holding the right number of bytes, as a one-link regular file, already
-    // holds these bytes.
-    if crate::state::blob_len(&path) != Some(len) {
-        fs::write_atomically(&path, &bytes, Mode::PRIVATE_FILE)?;
-    }
-    Ok(Prior::Existed(reference))
 }
 
 /// Look at `dest`, and refuse it unless it is still what `planned` observed.
@@ -7408,9 +7388,7 @@ pub(crate) mod tests {
             panic!("a prior mode");
         };
         assert_eq!(
-            ledger
-                .restore_bytes(&state, reference)
-                .expect("the empty blob"),
+            crate::state::restore::read(&state, reference).expect("the empty blob"),
             DIR_BYTES
         );
     }
@@ -7696,9 +7674,7 @@ pub(crate) mod tests {
         );
         assert_eq!(reference.mode, Mode::LINK);
         assert_eq!(
-            LedgerView::default()
-                .restore_bytes(&state, reference)
-                .expect("the text is stored"),
+            crate::state::restore::read(&state, reference).expect("the text is stored"),
             b"../../src/tool"
         );
         session.finish().expect("finish");

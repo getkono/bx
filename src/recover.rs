@@ -1094,10 +1094,9 @@ fn snapshot(
 ) -> Result<Result<Vec<u8>, String>, Error> {
     use crate::state::Error::{RestoreCorrupt, RestoreMissing};
 
-    // `restore_bytes` reads the content-addressed blob and consults no entry, so
-    // an empty view reads it exactly as the ledger would, and a read-only report
-    // needs no lock to do it.
-    match LedgerView::default().restore_bytes(state, reference) {
+    // `restore::read` reads the content-addressed blob and consults no entry,
+    // so a read-only report needs no lock to do it.
+    match crate::state::restore::read(state, reference) {
         Ok(bytes) => Ok(Ok(bytes)),
         Err(RestoreMissing { digest, path }) => Ok(Err(RestoreMissing {
             digest,

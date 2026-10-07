@@ -3222,6 +3222,7 @@ mod tests {
     use crate::report::Action;
     use crate::state::{
         ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, StateDir,
+        restore,
     };
     use crate::testing::{GuardedHome, guarded_home};
 
@@ -7317,9 +7318,8 @@ mod tests {
         };
         assert_eq!(reference.mode, Mode::from_bits(0o640));
         assert_eq!(reference.len, 9);
-        let bytes = ledger
-            .restore_bytes(&dir, reference)
-            .expect("the blob is durable by the time record returns");
+        let bytes =
+            restore::read(&dir, reference).expect("the blob is durable by the time record returns");
         write_atomically(&dest, &bytes, reference.mode).expect("restore");
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host old\n");
         assert_eq!(mode_of_path(&dest), Mode::from_bits(0o640));
@@ -7426,9 +7426,7 @@ mod tests {
         // names. Both are real, and both describe a write that did not happen.
         assert_eq!(ledger.len(), 1, "the entry is still in the ledger");
         assert_eq!(
-            ledger
-                .restore_bytes(&dir, reference)
-                .expect("the blob record fsynced"),
+            restore::read(&dir, reference).expect("the blob record fsynced"),
             b"Host old\n",
             "the snapshot is durable, and it is not what is on disk now",
         );
@@ -7531,9 +7529,7 @@ mod tests {
         let entry = reread.get(&key).expect("the entry survives the withdrawal");
         assert_eq!(entry, &before);
         assert_eq!(
-            reread
-                .restore_bytes(&dir, original)
-                .expect("the original prior"),
+            restore::read(&dir, original).expect("the original prior"),
             b"Host old\n",
         );
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host theirs\n");
@@ -7598,9 +7594,7 @@ mod tests {
         // The edit was written over bx's 0600 output, so it carries that mode.
         assert_eq!(reference.mode, Mode::PRIVATE_FILE);
         assert_eq!(
-            ledger
-                .restore_bytes(&dir, reference)
-                .expect("restore bytes"),
+            restore::read(&dir, reference).expect("restore bytes"),
             b"Host edited\n",
             "the prior is what the user last had: the edit the second apply displaced",
         );
@@ -7614,9 +7608,7 @@ mod tests {
         let original = &recorded.superseded[0];
         assert_eq!(original.mode, Mode::from_bits(0o640));
         assert_eq!(
-            ledger
-                .restore_bytes(&dir, original)
-                .expect("restore the original"),
+            restore::read(&dir, original).expect("restore the original"),
             b"Host theirs\n",
             "the file the user had before bx ever touched it is still restorable",
         );
@@ -7671,9 +7663,7 @@ mod tests {
         );
 
         // Reversing it restores the prior bytes at the prior mode.
-        let bytes = ledger
-            .restore_bytes(&dir, reference)
-            .expect("the prior bytes are durable");
+        let bytes = restore::read(&dir, reference).expect("the prior bytes are durable");
         write_atomically(&dest, &bytes, reference.mode).expect("reverse");
         assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host *\n");

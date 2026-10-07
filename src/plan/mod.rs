@@ -1145,8 +1145,7 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
             // symlink target's: the link recovery puts back was stored as
             // its text.
             (true, Some(state::Prior::Existed(reference))) if link => {
-                let prior = LedgerView::default()
-                    .restore_bytes(&inputs.state, reference)
+                let prior = state::restore::read(&inputs.state, reference)
                     .ok()
                     .map(|bytes| {
                         PathBuf::from(<OsString as std::os::unix::ffi::OsStringExt>::from_vec(
@@ -1181,9 +1180,7 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
                 "rolls back: removes the directory the session created where empty",
             ),
             (true, Some(state::Prior::Existed(reference))) => {
-                let prior = LedgerView::default()
-                    .restore_bytes(&inputs.state, reference)
-                    .ok();
+                let prior = state::restore::read(&inputs.state, reference).ok();
                 let mode = observed
                     .mode
                     .filter(|mode| *mode != reference.mode)

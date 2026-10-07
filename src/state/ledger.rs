@@ -19,15 +19,15 @@ use std::collections::btree_map::Iter;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{FileType, Mode as RawMode, OFlags};
 use serde::{Deserialize, Serialize};
 
 use super::Error;
 use super::dir::{StateDir, ensure_dir};
 use super::hash::ContentHash;
 use super::lock::{ExclusiveLock, HeldLock};
+use super::restore;
 use super::store::{self, Loaded, Loss, Rejected};
-use crate::fs::{Filled, Mode, Observed, write_atomically};
+use crate::fs::{Filled, Mode, Observed};
 
 /// The envelope tag for `ledger.mpk`.
 const KIND: &str = "bx.ledger";
@@ -708,112 +708,6 @@ impl LedgerView {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
-    /// The bytes a restore snapshot holds.
-    ///
-    /// The digest is recomputed and checked. Silently restoring corrupted
-    /// content over a file the user wrote would be worse than refusing, so this
-    /// refuses.
-    ///
-    /// # The read side asks a different question from the write side
-    ///
-    /// Availability, not ownership. Reading with plain `std::fs::read` accepted
-    /// entries that can never return: a FIFO blocks `bx rm` forever with no
-    /// diagnostic, and a symlink to an unbounded source such as `/dev/zero`
-    /// allocates until the process is killed. So the open is `O_NOFOLLOW |
-    /// O_NONBLOCK`, the descriptor must be a regular file, and the read is
-    /// bounded by `reference.len`.
-    ///
-    /// The write side's `st_nlink == 1` test is **not** repeated here (r4
-    /// round 2, CL6). A second hard link changes nothing about availability,
-    /// and content integrity is settled by the digest recomputed below — bytes
-    /// that hash to `reference.digest` are the user's prior bytes whoever else
-    /// has a name for them. Refusing them would make an ordinary hard-linking
-    /// deduplicator or backup tool run over `$HOME` turn an intact, verifiable
-    /// snapshot into [`Error::RestoreMissing`], and the user's own prior bytes
-    /// would not be restored though they are sitting there. On the write side
-    /// the test still earns its place: there `nlink` decides whether bx may
-    /// *skip* a write, and a shared inode is not a file bx can be sure it wrote.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::RestoreMissing`] if the blob is gone,
-    /// [`Error::RestoreNotAFile`] if what is at the name is not a regular file,
-    /// [`Error::RestoreCorrupt`] if it is not `reference.len` bytes long or its
-    /// bytes do not hash to `reference.digest`, and [`Error::Read`] for any
-    /// other read failure.
-    pub fn restore_bytes(&self, dir: &StateDir, reference: &RestoreRef) -> Result<Vec<u8>, Error> {
-        let path = blob_path(dir, &reference.digest);
-        let missing = || Error::RestoreMissing {
-            digest: reference.digest,
-            path: path.clone(),
-        };
-        let not_a_file = || Error::RestoreNotAFile {
-            digest: reference.digest,
-            path: path.clone(),
-        };
-        // `O_NONBLOCK` as well as `O_NOFOLLOW`: `O_NOFOLLOW` refuses a symlink,
-        // but a FIFO is opened by name and `open` itself blocks on one until a
-        // writer appears, before there is any descriptor to `fstat`.
-        let fd = match rustix::fs::open(
-            &path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            RawMode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(rustix::io::Errno::NOENT) => return Err(missing()),
-            // `ELOOP`: a symlink, refused by `O_NOFOLLOW`.
-            Err(rustix::io::Errno::LOOP) => return Err(not_a_file()),
-            Err(source) => {
-                return Err(Error::Read {
-                    path,
-                    source: source.into(),
-                });
-            }
-        };
-        let stat = rustix::fs::fstat(&fd).map_err(|source| Error::Read {
-            path: path.clone(),
-            source: source.into(),
-        })?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            return Err(not_a_file());
-        }
-        // The recorded length bounds the read. `reference.len` is written by
-        // `store_restore` and, until now, read by nothing: a regular,
-        // single-linked file of any size at `restore/<digest>` — left by an
-        // interrupted write, or put there by anything with access to
-        // `restore/` — was allocated whole before the digest below could
-        // reject it, which is the "allocate until the process is killed"
-        // failure this function's own preamble claims to close (r4 round 2,
-        // D3 and COV7). Different length means different bytes, so this is the
-        // refusal the digest would make, made before the allocation.
-        if !u64::try_from(stat.st_size).is_ok_and(|size| size == reference.len) {
-            return Err(Error::RestoreCorrupt {
-                digest: reference.digest,
-                path,
-            });
-        }
-        // The `st_size` test above is a statement about the file when it was
-        // `fstat`ed, not when it is read: a blob with a second hard link can
-        // grow in between, and `read_to_end` would follow it (r5, D2). So the
-        // read itself stops at `reference.len`. Whatever the first
-        // `reference.len` bytes are, the digest below judges them.
-        let mut bytes = Vec::new();
-        if let Err(source) = std::io::Read::read_to_end(
-            &mut std::io::Read::take(std::fs::File::from(fd), reference.len),
-            &mut bytes,
-        ) {
-            return Err(Error::Read { path, source });
-        }
-        if ContentHash::of(&bytes) == reference.digest {
-            Ok(bytes)
-        } else {
-            Err(Error::RestoreCorrupt {
-                digest: reference.digest,
-                path,
-            })
-        }
-    }
 }
 
 /// The ledger, writable.
@@ -1318,35 +1212,24 @@ impl Ledger {
     /// [`Ledger::adopt_current_as_prior`], where the re-fetch that borrow
     /// used to force was a branch no input could take (r4 round 2, COV7).
     fn store_prior(dir: &StateDir, prior: PriorBytes) -> Result<Prior, Error> {
-        match prior {
-            PriorBytes::Absent => Ok(Prior::Absent),
-            PriorBytes::Bytes { bytes, mode } => Ok(Prior::Existed(Self::store_restore(
-                dir,
-                ContentHash::of(&bytes),
-                &bytes,
-                mode,
-            )?)),
+        if matches!(prior, PriorBytes::Absent) {
+            return Ok(Prior::Absent);
         }
+        ensure_dir(&dir.restore(), Mode::PRIVATE_DIR)?;
+        Ok(restore::store(dir, prior)?)
     }
 
-    /// Store `bytes`, already hashed to `digest`, and return the reference.
-    ///
-    /// The length is taken once, here, and handed to [`Ledger::store_blob`]:
-    /// the two used to compute it independently, which was one saturating
-    /// conversion written twice (r4 round 2, COV7).
+    /// Store `bytes`, already hashed to `digest`, through
+    /// [`restore::store_bytes`], creating `restore/` first, and return the
+    /// reference.
     fn store_restore(
         dir: &StateDir,
         digest: ContentHash,
         bytes: &[u8],
         mode: Mode,
     ) -> Result<RestoreRef, Error> {
-        // `usize` is never wider than 64 bits on any target Rust supports, so
-        // the saturation is unreachable and the length is exact. Saturating
-        // rather than panicking keeps a blob's length wrong instead of killing
-        // `bx rm`, if that ever stops being true.
-        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        Self::store_blob(dir, digest, bytes, len)?;
-        Ok(RestoreRef { digest, mode, len })
+        ensure_dir(&dir.restore(), Mode::PRIVATE_DIR)?;
+        Ok(restore::store_bytes(dir, digest, bytes, mode)?)
     }
 
     /// Write the ledger out, atomically.
@@ -1397,45 +1280,6 @@ impl Ledger {
     /// the file it locked is still the lock file.
     fn check_lock(&self) -> Result<(), Error> {
         super::dir::check_held(&self.dir.ledger(), &self.lock)
-    }
-
-    /// Write `bytes` to `restore/<digest>`, durably, unless the bytes are
-    /// already there.
-    ///
-    /// The skip is guarded by the blob's *length*, not merely by its existence.
-    /// A name proves content only while nothing has damaged the file, and this
-    /// design already accepts that a blob can stop matching its name — that is
-    /// what [`Error::RestoreCorrupt`] is for. Checking when the bytes are in
-    /// hand costs one `stat` and repairs the blob; checking only in
-    /// [`LedgerView::restore_bytes`] discovers the loss when the target has
-    /// already been overwritten and the original bytes exist nowhere.
-    ///
-    /// A `stat` rather than a re-hash: it keeps the common repeat path O(1),
-    /// and the two ways a blob is plausibly lost — a truncated write and an
-    /// empty file left by an interrupted one — both change the length.
-    ///
-    /// The `stat` is of the name itself, never of what it links to: see
-    /// [`blob_len`]. A symlink or a second hard link of the right length is not
-    /// a blob bx wrote, so it is never trusted. A second hard link is rewritten.
-    /// A symlink is refused: [`write_atomically`] never replaces a link, so
-    /// this returns [`Error::Write`] carrying [`crate::fs::Error::Symlink`] and
-    /// leaves the link and what it names alone.
-    fn store_blob(
-        dir: &StateDir,
-        digest: ContentHash,
-        bytes: &[u8],
-        len: u64,
-    ) -> Result<(), Error> {
-        let restore = dir.restore();
-        ensure_dir(&restore, Mode::PRIVATE_DIR)?;
-        let path = restore.join(digest.to_hex());
-        if blob_len(&path) == Some(len) {
-            return Ok(());
-        }
-        // `write_atomically` fsyncs the blob and then `restore/` itself, which
-        // is what makes the snapshot durable before this function returns.
-        write_atomically(&path, bytes, Mode::PRIVATE_FILE)?;
-        Ok(())
     }
 }
 
@@ -1514,40 +1358,6 @@ fn merge_created_dirs(
     merged
 }
 
-/// The length of the blob at `path`, or `None` unless it is bx's own file.
-///
-/// `None` means *rewrite it*: a blob that cannot be stat'ed is not a blob whose
-/// content has been established.
-///
-/// The name is opened `O_PATH | O_NOFOLLOW` and the descriptor is checked, so
-/// what is measured is the entry in `restore/` and never what a symlink there
-/// names: a decoy link to a same-length file elsewhere used to satisfy the
-/// check with none of the user's bytes behind it. It must be a regular file
-/// with exactly one link. `O_PATH` reads nothing and cannot block on a FIFO.
-/// The rewrite goes through [`write_atomically`]: its rename replaces a second
-/// hard link, and it refuses a symlink outright, so a link is never written
-/// through.
-///
-/// Crate-visible because the journal's own snapshot store asks the same
-/// question before an Intent names a blob, and one rule means a decoy the
-/// ledger refuses to trust is not trusted there either.
-pub(crate) fn blob_len(path: &Path) -> Option<u64> {
-    let fd = rustix::fs::open(
-        path,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        RawMode::empty(),
-    )
-    .ok()?;
-    let stat = rustix::fs::fstat(&fd).ok()?;
-    let own = FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_nlink == 1;
-    own.then(|| u64::try_from(stat.st_size).ok()).flatten()
-}
-
-/// Where a snapshot with this digest lives.
-fn blob_path(dir: &StateDir, digest: &ContentHash) -> PathBuf {
-    dir.restore().join(digest.to_hex())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1555,6 +1365,9 @@ mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::Path;
 
+    use rustix::fs::{FileType, Mode as RawMode};
+
+    use crate::fs::write_atomically;
     use crate::paths::Portable;
     use crate::state::{Damage, Fingerprint, Fingerprints, Health};
     use crate::testing::{GuardedHome, guarded_home};
@@ -1665,7 +1478,7 @@ mod tests {
         };
         assert_eq!(reference.digest, ContentHash::of(b"the user wrote this"));
         assert_eq!(
-            ledger.restore_bytes(&dir, reference).expect("restore"),
+            restore::read(&dir, reference).expect("restore"),
             b"the user wrote this",
         );
     }
@@ -1795,7 +1608,7 @@ mod tests {
         match &stored.prior {
             Prior::Absent => std::fs::remove_file(&dest).expect("unlink"),
             Prior::Existed(reference) => {
-                let bytes = view.restore_bytes(dir, reference).expect("restore bytes");
+                let bytes = restore::read(dir, reference).expect("restore bytes");
                 write_atomically(&dest, &bytes, reference.mode).expect("restore");
             }
         }
@@ -1874,8 +1687,7 @@ mod tests {
         let stored = view.get(&target("~/.ssh/config")).expect("entry");
         assert_eq!(stored.superseded.len(), 1, "the original stays indexed");
         assert_eq!(
-            view.restore_bytes(&dir, &stored.superseded[0])
-                .expect("restore"),
+            restore::read(&dir, &stored.superseded[0]).expect("restore"),
             b"Host theirs\n",
         );
         assert_eq!(stored.superseded[0].mode, Mode::from_bits(0o640));
@@ -1909,7 +1721,7 @@ mod tests {
         let history: Vec<Vec<u8>> = stored
             .superseded
             .iter()
-            .map(|r| view.restore_bytes(&dir, r).expect("restore"))
+            .map(|r| restore::read(&dir, r).expect("restore"))
             .collect();
         assert_eq!(history, vec![b"original\n".to_vec(), b"edit 1\n".to_vec()]);
 
@@ -2107,7 +1919,7 @@ mod tests {
         };
         assert_eq!(reference.len, 0);
         assert_eq!(
-            ledger.restore_bytes(&dir, reference).expect("restore"),
+            restore::read(&dir, reference).expect("restore"),
             Vec::<u8>::new(),
         );
     }
@@ -2133,10 +1945,7 @@ mod tests {
         else {
             panic!("expected a snapshot")
         };
-        assert_eq!(
-            reloaded.restore_bytes(&dir, reference).expect("restore"),
-            body,
-        );
+        assert_eq!(restore::read(&dir, reference).expect("restore"), body,);
     }
 
     #[test]
@@ -2239,7 +2048,8 @@ mod tests {
         let first = std::fs::metadata(&blob).expect("stat");
 
         // A second, distinct target displacing identical bytes: the skip is
-        // reached through `store_blob` rather than through first-prior-wins.
+        // reached through `restore::store_bytes` rather than through
+        // first-prior-wins.
         ledger
             .record(entry("~/b", b"y").with_prior(prior))
             .expect("second");
@@ -2340,7 +2150,7 @@ mod tests {
             "the blob must be repaired before `record` returns Ok",
         );
         assert_eq!(
-            ledger.restore_bytes(&dir, &reference).expect("restore"),
+            restore::read(&dir, &reference).expect("restore"),
             b"the user wrote this",
         );
     }
@@ -2424,10 +2234,7 @@ mod tests {
         let Prior::Existed(reference) = &stored.prior else {
             panic!("expected a snapshot");
         };
-        assert_eq!(
-            ledger.restore_bytes(&dir, reference).expect("restore"),
-            b"third"
-        );
+        assert_eq!(restore::read(&dir, reference).expect("restore"), b"third");
         let blob = dir.restore().join(hex(b"third"));
         let meta = std::fs::symlink_metadata(&blob).expect("stat");
         assert!(meta.file_type().is_file(), "the hard link was replaced");
@@ -2483,17 +2290,13 @@ mod tests {
             // not fail, it never returns, and a test that hangs reports
             // nothing. The thread is abandoned if it does hang.
             let (tx, rx) = std::sync::mpsc::channel();
-            let view: LedgerView = (*ledger).clone();
             let (dir_for, reference_for) = (dir.clone(), reference.clone());
             std::thread::spawn(move || {
-                let _ = tx.send(format!(
-                    "{:?}",
-                    view.restore_bytes(&dir_for, &reference_for)
-                ));
+                let _ = tx.send(format!("{:?}", restore::read(&dir_for, &reference_for)));
             });
             let said = rx
                 .recv_timeout(std::time::Duration::from_secs(20))
-                .unwrap_or_else(|_| panic!("restore_bytes blocked on a {stage}"));
+                .unwrap_or_else(|_| panic!("restore::read blocked on a {stage}"));
             assert!(said.starts_with("Err(RestoreNotAFile"), "{stage}: {said}");
             // And what the entry named was never read through.
             assert_eq!(
@@ -2530,7 +2333,7 @@ mod tests {
             "the blob now has a second name",
         );
         assert_eq!(
-            ledger.restore_bytes(&dir, &reference).expect("restore"),
+            restore::read(&dir, &reference).expect("restore"),
             b"original",
         );
     }
@@ -2557,9 +2360,7 @@ mod tests {
 
         let blob = dir.restore().join(reference.digest.to_hex());
         std::fs::write(&blob, vec![b'z'; 4 << 20]).expect("a big decoy at the name");
-        let err = ledger
-            .restore_bytes(&dir, &reference)
-            .expect_err("must refuse");
+        let err = restore::read(&dir, &reference).expect_err("must refuse");
         assert!(
             matches!(&err, Error::RestoreCorrupt { path, .. } if *path == blob),
             "got {err}",
@@ -2568,7 +2369,7 @@ mod tests {
 
     #[test]
     fn a_directory_at_a_blob_name_fails_the_write_rather_than_being_skipped() {
-        // r4 round 2 (COV7): `store_blob` with something at the blob name that
+        // r4 round 2 (COV7): `restore::store_bytes` with something at the blob name that
         // `blob_len` will not measure — so the skip does not fire — and that
         // the rename cannot replace. `a_restore_directory_that_cannot_be_
         // created_is_reported` covers `ensure_dir` failing, which is a
@@ -2605,9 +2406,7 @@ mod tests {
         let Prior::Existed(reference) = &ledger.get(&target("~/a")).expect("entry").prior else {
             panic!("expected a snapshot")
         };
-        let err = ledger
-            .restore_bytes(&dir, reference)
-            .expect_err("must refuse");
+        let err = restore::read(&dir, reference).expect_err("must refuse");
         assert!(matches!(err, Error::RestoreCorrupt { .. }), "got {err}");
     }
 
@@ -2628,9 +2427,7 @@ mod tests {
         let Prior::Existed(reference) = &ledger.get(&target("~/a")).expect("entry").prior else {
             panic!("expected a snapshot")
         };
-        let err = ledger
-            .restore_bytes(&dir, reference)
-            .expect_err("must report");
+        let err = restore::read(&dir, reference).expect_err("must report");
         assert!(matches!(err, Error::RestoreMissing { .. }), "got {err}");
         assert!(err.to_string().contains(&digest.to_hex()));
     }
@@ -2660,9 +2457,7 @@ mod tests {
         let Prior::Existed(reference) = &ledger.get(&target("~/a")).expect("entry").prior else {
             panic!("expected a snapshot")
         };
-        let err = ledger
-            .restore_bytes(&dir, reference)
-            .expect_err("must report");
+        let err = restore::read(&dir, reference).expect_err("must report");
         assert!(matches!(err, Error::Read { .. }), "got {err}");
     }
 
@@ -3337,10 +3132,7 @@ mod tests {
             let Prior::Existed(reference) = &stored.prior else {
                 panic!("case {index}: the original prior must stand");
             };
-            assert_eq!(
-                ledger.restore_bytes(&dir, reference).expect("restore"),
-                original,
-            );
+            assert_eq!(restore::read(&dir, reference).expect("restore"), original,);
             assert!(!has_blob(&dir, &edited), "case {index}");
             assert_eq!(blob_names(&dir), blobs, "case {index}");
             ledger.save().expect("save");
@@ -3489,7 +3281,7 @@ mod tests {
 
     #[test]
     fn a_restore_directory_that_cannot_be_created_is_reported() {
-        // r4 round 1 (COV7): `store_blob`'s `Error::CreateDir` arm — the
+        // r4 round 1 (COV7): `Ledger::store_restore`'s `Error::CreateDir` arm — the
         // `ensure_dir` of `restore/` failing — was reached by no test.
         let home = guarded_home();
         let (dir, lock) = locked(&home);

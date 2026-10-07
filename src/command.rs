@@ -3324,7 +3324,7 @@ mod tests {
         fn a_move_nothing_here_can_check_exits_pending() {
             let home = guarded_home();
             upstream(&home, &["skills/a/SKILL.md"]);
-            let repo = cloned(&home, &layer());
+            cloned(&home, &layer());
             update(&home, true, &mut Vec::new()).expect("update");
             publish(&home, &["skills/b/SKILL.md"]);
             // A machine with the configuration and none of its checkouts.
@@ -3337,7 +3337,6 @@ mod tests {
             assert!(text(&out).contains("is not locked"), "{}", text(&out));
             assert_eq!(locked(&home), before);
             assert!(home.child(AT).is_dir(), "cloned at the commit locked");
-            let _ = repo;
         }
 
         #[test]
@@ -3351,15 +3350,15 @@ mod tests {
             stamps
                 .write(&stamps.available(), "~/x: y\n")
                 .expect("offered");
+            // Held throughout, past the snooze's wait: it gives up waiting
+            // and writes anyway.
             let _held = stamps.try_hold().expect("hold").expect("free");
-            // Not the full wait: the snooze gives up and writes anyway.
-            let held_for = std::thread::spawn({
-                let home = home.path().to_path_buf();
-                move || update::snooze(&env(&home), &mut Vec::new()).map(|_| ())
-            });
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            drop(_held);
-            held_for.join().expect("snooze ran").expect("snoozed");
+            update::snooze_waiting(
+                &env(home.path()),
+                std::time::Duration::from_millis(50),
+                &mut Vec::new(),
+            )
+            .expect("snoozed");
             assert!(Stamps::read(&stamps.ask_due()).expect("ask-due") > 1);
             assert!(!stamps.available().exists());
         }

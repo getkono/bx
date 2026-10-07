@@ -102,8 +102,8 @@ pub enum Error {
     },
     /// A rebase stands open in the config repo.
     #[error(
-        "a rebase is in progress in the config repo {}; finish it, or run \
-         `git -C {} rebase --abort`, then bx update again",
+        "a rebase or `git am` is in progress in the config repo {}; finish it, or abort it \
+         with `git -C {} rebase --abort` (or `am --abort`), then bx update again",
         .0.display(),
         .0.display()
     )]
@@ -516,7 +516,11 @@ pub fn replay_own_lock_commits(git: &Git, repo: &Path) -> Result<Replay, Error> 
         // nothing to undo: git's own words say why.
         Err(error) if !rebasing(git, repo) => Err(error.into()),
         Err(error) => {
-            let unmerged = git.query(repo, &["diff", "--name-only", "--diff-filter=U"])?;
+            // Asked before the abort, and never in its way: a replay is
+            // never left open.
+            let unmerged = git
+                .query(repo, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default();
             git.query(repo, &["rebase", "--abort"])?;
             if unmerged.is_empty() {
                 // Stopped for something else, signing above all.
@@ -936,12 +940,22 @@ pub fn snooze(
     env: &crate::plan::Env,
     out: &mut dyn std::io::Write,
 ) -> Result<crate::report::Exit, Error> {
+    snooze_waiting(env, SNOOZE_WAIT, out)
+}
+
+/// [`snooze`], waiting at most `wait` for a running check to let go.
+pub(crate) fn snooze_waiting(
+    env: &crate::plan::Env,
+    wait: Duration,
+    out: &mut dyn std::io::Write,
+) -> Result<crate::report::Exit, Error> {
     let inputs = crate::plan::Inputs::load(env)?;
     // A check another shell is running would write its offer back after
     // this clears it; a snooze waits it out, as it runs detached anyway.
     // A person's `bx update` can hold it through its question for as long as
-    // they take; the answer given here is snoozed all the same.
-    let _held = Stamps::of(inputs.state()).hold(SNOOZE_WAIT)?;
+    // they take; the answer given here is snoozed all the same, and the
+    // latest write stands.
+    let _held = Stamps::of(inputs.state()).hold(wait)?;
     let interval = inputs.resolved().update.interval();
     let externals = &inputs.resolved().externals;
     let (ask, auto) = (

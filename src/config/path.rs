@@ -402,9 +402,9 @@ pub fn render(entries: &[PathEntry], shell: Shell) -> String {
     let added = |out: &mut String, entry: &PathEntry, list: String| {
         removal(out, &entry.shell);
         if entry.if_exists {
-            out.push_str("[[ -d ");
+            out.push_str(GATE.0);
             out.push_str(&entry.shell);
-            out.push_str(" ]] && ");
+            out.push_str(GATE.1);
         }
         out.push_str("export PATH=");
         out.push_str(&list);
@@ -426,7 +426,7 @@ pub fn render(entries: &[PathEntry], shell: Shell) -> String {
     if out
         .lines()
         .next_back()
-        .is_some_and(|line| line.starts_with("[[ -d "))
+        .is_some_and(|line| line.starts_with(GATE.0))
     {
         out.push_str(SETTLE);
     }
@@ -437,14 +437,28 @@ pub fn render(entries: &[PathEntry], shell: Shell) -> String {
 /// assigned its own value, changing nothing and returning 0.
 const SETTLE: &str = "export PATH=${PATH}\n";
 
+/// What opens a gated line, which assigns `PATH` only when its directory
+/// exists, and what separates the directory tested from the assignment. The
+/// environment guard reads exactly this shape.
+pub(crate) const GATE: (&str, &str) = ("[[ -d ", " ]] && ");
+
 /// What opens and closes zsh's line taking one directory out of `PATH`,
 /// around the directory. The environment guard reads exactly this shape.
-const ZSH_REMOVAL: (&str, &str) = ("path=(${path:#", "})");
+pub(crate) const ZSH_REMOVAL: (&str, &str) = ("path=(${path:#", "})");
 
 /// What opens and closes bash's line taking one directory out of `PATH`,
-/// around the directory; [`render`] says how it works. The environment guard
-/// reads exactly this shape.
-const BASH_REMOVAL: (&str, &str) = (
+/// around the directory. The environment guard reads exactly this shape.
+///
+/// bash ties no array to `PATH`, so it takes an entry out with five
+/// assignments to `PATH` on one line: every `:` doubled and one more at each
+/// end, so each entry stands between colons of its own; every `:WORD:` dropped,
+/// which with no colon shared takes out every copy; the doubled colons
+/// collapsed; the two added stripped. The word is double-quoted, so a `/` in
+/// it does not end the pattern and no character in it is a glob, and a
+/// reference in it expands as it would bare. Nothing but `PATH` is assigned,
+/// and what it holds after is what it held before less every entry that is
+/// `WORD`, so the guard judges the line exactly as it judges zsh's.
+pub(crate) const BASH_REMOVAL: (&str, &str) = (
     "PATH=:${PATH//:/::}:; PATH=${PATH//\":",
     ":\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}",
 );

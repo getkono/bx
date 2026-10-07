@@ -158,6 +158,7 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::env;
+use crate::config::path::{BASH_REMOVAL, GATE, ZSH_REMOVAL};
 use crate::config::values::ResolvedValues;
 use crate::lexical::is_variable_name;
 use crate::paths;
@@ -2260,29 +2261,6 @@ enum Statement<'a> {
 /// environment spells it.
 const SEARCH_PATH: &str = "PATH";
 
-/// What opens a [`Statement::Gated`] line, and what separates its test from
-/// its assignment.
-const GATE: (&str, &str) = ("[[ -d ", " ]] && ");
-
-/// What opens and closes zsh's [`Statement::Removal`] line, around its word.
-const REMOVAL: (&str, &str) = ("path=(${path:#", "})");
-
-/// What opens and closes bash's [`Statement::Removal`] line, around its word.
-///
-/// bash ties no array to `PATH`, so it takes an entry out with five
-/// assignments to `PATH` on one line: every `:` doubled and one more at each
-/// end, so each entry stands between colons of its own; every `:WORD:` dropped,
-/// which with no colon shared takes out every copy; the doubled colons
-/// collapsed; the two added stripped. The word is double-quoted, so a `/` in
-/// it does not end the pattern and no character in it is a glob, and a
-/// reference in it expands as it would bare. Nothing but `PATH` is assigned,
-/// and what it holds after is what it held before less every entry that is
-/// `WORD`, so the line is judged exactly as zsh's is.
-const BASH_REMOVAL: (&str, &str) = (
-    "PATH=:${PATH//:/::}:; PATH=${PATH//\":",
-    ":\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}",
-);
-
 /// Read one line of a fragment against the statement grammar.
 fn statement(line: &str) -> Statement<'_> {
     let text = line.trim_matches(BLANKS);
@@ -2320,7 +2298,7 @@ fn statement(line: &str) -> Statement<'_> {
             })
             .unwrap_or(Statement::Refused);
     }
-    for (open, close) in [REMOVAL, BASH_REMOVAL] {
+    for (open, close) in [ZSH_REMOVAL, BASH_REMOVAL] {
         if let Some(word) = text
             .strip_prefix(open)
             .and_then(|rest| rest.strip_suffix(close))

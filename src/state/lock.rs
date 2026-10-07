@@ -27,7 +27,7 @@
 //!
 //! It does **not** create `restore/` or `shell/`: a read that stores no
 //! snapshot and writes no fragment needs neither, and `restore/` is created by
-//! [`Ledger::store_blob`][super::Ledger] on the write that first needs it.
+//! [`Ledger::record`][super::Ledger] on the write that first needs it.
 //! [`StateDir::ensure`][super::StateDir::ensure] is what creates all three, and
 //! on this branch no command calls it — `apply` is the entry that will. The
 //! consequence is that the `ForeignOwner`, `SharedLinkedDir` and

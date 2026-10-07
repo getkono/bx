@@ -54,7 +54,7 @@ use crate::paths::Portable;
 use crate::plan::external;
 use crate::recover;
 use crate::state::{
-    Ledger, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, StateDir,
+    self, Ledger, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, StateDir,
     clone_written,
 };
 use crate::sync::Git;
@@ -630,7 +630,9 @@ fn remove_clone(
         Restoration::AlreadyGone { dest } => {
             let claims: Vec<PathBuf> = entry.created_dirs.iter().map(|d| d.render(home)).collect();
             let _ = ledger.forget(&target);
-            journal::hand_off_claims(ledger, home, &claims)?;
+            ledger
+                .hand_off_claims(home, &claims)
+                .map_err(journal::Error::from)?;
             ledger.save().map_err(journal::Error::from)?;
             Ok(Restored::AlreadyGone { target, dest })
         }
@@ -652,8 +654,12 @@ fn remove_clone(
                 })?;
             }
             let _ = ledger.forget(&target);
-            journal::prune_claims(ledger, home, &created_dirs)?;
-            journal::hand_off_claims(ledger, home, &created_dirs)?;
+            ledger
+                .prune_claims(home, &created_dirs)
+                .map_err(journal::Error::from)?;
+            ledger
+                .hand_off_claims(home, &created_dirs)
+                .map_err(journal::Error::from)?;
             ledger.save().map_err(journal::Error::from)?;
             Ok(Restored::Removed { target, dest })
         }
@@ -760,7 +766,7 @@ fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Err
         } => {
             // The earlier text, verified as a file's bytes are before any is
             // written.
-            let text = match session.ledger().restore_bytes(session.state(), &reference) {
+            let text = match state::restore::read(session.state(), &reference) {
                 Ok(bytes) => PathBuf::from(
                     <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes),
                 ),
@@ -825,11 +831,11 @@ fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Err
             reference,
             planned,
         } => {
-            // Verified before a single byte is written: `restore_bytes` rehashes
+            // Verified before a single byte is written: `restore::read` rehashes
             // the blob and refuses if it does not match the digest that named
             // it. Restoring corrupted content over the user's file would be
             // worse than refusing.
-            let bytes = match session.ledger().restore_bytes(session.state(), &reference) {
+            let bytes = match state::restore::read(session.state(), &reference) {
                 Ok(bytes) => bytes,
                 Err(
                     e @ (crate::state::Error::RestoreMissing { .. }
@@ -1602,11 +1608,7 @@ mod tests {
         else {
             panic!("a displaced file is reverted")
         };
-        let bytes = LedgerView::read(&state, home.path())
-            .expect("read the ledger")
-            .value
-            .restore_bytes(&state, &reference)
-            .expect("the snapshot");
+        let bytes = crate::state::restore::read(&state, &reference).expect("the snapshot");
         let mut session =
             Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
         session

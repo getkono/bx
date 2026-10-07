@@ -99,6 +99,7 @@ mod fingerprint;
 mod hash;
 mod ledger;
 mod lock;
+pub mod restore;
 mod store;
 
 use std::path::{Path, PathBuf};
@@ -110,10 +111,9 @@ pub(crate) use dir::{move_aside, quarantines};
 pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use ledger::RestoreRef;
-pub(crate) use ledger::blob_len;
 pub use ledger::{
-    Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, Withdrawal,
-    clone_written,
+    DIR_BYTES, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes,
+    clone_written, dir_digest, dir_prior,
 };
 pub use lock::{ExclusiveLock, Holder, SharedLock};
 pub use store::{Damage, Health, Loaded, MAX_STATE_FILE, Unlisted};
@@ -549,7 +549,7 @@ pub enum Error {
     /// `/dev/zero`, so the read side refuses anything but a regular file.
     ///
     /// A second hard link is **not** one of them: see
-    /// [`LedgerView::restore_bytes`] for why the write side's `nlink` test is
+    /// [`restore::read`] for why the write side's `nlink` test is
     /// not repeated on the read side.
     #[error(
         "the restore snapshot {digest} is not the plain file bx wrote: {} is a symbolic link, a \

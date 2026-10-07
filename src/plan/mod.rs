@@ -705,8 +705,9 @@ fn declared_path(resolution: &Resolution<Target>) -> &str {
 /// Expand, decide and write every link `plan` announced as pending, now that
 /// the clones have run, appending a row for each child.
 ///
-/// A pending link's row stays as `plan` showed it when its children are
-/// written, and is stopped with why when its commit is still not here — its
+/// A pending link's row turns unchanged once its children are listed — they
+/// carry the work, each in a row of its own — and is stopped with why when
+/// its commit is still not here — its
 /// external was stopped, or reached no commit. Each child is decided against
 /// the ledger as the clones left it, and written in a session of its own,
 /// after the one the targets were written in.

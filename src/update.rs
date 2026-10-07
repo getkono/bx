@@ -100,6 +100,14 @@ pub enum Error {
         /// The config repo.
         repo: PathBuf,
     },
+    /// A rebase stands open in the config repo.
+    #[error(
+        "a rebase is in progress in the config repo {}; finish it, or run \
+         `git -C {} rebase --abort`, then bx update again",
+        .0.display(),
+        .0.display()
+    )]
+    Rebasing(PathBuf),
     /// Another `bx update` holds `update/check.lock`.
     #[error(
         "another bx update is running, in this shell or another; let it finish, then run \
@@ -498,12 +506,35 @@ pub fn replay_own_lock_commits(git: &Git, repo: &Path) -> Result<Replay, Error> 
         ],
     );
     match replayed {
-        Ok(_) => Ok(Replay::Replayed(commits)),
-        Err(_) => {
+        // Counted again: a commit the upstream already holds is dropped.
+        Ok(_) => Ok(Replay::Replayed(
+            git.query(repo, &["rev-list", "--count", "@{upstream}..HEAD"])?
+                .parse()
+                .unwrap_or(0),
+        )),
+        // Never started — a working tree in the way, a refusing hook — and
+        // nothing to undo: git's own words say why.
+        Err(error) if !rebasing(git, repo) => Err(error.into()),
+        Err(error) => {
+            let unmerged = git.query(repo, &["diff", "--name-only", "--diff-filter=U"])?;
             git.query(repo, &["rebase", "--abort"])?;
-            Ok(Replay::Conflicted(commits))
+            if unmerged.is_empty() {
+                // Stopped for something else, signing above all.
+                Err(error.into())
+            } else {
+                Ok(Replay::Conflicted(commits))
+            }
         }
     }
+}
+
+/// Whether a rebase stands open in the config repo at `repo`.
+#[must_use]
+pub fn rebasing(git: &Git, repo: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"].iter().any(|name| {
+        git.query(repo, &["rev-parse", "--git-path", name])
+            .is_ok_and(|path| repo.join(path).exists())
+    })
 }
 
 /// Refuse a `bx.lock` with changes git has not committed, which a commit of
@@ -908,9 +939,9 @@ pub fn snooze(
     let inputs = crate::plan::Inputs::load(env)?;
     // A check another shell is running would write its offer back after
     // this clears it; a snooze waits it out, as it runs detached anyway.
-    let Some(_held) = Stamps::of(inputs.state()).hold(SNOOZE_WAIT)? else {
-        return Err(Error::Busy);
-    };
+    // A person's `bx update` can hold it through its question for as long as
+    // they take; the answer given here is snoozed all the same.
+    let _held = Stamps::of(inputs.state()).hold(SNOOZE_WAIT)?;
     let interval = inputs.resolved().update.interval();
     let externals = &inputs.resolved().externals;
     let (ask, auto) = (

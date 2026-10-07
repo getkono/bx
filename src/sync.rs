@@ -296,7 +296,10 @@ impl Git {
     ///
     /// Only for a run nobody is at the terminal for — `bx update
     /// --background` — since a group of its own is also out of reach of the
-    /// Ctrl-C a person presses.
+    /// Ctrl-C a person presses. Without it a deadline kills git alone, and a
+    /// transport git started that is waiting on a silent remote outlives it
+    /// until the remote answers or closes: the price of Ctrl-C still reaching
+    /// a person's `bx update`.
     #[must_use]
     pub const fn in_own_group(mut self) -> Self {
         self.own_group = true;

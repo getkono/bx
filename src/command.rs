@@ -432,6 +432,10 @@ fn update_with(
         .hold(update::HOLD_WAIT)?
         .ok_or(update::Error::Busy)?;
     update::refuse_edited_lock(git, &repo)?;
+    // One an interrupted replay left, or the user's own: theirs to finish.
+    if update::rebasing(git, &repo) {
+        return Err(update::Error::Rebasing(repo));
+    }
     // Diverged only by this machine's own unpushed lock commits: those are
     // replayed on top of the upstream, keeping every lock they hold.
     let pulled = match sync::pull(env, git) {
@@ -440,10 +444,16 @@ fn update_with(
                 update::Replay::Replayed(replayed) => {
                     say(
                         out,
-                        &format!(
-                            "Replayed {replayed} unpushed bx.lock commit(s) of this machine's on \
-                             top of what another machine pushed."
-                        ),
+                        &if replayed == 0 {
+                            "This machine's unpushed bx.lock commits were already in what \
+                             another machine pushed."
+                                .to_string()
+                        } else {
+                            format!(
+                                "Replayed {replayed} unpushed bx.lock commit(s) of this \
+                                 machine's on top of what another machine pushed."
+                            )
+                        },
                     )?;
                     sync::pull(env, git)
                 }
@@ -3216,6 +3226,142 @@ mod tests {
                 "kept, on top of the upstream"
             );
             assert!(home.child(".claude/skills/c/SKILL.md").is_file());
+        }
+
+        /// A config repo whose branch has one unpushed lock commit of this
+        /// machine's, and an upstream another machine pushed `notes` to.
+        fn diverged(home: &GuardedHome) -> std::path::PathBuf {
+            upstream(home, &["skills/a/SKILL.md"]);
+            let repo = cloned(home, &layer());
+            update(home, true, &mut Vec::new()).expect("update");
+            run(home.path(), &repo, &["push", "--quiet"]);
+            publish(home, &["skills/b/SKILL.md"]);
+            update(home, true, &mut Vec::new()).expect("a local lock commit");
+            let other = crate::sync::tests::other(home);
+            std::fs::write(other.join("notes"), "x\n").expect("a note");
+            commit_all(home.path(), &other, "elsewhere");
+            run(home.path(), &other, &["push", "--quiet"]);
+            repo
+        }
+
+        #[test]
+        fn a_replay_that_cannot_start_says_why_and_changes_nothing() {
+            let home = guarded_home();
+            let repo = diverged(&home);
+            // Declaring a dependency is an edit to a layer, made first.
+            let layer_text = std::fs::read_to_string(repo.join("bx.toml")).expect("bx.toml");
+            std::fs::write(repo.join("bx.toml"), format!("{layer_text}# soon\n")).expect("an edit");
+            let head = rev(home.path(), &repo, "HEAD");
+            let error = update(&home, true, &mut Vec::new()).expect_err("in the way");
+            let shown = error.to_string();
+            assert!(matches!(error, update::Error::Sync(_)), "{error:?}");
+            assert!(!shown.contains("no rebase in progress"), "{shown}");
+            assert!(!shown.contains("another machine pushed"), "{shown}");
+            assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+            assert!(!update::rebasing(&git(home.path()), &repo));
+            assert!(
+                std::fs::read_to_string(repo.join("bx.toml"))
+                    .expect("kept")
+                    .ends_with("# soon\n")
+            );
+        }
+
+        #[test]
+        fn a_replay_that_stops_for_signing_is_not_called_a_conflict() {
+            let home = guarded_home();
+            let repo = diverged(&home);
+            for (key, value) in [
+                ("commit.gpgsign", "true"),
+                ("gpg.format", "ssh"),
+                ("user.signingkey", "/nonexistent/bx-test-key"),
+            ] {
+                run(home.path(), &repo, &["config", key, value]);
+            }
+            let head = rev(home.path(), &repo, "HEAD");
+            let error = update(&home, true, &mut Vec::new()).expect_err("cannot sign");
+            assert!(matches!(error, update::Error::Sync(_)), "{error:?}");
+            assert_eq!(rev(home.path(), &repo, "HEAD"), head, "put back");
+            assert!(
+                !update::rebasing(&git(home.path()), &repo),
+                "no replay left open"
+            );
+        }
+
+        #[test]
+        fn a_replay_the_upstream_already_holds_says_so() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            run(home.path(), &repo, &["push", "--quiet"]);
+            publish(&home, &["skills/b/SKILL.md"]);
+            update(&home, true, &mut Vec::new()).expect("a local lock commit");
+            // Another machine locked the very same commit and pushed it.
+            let other = crate::sync::tests::other(&home);
+            std::fs::copy(repo.join("bx.lock"), other.join("bx.lock")).expect("bx.lock");
+            commit_all(home.path(), &other, update::SUBJECT);
+            run(home.path(), &other, &["push", "--quiet"]);
+            let mut out = Vec::new();
+            update(&home, true, &mut out).expect("caught up");
+            assert!(
+                text(&out).starts_with("This machine's unpushed bx.lock commits were already in"),
+                "{}",
+                text(&out)
+            );
+        }
+
+        #[test]
+        fn a_rebase_left_open_in_the_config_repo_is_named() {
+            let home = guarded_home();
+            let repo = diverged(&home);
+            std::fs::create_dir_all(repo.join(".git/rebase-merge")).expect("an open rebase");
+            let error = update(&home, true, &mut Vec::new()).expect_err("open");
+            assert!(matches!(error, update::Error::Rebasing(_)), "{error:?}");
+            assert!(error.to_string().contains("rebase --abort"), "{error}");
+        }
+
+        #[test]
+        fn a_move_nothing_here_can_check_exits_pending() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            publish(&home, &["skills/b/SKILL.md"]);
+            // A machine with the configuration and none of its checkouts.
+            std::fs::remove_dir_all(home.child(AT)).expect("no checkout");
+            std::fs::remove_dir_all(home.child(".local/state/bx")).expect("no state");
+            let before = locked(&home);
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("update");
+            assert_eq!(exit, Exit::Pending, "{}", text(&out));
+            assert!(text(&out).contains("is not locked"), "{}", text(&out));
+            assert_eq!(locked(&home), before);
+            assert!(home.child(AT).is_dir(), "cloned at the commit locked");
+            let _ = repo;
+        }
+
+        #[test]
+        fn a_snooze_while_a_check_holds_on_still_puts_the_question_off() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+            std::fs::write(stamps.ask_due(), "1\n").expect("due");
+            stamps
+                .write(&stamps.available(), "~/x: y\n")
+                .expect("offered");
+            let _held = stamps.try_hold().expect("hold").expect("free");
+            // Not the full wait: the snooze gives up and writes anyway.
+            let held_for = std::thread::spawn({
+                let home = home.path().to_path_buf();
+                move || update::snooze(&env(&home), &mut Vec::new()).map(|_| ())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(_held);
+            held_for.join().expect("snooze ran").expect("snoozed");
+            assert!(Stamps::read(&stamps.ask_due()).expect("ask-due") > 1);
+            assert!(!stamps.available().exists());
         }
 
         #[test]

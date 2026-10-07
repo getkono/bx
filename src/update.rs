@@ -125,7 +125,7 @@ pub enum Verdict {
         /// The tip.
         tip: String,
         /// The new commits' short ids and subjects, newest first, at most
-        /// [`LOG_LIMIT`] of them; `None` when no checkout could list them.
+        /// twenty of them; `None` when no checkout could list them.
         log: Option<Vec<String>>,
         /// How many new commits there are, when a checkout could count them.
         count: Option<u64>,
@@ -582,7 +582,7 @@ pub fn now() -> Epoch {
 /// next prompt offers to apply; lines for externals this check did not look
 /// at are kept.
 ///
-/// Exits [`Exit::Pending`] when there is something to apply.
+/// Exits [`crate::report::Exit::Pending`] when there is something to apply.
 ///
 /// # Errors
 ///

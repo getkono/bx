@@ -140,7 +140,7 @@ impl Update {
 ///
 /// # Errors
 ///
-/// [`Error::UnknownKey`] for a key beyond [`KEYS`], and [`Error::BadValue`] or
+/// [`Error::UnknownKey`] for a key beyond `interval`, and [`Error::BadValue`] or
 /// [`Error::WrongType`] for an `interval` that is not one.
 pub fn parse_update(table: &Table, file: &Path, text: &str) -> Result<Update, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);

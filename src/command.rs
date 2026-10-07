@@ -18,6 +18,7 @@ use crate::adopt::{self, Adoption, Removal};
 use crate::config::resolve::Resolution;
 use crate::config::target::Body;
 use crate::doctor::{self, Probes, systemd};
+use crate::git::Git;
 use crate::init;
 use crate::paths;
 use crate::plan::{self, Env, Error, Inputs, Mode, Palette, Report, View};
@@ -233,7 +234,7 @@ fn converge(
 ///
 /// Whatever [`sync::pull`] and [`sync::push`] return, and as [`apply`].
 pub fn sync(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, sync::Error> {
-    sync_with(env, yes, out, &sync::Git::new(env), &mut confirm)
+    sync_with(env, yes, out, &Git::new(env), &mut confirm)
 }
 
 /// [`sync`], through `git`, with the question asked through `ask`.
@@ -241,7 +242,7 @@ fn sync_with(
     env: &Env,
     yes: bool,
     out: &mut dyn Write,
-    git: &sync::Git,
+    git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, sync::Error> {
     let pulled = sync::pull(env, git)?;

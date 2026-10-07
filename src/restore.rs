@@ -49,6 +49,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::fs::{self, Kind, Mode};
+use crate::git::Git;
 use crate::journal::{self, Content, Ownership, Request, Session, SessionKind};
 use crate::paths::Portable;
 use crate::plan::external;
@@ -57,7 +58,6 @@ use crate::state::{
     self, Ledger, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, StateDir,
     clone_written,
 };
-use crate::sync::Git;
 
 /// Everything that can go wrong restoring.
 #[derive(Debug, thiserror::Error)]

@@ -181,7 +181,7 @@ pub struct Context {
     roots: RootSet,
     /// The `git` `rm` asks whether a checkout bx cloned holds anything of
     /// the user's.
-    git: crate::sync::Git,
+    git: crate::git::Git,
     trees: Vec<TreeDecl>,
 }
 
@@ -256,7 +256,7 @@ impl Context {
             layers,
             resolved,
             roots,
-            git: crate::sync::Git::new(env),
+            git: crate::git::Git::new(env),
             trees,
         })
     }

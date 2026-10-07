@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 use super::{Change, Diff, Error};
 use crate::config::external::External;
 use crate::fs::{self, Kind};
+use crate::git::{self, Git};
 use crate::journal;
 use crate::paths::{self, Portable};
 use crate::report::Action;
@@ -54,7 +55,6 @@ use crate::state::{
     self, ExclusiveLock, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, PriorBytes,
     StateDir, clone_written,
 };
-use crate::sync::{self, Git};
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -665,12 +665,12 @@ fn record_rev(op: &Op, ledger: &mut Ledger) -> Result<(), state::Error> {
 }
 
 /// A git failure, in the words a row's note uses.
-pub(crate) fn problem(error: &sync::Error) -> String {
+pub(crate) fn problem(error: &git::Error) -> String {
     match error {
-        sync::Error::Spawn { source, .. } => {
+        git::Error::Spawn { source, .. } => {
             format!("git could not be started: {source}; bx needs git on PATH")
         }
-        sync::Error::Git { args, stderr, .. } => {
+        git::Error::Failed { args, stderr, .. } => {
             let stderr = stderr.trim();
             if stderr.is_empty() {
                 format!("`git {args}` failed")
@@ -678,7 +678,6 @@ pub(crate) fn problem(error: &sync::Error) -> String {
                 format!("`git {args}` failed: {}", stderr.replace('\n', "; "))
             }
         }
-        other => other.to_string(),
     }
 }
 
@@ -703,21 +702,21 @@ pub(crate) fn own_checkout(git: &Git, dest: &Path) -> Result<(), String> {
 }
 
 /// The commit checked out in `dest`.
-pub(crate) fn head(git: &Git, dest: &Path) -> Result<String, sync::Error> {
+pub(crate) fn head(git: &Git, dest: &Path) -> Result<String, git::Error> {
     git.query(dest, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
 }
 
 /// The url of `origin`, or `None` when there is no such remote.
-fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, sync::Error> {
+fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, git::Error> {
     match git.query(dest, &["config", "--get", "remote.origin.url"]) {
         Ok(url) => Ok(Some(url)),
-        Err(sync::Error::Git { status, .. }) if status.code() == Some(1) => Ok(None),
+        Err(git::Error::Failed { status, .. }) if status.code() == Some(1) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
 /// Whether a tracked file differs from the commit checked out, staged or not.
-fn dirty(git: &Git, dest: &Path) -> Result<bool, sync::Error> {
+fn dirty(git: &Git, dest: &Path) -> Result<bool, git::Error> {
     git.query(dest, &["status", "--porcelain", "--untracked-files=no"])
         .map(|status| !status.is_empty())
 }
@@ -734,10 +733,10 @@ fn is_ancestor(
     dest: &Path,
     ancestor: &str,
     descendant: &str,
-) -> Result<bool, sync::Error> {
+) -> Result<bool, git::Error> {
     match git.query(dest, &["merge-base", "--is-ancestor", ancestor, descendant]) {
         Ok(_) => Ok(true),
-        Err(sync::Error::Git { status, .. }) if status.code() == Some(1) => Ok(false),
+        Err(git::Error::Failed { status, .. }) if status.code() == Some(1) => Ok(false),
         Err(error) => Err(error),
     }
 }

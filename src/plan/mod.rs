@@ -37,6 +37,7 @@ use crate::config::resolve::{self, Resolution, Resolved};
 use crate::config::target::{Body, Direction, Gen, Target};
 use crate::config::{self, Origin, layers, merge};
 use crate::env_guard::RootSet;
+use crate::git::Git;
 use crate::journal::{self, Session, SessionKind};
 use crate::paths::{self, Portable};
 use crate::recover::{self, Interrupted};
@@ -45,7 +46,6 @@ use crate::shell::activation;
 use crate::state::{
     self, ExclusiveLock, Fingerprints, LedgerView, Mechanism, SharedLock, StateDir,
 };
-use crate::sync::Git;
 
 /// Which half of the traversal is running.
 ///

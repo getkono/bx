@@ -54,7 +54,8 @@
 //! holds the commands' bodies, `bx doctor`'s among them, so the binary only
 //! parses its arguments and dispatches. [`sync`] is the git on either side of
 //! `bx sync`'s apply: a fast-forward-only pull before it, and a push after it
-//! that never carries a state file. [`upgrade`] is `bx self-upgrade`: the
+//! that never carries a state file. [`git`] runs the user's own `git` for it,
+//! for a declared external, and for `bx rm`'s checks on a checkout. [`upgrade`] is `bx self-upgrade`: the
 //! installer a fresh install runs, fetched from master and run only while its
 //! digest is the one this release pins.
 //!
@@ -118,6 +119,7 @@ pub mod detect;
 pub mod doctor;
 pub mod env_guard;
 pub mod fs;
+pub mod git;
 pub mod init;
 pub mod journal;
 pub mod paths;

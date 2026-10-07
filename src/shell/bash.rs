@@ -77,7 +77,7 @@
 //!
 //! [`vacated`] plans the file and `~/.inputrc` with nothing declared in them
 //! once nothing places either but bx's generator for it wrote it before, as
-//! [`crate::config::resolve::vacated_fragments`] does for zsh's fragments; the
+//! [`super::placement::vacated_fragments`] does for zsh's fragments; the
 //! region is left sourcing a file that sets nothing, and `bx rm` restores
 //! each file from the ledger.
 //!
@@ -105,13 +105,13 @@ use std::path::Path;
 use super::alias::AliasDecl;
 use super::function::Function;
 use super::keybindings::Keybindings;
+use super::placement::{held_together, resolve_env};
 use super::source::{Source, SourceDecl};
 use super::{Assembly, Phase, Shell, activation};
 use crate::config::env::{EnvDecl, EnvKind, Var, assignment};
 use crate::config::history::{self, History};
 use crate::config::path::{self, PathEntry};
 use crate::config::resolution::{BlockedEntry, Resolution};
-use crate::config::resolve::{held_together, resolve_env};
 use crate::config::shell_options::{self, ShellOptions};
 use crate::config::target::{Attach, Body, Direction, Format, Gen, SETTLE, Target};
 use crate::config::values::ResolvedValues;

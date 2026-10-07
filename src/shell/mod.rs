@@ -114,6 +114,7 @@ pub mod alias;
 pub mod bash;
 pub mod function;
 pub mod keybindings;
+pub mod placement;
 pub mod plugin;
 pub mod source;
 

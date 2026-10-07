@@ -535,7 +535,7 @@ pub fn run(
             .get(path)
             .is_some_and(|entry| entry.mechanism == Mechanism::Own)
     };
-    targets.extend(resolve::vacated_fragments(
+    targets.extend(crate::shell::placement::vacated_fragments(
         &inputs.resolved.targets,
         owned,
         // bash's files sit where a `[[target]]` may have put a file bx owns

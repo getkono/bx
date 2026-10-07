@@ -317,6 +317,28 @@ pub fn config_root_in(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
     xdg_base(xdg_config_home, home, ".config").join("bx")
 }
 
+/// The account's own layer file's name, in the [`state_dir`].
+pub const LOCAL_FILE: &str = "local.toml";
+
+/// The state directory's default, relative to the home.
+const STATE_FALLBACK: &str = ".local/state";
+
+/// The state directory — `$XDG_STATE_HOME/bx`, default `~/.local/state/bx`.
+///
+/// Both inputs are explicit so the library reads no environment. The binary
+/// passes `std::env::var_os("XDG_STATE_HOME").as_deref()`; a test passes what it
+/// wants to test.
+#[must_use]
+pub fn state_dir(home: &Path, xdg_state_home: Option<&OsStr>) -> PathBuf {
+    xdg_base(xdg_state_home, home, STATE_FALLBACK).join("bx")
+}
+
+/// This account's layer file inside `state_dir`.
+#[must_use]
+pub fn local_layer_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(LOCAL_FILE)
+}
+
 /// The systemd user unit directory — `$XDG_CONFIG_HOME/systemd/user`, default
 /// `~/.config/systemd/user`.
 ///
@@ -687,6 +709,36 @@ mod tests {
         // A deliberately non-standard home: nothing here may name a real
         // account, and nothing here may assume `/home/<user>`.
         PathBuf::from("/var/home/example")
+    }
+
+    #[test]
+    fn state_dir_defaults_to_local_state_bx() {
+        assert_eq!(
+            state_dir(Path::new("/var/home/example"), None),
+            Path::new("/var/home/example/.local/state/bx")
+        );
+    }
+
+    #[test]
+    fn state_dir_honours_xdg_state_home() {
+        assert_eq!(
+            state_dir(
+                Path::new("/var/home/example"),
+                Some(OsStr::new("/var/mnt/scratch/one/state"))
+            ),
+            Path::new("/var/mnt/scratch/one/state/bx")
+        );
+    }
+
+    #[test]
+    fn a_relative_or_empty_xdg_state_home_falls_back() {
+        // The base-directory specification honours the variable only when it is
+        // non-empty and absolute; anything else is invalid and the default wins.
+        let home = Path::new("/var/home/example");
+        let default = home.join(".local/state/bx");
+
+        assert_eq!(state_dir(home, Some(OsStr::new(""))), default);
+        assert_eq!(state_dir(home, Some(OsStr::new("relative/state"))), default);
     }
 
     #[test]

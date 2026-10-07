@@ -157,8 +157,8 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
+use crate::config::env;
 use crate::config::values::ResolvedValues;
-use crate::config::{env, layers};
 use crate::paths;
 
 /// Names a shell defines and manages itself. A fragment may not assign one,
@@ -901,7 +901,7 @@ impl RootSet {
                 inadmissible.push(declared.clone());
             }
         }
-        let owned = vec![paths::normalize(&layers::state_dir(&home, None))];
+        let owned = vec![paths::normalize(&paths::state_dir(&home, None))];
         let fragment_dirs = vec![paths::normalize(&paths::render(env::FRAGMENT_DIR, &home))];
         let repos = vec![paths::normalize(&paths::config_root_in(&home, None))];
         Self {

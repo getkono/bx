@@ -1041,7 +1041,7 @@ pub(crate) fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error
         }
         Ok(())
     }
-    walk(state.root(), &layers::local_layer_path(state.root()))
+    walk(state.root(), &paths::local_layer_path(state.root()))
 }
 
 /// What a read-only run learns from the state directory before deciding.
@@ -3406,7 +3406,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(state.root(), std::fs::Permissions::from_mode(0o700))
             .expect("a private state directory");
         let real = home.write("dotfiles/local.toml", "[values]\n");
-        let local = layers::local_layer_path(state.root());
+        let local = paths::local_layer_path(state.root());
         std::os::unix::fs::symlink(&real, &local).expect("the link");
         let inputs = load(home.path());
 

@@ -40,14 +40,14 @@ impl StateDir {
 
     /// The state directory for `home`, honouring an `$XDG_STATE_HOME` value.
     ///
-    /// The resolution itself is [`crate::config::layers::state_dir`]'s, not this
+    /// The resolution itself is [`crate::paths::state_dir`]'s, not this
     /// module's, and this delegates to it rather than repeating the XDG rule.
     /// The local layer and the ledger have to agree about which directory they
     /// are in; two resolvers that agree today are two resolvers that can
     /// disagree tomorrow.
     #[must_use]
     pub fn resolve_in(home: &Path, xdg_state_home: Option<&OsStr>) -> Self {
-        Self::new(crate::config::layers::state_dir(home, xdg_state_home))
+        Self::new(crate::paths::state_dir(home, xdg_state_home))
     }
 
     /// A state directory at an already-known path.
@@ -64,11 +64,11 @@ impl StateDir {
 
     /// `local.toml` — this account's own layer, which is never committed.
     ///
-    /// Delegates to [`crate::config::layers::local_layer_path`], so the layer
+    /// Delegates to [`crate::paths::local_layer_path`], so the layer
     /// loader and the state directory cannot name two different files.
     #[must_use]
     pub fn local_toml(&self) -> PathBuf {
-        crate::config::layers::local_layer_path(&self.root)
+        crate::paths::local_layer_path(&self.root)
     }
 
     /// `ledger.mpk` — what bx wrote, and what it displaced.
@@ -515,7 +515,7 @@ fn check_local_layer(dir: &Path, mode: Mode) -> Result<(), Error> {
     if mode.bits() & 0o011 == 0 {
         return Ok(());
     }
-    let file = crate::config::layers::local_layer_path(dir);
+    let file = crate::paths::local_layer_path(dir);
     let meta = match std::fs::symlink_metadata(&file) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -752,12 +752,9 @@ mod tests {
         let home = Path::new("/home/someone");
         for xdg in [None, Some(OsStr::new("/srv/state"))] {
             let dir = StateDir::resolve_in(home, xdg);
-            let resolved = crate::config::layers::state_dir(home, xdg);
+            let resolved = crate::paths::state_dir(home, xdg);
             assert_eq!(dir.root(), resolved);
-            assert_eq!(
-                dir.local_toml(),
-                crate::config::layers::local_layer_path(&resolved),
-            );
+            assert_eq!(dir.local_toml(), crate::paths::local_layer_path(&resolved),);
         }
     }
 

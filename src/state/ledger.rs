@@ -1278,11 +1278,15 @@ impl Ledger {
     /// [`Ledger::adopt_current_as_prior`], where the re-fetch that borrow
     /// used to force was a branch no input could take (r4 round 2, COV7).
     fn store_prior(dir: &StateDir, prior: PriorBytes) -> Result<Prior, Error> {
-        if matches!(prior, PriorBytes::Absent) {
-            return Ok(Prior::Absent);
+        match prior {
+            PriorBytes::Absent => Ok(Prior::Absent),
+            PriorBytes::Bytes { bytes, mode } => Ok(Prior::Existed(Self::store_restore(
+                dir,
+                ContentHash::of(&bytes),
+                &bytes,
+                mode,
+            )?)),
         }
-        ensure_dir(&dir.restore(), Mode::PRIVATE_DIR)?;
-        Ok(restore::store(dir, prior)?)
     }
 
     /// Store `bytes`, already hashed to `digest`, through
@@ -1305,7 +1309,7 @@ impl Ledger {
     /// [`Error::Encode`], [`Error::CreateDir`] or [`Error::Write`]. A failure
     /// leaves the previous ledger exactly as it was, except a failing `fsync`
     /// of the state directory after the rename, which is returned with the new
-    /// ledger already in place — see [`write_atomically`].
+    /// ledger already in place — see [`crate::fs::write_atomically`].
     ///
     /// [`Error::WrongLock`] if the lock file this ledger was opened under has
     /// been replaced or removed since; nothing is written.

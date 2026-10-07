@@ -54,7 +54,10 @@
 //! holds the commands' bodies, `bx doctor`'s among them, so the binary only
 //! parses its arguments and dispatches. [`sync`] is the git on either side of
 //! `bx sync`'s apply: a fast-forward-only pull before it, and a push after it
-//! that never carries a state file. [`upgrade`] is `bx self-upgrade`: the
+//! that never carries a state file. [`update`] is `bx update`'s own part:
+//! where a followed external's branch is now, `bx.lock` written and committed
+//! before anything moves, and the stamps an interactive zsh reads to decide
+//! whether to ask. [`upgrade`] is `bx self-upgrade`: the
 //! installer a fresh install runs, fetched from master and run only while its
 //! digest is the one this release pins.
 //!

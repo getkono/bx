@@ -43,8 +43,11 @@ wrong even if it passes CI.
    `BX_` namespace, and gets every other variable by sourcing a guarded
    environment fragment, and `env_guard`'s
    `the_init_snippet_is_not_an_environment_fragment` holds its bytes to the
-   rule. Nothing holds a *second* such file to it, so the change that generates
-   one carries the proof of its own bytes with it. Cached tool activation
+   rule. The zsh update prompt is the second: it assigns only its locals,
+   `BX_` names and zsh's `precmd_functions` hook array, and
+   `the_update_prompt_is_not_an_environment_fragment` holds its bytes to that.
+   Nothing holds a *third* such file to it, so the change that generates one
+   carries the proof of its own bytes with it. Cached tool activation
    output is the second admitted non-fragment file, and the one exception to
    the no-assignment rule: it is searched by name for every relocating
    variable, and each such assignment is judged by `env_guard`, so a tool's
@@ -68,7 +71,12 @@ wrong even if it passes CI.
    restores exactly. An interrupted `apply` must be detectable and recoverable.
 5. **Nothing user-specific and no cleartext secret in the repo.** Ever.
 6. **Shell startup is budgeted at 5 ms**, enforced by `mise run bench`. The
-   shell-start path spawns no process and parses no config file.
+   shell-start path spawns no process and parses no config file. After the
+   first prompt, an interactive shell with a terminal and no CI or coding-agent
+   variable set may start one detached, time-bounded
+   `bx update --background`, and only once a followed `[[external]]` set to
+   `check = "auto"` is due; it starts nothing else unless someone answers a
+   question.
 7. **`plan` and `apply` share one function.** `apply` must never do work `plan`
    did not announce.
 

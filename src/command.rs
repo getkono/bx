@@ -1,11 +1,13 @@
 //! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
-//! `bx doctor`, `bx add`, `bx rm`, `bx secret list` and `bx self-upgrade`, and
-//! the refusal of `bx shell-init` and `bx __complete`, which have none yet.
+//! `bx update`, `bx doctor`, `bx add`, `bx rm`, `bx secret list` and
+//! `bx self-upgrade`, and the refusal of `bx shell-init` and `bx __complete`,
+//! which have none yet.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
 //! or, for `doctor`, the read-only checks in [`crate::doctor`], for `add` and
 //! `rm`, [`crate::adopt`], for `init`, [`crate::init`] before the
-//! traversal, and for `sync`, [`crate::sync`] around it — writes the rendering
+//! traversal, for `sync`, [`crate::sync`] around it, and for `update`,
+//! [`crate::update`] before it — writes the rendering
 //! to the output it is
 //! handed, and returns the exit status. `self-upgrade` reads no configuration:
 //! it is [`crate::upgrade`] run for the binary that is running. `main` does

@@ -121,7 +121,7 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::{Assembly, Phase, Shell, Shells};
-use crate::config::resolve::{BlockReason, BlockedEntry, Resolution};
+use crate::config::resolution::{BlockReason, BlockedEntry, Resolution};
 use crate::config::values::{self, ResolvedValues, Unresolved};
 use crate::config::when::{self, Gate, When};
 use crate::config::{Ctx, Error, Origin};

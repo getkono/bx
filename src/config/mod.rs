@@ -27,6 +27,7 @@ pub mod layers;
 pub mod merge;
 pub mod origin;
 pub mod path;
+pub mod resolution;
 pub mod resolve;
 pub mod secrets;
 pub mod shell_options;

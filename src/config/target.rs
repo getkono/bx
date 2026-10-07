@@ -76,7 +76,7 @@ use crate::shell::{Assembly, Phase};
 use toml_edit::Table;
 
 use super::history::History;
-use super::resolve::{BlockedEntry, Resolution};
+use super::resolution::{BlockedEntry, Resolution};
 use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
 
@@ -2761,7 +2761,7 @@ mod tests {
                     file: PathBuf::from("/repo/bx.toml"),
                     line: 9,
                 },
-                reason: super::super::super::resolve::BlockReason::UnsetValue {
+                reason: super::super::super::resolution::BlockReason::UnsetValue {
                     names: vec!["proj".to_string()],
                 },
                 hint: hint.to_string(),

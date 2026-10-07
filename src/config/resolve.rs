@@ -74,83 +74,10 @@ use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::PluginDecl;
 use crate::shell::source::SourceDecl;
 
-/// A configuration entry that either resolved or could not.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Resolution<T> {
-    /// Fully substituted, ready to be written.
-    Ready(T),
-    /// Held back, with the reason and what would clear it.
-    Blocked(BlockedEntry),
-}
-
-/// Why an entry could not be resolved.
-///
-/// The shared reason enum: a later reason extends it rather than introducing a
-/// parallel blocked type, which is why `report::Action::Blocked` is documented
-/// as "a prerequisite is absent" rather than as one specific prerequisite.
-///
-/// An absent tool is deliberately not a reason. A target's `requires` never
-/// blocks it — its file is written on its own content and mode alone, and
-/// `bx doctor` names the tool — so no variant here says a tool is missing. A
-/// target whose whole content is the output of running an absent tool would
-/// need one; that case is reserved, and nothing produces it yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlockReason {
-    /// One or more declared values this entry references have no answer.
-    UnsetValue {
-        /// The values that need answering, in declaration order.
-        names: Vec<String>,
-    },
-    /// One or more declared values this entry references are switched off.
-    ///
-    /// Kept apart from [`BlockReason::UnsetValue`] because the two are cleared
-    /// by different acts, and a note that told an account to answer a value it
-    /// has itself refused would be advice it cannot follow.
-    DisabledValue {
-        /// The declarations to re-enable, in declaration order.
-        names: Vec<String>,
-    },
-    /// One or more answers in this account's layer leave this entry unusable:
-    /// an answer its kind refuses, one that made a committed `default` invalid,
-    /// or one that, substituted into this entry, makes a field invalid — a path
-    /// that climbs out of the home, a `file` that climbs out of the repo, an
-    /// owned key with an empty segment or with more or fewer segments than
-    /// written — or a `file` that reaches a `path` value through an answer.
-    ///
-    /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
-    /// unanswered: every answer the entry needs is written, and one of them is
-    /// the account's to change. They share one variant because they share that
-    /// cause, not because one act clears them all: which answer to change, and
-    /// whether changing one is the whole act, is [`BlockedEntry::hint`]'s to
-    /// say. A clash holding a toggle bx cannot show names a declared target is
-    /// cleared by removing that toggle first, and by an answer only for the
-    /// statements the removal leaves — so the hint may name one of these
-    /// values, or none of them.
-    InvalidValue {
-        /// The answers this block was made of, in declaration order: the
-        /// declarations whose text is invalid, the answers that went into the
-        /// invalid field, or every answer that made a layer's clashing
-        /// spellings meet. The cause, which a report may name as the entry's;
-        /// the instruction is the hint.
-        names: Vec<String>,
-    },
-}
-
-/// An entry that was held back, and what it would take to release it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockedEntry {
-    /// The entry's natural key, so a report can name it.
-    pub key: String,
-    /// Where the entry was declared.
-    pub origin: Origin,
-    /// Why it is blocked.
-    pub reason: BlockReason,
-    /// What the user should do. Spelled in `values` — `init_hint`,
-    /// `disabled_hint`, `path_answer_hint`, `ResolvedValues::invalid_hint`,
-    /// `ResolvedValues::answers_hint` or `ResolvedValues::removal_hint` — never
-    /// at a call site.
-    pub hint: String,
-}
+/// The vocabulary a resolution is reported in, defined in
+/// [`super::resolution`] and named here too, where every caller that resolves
+/// a configuration already looks.
+pub use super::resolution::{BlockReason, BlockedEntry, Resolution};
 
 /// A merged configuration, resolved against one account's home.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,7 +507,7 @@ pub(crate) fn resolve_env(
             hint,
         }))
     };
-    let names_of = |names: Vec<String>| in_declaration_order(values, names);
+    let names_of = |names: Vec<String>| values.in_declaration_order(names);
     match values.substitute(&decl.value) {
         Ok(value) => {
             let Some(problem) = super::env::unwritable(&value) else {
@@ -657,17 +584,17 @@ pub(crate) fn held_together(
         names.iter().map(String::as_str).collect()
     }
     if !disabled.is_empty() {
-        let names = in_declaration_order(values, disabled);
+        let names = values.in_declaration_order(disabled);
         let hint = super::values::disabled_hint(&spelled(&names));
         (BlockReason::DisabledValue { names }, hint)
     } else if !invalid.is_empty() {
-        let names = in_declaration_order(values, invalid);
+        let names = values.in_declaration_order(invalid);
         (
             BlockReason::InvalidValue { names },
             invalid_hints.join("; "),
         )
     } else {
-        let names = in_declaration_order(values, unset);
+        let names = values.in_declaration_order(unset);
         let hint = super::values::init_hint(&spelled(&names));
         (BlockReason::UnsetValue { names }, hint)
     }
@@ -872,7 +799,7 @@ fn resolve_target(
     // A switched-off declaration is reported ahead of an unanswered one: it is
     // the more specific statement about what this target is waiting for.
     if !disabled.is_empty() {
-        let names = in_declaration_order(values, disabled);
+        let names = values.in_declaration_order(disabled);
         let hint =
             super::values::disabled_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
         return block(BlockReason::DisabledValue { names }, hint);
@@ -880,13 +807,13 @@ fn resolve_target(
 
     // An invalid value ahead of an unanswered one: answering would not clear it.
     if !invalid.is_empty() {
-        let names = in_declaration_order(values, invalid);
+        let names = values.in_declaration_order(invalid);
         let hint = values.invalid_hint(&names);
         return block(BlockReason::InvalidValue { names }, hint);
     }
 
     if !unset.is_empty() {
-        let names = in_declaration_order(values, unset);
+        let names = values.in_declaration_order(unset);
         let hint = super::values::init_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
         return block(BlockReason::UnsetValue { names }, hint);
     }
@@ -902,8 +829,7 @@ fn resolve_target(
             if clashes.is_empty() {
                 return Ok(Resolution::Ready(ready));
             }
-            let names = in_declaration_order(
-                values,
+            let names = values.in_declaration_order(
                 clashes
                     .iter()
                     .flat_map(|conflict| conflict.names.iter().cloned())
@@ -930,7 +856,7 @@ fn resolve_target(
                     message: problem,
                 });
             }
-            let names = in_declaration_order(values, causes);
+            let names = values.in_declaration_order(causes);
             let hint = values.answers_hint(&problem, &[raw.as_str()], &names);
             block(BlockReason::InvalidValue { names }, hint)
         }
@@ -1222,8 +1148,7 @@ fn refuse_path_answer_in_file(
         target.path
     );
 
-    let names = in_declaration_order(
-        values,
+    let names = values.in_declaration_order(
         chain
             .iter()
             .filter_map(|step| match step {
@@ -1317,10 +1242,11 @@ enum Step<'a> {
 /// Everything that asks what a declaration *is* reads it through
 /// [`ResolvedValues::decl`] or [`ResolvedValues::index_of`], both unfiltered,
 /// and ignores `enabled`: this walk's terminal, [`path_value_behind`],
-/// `merge`'s `written_form` kind lookups, and both `in_declaration_order`s.
-/// The resolve-side one was the single exception — it indexed against the
-/// filtered `decls`, so a switch moved a declaration's position — and it now
-/// indexes against [`ResolvedValues::index_of`] like its twin.
+/// `merge`'s `written_form` kind lookups, and
+/// [`ResolvedValues::in_declaration_order`]. A resolve-side copy of that last
+/// one was the single exception — it indexed against the filtered `decls`, so
+/// a switch moved a declaration's position — and every caller now uses the
+/// one method.
 ///
 /// This list was derived by grepping `enabled` across `src` and classifying
 /// every hit, reads and writes alike. Two earlier versions were not: the first
@@ -1693,42 +1619,6 @@ fn unfindable_requirement(text: &str) -> String {
         "`requires` names a tool by a bare name to look up on `PATH`, or by an \
          absolute path; got {text:?}"
     )
-}
-
-/// Order `names` the way the values were declared, deduplicated.
-///
-/// So two reports of one problem read the same way regardless of which field
-/// happened to be probed first.
-///
-/// Indexed against [`ResolvedValues::index_of`], which counts every
-/// declaration, rather than [`ResolvedValues::decls`], which lists only the
-/// enabled ones. There are six callers, and the list is exhaustive because a
-/// partial one would not be a safety case:
-///
-/// - the `disabled` names — switched off by definition, so against the
-///   filtered list every one came back `usize::MAX` and the sort left them in
-///   whichever order the fields were probed. This is the caller the index was
-///   wrong for, and the only one.
-/// - the `invalid` and `unset` names, which come from declarations this
-///   account may answer, so they are enabled;
-/// - a clash's causes and a [`Broken::Field`]'s causes, which are answers this
-///   account applied, and a switched-off declaration has none applied;
-/// - [`refuse_path_answer_in_file`]'s own names, which are the [`Step::Answer`]
-///   declarations of a chain — and `Step::Answer` is built only behind the
-///   `enabled` filter in [`path_value_through_answer`], so they are enabled
-///   too.
-///
-/// [`ResolvedValues::in_declaration_order`] is this function's twin on the
-/// `values` side, for the names inside an
-/// [`Unresolved`](super::values::Unresolved), those in `answers_hint`, and a
-/// clash's; it indexed against every declaration already, and the two now
-/// agree. The count of six above is this function's own callers, not the
-/// twin's.
-fn in_declaration_order(values: &ResolvedValues, mut names: Vec<String>) -> Vec<String> {
-    let index = |name: &String| values.index_of(name).unwrap_or(usize::MAX);
-    names.sort_by_key(index);
-    names.dedup();
-    names
 }
 
 #[cfg(test)]

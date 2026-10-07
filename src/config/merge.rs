@@ -3934,7 +3934,8 @@ mod tests {
     /// The layers merged and resolved with no conflict, no block and no error:
     /// a configuration that loads. The ready targets, as path and body.
     fn loads(layers: &[Layer]) -> Vec<(String, crate::config::target::Body)> {
-        use crate::config::resolve::{Resolution, resolve};
+        use crate::config::resolution::Resolution;
+        use crate::config::resolve::resolve;
 
         let config = merge(layers).unwrap_or_else(|e| panic!("the merge failed: {e}"));
         assert!(config.conflicts.is_empty(), "{:#?}", config.conflicts);

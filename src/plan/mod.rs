@@ -22,6 +22,7 @@ mod decide;
 mod diff;
 mod execute;
 pub(crate) mod external;
+mod links;
 mod region;
 
 use std::collections::BTreeSet;
@@ -560,6 +561,19 @@ pub fn run(
         &inputs.home,
         &inputs.state.ledger(),
     ));
+    // Every external's links, as symlink targets decided with the rest: each
+    // child the commit holds, beside every path a target already declares.
+    let mut expansion = {
+        let declared: BTreeSet<&str> = targets.iter().map(declared_path).collect();
+        links::expand(
+            &inputs.resolved.externals,
+            &inputs.lock,
+            &inputs.home,
+            &inputs.git,
+            &declared,
+        )
+    };
+    targets.append(&mut expansion.targets);
     let decided = decide::decide_all(&targets, &ctx)?;
     report.changes = decided.changes;
     // A tracked target's repo copy is written by `sync` alone, after every
@@ -581,11 +595,15 @@ pub fn run(
     )?;
     let first_external = report.changes.len();
     report.changes.extend(rows);
+    // A child some other declaration holds, and each link whose commit is not
+    // here yet, after the externals whose work brings it.
+    let first_link = report.changes.len();
+    report.changes.append(&mut expansion.rows);
     // Last, after every external, so the indices `stopped` is built from are
     // not moved: every file bx wrote that nothing declares any more.
     report
         .changes
-        .extend(undeclared_rows(inputs, &ledger, &targets));
+        .extend(undeclared_rows(inputs, &ledger, &targets, &expansion.held));
 
     match mode {
         Mode::Plan => Ok(report),
@@ -598,7 +616,7 @@ pub fn run(
                 .steps()
                 .iter()
                 .any(|step| step.action().is_pending());
-            if ops.is_empty() && clones.is_empty() && !captured {
+            if ops.is_empty() && clones.is_empty() && expansion.pending.is_empty() && !captured {
                 agree(inputs, &bases, &agreed, mode, false)?;
                 return Ok(report);
             }
@@ -639,6 +657,21 @@ pub fn run(
                     report.stopped.push(at);
                 }
             }
+            // After the clones, which are what bring a pending link's commit.
+            if !expansion.pending.is_empty() {
+                let declared = targets
+                    .iter()
+                    .map(|target| declared_path(target).to_string())
+                    .collect();
+                link_pending(
+                    inputs,
+                    &bases,
+                    &expansion.pending,
+                    first_link,
+                    &declared,
+                    &mut report,
+                )?;
+            }
             // Last, so a cache entry is never saved for output a failed write
             // left out of the file: losing it costs only a re-run.
             if !inputs.activations.is_empty() {
@@ -649,6 +682,79 @@ pub fn run(
             Ok(report)
         }
     }
+}
+
+/// The path a target declares: its own, or a held-back one's key.
+fn declared_path(resolution: &Resolution<Target>) -> &str {
+    match resolution {
+        Resolution::Ready(target) => target.path.as_str(),
+        Resolution::Blocked(entry) => entry.key.as_str(),
+    }
+}
+
+/// Expand, decide and write every link `plan` announced as pending, now that
+/// the clones have run, appending a row for each child.
+///
+/// A pending link's row stays as `plan` showed it when its children are
+/// written, and is stopped with why when its commit is still not here — its
+/// external was stopped, or reached no commit. Each child is decided against
+/// the ledger as the clones left it, and written in a session of its own,
+/// after the one the targets were written in.
+///
+/// # Errors
+///
+/// As [`decide::decide_all`] and [`execute::execute`].
+fn link_pending(
+    inputs: &Inputs,
+    bases: &decide::Bases,
+    pending: &[links::Pending],
+    first_row: usize,
+    declared: &BTreeSet<String>,
+    report: &mut Report,
+) -> Result<(), Error> {
+    let mut targets = Vec::new();
+    for pending in pending {
+        let external = &inputs.resolved.externals[pending.external];
+        let link = &external.links[pending.link];
+        match links::expand_pending(
+            external,
+            link,
+            &pending.rev,
+            &inputs.home,
+            &inputs.git,
+            declared,
+        ) {
+            Ok(children) => targets.extend(children),
+            Err(note) => {
+                let at = first_row + pending.row;
+                report.changes[at].action = Action::Blocked;
+                report.changes[at].note = Some(note);
+                report.stopped.push(at);
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
+    let ctx = decide::Ctx {
+        ledger: &ledger,
+        home: &inputs.home,
+        repo: &inputs.repo,
+        roots: &inputs.roots,
+        secrets: &inputs.resolved.secrets,
+        declared: &decide::Declared::new(),
+        bases,
+    };
+    let decided = decide::decide_all(&targets, &ctx)?;
+    report.changes.extend(decided.changes);
+    if !decided.ops.is_empty() {
+        let scope = decided.ops.iter().map(|op| op.target().clone()).collect();
+        let session = Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;
+        let progress = execute::progress(decided.ops.len(), inputs.progress);
+        execute::execute(decided.ops, session, &progress)?;
+    }
+    Ok(())
 }
 
 /// One row per ledger entry that nothing this run decides names, in ascending
@@ -671,6 +777,9 @@ pub fn run(
 /// counts as declared — the conservative rule a blocked secret gets — rather
 /// than advising `bx rm` on a copy the configuration may still declare.
 ///
+/// Every entry beneath a directory in `held` — an external link's `to` whose
+/// children this run cannot list — counts as declared too, by the same rule.
+///
 /// The rows are [`decide::decide_undeclared`]'s, which writes nothing, so they
 /// produce no op: `apply` leaves the file and its ledger entry as they are,
 /// and the next `plan` shows the same row.
@@ -678,6 +787,7 @@ fn undeclared_rows(
     inputs: &Inputs,
     ledger: &LedgerView,
     targets: &[Resolution<Target>],
+    held: &[Portable],
 ) -> Vec<Change> {
     let blocked = inputs
         .declared_targets()
@@ -731,9 +841,16 @@ fn undeclared_rows(
         }
     }
     let origin = Origin::unknown(&inputs.state.ledger());
+    // A link's own directory is the user's, not bx's: only what lies beneath
+    // one whose children this run cannot list is held.
+    let held_beneath = |path: &Portable| {
+        held.iter()
+            .any(|dir| path.as_str().starts_with(&format!("{dir}/")))
+    };
     ledger
         .iter()
         .filter(|(path, _)| !declared.contains(path.as_str()))
+        .filter(|(path, _)| !held_beneath(path))
         // Lexical, like every containment verdict bx makes.
         .filter(|(path, _)| {
             !(tracking_held_back && paths::normalize(&path.render(&inputs.home)).starts_with(&repo))

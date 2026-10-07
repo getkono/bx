@@ -1792,6 +1792,156 @@ mod tests {
         }
     }
 
+    /// Commit `files` on the upstream's `master`, and return the commit.
+    fn commit_upstream(home: &GuardedHome, files: &[&str]) -> String {
+        let dir = home.child("upstream");
+        for file in files {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+            std::fs::write(path, "x\n").expect("a file");
+        }
+        commit_all(home.path(), &dir, "more");
+        git_run(home.path(), &dir, &["rev-parse", "HEAD"])
+    }
+
+    /// [`followed`], linking each child of `skills/` holding `SKILL.md` into
+    /// `~/.claude/skills`.
+    fn linking(branch: &str) -> String {
+        format!(
+            "{}[[external.link]]\nfrom = \"skills/*\"\nto = \"~/.claude/skills/*\"\n\
+             require = \"SKILL.md\"\n",
+            followed(branch)
+        )
+    }
+
+    /// Each row's target and action, in order.
+    fn rows(report: &Report) -> Vec<(String, Action)> {
+        report
+            .changes
+            .iter()
+            .map(|row| (row.target.clone(), row.action))
+            .collect()
+    }
+
+    #[test]
+    fn a_link_is_pending_until_its_clone_then_each_child_is_linked_and_converges() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(
+            &home,
+            &["skills/a/SKILL.md", "skills/b/SKILL.md", "skills/c/x"],
+        );
+        lock(&home, URL, "master", &rev);
+        let layer = linking("master");
+
+        let planned = plan(&home, &layer);
+        assert_eq!(
+            rows(&planned),
+            [
+                (format!("~/{AT}"), Action::Create),
+                ("~/.claude/skills/*".to_string(), Action::Create),
+            ]
+        );
+        let note = planned.changes[1].note.as_deref().expect("a note");
+        assert!(
+            note.contains(&format!("`skills/*` holding `SKILL.md` in ~/{AT} at {rev}")),
+            "{note}"
+        );
+
+        let applied = apply(&home, &layer);
+        assert!(applied.stopped.is_empty(), "{applied:?}");
+        assert_eq!(
+            rows(&applied)[2..],
+            [
+                ("~/.claude/skills/a".to_string(), Action::Create),
+                ("~/.claude/skills/b".to_string(), Action::Create),
+            ],
+            "the children, appended once the clone brought them"
+        );
+        for skill in ["a", "b"] {
+            let link = home.child(format!(".claude/skills/{skill}"));
+            assert_eq!(
+                std::fs::read_link(&link).expect("a link"),
+                home.child(format!("{AT}/skills/{skill}"))
+            );
+            assert!(
+                link.join("SKILL.md").is_file(),
+                "resolves into the checkout"
+            );
+        }
+        assert!(!home.child(".claude/skills/c").exists(), "no SKILL.md");
+
+        let again = plan(&home, &layer);
+        assert!(
+            again
+                .changes
+                .iter()
+                .all(|row| row.action == Action::Unchanged),
+            "{:?}",
+            rows(&again)
+        );
+        assert_eq!(again.changes.len(), 3, "the external and its two children");
+
+        // A child the next commit adds is listed offline once it is fetched,
+        // and one it drops is left as bx made it, for `bx rm` to release.
+        std::fs::remove_dir_all(home.child("upstream/skills/a")).expect("drop a");
+        let next = commit_upstream(&home, &["skills/d/SKILL.md"]);
+        git_run(
+            home.path(),
+            &home.child(AT),
+            &["fetch", "--quiet", "origin"],
+        );
+        lock(&home, URL, "master", &next);
+        let planned = plan(&home, &layer);
+        assert_eq!(
+            rows(&planned),
+            [
+                ("~/.claude/skills/b".to_string(), Action::Unchanged),
+                ("~/.claude/skills/d".to_string(), Action::Create),
+                (format!("~/{AT}"), Action::Modify),
+                ("~/.claude/skills/a".to_string(), Action::Undeclared),
+            ],
+            "targets, then the external, then what nothing declares"
+        );
+        assert!(planned.stopped.is_empty());
+        apply(&home, &layer);
+        assert_eq!(checked_out(&home), next);
+        assert!(home.child(".claude/skills/d/SKILL.md").is_file());
+        assert!(
+            std::fs::symlink_metadata(home.child(".claude/skills/a")).is_ok(),
+            "left as bx made it"
+        );
+    }
+
+    #[test]
+    fn a_link_whose_clone_failed_is_stopped_with_why() {
+        let home = guarded_home();
+        upstream(&home);
+        let missing = "c".repeat(40);
+        lock(&home, URL, "master", &missing);
+        let applied = apply(&home, &linking("master"));
+        assert_eq!(applied.stopped, [0, 1], "{:?}", rows(&applied));
+        let note = applied.changes[1].note.as_deref().expect("a note");
+        assert!(note.contains("does not hold"), "{note}");
+        assert!(!home.child(".claude").exists());
+    }
+
+    #[test]
+    fn a_link_of_an_unlocked_external_holds_what_it_made() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(&home, &["skills/a/SKILL.md"]);
+        lock(&home, URL, "master", &rev);
+        apply(&home, &linking("master"));
+        // The declaration moves to another branch, which nothing locked yet.
+        let planned = plan(&home, &linking("side"));
+        assert_eq!(
+            rows(&planned),
+            [(format!("~/{AT}"), Action::Blocked)],
+            "the link bx made is not reported as undeclared"
+        );
+    }
+
     #[test]
     fn a_pinned_external_reads_no_lock() {
         let home = guarded_home();

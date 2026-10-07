@@ -1285,9 +1285,9 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        WRITES_THROUGH_PERMISSIONS, cannot_build, crash_phases, finish_crash_phases, frame_starts,
-        link_at, link_to, names_in, peek, permissions_refuse, plant_file, raw_journal, seal,
-        state_beyond_set_aside_names, target, write_to,
+        WRITES_THROUGH_PERMISSIONS, cannot_build, crash_phases, dir_to, finish_crash_phases,
+        frame_starts, link_at, link_to, names_in, peek, permissions_refuse, plant_file,
+        raw_journal, seal, state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
@@ -1835,6 +1835,42 @@ mod tests {
         assert_eq!(entry.mechanism, Mechanism::Link);
         assert_eq!(entry.written, fs::link::digest(Path::new("/opt/tool")));
         assert_eq!(entry.mode, Mode::LINK);
+    }
+
+    /// A directory's earlier state is its mode, never a snapshot to read:
+    /// rolling forward a terminated chmod of one records that mode even with
+    /// the empty blob gone from `restore/`, where a file's missing snapshot
+    /// would block it.
+    #[test]
+    fn a_terminated_directory_session_records_its_earlier_mode_without_a_snapshot() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".vault");
+        std::fs::create_dir(&dest).expect("the prior directory");
+        fs::set_mode(&dest, Mode::DEFAULT_DIR).expect("its prior mode");
+        let request = dir_to(home.path(), ".vault", Mode::PRIVATE_DIR);
+        let portable = request.target.clone();
+        interrupted(&state, home.path(), vec![request]);
+        seal(&state.journal(), 1);
+        let empty = state.restore().join(crate::state::dir_digest().to_hex());
+        std::fs::remove_file(&empty).expect("delete the empty blob");
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 }
+        );
+        let entry = LedgerView::read(&state, home.path())
+            .expect("ledger")
+            .value
+            .get(&portable)
+            .cloned()
+            .expect("recorded");
+        assert_eq!(entry.mechanism, Mechanism::Dir);
+        assert_eq!(entry.mode, Mode::PRIVATE_DIR);
+        let Prior::Existed(reference) = entry.prior else {
+            panic!("the directory was there before: {:?}", entry.prior);
+        };
+        assert_eq!(reference.mode, Mode::DEFAULT_DIR);
     }
 
     /// The crashing half of [`a_killed_rm_rolls_back_into_the_directory_it_found`]:

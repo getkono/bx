@@ -154,7 +154,7 @@ use super::values::{
 };
 use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
-use crate::shell::activation::{self, ActivationDecl};
+use crate::shell::activation::ActivationDecl;
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
 use crate::shell::keybindings::Keybindings;
@@ -413,11 +413,11 @@ impl Section {
             Self::Target => super::target::SECTION,
             Self::Value => super::values::DECL_SECTION,
             Self::Env => super::env::SECTION,
-            Self::Alias => crate::shell::alias::SECTION,
-            Self::Function => crate::shell::function::SECTION,
-            Self::Plugin => plugin::SECTION,
-            Self::Source => crate::shell::source::SECTION,
-            Self::Activation => activation::SECTION,
+            Self::Alias => super::alias::SECTION,
+            Self::Function => super::function::SECTION,
+            Self::Plugin => super::plugin::SECTION,
+            Self::Source => super::source::SECTION,
+            Self::Activation => super::activation::SECTION,
             Self::Tool => super::tool::SECTION,
             Self::External => super::external::SECTION,
         }

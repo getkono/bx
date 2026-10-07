@@ -20,17 +20,23 @@
 //! binary through one install channel, so a repo and a binary are versioned
 //! together, and a silent no-op is the failure mode this tool exists to end.
 
+pub mod activation;
+pub mod alias;
 pub mod env;
 pub mod external;
+pub mod function;
 pub mod history;
+pub mod keybindings;
 pub mod layers;
 pub mod merge;
 pub mod origin;
 pub mod path;
+pub mod plugin;
 pub mod resolution;
 pub mod resolve;
 pub mod secrets;
 pub mod shell_options;
+pub mod source;
 pub mod target;
 pub mod tool;
 pub mod tree;
@@ -40,7 +46,7 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::{activation, alias, function, keybindings, plugin, source};
+use crate::shell::Shells;
 use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
@@ -102,7 +108,7 @@ pub struct Config {
     /// `[[activation]]`'s entries, keyed by `name`, in the order written: the
     /// declared tool activations, run at `plan` time and cached. See
     /// [`crate::shell::activation`].
-    pub activations: Vec<activation::ActivationDecl>,
+    pub activations: Vec<crate::shell::activation::ActivationDecl>,
     /// `[[tool]]`'s entries, keyed by `name`, in the order written: the
     /// declared tool inventory `bx doctor` reports on and never installs. See
     /// [`tool`].
@@ -1001,6 +1007,23 @@ impl<'a> Ctx<'a> {
                     })
             })
             .collect()
+    }
+
+    /// Read `shells` from `table`, or [`Shells::EVERY`] when it is absent.
+    /// `owner` names the entry, as the message for a bad list opens with.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] for a value that is not an array of strings, and
+    /// [`Error::BadValue`] for an empty list or a name that is not a shell bx
+    /// generates for.
+    pub(crate) fn shells_at(&self, table: &Table, owner: &str) -> Result<Shells, Error> {
+        if table.get(Shells::KEY).is_none() {
+            return Ok(Shells::EVERY);
+        }
+        let names = self.str_array_at(table, Shells::KEY)?;
+        Shells::from_names(&names)
+            .map_err(|problem| self.bad(table, Shells::KEY, format!("{owner}: {problem}")))
     }
 }
 

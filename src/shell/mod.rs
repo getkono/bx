@@ -246,26 +246,6 @@ impl Shells {
         }
     }
 
-    /// Read `shells` from `table`, or [`Shells::EVERY`] when it is absent.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::config::Error::WrongType`] for a value that is not an array
-    /// of strings, and [`crate::config::Error::BadValue`] for an empty list
-    /// or a name that is not a shell bx generates for.
-    pub(crate) fn parse_in(
-        ctx: &crate::config::Ctx<'_>,
-        table: &toml_edit::Table,
-        owner: &str,
-    ) -> Result<Self, crate::config::Error> {
-        if table.get(Self::KEY).is_none() {
-            return Ok(Self::EVERY);
-        }
-        let names = ctx.str_array_at(table, Self::KEY)?;
-        Self::from_names(&names)
-            .map_err(|problem| ctx.bad(table, Self::KEY, format!("{owner}: {problem}")))
-    }
-
     /// The shells `names` spell.
     ///
     /// # Errors

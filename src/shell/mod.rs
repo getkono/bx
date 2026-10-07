@@ -116,6 +116,7 @@ pub mod function;
 pub mod keybindings;
 pub mod plugin;
 pub mod source;
+pub mod update_prompt;
 
 /// Running generated shell text in a real shell, for the submodules' tests.
 #[cfg(test)]

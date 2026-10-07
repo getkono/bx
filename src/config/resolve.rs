@@ -356,6 +356,13 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
         .iter()
         .find(|a| a.enabled && a.command_for(Shell::Zsh).is_some())
         .map(|a| &a.origin);
+    // The first external that follows a branch: the interactive file asks
+    // about its updates, and is placed for that alone when nothing else is.
+    let followed_origin = merged
+        .externals
+        .iter()
+        .find(|external| external.follows().is_some())
+        .map(|external| &external.origin);
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
@@ -402,7 +409,10 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
             (None, None, None, None, None, Some(table), _) => table.clone(),
             (None, None, None, None, None, None, Some(source)) => source.origin.clone(),
             (None, None, None, None, None, None, None) => {
-                match activation_origin.filter(|_| place == Place::Zshrc) {
+                match activation_origin
+                    .or(followed_origin)
+                    .filter(|_| place == Place::Zshrc)
+                {
                     Some(origin) => origin.clone(),
                     None => continue,
                 }
@@ -438,7 +448,8 @@ fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution
                         .with_aliases(declared)
                         .with_functions(bodies.clone())
                         .with_sources(sourced.clone())
-                        .with_omitted(crate::shell::omitted(Shell::Zsh, merged)),
+                        .with_omitted(crate::shell::omitted(Shell::Zsh, merged))
+                        .with_update_prompt(followed_origin.is_some()),
                 )),
                 other => other,
             };
@@ -1860,6 +1871,41 @@ mod tests {
         }
         // A shared prefix that is not a parent is no overlap.
         assert!(resolved(&format!("{}{}", external("~/a"), external("~/ab")), None).is_ok());
+    }
+
+    #[test]
+    fn a_followed_external_places_the_update_prompt_and_a_pinned_one_does_not() {
+        let interactive = |text: &str| -> Option<String> {
+            let resolved = resolved(text, None).unwrap();
+            resolved
+                .targets
+                .iter()
+                .find_map(|resolution| match resolution {
+                    Resolution::Ready(Target {
+                        body: Body::Generated(generated @ Gen::Interactive(_)),
+                        ..
+                    }) => Some(generated.render(&|_| true)),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            interactive(&external("~/a")),
+            None,
+            "a pinned external alone"
+        );
+
+        let followed = "[[external]]\npath = \"~/a\"\nurl = \"https://h/o/a\"\nbranch = \"main\"\n";
+        let file = interactive(followed).expect("placed for the prompt alone");
+        assert!(file.contains("precmd_functions+=(__bx_update)"), "{file}");
+
+        let alias = "[[alias]]\nname = \"ll\"\ncommand = \"ls -l\"\n";
+        let without = interactive(&format!("{alias}{}", external("~/a"))).expect("an alias");
+        assert!(!without.contains("__bx_update"), "{without}");
+        let with = interactive(&format!("{alias}{followed}")).expect("an alias");
+        assert!(
+            with.contains("alias ll") && with.contains("__bx_update"),
+            "{with}"
+        );
     }
 
     #[test]

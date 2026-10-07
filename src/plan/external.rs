@@ -964,9 +964,17 @@ mod tests {
         .expect("rm")
     }
 
+    /// The one row that is not the interactive zsh file a followed external
+    /// places for its update prompt, or the `~/.zshrc` region sourcing it.
     fn only(report: &Report) -> &Change {
-        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
-        &report.changes[0]
+        let rows: Vec<&Change> = report.changes.iter().filter(|row| !shell(row)).collect();
+        assert_eq!(rows.len(), 1, "{:?}", report.changes);
+        rows[0]
+    }
+
+    /// Whether `row` is the generated interactive zsh file or its region.
+    fn shell(row: &Change) -> bool {
+        row.target == "~/.zshrc" || row.target.starts_with("~/.local/share/bx/")
     }
 
     #[test]
@@ -1819,7 +1827,26 @@ mod tests {
         report
             .changes
             .iter()
+            .filter(|row| !shell(row))
             .map(|row| (row.target.clone(), row.action))
+            .collect()
+    }
+
+    /// The row for `target`.
+    fn row<'a>(report: &'a Report, target: &str) -> &'a Change {
+        report
+            .changes
+            .iter()
+            .find(|row| row.target == target)
+            .unwrap_or_else(|| panic!("no row for {target}: {:?}", rows(report)))
+    }
+
+    /// The targets of the rows `report` stopped short of.
+    fn stopped(report: &Report) -> Vec<&str> {
+        report
+            .stopped
+            .iter()
+            .map(|&at| report.changes[at].target.as_str())
             .collect()
     }
 
@@ -1842,7 +1869,10 @@ mod tests {
                 ("~/.claude/skills/*".to_string(), Action::Create),
             ]
         );
-        let note = planned.changes[1].note.as_deref().expect("a note");
+        let note = row(&planned, "~/.claude/skills/*")
+            .note
+            .as_deref()
+            .expect("a note");
         assert!(
             note.contains(&format!("`skills/*` holding `SKILL.md` in ~/{AT} at {rev}")),
             "{note}"
@@ -1880,7 +1910,7 @@ mod tests {
             "{:?}",
             rows(&again)
         );
-        assert_eq!(again.changes.len(), 3, "the external and its two children");
+        assert_eq!(rows(&again).len(), 3, "the external and its two children");
 
         // A child the next commit adds is listed offline once it is fetched,
         // and one it drops is left as bx made it, for `bx rm` to release.
@@ -1920,8 +1950,16 @@ mod tests {
         let missing = "c".repeat(40);
         lock(&home, URL, "master", &missing);
         let applied = apply(&home, &linking("master"));
-        assert_eq!(applied.stopped, [0, 1], "{:?}", rows(&applied));
-        let note = applied.changes[1].note.as_deref().expect("a note");
+        assert_eq!(
+            stopped(&applied),
+            [format!("~/{AT}").as_str(), "~/.claude/skills/*"],
+            "{:?}",
+            rows(&applied)
+        );
+        let note = row(&applied, "~/.claude/skills/*")
+            .note
+            .as_deref()
+            .expect("a note");
         assert!(note.contains("does not hold"), "{note}");
         assert!(!home.child(".claude").exists());
     }

@@ -718,7 +718,9 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     }
 
     if let (Some(ledger), Some(home)) = (ledger.as_mut(), home) {
-        journal::hand_off_claims(ledger, home, &released)?;
+        ledger
+            .hand_off_claims(home, &released)
+            .map_err(journal::Error::from)?;
     }
 
     if let Some(ledger) = &mut ledger {
@@ -991,7 +993,7 @@ fn decide(
         // A directory's earlier state is its mode alone; there is no snapshot
         // to read.
         Prior::Existed(reference) if intent.dir => PriorBytes::Bytes {
-            bytes: journal::DIR_BYTES.to_vec(),
+            bytes: crate::state::DIR_BYTES.to_vec(),
             mode: reference.mode,
         },
         Prior::Existed(reference) => match snapshot(state, reference, spelling)? {
@@ -1201,7 +1203,7 @@ fn standing(intent: &Intent, found: &Found) -> Standing {
         (Found::Absent, _, _) => None,
         (Found::File { digest, mode }, false, false)
         | (Found::Link { digest, mode }, false, true) => Some((digest, mode)),
-        (Found::Dir { mode }, true, false) => Some((journal::dir_digest(), mode)),
+        (Found::Dir { mode }, true, false) => Some((crate::state::dir_digest(), mode)),
         (Found::File { .. } | Found::Dir { .. } | Found::Link { .. } | Found::Foreign, _, _) => {
             return Standing::Foreign;
         }

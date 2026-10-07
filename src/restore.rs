@@ -630,7 +630,9 @@ fn remove_clone(
         Restoration::AlreadyGone { dest } => {
             let claims: Vec<PathBuf> = entry.created_dirs.iter().map(|d| d.render(home)).collect();
             let _ = ledger.forget(&target);
-            journal::hand_off_claims(ledger, home, &claims)?;
+            ledger
+                .hand_off_claims(home, &claims)
+                .map_err(journal::Error::from)?;
             ledger.save().map_err(journal::Error::from)?;
             Ok(Restored::AlreadyGone { target, dest })
         }
@@ -652,8 +654,12 @@ fn remove_clone(
                 })?;
             }
             let _ = ledger.forget(&target);
-            journal::prune_claims(ledger, home, &created_dirs)?;
-            journal::hand_off_claims(ledger, home, &created_dirs)?;
+            ledger
+                .prune_claims(home, &created_dirs)
+                .map_err(journal::Error::from)?;
+            ledger
+                .hand_off_claims(home, &created_dirs)
+                .map_err(journal::Error::from)?;
             ledger.save().map_err(journal::Error::from)?;
             Ok(Restored::Removed { target, dest })
         }

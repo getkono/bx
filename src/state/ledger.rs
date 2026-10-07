@@ -62,7 +62,7 @@ pub enum Mechanism {
     /// A directory has no bytes, so an entry attached this way records the
     /// digest of the empty string as [`LedgerEntry::written`], and a
     /// [`Prior::Existed`] names the directory's earlier mode against the empty
-    /// blob. [`crate::journal::DIR_BYTES`] is that convention's one spelling.
+    /// blob. [`DIR_BYTES`] is that convention's one spelling.
     Dir,
     /// bx owns a symlink it made: the link itself, never what it points at.
     ///
@@ -254,6 +254,34 @@ impl PriorBytes {
             _ => Self::Absent,
         }
     }
+}
+
+/// The bytes a directory stands for in a record: none.
+///
+/// A directory target's ledger entry and journal intents name it by the digest
+/// of these bytes and by its mode, so the shapes that describe a file describe
+/// a directory without a second vocabulary. The [`Mechanism`] or
+/// [`crate::journal::Intent::dir`] beside them says which is meant.
+pub const DIR_BYTES: &[u8] = b"";
+
+/// The digest a directory is recorded under: that of [`DIR_BYTES`].
+#[must_use]
+pub fn dir_digest() -> ContentHash {
+    ContentHash::of(DIR_BYTES)
+}
+
+/// A directory's earlier state at `mode`, in the shape a [`Prior`] takes.
+///
+/// No blob is stored for it: a directory's rollback is a `chmod` or a
+/// `mkdir`, which reads no bytes. [`Ledger::record`] stores the empty blob
+/// itself when the ledger adopts this as an entry's prior.
+#[must_use]
+pub fn dir_prior(mode: Mode) -> Prior {
+    Prior::Existed(RestoreRef {
+        digest: dir_digest(),
+        mode,
+        len: 0,
+    })
 }
 
 /// A target to record, before its prior bytes have been stored.
@@ -707,6 +735,44 @@ impl LedgerView {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Remove each of `dirs` that is empty and that no entry this ledger holds
+    /// names, deepest first.
+    ///
+    /// `dirs` are claims — possibly several targets' — so unlike
+    /// [`crate::fs::remove::prune_dirs`] a directory that is not empty does not
+    /// stop the walk: it is skipped and the rest are tried. Its parents are
+    /// not empty either, so they stay too. A claim that is no longer a
+    /// directory is skipped the same way, and dropped with its target. A
+    /// directory an entry names is somebody's target, whoever claimed it, and
+    /// is never removed here.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::fs::remove::Error`] for a failure that is neither "already
+    /// gone", "not empty" nor "not a directory".
+    pub(crate) fn prune_claims<'a>(
+        &self,
+        home: &Path,
+        dirs: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> Result<(), crate::fs::remove::Error> {
+        let named: std::collections::HashSet<PathBuf> =
+            self.iter().map(|(path, _)| path.render(home)).collect();
+        let mut dirs: Vec<&PathBuf> = dirs.into_iter().collect();
+        dirs.sort_by(|a, b| {
+            b.components()
+                .count()
+                .cmp(&a.components().count())
+                .then_with(|| a.cmp(b))
+        });
+        dirs.dedup();
+        for dir in dirs {
+            if !named.contains(dir) {
+                crate::fs::remove::remove_if_empty(dir)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1280,6 +1346,77 @@ impl Ledger {
     /// the file it locked is still the lock file.
     fn check_lock(&self) -> Result<(), Error> {
         super::dir::check_held(&self.dir.ledger(), &self.lock)
+    }
+
+    /// Give each claimed directory that still stands to an entry this ledger
+    /// holds beneath it, so the `rm` that removes that entry prunes it.
+    ///
+    /// The heir is the first entry, in the ledger's own order, whose target is
+    /// strictly inside the directory. A directory no entry is beneath — one only
+    /// the user's files keep — is claimed by nobody from here on, and stays. The
+    /// claim is merged by [`Ledger::record`] with the heir's digest, mode and
+    /// mechanism as they are and no prior, which keeps the stored prior and
+    /// every superseded snapshot.
+    ///
+    /// Bookkeeping only: no destination is touched. [`crate::recover`] runs the
+    /// same hand-off when it rebuilds a terminated journal's ledger, so a crash
+    /// between the `End` frame and the save loses no claim.
+    ///
+    /// # Errors
+    ///
+    /// What [`Ledger::record`] returns when it refuses the re-record, and
+    /// [`Error::Write`] with [`crate::fs::Error::NotPortable`] for a directory
+    /// that cannot be made portable.
+    pub(crate) fn hand_off_claims<'a>(
+        &mut self,
+        home: &Path,
+        dirs: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> Result<(), Error> {
+        let mut dirs: Vec<&PathBuf> = dirs.into_iter().collect();
+        dirs.sort();
+        dirs.dedup();
+        for dir in dirs {
+            if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+                continue;
+            }
+            let Some(heir) = self
+                .iter()
+                .find(|(path, _)| {
+                    let at = path.render(home);
+                    at != *dir && at.starts_with(dir)
+                })
+                .map(|(_, entry)| entry.clone())
+            else {
+                continue;
+            };
+            let claim = crate::paths::Portable::from_path(dir, home).map_err(|source| {
+                crate::fs::Error::NotPortable {
+                    path: dir.clone(),
+                    source,
+                }
+            })?;
+            if heir.created_dirs.contains(&claim) {
+                continue;
+            }
+            tracing::debug!(
+                dir = %dir.display(),
+                heir = %heir.path,
+                "handed a directory bx created to an entry still beneath it",
+            );
+            // `Absent` states no prior, and on a re-record `record` never lets an
+            // incoming `Absent` replace the stored one, so the heir keeps its own.
+            self.record(
+                NewEntry::new(
+                    heir.path,
+                    heir.written,
+                    heir.mode,
+                    heir.mechanism,
+                    PriorBytes::Absent,
+                )
+                .with_created_dirs(vec![claim]),
+            )?;
+        }
+        Ok(())
     }
 }
 

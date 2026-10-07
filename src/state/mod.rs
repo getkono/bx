@@ -112,8 +112,8 @@ pub use fingerprint::{Fingerprint, Fingerprints};
 pub use hash::ContentHash;
 pub use ledger::RestoreRef;
 pub use ledger::{
-    Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, Withdrawal,
-    clone_written,
+    DIR_BYTES, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, Withdrawal,
+    clone_written, dir_digest, dir_prior,
 };
 pub use lock::{ExclusiveLock, Holder, SharedLock};
 pub use store::{Damage, Health, Loaded, MAX_STATE_FILE, Unlisted};

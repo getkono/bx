@@ -133,7 +133,17 @@ fn confirm() -> Result<bool, Error> {
     inquire::Confirm::new("Apply these changes?")
         .with_default(false)
         .prompt()
-        .map_err(Error::from_prompt)
+        .map_err(confirmation_failed)
+}
+
+/// What a confirmation prompt's failure is: [`Error::Canceled`] when it was
+/// [`init::abandoned`], [`Error::Prompt`] otherwise.
+fn confirmation_failed(error: inquire::InquireError) -> Error {
+    if init::abandoned(&error) {
+        Error::Canceled
+    } else {
+        Error::Prompt(error)
+    }
 }
 
 /// [`apply`], with the question asked through `ask`.
@@ -776,6 +786,22 @@ mod tests {
             matches!(answer, Err(Error::Prompt(inquire::InquireError::NotTTY))),
             "{answer:?}"
         );
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_at_the_confirmation_are_a_cancel_and_every_other_failure_is_an_error() {
+        use inquire::InquireError;
+
+        for key in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            assert!(matches!(confirmation_failed(key), Error::Canceled));
+        }
+        assert!(matches!(
+            confirmation_failed(InquireError::NotTTY),
+            Error::Prompt(InquireError::NotTTY)
+        ));
     }
 
     #[test]

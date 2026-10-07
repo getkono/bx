@@ -305,27 +305,6 @@ pub enum Error {
     Output(#[source] std::io::Error),
 }
 
-/// Whether a prompt ended because the person at it pressed Esc or Ctrl-C,
-/// rather than because it could not be asked.
-pub(crate) const fn abandoned(error: &inquire::InquireError) -> bool {
-    matches!(
-        error,
-        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted
-    )
-}
-
-impl Error {
-    /// What a confirmation prompt's failure is: [`Error::Canceled`] when it
-    /// was [`abandoned`], [`Error::Prompt`] otherwise.
-    pub(crate) fn from_prompt(error: inquire::InquireError) -> Self {
-        if abandoned(&error) {
-            Self::Canceled
-        } else {
-            Self::Prompt(error)
-        }
-    }
-}
-
 impl From<config::Error> for Error {
     fn from(error: config::Error) -> Self {
         match error {

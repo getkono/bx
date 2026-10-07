@@ -156,11 +156,20 @@ pub enum Error {
     Output(#[source] std::io::Error),
 }
 
+/// Whether a prompt ended because the person at it pressed Esc or Ctrl-C,
+/// rather than because it could not be asked.
+pub(crate) const fn abandoned(error: &inquire::InquireError) -> bool {
+    matches!(
+        error,
+        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted
+    )
+}
+
 impl Error {
-    /// What a prompt's failure is: [`Error::Canceled`] when it was abandoned,
-    /// [`Error::Prompt`] otherwise.
+    /// What a prompt's failure is: [`Error::Canceled`] when it was
+    /// [`abandoned`], [`Error::Prompt`] otherwise.
     fn from_prompt(error: inquire::InquireError) -> Self {
-        if crate::plan::abandoned(&error) {
+        if abandoned(&error) {
             Self::Canceled
         } else {
             Self::Prompt(error)
@@ -662,22 +671,9 @@ pub(crate) mod tests {
         ] {
             assert!(matches!(Error::from_prompt(key), Error::Canceled));
         }
-        for key in [
-            InquireError::OperationCanceled,
-            InquireError::OperationInterrupted,
-        ] {
-            assert!(matches!(
-                crate::plan::Error::from_prompt(key),
-                crate::plan::Error::Canceled
-            ));
-        }
         assert!(matches!(
             Error::from_prompt(InquireError::NotTTY),
             Error::Prompt(InquireError::NotTTY)
-        ));
-        assert!(matches!(
-            crate::plan::Error::from_prompt(InquireError::NotTTY),
-            crate::plan::Error::Prompt(InquireError::NotTTY)
         ));
     }
 

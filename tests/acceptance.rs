@@ -732,6 +732,26 @@ fn interactive(machine: &Machine, shell: &str, script: &str) -> Output {
 }
 
 #[test]
+fn every_activation_the_example_declares_ran_the_bench_stub() {
+    // The module doc promises the activations run the stubs and nothing the
+    // developer installed. Each stub's output sets a marker no real tool's
+    // does, so a host binary answering for one leaves its marker unset.
+    let machine = Machine::answered();
+    machine.apply();
+
+    let markers = ["mise", "starship", "zoxide", "fzf"]
+        .map(|tool| format!("[[ -n ${{__bench_{tool}_loaded-}} ]]"))
+        .join(" && ");
+    for shell in ["zsh", "bash"] {
+        let output = interactive(&machine, shell, &markers);
+        assert!(
+            output.status.success(),
+            "{shell} did not source every stub's activation: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn zsh_and_bash_start_cleanly_with_what_bx_generated() {
     let machine = Machine::answered();
     machine.apply();

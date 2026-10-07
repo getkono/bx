@@ -4160,6 +4160,26 @@ mod tests {
     }
 
     #[test]
+    fn bashs_removal_of_a_word_ending_in_a_braced_reference_is_read() {
+        // bash's shape follows the word with a `:`, which zsh would read as a
+        // modifier on an unbraced reference ending it; a braced one ends at
+        // its `}`, so nothing follows it to misread.
+        let bash = |word: &str| format!("{}{word}{}", BASH_REMOVAL.0, BASH_REMOVAL.1);
+        for removed in ["${CARGO_HOME}", "/opt/${TOOL}"] {
+            let line = bash(removed);
+            let Statement::Removal { word } = statement(&line) else {
+                panic!("bash's removal of a braced reference is read: {line:?}");
+            };
+            assert_eq!(word.text, removed);
+        }
+        // The same words unbraced are the ones refused.
+        for refused in ["$CARGO_HOME", "/opt/$TOOL"] {
+            let line = bash(refused);
+            assert!(matches!(statement(&line), Statement::Refused), "{line:?}");
+        }
+    }
+
+    #[test]
     fn a_gate_and_a_removal_are_read_only_in_the_one_shape_each_is_written() {
         let Statement::Gated {
             test,
@@ -6156,6 +6176,20 @@ mod tests {
                     Some(reason),
                     "{value}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_word_opening_with_a_tilde_before_a_break_is_read_from_its_first_slash() {
+        // Split at `:` or `=`, `~:notes/todo.md` is the pieces `~` and
+        // `notes/todo.md`, each judged on its own. Read whole, it opens with a
+        // `~` that is not the home's, and is judged from its first `/`, as its
+        // pieces are, rather than refused as another account's home.
+        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        for value in ["\"nvim ~:notes/todo.md\"", "\"nvim ~=notes/todo.md\""] {
+            for roots in [rooted(), home_rooted.clone()] {
+                assert_eq!(check("EDITOR", value, &roots), Verdict::Allowed, "{value}");
             }
         }
     }

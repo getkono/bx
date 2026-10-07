@@ -92,6 +92,7 @@ pub(super) fn expand(
     home: &Path,
     git: &Git,
     declared: &BTreeSet<&str>,
+    owned: &dyn Fn(&Portable) -> bool,
 ) -> Expansion {
     let mut expansion = Expansion::default();
     let mut taken: BTreeSet<String> = declared.iter().map(|path| (*path).to_string()).collect();
@@ -106,6 +107,14 @@ pub(super) fn expand(
             continue;
         };
         let dest = external.path.render(home);
+        if !owned(&external.path) && dest.exists() {
+            // Someone else's directory, which the external's own row reports
+            // as a conflict: nothing is read from it or linked into it.
+            expansion
+                .held
+                .extend(external.links.iter().map(|link| link.to.clone()));
+            continue;
+        }
         for (index, link) in external.links.iter().enumerate() {
             let Some(children) = children(git, &dest, rev, link) else {
                 expansion.held.push(link.to.clone());
@@ -125,18 +134,7 @@ pub(super) fn expand(
                     Some(target) if taken.insert(target.path.as_str().to_string()) => {
                         expansion.targets.push(Resolution::Ready(target));
                     }
-                    Some(target) => expansion.rows.push(Change {
-                        target: target.path.as_str().to_string(),
-                        origin: link.origin.clone(),
-                        action: Action::Conflict,
-                        diff: None,
-                        note: Some(format!(
-                            "a child of `{}` in {}, which another declaration already puts \
-                             here; the first one keeps it",
-                            from_shown(link),
-                            external.path
-                        )),
-                    }),
+                    Some(target) => expansion.rows.push(taken_row(&target, external, link)),
                     None => {}
                 }
             }
@@ -150,19 +148,29 @@ pub(super) fn expand(
     expansion
 }
 
-/// The targets of one pending link, now that its commit should be here, or
-/// the note for its row when it still is not.
+/// The targets of one pending link, now that its commit should be here, and
+/// a conflict row for each child some declaration already holds; or the note
+/// for its row when the commit still is not here.
 ///
-/// `declared` is every path already decided this run.
+/// `taken` is every path already declared this run, the children of earlier
+/// pending links among them, and each child returned is added to it: the
+/// first declaration keeps a path, as in [`expand`].
 pub(super) fn expand_pending(
     external: &External,
     link: &Link,
     rev: &str,
     home: &Path,
     git: &Git,
-    declared: &BTreeSet<String>,
-) -> Result<Vec<Resolution<Target>>, String> {
+    taken: &mut BTreeSet<String>,
+    owned: bool,
+) -> Result<(Vec<Resolution<Target>>, Vec<Change>), String> {
     let dest = external.path.render(home);
+    if !owned && dest.exists() {
+        return Err(format!(
+            "{} is not a checkout bx cloned, so nothing in it is linked",
+            external.path
+        ));
+    }
     let children = children(git, &dest, rev, link).ok_or_else(|| {
         format!(
             "the checkout at {} does not hold {rev}, so the children of `{}` were not linked",
@@ -170,12 +178,35 @@ pub(super) fn expand_pending(
             from_shown(link)
         )
     })?;
-    Ok(children
+    let mut targets = Vec::new();
+    let mut conflicts = Vec::new();
+    for target in children
         .iter()
         .filter_map(|child| link_target(external, link, child, home))
-        .filter(|target| !declared.contains(target.path.as_str()))
-        .map(Resolution::Ready)
-        .collect())
+    {
+        if taken.insert(target.path.as_str().to_string()) {
+            targets.push(Resolution::Ready(target));
+        } else {
+            conflicts.push(taken_row(&target, external, link));
+        }
+    }
+    Ok((targets, conflicts))
+}
+
+/// The row for a child of `link` whose path another declaration holds.
+fn taken_row(target: &Target, external: &External, link: &Link) -> Change {
+    Change {
+        target: target.path.as_str().to_string(),
+        origin: link.origin.clone(),
+        action: Action::Conflict,
+        diff: None,
+        note: Some(format!(
+            "a child of `{}` in {}, which another declaration already puts here; the first \
+             one keeps it",
+            from_shown(link),
+            external.path
+        )),
+    }
 }
 
 /// The row a pending link shows.
@@ -367,6 +398,7 @@ mod tests {
             home.path(),
             &git(home.path()),
             &BTreeSet::new(),
+            &|_| true,
         );
         assert_eq!(
             links(&expansion),
@@ -397,6 +429,7 @@ mod tests {
             home.path(),
             &git(home.path()),
             &BTreeSet::new(),
+            &|_| true,
         );
         assert_eq!(
             links(&expansion),
@@ -423,6 +456,7 @@ mod tests {
             home.path(),
             &git(home.path()),
             &declared,
+            &|_| true,
         );
         assert_eq!(
             links(&expansion),
@@ -455,6 +489,7 @@ mod tests {
             home.path(),
             &git(home.path()),
             &BTreeSet::new(),
+            &|_| true,
         );
         assert!(expansion.targets.is_empty());
         let held: Vec<&str> = expansion.held.iter().map(Portable::as_str).collect();
@@ -475,20 +510,70 @@ mod tests {
             &absent,
             home.path(),
             &git(home.path()),
-            &BTreeSet::new(),
+            &mut BTreeSet::new(),
+            true,
         )
         .unwrap_err();
         assert!(err.contains("does not hold"), "{err}");
-        let now = expand_pending(
+        let err = expand_pending(
             &ext,
             &ext.links[0],
             &rev,
             home.path(),
             &git(home.path()),
-            &BTreeSet::from(["~/x/z".to_string()]),
+            &mut BTreeSet::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a checkout bx cloned"), "{err}");
+
+        // Each child goes to the first link to name it, and a second is a
+        // conflict row rather than a second write.
+        let mut taken = BTreeSet::from(["~/x/z".to_string()]);
+        let (first, none) = expand_pending(
+            &ext,
+            &ext.links[0],
+            &rev,
+            home.path(),
+            &git(home.path()),
+            &mut taken,
+            true,
         )
         .unwrap();
-        assert_eq!(now.len(), 1);
+        assert_eq!(first.len(), 1);
+        assert!(none.is_empty());
+        let (second, conflicts) = expand_pending(
+            &ext,
+            &ext.links[0],
+            &rev,
+            home.path(),
+            &git(home.path()),
+            &mut taken,
+            true,
+        )
+        .unwrap();
+        assert!(second.is_empty());
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].target, "~/x/a");
+        assert_eq!(conflicts[0].action, Action::Conflict);
+    }
+
+    #[test]
+    fn a_directory_bx_did_not_clone_is_never_read_or_linked_into() {
+        let home = guarded_home();
+        let rev = checkout(&home, &["s/a/f"]);
+        let ext = external(&home, &rev, vec![link(&home, "s", "~/x", None)]);
+        let expansion = expand(
+            &[ext],
+            &Lock::default(),
+            home.path(),
+            &git(home.path()),
+            &BTreeSet::new(),
+            &|_| false,
+        );
+        assert!(expansion.targets.is_empty() && expansion.rows.is_empty());
+        let held: Vec<&str> = expansion.held.iter().map(Portable::as_str).collect();
+        assert_eq!(held, ["~/x"]);
     }
 
     #[test]
@@ -505,6 +590,7 @@ mod tests {
             home.path(),
             &git(home.path()),
             &BTreeSet::new(),
+            &|_| true,
         );
         assert!(expansion.rows.is_empty() && expansion.targets.is_empty());
         assert_eq!(expansion.held.len(), 1);

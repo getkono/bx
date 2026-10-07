@@ -352,6 +352,24 @@ pub enum UpdateMode {
     Snooze,
 }
 
+impl UpdateMode {
+    /// The mode `bx update`'s flags ask for: `--background` over `--snooze`
+    /// over `--check`, though the command line admits no two of them
+    /// together; with none, an update, approved by `--yes`.
+    #[must_use]
+    pub const fn from_flags(yes: bool, check: bool, snooze: bool, background: bool) -> Self {
+        if background {
+            Self::Background
+        } else if snooze {
+            Self::Snooze
+        } else if check {
+            Self::Check
+        } else {
+            Self::Update { yes }
+        }
+    }
+}
+
 /// `bx update`: move followed externals to their branches' new commits.
 ///
 /// [`UpdateMode::Update`] first brings the config repo level with its
@@ -407,6 +425,12 @@ fn update_with(
     if !repo.is_dir() {
         return Err(Error::RepoMissing(repo).into());
     }
+    // Held to the end, so two shells answering `y` at once, or a background
+    // check fetching into a checkout this run moves, never overlap.
+    let state = crate::state::StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
+    let _held = update::Stamps::of(&state)
+        .hold(update::HOLD_WAIT)?
+        .ok_or(update::Error::Busy)?;
     update::refuse_edited_lock(git, &repo)?;
     match sync::pull(env, git) {
         Ok(pulled) if pulled.fast_forwarded > 0 => say(
@@ -435,10 +459,20 @@ fn update_with(
     let inputs = Inputs::load(env)?;
     let externals = &inputs.resolved().externals;
     let chosen = update::select(externals, names, &env.home)?;
-    let looker = git.clone().unattended();
+    let ledger = crate::state::LedgerView::read(inputs.state(), &env.home)
+        .map_err(Error::from)?
+        .value;
+    // Each remote has its own bound, so one that never answers holds the
+    // question up for a minute rather than until someone presses Ctrl-C.
     let found: Vec<update::Found> = chosen
         .iter()
-        .map(|external| update::look(&looker, &env.home, external, inputs.lock()))
+        .map(|external| {
+            let looker = git
+                .clone()
+                .unattended()
+                .with_deadline(std::time::Instant::now() + update::LOOK_BOUND);
+            update::look(&looker, &env.home, external, inputs.lock(), &ledger)
+        })
         .collect();
     for found in &found {
         say(out, &found.summary())?;
@@ -2853,12 +2887,89 @@ mod tests {
                 "the checkout stays at the commit the repo names"
             );
             assert!(!home.child(".claude/skills/b").exists());
-            assert_ne!(
+            assert_eq!(
                 locked(&home).as_deref(),
                 Some(first.as_str()),
-                "written, not committed"
+                "put back as it was, so a later apply moves nothing"
             );
-            let _ = second;
+            assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
+            std::fs::remove_file(&hook).expect("the hook");
+            let mut out = Vec::new();
+            update(&home, true, &mut out).expect("update");
+            assert_eq!(
+                locked(&home).as_deref(),
+                Some(second.as_str()),
+                "{}",
+                text(&out)
+            );
+        }
+
+        #[test]
+        fn a_force_push_past_a_commit_the_checkout_lacks_is_never_locked() {
+            let home = guarded_home();
+            let first = upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            // Another machine locked a commit this checkout never fetched,
+            // and the branch was then rewritten past it.
+            let dir = home.child("upstream");
+            let elsewhere = publish(&home, &["skills/b/SKILL.md"]);
+            let mut lock = Lock::read(&repo, home.path()).expect("bx.lock");
+            let path = lock
+                .iter()
+                .next()
+                .map(|(path, _)| path.clone())
+                .expect("an entry");
+            let mut entry = lock.get(&path).cloned().expect("an entry");
+            entry.rev = elsewhere.clone();
+            lock.set(path, entry);
+            std::fs::write(repo.join("bx.lock"), lock.render()).expect("bx.lock");
+            commit_all(home.path(), &repo, "locked elsewhere");
+            run(home.path(), &dir, &["reset", "--quiet", "--hard", &first]);
+            run(
+                home.path(),
+                &dir,
+                &["reflog", "expire", "--expire=now", "--all"],
+            );
+            run(home.path(), &dir, &["gc", "--quiet", "--prune=now"]);
+            let rewritten = publish(&home, &["skills/z/SKILL.md"]);
+
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("update");
+            assert_eq!(exit, Exit::Pending, "{}", text(&out));
+            assert!(
+                text(&out).contains(&format!("its tip {} does not descend", &rewritten[..12])),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(locked(&home).as_deref(), Some(elsewhere.as_str()));
+        }
+
+        #[test]
+        fn two_links_naming_one_child_converge_in_one_apply() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md", "skills/b/SKILL.md"]);
+            let twice = format!(
+                "{}[[external.link]]\nfrom = \"skills/*\"\nto = \"~/.claude/skills/*\"\n",
+                layer()
+            );
+            cloned(&home, &twice);
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("one apply");
+            assert_eq!(exit, Exit::Pending, "the second link's children conflict");
+            assert!(
+                text(&out).contains("! ~/.claude/skills/a  stopped: a child of `skills/*`"),
+                "{}",
+                text(&out)
+            );
+            assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+            let mut plan_out = Vec::new();
+            plan(&env(home.path()), &mut plan_out).expect("plan");
+            let shown = text(&plan_out);
+            assert!(
+                !shown.contains("  + ") && !shown.contains("  ~ "),
+                "{shown}"
+            );
         }
 
         #[test]
@@ -2991,6 +3102,123 @@ mod tests {
                 due <= update::now() + 24 * 60 * 60,
                 "its own interval: {due}"
             );
+        }
+
+        #[test]
+        fn an_apply_on_a_machine_that_never_ran_update_starts_the_interval() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+            std::fs::remove_dir_all(home.child(".local/state/bx/update")).expect("a new machine");
+            std::fs::remove_file(home.child(".claude/skills/a")).expect("one write to make");
+            apply(&env(home.path()), true, &mut Vec::new()).expect("apply");
+            assert!(Stamps::read(&stamps.ask_due()).is_some(), "seeded");
+            assert!(!stamps.check_due().exists(), "nothing checks on its own");
+        }
+
+        #[test]
+        fn an_auto_only_configuration_is_never_asked_whether_to_check() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(
+                &home,
+                &layer().replace(
+                    "branch = \"master\"\n",
+                    "branch = \"master\"\ncheck = \"auto\"\n",
+                ),
+            );
+            update(&home, true, &mut Vec::new()).expect("update");
+            let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+            assert!(!stamps.ask_due().exists());
+            assert!(Stamps::read(&stamps.check_due()).is_some());
+        }
+
+        #[test]
+        fn a_config_repo_with_no_upstream_is_locked_as_it_stands() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            run(
+                home.path(),
+                &repo,
+                &["branch", "--quiet", "--unset-upstream"],
+            );
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("update");
+            assert_eq!(exit, Exit::Converged, "{}", text(&out));
+            assert!(
+                text(&out).starts_with("The config repo's master has no upstream"),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(
+                run(home.path(), &repo, &["log", "-1", "--format=%s"]),
+                "chore(bx): update bx.lock"
+            );
+        }
+
+        #[test]
+        fn each_flag_asks_for_its_mode() {
+            use UpdateMode::{Background, Check, Snooze, Update};
+            assert_eq!(
+                UpdateMode::from_flags(false, false, false, false),
+                Update { yes: false }
+            );
+            assert_eq!(
+                UpdateMode::from_flags(true, false, false, false),
+                Update { yes: true }
+            );
+            assert_eq!(UpdateMode::from_flags(false, true, false, false), Check);
+            assert_eq!(UpdateMode::from_flags(false, false, true, false), Snooze);
+            assert_eq!(
+                UpdateMode::from_flags(false, false, false, true),
+                Background
+            );
+            assert_eq!(UpdateMode::from_flags(true, true, true, true), Background);
+            assert_eq!(UpdateMode::from_flags(false, true, true, false), Snooze);
+        }
+
+        #[test]
+        fn update_says_it_fast_forwarded_and_declining_locks_nothing() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            // Pushed, as `bx sync` would; then another machine pushed too.
+            run(home.path(), &repo, &["push", "--quiet"]);
+            let other = crate::sync::tests::other(&home);
+            std::fs::write(other.join("notes"), "x\n").expect("a note");
+            commit_all(home.path(), &other, "elsewhere");
+            run(home.path(), &other, &["push", "--quiet"]);
+            publish(&home, &["skills/b/SKILL.md"]);
+            let before = locked(&home);
+            let head = rev(home.path(), &repo, "HEAD");
+
+            let tty = Env {
+                stdin_tty: true,
+                ..env(home.path())
+            };
+            let mut out = Vec::new();
+            update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
+                Ok(false)
+            })
+            .expect("declined");
+            assert!(
+                text(&out)
+                    .starts_with("Fast-forwarded master by 1 commit(s) from origin/master.\n"),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(locked(&home), before, "declined: nothing locked");
+            assert_ne!(rev(home.path(), &repo, "HEAD"), head, "but the pull stands");
+            assert_eq!(
+                run(home.path(), &repo, &["log", "-1", "--format=%s"]),
+                "elsewhere",
+                "no lock commit"
+            );
+            assert!(!home.child(".claude/skills/b").exists());
         }
 
         #[test]

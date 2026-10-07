@@ -57,6 +57,9 @@ const MAX: u64 = 3650 * DAY;
 pub struct Interval(u64);
 
 impl Interval {
+    /// One hour: the shortest interval.
+    pub const HOUR: Self = Self(HOUR);
+
     /// The interval in seconds.
     #[must_use]
     pub const fn seconds(self) -> u64 {

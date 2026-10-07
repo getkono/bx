@@ -134,12 +134,7 @@ fn main() -> Result<()> {
             snooze,
             background,
         }) => {
-            let mode = match (check, snooze, background) {
-                (_, _, true) => bx::command::UpdateMode::Background,
-                (_, true, _) => bx::command::UpdateMode::Snooze,
-                (true, ..) => bx::command::UpdateMode::Check,
-                _ => bx::command::UpdateMode::Update { yes },
-            };
+            let mode = bx::command::UpdateMode::from_flags(yes, check, snooze, background);
             bx::command::update(&env, &paths, mode, &mut out)?
         }
         Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,

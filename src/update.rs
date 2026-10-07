@@ -57,6 +57,9 @@ use crate::sync::{self, Git};
 /// How long `bx update --background` may take, from start to finish.
 pub const BACKGROUND_BOUND: Duration = Duration::from_secs(30);
 
+/// How long a foreground `bx update` waits on one remote.
+pub const LOOK_BOUND: Duration = Duration::from_secs(60);
+
 /// The most commits a move lists by subject.
 const LOG_LIMIT: usize = 20;
 
@@ -82,6 +85,12 @@ pub enum Error {
          one by its `path`, or name none to update them all"
     )]
     NotFollowed(String),
+    /// Another `bx update` holds `update/check.lock`.
+    #[error(
+        "another bx update is running, in this shell or another; let it finish, then run \
+         bx update again"
+    )]
+    Busy,
     /// A file under the state directory could not be written.
     #[error("{}: {source}", .path.display())]
     Write {
@@ -135,6 +144,12 @@ pub enum Verdict {
         /// The tip.
         tip: String,
     },
+    /// The tip differs from the commit locked, and with no checkout of bx's
+    /// there is nothing to show it descends from it.
+    Unproven {
+        /// The tip.
+        tip: String,
+    },
     /// The remote could not be asked.
     Unreachable(String),
 }
@@ -170,6 +185,13 @@ impl Found {
             Verdict::Rewritten { tip } => format!(
                 "{path}: {branch} was rewritten; its tip {} does not descend from {}, so it \
                  is not locked. Pin a commit with `rev` to take it",
+                short(tip),
+                self.locked.as_deref().map_or("the commit locked", short)
+            ),
+            Verdict::Unproven { tip } => format!(
+                "{path}: {branch} is at {}, and with no checkout of bx's there is nothing to \
+                 show it descends from {}, so it is not locked. Run `bx update` again once \
+                 `bx apply` has cloned it",
                 short(tip),
                 self.locked.as_deref().map_or("the commit locked", short)
             ),
@@ -219,8 +241,24 @@ pub fn select<'a>(
 /// Never fails: a remote that cannot be asked is
 /// [`Verdict::Unreachable`], so one external offline does not keep the
 /// others from being looked at.
+///
+/// Only a checkout the ledger records as bx's own finished clone is fetched
+/// into: a directory the user made at the path — which `plan` reports as a
+/// conflict — is never touched, and its remote is asked with `ls-remote`.
+///
+/// A new tip is a move only once it is shown to descend from the commit
+/// locked. When the checkout lacks the locked commit it is fetched by id
+/// first; when that fails — a force-push took it from the remote — or there
+/// is no checkout to ask, nothing can show it, and the verdict is
+/// [`Verdict::Unproven`] or [`Verdict::Rewritten`], never a lock.
 #[must_use]
-pub fn look(git: &Git, home: &Path, external: &External, lock: &Lock) -> Found {
+pub fn look(
+    git: &Git,
+    home: &Path,
+    external: &External,
+    lock: &Lock,
+    ledger: &crate::state::LedgerView,
+) -> Found {
     let follow = external
         .follows()
         .expect("only a followed external is looked at");
@@ -237,7 +275,12 @@ pub fn look(git: &Git, home: &Path, external: &External, lock: &Lock) -> Found {
     };
     let dest = external.path.render(home);
     let reference = format!("refs/heads/{}", follow.branch);
-    let ours = dest.is_dir()
+    let recorded = ledger.get(&external.path).is_some_and(|entry| {
+        entry.mechanism == crate::state::Mechanism::Clone
+            && entry.written != crate::state::clone_written(None)
+    });
+    let ours = recorded
+        && dest.is_dir()
         && checkout::own_checkout(git, &dest).is_ok()
         && matches!(checkout::origin_url(git, &dest), Ok(Some(url)) if url == external.url);
 
@@ -270,12 +313,17 @@ pub fn look(git: &Git, home: &Path, external: &External, lock: &Lock) -> Found {
     if from == tip {
         return found(Verdict::Current);
     }
-    if !ours || !checkout::has_commit(git, &dest, from) {
-        return found(Verdict::Moves {
-            tip,
-            log: None,
-            count: None,
-        });
+    if !ours {
+        return found(Verdict::Unproven { tip });
+    }
+    if !checkout::has_commit(git, &dest, from)
+        && git
+            .query(&dest, &["fetch", "--quiet", "--no-tags", "origin", from])
+            .is_err()
+    {
+        // The remote no longer has the commit locked: its branch was
+        // rewritten past it, whatever the new tip says.
+        return found(Verdict::Rewritten { tip });
     }
     match checkout::is_ancestor(git, &dest, from, &tip) {
         Ok(true) => {
@@ -403,27 +451,53 @@ pub fn refuse_edited_lock(git: &Git, repo: &Path) -> Result<(), Error> {
 ///
 /// [`Error::Write`] when the file cannot be written, and [`Error::Sync`] when
 /// git refuses the commit, as a failing hook makes it.
+///
+/// A commit git refuses puts the file back as it was, and unstages it, so a
+/// later `apply` never moves a checkout to a commit the repo does not name.
+/// Only a run killed between the write and the commit can leave the new
+/// bytes uncommitted, and the next `bx update` refuses to go on until they
+/// are committed or discarded ([`refuse_edited_lock`]).
 pub fn write_and_commit(git: &Git, repo: &Path, lock: &Lock, message: &str) -> Result<bool, Error> {
     let path = Lock::path_in(repo);
-    crate::fs::write_atomically(&path, lock.render().as_bytes(), Mode::DEFAULT_FILE).map_err(
-        |source| Error::Write {
-            path: path.clone(),
-            source,
-        },
-    )?;
+    let prior = std::fs::read(&path).ok();
+    let write = |bytes: &[u8]| {
+        crate::fs::write_atomically(&path, bytes, Mode::DEFAULT_FILE).map_err(|source| {
+            Error::Write {
+                path: path.clone(),
+                source,
+            }
+        })
+    };
+    write(lock.render().as_bytes())?;
     if sync::own_repository(git, repo).is_err() {
         return Ok(false);
     }
-    git.query(repo, &["add", "--", lock::FILE])?;
-    let staged = git.query(repo, &["diff", "--cached", "--name-only", "--", lock::FILE])?;
-    if staged.is_empty() {
-        return Ok(false);
+    let committed = git
+        .query(repo, &["add", "--", lock::FILE])
+        .and_then(|_| git.query(repo, &["diff", "--cached", "--name-only", "--", lock::FILE]))
+        .and_then(|staged| {
+            if staged.is_empty() {
+                return Ok(false);
+            }
+            git.commit(
+                repo,
+                &["commit", "--quiet", "-m", message, "--", lock::FILE],
+            )
+            .map(|_| true)
+        });
+    match committed {
+        Ok(made) => Ok(made),
+        Err(error) => {
+            let _ = git.query(repo, &["reset", "--quiet", "--", lock::FILE]);
+            match &prior {
+                Some(bytes) => write(bytes)?,
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Err(error.into())
+        }
     }
-    git.commit(
-        repo,
-        &["commit", "--quiet", "-m", message, "--", lock::FILE],
-    )?;
-    Ok(true)
 }
 
 /// The update stamps in a state directory's `update/`.
@@ -471,10 +545,10 @@ impl Stamps {
         self.dir.join("last-check")
     }
 
-    /// Set `ask-due` to `now` plus `ask`, `check-due` to `now` plus `check`
-    /// or removed when no external checks on its own, and `available` to
-    /// `available`'s lines, or removed when there are none. A stamp given as
-    /// `None` is left as it is.
+    /// Set `ask-due` to `now` plus `ask`, or removed when no external asks
+    /// first; `check-due` to `now` plus `check`, or removed when no external
+    /// checks on its own; and `available` to `available`'s lines, or removed
+    /// when there are none. A stamp given as `None` is left as it is.
     ///
     /// # Errors
     ///
@@ -483,20 +557,19 @@ impl Stamps {
     pub fn set(
         &self,
         now: Epoch,
-        ask: Option<Interval>,
+        ask: Option<Option<Interval>>,
         check: Option<Option<Interval>>,
         available: Option<&[String]>,
     ) -> Result<(), Error> {
         self.state.ensure_update()?;
-        if let Some(ask) = ask {
-            self.write(&self.ask_due(), &format!("{}\n", now + ask.seconds()))?;
-        }
-        match check {
-            Some(Some(check)) => {
-                self.write(&self.check_due(), &format!("{}\n", now + check.seconds()))?;
+        for (path, interval) in [(self.ask_due(), ask), (self.check_due(), check)] {
+            match interval {
+                Some(Some(interval)) => {
+                    self.write(&path, &format!("{}\n", now + interval.seconds()))?;
+                }
+                Some(None) => self.remove(&path)?,
+                None => {}
             }
-            Some(None) => self.remove(&self.check_due())?,
-            None => {}
         }
         match available {
             Some([]) => self.remove(&self.available())?,
@@ -559,6 +632,17 @@ pub fn check_interval(externals: &[External], default: Interval) -> Option<Inter
         .min()
 }
 
+/// How often a shell asks whether to check: `interval`, when an external in
+/// `externals` follows a branch with `check = "ask"`, and `None` when every
+/// one checks on its own, or none follows a branch.
+#[must_use]
+pub fn ask_interval(externals: &[External], interval: Interval) -> Option<Interval> {
+    externals
+        .iter()
+        .any(|external| matches!(external.follows().map(|f| f.check), Some(Check::Ask)))
+        .then_some(interval)
+}
+
 /// The time now, in seconds since the epoch.
 #[must_use]
 pub fn now() -> Epoch {
@@ -594,27 +678,68 @@ pub fn check(
     git: &Git,
     out: &mut dyn std::io::Write,
 ) -> Result<crate::report::Exit, Error> {
+    let state = StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
+    let stamps = Stamps::of(&state);
+    let now = now();
+    let held = if background {
+        stamps.try_hold()?
+    } else {
+        stamps.hold(HOLD_WAIT)?
+    };
+    let Some(_held) = held else {
+        // A shell's check gives way to any other; a person's says why not.
+        return if background {
+            Ok(crate::report::Exit::Converged)
+        } else {
+            Err(Error::Busy)
+        };
+    };
+    if !background {
+        return looked(env, names, false, git, &stamps, now, out);
+    }
+    // Before anything that can fail, so a configuration that does not load
+    // is retried hourly, not at every new shell's first prompt.
+    stamps.set(now, None, Some(Some(Interval::HOUR)), None)?;
+    let result = looked(env, names, true, git, &stamps, now, out);
+    if let Err(error) = &result {
+        stamps.write(
+            &stamps.last_check(),
+            &format!("the check failed: {error}\n"),
+        )?;
+    }
+    result
+}
+
+/// [`check`], under `update/check.lock`.
+fn looked(
+    env: &crate::plan::Env,
+    names: &[String],
+    background: bool,
+    git: &Git,
+    stamps: &Stamps,
+    now: Epoch,
+    out: &mut dyn std::io::Write,
+) -> Result<crate::report::Exit, Error> {
     let inputs = crate::plan::Inputs::load(env)?;
-    let stamps = Stamps::of(inputs.state());
+    let ledger = crate::state::LedgerView::read(inputs.state(), &env.home)
+        .map_err(crate::plan::Error::from)?
+        .value;
     let externals = &inputs.resolved().externals;
     let interval = inputs.resolved().update.interval();
     let auto = check_interval(externals, interval);
-    let now = now();
-    let _held = if background {
-        let Some(held) = stamps.try_hold()? else {
-            return Ok(crate::report::Exit::Converged);
-        };
+    if background {
         stamps.set(now, None, Some(auto), None)?;
-        Some(held)
-    } else {
-        None
-    };
-    let git = if background {
-        git.clone()
-            .unattended()
-            .with_deadline(std::time::Instant::now() + BACKGROUND_BOUND)
-    } else {
-        git.clone().unattended()
+    }
+    // The whole background run shares one bound; a person's check bounds each
+    // remote on its own.
+    let started = std::time::Instant::now();
+    let git = |started: std::time::Instant| {
+        let bound = if background {
+            started + BACKGROUND_BOUND
+        } else {
+            std::time::Instant::now() + LOOK_BOUND
+        };
+        git.clone().unattended().with_deadline(bound)
     };
     let chosen: Vec<&External> = select(externals, names, &env.home)?
         .into_iter()
@@ -628,7 +753,7 @@ pub fn check(
         .collect();
     let found: Vec<Found> = chosen
         .iter()
-        .map(|external| look(&git, &env.home, external, inputs.lock()))
+        .map(|external| look(&git(started), &env.home, external, inputs.lock(), &ledger))
         .collect();
 
     let looked: Vec<String> = found.iter().map(|f| format!("{}: ", f.path)).collect();
@@ -649,7 +774,8 @@ pub fn check(
         stamps.set(now, None, None, Some(&available))?;
         stamps.write(&stamps.last_check(), &summaries)?;
     } else {
-        stamps.set(now, Some(interval), Some(auto), Some(&available))?;
+        let ask = ask_interval(externals, interval);
+        stamps.set(now, Some(ask), Some(auto), Some(&available))?;
         out.write_all(summaries.as_bytes()).map_err(Error::Output)?;
         if chosen.is_empty() {
             writeln!(out, "No [[external]] follows a branch.").map_err(Error::Output)?;
@@ -674,8 +800,12 @@ pub fn snooze(
 ) -> Result<crate::report::Exit, Error> {
     let inputs = crate::plan::Inputs::load(env)?;
     let interval = inputs.resolved().update.interval();
-    let auto = check_interval(&inputs.resolved().externals, interval);
-    Stamps::of(inputs.state()).set(now(), Some(interval), Some(auto), Some(&[]))?;
+    let externals = &inputs.resolved().externals;
+    let (ask, auto) = (
+        ask_interval(externals, interval),
+        check_interval(externals, interval),
+    );
+    Stamps::of(inputs.state()).set(now(), Some(ask), Some(auto), Some(&[]))?;
     writeln!(
         out,
         "bx will ask about updates again in {interval}; run `bx update` any time before."
@@ -692,8 +822,12 @@ pub fn snooze(
 /// As [`Stamps::set`].
 pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
     let interval = inputs.resolved().update.interval();
-    let auto = check_interval(&inputs.resolved().externals, interval);
-    Stamps::of(inputs.state()).set(now(), Some(interval), Some(auto), Some(&[]))
+    let externals = &inputs.resolved().externals;
+    let (ask, auto) = (
+        ask_interval(externals, interval),
+        check_interval(externals, interval),
+    );
+    Stamps::of(inputs.state()).set(now(), Some(ask), Some(auto), Some(&[]))
 }
 
 /// After an `apply` that wrote: when an external follows a branch and no
@@ -712,9 +846,9 @@ pub fn seed(inputs: &crate::plan::Inputs) {
     }
     let stamps = Stamps::of(inputs.state());
     let interval = inputs.resolved().update.interval();
-    let ask = Stamps::read(&stamps.ask_due())
-        .is_none()
-        .then_some(interval);
+    let ask = ask_interval(externals, interval)
+        .filter(|_| Stamps::read(&stamps.ask_due()).is_none())
+        .map(Some);
     let check = check_interval(externals, interval)
         .filter(|_| Stamps::read(&stamps.check_due()).is_none())
         .map(Some);
@@ -754,7 +888,30 @@ impl Stamps {
             Err(_) => Ok(None),
         }
     }
+
+    /// [`Stamps::try_hold`], trying again for up to `wait`: what a person's
+    /// `bx update` does, so a check another shell is just finishing does not
+    /// turn them away.
+    ///
+    /// # Errors
+    ///
+    /// As [`Stamps::try_hold`].
+    pub fn hold(&self, wait: Duration) -> Result<Option<std::fs::File>, Error> {
+        let until = std::time::Instant::now() + wait;
+        loop {
+            if let Some(held) = self.try_hold()? {
+                return Ok(Some(held));
+            }
+            if std::time::Instant::now() >= until {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
+
+/// How long a person's `bx update` waits for another to let go.
+pub const HOLD_WAIT: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {
@@ -1000,7 +1157,7 @@ mod tests {
         stamps
             .set(
                 1000,
-                Some(day),
+                Some(Some(day)),
                 Some(Some(day)),
                 Some(&["~/a: x".to_string()]),
             )
@@ -1053,20 +1210,67 @@ mod tests {
         external.url = "https://h/o/upstream".to_string();
 
         let tip = crate::sync::tests::rev(home.path(), &repo, "HEAD");
-        let seen = look(&git, home.path(), &external, &Lock::default());
+        let ledger = crate::state::LedgerView::default();
+        let seen = look(&git, home.path(), &external, &Lock::default(), &ledger);
         assert_eq!(
             seen.moves_to(),
             Some(tip.as_str()),
-            "ls-remote, with no checkout"
+            "ls-remote, with no checkout: a first lock needs no ancestry"
+        );
+
+        // A commit locked elsewhere, with no checkout here to show the tip
+        // descends from it: nothing is locked.
+        let mut lock = Lock::default();
+        lock.set(
+            external.path.clone(),
+            Locked {
+                url: external.url.clone(),
+                branch: "main".to_string(),
+                rev: A.to_string(),
+            },
+        );
+        let seen = look(&git, home.path(), &external, &lock, &ledger);
+        assert!(
+            matches!(&seen.verdict, Verdict::Unproven { tip: t } if *t == tip),
+            "{seen:?}"
+        );
+        assert_eq!(seen.moves_to(), None);
+        assert!(
+            seen.summary().contains("is not locked"),
+            "{}",
+            seen.summary()
+        );
+
+        // The user's own clone at the path is never fetched into: without a
+        // ledger entry it is asked with ls-remote, and proves nothing.
+        crate::sync::tests::run(
+            home.path(),
+            home.path(),
+            &["clone", "--quiet", "https://h/o/upstream", "clone"],
+        );
+        let seen = look(&git, home.path(), &external, &lock, &ledger);
+        assert!(matches!(seen.verdict, Verdict::Unproven { .. }), "{seen:?}");
+        assert!(
+            !home.child("clone/.git/FETCH_HEAD").exists(),
+            "nothing was fetched into it"
         );
 
         external.pin = Pin::Follow(Follow {
             branch: "nope".to_string(),
             check: Check::Ask,
         });
-        let seen = look(&git, home.path(), &external, &Lock::default());
+        let seen = look(&git, home.path(), &external, &Lock::default(), &ledger);
         assert!(
             matches!(&seen.verdict, Verdict::Unreachable(why) if why.contains("has no refs/heads/nope")),
+            "{seen:?}"
+        );
+
+        // A remote that is not there at all says what git said, not that a
+        // branch is missing.
+        external.url = "https://h/o/nowhere".to_string();
+        let seen = look(&git, home.path(), &external, &Lock::default(), &ledger);
+        assert!(
+            matches!(&seen.verdict, Verdict::Unreachable(why) if why.contains("`git ls-remote") && !why.contains("has no")),
             "{seen:?}"
         );
     }

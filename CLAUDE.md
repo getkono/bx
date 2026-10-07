@@ -48,7 +48,7 @@ wrong even if it passes CI.
    `the_update_prompt_is_not_an_environment_fragment` holds its bytes to that.
    Nothing holds a *third* such file to it, so the change that generates one
    carries the proof of its own bytes with it. Cached tool activation
-   output is the second admitted non-fragment file, and the one exception to
+   output is the other admitted non-fragment file, and the one exception to
    the no-assignment rule: it is searched by name for every relocating
    variable, and each such assignment is judged by `env_guard`, so a tool's
    own variables that relocate nothing pass and an output with any refused

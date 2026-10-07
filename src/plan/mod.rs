@@ -580,6 +580,7 @@ pub fn run(
             &inputs.home,
             &inputs.git,
             &declared,
+            &|path| finished_clone(&ledger, path),
         )
     };
     targets.append(&mut expansion.targets);
@@ -677,7 +678,7 @@ pub fn run(
                     &bases,
                     &expansion.pending,
                     first_link,
-                    &declared,
+                    declared,
                     &mut report,
                 )?;
             }
@@ -691,6 +692,13 @@ pub fn run(
             Ok(report)
         }
     }
+}
+
+/// Whether the ledger records `path` as a clone bx finished.
+fn finished_clone(ledger: &LedgerView, path: &Portable) -> bool {
+    ledger.get(path).is_some_and(|entry| {
+        entry.mechanism == Mechanism::Clone && entry.written != state::clone_written(None)
+    })
 }
 
 /// The path a target declares: its own, or a held-back one's key.
@@ -718,10 +726,14 @@ fn link_pending(
     bases: &decide::Bases,
     pending: &[links::Pending],
     first_row: usize,
-    declared: &BTreeSet<String>,
+    declared: BTreeSet<String>,
     report: &mut Report,
 ) -> Result<(), Error> {
+    // As the clones left it: a clone this run made is bx's now.
+    let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
+    let mut taken = declared;
     let mut targets = Vec::new();
+    let mut conflicts = Vec::new();
     for pending in pending {
         let external = &inputs.resolved.externals[pending.external];
         let link = &external.links[pending.link];
@@ -731,9 +743,13 @@ fn link_pending(
             &pending.rev,
             &inputs.home,
             &inputs.git,
-            declared,
+            &mut taken,
+            finished_clone(&ledger, &external.path),
         ) {
-            Ok(children) => targets.extend(children),
+            Ok((children, taken_rows)) => {
+                targets.extend(children);
+                conflicts.extend(taken_rows);
+            }
             Err(note) => {
                 let at = first_row + pending.row;
                 report.changes[at].action = Action::Blocked;
@@ -742,10 +758,15 @@ fn link_pending(
             }
         }
     }
+    // Reported, never written: the first declaration keeps the path. Known
+    // only now, so said with the rows apply stopped short of.
+    for conflict in conflicts {
+        report.stopped.push(report.changes.len());
+        report.changes.push(conflict);
+    }
     if targets.is_empty() {
         return Ok(());
     }
-    let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
     let ctx = decide::Ctx {
         ledger: &ledger,
         home: &inputs.home,

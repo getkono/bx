@@ -1949,19 +1949,61 @@ mod tests {
         upstream(&home);
         let missing = "c".repeat(40);
         lock(&home, URL, "master", &missing);
-        let applied = apply(&home, &linking("master"));
+        // Two links, so the second's row is not the first after the
+        // externals: each stopped row is the one its link announced.
+        let layer = format!(
+            "{}[[external.link]]\nfrom = \"*\"\nto = \"~/.other/*\"\n",
+            linking("master")
+        );
+        let applied = apply(&home, &layer);
         assert_eq!(
             stopped(&applied),
-            [format!("~/{AT}").as_str(), "~/.claude/skills/*"],
+            [
+                format!("~/{AT}").as_str(),
+                "~/.claude/skills/*",
+                "~/.other/*"
+            ],
             "{:?}",
             rows(&applied)
         );
-        let note = row(&applied, "~/.claude/skills/*")
-            .note
-            .as_deref()
-            .expect("a note");
-        assert!(note.contains("does not hold"), "{note}");
+        for target in ["~/.claude/skills/*", "~/.other/*"] {
+            let row = row(&applied, target);
+            assert_eq!(row.action, Action::Blocked);
+            let note = row.note.as_deref().expect("a note");
+            assert!(note.contains("does not hold"), "{note}");
+        }
         assert!(!home.child(".claude").exists());
+    }
+
+    #[test]
+    fn a_child_a_target_already_declares_is_a_conflict_it_keeps() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(&home, &["skills/a/SKILL.md", "skills/b/SKILL.md"]);
+        lock(&home, URL, "master", &rev);
+        let layer = format!(
+            "{}[[target]]\npath = \"~/.claude/skills/a\"\ncontent = \"mine\"\n",
+            linking("master")
+        );
+        apply(&home, &layer);
+        assert_eq!(
+            std::fs::read_to_string(home.child(".claude/skills/a")).expect("the target"),
+            "mine"
+        );
+        assert!(home.child(".claude/skills/b/SKILL.md").is_file());
+        let planned = plan(&home, &layer);
+        assert_eq!(
+            row(&planned, "~/.claude/skills/a").action,
+            Action::Unchanged,
+            "the target keeps it"
+        );
+        let conflicts: Vec<&str> = planned
+            .changes
+            .iter()
+            .filter(|row| row.action == Action::Conflict)
+            .map(|row| row.target.as_str())
+            .collect();
+        assert_eq!(conflicts, ["~/.claude/skills/a"], "{:?}", rows(&planned));
     }
 
     #[test]

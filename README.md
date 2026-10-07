@@ -259,9 +259,11 @@ commit — and `bx update` is the only thing that moves it.
 **`bx update`** brings the config repo level with its upstream, asks each
 followed branch where it is now, lists the new commits, and shows the plan the
 new lock would make. Once you approve, it writes and commits `bx.lock` *before*
-it moves any checkout, then applies; `bx sync` pushes the commit. A branch whose
-history was rewritten is reported and never locked. `plan` and `apply` never
-reach the network for a followed external: they read the lock.
+it moves any checkout, then applies; `bx sync` pushes the commit. A new commit
+is locked only once it is shown to descend from the one locked before, so a
+branch whose history was rewritten is reported and never locked. `plan` and
+`apply` never ask a remote where a branch is: they read the lock, and `apply`
+fetches only the commit it names.
 
 **Links.** Each `[[external.link]]` turns every child directory of `from` in
 the locked commit into a symlink of the same name in `to`, so a new skill

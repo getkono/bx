@@ -373,9 +373,18 @@ impl Git {
 fn bounded(command: &mut Command, deadline: Instant) -> Option<std::io::Result<Output>> {
     use std::io::Read as _;
 
+    // A group of its own, so the deadline reaches the `ssh` or
+    // `git-remote-https` git starts for a remote, not only git itself.
+    std::os::unix::process::CommandExt::process_group(command, 0);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return Some(Err(error)),
+    };
+    let group = rustix::process::Pid::from_child(&child);
+    let kill = |child: &mut std::process::Child| {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        let _ = child.kill();
+        let _ = child.wait();
     };
     let read = |stream: Option<Box<dyn std::io::Read + Send>>| {
         std::thread::spawn(move || {
@@ -391,17 +400,16 @@ fn bounded(command: &mut Command, deadline: Instant) -> Option<std::io::Result<O
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    kill(&mut child);
+                    return None;
+                }
+                std::thread::sleep(left.min(Duration::from_millis(10)));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill(&mut child);
                 return Some(Err(error));
             }
         }
@@ -891,10 +899,10 @@ pub(crate) mod tests {
     fn a_command_past_its_deadline_is_killed_and_one_within_it_is_not() {
         let started = Instant::now();
         let mut slow = Command::new("sleep");
-        slow.arg("30").stdout(Stdio::piped()).stderr(Stdio::piped());
+        slow.arg("3").stdout(Stdio::piped()).stderr(Stdio::piped());
         assert!(bounded(&mut slow, started + Duration::from_millis(50)).is_none());
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < Duration::from_secs(2),
             "killed, not waited on"
         );
 

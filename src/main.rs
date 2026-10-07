@@ -1,6 +1,6 @@
 //! The `bx` binary.
 //!
-//! Eleven commands, no manual. Everything the user needs to discover is reachable
+//! Twelve commands, no manual. Everything the user needs to discover is reachable
 //! from `--help` and the prompts in `bx init`.
 
 use std::io::Write as _;
@@ -47,6 +47,25 @@ enum Command {
         /// Write without asking for confirmation
         #[arg(long)]
         yes: bool,
+    },
+    /// Move externals that follow a branch to its new commits: pull, look,
+    /// lock and commit, apply
+    Update {
+        /// Only these externals, by path; every followed one when none
+        paths: Vec<String>,
+        /// Lock, commit and apply without asking for confirmation
+        #[arg(long, conflicts_with_all = ["check", "snooze"])]
+        yes: bool,
+        /// Only look and report: exit 0 when nothing is new, 2 when
+        /// something is; locks, commits and applies nothing
+        #[arg(long, conflicts_with = "snooze")]
+        check: bool,
+        /// Ask again only after the next interval; reaches no network
+        #[arg(long, conflicts_with = "paths")]
+        snooze: bool,
+        /// The interactive shell's own quiet, bounded check
+        #[arg(long, hide = true, conflicts_with_all = ["yes", "check", "snooze", "paths"])]
+        background: bool,
     },
     /// List declared secrets, and whether each decrypts here
     Secret {
@@ -108,6 +127,21 @@ fn main() -> Result<()> {
         Some(Command::Plan) => bx::command::plan(&env, &mut out)?,
         Some(Command::Apply { yes }) => bx::command::apply(&env, yes, &mut out)?,
         Some(Command::Sync { yes }) => bx::command::sync(&env, yes, &mut out)?,
+        Some(Command::Update {
+            paths,
+            yes,
+            check,
+            snooze,
+            background,
+        }) => {
+            let mode = match (check, snooze, background) {
+                (_, _, true) => bx::command::UpdateMode::Background,
+                (_, true, _) => bx::command::UpdateMode::Snooze,
+                (true, ..) => bx::command::UpdateMode::Check,
+                _ => bx::command::UpdateMode::Update { yes },
+            };
+            bx::command::update(&env, &paths, mode, &mut out)?
+        }
         Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,
         Some(Command::Secret {
             action: SecretAction::List,

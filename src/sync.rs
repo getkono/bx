@@ -55,7 +55,8 @@
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::paths;
 use crate::plan::{self, Env, Report};
@@ -89,6 +90,12 @@ pub enum Error {
         /// Why it could not be started.
         #[source]
         source: std::io::Error,
+    },
+    /// `git` ran past the deadline it was given, and was killed.
+    #[error("`git {args}` did not finish in time, and was stopped")]
+    TimedOut {
+        /// The arguments it was given.
+        args: String,
     },
     /// `git` ran and failed.
     #[error("`git {args}` failed ({status}){}", stderr_suffix(.stderr))]
@@ -208,6 +215,8 @@ pub struct Git {
     home: PathBuf,
     xdg_config_home: Option<OsString>,
     extra: Vec<(OsString, OsString)>,
+    /// When every command must have finished, or `None` for no bound.
+    deadline: Option<Instant>,
 }
 
 impl Git {
@@ -219,6 +228,7 @@ impl Git {
             home: env.home.clone(),
             xdg_config_home: env.xdg_config_home.clone(),
             extra: Vec::new(),
+            deadline: None,
         }
     }
 
@@ -234,6 +244,7 @@ impl Git {
             home: home.to_path_buf(),
             xdg_config_home: None,
             extra: Vec::new(),
+            deadline: None,
         }
     }
 
@@ -261,6 +272,18 @@ impl Git {
             .with_env("SSH_ASKPASS", "false")
             .with_env("SSH_ASKPASS_REQUIRE", "force")
             .with_env("GCM_INTERACTIVE", "never")
+    }
+
+    /// The same `git`, every command killed and failed with
+    /// [`Error::TimedOut`] once `deadline` passes.
+    ///
+    /// For a run nobody is waiting on — `bx update --background` — whose
+    /// network has to be bounded: a remote that accepts the connection and
+    /// never answers would otherwise hold it until the next boot.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     /// Set `name` to `value` in every child as well.
@@ -300,14 +323,19 @@ impl Git {
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        let output = self
-            .command(repo, args)
-            .stdin(stdin)
-            .output()
-            .map_err(|source| Error::Spawn {
-                args: shown.clone(),
-                source,
-            })?;
+        let mut command = self.command(repo, args);
+        command.stdin(stdin);
+        let output = match self.deadline {
+            None => command.output(),
+            Some(deadline) => match bounded(&mut command, deadline) {
+                Some(output) => output,
+                None => return Err(Error::TimedOut { args: shown }),
+            },
+        }
+        .map_err(|source| Error::Spawn {
+            args: shown.clone(),
+            source,
+        })?;
         if !output.status.success() {
             return Err(Error::Git {
                 args: shown,
@@ -325,11 +353,64 @@ impl Git {
         self.output(repo, &args, Stdio::null())
     }
 
+    /// A `git commit`, with standard input inherited so the user's own hooks
+    /// and signing can ask what they ask on any commit they make.
+    pub(crate) fn commit(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
+        self.remote(repo, args)
+    }
+
     /// A command that may reach the remote.
     fn remote(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         self.output(repo, &args, Stdio::inherit())
     }
+}
+
+/// Run `command` to its end, or kill it once `deadline` passes.
+///
+/// `None` when it was killed. Each stream is read on its own thread, so a
+/// child that fills one pipe while this waits on the other cannot stall.
+fn bounded(command: &mut Command, deadline: Instant) -> Option<std::io::Result<Output>> {
+    use std::io::Read as _;
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Some(Err(error)),
+    };
+    let read = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = read(child.stdout.take().map(|s| Box::new(s) as _));
+    let stderr = read(child.stderr.take().map(|s| Box::new(s) as _));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(Err(error));
+            }
+        }
+    };
+    Some(Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    }))
 }
 
 /// The branch's upstream, as git's configuration names it.
@@ -562,7 +643,7 @@ fn refuse_state_in_repo(repo: &Path, state: &Path) -> Result<(), Error> {
 /// all, or a directory inside some other repository, whose history `sync`
 /// must not pull into or push from. A `git` that cannot be started at all is
 /// [`Error::Spawn`], not a missing repository: `git init` would not help.
-fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
+pub(crate) fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
     let top = match git.query(repo, &["rev-parse", "--show-toplevel"]) {
         Ok(top) => top,
         Err(error @ Error::Spawn { .. }) => return Err(error),
@@ -804,6 +885,47 @@ pub(crate) mod tests {
     /// The commit `rev` names in `dir`.
     pub(crate) fn rev(home: &Path, dir: &Path, rev: &str) -> String {
         run(home, dir, &["rev-parse", rev])
+    }
+
+    #[test]
+    fn a_command_past_its_deadline_is_killed_and_one_within_it_is_not() {
+        let started = Instant::now();
+        let mut slow = Command::new("sleep");
+        slow.arg("30").stdout(Stdio::piped()).stderr(Stdio::piped());
+        assert!(bounded(&mut slow, started + Duration::from_millis(50)).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "killed, not waited on"
+        );
+
+        let mut quick = Command::new("sh");
+        quick
+            .args(["-c", "echo out; echo err >&2; exit 3"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = bounded(&mut quick, Instant::now() + Duration::from_secs(30))
+            .expect("in time")
+            .expect("ran");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+
+        let mut missing = Command::new("/nonexistent/bx-test");
+        assert!(matches!(
+            bounded(&mut missing, Instant::now() + Duration::from_secs(1)),
+            Some(Err(_))
+        ));
+
+        let home = guarded_home();
+        let error = git(home.path())
+            .with_deadline(Instant::now())
+            .query(home.path(), &["version"]);
+        if let Err(error) = error {
+            assert!(
+                error.to_string().contains("did not finish in time"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

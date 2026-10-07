@@ -131,6 +131,7 @@ pub mod state;
 pub mod sync;
 #[doc(hidden)]
 pub mod testing;
+pub mod update;
 pub mod upgrade;
 pub mod version;
 

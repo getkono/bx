@@ -25,6 +25,7 @@ use crate::report::{Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
 use crate::sync;
+use crate::update;
 use crate::upgrade;
 
 /// `bx self-upgrade`: install the latest release over the running binary, as
@@ -165,20 +166,43 @@ fn converge(
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Report, Error> {
     let inputs = Inputs::load(env)?;
+    let report = converge_inputs(&inputs, env, mode, yes, out, ask, &mut |approved| approved)?;
+    // A machine that just began following a branch starts its interval now,
+    // so its shells ask once it has passed rather than never.
+    if report.executed {
+        update::seed(&inputs);
+    }
+    Ok(report)
+}
+
+/// [`converge`] over `inputs` already loaded, telling `decided` the answer to
+/// the one question as soon as it is given and writing only when it returns
+/// `true`: the seam `bx update` commits its lock through, between the
+/// approval and the first write.
+fn converge_inputs(
+    inputs: &Inputs,
+    env: &Env,
+    mode: Mode,
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut() -> Result<bool, Error>,
+    decided: &mut dyn FnMut(bool) -> bool,
+) -> Result<Report, Error> {
     let mut shown = false;
-    let report = plan::run(&inputs, mode, &mut |report| {
+    let report = plan::run(inputs, mode, &mut |report| {
         emit(out, report, View::Plan, env)?;
         // On screen before the question about it is put, whatever buffers
         // the output.
         out.flush().map_err(Error::Output)?;
         shown = true;
-        if yes {
-            Ok(true)
+        let approved = if yes {
+            true
         } else if env.stdin_tty {
-            ask()
+            ask()?
         } else {
-            Err(Error::NeedsConfirmation)
-        }
+            return Err(Error::NeedsConfirmation);
+        };
+        Ok(decided(approved))
     })?;
 
     if !shown {
@@ -304,6 +328,191 @@ fn sync_with(
         .map_err(sync::Error::Output)?;
     }
     Ok(plan::exit(&report, Mode::Sync))
+}
+
+/// What `bx update` is asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMode {
+    /// Pull the config repo, look for new commits, show the plan, and on
+    /// approval lock, commit and apply.
+    Update {
+        /// Approve without asking.
+        yes: bool,
+    },
+    /// Look for new commits and say what was found; change nothing but the
+    /// stamps and the objects fetched into checkouts.
+    Check,
+    /// [`UpdateMode::Check`] for the externals set to `check = "auto"`, from
+    /// an interactive shell's prompt hook: quietly, bounded by
+    /// [`update::BACKGROUND_BOUND`], and not at all while another runs.
+    Background,
+    /// Put off the next question by one interval.
+    Snooze,
+}
+
+/// `bx update`: move followed externals to their branches' new commits.
+///
+/// [`UpdateMode::Update`] first brings the config repo level with its
+/// upstream, as `bx sync` does, so the lock it writes is written on top of
+/// every other machine's. It then asks each followed external's remote where
+/// its branch is ([`update::look`]), says what it found, and shows the plan
+/// for the lock that would follow — the same rendering and the same one
+/// confirmation `bx apply` has. Once approved, `bx.lock` is written and
+/// committed **before** any checkout moves, and then the plan is applied: the
+/// work that runs is the work shown. Nothing is pushed; `bx sync` pushes. With
+/// nothing new it still pulls and applies, so the machine ends where the
+/// configuration says.
+///
+/// Without `yes` it needs a terminal to ask on, and refuses before reaching
+/// the network.
+///
+/// # Errors
+///
+/// [`update::Error`] for a refused pull, an edited `bx.lock`, a name that is
+/// not a followed external, a lock that cannot be written or committed, and
+/// as [`apply`].
+pub fn update(
+    env: &Env,
+    names: &[String],
+    mode: UpdateMode,
+    out: &mut dyn Write,
+) -> Result<Exit, update::Error> {
+    let git = sync::Git::new(env);
+    match mode {
+        UpdateMode::Update { yes } => update_with(env, names, yes, out, &git, &mut confirm),
+        UpdateMode::Check => update::check(env, names, false, &git, out),
+        UpdateMode::Background => update::check(env, names, true, &git, out),
+        UpdateMode::Snooze => update::snooze(env, out),
+    }
+}
+
+/// [`update`]'s [`UpdateMode::Update`], through `git`, with the question
+/// asked through `ask`.
+fn update_with(
+    env: &Env,
+    names: &[String],
+    yes: bool,
+    out: &mut dyn Write,
+    git: &sync::Git,
+    ask: &mut dyn FnMut() -> Result<bool, Error>,
+) -> Result<Exit, update::Error> {
+    if !yes && !env.stdin_tty {
+        return Err(Error::NeedsConfirmation.into());
+    }
+    let say =
+        |out: &mut dyn Write, text: &str| writeln!(out, "{text}").map_err(update::Error::Output);
+    let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
+    if !repo.is_dir() {
+        return Err(Error::RepoMissing(repo).into());
+    }
+    update::refuse_edited_lock(git, &repo)?;
+    match sync::pull(env, git) {
+        Ok(pulled) if pulled.fast_forwarded > 0 => say(
+            out,
+            &format!(
+                "Fast-forwarded {} by {} commit(s) from {}.",
+                pulled.branch, pulled.fast_forwarded, pulled.upstream.short
+            ),
+        )?,
+        Ok(_) => {}
+        Err(sync::Error::NoUpstream { branch, .. }) => say(
+            out,
+            &format!(
+                "The config repo's {branch} has no upstream, so there is nothing to pull; \
+                 bx update locks on top of it as it stands."
+            ),
+        )?,
+        Err(sync::Error::NotARepo { .. }) => say(
+            out,
+            "The config repo is not a git repository, so there is nothing to pull or commit; \
+             bx update writes bx.lock there and commits nothing.",
+        )?,
+        Err(other) => return Err(other.into()),
+    }
+
+    let inputs = Inputs::load(env)?;
+    let externals = &inputs.resolved().externals;
+    let chosen = update::select(externals, names, &env.home)?;
+    let looker = git.clone().unattended();
+    let found: Vec<update::Found> = chosen
+        .iter()
+        .map(|external| update::look(&looker, &env.home, external, inputs.lock()))
+        .collect();
+    for found in &found {
+        say(out, &found.summary())?;
+        if let update::Verdict::Moves { log: Some(log), .. } = &found.verdict {
+            for line in log {
+                say(out, &format!("    {}", plan::escape(line)))?;
+            }
+        }
+    }
+
+    let before = inputs.lock().clone();
+    let after = update::proposed(&before, &found, externals);
+    let message = update::message(&before, &after);
+    let changed = after != before;
+    let inputs = inputs.with_lock(after.clone());
+    let mut asked = false;
+    let mut failed: Option<update::Error> = None;
+    let lock = |failed: &mut Option<update::Error>| match update::write_and_commit(
+        git, &repo, &after, &message,
+    ) {
+        Ok(_) => true,
+        Err(error) => {
+            *failed = Some(error);
+            false
+        }
+    };
+    let converged = converge_inputs(&inputs, env, Mode::Apply, yes, out, ask, &mut |approved| {
+        asked = true;
+        // Committed before the first write, so a checkout never stands at a
+        // commit the config repo does not name.
+        approved && (!changed || lock(&mut failed))
+    });
+    let report = match converged {
+        Ok(report) => report,
+        Err(Error::Canceled) => {
+            say(out, "Canceled. Nothing was locked or applied.")?;
+            return Ok(Exit::Canceled);
+        }
+        Err(other) => return Err(other.into()),
+    };
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    // A lock that moves nothing `apply` writes — an entry dropped, or a
+    // checkout that is a conflict either way — is still the user's to approve.
+    if changed && !asked {
+        let approved = if yes {
+            true
+        } else {
+            match ask() {
+                Ok(approved) => approved,
+                Err(Error::Canceled) => {
+                    say(out, "Canceled. Nothing was locked.")?;
+                    return Ok(Exit::Canceled);
+                }
+                Err(other) => return Err(other.into()),
+            }
+        };
+        if approved && lock(&mut failed) {
+            say(out, "Locked.")?;
+        }
+        if let Some(error) = failed {
+            return Err(error);
+        }
+    }
+    update::finished(&inputs)?;
+    let attention = found.iter().any(|found| {
+        matches!(
+            found.verdict,
+            update::Verdict::Rewritten { .. } | update::Verdict::Unreachable(_)
+        )
+    });
+    Ok(match plan::exit(&report, Mode::Apply) {
+        Exit::Converged if attention => Exit::Pending,
+        exit => exit,
+    })
 }
 
 /// `bx init`: create the repo when there is none, answer this account's unset
@@ -2474,6 +2683,329 @@ mod tests {
                 ),
                 "b"
             );
+        }
+    }
+
+    mod update_command {
+        use super::*;
+        use crate::config::lock::Lock;
+        use crate::sync::tests::{cloned, commit_all, git, rev, run};
+        use crate::testing::GuardedHome;
+        use crate::update::Stamps;
+
+        /// Where the followed external is checked out, relative to the home.
+        const AT: &str = ".local/share/skills";
+
+        /// The url every test declares; `~/.gitconfig` rewrites it to the
+        /// repository at `~/upstream`.
+        const URL: &str = "https://example.invalid/upstream";
+
+        /// The followed external, linking each skill into `~/.claude/skills`.
+        fn layer() -> String {
+            format!(
+                "[[external]]\npath = \"~/{AT}\"\nurl = \"{URL}\"\nbranch = \"master\"\n\
+                 [[external.link]]\nfrom = \"skills/*\"\nto = \"~/.claude/skills/*\"\n\
+                 require = \"SKILL.md\"\n"
+            )
+        }
+
+        /// An upstream at `~/upstream` reachable as [`URL`], holding `files`.
+        fn upstream(home: &GuardedHome, files: &[&str]) -> String {
+            let dir = home.child("upstream");
+            std::fs::create_dir_all(&dir).expect("the upstream");
+            std::fs::write(
+                home.child(".gitconfig"),
+                format!(
+                    "[url \"file://{}/\"]\n\tinsteadOf = https://example.invalid/\n",
+                    home.path().display()
+                ),
+            )
+            .expect("~/.gitconfig");
+            run(home.path(), &dir, &["init", "--quiet", "-b", "master"]);
+            publish(home, files)
+        }
+
+        /// Commit `files` on the upstream's `master`, and return the commit.
+        fn publish(home: &GuardedHome, files: &[&str]) -> String {
+            let dir = home.child("upstream");
+            for file in files {
+                let path = dir.join(file);
+                std::fs::create_dir_all(path.parent().expect("a parent")).expect("a dir");
+                std::fs::write(path, format!("{file}\n")).expect("a file");
+            }
+            commit_all(home.path(), &dir, "skills");
+            rev(home.path(), &dir, "HEAD")
+        }
+
+        fn update(home: &GuardedHome, yes: bool, out: &mut Vec<u8>) -> Result<Exit, update::Error> {
+            update_with(
+                &env(home.path()),
+                &[],
+                yes,
+                out,
+                &git(home.path()),
+                &mut never,
+            )
+        }
+
+        fn locked(home: &GuardedHome) -> Option<String> {
+            let lock = Lock::read(&home.child(".config/bx"), home.path()).expect("bx.lock");
+            lock.iter().next().map(|(_, locked)| locked.rev.clone())
+        }
+
+        #[test]
+        fn update_locks_commits_and_applies_then_finds_nothing_new() {
+            let home = guarded_home();
+            let first = upstream(&home, &["skills/a/SKILL.md", "skills/notes/x"]);
+            let repo = cloned(&home, &layer());
+
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("update");
+            assert_eq!(exit, Exit::Converged, "{}", text(&out));
+            assert!(
+                text(&out).starts_with(&format!("~/{AT}: locks master at {}\n", &first[..12])),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(locked(&home).as_deref(), Some(first.as_str()));
+            assert_eq!(
+                run(home.path(), &repo, &["log", "-1", "--format=%s"]),
+                "chore(bx): update bx.lock"
+            );
+            assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
+            assert_eq!(rev(home.path(), &home.child(AT), "HEAD"), first);
+            assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+            assert!(!home.child(".claude/skills/notes").exists());
+            let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+            assert!(
+                Stamps::read(&stamps.ask_due()).is_some(),
+                "the interval starts"
+            );
+
+            let head = rev(home.path(), &repo, "HEAD");
+            let mut again = Vec::new();
+            // At a terminal, and never asked: there is nothing to approve.
+            let tty = Env {
+                stdin_tty: true,
+                ..env(home.path())
+            };
+            let exit = update_with(&tty, &[], false, &mut again, &git(home.path()), &mut never)
+                .expect("a second update");
+            assert_eq!(exit, Exit::Converged, "{}", text(&again));
+            assert!(
+                text(&again).starts_with(&format!("~/{AT}: up to date with master\n")),
+                "{}",
+                text(&again)
+            );
+            assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing to commit");
+
+            let second = publish(&home, &["skills/b/SKILL.md"]);
+            let mut moved = Vec::new();
+            let exit = update(&home, true, &mut moved).expect("a third update");
+            assert_eq!(exit, Exit::Converged, "{}", text(&moved));
+            assert!(
+                text(&moved).contains(&format!(
+                    "~/{AT}: 1 new commit(s) on master, {} -> {}\n    {} skills\n",
+                    &first[..12],
+                    &second[..12],
+                    &second[..7]
+                )),
+                "{}",
+                text(&moved)
+            );
+            assert!(
+                text(&moved).contains("+ ~/.claude/skills/b"),
+                "{}",
+                text(&moved)
+            );
+            assert_eq!(locked(&home).as_deref(), Some(second.as_str()));
+            assert_eq!(rev(home.path(), &home.child(AT), "HEAD"), second);
+            assert!(home.child(".claude/skills/b/SKILL.md").is_file());
+            let message = run(home.path(), &repo, &["log", "-1", "--format=%B"]);
+            assert!(
+                message.contains(&format!(
+                    "~/{AT}: master {} -> {}",
+                    &first[..12],
+                    &second[..12]
+                )),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn update_commits_the_lock_before_it_moves_anything() {
+            let home = guarded_home();
+            let first = upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            let second = publish(&home, &["skills/b/SKILL.md"]);
+            let hook = repo.join(".git/hooks/pre-commit");
+            std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("a hook");
+            crate::fs::set_mode(&hook, crate::fs::Mode::from_bits(0o755)).expect("executable");
+
+            let error = update(&home, true, &mut Vec::new()).expect_err("the hook refuses");
+            assert!(matches!(error, update::Error::Sync(_)), "{error:?}");
+            assert_eq!(
+                rev(home.path(), &home.child(AT), "HEAD"),
+                first,
+                "the checkout stays at the commit the repo names"
+            );
+            assert!(!home.child(".claude/skills/b").exists());
+            assert_ne!(
+                locked(&home).as_deref(),
+                Some(first.as_str()),
+                "written, not committed"
+            );
+            let _ = second;
+        }
+
+        #[test]
+        fn update_without_yes_or_a_terminal_reaches_nothing() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(&home, &layer());
+            let error = update(&home, false, &mut Vec::new()).expect_err("no terminal");
+            assert!(
+                matches!(error, update::Error::Plan(Error::NeedsConfirmation)),
+                "{error:?}"
+            );
+            assert_eq!(locked(&home), None);
+            assert!(!home.child(AT).exists());
+        }
+
+        #[test]
+        fn update_refuses_a_lock_with_uncommitted_edits() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            std::fs::write(repo.join("bx.lock"), "# mine\n").expect("an edit");
+            let error = update(&home, true, &mut Vec::new()).expect_err("edited");
+            assert!(matches!(error, update::Error::LockEdited(_)), "{error:?}");
+            assert_eq!(
+                std::fs::read_to_string(repo.join("bx.lock")).expect("kept"),
+                "# mine\n"
+            );
+        }
+
+        #[test]
+        fn a_rewritten_branch_is_reported_and_never_locked() {
+            let home = guarded_home();
+            let first = upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            let dir = home.child("upstream");
+            run(
+                home.path(),
+                &dir,
+                &["checkout", "--quiet", "--orphan", "fresh"],
+            );
+            let rewritten = publish(&home, &["skills/z/SKILL.md"]);
+            run(home.path(), &dir, &["branch", "--quiet", "-M", "master"]);
+
+            let mut out = Vec::new();
+            let exit = update(&home, true, &mut out).expect("update");
+            assert_eq!(exit, Exit::Pending, "{}", text(&out));
+            assert!(
+                text(&out).contains(&format!(
+                    "master was rewritten; its tip {}",
+                    &rewritten[..12]
+                )),
+                "{}",
+                text(&out)
+            );
+            assert_eq!(locked(&home).as_deref(), Some(first.as_str()));
+        }
+
+        #[test]
+        fn check_offers_what_it_found_and_snooze_puts_it_off() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(&home, &layer());
+            update(&home, true, &mut Vec::new()).expect("update");
+            publish(&home, &["skills/b/SKILL.md"]);
+            let env = env(home.path());
+            let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+
+            let mut out = Vec::new();
+            let exit = update::check(&env, &[], false, &git(home.path()), &mut out).expect("check");
+            assert_eq!(exit, Exit::Pending);
+            let offered = std::fs::read_to_string(stamps.available()).expect("offered");
+            assert!(
+                offered.starts_with(&format!("~/{AT}: 1 new commit(s)")),
+                "{offered}"
+            );
+            assert_eq!(text(&out), offered, "what it says is what it offers");
+            assert!(!home.child(".claude/skills/b").exists(), "nothing applied");
+
+            let mut quiet = Vec::new();
+            let exit =
+                update::check(&env, &[], true, &git(home.path()), &mut quiet).expect("background");
+            assert_eq!(exit, Exit::Converged, "no external checks on its own");
+            assert!(quiet.is_empty());
+            assert_eq!(
+                std::fs::read_to_string(stamps.available()).expect("kept"),
+                offered,
+                "a background check keeps lines it did not look at"
+            );
+
+            update::snooze(&env, &mut Vec::new()).expect("snooze");
+            assert!(!stamps.available().exists());
+            let due = Stamps::read(&stamps.ask_due()).expect("ask-due");
+            assert!(due >= update::now() + 7 * 24 * 60 * 60 - 60, "{due}");
+        }
+
+        #[test]
+        fn a_background_check_looks_at_auto_externals_only_and_never_twice_at_once() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(
+                &home,
+                &layer().replace(
+                    "branch = \"master\"\n",
+                    "branch = \"master\"\ncheck = \"auto\"\ninterval = \"1d\"\n",
+                ),
+            );
+            update(&home, true, &mut Vec::new()).expect("update");
+            publish(&home, &["skills/b/SKILL.md"]);
+            let env = env(home.path());
+            let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+
+            let held = stamps.try_hold().expect("hold").expect("free");
+            let exit =
+                update::check(&env, &[], true, &git(home.path()), &mut Vec::new()).expect("busy");
+            assert_eq!(exit, Exit::Converged);
+            assert!(!stamps.available().exists(), "another check holds it");
+            drop(held);
+
+            let exit = update::check(&env, &[], true, &git(home.path()), &mut Vec::new())
+                .expect("background");
+            assert_eq!(exit, Exit::Pending);
+            assert!(stamps.available().exists());
+            let last = std::fs::read_to_string(stamps.last_check()).expect("last-check");
+            assert!(last.contains("1 new commit(s)"), "{last}");
+            let due = Stamps::read(&stamps.check_due()).expect("check-due");
+            assert!(
+                due <= update::now() + 24 * 60 * 60,
+                "its own interval: {due}"
+            );
+        }
+
+        #[test]
+        fn a_name_that_is_not_a_followed_external_is_refused() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            cloned(&home, &layer());
+            let error = update_with(
+                &env(home.path()),
+                &["~/elsewhere".to_string()],
+                true,
+                &mut Vec::new(),
+                &git(home.path()),
+                &mut never,
+            )
+            .expect_err("not followed");
+            assert!(matches!(error, update::Error::NotFollowed(_)), "{error:?}");
         }
     }
 }

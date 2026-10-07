@@ -201,6 +201,15 @@ impl Inputs {
         &self.lock
     }
 
+    /// The same inputs, keeping followed externals at the commits `lock`
+    /// holds rather than the file's: what `bx update` plans against before
+    /// it writes the lock it proposes.
+    #[must_use]
+    pub fn with_lock(mut self, lock: Lock) -> Self {
+        self.lock = lock;
+        self
+    }
+
     /// The same inputs, looking at externals through `git`.
     #[cfg(test)]
     pub(crate) fn with_git(mut self, git: Git) -> Self {

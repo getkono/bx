@@ -173,6 +173,8 @@ pub struct Resolved {
     ///
     /// Nothing in one is substituted, so none is ever held back.
     pub tools: Vec<super::tool::ToolDecl>,
+    /// The merged `[update]` table: nothing in it is substituted.
+    pub update: super::update::Update,
 }
 
 /// Resolve a merged configuration.
@@ -221,6 +223,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
         externals: merged.externals.clone(),
         secrets: merged.secrets.clone(),
         tools: merged.tools.clone(),
+        update: merged.update.clone(),
     })
 }
 

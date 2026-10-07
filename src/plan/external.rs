@@ -758,7 +758,7 @@ pub(crate) fn head(git: &Git, dest: &Path) -> Result<String, sync::Error> {
 }
 
 /// The url of `origin`, or `None` when there is no such remote.
-fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, sync::Error> {
+pub(crate) fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, sync::Error> {
     match git.query(dest, &["config", "--get", "remote.origin.url"]) {
         Ok(url) => Ok(Some(url)),
         Err(sync::Error::Git { status, .. }) if status.code() == Some(1) => Ok(None),
@@ -773,13 +773,13 @@ fn dirty(git: &Git, dest: &Path) -> Result<bool, sync::Error> {
 }
 
 /// Whether `rev` is a commit `dest` already holds.
-fn has_commit(git: &Git, dest: &Path, rev: &str) -> bool {
+pub(crate) fn has_commit(git: &Git, dest: &Path, rev: &str) -> bool {
     git.query(dest, &["cat-file", "-e", &format!("{rev}^{{commit}}")])
         .is_ok()
 }
 
 /// Whether `ancestor` is `descendant` or one of its ancestors.
-fn is_ancestor(
+pub(crate) fn is_ancestor(
     git: &Git,
     dest: &Path,
     ancestor: &str,

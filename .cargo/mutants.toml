@@ -1,0 +1,5 @@
+# cargo-mutants copies the tree to a scratch directory and, by default, leaves
+# `.git` behind. The no-user-specific-data guard in `src/testing.rs` lists the
+# files it scans with `git ls-files`, so without the repository the unmutated
+# baseline fails and no mutant is ever tested.
+copy_vcs = true

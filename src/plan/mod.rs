@@ -33,6 +33,7 @@ pub(crate) use decide::read_repo_file;
 pub(crate) use diff::escape;
 pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
 
+use crate::config::lock::Lock;
 use crate::config::resolve::{self, Resolution, Resolved};
 use crate::config::target::{Body, Direction, Gen, Target};
 use crate::config::{self, Origin, layers, merge};
@@ -153,6 +154,8 @@ pub struct Inputs {
     activations: Vec<activation::ActivationDecl>,
     /// The machine an activation's tool is looked up and run on.
     host: activation::System,
+    /// `bx.lock`: the commit each followed external is kept at.
+    lock: Lock,
 }
 
 impl Inputs {
@@ -172,6 +175,7 @@ impl Inputs {
         let layers = layers::load_layer_set(&repo, state.root(), &home)?;
         let merged = merge::merge(&layers, &home)?;
         let resolved = resolve::resolve(&merged, &home)?;
+        let lock = Lock::read(&repo, &home)?;
         let roots = RootSet::from_values(&resolved.values)
             .owning(&[state.root().to_path_buf()])
             .with_config_repos(std::slice::from_ref(&repo));
@@ -186,7 +190,14 @@ impl Inputs {
             git: Git::new(env).unattended(),
             activations: merged.activations,
             host: activation::System::from_env(),
+            lock,
         })
+    }
+
+    /// `bx.lock`, as this run read it.
+    #[must_use]
+    pub const fn lock(&self) -> &Lock {
+        &self.lock
     }
 
     /// The same inputs, looking at externals through `git`.
@@ -565,6 +576,7 @@ pub fn run(
             ledger: &ledger,
             home: &inputs.home,
             git: &inputs.git,
+            lock: &inputs.lock,
         },
     )?;
     let first_external = report.changes.len();

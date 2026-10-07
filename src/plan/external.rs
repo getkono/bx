@@ -45,7 +45,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{Change, Diff, Error};
-use crate::config::external::External;
+use crate::config::external::{External, Pin};
+use crate::config::lock::{self, Lock, Lookup};
 use crate::fs::{self, Kind};
 use crate::journal;
 use crate::paths::{self, Portable};
@@ -65,6 +66,8 @@ pub(super) struct Ctx<'a> {
     pub home: &'a Path,
     /// The `git` every question is put to.
     pub git: &'a Git,
+    /// The commits followed externals are kept at.
+    pub lock: &'a Lock,
 }
 
 /// The work one decision announced. Only this module can make one.
@@ -116,7 +119,20 @@ pub(super) fn decide_all(
     let mut rows = Vec::with_capacity(externals.len());
     let mut ops = Vec::new();
     for (at, external) in externals.iter().enumerate() {
-        let (change, work) = decide(external, ctx)?;
+        let rev = match rev(external, ctx.lock) {
+            Ok(rev) => rev,
+            Err(note) => {
+                rows.push(Change {
+                    target: external.path.as_str().to_string(),
+                    origin: external.origin.clone(),
+                    action: Action::Blocked,
+                    diff: None,
+                    note: Some(note),
+                });
+                continue;
+            }
+        };
+        let (change, work) = decide(external, rev, ctx)?;
         rows.push(change);
         if let Some(work) = work {
             ops.push(Op {
@@ -124,7 +140,7 @@ pub(super) fn decide_all(
                 target: external.path.clone(),
                 dest: external.path.render(ctx.home),
                 url: external.url.clone(),
-                rev: external.rev.clone(),
+                rev: rev.to_string(),
                 work,
             });
         }
@@ -132,11 +148,43 @@ pub(super) fn decide_all(
     Ok((rows, ops))
 }
 
-/// Decide one external: its row, and the work `apply` does for it.
-fn decide(external: &External, ctx: &Ctx<'_>) -> Decision {
+/// The commit `external` is kept at: its `rev`, or what `lock` holds for the
+/// branch it follows.
+///
+/// # Errors
+///
+/// The note for a blocked row, when a followed external has no commit locked
+/// for the url and branch it declares. Nothing is guessed: `plan` and `apply`
+/// never ask a remote where a branch is, so only `bx update` can say.
+pub(crate) fn rev<'a>(external: &'a External, lock: &'a Lock) -> Result<&'a str, String> {
+    let follow = match &external.pin {
+        Pin::Rev(rev) => return Ok(rev),
+        Pin::Follow(follow) => follow,
+    };
+    match lock.lookup(external) {
+        Lookup::Locked(rev) => Ok(rev),
+        Lookup::Missing => Err(format!(
+            "follows `{}`, and {} holds no commit for it yet; `bx update` locks one",
+            follow.branch,
+            lock::FILE
+        )),
+        Lookup::Stale(locked) => Err(format!(
+            "follows `{}` of {}, and {} locks it for `{}` of {}; `bx update` locks it again",
+            follow.branch,
+            external.url,
+            lock::FILE,
+            locked.branch,
+            locked.url
+        )),
+    }
+}
+
+/// Decide one external kept at `rev`: its row, and the work `apply` does for
+/// it.
+fn decide(external: &External, rev: &str, ctx: &Ctx<'_>) -> Decision {
     let dest = external.path.render(ctx.home);
     let observed = fs::observe(&dest)?;
-    let (url, rev) = (external.url.as_str(), external.rev.as_str());
+    let url = external.url.as_str();
     let row = |action, diff, note: Option<String>| Change {
         target: external.path.as_str().to_string(),
         origin: external.origin.clone(),
@@ -221,7 +269,9 @@ fn decide(external: &External, ctx: &Ctx<'_>) -> Decision {
                  directory it did not create"
                     .to_string(),
             ),
-            Some(entry) => decide_checkout(external, entry, &dest, ctx, &row, &blocked, &conflict),
+            Some(entry) => {
+                decide_checkout((url, rev), entry, &dest, ctx, &row, &blocked, &conflict)
+            }
         },
         kind => conflict(if entry.is_some() {
             format!("is {kind}, not the checkout bx cloned")
@@ -236,7 +286,7 @@ type Decision = Result<(Change, Option<Work>), Error>;
 
 /// [`decide`] for a checkout bx cloned and finished.
 fn decide_checkout(
-    external: &External,
+    (url, rev): (&str, &str),
     entry: &LedgerEntry,
     dest: &Path,
     ctx: &Ctx<'_>,
@@ -244,7 +294,7 @@ fn decide_checkout(
     blocked: &dyn Fn(String) -> Decision,
     conflict: &dyn Fn(String) -> Decision,
 ) -> Decision {
-    let (git, url, rev) = (ctx.git, external.url.as_str(), external.rev.as_str());
+    let git = ctx.git;
     if let Err(note) = own_checkout(git, dest) {
         return conflict(note);
     }
@@ -1666,5 +1716,92 @@ mod tests {
             .query(home.path(), &["rev-parse", "--verify", "no-such-ref"])
             .expect_err("no such ref");
         assert!(problem(&failed).starts_with("`git rev-parse --verify no-such-ref` failed"));
+    }
+
+    /// One `[[external]]` at [`AT`] from [`URL`], following `branch`.
+    fn followed(branch: &str) -> String {
+        format!("[[external]]\npath = \"~/{AT}\"\nurl = \"{URL}\"\nbranch = \"{branch}\"\n")
+    }
+
+    /// Write `bx.lock`, locking [`AT`] for `url` and `branch` at `rev`.
+    fn lock(home: &GuardedHome, url: &str, branch: &str, rev: &str) {
+        let mut lock = Lock::default();
+        lock.set(
+            target(home),
+            lock::Locked {
+                url: url.to_string(),
+                branch: branch.to_string(),
+                rev: rev.to_string(),
+            },
+        );
+        let repo = home.child(".config/bx");
+        std::fs::create_dir_all(&repo).expect("the config repo");
+        std::fs::write(Lock::path_in(&repo), lock.render()).expect("bx.lock");
+    }
+
+    #[test]
+    fn a_followed_external_is_kept_at_the_commit_bx_lock_holds() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        let layer = followed("master");
+
+        lock(&home, URL, "master", &up.first);
+        let row = only(&plan(&home, &layer)).clone();
+        assert_eq!(row.action, Action::Create, "{row:?}");
+        let note = row.note.expect("a note");
+        assert!(note.contains(&format!("at {}", up.first)), "{note}");
+        apply(&home, &layer);
+        assert_eq!(
+            checked_out(&home),
+            up.first,
+            "the locked commit, not the tip"
+        );
+        assert_eq!(only(&plan(&home, &layer)).action, Action::Unchanged);
+
+        lock(&home, URL, "master", &up.second);
+        assert_eq!(only(&plan(&home, &layer)).action, Action::Modify);
+        apply(&home, &layer);
+        assert_eq!(checked_out(&home), up.second);
+        assert_eq!(only(&plan(&home, &layer)).action, Action::Unchanged);
+    }
+
+    #[test]
+    fn a_followed_external_bx_lock_holds_nothing_for_is_blocked_on_bx_update() {
+        let home = guarded_home();
+        let up = upstream(&home);
+
+        let applied = apply(&home, &followed("master"));
+        let row = only(&applied);
+        assert_eq!(row.action, Action::Blocked);
+        let note = row.note.as_deref().expect("a note");
+        assert!(note.contains("follows `master`"), "{note}");
+        assert!(note.contains("bx.lock holds no commit"), "{note}");
+        assert!(note.contains("`bx update`"), "{note}");
+        assert!(!home.child(AT).exists(), "nothing is cloned on a guess");
+
+        for (url, branch) in [(URL, "side"), ("https://example.invalid/other", "master")] {
+            lock(&home, url, branch, &up.side);
+            let planned = plan(&home, &followed("master"));
+            let row = only(&planned);
+            assert_eq!(row.action, Action::Blocked, "{url} {branch}");
+            let note = row.note.as_deref().expect("a note");
+            assert!(
+                note.contains(&format!("locks it for `{branch}` of {url}")),
+                "{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_external_reads_no_lock() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        lock(&home, URL, "master", &up.second);
+        apply(&home, &layer(&up.first));
+        assert_eq!(
+            checked_out(&home),
+            up.first,
+            "`rev` wins over any lock entry"
+        );
     }
 }

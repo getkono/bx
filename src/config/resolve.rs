@@ -747,6 +747,29 @@ fn refuse_overlapping_externals(
         }
     }
 
+    // A link's children land in its `to`: inside any checkout, they would be
+    // untracked files in it, as a target there would be.
+    for (linking, link) in externals
+        .iter()
+        .flat_map(|external| external.links.iter().map(move |link| (external, link)))
+    {
+        if let Some(external) = externals.iter().find(|external| {
+            matches!(
+                overlap(&external.path, &link.to),
+                Some(Overlap::Same | Overlap::Beneath)
+            )
+        }) {
+            return Err(Error::BadValue {
+                origin: link.origin.clone(),
+                message: format!(
+                    "a link of external `{}` puts its children in `{}`, inside external \
+                     `{}` at {}; a checkout is a directory git owns whole",
+                    linking.path, link.to, external.path, external.origin
+                ),
+            });
+        }
+    }
+
     for target in targets.iter().filter_map(|resolution| match resolution {
         Resolution::Ready(target) => Some(target),
         Resolution::Blocked(_) => None,
@@ -1834,6 +1857,31 @@ mod tests {
         }
         // A shared prefix that is not a parent is no overlap.
         assert!(resolved(&format!("{}{}", external("~/a"), external("~/ab")), None).is_ok());
+    }
+
+    #[test]
+    fn a_link_into_another_external_is_refused_naming_both() {
+        for to in ["~/b", "~/b/sub"] {
+            let text = format!(
+                "{}[[external.link]]\nfrom = \"*\"\nto = \"{to}/*\"\n{}",
+                external("~/a"),
+                external("~/b")
+            );
+            let err = resolved(&text, None).expect_err(to);
+            assert!(err.starts_with("bx.toml:5: "), "at the link: {err}");
+            assert!(
+                err.contains(&format!(
+                    "puts its children in `{to}`, inside external `~/b`"
+                )),
+                "{err}"
+            );
+        }
+        let beside = format!(
+            "{}[[external.link]]\nfrom = \"*\"\nto = \"~/bin/*\"\n{}",
+            external("~/a"),
+            external("~/b")
+        );
+        assert!(resolved(&beside, None).is_ok());
     }
 
     #[test]

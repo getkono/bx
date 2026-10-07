@@ -1,0 +1,6 @@
+# cargo-mutants configuration, read by `mise run mutants` locally and in CI.
+
+# Copy `.git` into the scratch tree each mutant is built in. The
+# no-user-specific-data test lists the repository's files with `git ls-files`,
+# so without it the unmutated baseline fails before any mutant is tested.
+copy_vcs = true

@@ -120,6 +120,7 @@ pub mod env_guard;
 pub mod fs;
 pub mod init;
 pub mod journal;
+pub mod lexical;
 pub mod paths;
 pub mod plan;
 pub mod recover;

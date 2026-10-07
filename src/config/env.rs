@@ -68,7 +68,7 @@ use toml_edit::Table;
 use super::path::{self, PathEntry};
 use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
-use crate::env_guard::is_variable_name;
+use crate::lexical::is_variable_name;
 use crate::paths::Portable;
 use crate::shell::{Shell, Shells};
 

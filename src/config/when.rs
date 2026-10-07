@@ -33,7 +33,7 @@
 //!
 //! One condition per declaration: there is no `and`, `or` or `not`.
 
-use crate::env_guard::is_variable_name;
+use crate::lexical::is_variable_name;
 
 /// Every spelling, as an error message lists them.
 const SPELLINGS: &str = "\"interactive\", \"login\", \"ssh\", \"env:NAME\", \"env:NAME=VALUE\" \

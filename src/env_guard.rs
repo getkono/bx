@@ -159,6 +159,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::config::env;
 use crate::config::values::ResolvedValues;
+use crate::lexical::is_variable_name;
 use crate::paths;
 
 /// Names a shell defines and manages itself. A fragment may not assign one,
@@ -2578,18 +2579,6 @@ fn after_value(rest: &str) -> Result<(), Reason> {
         Some((head, _)) if is_variable_name(head) => Reason::MultipleAssignments,
         _ => Reason::Unreadable,
     })
-}
-
-/// Whether `name` is a variable name every shell and `environment.d` read the
-/// same way: `[A-Za-z_][A-Za-z0-9_]*`.
-///
-/// The `[[env]]` parser checks a declared name with this same predicate, so
-/// the parser and the guard cannot disagree on what a variable name is.
-pub(crate) fn is_variable_name(name: &str) -> bool {
-    name.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -7694,12 +7683,6 @@ mod tests {
         // and the scan's text is never generated. So no generated fragment
         // reaches the guard through it.
         //
-        // `config/env.rs` imports only the name predicate, so the `[[env]]`
-        // parser and the guard agree on what a variable name is; a predicate
-        // reads no fragment and writes no bytes. `config/when.rs` imports it
-        // for the same reason, to check the name a `when = "env:NAME"` tests,
-        // and `config/path.rs` for the references a `[path]` entry holds.
-        //
         // `shell/activation.rs` judges a tool's cached activation output,
         // which is the tool's own shell code rather than an environment
         // fragment: it searches the output for every name `is_relocating`
@@ -7713,15 +7696,10 @@ mod tests {
         // into a further file is a new caller, as it was when sites were
         // matched by file. "This module" is the `env_guard` module wherever
         // its files are — `env_guard.rs` and everything beneath `env_guard/`.
-        const KNOWN: [&str; 16] = [
+        const KNOWN: [&str; 13] = [
             // `bx add`'s advisory scan.
             "use crate::env_guard::{self, Reason, RootSet};",
             "env_guard::scan_with(text, roots)",
-            // The name predicate, in `config::env`, `config::when` and
-            // `config::path`.
-            "use crate::env_guard::is_variable_name;",
-            "use crate::env_guard::is_variable_name;",
-            "use crate::env_guard::is_variable_name;",
             // The plan's fragment judgements.
             "use crate::env_guard::{self, RootSet};",
             "violations(&env_guard::scan_with(content, roots), before)",

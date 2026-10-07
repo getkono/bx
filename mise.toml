@@ -11,6 +11,7 @@ pkl = "latest"                           # config language hk.pkl is written in
 "cargo:cargo-mutants" = "27.1.0"
 "aqua:sharkdp/hyperfine" = "latest"      # the shell-startup benchmark's measurement tool
 shellcheck = "latest"                    # install.sh and the bench harness are gated on it (pre-commit + CI)
+actionlint = "1.7.12"                    # the GitHub workflows are gated on it (pre-commit + CI)
 
 # After `mise install`, wire hk's git hooks through mise so they resolve hk and
 # convco without requiring shell activation. Skipped in CI, where the hooks
@@ -52,8 +53,14 @@ description = "Run the test suite"
 run = "cargo test"
 
 [tasks.coverage]
-description = "Run tests with coverage (minimum 80% line coverage; the main.rs entry point is excluded)"
-run = '''cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80'''
+description = "Run tests with coverage (minimum 80% line coverage; the main.rs entry point is excluded) and write lcov.info (CI, pre-push)"
+# The first command runs the suite, prints the summary and enforces the
+# threshold; the second reads the same profile data back as lcov.info, which CI
+# uploads, without running the suite again.
+run = [
+  '''cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --summary-only --fail-under-lines 80''',
+  '''cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' --lcov --output-path lcov.info''',
+]
 
 [tasks.bench]
 description = "Measure what bx's generated files cost zsh startup against its 5 ms budget"
@@ -62,6 +69,22 @@ description = "Measure what bx's generated files cost zsh startup against its 5 
 # binary first: a bench that measured without one would pass by measuring
 # nothing. See bench/README.md for what the fixture controls for.
 run = ["cargo build --release --bin bx", "bench/run.sh"]
+
+[tasks.line-check]
+description = "Fail when a file newly exceeds the line limit or the baseline grows (CI, pre-commit)"
+usage = 'arg "[base]" help="Ref whose baseline this one may not outgrow (default: origin/HEAD)"'
+run = 'scripts/line-check ${usage_base:-}'
+
+[tasks.shellcheck]
+description = "ShellCheck every shell script: the installer, the bench harness and its stubs, and the line check (CI, pre-commit)"
+# install.sh runs on machines with nothing else on them, so a shell bug there is
+# the one bug a user cannot work around; the bench and line-check scripts gate
+# the startup budget and the line limit, which a bug would silently disable.
+run = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh bench/stubs/fzf bench/stubs/mise bench/stubs/starship bench/stubs/zoxide scripts/line-check"
+
+[tasks.actionlint]
+description = "Lint the GitHub Actions workflows (CI, pre-commit)"
+run = "actionlint"
 
 [tasks.commit-check]
 description = "Verify this branch's commits (vs origin/master) follow Conventional Commits"

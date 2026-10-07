@@ -84,6 +84,8 @@ struct Machine {
     home: GuardedHome,
     /// Holds the upstream repository for as long as the machine lives.
     _upstream: tempfile::TempDir,
+    /// The bench's stub tools, copied and made executable.
+    stubs: tempfile::TempDir,
 }
 
 impl Machine {
@@ -139,6 +141,7 @@ impl Machine {
         Self {
             home,
             _upstream: upstream,
+            stubs: executable_stubs(),
         }
     }
 
@@ -147,11 +150,8 @@ impl Machine {
     }
 
     /// `PATH` for everything the machine runs: the bench's stubs first.
-    fn search_path() -> String {
-        format!(
-            "{}:{SYSTEM_PATH}",
-            repo_root().join("bench/stubs").display()
-        )
+    fn search_path(&self) -> String {
+        format!("{}:{SYSTEM_PATH}", self.stubs.path().display())
     }
 
     /// A command with this machine's environment and nothing else.
@@ -165,7 +165,7 @@ impl Machine {
         command
             .env_clear()
             .env("HOME", self.path())
-            .env("PATH", Self::search_path())
+            .env("PATH", self.search_path())
             .current_dir(self.path());
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile);
@@ -300,6 +300,24 @@ fn encrypt(recipient: &age::x25519::Recipient, plaintext: &[u8]) -> Vec<u8> {
     writer.write_all(plaintext).expect("the plaintext");
     writer.finish().expect("the stream");
     out
+}
+
+/// A copy of `bench/stubs` whose every file is executable.
+///
+/// The suite does not run the stubs where the checkout holds them, because
+/// it cannot rely on their execute bits there: `cargo mutants` copies the
+/// tree with reflinks where the filesystem supports them, and a reflinked
+/// file is created with the default mode, so on such a host the copy's stubs
+/// are not executable and the unmutated baseline fails.
+fn executable_stubs() -> tempfile::TempDir {
+    let stubs = tempfile::tempdir().expect("a tempdir for the stubs");
+    copy_tree(&repo_root().join("bench/stubs"), stubs.path());
+    for entry in std::fs::read_dir(stubs.path()).expect("the copied stubs") {
+        let path = entry.expect("a stub").path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("an executable stub");
+    }
+    stubs
 }
 
 /// Copy the directory `from` to `to`, recursively, files and links alike.

@@ -2245,7 +2245,6 @@ mod tests {
         // The guard's only enforcement mechanism, switched off invisibly.
         let mut root = a_decl("scratch_root", ValueKind::Path);
         root.is_root = true;
-
         let values = resolve(vec![root.clone()], &[answer("scratch_root", "/")]).unwrap();
         assert!(values.roots().is_empty(), "refused, and admits nothing");
 
@@ -2256,15 +2255,10 @@ mod tests {
         let message = values.check_answer("scratch_root", "/a/../..").unwrap_err();
         assert!(message.to_string().contains("may not be `/`"), "{message}");
 
-        // A value that is not a root is unaffected: it names a location, and
-        // nothing is admitted on the strength of it.
+        // A value that is not a root is unaffected: it is kept, and admits nothing.
         let plain = a_decl("brew_prefix", ValueKind::Path);
-        let values = resolve(vec![plain], &[answer("brew_prefix", "/")])
-            .expect("`/` is an ordinary answer for a value that is not a root");
-        assert_eq!(
-            values.get("brew_prefix").map(|v| v.text.as_str()),
-            Some("/")
-        );
+        let values = resolve(vec![plain], &[answer("brew_prefix", "/")]).unwrap();
+        assert_eq!(values.get("brew_prefix").unwrap().text, "/");
         assert!(values.roots().is_empty(), "and it admits nothing");
     }
 

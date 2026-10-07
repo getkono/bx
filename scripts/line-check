@@ -1,0 +1,126 @@
+#!/bin/sh
+# line-check — no tracked file may grow past LIMIT lines.
+#
+#   scripts/line-check [BASE]
+#
+# Counts the lines of every git-tracked text file in the working tree, outside
+# tests/fixtures/ (captured third-party output nobody edits). A file over LIMIT
+# fails the check unless its path is listed in scripts/line-check-baseline, the
+# files that were already over it when the gate landed. That list may only
+# shrink, so the check also fails when:
+#
+#   - a listed path is no longer over LIMIT (or no longer exists): delete its
+#     line, so the file cannot quietly grow back;
+#   - the list holds a path BASE's list does not: the baseline is not a place to
+#     park a newly long file. BASE defaults to origin/HEAD; when it does not
+#     resolve, or holds no baseline yet, this part is skipped and says so.
+#
+# The baseline holds paths, not counts, so a listed file shrinking or growing
+# under its entry never churns the list. Lines starting with `#` and blank
+# lines are ignored; the paths must be sorted (LC_ALL=C) and unique.
+
+set -eu
+
+LIMIT=3743
+BASELINE=scripts/line-check-baseline
+
+cd "$(git rev-parse --show-toplevel)"
+
+fail=0
+problem() {
+	printf 'line-check: %s\n' "$1" >&2
+	fail=1
+}
+
+# Total lines of one file, counting a final line with no newline.
+lines() {
+	awk 'END { print NR }' "$1"
+}
+
+# Paths listed in a baseline read from stdin.
+entries() {
+	grep -v -e '^#' -e '^[[:space:]]*$' || true
+}
+
+# Lines of list $1 that list $2 does not hold.
+missing() {
+	printf '%s\n' "$1" | while IFS= read -r path; do
+		[ -n "$path" ] || continue
+		printf '%s\n' "$2" | grep -Fxq -- "$path" || printf '%s\n' "$path"
+	done
+}
+
+# Print each line of $1 as an error through format $2, and fail if there is one.
+report() {
+	[ -n "$1" ] || return 0
+	fail=1
+	while IFS= read -r path; do
+		# shellcheck disable=SC2059 # the format is this script's own constant
+		printf "line-check: $2\n" "$path" >&2
+	done <<EOF
+$1
+EOF
+}
+
+# Tracked text files outside tests/fixtures/ that are over LIMIT, sorted.
+# `--eol` marks a binary in the index as `i/-text`, and its path follows a tab.
+over=$(git -c core.quotePath=false ls-files --eol -- . ':!:tests/fixtures/' |
+	awk -F '\t' '$1 !~ /^i\/-text/ { print $2 }' |
+	while IFS= read -r path; do
+		if [ -f "$path" ] && [ ! -L "$path" ]; then
+			printf '%s\0' "$path"
+		fi
+	done |
+	xargs -0 awk -v limit="$LIMIT" '
+		{ n[FILENAME]++ }
+		END { for (f in n) if (n[f] > limit) print f }
+	' |
+	LC_ALL=C sort)
+
+if [ -f "$BASELINE" ]; then
+	listed=$(entries <"$BASELINE")
+else
+	listed=
+fi
+
+if [ "$listed" != "$(printf '%s\n' "$listed" | LC_ALL=C sort -u)" ]; then
+	problem "$BASELINE must be sorted (LC_ALL=C) with no repeated path"
+fi
+
+# A file over LIMIT that the baseline does not excuse.
+unlisted=$(missing "$over" "$listed")
+if [ -n "$unlisted" ]; then
+	fail=1
+	while IFS= read -r path; do
+		printf 'line-check: %s has %s lines, over the %s-line limit; split it\n' \
+			"$path" "$(lines "$path")" "$LIMIT" >&2
+	done <<EOF
+$unlisted
+EOF
+fi
+
+# A baseline entry the file no longer needs.
+report "$(missing "$listed" "$over")" \
+	"%s is no longer over $LIMIT lines; delete it from $BASELINE"
+
+# A baseline entry BASE's baseline does not hold.
+base=${1-}
+if [ -z "$base" ] && git rev-parse -q --verify origin/HEAD >/dev/null; then
+	base=origin/HEAD
+fi
+if [ -z "$base" ]; then
+	printf 'line-check: no base to compare %s against; growth not checked\n' "$BASELINE" >&2
+elif ! git rev-parse -q --verify "$base^{commit}" >/dev/null; then
+	problem "base $base does not resolve to a commit"
+elif ! git cat-file -e "$base:$BASELINE" 2>/dev/null; then
+	printf 'line-check: %s has no %s yet; growth not checked\n' "$base" "$BASELINE" >&2
+else
+	before=$(git show "$base:$BASELINE" | entries)
+	report "$(missing "$listed" "$before")" \
+		"$BASELINE gained %s, which $base does not list; the baseline only shrinks"
+fi
+
+if [ "$fail" = 0 ]; then
+	printf 'line-check: no file newly over %s lines\n' "$LIMIT"
+fi
+exit "$fail"

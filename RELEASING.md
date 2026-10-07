@@ -6,13 +6,15 @@ Releases are automated. Land Conventional Commits on `master` and
 1. A push to `master` opens or updates a **release PR** that bumps the version
    in `Cargo.toml` and writes `CHANGELOG.md` from the commit messages.
 2. Merging that PR cuts a **GitHub Release** and a `v{version}` tag.
-3. The tag triggers the build job, which cross-compiles
-   `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, and attaches
-   each tarball **and its `.sha256`** to the Release.
+3. When the release job reports that it cut a release, the same workflow run's
+   `build` job cross-compiles `x86_64-unknown-linux-musl` and
+   `aarch64-unknown-linux-musl`, packaging each tarball with its `.sha256`, and
+   the `upload-assets` job attaches them all to the Release.
 
 `install.sh` refuses to install without verifying the checksum, so the `.sha256`
-assets are required. If the build job fails, the Release exists but is not
-installable — re-run the workflow rather than publishing by hand.
+assets are required. If `build` or `upload-assets` fails, the Release exists but
+is not installable — re-run that run's failed jobs rather than publishing by
+hand.
 
 ## Not on crates.io
 
@@ -22,15 +24,8 @@ Rust toolchain on it yet. `release-plz.toml` therefore sets `publish = false`
 with `git_only = true`, so versions are detected from git tags instead of the
 registry.
 
-## The first release
+## Optional secret
 
-There is no `v0.1.0` tag yet, so nothing for release-plz to diff against. Run
-the **Release-plz** workflow manually from the Actions tab to cut it.
-
-## Optional secrets
-
-Neither is required; both degrade to a working default.
-
-| Secret | Effect when absent |
-|---|---|
-| `RELEASE_PLZ_TOKEN` | Falls back to `GITHUB_TOKEN`. CI will not run on the release PR, so branch protection cannot gate it, and the Release shows `github-actions` as author. |
+`RELEASE_PLZ_TOKEN` is not required. Without it the workflow falls back to
+`GITHUB_TOKEN`, so CI does not run on the release PR, branch protection cannot
+gate it, and the Release shows `github-actions` as author.

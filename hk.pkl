@@ -2,8 +2,12 @@ amends "package://github.com/jdx/hk/releases/download/v1.57.0/hk@1.57.0#/Config.
 
 // hk git hooks — https://hk.jdx.dev
 //
+// commit-msg rejects a message that is not a Conventional Commit (convco).
 // pre-commit auto-fixes formatting then linting (formatting can affect lint
-// output); pre-push is the final gate (format-check, clippy, tests, coverage).
+// output), then checks shell scripts (shellcheck), workflows (actionlint) and
+// file length (line-check); pre-push is the final gate (format-check, clippy,
+// tests, coverage).
+// Every check step calls the mise task CI calls, so a gate has one definition.
 // cargo fmt/clippy operate on the whole workspace, so the *.rs glob only gates
 // *whether* a step runs — the commands take no file arguments. `depends`
 // serialises the steps within each hook.
@@ -28,18 +32,29 @@ hooks {
     steps = new Mapping<String, Step> {
       ["format"] {
         glob = "*.rs"
-        fix = "cargo fmt"
+        fix = "mise run format"
       }
       ["lint-fix"] {
         glob = "*.rs"
         depends = List("format")
-        fix = "cargo clippy --fix --allow-dirty --allow-staged --all-targets"
+        fix = "mise run lint-fix"
       }
       // install.sh runs on machines with nothing else on them; a shell bug
-      // there is the one bug a user cannot work around.
+      // there is the one bug a user cannot work around. The task names every
+      // script, the same list CI checks.
       ["shellcheck"] {
-        glob = "*.sh"
-        check = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh"
+        glob = List("*.sh", "scripts/*", "bench/stubs/*")
+        check = "mise run shellcheck"
+      }
+      ["actionlint"] {
+        glob = List(".github/workflows/*.yml", ".github/workflows/*.yaml")
+        check = "mise run actionlint"
+      }
+      // No file may newly grow past the line limit; the files already over it
+      // sit on a baseline that only shrinks. Any staged file can cross it, so
+      // the step has no glob.
+      ["line-check"] {
+        check = "mise run line-check"
       }
     }
   }
@@ -47,19 +62,19 @@ hooks {
     fix = false
     steps = new Mapping<String, Step> {
       ["format-check"] {
-        check = "cargo fmt --check"
+        check = "mise run format-check"
       }
       ["lint"] {
         depends = List("format-check")
-        check = "cargo clippy --all-targets -- -D warnings"
+        check = "mise run lint"
       }
       ["test"] {
         depends = List("lint")
-        check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX cargo test"
+        check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX mise run test"
       }
       ["coverage"] {
         depends = List("test")
-        check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX cargo llvm-cov --ignore-filename-regex 'src/main\\.rs' --fail-under-lines 80"
+        check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX mise run coverage"
       }
     }
   }

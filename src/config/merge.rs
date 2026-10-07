@@ -4843,79 +4843,76 @@ mod tests {
         // 2024 and process-global, so a test that mutated the environment would
         // race every other test in this binary.
         //
-        // `layers.rs` is here because it is the module whose own doc asserts
-        // "nothing here reads the environment" — it takes both the home and the
+        // Every file of the `config` module is scanned, read off the directory
+        // at run time rather than from a list of names, so a file added to it
+        // or split out of one is scanned without anyone remembering to list
+        // it. `layers.rs` is the module whose own doc asserts "nothing here
+        // reads the environment" — it takes both the home and the
         // `XDG_STATE_HOME` override as arguments — which is the claim this test
         // is quoted as proving.
         //
         // `target.rs` parses every target a layer holds, against the home it is
-        // handed. `paths.rs` holds `Portable::parse_in` and `normalize`, which
-        // every module above calls, and also the crate's two deliberate reads
-        // of the environment: `home()` and `config_root()`, the edges that hand
-        // a resolution path its arguments. Each edge line is allowed exactly
-        // once and by its whole text, so a third read anywhere in the module,
-        // or a second copy of either, still fails here.
+        // handed. The `paths` module holds `Portable::parse_in` and
+        // `normalize`, which every module above calls, and also the crate's two
+        // deliberate reads of the environment: `home()` and `config_root()`,
+        // the edges that hand a resolution path its arguments. Each edge line
+        // is allowed only in `paths`, exactly once across the whole module and
+        // by its whole text, so a third read anywhere in it, or a second copy
+        // of either, still fails here.
         const PATHS_EDGES: [&str; 2] = [
             "home_in(std::env::var_os(\"HOME\").as_deref())",
             "std::env::var_os(\"XDG_CONFIG_HOME\").as_deref(),",
         ];
-        for (name, source) in [
-            ("layers.rs", include_str!("layers.rs")),
-            ("merge.rs", include_str!("merge.rs")),
-            ("values.rs", include_str!("values.rs")),
-            ("resolve.rs", include_str!("resolve.rs")),
-            ("values/local.rs", include_str!("values/local.rs")),
-            ("target.rs", include_str!("target.rs")),
-            ("paths.rs", include_str!("../paths.rs")),
-        ] {
-            // The non-test half, minus its prose. This very test names the
-            // strings it forbids, and `layers.rs` documents what the *binary*
-            // passes in by naming the call the library itself may not make — a
-            // textual scan cannot tell a description from a call, so whole-line
-            // comments are dropped and code is what is scanned.
-            let code = source
-                .split("#[cfg(test)]")
-                .next()
-                .expect("the non-test half");
-            let edges: &[&str] = if name == "paths.rs" {
-                &PATHS_EDGES
-            } else {
-                &[]
-            };
-            for edge in edges {
-                assert_eq!(
-                    code.lines().filter(|line| line.trim() == *edge).count(),
-                    1,
-                    "{name}: the edge `{edge}` is expected exactly once; if it moved, \
-                     re-verify this list rather than widening the scan's exceptions"
-                );
+        let mut edges_seen = [0_usize; PATHS_EDGES.len()];
+        for (module, edges) in [("config", &[][..]), ("paths", &PATHS_EDGES[..])] {
+            for (path, source) in crate::testing::module_sources(module) {
+                let name = path.display();
+                // The non-test half, minus its prose. This very test names the
+                // strings it forbids, and `layers.rs` documents what the *binary*
+                // passes in by naming the call the library itself may not make — a
+                // textual scan cannot tell a description from a call, so whole-line
+                // comments are dropped and code is what is scanned.
+                let code = source
+                    .split("#[cfg(test)]")
+                    .next()
+                    .expect("the non-test half");
+                for (edge, seen) in edges.iter().zip(&mut edges_seen) {
+                    *seen += code.lines().filter(|line| line.trim() == *edge).count();
+                }
+                let body: String = code
+                    .lines()
+                    .filter(|line| {
+                        !line.trim_start().starts_with("//") && !edges.contains(&line.trim())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // `paths::home(` is the likeliest real regression: a resolution
+                // module calling the crate's own home resolver — which does read
+                // `$HOME` — instead of threading the argument through, which would
+                // read as innocuous at the call site and make the merge impure.
+                for forbidden in [
+                    "env::var",
+                    "var_os",
+                    "env!(",
+                    "option_env!",
+                    "canonicalize(",
+                    "current_dir(",
+                    "paths::home(",
+                ] {
+                    assert!(
+                        !body.contains(forbidden),
+                        "{name} contains `{forbidden}`: resolution is a pure function of \
+                         the layer bytes plus the home that is threaded in"
+                    );
+                }
             }
-            let body: String = code
-                .lines()
-                .filter(|line| {
-                    !line.trim_start().starts_with("//") && !edges.contains(&line.trim())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            // `paths::home(` is the likeliest real regression: a resolution
-            // module calling the crate's own home resolver — which does read
-            // `$HOME` — instead of threading the argument through, which would
-            // read as innocuous at the call site and make the merge impure.
-            for forbidden in [
-                "env::var",
-                "var_os",
-                "env!(",
-                "option_env!",
-                "canonicalize(",
-                "current_dir(",
-                "paths::home(",
-            ] {
-                assert!(
-                    !body.contains(forbidden),
-                    "{name} contains `{forbidden}`: resolution is a pure function of \
-                     the layer bytes plus the home that is threaded in"
-                );
-            }
+        }
+        for (edge, seen) in PATHS_EDGES.iter().zip(edges_seen) {
+            assert_eq!(
+                seen, 1,
+                "paths: the edge `{edge}` is expected exactly once; if it moved, \
+                 re-verify this list rather than widening the scan's exceptions"
+            );
         }
     }
 }

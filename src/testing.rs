@@ -228,9 +228,118 @@ impl std::fmt::Debug for GuardedHome {
     }
 }
 
+/// Every `.rs` file under `root`, recursively, sorted by path.
+#[cfg(test)]
+pub(crate) fn rust_sources(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The crate's `src/` directory, read by the tests that hold a property of
+/// the source text itself.
+#[cfg(test)]
+pub(crate) fn src_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// Every source file of the crate module `module` (`"config"`,
+/// `"config::values::local"`), as its path beneath `src/` and its text,
+/// sorted by path.
+///
+/// A module's source is its own file — `src/a/b.rs` — and every `.rs` file
+/// beneath `src/a/b/`, which is where its `mod.rs` and its submodules live.
+/// Reading the module rather than a list of file names is what keeps a test
+/// that scans source holding its property when the module is split into
+/// submodules: the new files are read because they are where Rust requires
+/// them to be, not because someone remembered to list them.
+///
+/// # Panics
+///
+/// When the module has no source file, so a renamed module fails the scan
+/// that reads it instead of leaving it scanning nothing.
+#[cfg(test)]
+pub(crate) fn module_sources(module: &str) -> Vec<(PathBuf, String)> {
+    let src = src_root();
+    let relative: PathBuf = module.split("::").collect();
+    let mut files = Vec::new();
+    let own = src.join(&relative).with_extension("rs");
+    if own.is_file() {
+        files.push(own);
+    }
+    let dir = src.join(&relative);
+    if dir.is_dir() {
+        files.extend(rust_sources(&dir));
+    }
+    assert!(
+        !files.is_empty(),
+        "the module `{module}` has no source file under {}",
+        src.display()
+    );
+    files.sort();
+    files
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            let beneath = path.strip_prefix(&src).expect("beneath src").to_path_buf();
+            (beneath, text)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_module_is_read_from_its_file_and_its_directory() {
+        // `config` is a directory module; `config::values` is both a file and
+        // a directory, so its submodule is read with it.
+        let paths = |module: &str| -> Vec<PathBuf> {
+            module_sources(module)
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect()
+        };
+        let config = paths("config");
+        assert!(
+            config.contains(&PathBuf::from("config/mod.rs")),
+            "{config:?}"
+        );
+        assert!(
+            config.contains(&PathBuf::from("config/values/local.rs")),
+            "{config:?}"
+        );
+        assert_eq!(
+            paths("config::values"),
+            vec![
+                PathBuf::from("config/values/local.rs"),
+                PathBuf::from("config/values.rs"),
+            ],
+            "sorted by path component, so a directory sorts before its sibling file"
+        );
+        assert_eq!(paths("paths"), vec![PathBuf::from("paths.rs")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no source file")]
+    fn a_module_with_no_source_is_refused() {
+        let _ = module_sources("no_such_module");
+    }
 
     #[test]
     fn the_guard_hands_out_a_tempdir() {
@@ -393,140 +502,280 @@ mod tests {
     }
 
     /// How a forbidden needle is matched.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Rule {
         /// Anywhere in the text, boundaries included.
         ///
-        /// For a **path** fragment. A path cannot occur inside an English word,
-        /// so it needs no leading word boundary — and demanding one is what made
-        /// this guard miss the very spelling it was written to catch: the real
-        /// directory is `/var/<fragment>`, where the fragment is preceded by
-        /// `r`, so the canonical path was not reported.
+        /// For a **path**. A path cannot occur inside an English word, so it
+        /// needs no word boundary — and demanding one would miss the spelling
+        /// that matters most: a home under a symlinked mount is written
+        /// `/var/<home>` once resolved, where the home is preceded by `r`.
         Anywhere,
-        /// Only where it is not preceded by an alphanumeric character.
+        /// Only where neither neighbour is an alphanumeric character.
         ///
         /// For an **account name**, which does occur inside ordinary words.
+        /// Both sides count because the name is whatever the machine running
+        /// the test says it is, and a short name is the start of many words.
         WholeWord,
     }
 
-    /// Every user-specific needle, with the rule that matches it.
+    /// The shortest account name worth hunting for. A shorter one is the
+    /// whole of too many ordinary words for a match to mean anything.
+    const SHORTEST_ACCOUNT_NAME: usize = 4;
+
+    /// The fewest named components a path needs to identify someone: `/root`
+    /// and `/` name a system account or nothing, `/home/<name>` names a person.
+    const FEWEST_PATH_COMPONENTS: usize = 2;
+
+    /// Every user-specific needle on a machine with this account name, home
+    /// directory and checkout path, with the rule that matches each.
     ///
-    /// Assembled from fragments at runtime so this file is not its own
-    /// counter-example.
-    fn user_specific_needles() -> Vec<(String, Rule)> {
-        vec![
-            (["/m", "nt/sc", "ratch/go", "lem"].concat(), Rule::Anywhere),
-            (["jus", "tin"].concat(), Rule::WholeWord),
-            (["jus", "ty"].concat(), Rule::WholeWord),
-            (["go", "lem"].concat(), Rule::WholeWord),
-        ]
+    /// Derived from the machine running the test rather than stored in the
+    /// repository, because a stored list of someone's account names and paths
+    /// is itself the user-specific data invariant 5 forbids. On CI the account,
+    /// home and checkout are a hosted runner's, which identify nobody and whose
+    /// generic account name occurs in ordinary prose, so there are none.
+    fn user_specific_needles(
+        on_ci: bool,
+        account: Option<&str>,
+        home: Option<&Path>,
+        checkout: Option<&Path>,
+    ) -> Vec<(String, Rule)> {
+        if on_ci {
+            return Vec::new();
+        }
+        let mut needles = Vec::new();
+        if let Some(account) = account.map(str::to_ascii_lowercase)
+            && account.len() >= SHORTEST_ACCOUNT_NAME
+        {
+            needles.push((account, Rule::WholeWord));
+        }
+        for path in [home, checkout].into_iter().flatten() {
+            let named = path
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count();
+            if named >= FEWEST_PATH_COMPONENTS {
+                // Rebuilt from its components, so a trailing `/` is dropped.
+                let path: PathBuf = path.components().collect();
+                needles.push((path.to_string_lossy().to_ascii_lowercase(), Rule::Anywhere));
+            }
+        }
+        needles
     }
 
-    /// Every forbidden needle `text` names. `text` is expected lowercased.
-    fn user_specific_offences(text: &str) -> Vec<String> {
-        user_specific_needles()
-            .into_iter()
+    /// The needles of the machine running this test.
+    fn machine_needles() -> Vec<(String, Rule)> {
+        let account = std::env::var("USER").ok();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        user_specific_needles(
+            std::env::var_os("CI").is_some_and(|ci| !ci.is_empty()),
+            account.as_deref(),
+            home.as_deref(),
+            Some(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        )
+    }
+
+    /// Every needle of `needles` that `text` names. `text` is expected
+    /// lowercased.
+    fn user_specific_offences(text: &str, needles: &[(String, Rule)]) -> Vec<String> {
+        needles
+            .iter()
             .filter(|(needle, rule)| match rule {
                 Rule::Anywhere => text.contains(needle.as_str()),
                 Rule::WholeWord => contains_token(text, needle),
             })
-            .map(|(needle, _)| needle)
+            .map(|(needle, _)| needle.clone())
             .collect()
+    }
+
+    /// A machine no developer has: every needle the tests below match against.
+    fn synthetic_needles() -> Vec<(String, Rule)> {
+        user_specific_needles(
+            false,
+            Some("Quillon"),
+            Some(Path::new("/home/quillon/")),
+            Some(Path::new("/srv/build/quillon/bx")),
+        )
+    }
+
+    #[test]
+    fn the_needles_are_the_account_the_home_and_the_checkout() {
+        assert_eq!(
+            synthetic_needles(),
+            vec![
+                ("quillon".to_owned(), Rule::WholeWord),
+                ("/home/quillon".to_owned(), Rule::Anywhere),
+                ("/srv/build/quillon/bx".to_owned(), Rule::Anywhere),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_needle_too_short_to_identify_anyone_is_skipped() {
+        assert!(
+            user_specific_needles(false, Some("bob"), Some(Path::new("/root")), None).is_empty()
+        );
+        assert!(user_specific_needles(false, None, Some(Path::new("/")), None).is_empty());
+        assert_eq!(
+            user_specific_needles(false, Some("anna"), None, Some(Path::new("/w/bx"))),
+            vec![
+                ("anna".to_owned(), Rule::WholeWord),
+                ("/w/bx".to_owned(), Rule::Anywhere),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ci_runner_has_no_needles() {
+        let needles = user_specific_needles(
+            true,
+            Some("quillon"),
+            Some(Path::new("/home/quillon")),
+            Some(Path::new("/home/quillon/work/bx")),
+        );
+        assert!(needles.is_empty(), "{needles:?}");
     }
 
     #[test]
     fn a_user_specific_path_is_an_offence_wherever_it_appears() {
-        let fragment = ["/m", "nt/sc", "ratch/go", "lem"].concat();
-        let account = ["go", "lem"].concat();
+        let needles = synthetic_needles();
+        let offences = |text: &str| user_specific_offences(text, &needles);
+        // The paths alone, so a path is seen to be caught by its own rule and
+        // not by the account name inside it.
+        let paths: Vec<_> = needles
+            .iter()
+            .filter(|(_, rule)| *rule == Rule::Anywhere)
+            .cloned()
+            .collect();
 
-        // The canonical spelling on the machine this repository lives on. The
-        // fragment is preceded by `r`, so the word-boundary rule exempted it and
-        // the primary case went unreported.
-        assert!(!user_specific_offences(&format!("/var{fragment}/dev/x")).is_empty());
-        assert!(!user_specific_offences(&format!("{fragment}/dev/x")).is_empty());
-        // The bare account name, which was not a needle at all.
-        assert!(!user_specific_offences(&format!("/home/{account}")).is_empty());
-        assert!(!user_specific_offences(&format!("home = {account}")).is_empty());
-        // And an account name inside an ordinary word still is not an offence.
-        assert!(user_specific_offences(&format!("an amal{account} of prose")).is_empty());
+        // A home under a symlinked mount, as it reads once resolved: the path
+        // is preceded by `r`, so a word-boundary rule would exempt it.
+        assert_eq!(
+            user_specific_offences("/var/home/quillon/dev/x", &paths),
+            ["/home/quillon"]
+        );
+        assert_eq!(
+            user_specific_offences("cd /srv/build/quillon/bx/src", &paths),
+            ["/srv/build/quillon/bx"]
+        );
+        // The bare account name.
+        assert_eq!(offences("home = quillon"), ["quillon"]);
+        assert_eq!(
+            offences("by Quillon.".to_ascii_lowercase().as_str()),
+            ["quillon"]
+        );
+        // An account name inside an ordinary word, on either side, is not.
+        assert!(offences("an amalquillon of prose").is_empty());
+        assert!(offences("a quillonite of prose").is_empty());
 
         // The path rule needs a negative case of its own, or a rule that
         // reported every string would pass this test and still be useless. A
-        // path sharing the fragment's leading directories, but not the
+        // path sharing a needle's leading directories, but not the
         // account-specific tail, is not an offence.
-        let prefix = ["/m", "nt/sc", "ratch/"].concat();
         assert!(
-            user_specific_offences(&format!("{prefix}shared/dev/x")).is_empty(),
+            offences("/home/shared/dev/x").is_empty(),
             "only the account-specific tail makes the path a literal"
         );
         assert!(
-            user_specific_offences("/var/home/example/.ssh/config").is_empty(),
+            offences("/var/home/example/.ssh/config").is_empty(),
             "the placeholder home every test in this crate uses is not an offence"
         );
     }
 
-    /// Invariant 5 has no exception, and a one-time fix without a regression
-    /// guard is not enforcement. This file is skipped, because the needles it
-    /// hunts for have to appear in it somewhere.
+    /// Every git-tracked file under `root`, as an absolute path.
+    fn tracked_files(root: &Path) -> Vec<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "-z"])
+            .output()
+            .unwrap_or_else(|e| panic!("running git ls-files in {}: {e}", root.display()));
+        assert!(
+            out.status.success(),
+            "git ls-files in {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| root.join(std::ffi::OsStr::from_bytes(name)))
+            .collect()
+    }
+
+    /// The text of tracked file `file` the guard reads, lowercased.
     ///
-    /// The blast radius is `src/` only. `Cargo.toml`'s `authors` field names a
-    /// person on purpose: authorship metadata is a legitimate exception, and a
-    /// guard that fired on it would be deleted rather than obeyed.
+    /// `Cargo.toml`'s `authors` field names a person on purpose: authorship
+    /// metadata is a legitimate exception, and a guard that fired on it would
+    /// be deleted rather than obeyed. That line, and nothing else, is left out.
+    fn scanned_text(root: &Path, file: &Path, bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+        if file != root.join("Cargo.toml") {
+            return text;
+        }
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with("authors"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
-    fn no_user_specific_literal_survives_under_src() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let self_path = root.join("testing.rs");
+    fn only_the_authors_line_of_the_manifest_is_exempt() {
+        let root = Path::new("/srv/build/quillon/bx");
+        let manifest = b"[package]\nauthors = [\"Quillon\"]\nname = \"bx\"\n";
+        let needles = synthetic_needles();
+        let read = |file: &str| scanned_text(root, &root.join(file), manifest);
+
+        assert!(user_specific_offences(&read("Cargo.toml"), &needles).is_empty());
+        assert_eq!(
+            user_specific_offences(&read("README.md"), &needles),
+            ["quillon"]
+        );
+        assert!(read("Cargo.toml").contains("name = \"bx\""));
+    }
+
+    /// Invariant 5 has no exception, and a one-time fix without a regression
+    /// guard is not enforcement. Every tracked file is read, this one included:
+    /// the needles are the running machine's, so no file has to hold them.
+    #[test]
+    fn no_user_specific_literal_survives_in_a_tracked_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let needles = machine_needles();
 
         let mut offences = Vec::new();
-        for file in rust_sources(&root) {
-            if file == self_path {
+        for file in tracked_files(root) {
+            // A tracked file deleted in the working tree has nothing to read.
+            if !file.is_file() {
                 continue;
             }
-            let text = std::fs::read_to_string(&file)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()))
-                .to_ascii_lowercase();
-            for needle in user_specific_offences(&text) {
+            let bytes =
+                std::fs::read(&file).unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
+            for needle in user_specific_offences(&scanned_text(root, &file, &bytes), &needles) {
                 offences.push(format!("{} names {needle}", file.display()));
             }
         }
 
         assert!(
             offences.is_empty(),
-            "nothing user-specific may live under src/:\n  {}",
+            "nothing user-specific may live in the repository:\n  {}",
             offences.join("\n  ")
         );
     }
 
-    /// Every `.rs` file under `root`, recursively, in no particular order.
-    fn rust_sources(root: &Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let entries = std::fs::read_dir(&dir)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
-            for entry in entries {
-                let path = entry.expect("a directory entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        out
-    }
-
-    /// `haystack` contains `needle` not preceded by an alphanumeric character.
+    /// `haystack` contains `needle` with no alphanumeric character on either
+    /// side.
     ///
-    /// The boundary matters: "adjusting" contains one of the usernames as a
-    /// substring, and a guard that fires on ordinary English is a guard someone
-    /// deletes.
+    /// The boundary matters: an account name is often the start or the middle
+    /// of an ordinary word, and a guard that fires on ordinary English is a
+    /// guard someone deletes.
     fn contains_token(haystack: &str, needle: &str) -> bool {
+        let alphanumeric = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
         haystack.match_indices(needle).any(|(at, _)| {
-            haystack[..at]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !c.is_ascii_alphanumeric())
+            !alphanumeric(haystack[..at].chars().next_back())
+                && !alphanumeric(haystack[at + needle.len()..].chars().next())
         })
     }
 }

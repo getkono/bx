@@ -78,8 +78,10 @@
 //! asks read-only questions about the machine — whether each declared tool is
 //! on `PATH`, whether a required value is unanswered, whether a state file is
 //! damaged or a session was interrupted, whether a directory is wider than a
-//! private file in it, whether a declared optional source is there, and
-//! whether systemd has reloaded, enabled, or failed a unit file bx wrote —
+//! private file in it, whether a declared optional source is there, whether
+//! systemd has reloaded, enabled, or failed a unit file bx wrote, whether a
+//! path a written target declares in `references` is on disk, and whether an
+//! interrupted write left a `.bx-` temporary file beside its destination —
 //! changing nothing itself and installing nothing: a declared tool's install
 //! command is printed, never run.
 //!

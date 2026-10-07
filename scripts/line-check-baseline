@@ -3,7 +3,6 @@
 src/config/merge.rs
 src/config/resolve.rs
 src/env_guard.rs
-src/journal.rs
 src/plan/decide.rs
 src/plan/mod.rs
 src/recover.rs

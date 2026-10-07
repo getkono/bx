@@ -2300,10 +2300,7 @@ impl Session {
     ) -> Result<(), Error> {
         let index = self.written;
         let announced = fs::compare_dir(planned, mode);
-        if !matches!(
-            announced.action,
-            crate::report::Action::Create | crate::report::Action::Modify
-        ) {
+        if !matches!(announced.drift, fs::Drift::Create | fs::Drift::Modify) {
             return Err(fs::Error::Changed {
                 path: dest,
                 detail: "plan announced nothing for bx to make here".to_string(),

@@ -650,9 +650,9 @@ pub(super) fn decide(
     let entry = ctx.ledger.get(&target.path);
     let (action, note) = match target.attach {
         Attach::Region { comment } => {
-            region_ownership(outcome.action, &observed, entry, comment, note)
+            region_ownership(outcome.drift.into(), &observed, entry, comment, note)
         }
-        _ => ownership(outcome.action, &observed, entry, note),
+        _ => ownership(outcome.drift.into(), &observed, entry, note),
     };
 
     // A write into a directory its owner cannot write or search is refused
@@ -827,7 +827,7 @@ fn decide_dir(
         })
         .or(outcome.note);
     let (action, note) = dir_ownership(
-        outcome.action,
+        outcome.drift.into(),
         &observed,
         ctx.ledger.get(&target.path),
         note,
@@ -1405,9 +1405,9 @@ fn track_onto_machine(
     } else {
         Action::Modify
     };
-    let why = match (unusable, outcome.action) {
+    let why = match (unusable, outcome.drift) {
         (Some(reason), _) => Some(reason),
-        (None, Action::Conflict) => Some(outcome.note.unwrap_or_default()),
+        (None, fs::Drift::Conflict) => Some(outcome.note.unwrap_or_default()),
         (None, _) => locked_parent(observed, ctx.home, ctx.declared, Write::File),
     };
     if let Some(why) = why {
@@ -1464,9 +1464,9 @@ fn track_into_repo(
         let reason = parent.unusable()?;
         Some(portable_reason(&parent.path, reason, ctx.home))
     });
-    let why = match (unusable, outcome.action) {
+    let why = match (unusable, outcome.drift) {
         (Some(reason), _) => Some(reason),
-        (None, Action::Conflict) => Some(outcome.note.unwrap_or_default()),
+        (None, fs::Drift::Conflict) => Some(outcome.note.unwrap_or_default()),
         (None, _) => locked_parent(repo, ctx.home, ctx.declared, Write::File),
     };
     if let Some(why) = why {
@@ -1805,9 +1805,35 @@ fn join(parts: impl IntoIterator<Item = Option<String>>) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
+/// What the filesystem found, as the action the plan announces before the
+/// ledger is consulted: the ownership rules above settle what bx then does
+/// about it.
+impl From<fs::Drift> for Action {
+    fn from(drift: fs::Drift) -> Self {
+        match drift {
+            fs::Drift::Unchanged => Self::Unchanged,
+            fs::Drift::Create => Self::Create,
+            fs::Drift::Modify => Self::Modify,
+            fs::Drift::Conflict => Self::Conflict,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_drift_is_announced_as_the_action_of_the_same_name() {
+        for (drift, action) in [
+            (fs::Drift::Unchanged, Action::Unchanged),
+            (fs::Drift::Create, Action::Create),
+            (fs::Drift::Modify, Action::Modify),
+            (fs::Drift::Conflict, Action::Conflict),
+        ] {
+            assert_eq!(Action::from(drift), action, "{drift:?}");
+        }
+    }
     use crate::config::Origin;
     use crate::config::target::KeyPath;
     use crate::testing::guarded_home;

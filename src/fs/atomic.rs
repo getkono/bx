@@ -171,7 +171,6 @@ use tempfile::NamedTempFile;
 use super::durable;
 use super::mode::{Kind, Mode};
 use crate::paths::Portable;
-use crate::report::Action;
 use crate::state::{ContentHash, Mechanism, NewEntry, PriorBytes};
 
 /// The prefix every temporary file bx creates in a destination directory
@@ -243,7 +242,7 @@ pub enum Error {
     ///
     /// Distinct from a parent that is simply missing, which bx creates.
     /// `mkdir` cannot create a directory through a dangling link, so this is
-    /// announced as a [`Action::Conflict`] by `compare` rather than left for
+    /// announced as a [`Drift::Conflict`] by `compare` rather than left for
     /// `apply` to discover as an `ENOENT` naming a temporary file.
     #[error("{reason}")]
     UnusableParent {
@@ -461,7 +460,7 @@ pub enum Error {
     ///
     /// Applying such a mode would succeed once and leave every later `plan`
     /// failing with a permission error, against Invariant 3. [`compare`]
-    /// announces it as an [`Action::Conflict`] whose note is this error's
+    /// announces it as an [`Drift::Conflict`] whose note is this error's
     /// words, less the path, so `apply` never reaches a target `plan` printed
     /// that way. No writer in `fs` raises it: [`stage`] writes the mode it is
     /// given, because a reversal restores a recorded prior mode through it. It
@@ -916,6 +915,24 @@ pub struct Desired<'a> {
     pub mode: Mode,
 }
 
+/// How what is at a destination stands against what bx wants there.
+///
+/// The filesystem's own verdict, in its own words: `fs` knows whether a path
+/// matches, is missing, differs or cannot be written, and nothing about the
+/// ownership, tracking or prerequisites the plan weighs besides. The plan maps
+/// it to the [`crate::report::Action`] it announces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drift {
+    /// Kind, bytes and mode all match.
+    Unchanged,
+    /// Nothing is there.
+    Create,
+    /// It is there and differs, in bytes or in mode.
+    Modify,
+    /// Something is there that bx will not write over.
+    Conflict,
+}
+
 /// The difference between what is at a destination and what bx wants there.
 ///
 /// One function produces this for both `plan` and `apply`, which is how `apply`
@@ -923,7 +940,7 @@ pub struct Desired<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     /// What bx will do.
-    pub action: Action,
+    pub drift: Drift,
     /// Whether the bytes on disk differ from the bytes bx wants there.
     ///
     /// `true` for an absent destination, including when the desired content is
@@ -959,9 +976,9 @@ pub struct Outcome {
 /// bytes. The one read, the realpath of `home`, only names a directory in the
 /// parent note.
 ///
-/// * [`Action::Unchanged`] — kind, bytes and mode all match.
-/// * [`Action::Create`] — nothing is there.
-/// * [`Action::Modify`] — a regular file whose bytes **or** mode differ. A mode
+/// * [`Drift::Unchanged`] — kind, bytes and mode all match.
+/// * [`Drift::Create`] — nothing is there.
+/// * [`Drift::Modify`] — a regular file whose bytes **or** mode differ. A mode
 ///   difference alone is still a `Modify`, with `content_drift == false`, and
 ///   `apply` closes it like any other `Modify`: [`stage`] with this
 ///   observation as `planned` and the desired mode, committed with the desired
@@ -970,7 +987,7 @@ pub struct Outcome {
 ///   observation recorded, so a `chmod`, an edit or a directory landing after
 ///   `plan` is refused rather than overwritten. [`set_mode`] is not the apply
 ///   for it: it compares nothing with `plan`.
-/// * [`Action::Conflict`] — a directory, a symlink, or anything else that is
+/// * [`Drift::Conflict`] — a directory, a symlink, or anything else that is
 ///   not a regular file; and, whatever is there, a declared mode that does not
 ///   grant the owner read (`0400`), because bx could not read the file back to
 ///   compare it. The note is [`Error::OwnerLockedOut`]'s words, less the path.
@@ -1022,7 +1039,7 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
     // whatever is on disk.
     if !desired.mode.includes(FILE_OWNER_NEEDS) {
         return Outcome {
-            action: Action::Conflict,
+            drift: Drift::Conflict,
             content_drift: false,
             mode_drift: None,
             note: Some(owner_locked_out(desired.mode, FILE_OWNER_NEEDS)),
@@ -1034,7 +1051,7 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
     // anything but a conflict would announce work `apply` cannot do.
     if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
         return Outcome {
-            action: Action::Conflict,
+            drift: Drift::Conflict,
             content_drift: false,
             mode_drift: None,
             note: Some(reason.to_string()),
@@ -1075,36 +1092,36 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
         ))
     });
 
-    let (action, content_drift, mode_drift, note) = match observed.kind {
-        Kind::Absent => (Action::Create, true, None, None),
+    let (drift, content_drift, mode_drift, note) = match observed.kind {
+        Kind::Absent => (Drift::Create, true, None, None),
         Kind::File => {
             let content_drift = observed.bytes.as_deref() != Some(desired.bytes);
             let mode_drift = observed
                 .mode
                 .filter(|found| *found != desired.mode)
                 .map(|found| (found, desired.mode));
-            let action = if content_drift || mode_drift.is_some() {
-                Action::Modify
+            let drift = if content_drift || mode_drift.is_some() {
+                Drift::Modify
             } else {
-                Action::Unchanged
+                Drift::Unchanged
             };
             let note = mode_drift.map(|(found, wanted)| format!("mode {found} -> {wanted}"));
-            (action, content_drift, mode_drift, note)
+            (drift, content_drift, mode_drift, note)
         }
         Kind::Dir => (
-            Action::Conflict,
+            Drift::Conflict,
             false,
             None,
             Some("a directory, where the target declares a file".to_string()),
         ),
         Kind::Symlink => (
-            Action::Conflict,
+            Drift::Conflict,
             false,
             None,
             Some("a symlink; bx will not replace a link you created".to_string()),
         ),
         Kind::Other => (
-            Action::Conflict,
+            Drift::Conflict,
             false,
             None,
             Some("not a regular file".to_string()),
@@ -1112,7 +1129,7 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
     };
 
     Outcome {
-        action,
+        drift,
         content_drift,
         mode_drift,
         note,
@@ -1852,13 +1869,13 @@ pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
 /// non-directory anywhere above the path is a conflict here, not an `ENOENT`
 /// for `apply` to discover.
 ///
-/// * [`Action::Unchanged`] — a directory at `mode`.
-/// * [`Action::Create`] — nothing is there; `path` will be created at `mode`
+/// * [`Drift::Unchanged`] — a directory at `mode`.
+/// * [`Drift::Create`] — nothing is there; `path` will be created at `mode`
 ///   and any missing ancestor at [`Mode::DEFAULT_DIR`].
-/// * [`Action::Modify`] — a directory at another mode, closed by [`ensure_dir`]
+/// * [`Drift::Modify`] — a directory at another mode, closed by [`ensure_dir`]
 ///   with a `chmod` and a read-back of the special bits that stuck. The note
 ///   reads exactly `mode 0755 -> 0700`, as for a file.
-/// * [`Action::Conflict`] — anything that is not a directory, including a
+/// * [`Drift::Conflict`] — anything that is not a directory, including a
 ///   symlink to one: bx does not chmod a directory through a link.
 ///
 /// # A declared mode that denies the owner access is applied like any other
@@ -1886,7 +1903,7 @@ pub fn set_mode(path: &Path, mode: Mode) -> Result<(), Error> {
 pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
     if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {
         return Outcome {
-            action: Action::Conflict,
+            drift: Drift::Conflict,
             content_drift: false,
             mode_drift: None,
             note: Some(reason.to_string()),
@@ -1894,13 +1911,13 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
         };
     }
 
-    let conflict = |note: &str| (Action::Conflict, None, Some(note.to_string()));
-    let (action, mode_drift, note) = match observed.kind {
-        Kind::Absent => (Action::Create, None, None),
+    let conflict = |note: &str| (Drift::Conflict, None, Some(note.to_string()));
+    let (drift, mode_drift, note) = match observed.kind {
+        Kind::Absent => (Drift::Create, None, None),
         Kind::Dir => match observed.mode.filter(|found| *found != mode) {
-            None => (Action::Unchanged, None, None),
+            None => (Drift::Unchanged, None, None),
             Some(found) => (
-                Action::Modify,
+                Drift::Modify,
                 Some((found, mode)),
                 Some(format!("mode {found} -> {mode}")),
             ),
@@ -1911,7 +1928,7 @@ pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
     };
 
     Outcome {
-        action,
+        drift,
         // A directory has no content to drift.
         content_drift: false,
         mode_drift,
@@ -2000,8 +2017,8 @@ pub fn ensure_dir(
 /// What [`ensure_dir`] did, and what a ledger needs to reverse it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnsuredDir {
-    /// The action performed — the one `plan` announced.
-    pub action: Action,
+    /// The change performed — the one `plan` announced.
+    pub drift: Drift,
     /// What was at the path immediately before, which is what `plan` saw. For
     /// a `Modify` its `mode` is the mode that was overwritten. For a directory
     /// an earlier write in this apply created, it is `plan`'s observation:
@@ -2011,7 +2028,7 @@ pub struct EnsuredDir {
     /// and any ancestor this call had to invent, less an ancestor another
     /// directory target in this apply declares, which that target claims —
     /// in the order a reversal removes them. For a directory an earlier call in
-    /// this apply made, just the path. Empty unless `action` is `Create`.
+    /// this apply made, just the path. Empty unless `drift` is `Create`.
     pub created_dirs: Vec<PathBuf>,
 }
 
@@ -2177,7 +2194,7 @@ fn act_on_dir(
     // directory counts — another one somebody put at the same path is not
     // bx's — and only one made at the declared mode: a write that ran before
     // the declaration made it at 0755 and may already have published into it.
-    if announced.action == Action::Create
+    if announced.drift == Drift::Create
         && fresh.kind == Kind::Dir
         && let (Some(made), Some(stamp)) = (created.made(path), fresh.stamp)
         && (made.dev, made.ino) == (stamp.dev, stamp.ino)
@@ -2200,7 +2217,7 @@ fn act_on_dir(
             "set a directory this apply created to its declared mode"
         );
         return Ok(EnsuredDir {
-            action: Action::Create,
+            drift: Drift::Create,
             prior: planned.clone(),
             created_dirs: vec![path.to_path_buf()],
         });
@@ -2216,8 +2233,8 @@ fn act_on_dir(
     }
 
     let mut created_dirs = Vec::new();
-    match outcome.action {
-        Action::Create => {
+    match outcome.drift {
+        Drift::Create => {
             let made = create_missing_dirs(path, created)?;
             // The path itself is the deepest entry when this call made it. When
             // it is not there, something took the path between the observation
@@ -2236,7 +2253,7 @@ fn act_on_dir(
             created_dirs = created.record(made, Some(path));
             tracing::debug!(path = %path.display(), %mode, "created a directory");
         }
-        Action::Modify => {
+        Drift::Modify => {
             // A `Modify` is only announced for a directory, which always has
             // a mode.
             let prior = fresh.mode.unwrap_or(mode);
@@ -2250,7 +2267,7 @@ fn act_on_dir(
         _ => {}
     }
     Ok(EnsuredDir {
-        action: outcome.action,
+        drift: outcome.drift,
         prior: fresh,
         created_dirs,
     })
@@ -3258,6 +3275,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Mutex;
 
+    use crate::report::Action;
     use crate::state::{ExclusiveLock, Ledger, LedgerView, Prior, StateDir};
     use crate::testing::{GuardedHome, guarded_home};
 
@@ -3367,7 +3385,7 @@ mod tests {
     fn an_absent_destination_is_a_create() {
         let home = guarded_home();
         let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Create);
+        assert_eq!(outcome.drift, Drift::Create);
         assert!(outcome.content_drift);
         assert_eq!(outcome.mode_drift, None);
         assert_eq!(outcome.note, None);
@@ -3378,11 +3396,14 @@ mod tests {
         let home = guarded_home();
         seed(&home.child("f"), b"x", Mode::DEFAULT_FILE);
         let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Unchanged);
+        assert_eq!(outcome.drift, Drift::Unchanged);
         assert!(!outcome.content_drift);
         assert_eq!(outcome.mode_drift, None);
         assert_eq!(outcome.note, None);
-        assert!(!outcome.action.is_pending(), "a second plan must be empty");
+        assert!(
+            !Action::from(outcome.drift).is_pending(),
+            "a second plan must be empty"
+        );
     }
 
     #[test]
@@ -3390,7 +3411,7 @@ mod tests {
         let home = guarded_home();
         seed(&home.child("f"), b"x", Mode::DEFAULT_FILE);
         let outcome = outcome_for(&home, "f", b"x", Mode::PRIVATE_FILE);
-        assert_eq!(outcome.action, Action::Modify);
+        assert_eq!(outcome.drift, Drift::Modify);
         assert!(
             !outcome.content_drift,
             "the bytes match; only the mode drifted",
@@ -3408,9 +3429,9 @@ mod tests {
         // will not accept, declared 0600.
         seed(&home.child(".ssh/config"), b"Host *\n", Mode::DEFAULT_FILE);
         let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
-        assert_eq!(outcome.action, Action::Modify);
+        assert_eq!(outcome.drift, Drift::Modify);
         assert_eq!(outcome.note.as_deref(), Some("mode 0644 -> 0600"));
-        assert_eq!(outcome.action.symbol(), '~');
+        assert_eq!(Action::from(outcome.drift).symbol(), '~');
     }
 
     #[test]
@@ -3418,7 +3439,7 @@ mod tests {
         let home = guarded_home();
         seed(&home.child("f"), b"old", Mode::DEFAULT_FILE);
         let outcome = outcome_for(&home, "f", b"new", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Modify);
+        assert_eq!(outcome.drift, Drift::Modify);
         assert!(outcome.content_drift);
         assert_eq!(outcome.mode_drift, None);
         assert_eq!(outcome.note, None);
@@ -3429,8 +3450,8 @@ mod tests {
         let home = guarded_home();
         std::fs::create_dir(home.child("f")).expect("occupy");
         let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Conflict);
-        assert!(outcome.action.needs_attention());
+        assert_eq!(outcome.drift, Drift::Conflict);
+        assert!(Action::from(outcome.drift).needs_attention());
         assert!(
             outcome
                 .note
@@ -3454,7 +3475,7 @@ mod tests {
         )
         .expect("mkfifo");
         let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Conflict);
+        assert_eq!(outcome.drift, Drift::Conflict);
         assert_eq!(outcome.note.as_deref(), Some("not a regular file"));
     }
 
@@ -3530,7 +3551,7 @@ mod tests {
         seed(&home.child(".ssh/config"), b"Host *\n", Mode::PRIVATE_FILE);
 
         let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
-        assert_eq!(outcome.action, Action::Unchanged, "the file itself is fine");
+        assert_eq!(outcome.drift, Drift::Unchanged, "the file itself is fine");
         // Exactly, so a plain directory is never reported with the symlink
         // wording, whose remedy ("chmod ... itself") names a different action
         // and shares every substring checked above it.
@@ -3589,7 +3610,7 @@ mod tests {
     fn a_parent_bx_has_yet_to_create_is_reported_before_it_exists() {
         let home = guarded_home();
         let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
-        assert_eq!(outcome.action, Action::Create);
+        assert_eq!(outcome.drift, Drift::Create);
         let note = outcome.parent_note.expect("the parent must be reported");
         assert!(note.contains("will be created at 0755"), "{note}");
     }
@@ -3648,8 +3669,8 @@ mod tests {
 
         let outcome = outcome_for(&home, ".config/f", b"x", Mode::DEFAULT_FILE);
         assert_eq!(
-            outcome.action,
-            Action::Conflict,
+            outcome.drift,
+            Drift::Conflict,
             "a create bx cannot perform is not a create",
         );
         let note = outcome.note.expect("the cause must be named");
@@ -3694,7 +3715,7 @@ mod tests {
         // The link is two components up, so the immediate parent is absent for
         // a second reason and `mkdir` cannot reach it either.
         let outcome = outcome_for(&home, ".config/bx/init.sh", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Conflict);
+        assert_eq!(outcome.drift, Drift::Conflict);
         let note = outcome.note.expect("the cause must be named");
         assert!(note.contains(".config"), "{note}");
 
@@ -3709,7 +3730,7 @@ mod tests {
         std::os::unix::fs::symlink("loop", home.child("loop")).expect("symlink");
 
         let outcome = outcome_for(&home, "loop/f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Conflict);
+        assert_eq!(outcome.drift, Drift::Conflict);
         let note = outcome.note.expect("the cause must be named");
         assert!(note.contains("loop"), "{note}");
         assert!(note.contains("does not resolve to a directory"), "{note}");
@@ -3731,7 +3752,7 @@ mod tests {
         seed(&home.child("notadir"), b"a file", Mode::DEFAULT_FILE);
 
         let outcome = outcome_for(&home, "notadir/f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Conflict);
+        assert_eq!(outcome.drift, Drift::Conflict);
         assert!(
             outcome
                 .note
@@ -3850,8 +3871,8 @@ mod tests {
                     &desired(b"#!/bin/sh\nexit 0\n", mode),
                     home.path()
                 )
-                .action,
-                Action::Unchanged,
+                .drift,
+                Drift::Unchanged,
                 "{mode}: the second plan is empty",
             );
         }
@@ -4014,7 +4035,7 @@ mod tests {
             // A directory target plan announces as a create.
             let team = dir.join("team");
             let planned = observe(&team).expect("observe");
-            assert_eq!(compare_dir(&planned, mode).action, Action::Create);
+            assert_eq!(compare_dir(&planned, mode).drift, Drift::Create);
             let err = ensure_dir(&team, mode, &planned, &mut CreatedDirs::new())
                 .expect_err("create: a setgid bit the kernel dropped is not an applied mode");
             let landed = assert_directory_set_id_not_kept(&err, &team, mode);
@@ -4025,8 +4046,8 @@ mod tests {
             );
             let second = compare_dir(&observe(&team).expect("observe"), mode);
             assert_eq!(
-                (second.action, second.mode_drift),
-                (Action::Modify, Some((landed, mode))),
+                (second.drift, second.mode_drift),
+                (Drift::Modify, Some((landed, mode))),
                 "the second plan shows the bit that is still missing",
             );
 
@@ -4036,7 +4057,7 @@ mod tests {
             std::fs::create_dir(&team2).expect("mkdir");
             set_mode(&team2, Mode::PRIVATE_DIR).expect("chmod");
             let planned = observe(&team2).expect("observe");
-            assert_eq!(compare_dir(&planned, mode).action, Action::Modify);
+            assert_eq!(compare_dir(&planned, mode).drift, Drift::Modify);
             let err = ensure_dir(&team2, mode, &planned, &mut CreatedDirs::new())
                 .expect_err("modify: a setgid bit the kernel would drop is not applied");
             let message = err.to_string();
@@ -4068,8 +4089,8 @@ mod tests {
             );
             let second = compare_dir(&observe(&team2).expect("observe"), mode);
             assert_eq!(
-                (second.action, second.mode_drift),
-                (Action::Modify, Some((Mode::PRIVATE_DIR, mode))),
+                (second.drift, second.mode_drift),
+                (Drift::Modify, Some((Mode::PRIVATE_DIR, mode))),
                 "the second plan is the first plan again",
             );
 
@@ -4122,8 +4143,8 @@ mod tests {
                 let planned = observe(&team).expect("observe");
                 let first = compare_dir(&planned, declared);
                 assert_eq!(
-                    (first.action, first.mode_drift),
-                    (Action::Modify, Some((inherited, declared))),
+                    (first.drift, first.mode_drift),
+                    (Drift::Modify, Some((inherited, declared))),
                 );
                 let err = ensure_dir(&team, declared, &planned, &mut CreatedDirs::new())
                     .expect_err("a chmod that would strip the setgid bit is refused");
@@ -4640,7 +4661,7 @@ mod tests {
         let planned = observe(&dir).expect("plan sees nothing");
         let mut created = CreatedDirs::new();
         let made = ensure_dir(&dir, declared, &planned, &mut created).expect("create");
-        assert_eq!(made.action, Action::Create);
+        assert_eq!(made.drift, Drift::Create);
         assert_eq!(
             mode_of_path(&dir),
             declared,
@@ -4728,10 +4749,10 @@ mod tests {
         let planned = observe(&team).expect("observe");
         let applied = ensure_dir(&team, declared, &planned, &mut CreatedDirs::new())
             .expect("a member's chmod keeps the bit");
-        assert_eq!(applied.action, Action::Modify);
+        assert_eq!(applied.drift, Drift::Modify);
         assert_eq!(mode_of_path(&team), declared);
         let second = observe(&team).expect("observe");
-        assert_eq!(compare_dir(&second, declared).action, Action::Unchanged);
+        assert_eq!(compare_dir(&second, declared).drift, Drift::Unchanged);
     }
 
     #[test]
@@ -4857,8 +4878,8 @@ mod tests {
         // Declared, the mode is still plan's conflict: bx could not read the
         // file back to compare it.
         assert_eq!(
-            compare(&now, &desired(b"prior\n", recorded), home.path()).action,
-            Action::Conflict,
+            compare(&now, &desired(b"prior\n", recorded), home.path()).drift,
+            Drift::Conflict,
         );
         // Restored, it is what was there, and stage writes it as recorded.
         stage(&dest, recorded, &now, &mut CreatedDirs::new())
@@ -5286,8 +5307,8 @@ mod tests {
                 &desired(b"same\n", Mode::DEFAULT_FILE),
                 home.path()
             )
-            .action,
-            Action::Unchanged,
+            .drift,
+            Drift::Unchanged,
             "the second plan is empty",
         );
     }
@@ -5474,8 +5495,8 @@ mod tests {
             seed(&dest, b"v1\n", Mode::DEFAULT_FILE);
             let planned = observe(&dest).expect("plan observes");
             assert_eq!(
-                compare(&planned, &desired(b"bx\n", Mode::DEFAULT_FILE), home.path()).action,
-                Action::Modify,
+                compare(&planned, &desired(b"bx\n", Mode::DEFAULT_FILE), home.path()).drift,
+                Drift::Modify,
                 "{how}",
             );
 
@@ -5646,7 +5667,7 @@ mod tests {
 
         // And `plan` says the same thing rather than something else.
         let outcome = outcome_for(&home, "link", b"replacement", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.action, Action::Conflict);
+        assert_eq!(outcome.drift, Drift::Conflict);
         assert_eq!(
             outcome.note.as_deref(),
             Some("a symlink; bx will not replace a link you created"),
@@ -5911,7 +5932,7 @@ mod tests {
         seed(&chmodded, b"Host *\n", Mode::DEFAULT_FILE);
         let planned_a = observe(&chmodded).expect("plan observes");
         let outcome = compare(&planned_a, &want, home.path());
-        assert_eq!(outcome.action, Action::Modify);
+        assert_eq!(outcome.drift, Drift::Modify);
         assert!(!outcome.content_drift, "only the mode drifted");
         set_mode(&chmodded, Mode::from_bits(0o640)).expect("the user's chmod after plan");
         let result_a = apply_file_modify(&planned_a, &chmodded, &want);
@@ -5921,10 +5942,7 @@ mod tests {
         let replaced = home.child("replaced");
         seed(&replaced, b"Host *\n", Mode::DEFAULT_FILE);
         let planned_b = observe(&replaced).expect("plan observes");
-        assert_eq!(
-            compare(&planned_b, &want, home.path()).action,
-            Action::Modify
-        );
+        assert_eq!(compare(&planned_b, &want, home.path()).drift, Drift::Modify);
         std::fs::remove_file(&replaced).expect("rm");
         std::fs::create_dir(&replaced).expect("a directory takes the path");
         set_mode(&replaced, Mode::DEFAULT_DIR).expect("at its own mode");
@@ -6035,8 +6053,8 @@ mod tests {
         set_mode(&dir, Mode::PRIVATE_DIR).expect("chmod");
         let planned = observe(&dir).expect("plan observes");
         assert_eq!(
-            compare_dir(&planned, Mode::PRIVATE_DIR).action,
-            Action::Unchanged,
+            compare_dir(&planned, Mode::PRIVATE_DIR).drift,
+            Drift::Unchanged,
         );
 
         set_mode(&dir, Mode::DEFAULT_DIR).expect("somebody widens it after plan");
@@ -6064,8 +6082,8 @@ mod tests {
         let dir = home.child("shared");
         let planned = observe(&dir).expect("plan observes");
         assert_eq!(
-            compare_dir(&planned, Mode::PRIVATE_DIR).action,
-            Action::Create
+            compare_dir(&planned, Mode::PRIVATE_DIR).drift,
+            Drift::Create
         );
 
         std::fs::create_dir(&dir).expect("another tool makes it");
@@ -6094,8 +6112,8 @@ mod tests {
         set_mode(&dir, Mode::PRIVATE_DIR).expect("chmod");
         let planned = observe(&dir).expect("plan observes");
         assert_eq!(
-            compare_dir(&planned, Mode::PRIVATE_DIR).action,
-            Action::Unchanged,
+            compare_dir(&planned, Mode::PRIVATE_DIR).drift,
+            Drift::Unchanged,
         );
 
         // Somebody replaces the parent with a dangling symlink between `plan`
@@ -6144,7 +6162,7 @@ mod tests {
                     bytes to compare them with what it wants there, so its mode must grant the \
                     owner read (0400)";
         let conflict = Outcome {
-            action: Action::Conflict,
+            drift: Drift::Conflict,
             content_drift: false,
             mode_drift: None,
             note: Some(note.to_string()),
@@ -6185,8 +6203,8 @@ mod tests {
         // or searches them: whether a mode is too narrow for what lies beneath
         // is the plan layer's to judge.
         for (name, before, declared, action) in [
-            ("ro", Some(Mode::DEFAULT_DIR), 0o555, Action::Modify),
-            (".aws", None, 0o500, Action::Create),
+            ("ro", Some(Mode::DEFAULT_DIR), 0o555, Drift::Modify),
+            (".aws", None, 0o500, Drift::Create),
         ] {
             let path = home.child(name);
             if let Some(mode) = before {
@@ -6197,16 +6215,16 @@ mod tests {
             let planned = observe(&path).expect("plan observes");
             let first = compare_dir(&planned, declared);
             assert_eq!(
-                (first.action, first.mode_drift),
+                (first.drift, first.mode_drift),
                 (action, before.map(|mode| (mode, declared))),
                 "{name}: the first plan",
             );
             let applied = ensure_dir(&path, declared, &planned, &mut CreatedDirs::new())
                 .expect("a childless directory target applies");
-            assert_eq!(applied.action, action, "{name}");
+            assert_eq!(applied.drift, action, "{name}");
             assert_eq!(mode_of_path(&path), declared, "{name}");
             let second = compare_dir(&observe(&path).expect("plan observes"), declared);
-            assert_eq!(second.action, Action::Unchanged, "{name}: the second plan");
+            assert_eq!(second.drift, Drift::Unchanged, "{name}: the second plan");
             set_mode(&path, Mode::DEFAULT_DIR).expect("unlock for cleanup");
         }
     }
@@ -6244,7 +6262,7 @@ mod tests {
         let dir = home.child("a/b/c");
 
         let created = apply_dir(&dir, Mode::PRIVATE_DIR).expect("create");
-        assert_eq!(created.action, Action::Create);
+        assert_eq!(created.drift, Drift::Create);
         assert_eq!(created.prior.kind, Kind::Absent);
         assert_eq!(
             created.created_dirs,
@@ -6254,7 +6272,7 @@ mod tests {
 
         set_mode(&dir, Mode::DEFAULT_DIR).expect("widen");
         let closed = apply_dir(&dir, Mode::PRIVATE_DIR).expect("modify");
-        assert_eq!(closed.action, Action::Modify);
+        assert_eq!(closed.drift, Drift::Modify);
         assert_eq!(
             closed.prior.mode,
             Some(Mode::DEFAULT_DIR),
@@ -6263,7 +6281,7 @@ mod tests {
         assert!(closed.created_dirs.is_empty());
 
         let unchanged = apply_dir(&dir, Mode::PRIVATE_DIR).expect("unchanged");
-        assert_eq!(unchanged.action, Action::Unchanged);
+        assert_eq!(unchanged.drift, Drift::Unchanged);
         assert_eq!(unchanged.prior.mode, Some(Mode::PRIVATE_DIR));
         assert!(unchanged.created_dirs.is_empty());
     }
@@ -6274,22 +6292,22 @@ mod tests {
         let dir = home.child(".ssh");
 
         assert_eq!(
-            apply_dir(&dir, Mode::PRIVATE_DIR).expect("create").action,
-            Action::Create,
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("create").drift,
+            Drift::Create,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
 
         // Idempotence: the second call changes nothing and reports nothing.
         assert_eq!(
-            apply_dir(&dir, Mode::PRIVATE_DIR).expect("again").action,
-            Action::Unchanged,
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("again").drift,
+            Drift::Unchanged,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
 
         // Drift is announced by plan, which changes nothing...
         set_mode(&dir, Mode::DEFAULT_DIR).expect("widen");
         let planned = dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR);
-        assert_eq!(planned.action, Action::Modify);
+        assert_eq!(planned.drift, Drift::Modify);
         assert_eq!(planned.note.as_deref(), Some("mode 0755 -> 0700"));
         assert_eq!(
             planned.mode_drift,
@@ -6304,13 +6322,13 @@ mod tests {
 
         // ...and closed by apply, which does exactly that and nothing else.
         assert_eq!(
-            apply_dir(&dir, Mode::PRIVATE_DIR).expect("drift").action,
-            planned.action,
+            apply_dir(&dir, Mode::PRIVATE_DIR).expect("drift").drift,
+            planned.drift,
         );
         assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR);
         assert_eq!(
-            dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).action,
-            Action::Unchanged,
+            dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).drift,
+            Drift::Unchanged,
             "the second plan is empty",
         );
     }
@@ -6320,7 +6338,7 @@ mod tests {
         let home = guarded_home();
 
         let outcome = dir_outcome_for(&home, "declared/dir", Mode::PRIVATE_DIR);
-        assert_eq!(outcome.action, Action::Create);
+        assert_eq!(outcome.drift, Drift::Create);
         assert_eq!(outcome.note, None);
         assert_eq!(outcome.parent_note, None);
         assert!(!outcome.content_drift);
@@ -6334,8 +6352,8 @@ mod tests {
         assert_eq!(
             apply_dir(&home.child("declared/dir"), Mode::PRIVATE_DIR)
                 .expect("apply")
-                .action,
-            outcome.action,
+                .drift,
+            outcome.drift,
         );
         assert_eq!(mode_of_path(&home.child("declared/dir")), Mode::PRIVATE_DIR);
         assert_eq!(mode_of_path(&home.child("declared")), Mode::DEFAULT_DIR);
@@ -6347,20 +6365,20 @@ mod tests {
         std::os::unix::fs::symlink("nowhere", home.child("d")).expect("symlink");
 
         let outcome = dir_outcome_for(&home, "d/a", Mode::PRIVATE_DIR);
-        assert_eq!(outcome.action, Action::Conflict);
+        assert_eq!(outcome.drift, Drift::Conflict);
         let note = outcome.note.expect("the cause must be named");
         assert!(note.contains("does not resolve to a directory"), "{note}");
 
         // A dangling link *at* the path is a link, and a conflict too.
         assert_eq!(
-            dir_outcome_for(&home, "d", Mode::PRIVATE_DIR).action,
-            Action::Conflict,
+            dir_outcome_for(&home, "d", Mode::PRIVATE_DIR).drift,
+            Drift::Conflict,
         );
         assert_eq!(
             apply_dir(&home.child("d"), Mode::PRIVATE_DIR)
                 .expect("a verdict")
-                .action,
-            Action::Conflict,
+                .drift,
+            Drift::Conflict,
         );
         assert!(std::fs::symlink_metadata(home.child("nowhere")).is_err());
     }
@@ -6389,7 +6407,7 @@ mod tests {
             ("fifo", "not a directory"),
         ] {
             let outcome = dir_outcome_for(&home, rel, Mode::PRIVATE_DIR);
-            assert_eq!(outcome.action, Action::Conflict, "{rel}");
+            assert_eq!(outcome.drift, Drift::Conflict, "{rel}");
             assert_eq!(outcome.note.as_deref(), Some(expected), "{rel}");
         }
     }
@@ -6406,8 +6424,8 @@ mod tests {
         let planned_dir = observe(&dir).expect("plan observes the directory");
         let planned_file = observe(&file).expect("plan observes the file");
         assert_eq!(
-            compare_dir(&planned_dir, Mode::PRIVATE_DIR).action,
-            Action::Create
+            compare_dir(&planned_dir, Mode::PRIVATE_DIR).drift,
+            Drift::Create
         );
         assert_eq!(
             compare(
@@ -6415,8 +6433,8 @@ mod tests {
                 &desired(b"Host *\n", Mode::PRIVATE_FILE),
                 home.path(),
             )
-            .action,
-            Action::Create,
+            .drift,
+            Drift::Create,
         );
 
         let mut created = CreatedDirs::new();
@@ -6450,7 +6468,7 @@ mod tests {
 
         let ensured = ensure_dir(&dir, Mode::PRIVATE_DIR, &planned_dir, &mut created)
             .expect("the create plan announced");
-        assert_eq!(ensured.action, Action::Create);
+        assert_eq!(ensured.drift, Drift::Create);
         assert_eq!(
             ensured.prior.kind,
             Kind::Absent,
@@ -6466,13 +6484,13 @@ mod tests {
         assert_eq!(mode_of_path(&file), Mode::PRIVATE_FILE);
         assert_eq!(std::fs::read(&file).expect("read"), b"Host *\n");
         assert_eq!(
-            dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).action,
-            Action::Unchanged,
+            dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).drift,
+            Drift::Unchanged,
             "the second plan is empty for the directory",
         );
         assert_eq!(
-            outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE).action,
-            Action::Unchanged,
+            outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE).drift,
+            Drift::Unchanged,
             "and for the file",
         );
     }
@@ -6502,8 +6520,8 @@ mod tests {
             let ensured_a = ensured_a.unwrap_or_else(|e| panic!("{order}: a: {e:?}"));
             let ensured_b = ensured_b.unwrap_or_else(|e| panic!("{order}: a/b: {e:?}"));
 
-            assert_eq!(ensured_a.action, Action::Create, "{order}");
-            assert_eq!(ensured_b.action, Action::Create, "{order}");
+            assert_eq!(ensured_a.drift, Drift::Create, "{order}");
+            assert_eq!(ensured_b.drift, Drift::Create, "{order}");
             assert_eq!(mode_of_path(&a), mode_a, "{order}");
             assert_eq!(mode_of_path(&b), Mode::PRIVATE_DIR, "{order}");
             assert_eq!(ensured_a.created_dirs, std::slice::from_ref(&a), "{order}");
@@ -6515,13 +6533,13 @@ mod tests {
                 "{order}: a/b claims only itself",
             );
             assert_eq!(
-                dir_outcome_for(&home, "a", mode_a).action,
-                Action::Unchanged,
+                dir_outcome_for(&home, "a", mode_a).drift,
+                Drift::Unchanged,
                 "{order}: the second plan is empty",
             );
             assert_eq!(
-                dir_outcome_for(&home, "a/b", Mode::PRIVATE_DIR).action,
-                Action::Unchanged,
+                dir_outcome_for(&home, "a/b", Mode::PRIVATE_DIR).drift,
+                Drift::Unchanged,
                 "{order}: the second plan is empty",
             );
         }
@@ -6626,18 +6644,18 @@ mod tests {
                      {modes:?}",
                 );
             }
-            assert_eq!(ensured.action, Action::Create, "{order}");
+            assert_eq!(ensured.drift, Drift::Create, "{order}");
             assert_eq!(mode_of_path(&dir), Mode::PRIVATE_DIR, "{order}");
             assert_eq!(mode_of_path(&file), Mode::DEFAULT_FILE, "{order}");
             assert_eq!(std::fs::read(&file).expect("read"), b"notes\n", "{order}");
             assert_eq!(
-                dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).action,
-                Action::Unchanged,
+                dir_outcome_for(&home, ".ssh", Mode::PRIVATE_DIR).drift,
+                Drift::Unchanged,
                 "{order}: the second plan is empty for the directory",
             );
             assert_eq!(
-                outcome_for(&home, ".ssh/notes", b"notes\n", Mode::DEFAULT_FILE).action,
-                Action::Unchanged,
+                outcome_for(&home, ".ssh/notes", b"notes\n", Mode::DEFAULT_FILE).drift,
+                Drift::Unchanged,
                 "{order}: and for the file",
             );
         }
@@ -6651,8 +6669,8 @@ mod tests {
         set_mode(&dir, Mode::DEFAULT_DIR).expect("the user's own wide ~/.ssh");
         let planned_dir = observe(&dir).expect("plan observes the directory");
         assert_eq!(
-            compare_dir(&planned_dir, Mode::PRIVATE_DIR).action,
-            Action::Modify
+            compare_dir(&planned_dir, Mode::PRIVATE_DIR).drift,
+            Drift::Modify
         );
         let planned_file = observe(&file).expect("plan observes the file");
         let deeper = home.child(".ssh/sub/notes");
@@ -7077,8 +7095,8 @@ mod tests {
         assert_eq!(
             apply_dir(&home.child("a/b/c"), Mode::PRIVATE_DIR)
                 .expect("create")
-                .action,
-            Action::Create,
+                .drift,
+            Drift::Create,
         );
         assert_eq!(mode_of_path(&home.child("a")), Mode::DEFAULT_DIR);
         assert_eq!(mode_of_path(&home.child("a/b")), Mode::DEFAULT_DIR);
@@ -7091,8 +7109,8 @@ mod tests {
         let path = home.child("f");
         seed(&path, b"x", Mode::DEFAULT_FILE);
         assert_eq!(
-            apply_dir(&path, Mode::PRIVATE_DIR).expect("report").action,
-            Action::Conflict,
+            apply_dir(&path, Mode::PRIVATE_DIR).expect("report").drift,
+            Drift::Conflict,
         );
         assert_eq!(std::fs::read(&path).expect("read"), b"x");
         assert_eq!(mode_of_path(&path), Mode::DEFAULT_FILE);
@@ -7115,15 +7133,15 @@ mod tests {
             assert_eq!(observed.kind, Kind::Symlink, "{spelled}");
             assert_eq!(observed.path, home.child("link"), "{spelled}");
             assert_eq!(
-                compare_dir(&observed, Mode::PRIVATE_DIR).action,
-                Action::Conflict,
+                compare_dir(&observed, Mode::PRIVATE_DIR).drift,
+                Drift::Conflict,
                 "{spelled}",
             );
             assert_eq!(
                 ensure_dir(&path, Mode::PRIVATE_DIR, &observed, &mut CreatedDirs::new())
                     .expect("a verdict")
-                    .action,
-                Action::Conflict,
+                    .drift,
+                Drift::Conflict,
                 "{spelled}",
             );
             let err = set_mode(&path, Mode::PRIVATE_DIR).expect_err("a link is not chmod'd");
@@ -7168,8 +7186,8 @@ mod tests {
         assert_eq!(
             apply_dir(&home.child("link"), Mode::PRIVATE_DIR)
                 .expect("report")
-                .action,
-            Action::Conflict,
+                .drift,
+            Drift::Conflict,
         );
         assert_eq!(
             mode_of_path(&home.child("real")),
@@ -7679,7 +7697,7 @@ mod tests {
         let want = desired(b"Host *\n", Mode::PRIVATE_FILE);
         let planned = observe(&dest).expect("observe");
         let outcome = compare(&planned, &want, home.path());
-        assert_eq!(outcome.action, Action::Modify);
+        assert_eq!(outcome.drift, Drift::Modify);
         assert!(!outcome.content_drift);
 
         // Applied like any other Modify: staged against plan's observation,
@@ -7713,8 +7731,8 @@ mod tests {
         assert_eq!(std::fs::read(&dest).expect("read"), b"Host *\n");
         // Idempotent: the second plan is empty.
         assert_eq!(
-            compare(&observe(&dest).expect("observe again"), &want, home.path()).action,
-            Action::Unchanged,
+            compare(&observe(&dest).expect("observe again"), &want, home.path()).drift,
+            Drift::Unchanged,
         );
 
         // Reversing it restores the prior bytes at the prior mode.
@@ -7921,8 +7939,8 @@ mod tests {
         assert_eq!(
             apply_dir(&home.child("d/a"), Mode::PRIVATE_DIR)
                 .expect("a verdict, not an error")
-                .action,
-            Action::Conflict,
+                .drift,
+            Drift::Conflict,
         );
         assert!(
             std::fs::symlink_metadata(home.child("nowhere")).is_err(),
@@ -7939,7 +7957,7 @@ mod tests {
 
         for (rel, culprit) in [("f/sub/x", "f"), ("loop/a/x", "loop"), ("l/a/x", "l")] {
             let outcome = outcome_for(&home, rel, b"x", Mode::DEFAULT_FILE);
-            assert_eq!(outcome.action, Action::Conflict, "{rel}");
+            assert_eq!(outcome.drift, Drift::Conflict, "{rel}");
             let note = outcome.note.expect("the cause must be named");
             assert!(
                 note.contains(&home.child(culprit).display().to_string()),

@@ -55,12 +55,12 @@
 //! `phase` names where the line loads, from the phases whose content is not an
 //! environment fragment and that nothing but bx's own setup owns:
 //! `activations`, `completions`, `plugins`, `aliases`, `functions`,
-//! `keybindings` and `options` ([`PHASES`]). `env` and `path` are refused
-//! because they hold only fragments the environment guard judges, `completion`
-//! because it is the completion system's own setup, and `terminal` because it
-//! is the single slot one plugin may claim, which a source never does. Within
-//! its phase a source loads after that phase's own declarations, in
-//! declaration order.
+//! `keybindings` and `options` ([`crate::config::source::PHASES`]). `env` and
+//! `path` are refused because they hold only fragments the environment guard
+//! judges, `completion` because it is the completion system's own setup, and
+//! `terminal` because it is the single slot one plugin may claim, which a
+//! source never does. Within its phase a source loads after that phase's own
+//! declarations, in declaration order.
 //!
 //! `when` is one condition from the closed set [`crate::config::when`]
 //! defines, and it gates the line: `has:TOOL` is decided while `plan` renders,

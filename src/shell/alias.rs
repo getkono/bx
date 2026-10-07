@@ -108,7 +108,11 @@ impl AliasDecl {
     /// ([`When::test_bash`]).
     #[must_use]
     pub fn render_bash(&self, present: &dyn Fn(&str) -> bool) -> String {
-        self.render_gated(self.when.as_ref().map(|when| when.gate_bash(present)))
+        self.render_gated(
+            self.when
+                .as_ref()
+                .map(|when| super::bash::gate(when, present)),
+        )
     }
 
     /// The alias's line, gated as `gate` says.

@@ -146,7 +146,7 @@ impl Source {
         let line = self.line();
         let gate = |when: &When| match shell {
             Shell::Zsh => when.gate(present),
-            Shell::Bash => when.gate_bash(present),
+            Shell::Bash => super::bash::gate(when, present),
         };
         match self.when.as_ref().map(gate) {
             None | Some(Gate::Always) => line,

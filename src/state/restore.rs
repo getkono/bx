@@ -124,10 +124,15 @@ pub fn read(dir: &StateDir, reference: &RestoreRef) -> Result<Vec<u8>, Error> {
     };
     // `O_NONBLOCK` as well as `O_NOFOLLOW`: `O_NOFOLLOW` refuses a symlink,
     // but a FIFO is opened by name and `open` itself blocks on one until a
-    // writer appears, before there is any descriptor to `fstat`.
+    // writer appears, before there is any descriptor to `fstat`. The flags
+    // are joined with `union` rather than `|`: they share no bit, so a `^` in
+    // place of a `|` is the same program, and a mutant no test can kill.
     let fd = match rustix::fs::open(
         &path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        OFlags::RDONLY
+            .union(OFlags::NOFOLLOW)
+            .union(OFlags::NONBLOCK)
+            .union(OFlags::CLOEXEC),
         RawMode::empty(),
     ) {
         Ok(fd) => fd,
@@ -199,9 +204,10 @@ pub fn read(dir: &StateDir, reference: &RestoreRef) -> Result<Vec<u8>, Error> {
 /// hard link, and it refuses a symlink outright, so a link is never written
 /// through.
 fn blob_len(path: &Path) -> Option<u64> {
+    // `union`, not `|`, for the reason `read` gives.
     let fd = rustix::fs::open(
         path,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC),
         RawMode::empty(),
     )
     .ok()?;

@@ -56,9 +56,10 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::env::Env;
 use crate::git::{self, Git};
 use crate::paths;
-use crate::plan::{self, Env, Report};
+use crate::plan::{self, Report};
 use crate::state::{ContentHash, LedgerView, Mechanism, StateDir};
 
 /// Everything that stops `bx sync`.

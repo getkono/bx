@@ -47,9 +47,9 @@ use toml_edit::DocumentMut;
 use crate::adopt::{self, Adoption};
 use crate::config::values::{self, AnswerError, ResolvedValues, ValueDecl, local};
 use crate::config::{self, Layer, LayerKind, layers, merge};
+use crate::env::Env;
 use crate::fs::{self, Mode};
 use crate::paths::{self, Portable};
-use crate::plan::Env;
 use crate::recover;
 use crate::state::{self, ExclusiveLock, StateDir};
 

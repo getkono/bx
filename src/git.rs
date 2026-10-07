@@ -18,7 +18,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::plan::Env;
+use crate::env::Env;
 
 /// Variables that make git operate on a repository other than the one it is
 /// run in. Removed from every child, so `-C REPO` is what decides.

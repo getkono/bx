@@ -70,11 +70,11 @@ use crate::config::resolve::{Resolution, Resolved};
 use crate::config::target::{Attach, Body, Direction, Format};
 use crate::config::values::ResolvedValues;
 use crate::config::{self, Layer, Origin, layers, merge, resolve};
+use crate::env::Env;
 use crate::env_guard::{self, Reason, RootSet};
 use crate::fs::{self, Kind, Mode};
 use crate::journal;
 use crate::paths::{self, Portable};
-use crate::plan::Env;
 use crate::recover;
 use crate::restore::{self, Restored};
 use crate::state::{

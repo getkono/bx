@@ -136,8 +136,10 @@ impl Merged<Target, TargetKey> {
     /// written, and unrelated targets keep their order among themselves; which
     /// slot the file holds is decided by the answer, though, so a later row for
     /// it can sit ahead of an unrelated target for one answer and not another.
-    /// A later layer that names the file settles it — a full entry replaces
-    /// every entry for it, and a toggle flips every one.
+    /// Only a later layer's full entry for the file settles it: it replaces
+    /// every entry for the file and drops the file's recorded clashes. A later
+    /// toggle flips every entry for the file and settles nothing; the clashes
+    /// stay recorded.
     ///
     /// # Errors
     ///

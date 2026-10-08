@@ -108,8 +108,9 @@ pub fn pending(state: &StateDir) -> Result<Option<Interrupted>, Error> {
 /// Resolve an interrupted session, or report why it cannot be.
 ///
 /// Takes the state directory's exclusive lock for the duration. Safe to run when
-/// there is nothing to do — that is [`Outcome::Nothing`] — and safe to run twice:
-/// the second run finds no journal.
+/// there is nothing to do — that is [`Outcome::Nothing`], which is also what a
+/// journal no bx session could have written comes to once it is set aside —
+/// and safe to run twice: the second run finds no journal.
 ///
 /// # Errors
 ///

@@ -1,5 +1,5 @@
-//! Systemd user units: written by bx like any other file, checked by `bx
-//! doctor` against what the user's systemd has made of them.
+//! Check 7: systemd user units, written by bx like any other file and checked
+//! against what the user's systemd has made of them.
 //!
 //! A unit is not a kind of target. It is an ordinary file target whose path is
 //! a direct child of the user unit directory ([`crate::paths::systemd_user_dir_in`])

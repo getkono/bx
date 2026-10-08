@@ -174,9 +174,9 @@ impl LedgerView {
     /// opening a ledger and saving it without re-recording that row wrote the
     /// stray out, and the reread reported it (r4 round 5, D1 and CL1). The
     /// exposure that remains is the returned value itself, in memory, for the
-    /// life of one run. `bx rm` — the one command that acts
-    /// on `created_dirs` — does not exist on this branch; when it does, it
-    /// reads a ledger this rule has already been through.
+    /// life of one run. `bx rm`, which removes the directories `created_dirs`
+    /// names, opens the ledger through this same load, so it acts only on a
+    /// ledger this rule has already been through.
     ///
     /// All-or-nothing was the wrong degradation for this file. `CLAUDE.md`
     /// requires a corrupt machine-owned file to degrade to recomputation, and

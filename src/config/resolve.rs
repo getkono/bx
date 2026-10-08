@@ -111,8 +111,11 @@ pub struct Resolved {
 /// placeholder, a reference to a value no layer declares, a `default` that
 /// references a later value, a `default` that is not of its kind with no
 /// account answer involved, a target field that substitution makes invalid
-/// with no account answer in it, or a `file` that references a `path` value,
-/// answered or not; for a `[[function]]` body holding a malformed placeholder,
+/// with no account answer in it, a `file` that references a `path` value,
+/// answered or not, or a `requires` entry no answer could make a tool bx can
+/// look up; for an `[[env]]` value that is a repo defect, as
+/// [`crate::shell::placement::place_envs`] lists, and a home that cannot hold
+/// bash's files' paths; for a `[[function]]` body holding a malformed placeholder,
 /// a reference to a value no layer declares, or a committed `default` it
 /// cannot hold; for a `[[source]]` path referencing a value no layer declares,
 /// or made unwritable by a committed `default`; for two enabled plugins that

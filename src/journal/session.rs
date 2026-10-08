@@ -213,8 +213,10 @@ impl Session {
     /// left in place, never replaced. [`Error::State`] with
     /// [`crate::state::Error::ForeignRecord`] when a scope entry is one the
     /// loader would refuse. [`Error::State`] when the directory
-    /// cannot be made or locked, and [`Error::Io`] when the journal cannot be
-    /// written.
+    /// cannot be made or locked, or the ledger cannot be opened.
+    /// [`Error::Write`] when the journal cannot be written, [`Error::Io`] when
+    /// it cannot be reopened for appending, and [`Error::Encode`] or
+    /// [`Error::FrameTooLarge`] when its `Begin` cannot be framed.
     pub fn open(
         state: &StateDir,
         kind: SessionKind,
@@ -1340,9 +1342,10 @@ fn link_prior_bytes(observed: &Observed) -> PriorBytes {
 ///
 /// # Errors
 ///
-/// [`Error::Read`] when the destination cannot be looked at — a parent that
-/// does not resolve, or one this process may not search — and [`Error::Write`]
-/// with [`crate::fs::Error::Changed`] when it is no longer what plan saw.
+/// [`Error::Write`] with [`crate::fs::Error::Read`] when the destination cannot
+/// be looked at — a parent that does not resolve, or one this process may not
+/// search — and with [`crate::fs::Error::Changed`] when it is no longer what
+/// plan saw.
 fn refuse_unplanned(dest: &Path, planned: &Observed) -> Result<Observed, Error> {
     let observed = fs::observe(dest)?;
     refuse_moved(planned, &observed)?;

@@ -409,7 +409,7 @@ impl ValueKind {
     ///
     /// # Errors
     ///
-    /// [`ValueError::Malformed`] when `answer` is not of this kind.
+    /// [`ValueError::Malformed`] or [`ValueError::NotAbsolute`] for an answer not of this kind.
     pub(crate) fn check(self, answer: &str, home: &Path) -> Result<String, ValueError> {
         let malformed = |expected: &'static str| ValueError::Malformed {
             kind: self,
@@ -1725,9 +1725,9 @@ impl ResolvedValues {
     ///
     /// # Errors
     ///
-    /// [`Unresolved::Unset`] when a referenced value has no answer — which makes
-    /// a target blocked, not the load failed. [`Unresolved::Malformed`] and
-    /// [`Unresolved::Undeclared`] are repo defects and do fail the load.
+    /// [`Unresolved::Unset`], [`Unresolved::Disabled`] or [`Unresolved::Invalid`] when a value is
+    /// unanswered, switched off, or made invalid by the account: a target blocks, not the load.
+    /// [`Unresolved::Malformed`] and [`Unresolved::Undeclared`] are repo defects that fail the load.
     pub fn substitute(&self, text: &str) -> Result<String, Unresolved> {
         let expanded = expand(text, &|name: &str| match self.index_of(name) {
             Some(index) => self.lookup_at(index),

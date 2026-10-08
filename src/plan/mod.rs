@@ -18,7 +18,9 @@
 //! the `PATH` a declared activation's tool and a generated file's `has:TOOL`
 //! condition are looked up along, which [`Inputs::load`] takes once through
 //! [`activation::System::from_env`]; every other function takes what it needs
-//! as an argument.
+//! as an argument. The processes the path spawns — a declared activation's
+//! command, and `git` for a declared external — inherit the rest of the
+//! process environment, which bx itself never reads.
 
 mod decide;
 mod diff;
@@ -132,10 +134,10 @@ impl Report {
     }
 }
 
-/// Decide every target, report, and — in [`Mode::Apply`], once `approve` says
-/// so — write.
+/// Decide every target, report, and — in [`Mode::Apply`] or [`Mode::Sync`],
+/// once `approve` says so — write.
 ///
-/// An interrupted session comes first, in both modes, and is then all a run
+/// An interrupted session comes first, in every mode, and is then all a run
 /// does. Its rows are what recovery would do to each write the session
 /// announced, and no configured target is decided against a disk recovery is
 /// about to change: `plan` shows the rows, and `apply` refuses before any

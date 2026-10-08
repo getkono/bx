@@ -38,6 +38,9 @@
 //!
 //! A restore is a [`Session`] like any other write, so an interrupted `rm` is
 //! detected and rolled back by the same machinery as an interrupted `apply`.
+//! The one exception is a checkout bx cloned: its bytes are git's, so it is
+//! deleted outside the journal, before the session opens, and made crash-safe
+//! by the ledger alone ([`restore_with`] says how).
 //!
 //! # `plan` and `rm` share one function
 //!

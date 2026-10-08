@@ -88,6 +88,10 @@ fn doctor_with(
 
 /// Bare `bx`: every target, unchanged ones included.
 ///
+/// Writes nothing, but it is not free of processes: deciding the plan runs
+/// each declared activation's command whose output is not cached yet, and asks
+/// the user's `git` about each declared external's checkout.
+///
 /// # Errors
 ///
 /// Whatever loading or deciding returns, and [`Error::Output`] when `out`
@@ -97,6 +101,9 @@ pub fn status(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 }
 
 /// `bx plan`: what `apply` would do, writing nothing.
+///
+/// Spawns what [`status`] spawns: uncached activation commands, and `git` for
+/// declared externals.
 ///
 /// # Errors
 ///
@@ -228,8 +235,11 @@ fn converge(
 /// `bx apply` does, and push what this machine committed.
 ///
 /// [`sync::pull`] runs first and refuses a diverged branch, a missing
-/// upstream, and a push that would carry a state file, all before anything is
-/// changed. The apply is [`apply`]'s, with its one confirmation and its `yes`.
+/// upstream, and a push that would carry a state file, all before the apply
+/// changes anything. It is not free of writes itself: before the fetch it
+/// commits the tracked copies an interrupted sync wrote and never committed
+/// ([`sync::commit_carried`]), so a refusal can follow that commit.
+/// The apply is [`apply`]'s, with its one confirmation and its `yes`.
 /// The apply runs in [`Mode::Sync`], so each tracked target this machine
 /// changed is carried into the repo, and [`sync::commit_carried`] commits
 /// those files in one commit before the push.
@@ -243,7 +253,9 @@ fn converge(
 ///
 /// # Errors
 ///
-/// Whatever [`sync::pull`] and [`sync::push`] return, and as [`apply`].
+/// Whatever [`sync::pull`] and [`sync::push`] return, and as [`apply`]; and
+/// whatever [`sync::commit_carried`] returns after the apply, which leaves
+/// what the apply wrote on disk and uncommitted for the next `sync` to commit.
 pub fn sync(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, sync::Error> {
     sync_with(env, yes, out, &Git::new(env), &mut confirm)
 }

@@ -254,6 +254,18 @@ pub fn run(
         &inputs.home,
         &inputs.state.ledger(),
     ));
+    // Every declared external, in configuration order; reported after every
+    // target, and decided first so a link is never read from a checkout that
+    // stays where it is.
+    let (rows, clones) = external::decide_all(
+        &inputs.resolved.externals,
+        &external::Ctx {
+            ledger: &ledger,
+            home: &inputs.home,
+            git: &inputs.git,
+            lock: &inputs.lock,
+        },
+    )?;
     // Every external's links, as symlink targets decided with the rest: each
     // child the commit holds, beside every path a target already declares.
     let mut expansion = {
@@ -265,6 +277,7 @@ pub fn run(
             &inputs.git,
             &declared,
             &|path| external::bx_clone(&ledger, path),
+            &|at| matches!(rows[at].action, Action::Blocked | Action::Conflict),
         )
     };
     targets.append(&mut expansion.targets);
@@ -277,16 +290,6 @@ pub fn run(
         ops.extend(decided.carries);
     }
     let agreed = decided.agreed;
-    // Every declared external after every target, in configuration order.
-    let (rows, clones) = external::decide_all(
-        &inputs.resolved.externals,
-        &external::Ctx {
-            ledger: &ledger,
-            home: &inputs.home,
-            git: &inputs.git,
-            lock: &inputs.lock,
-        },
-    )?;
     let first_external = report.changes.len();
     report.changes.extend(rows);
     // A child some other declaration holds, and each link whose commit is not

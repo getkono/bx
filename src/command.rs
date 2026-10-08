@@ -2925,8 +2925,8 @@ mod tests {
                 text(&moved)
             );
             assert!(
-                text(&moved).contains("+ ~/.claude/skills/b"),
-                "{}",
+                text(&moved).contains("+ ~/.claude/skills/*"),
+                "the link, waiting for its checkout to move: {}",
                 text(&moved)
             );
             assert_eq!(locked(&home).as_deref(), Some(second.as_str()));

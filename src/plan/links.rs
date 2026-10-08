@@ -11,34 +11,40 @@
 //! # Read from the commit, never the working tree
 //!
 //! The children are listed from the commit itself, `git ls-tree` over the
-//! checkout's object store, rather than by reading the directory on disk. That
-//! is what lets `plan` list the children of a commit the checkout has fetched
-//! but not yet moved to — which `bx update` always arranges before it shows a
-//! plan — and what keeps an untracked directory someone left in the checkout
-//! from being linked as if the external shipped it. Only directories are
+//! checkout's object store, rather than by reading the directory on disk, and
+//! only once the checkout stands at that commit: a link made while it is still
+//! on another would dangle, or point at what the commit no longer ships, for as
+//! long as the checkout stays there. Listing from the commit keeps an
+//! untracked directory someone left in the checkout from being linked as if
+//! the external shipped it. Only directories are
 //! children: a file, a symlink or a submodule beside them is not linked, and
 //! neither is a child whose name begins with `.`, which is how a repository
 //! keeps its own machinery (`.github`) out of sight.
 //!
-//! # When the commit is not here yet
+//! # When the checkout is not at the commit yet
 //!
-//! A checkout that is not cloned, or that does not hold the commit yet, cannot
-//! say what its children are without reaching the network, which `plan` never
-//! does. Such a link is **pending**: `plan` shows one row for the rule, naming
-//! the commit its children will be read from, and `apply` expands it once the
-//! external's own work has fetched that commit, then decides and writes those
-//! links as one more step. The children are a function of the commit `plan`
-//! named, so `apply` does what the row announced and nothing beyond it
-//! (Invariant 7), and the next `plan` lists every child, unchanged
-//! (Invariant 3). While a link is pending or its external is blocked, every
-//! file bx recorded beneath its `to` counts as declared, so a link already
-//! made is not reported as one nothing declares just because this run cannot
-//! list it.
+//! A checkout that is not cloned, or not at the commit yet, is one the
+//! external's own work moves first. Such a link is **pending**: `plan` shows
+//! one row for the rule, naming the commit its children will be read from,
+//! and `apply` expands it once the external's own work has moved the checkout
+//! there, then decides and writes those links as one more step. The children
+//! are a function of the commit `plan` named, so `apply` does what the row
+//! announced and nothing beyond it (Invariant 7), and the next `plan` lists
+//! every child, unchanged (Invariant 3). A checkout the external's work
+//! stopped short of moving is not at the commit, so its pending links are
+//! stopped too. An external whose own row is blocked or a conflict is never
+//! moved, and its links are not expanded at all. While a link is pending or
+//! its external is blocked, every file bx recorded beneath its `to` counts as
+//! declared, so a link already made is not reported as one nothing declares
+//! just because this run cannot list it.
 //!
 //! # Collisions
 //!
 //! A child whose path a `[[target]]`, or an earlier link, already declares is
 //! a conflict row and is not written: the first declaration keeps the path.
+//! A link into the same directory as an earlier pending one is pending as
+//! well, so `apply` lists the two in the order they are declared, as the next
+//! `plan` does.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -85,7 +91,9 @@ pub(super) struct Pending {
 /// Expand every link of `externals`.
 ///
 /// `declared` is every path a target already declares, which a child may not
-/// take.
+/// take. `stopped` says, by index, whether an external's own row is blocked
+/// or a conflict: its checkout stays where it is, so nothing is linked from
+/// it.
 pub(super) fn expand(
     externals: &[External],
     lock: &Lock,
@@ -93,18 +101,27 @@ pub(super) fn expand(
     git: &Git,
     declared: &BTreeSet<&str>,
     owned: &dyn Fn(&Portable) -> bool,
+    stopped: &dyn Fn(usize) -> bool,
 ) -> Expansion {
     let mut expansion = Expansion::default();
     let mut taken: BTreeSet<String> = declared.iter().map(|path| (*path).to_string()).collect();
     let mut pending_rows = Vec::new();
+    // The `to` of every link left pending so far. A later link into the same
+    // directory waits for it, so `apply` lists the two in the order they are
+    // declared, as the next `plan` does, and the first keeps a child both
+    // name.
+    let mut waiting: BTreeSet<Portable> = BTreeSet::new();
     for (at, external) in externals.iter().enumerate() {
-        let Ok(rev) = super::external::rev(external, lock) else {
+        let rev = match super::external::rev(external, lock) {
+            Ok(rev) if !stopped(at) => rev,
             // The external's own row says why; nothing beneath its links is
             // reported for it in the meantime.
-            expansion
-                .held
-                .extend(external.links.iter().map(|link| link.to.clone()));
-            continue;
+            _ => {
+                expansion
+                    .held
+                    .extend(external.links.iter().map(|link| link.to.clone()));
+                continue;
+            }
         };
         let dest = external.path.render(home);
         if !owned(&external.path) && dest.exists() {
@@ -118,18 +135,27 @@ pub(super) fn expand(
             continue;
         }
         for (index, link) in external.links.iter().enumerate() {
-            let Some(children) = children(git, &dest, rev, link) else {
-                expansion.held.push(link.to.clone());
-                pending_rows.push((
-                    Pending {
-                        row: 0,
-                        external: at,
-                        link: index,
-                        rev: rev.to_string(),
-                    },
-                    pending_row(external, link, rev),
-                ));
-                continue;
+            let listed = if waiting.contains(&link.to) {
+                Err(Wait::Earlier)
+            } else {
+                children(git, &dest, rev, link).ok_or(Wait::Commit)
+            };
+            let children = match listed {
+                Ok(children) => children,
+                Err(wait) => {
+                    expansion.held.push(link.to.clone());
+                    waiting.insert(link.to.clone());
+                    pending_rows.push((
+                        Pending {
+                            row: 0,
+                            external: at,
+                            link: index,
+                            rev: rev.to_string(),
+                        },
+                        pending_row(external, link, rev, wait),
+                    ));
+                    continue;
+                }
             };
             for child in children {
                 match link_target(external, link, &child, home) {
@@ -175,7 +201,7 @@ pub(super) fn expand_pending(
     }
     let children = children(git, &dest, rev, link).ok_or_else(|| {
         format!(
-            "the checkout at {} does not hold {rev}, so the children of `{}` were not linked",
+            "the checkout at {} is not at {rev}, so the children of `{}` were not linked",
             external.path,
             from_shown(link)
         )
@@ -211,16 +237,28 @@ fn taken_row(target: &Target, external: &External, link: &Link) -> Change {
     }
 }
 
+/// What a pending link waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    /// Its checkout to stand at the commit.
+    Commit,
+    /// An earlier pending link into the same directory.
+    Earlier,
+}
+
 /// The row a pending link shows.
-fn pending_row(external: &External, link: &Link, rev: &str) -> Change {
+fn pending_row(external: &External, link: &Link, rev: &str, wait: Wait) -> Change {
+    let when = match wait {
+        Wait::Commit => "once the checkout is at that commit",
+        Wait::Earlier => "after the earlier link into this directory, which declares first",
+    };
     Change {
         target: link.key(),
         origin: link.origin.clone(),
         action: Action::Create,
         diff: None,
         note: Some(format!(
-            "links each child directory of `{}`{} in {} at {rev} here, once the checkout \
-             holds that commit",
+            "links each child directory of `{}`{} in {} at {rev} here, {when}",
             from_shown(link),
             link.require
                 .as_ref()
@@ -240,18 +278,30 @@ fn from_shown(link: &Link) -> String {
 }
 
 /// The names of `link`'s children in commit `rev` of the checkout at `dest`,
-/// sorted, or `None` when the checkout does not hold `rev`.
+/// sorted, or `None` when the checkout is not at `rev`: a link made before
+/// the checkout moves would point at what it does not hold yet.
 fn children(git: &Git, dest: &Path, rev: &str, link: &Link) -> Option<Vec<String>> {
     if !dest.is_dir() || super::external::own_checkout(git, dest).is_err() {
         return None;
     }
-    let commit = format!("{rev}^{{commit}}");
-    git.query(dest, &["cat-file", "-e", &commit]).ok()?;
-    let mut args = vec!["ls-tree", "-r", "-z", "--name-only", "--full-tree", rev];
+    if super::external::head(git, dest).ok()? != rev {
+        return None;
+    }
+    // `from` is a directory's name, never a pattern: a leading `:` is not
+    // git's pathspec magic, and a name's own whitespace is kept.
+    let mut args = vec![
+        "--literal-pathspecs",
+        "ls-tree",
+        "-r",
+        "-z",
+        "--name-only",
+        "--full-tree",
+        rev,
+    ];
     if !link.from.is_empty() {
         args.extend(["--", link.from.as_str()]);
     }
-    let listed = git.query(dest, &args).ok()?;
+    let listed = git.query_whole(dest, &args).ok()?;
     let prefix = if link.from.is_empty() {
         String::new()
     } else {
@@ -401,6 +451,7 @@ mod tests {
             &git(home.path()),
             &BTreeSet::new(),
             &|_| true,
+            &|_| false,
         );
         assert_eq!(
             links(&expansion),
@@ -432,6 +483,7 @@ mod tests {
             &git(home.path()),
             &BTreeSet::new(),
             &|_| true,
+            &|_| false,
         );
         assert_eq!(
             links(&expansion),
@@ -459,6 +511,7 @@ mod tests {
             &git(home.path()),
             &declared,
             &|_| true,
+            &|_| false,
         );
         assert_eq!(
             links(&expansion),
@@ -492,6 +545,7 @@ mod tests {
             &git(home.path()),
             &BTreeSet::new(),
             &|_| true,
+            &|_| false,
         );
         assert!(expansion.targets.is_empty());
         let held: Vec<&str> = expansion.held.iter().map(Portable::as_str).collect();
@@ -516,7 +570,7 @@ mod tests {
             true,
         )
         .unwrap_err();
-        assert!(err.contains("does not hold"), "{err}");
+        assert!(err.contains("is not at"), "{err}");
         let err = expand_pending(
             &ext,
             &ext.links[0],
@@ -577,6 +631,7 @@ mod tests {
             &git(home.path()),
             &BTreeSet::new(),
             &|_| true,
+            &|_| false,
         );
         assert!(expansion.targets.is_empty(), "{:?}", links(&expansion));
         assert_eq!(expansion.pending.len(), 1);
@@ -593,6 +648,7 @@ mod tests {
             home.path(),
             &git(home.path()),
             &BTreeSet::new(),
+            &|_| false,
             &|_| false,
         );
         assert!(expansion.targets.is_empty() && expansion.rows.is_empty());
@@ -615,6 +671,7 @@ mod tests {
             &git(home.path()),
             &BTreeSet::new(),
             &|_| true,
+            &|_| false,
         );
         assert!(expansion.rows.is_empty() && expansion.targets.is_empty());
         assert_eq!(expansion.held.len(), 1);
@@ -628,5 +685,134 @@ mod tests {
         for name in ["", ".a", "a\nb", "{{x}}", "a\u{FFFD}"] {
             assert!(!usable_name(name), "{name:?}");
         }
+    }
+
+    #[test]
+    fn a_checkout_not_at_the_commit_has_its_links_pending_even_holding_it() {
+        let home = guarded_home();
+        let first = checkout(&home, &["s/a/f"]);
+        let dir = home.child("src/a");
+        std::fs::create_dir_all(dir.join("s/b")).unwrap();
+        std::fs::write(dir.join("s/b/f"), "x\n").unwrap();
+        commit_all(home.path(), &dir, "b");
+        let second = git_run(home.path(), &dir, &["rev-parse", "HEAD"]);
+        git_run(home.path(), &dir, &["checkout", "--quiet", &first]);
+        let ext = external(&home, &second, vec![link(&home, "s", "~/x", None)]);
+        let expansion = expand(
+            std::slice::from_ref(&ext),
+            &Lock::default(),
+            home.path(),
+            &git(home.path()),
+            &BTreeSet::new(),
+            &|_| true,
+            &|_| false,
+        );
+        assert!(expansion.targets.is_empty(), "{:?}", links(&expansion));
+        assert_eq!(expansion.pending.len(), 1);
+        let note = expansion.rows[0].note.as_deref().unwrap();
+        assert!(
+            note.ends_with("once the checkout is at that commit"),
+            "{note}"
+        );
+        // Still there, as a stopped fast-forward leaves it.
+        let err = expand_pending(
+            &ext,
+            &ext.links[0],
+            &second,
+            home.path(),
+            &git(home.path()),
+            &mut BTreeSet::new(),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains(&format!("is not at {second}")), "{err}");
+    }
+
+    #[test]
+    fn a_stopped_external_holds_its_links_without_reading_them() {
+        let home = guarded_home();
+        let rev = checkout(&home, &["s/a/f"]);
+        let ext = external(&home, &rev, vec![link(&home, "s", "~/x", None)]);
+        let expansion = expand(
+            &[ext],
+            &Lock::default(),
+            home.path(),
+            &git(home.path()),
+            &BTreeSet::new(),
+            &|_| true,
+            &|at| at == 0,
+        );
+        assert!(expansion.targets.is_empty() && expansion.rows.is_empty());
+        let held: Vec<&str> = expansion.held.iter().map(Portable::as_str).collect();
+        assert_eq!(held, ["~/x"]);
+    }
+
+    #[test]
+    fn a_link_into_the_directory_of_an_earlier_pending_one_waits_for_it() {
+        let home = guarded_home();
+        let rev = checkout(&home, &["s/a/f", "t/c/f"]);
+        let none = External {
+            path: Portable::parse_in("~/src/none", home.path()).unwrap(),
+            ..external(&home, &rev, vec![link(&home, "s", "~/x", None)])
+        };
+        let ready = external(
+            &home,
+            &rev,
+            vec![link(&home, "s", "~/x", None), link(&home, "t", "~/y", None)],
+        );
+        let expansion = expand(
+            &[none, ready],
+            &Lock::default(),
+            home.path(),
+            &git(home.path()),
+            &BTreeSet::new(),
+            &|_| true,
+            &|_| false,
+        );
+        assert_eq!(
+            links(&expansion),
+            [("~/y/c".to_string(), "~/src/a/t/c".to_string())],
+            "another directory is not held up"
+        );
+        let waiting: Vec<(usize, usize)> = expansion
+            .pending
+            .iter()
+            .map(|pending| (pending.external, pending.link))
+            .collect();
+        assert_eq!(waiting, [(0, 0), (1, 0)], "in declaration order");
+        let note = expansion.rows[expansion.pending[1].row]
+            .note
+            .as_deref()
+            .unwrap();
+        assert!(note.ends_with("which declares first"), "{note}");
+    }
+
+    #[test]
+    fn a_from_is_read_as_a_name_and_a_child_keeps_its_own_whitespace() {
+        let home = guarded_home();
+        let rev = checkout(&home, &[" a/f", ":s/b/f"]);
+        let ext = external(
+            &home,
+            &rev,
+            vec![link(&home, "", "~/x", None), link(&home, ":s", "~/y", None)],
+        );
+        let expansion = expand(
+            &[ext],
+            &Lock::default(),
+            home.path(),
+            &git(home.path()),
+            &BTreeSet::new(),
+            &|_| true,
+            &|_| false,
+        );
+        assert!(expansion.pending.is_empty(), "{:?}", expansion.rows);
+        assert_eq!(
+            links(&expansion),
+            [
+                ("~/x/ a".to_string(), "~/src/a/ a".to_string()),
+                ("~/x/:s".to_string(), "~/src/a/:s".to_string()),
+                ("~/y/b".to_string(), "~/src/a/:s/b".to_string()),
+            ]
+        );
     }
 }

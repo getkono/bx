@@ -2144,8 +2144,10 @@ mod tests {
         );
         assert_eq!(rows(&again).len(), 3, "the external and its two children");
 
-        // A child the next commit adds is listed offline once it is fetched,
-        // and one it drops is left as bx made it, for `bx rm` to release.
+        // A commit fetched but not checked out yet is not read until the
+        // checkout moves to it: the link waits for its external, and then a
+        // child the commit adds is linked, and one it drops is left as bx
+        // made it, for `bx rm` to release.
         std::fs::remove_dir_all(home.child("upstream/skills/a")).expect("drop a");
         let next = commit_upstream(&home, &["skills/d/SKILL.md"]);
         git_run(
@@ -2158,12 +2160,10 @@ mod tests {
         assert_eq!(
             rows(&planned),
             [
-                ("~/.claude/skills/b".to_string(), Action::Unchanged),
-                ("~/.claude/skills/d".to_string(), Action::Create),
                 (format!("~/{AT}"), Action::Modify),
-                ("~/.claude/skills/a".to_string(), Action::Undeclared),
+                ("~/.claude/skills/*".to_string(), Action::Create),
             ],
-            "targets, then the external, then what nothing declares"
+            "the external, then its link, waiting for it"
         );
         assert!(planned.stopped.is_empty());
         apply(&home, &layer);
@@ -2172,6 +2172,14 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(home.child(".claude/skills/a")).is_ok(),
             "left as bx made it"
+        );
+        assert_eq!(
+            rows(&plan(&home, &layer))
+                .into_iter()
+                .filter(|(_, action)| *action != Action::Unchanged)
+                .collect::<Vec<_>>(),
+            [("~/.claude/skills/a".to_string(), Action::Undeclared)],
+            "what nothing declares any more"
         );
     }
 
@@ -2202,9 +2210,44 @@ mod tests {
             let row = row(&applied, target);
             assert_eq!(row.action, Action::Blocked);
             let note = row.note.as_deref().expect("a note");
-            assert!(note.contains("does not hold"), "{note}");
+            assert!(note.contains("is not at"), "{note}");
         }
         assert!(!home.child(".claude").exists());
+    }
+
+    #[test]
+    fn a_blocked_external_links_nothing_from_the_commit_it_was_not_moved_to() {
+        let home = guarded_home();
+        upstream(&home);
+        let first = commit_upstream(&home, &["skills/a/SKILL.md"]);
+        lock(&home, URL, "master", &first);
+        let layer = linking("master");
+        apply(&home, &layer);
+        assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+
+        let next = commit_upstream(&home, &["skills/b/SKILL.md"]);
+        git_run(
+            home.path(),
+            &home.child(AT),
+            &["fetch", "--quiet", "origin"],
+        );
+        lock(&home, URL, "master", &next);
+        std::fs::write(home.child(AT).join("skills/a/SKILL.md"), "edited\n").expect("an edit");
+        let applied = apply(&home, &layer);
+        assert_eq!(
+            rows(&applied)
+                .into_iter()
+                .filter(|(_, action)| *action != Action::Unchanged)
+                .collect::<Vec<_>>(),
+            [(format!("~/{AT}"), Action::Blocked)],
+            "no row for its link, and nothing it made called undeclared"
+        );
+        assert_eq!(checked_out(&home), first);
+        assert!(
+            std::fs::symlink_metadata(home.child(".claude/skills/b")).is_err(),
+            "nothing linked from a commit the checkout is not at"
+        );
+        assert!(home.child(".claude/skills/a").exists(), "left as it was");
     }
 
     #[test]

@@ -211,7 +211,7 @@ impl Git {
         command
     }
 
-    /// Run `git args` in `repo` and return what it printed, trimmed.
+    /// Run `git args` in `repo` and return what it printed, whole.
     ///
     /// `stdin` is inherited by a command that may talk to a remote, so a
     /// credential or host-key prompt has somewhere to be answered, and is
@@ -242,12 +242,20 @@ impl Git {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Run `git args` in `repo` with its standard input closed: a read-only
-    /// question, or any command that must not ask one.
+    /// question, or any command that must not ask one. What it printed is
+    /// returned trimmed.
     pub(crate) fn query(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
+        self.query_whole(repo, args)
+            .map(|printed| printed.trim().to_string())
+    }
+
+    /// [`Git::query`], returning what it printed untrimmed: for `-z` output,
+    /// whose names may begin or end with whitespace that is part of them.
+    pub(crate) fn query_whole(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         self.output(repo, &args, Stdio::null())
     }
@@ -262,6 +270,7 @@ impl Git {
     pub(crate) fn remote(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         self.output(repo, &args, Stdio::inherit())
+            .map(|printed| printed.trim().to_string())
     }
 }
 

@@ -43,7 +43,8 @@
 //! name a committed file the account cannot edit and take every unrelated
 //! target with it, so instead both entries are kept and recorded as a
 //! [`Conflict`], and resolution blocks each one, naming both lines and the
-//! answer's. A later layer that names the file settles it. When a toggle among
+//! answer's. A later layer's full entry for the file settles it; a later
+//! toggle does not, and leaves the conflict recorded. When a toggle among
 //! the statements cannot be shown to name a declared target for every answer —
 //! its spelling is not one path as written with a full entry's in its own layer
 //! or an earlier one — another answer may leave it naming a file nothing
@@ -181,9 +182,12 @@ use target_key::{Clash, TargetKey};
 ///
 /// # Errors
 ///
-/// [`Error::BadValue`] when a committed layer carries a `[values]` table, when a
-/// toggle names a key no earlier layer introduced, when one layer names one
-/// file twice with no account answer in either spelling, when two enabled
+/// [`Error::BadValue`] when a committed layer carries a `[values]` table or a
+/// `[secrets]` `identity`, when `local.toml` carries a `[secrets]`
+/// `recipients` list, when a toggle names a key no earlier layer introduced,
+/// when one layer names one file twice with no account answer in either
+/// spelling or under two spellings that are one path before any answer goes
+/// in, when two enabled
 /// plugins claim the terminal slot ([`plugin::check_terminal`]), or for any
 /// defect [`ResolvedValues::resolve`] reports. The same collision with an answer in it
 /// is not an error; it is carried to [`super::resolve`] as a [`Conflict`].

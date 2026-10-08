@@ -249,7 +249,8 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
 ///
 /// * [`Drift::Unchanged`] — a directory at `mode`.
 /// * [`Drift::Create`] — nothing is there; `path` will be created at `mode`
-///   and any missing ancestor at [`Mode::DEFAULT_DIR`].
+///   and any missing ancestor at the mode a directory target in the same
+///   apply declares for it, or at [`Mode::DEFAULT_DIR`] when none does.
 /// * [`Drift::Modify`] — a directory at another mode, closed by [`ensure_dir`](super::ensure_dir)
 ///   with a `chmod` and a read-back of the special bits that stuck. The note
 ///   reads exactly `mode 0755 -> 0700`, as for a file.

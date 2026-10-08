@@ -123,8 +123,9 @@ impl Ledger {
     /// # Errors
     ///
     /// [`Error::ForeignRecord`] for a path the next open under this home would
-    /// refuse, and [`Error::PriorConflict`] for a changed file bx shares with
-    /// the user.
+    /// refuse, [`Error::UnrelatedCreatedDir`] for a `created_dirs` entry that
+    /// is not an ancestor of the target, and [`Error::PriorConflict`] for a
+    /// changed file bx shares with the user.
     pub fn check_record(&self, entry: &NewEntry) -> Result<(), Error> {
         self.check_new_paths(entry)?;
         self.view.check_record(entry)

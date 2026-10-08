@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(doc)]
 use super::{Ledger, LedgerView};
 use crate::fs::{Filled, Mode, Observed};
+use crate::hash::ContentHash;
 use crate::state::Error;
-use crate::state::hash::ContentHash;
 
 /// How bx attached itself to a target file.
 ///

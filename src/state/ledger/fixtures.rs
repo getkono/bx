@@ -6,9 +6,9 @@ use std::path::Path;
 
 use super::{Ledger, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef};
 use crate::fs::{Mode, write_atomically};
+use crate::hash::ContentHash;
 use crate::paths::Portable;
 use crate::state::dir::StateDir;
-use crate::state::hash::ContentHash;
 use crate::state::lock::ExclusiveLock;
 use crate::state::restore;
 use crate::testing::GuardedHome;

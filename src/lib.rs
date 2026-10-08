@@ -31,6 +31,8 @@
 //! lock file's body — a best-effort line naming the holder — is truncated and
 //! written in place through the locked descriptor, because an atomic write
 //! renames a new inode over the name, and the lock is held on the old one.
+//! Both name content by [`hash::ContentHash`], the crate's one digest, which
+//! lives in [`hash`] beneath them so that `fs` needs nothing from `state`.
 //!
 //! [`journal`] is the durability layer between the two: the write-ahead log and
 //! the session every byte bx writes passes through, which records each write
@@ -123,6 +125,7 @@ pub mod env;
 pub mod env_guard;
 pub mod fs;
 pub mod git;
+pub mod hash;
 pub mod init;
 pub mod journal;
 pub mod lexical;

@@ -36,7 +36,7 @@ use tempfile::NamedTempFile;
 
 use super::atomic::{self, CreatedDirs, Error, Observed, Parent, TEMP_PREFIX, Unpublished};
 use super::{Kind, durable};
-use crate::state::ContentHash;
+use crate::hash::ContentHash;
 
 /// The digest a link holding `text` is recorded under: that of its bytes.
 #[must_use]

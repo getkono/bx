@@ -11,9 +11,9 @@ use super::entry::{
 use super::view::LedgerView;
 use super::{KIND, VERSION};
 use crate::fs::Mode;
+use crate::hash::ContentHash;
 use crate::state::Error;
 use crate::state::dir::{StateDir, ensure_dir};
-use crate::state::hash::ContentHash;
 use crate::state::lock::{ExclusiveLock, HeldLock};
 use crate::state::restore;
 use crate::state::store::{self, Loaded};

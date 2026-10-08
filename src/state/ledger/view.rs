@@ -384,8 +384,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use crate::fs::Mode;
+    use crate::hash::ContentHash;
     use crate::paths::Portable;
-    use crate::state::hash::ContentHash;
     use crate::state::ledger::fixtures::*;
     use crate::state::ledger::*;
     use crate::state::{Damage, Fingerprints, Health};

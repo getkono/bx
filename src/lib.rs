@@ -125,6 +125,7 @@ pub mod fs;
 pub mod git;
 pub mod init;
 pub mod journal;
+pub mod lexical;
 pub mod paths;
 pub mod plan;
 pub mod recover;

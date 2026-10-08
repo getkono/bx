@@ -157,8 +157,10 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
+use crate::config::env;
+use crate::config::path::{BASH_REMOVAL, GATE, ZSH_REMOVAL};
 use crate::config::values::ResolvedValues;
-use crate::config::{env, layers};
+use crate::lexical::is_variable_name;
 use crate::paths;
 
 /// Names a shell defines and manages itself. A fragment may not assign one,
@@ -901,7 +903,7 @@ impl RootSet {
                 inadmissible.push(declared.clone());
             }
         }
-        let owned = vec![paths::normalize(&layers::state_dir(&home, None))];
+        let owned = vec![paths::normalize(&paths::state_dir(&home, None))];
         let fragment_dirs = vec![paths::normalize(&paths::render(env::FRAGMENT_DIR, &home))];
         let repos = vec![paths::normalize(&paths::config_root_in(&home, None))];
         Self {
@@ -2259,29 +2261,6 @@ enum Statement<'a> {
 /// environment spells it.
 const SEARCH_PATH: &str = "PATH";
 
-/// What opens a [`Statement::Gated`] line, and what separates its test from
-/// its assignment.
-const GATE: (&str, &str) = ("[[ -d ", " ]] && ");
-
-/// What opens and closes zsh's [`Statement::Removal`] line, around its word.
-const REMOVAL: (&str, &str) = ("path=(${path:#", "})");
-
-/// What opens and closes bash's [`Statement::Removal`] line, around its word.
-///
-/// bash ties no array to `PATH`, so it takes an entry out with five
-/// assignments to `PATH` on one line: every `:` doubled and one more at each
-/// end, so each entry stands between colons of its own; every `:WORD:` dropped,
-/// which with no colon shared takes out every copy; the doubled colons
-/// collapsed; the two added stripped. The word is double-quoted, so a `/` in
-/// it does not end the pattern and no character in it is a glob, and a
-/// reference in it expands as it would bare. Nothing but `PATH` is assigned,
-/// and what it holds after is what it held before less every entry that is
-/// `WORD`, so the line is judged exactly as zsh's is.
-const BASH_REMOVAL: (&str, &str) = (
-    "PATH=:${PATH//:/::}:; PATH=${PATH//\":",
-    ":\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}",
-);
-
 /// Read one line of a fragment against the statement grammar.
 fn statement(line: &str) -> Statement<'_> {
     let text = line.trim_matches(BLANKS);
@@ -2319,7 +2298,7 @@ fn statement(line: &str) -> Statement<'_> {
             })
             .unwrap_or(Statement::Refused);
     }
-    for (open, close) in [REMOVAL, BASH_REMOVAL] {
+    for (open, close) in [ZSH_REMOVAL, BASH_REMOVAL] {
         if let Some(word) = text
             .strip_prefix(open)
             .and_then(|rest| rest.strip_suffix(close))
@@ -2578,18 +2557,6 @@ fn after_value(rest: &str) -> Result<(), Reason> {
         Some((head, _)) if is_variable_name(head) => Reason::MultipleAssignments,
         _ => Reason::Unreadable,
     })
-}
-
-/// Whether `name` is a variable name every shell and `environment.d` read the
-/// same way: `[A-Za-z_][A-Za-z0-9_]*`.
-///
-/// The `[[env]]` parser checks a declared name with this same predicate, so
-/// the parser and the guard cannot disagree on what a variable name is.
-pub(crate) fn is_variable_name(name: &str) -> bool {
-    name.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -7694,12 +7661,6 @@ mod tests {
         // and the scan's text is never generated. So no generated fragment
         // reaches the guard through it.
         //
-        // `config/env.rs` imports only the name predicate, so the `[[env]]`
-        // parser and the guard agree on what a variable name is; a predicate
-        // reads no fragment and writes no bytes. `config/when.rs` imports it
-        // for the same reason, to check the name a `when = "env:NAME"` tests,
-        // and `config/path.rs` for the references a `[path]` entry holds.
-        //
         // `shell/activation.rs` judges a tool's cached activation output,
         // which is the tool's own shell code rather than an environment
         // fragment: it searches the output for every name `is_relocating`
@@ -7713,15 +7674,10 @@ mod tests {
         // into a further file is a new caller, as it was when sites were
         // matched by file. "This module" is the `env_guard` module wherever
         // its files are — `env_guard.rs` and everything beneath `env_guard/`.
-        const KNOWN: [&str; 16] = [
+        const KNOWN: [&str; 13] = [
             // `bx add`'s advisory scan.
             "use crate::env_guard::{self, Reason, RootSet};",
             "env_guard::scan_with(text, roots)",
-            // The name predicate, in `config::env`, `config::when` and
-            // `config::path`.
-            "use crate::env_guard::is_variable_name;",
-            "use crate::env_guard::is_variable_name;",
-            "use crate::env_guard::is_variable_name;",
             // The plan's fragment judgements.
             "use crate::env_guard::{self, RootSet};",
             "violations(&env_guard::scan_with(content, roots), before)",

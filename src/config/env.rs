@@ -68,7 +68,7 @@ use toml_edit::Table;
 use super::path::{self, PathEntry};
 use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
-use crate::env_guard::is_variable_name;
+use crate::lexical::is_variable_name;
 use crate::paths::Portable;
 use crate::shell::{Shell, Shells};
 
@@ -213,7 +213,7 @@ pub fn parse_env(table: &Table, file: &Path, text: &str) -> Result<EnvDecl, Erro
         }
     };
 
-    let shells = Shells::parse_in(&ctx, table, &format!("`{name}`"))?;
+    let shells = ctx.shells_at(table, &format!("`{name}`"))?;
     if kind.places().contains(&Place::EnvironmentD) && table.get(Shells::KEY).is_some() {
         return Err(ctx.bad(
             table,

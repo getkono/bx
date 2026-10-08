@@ -33,7 +33,7 @@
 //!
 //! One condition per declaration: there is no `and`, `or` or `not`.
 
-use crate::env_guard::is_variable_name;
+use crate::lexical::is_variable_name;
 
 /// Every spelling, as an error message lists them.
 const SPELLINGS: &str = "\"interactive\", \"login\", \"ssh\", \"env:NAME\", \"env:NAME=VALUE\" \
@@ -165,16 +165,14 @@ impl When {
         self.gate_with(present, Self::test)
     }
 
-    /// [`When::gate`], leaving the shell a test in bash's words
-    /// ([`When::test_bash`]).
-    #[must_use]
-    pub fn gate_bash(&self, present: &dyn Fn(&str) -> bool) -> Gate {
-        self.gate_with(present, Self::test_bash)
-    }
-
     /// Decide a tool's presence through `present`, and render any other
-    /// condition through `test`.
-    fn gate_with(&self, present: &dyn Fn(&str) -> bool, test: fn(&Self) -> Option<String>) -> Gate {
+    /// condition through `test`: [`When::test`] for zsh, and
+    /// [`When::test_bash`] for bash ([`crate::shell::bash::gate`]).
+    pub(crate) fn gate_with(
+        &self,
+        present: &dyn Fn(&str) -> bool,
+        test: fn(&Self) -> Option<String>,
+    ) -> Gate {
         match self {
             Self::Has(tool) => {
                 if present(tool) {
@@ -202,9 +200,9 @@ pub const CLOSER: &str = "fi";
 ///
 /// The guard asks this of every line it reads, so the only openers it accepts
 /// are the ones [`When::test`] or [`When::test_bash`] can produce, and the
-/// one [`login_opener_bash`] writes: the test is read back into a condition
-/// and rendered again, and anything that does not come back identical is not
-/// an opener.
+/// one [`crate::shell::bash::login_opener`] writes: the test is read back
+/// into a condition and rendered again, and anything that does not come back
+/// identical is not an opener.
 #[must_use]
 pub fn is_opener(line: &str) -> bool {
     line.strip_prefix("if ")
@@ -214,20 +212,9 @@ pub fn is_opener(line: &str) -> bool {
         .is_some()
 }
 
-/// What opens bash's test of a login shell joined to one more test.
-const LOGIN_AND_BASH: &str = "shopt -q login_shell && ";
-
-/// The line that opens a bash block holding what only a login shell sees:
-/// bash's login test alone, or joined to `test` — a runtime condition's bash
-/// test — so a login-only line gated on its own condition is still one block,
-/// never one nested in another.
-#[must_use]
-pub fn login_opener_bash(test: Option<&str>) -> String {
-    match test {
-        None => opener(&When::Login.test_bash().unwrap_or_default()),
-        Some(test) => opener(&format!("{LOGIN_AND_BASH}{test}")),
-    }
-}
+/// What opens bash's test of a login shell joined to one more test
+/// ([`crate::shell::bash::login_opener`]).
+pub(crate) const LOGIN_AND_BASH: &str = "shopt -q login_shell && ";
 
 /// The runtime condition `test` is the rendering of, in either shell's
 /// words, if it is one.
@@ -414,8 +401,11 @@ mod tests {
         assert_eq!(has.gate(&|tool| tool == "sccache"), Gate::Always);
         assert_eq!(has.gate(&|_| false), Gate::Never);
         assert_eq!(has.test(), None);
-        assert_eq!(has.gate_bash(&|tool| tool == "sccache"), Gate::Always);
-        assert_eq!(has.gate_bash(&|_| false), Gate::Never);
+        assert_eq!(
+            crate::shell::bash::gate(&has, &|tool| tool == "sccache"),
+            Gate::Always
+        );
+        assert_eq!(crate::shell::bash::gate(&has, &|_| false), Gate::Never);
         assert_eq!(has.test_bash(), None);
     }
 
@@ -428,7 +418,7 @@ mod tests {
             assert_eq!(when.test_bash().as_deref(), Some(test), "{when:?}");
             assert_ne!(when.test(), when.test_bash(), "{when:?}");
             assert_eq!(
-                when.gate_bash(&|_| unreachable!()),
+                crate::shell::bash::gate(&when, &|_| unreachable!()),
                 Gate::Test(test.to_string())
             );
         }
@@ -486,11 +476,11 @@ mod tests {
             assert!(is_opener(line), "{line}");
         }
         assert_eq!(
-            login_opener_bash(None),
+            crate::shell::bash::login_opener(None),
             "if shopt -q login_shell; then".to_string()
         );
         let ssh = When::Ssh.test_bash().expect("a runtime test");
-        assert!(is_opener(&login_opener_bash(Some(&ssh))));
+        assert!(is_opener(&crate::shell::bash::login_opener(Some(&ssh))));
         for line in [
             "if shopt -q login_shell && true; then",
             "if shopt -q login_shell &&  [[ -o login ]]; then",

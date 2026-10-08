@@ -58,99 +58,17 @@
 
 use std::path::Path;
 
-use super::env::{EnvDecl, Fragment, Place, Syntax, Var};
 use super::external::External;
-use super::history::History;
 use super::merge::Conflict;
-use super::path::PathEntry;
-use super::target::{Attach, Body, Direction, Format, Gen, Interactive, KeyPath, Target};
+use super::target::{Attach, Body, Format, KeyPath, Target};
 use super::values::{ResolvedValues, Unresolved, ValueAssignment, ValueDecl};
-use super::{Config, Error, Origin};
+use super::{Config, Error};
 use crate::paths::Portable;
-use crate::shell::Shell;
-use crate::shell::alias::AliasDecl;
-use crate::shell::function::FunctionDecl;
-use crate::shell::keybindings::Keybindings;
-use crate::shell::plugin::PluginDecl;
-use crate::shell::source::SourceDecl;
 
-/// A configuration entry that either resolved or could not.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Resolution<T> {
-    /// Fully substituted, ready to be written.
-    Ready(T),
-    /// Held back, with the reason and what would clear it.
-    Blocked(BlockedEntry),
-}
-
-/// Why an entry could not be resolved.
-///
-/// The shared reason enum: a later reason extends it rather than introducing a
-/// parallel blocked type, which is why `report::Action::Blocked` is documented
-/// as "a prerequisite is absent" rather than as one specific prerequisite.
-///
-/// An absent tool is deliberately not a reason. A target's `requires` never
-/// blocks it — its file is written on its own content and mode alone, and
-/// `bx doctor` names the tool — so no variant here says a tool is missing. A
-/// target whose whole content is the output of running an absent tool would
-/// need one; that case is reserved, and nothing produces it yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlockReason {
-    /// One or more declared values this entry references have no answer.
-    UnsetValue {
-        /// The values that need answering, in declaration order.
-        names: Vec<String>,
-    },
-    /// One or more declared values this entry references are switched off.
-    ///
-    /// Kept apart from [`BlockReason::UnsetValue`] because the two are cleared
-    /// by different acts, and a note that told an account to answer a value it
-    /// has itself refused would be advice it cannot follow.
-    DisabledValue {
-        /// The declarations to re-enable, in declaration order.
-        names: Vec<String>,
-    },
-    /// One or more answers in this account's layer leave this entry unusable:
-    /// an answer its kind refuses, one that made a committed `default` invalid,
-    /// or one that, substituted into this entry, makes a field invalid — a path
-    /// that climbs out of the home, a `file` that climbs out of the repo, an
-    /// owned key with an empty segment or with more or fewer segments than
-    /// written — or a `file` that reaches a `path` value through an answer.
-    ///
-    /// Kept apart from [`BlockReason::UnsetValue`] because nothing is
-    /// unanswered: every answer the entry needs is written, and one of them is
-    /// the account's to change. They share one variant because they share that
-    /// cause, not because one act clears them all: which answer to change, and
-    /// whether changing one is the whole act, is [`BlockedEntry::hint`]'s to
-    /// say. A clash holding a toggle bx cannot show names a declared target is
-    /// cleared by removing that toggle first, and by an answer only for the
-    /// statements the removal leaves — so the hint may name one of these
-    /// values, or none of them.
-    InvalidValue {
-        /// The answers this block was made of, in declaration order: the
-        /// declarations whose text is invalid, the answers that went into the
-        /// invalid field, or every answer that made a layer's clashing
-        /// spellings meet. The cause, which a report may name as the entry's;
-        /// the instruction is the hint.
-        names: Vec<String>,
-    },
-}
-
-/// An entry that was held back, and what it would take to release it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockedEntry {
-    /// The entry's natural key, so a report can name it.
-    pub key: String,
-    /// Where the entry was declared.
-    pub origin: Origin,
-    /// Why it is blocked.
-    pub reason: BlockReason,
-    /// What the user should do. Spelled in `values` — `init_hint`,
-    /// `disabled_hint`, `path_answer_hint`, `ResolvedValues::invalid_hint`,
-    /// `ResolvedValues::answers_hint` or `ResolvedValues::removal_hint` — never
-    /// at a call site.
-    pub hint: String,
-}
+/// The vocabulary a resolution is reported in, defined in
+/// [`super::resolution`] and named here too, where every caller that resolves
+/// a configuration already looks.
+pub use super::resolution::{BlockReason, BlockedEntry, Resolution};
 
 /// A merged configuration, resolved against one account's home.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,7 +127,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    targets.extend(place_envs(merged, &values)?);
+    targets.extend(crate::shell::placement::place_envs(merged, &values)?);
     targets.extend(crate::shell::bash::place(merged, &values)?);
 
     refuse_shared_files(&targets)?;
@@ -235,441 +153,6 @@ fn repo_file(body: &Body) -> Option<(&'static str, std::borrow::Cow<'_, str>)> {
         Body::File(path) => Some(("file", path.to_string_lossy())),
         Body::Secret(path) => Some(("secret", path.to_string_lossy())),
         Body::Inline(_) | Body::Generated(_) | Body::Symlink(_) | Body::Dir => None,
-    }
-}
-
-/// The targets the `[[env]]` placement graph derives, after every declared
-/// target.
-///
-/// For each [`Place`] at least one variable lands in, in [`Place::ALL`]'s
-/// order: the fragment bx owns whole, and for a shell place the fixed region
-/// in the user's startup file that sources it. A fragment is held back when
-/// any variable it holds is — naming every value it waits on — and that costs
-/// that fragment alone: every other fragment, every region and every declared
-/// target still resolve. A region is never held back: its bytes name the
-/// fragment and nothing else, and it sources the fragment only once one is
-/// there to read. A place no variable lands in emits nothing here; a fragment
-/// bx wrote there earlier is planned empty by [`vacated_fragments`].
-///
-/// The `[path]` entries land in the `zshenv` fragment, after its variables,
-/// which is emitted when either is declared. Nothing in an entry is
-/// substituted, so an entry never holds a fragment back; a variable the
-/// fragment holds back holds its entries back with it.
-///
-/// The enabled `[[plugin]]` entries land in the `zshrc` fragment, which is
-/// the interactive shell file and is rendered through the phase assembly
-/// ([`Interactive`]), and it is emitted when either an interactive variable or
-/// a plugin is declared. Nothing in a plugin is substituted either, so a
-/// plugin never holds the file back; a variable that holds it back holds its
-/// plugins back with it.
-///
-/// The `[history]` declaration lands in the same file's `options` phase, in
-/// zsh's names, and a history that says anything zsh reads places the file on
-/// its own too. It holds no placeholder either, so it never holds the file
-/// back, and a variable that does holds the history back with it.
-///
-/// The declared `[keybindings]` land in that file's `keybindings` phase, and
-/// binding any key places the file on its own, as a history does. A binding
-/// holds no placeholder, and a variable that holds the file back holds its
-/// keybindings back with it.
-///
-/// The enabled `[aliases]` and `[[alias]]` entries land in that file's
-/// `aliases` phase, and an enabled alias places the file on its own as a
-/// plugin does. Its `when = "has:TOOL"` is decided when the file is rendered,
-/// with the `present` the plan decides every other `has:TOOL` through, so an
-/// alias gated on a missing tool still places the file and adds no line to
-/// it. Nothing in an alias is substituted, and a variable that holds the file
-/// back holds its aliases back with it.
-///
-/// The enabled `[[function]]` entries land in that file's `functions` phase,
-/// each body substituted from the same values every target is, and an enabled
-/// function places the file on its own as an alias does. A function whose
-/// body waits on a value is held back alone: the file is still written with
-/// every other function in it, and its plan row names each held-back one
-/// ([`Interactive::note`]). A variable that holds the file back holds its
-/// functions back with it.
-///
-/// The enabled `[[source]]` entries land in that file too, each in the phase
-/// it names, its path substituted from the same values, and an enabled source
-/// places the file on its own as a function does. A source whose path waits
-/// on a value is held back alone and named in the plan row, as a function is.
-///
-/// An enabled `[[activation]]` places that file on its own too, as a source
-/// does. What it adds is not known here — resolution runs no tool — so the
-/// file is placed without it, and `plan` attaches the activations it decided
-/// ([`Interactive::with_activations`]) before rendering. Nothing in an
-/// activation is substituted, and a variable that holds the file back holds
-/// its activations back with it.
-///
-/// # Errors
-///
-/// [`Error::BadValue`] for a variable, a function body or a source path whose
-/// value is a repo defect: a malformed placeholder, a reference to a value no
-/// layer declares, or a committed `default` that puts a character no fragment
-/// line, function body or source path can hold into it; and for a second
-/// enabled plugin claiming the terminal slot.
-fn place_envs(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
-    // Only what reaches zsh: a declaration kept to bash is bash's file's.
-    let path: Vec<PathEntry> = merged
-        .path
-        .iter()
-        .filter(|entry| entry.shells.includes(Shell::Zsh))
-        .cloned()
-        .collect();
-    let (envs, path, plugins, history): (&[EnvDecl], &[PathEntry], &[PluginDecl], &History) =
-        (&merged.envs, &path, &merged.plugins, &merged.history);
-    let functions: Vec<FunctionDecl> = merged
-        .functions
-        .iter()
-        .filter(|f| f.shells.includes(Shell::Zsh))
-        .cloned()
-        .collect();
-    let sources: Vec<SourceDecl> = merged
-        .sources
-        .iter()
-        .filter(|s| s.shells.includes(Shell::Zsh))
-        .cloned()
-        .collect();
-    let (aliases, functions, sources): (&[AliasDecl], &[FunctionDecl], &[SourceDecl]) =
-        (&merged.aliases, &functions, &sources);
-    let keybindings: &Keybindings = &merged.keybindings;
-    // The history's origin, when it says anything zsh reads, or else the
-    // keybindings', when any key is bound: what places the interactive file
-    // when nothing else does.
-    let table_origin = history
-        .origin
-        .as_ref()
-        .filter(|_| !history.render_zsh().is_empty())
-        .or_else(|| {
-            keybindings
-                .origin
-                .as_ref()
-                .filter(|_| !keybindings.is_empty())
-        });
-    // The first enabled activation's origin: what places the interactive
-    // file when nothing at all but an activation is declared.
-    let activation_origin = merged
-        .activations
-        .iter()
-        .find(|a| a.enabled && a.command_for(Shell::Zsh).is_some())
-        .map(|a| &a.origin);
-    let resolved = envs
-        .iter()
-        .map(|decl| Ok((decl, resolve_env(decl, values)?)))
-        .collect::<Result<Vec<_>, Error>>()?;
-    let bodies = crate::shell::function::resolve(functions, values)?;
-    let sourced = crate::shell::source::resolve(sources, values)?;
-
-    let mut placed = Vec::new();
-    for place in Place::ALL {
-        let here: Vec<&(&EnvDecl, Resolution<Var>)> = resolved
-            .iter()
-            // A variable that lands in `environment.d` carries no `shells`
-            // (the load refuses one), so this keeps only the other shell's
-            // variables out of zsh's files.
-            .filter(|(decl, _)| {
-                decl.kind.places().contains(&place) && decl.shells.includes(Shell::Zsh)
-            })
-            .collect();
-        let entries = if place == Place::Zshenv { path } else { &[] };
-        let (interactive, declared, defined, optional) = if place == Place::Zshrc {
-            (plugins, aliases, functions, sources)
-        } else {
-            (&[][..], &[][..], &[][..], &[][..])
-        };
-        let plugin = interactive.iter().find(|p| p.enabled);
-        let alias = declared.iter().find(|a| a.enabled);
-        let function = defined.iter().find(|f| f.enabled);
-        let table_here = table_origin.filter(|_| place == Place::Zshrc);
-        let source = optional.iter().find(|s| s.enabled);
-        let origin = match (
-            here.first(),
-            entries.first(),
-            plugin,
-            alias,
-            function,
-            table_here,
-            source,
-        ) {
-            (Some((first, _)), ..) => first.origin.clone(),
-            (None, Some(entry), ..) => entry.origin.clone(),
-            (None, None, Some(plugin), ..) => plugin.origin.clone(),
-            (None, None, None, Some(alias), ..) => alias.origin.clone(),
-            (None, None, None, None, Some(function), ..) => function.origin.clone(),
-            (None, None, None, None, None, Some(table), _) => table.clone(),
-            (None, None, None, None, None, None, Some(source)) => source.origin.clone(),
-            (None, None, None, None, None, None, None) => {
-                match activation_origin.filter(|_| place == Place::Zshrc) {
-                    Some(origin) => origin.clone(),
-                    None => continue,
-                }
-            }
-        };
-        let portable = |raw: &str| {
-            Portable::parse_in(raw, values.home()).map_err(|source| Error::BadValue {
-                origin: origin.clone(),
-                message: format!("`{raw}` cannot be placed under this home: {source}"),
-            })
-        };
-        let fragment = portable(place.fragment())?;
-        let held: Vec<&BlockedEntry> = here
-            .iter()
-            .filter_map(|(_, resolution)| match resolution {
-                Resolution::Blocked(entry) => Some(entry),
-                Resolution::Ready(_) => None,
-            })
-            .collect();
-        placed.push(if held.is_empty() {
-            let vars = here
-                .iter()
-                .filter_map(|(_, resolution)| match resolution {
-                    Resolution::Ready(var) => Some(var.clone()),
-                    Resolution::Blocked(_) => None,
-                })
-                .collect();
-            let generator = match fragment_gen(place, vars, entries.to_vec()) {
-                Gen::Interactive(file) => Gen::Interactive(Box::new(
-                    file.with_plugins(interactive)?
-                        .with_history(history.clone())
-                        .with_keybindings(keybindings.clone())
-                        .with_aliases(declared)
-                        .with_functions(bodies.clone())
-                        .with_sources(sourced.clone())
-                        .with_omitted(crate::shell::omitted(Shell::Zsh, merged)),
-                )),
-                other => other,
-            };
-            Resolution::Ready(fragment_target(place, fragment.clone(), generator, &origin))
-        } else {
-            let (reason, hint) = held_together(&held, values);
-            Resolution::Blocked(BlockedEntry {
-                key: fragment.to_string(),
-                origin: origin.clone(),
-                reason,
-                hint,
-            })
-        });
-        if let Some(file) = place.startup_file() {
-            placed.push(Resolution::Ready(placed_target(
-                portable(file)?,
-                Gen::Source(fragment),
-                Attach::Region { comment: '#' },
-                Format::Opaque,
-                &origin,
-            )));
-        }
-    }
-    Ok(placed)
-}
-
-/// What produces the fragment at `place`, holding `vars` and then `entries`:
-/// an environment fragment, or at the interactive place the file the phase
-/// assembly renders, with the fragment in its `env` phase and no plugin yet.
-fn fragment_gen(place: Place, vars: Vec<Var>, entries: Vec<PathEntry>) -> Gen {
-    let fragment = Fragment {
-        syntax: place.syntax(),
-        vars,
-        path: entries,
-    };
-    match place {
-        Place::Zshrc => Gen::Interactive(Box::new(Interactive::new(fragment))),
-        Place::Zshenv | Place::EnvironmentD | Place::Zprofile => Gen::Env(fragment),
-    }
-}
-
-/// The fragment bx owns whole at `place`, produced by `generator`.
-fn fragment_target(place: Place, path: Portable, generator: Gen, origin: &Origin) -> Target {
-    let format = match place.syntax() {
-        Syntax::EnvironmentD => Format::EnvD,
-        Syntax::Zsh => Format::Opaque,
-    };
-    placed_target(path, generator, Attach::Own, format, origin)
-}
-
-/// A header-only fragment for each place the placement graph no longer puts a
-/// variable in, but whose fragment bx wrote earlier.
-///
-/// [`place_envs`] emits nothing for a place no enabled variable lands in, so a
-/// variable switched off, removed, or moved to another `kind` would otherwise
-/// leave the fragment bx wrote for it in place — `export EDITOR=…` still
-/// sourced by every shell, with no plan row saying so. `recorded` answers
-/// whether bx has written a path as a file it owns whole, which only the
-/// ledger knows; resolution itself stays a pure function of the layers and the
-/// home. While it is recorded, the fragment is planned with no variable in it,
-/// so the change shows as a `modify` row and `apply` writes the empty
-/// fragment; the startup file's region is left as it is, sourcing a fragment
-/// that sets nothing, and `bx rm` restores both from the ledger.
-///
-/// A place `placed` already names — ready, or held back under the fragment's
-/// path — is left to it. Each vacated fragment is attributed to `ledger`, the
-/// record that put it in the plan. bash's generated file and `~/.inputrc`
-/// follow, vacated the same way ([`crate::shell::bash::vacated`]), but only
-/// where `generated` says their own generator wrote them.
-#[must_use]
-pub fn vacated_fragments(
-    placed: &[Resolution<Target>],
-    recorded: impl Fn(&Portable) -> bool,
-    generated: impl Fn(&Portable, &str) -> bool,
-    home: &Path,
-    ledger: &Path,
-) -> Vec<Resolution<Target>> {
-    let origin = Origin {
-        file: ledger.to_path_buf(),
-        line: 0,
-    };
-    let bash = crate::shell::bash::vacated(placed, &generated, home, &origin);
-    Place::ALL
-        .into_iter()
-        .filter_map(|place| {
-            let path = Portable::parse_in(place.fragment(), home).ok()?;
-            let named = placed.iter().any(|resolution| match resolution {
-                Resolution::Ready(target) => target.path == path,
-                Resolution::Blocked(entry) => entry.key == path.to_string(),
-            });
-            (!named && recorded(&path)).then(|| {
-                Resolution::Ready(fragment_target(
-                    place,
-                    path,
-                    fragment_gen(place, Vec::new(), Vec::new()),
-                    &origin,
-                ))
-            })
-        })
-        .chain(bash)
-        .collect()
-}
-
-/// A target the placement graph derives, attributed to the first variable
-/// that put it there.
-fn placed_target(
-    path: Portable,
-    generator: Gen,
-    attach: Attach,
-    format: Format,
-    origin: &Origin,
-) -> Target {
-    Target {
-        path,
-        body: Body::Generated(generator),
-        mode: None,
-        attach,
-        direction: Direction::Apply,
-        format,
-        requires: Vec::new(),
-        references: Vec::new(),
-        enabled: true,
-        origin: origin.clone(),
-    }
-}
-
-/// Substitute one variable's value, or explain why it cannot be — in the
-/// vocabulary a target is held back in, keyed by the variable's name.
-///
-/// # Errors
-///
-/// [`Error::BadValue`] for a repo defect, as [`place_envs`] lists.
-pub(crate) fn resolve_env(
-    decl: &EnvDecl,
-    values: &ResolvedValues,
-) -> Result<Resolution<Var>, Error> {
-    let block = |reason, hint| {
-        Ok(Resolution::Blocked(BlockedEntry {
-            key: decl.name.clone(),
-            origin: decl.origin.clone(),
-            reason,
-            hint,
-        }))
-    };
-    let names_of = |names: Vec<String>| in_declaration_order(values, names);
-    match values.substitute(&decl.value) {
-        Ok(value) => {
-            let Some(problem) = super::env::unwritable(&value) else {
-                return Ok(Resolution::Ready(Var {
-                    name: decl.name.clone(),
-                    value,
-                    when: decl.when.clone(),
-                }));
-            };
-            // Checked as written at parse, so the character came in through a
-            // value: an account's answer, whose line the hint names, or a
-            // committed `default` alone, which no answer can clear.
-            let problem = format!("env `{}`: {problem}", decl.name);
-            let causes = values.account_inputs(&decl.value);
-            if causes.is_empty() {
-                return Err(Error::BadValue {
-                    origin: decl.origin.clone(),
-                    message: problem,
-                });
-            }
-            let names = names_of(causes);
-            let hint = values.answers_hint(&problem, &[decl.value.as_str()], &names);
-            block(BlockReason::InvalidValue { names }, hint)
-        }
-        Err(Unresolved::Disabled { names }) => {
-            let names = names_of(names);
-            let hint =
-                super::values::disabled_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
-            block(BlockReason::DisabledValue { names }, hint)
-        }
-        Err(Unresolved::Invalid { names }) => {
-            let names = names_of(names);
-            let hint = values.invalid_hint(&names);
-            block(BlockReason::InvalidValue { names }, hint)
-        }
-        Err(Unresolved::Unset { names }) => {
-            let names = names_of(names);
-            let hint =
-                super::values::init_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
-            block(BlockReason::UnsetValue { names }, hint)
-        }
-        Err(defect) => Err(Error::BadValue {
-            origin: decl.origin.clone(),
-            message: format!("env `{}`: {defect}", decl.name),
-        }),
-    }
-}
-
-/// One reason and one hint for a fragment several held-back variables share,
-/// ranked as [`resolve_target`] ranks one target's: a switched-off declaration
-/// first, then an unusable answer, then an unanswered value. Every name of the
-/// winning class is named, in declaration order.
-pub(crate) fn held_together(
-    held: &[&BlockedEntry],
-    values: &ResolvedValues,
-) -> (BlockReason, String) {
-    let mut disabled = Vec::new();
-    let mut invalid = Vec::new();
-    let mut invalid_hints: Vec<&str> = Vec::new();
-    let mut unset = Vec::new();
-    for entry in held {
-        match &entry.reason {
-            BlockReason::DisabledValue { names } => disabled.extend(names.iter().cloned()),
-            BlockReason::InvalidValue { names } => {
-                invalid.extend(names.iter().cloned());
-                if !invalid_hints.contains(&entry.hint.as_str()) {
-                    invalid_hints.push(&entry.hint);
-                }
-            }
-            BlockReason::UnsetValue { names } => unset.extend(names.iter().cloned()),
-        }
-    }
-    fn spelled(names: &[String]) -> Vec<&str> {
-        names.iter().map(String::as_str).collect()
-    }
-    if !disabled.is_empty() {
-        let names = in_declaration_order(values, disabled);
-        let hint = super::values::disabled_hint(&spelled(&names));
-        (BlockReason::DisabledValue { names }, hint)
-    } else if !invalid.is_empty() {
-        let names = in_declaration_order(values, invalid);
-        (
-            BlockReason::InvalidValue { names },
-            invalid_hints.join("; "),
-        )
-    } else {
-        let names = in_declaration_order(values, unset);
-        let hint = super::values::init_hint(&spelled(&names));
-        (BlockReason::UnsetValue { names }, hint)
     }
 }
 
@@ -872,7 +355,7 @@ fn resolve_target(
     // A switched-off declaration is reported ahead of an unanswered one: it is
     // the more specific statement about what this target is waiting for.
     if !disabled.is_empty() {
-        let names = in_declaration_order(values, disabled);
+        let names = values.in_declaration_order(disabled);
         let hint =
             super::values::disabled_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
         return block(BlockReason::DisabledValue { names }, hint);
@@ -880,13 +363,13 @@ fn resolve_target(
 
     // An invalid value ahead of an unanswered one: answering would not clear it.
     if !invalid.is_empty() {
-        let names = in_declaration_order(values, invalid);
+        let names = values.in_declaration_order(invalid);
         let hint = values.invalid_hint(&names);
         return block(BlockReason::InvalidValue { names }, hint);
     }
 
     if !unset.is_empty() {
-        let names = in_declaration_order(values, unset);
+        let names = values.in_declaration_order(unset);
         let hint = super::values::init_hint(&names.iter().map(String::as_str).collect::<Vec<_>>());
         return block(BlockReason::UnsetValue { names }, hint);
     }
@@ -902,8 +385,7 @@ fn resolve_target(
             if clashes.is_empty() {
                 return Ok(Resolution::Ready(ready));
             }
-            let names = in_declaration_order(
-                values,
+            let names = values.in_declaration_order(
                 clashes
                     .iter()
                     .flat_map(|conflict| conflict.names.iter().cloned())
@@ -930,7 +412,7 @@ fn resolve_target(
                     message: problem,
                 });
             }
-            let names = in_declaration_order(values, causes);
+            let names = values.in_declaration_order(causes);
             let hint = values.answers_hint(&problem, &[raw.as_str()], &names);
             block(BlockReason::InvalidValue { names }, hint)
         }
@@ -1222,8 +704,7 @@ fn refuse_path_answer_in_file(
         target.path
     );
 
-    let names = in_declaration_order(
-        values,
+    let names = values.in_declaration_order(
         chain
             .iter()
             .filter_map(|step| match step {
@@ -1317,10 +798,11 @@ enum Step<'a> {
 /// Everything that asks what a declaration *is* reads it through
 /// [`ResolvedValues::decl`] or [`ResolvedValues::index_of`], both unfiltered,
 /// and ignores `enabled`: this walk's terminal, [`path_value_behind`],
-/// `merge`'s `written_form` kind lookups, and both `in_declaration_order`s.
-/// The resolve-side one was the single exception — it indexed against the
-/// filtered `decls`, so a switch moved a declaration's position — and it now
-/// indexes against [`ResolvedValues::index_of`] like its twin.
+/// `merge`'s `written_form` kind lookups, and
+/// [`ResolvedValues::in_declaration_order`]. A resolve-side copy of that last
+/// one was the single exception — it indexed against the filtered `decls`, so
+/// a switch moved a declaration's position — and every caller now uses the
+/// one method.
 ///
 /// This list was derived by grepping `enabled` across `src` and classifying
 /// every hit, reads and writes alike. Two earlier versions were not: the first
@@ -1695,47 +1177,14 @@ fn unfindable_requirement(text: &str) -> String {
     )
 }
 
-/// Order `names` the way the values were declared, deduplicated.
-///
-/// So two reports of one problem read the same way regardless of which field
-/// happened to be probed first.
-///
-/// Indexed against [`ResolvedValues::index_of`], which counts every
-/// declaration, rather than [`ResolvedValues::decls`], which lists only the
-/// enabled ones. There are six callers, and the list is exhaustive because a
-/// partial one would not be a safety case:
-///
-/// - the `disabled` names — switched off by definition, so against the
-///   filtered list every one came back `usize::MAX` and the sort left them in
-///   whichever order the fields were probed. This is the caller the index was
-///   wrong for, and the only one.
-/// - the `invalid` and `unset` names, which come from declarations this
-///   account may answer, so they are enabled;
-/// - a clash's causes and a [`Broken::Field`]'s causes, which are answers this
-///   account applied, and a switched-off declaration has none applied;
-/// - [`refuse_path_answer_in_file`]'s own names, which are the [`Step::Answer`]
-///   declarations of a chain — and `Step::Answer` is built only behind the
-///   `enabled` filter in [`path_value_through_answer`], so they are enabled
-///   too.
-///
-/// [`ResolvedValues::in_declaration_order`] is this function's twin on the
-/// `values` side, for the names inside an
-/// [`Unresolved`](super::values::Unresolved), those in `answers_hint`, and a
-/// clash's; it indexed against every declaration already, and the two now
-/// agree. The count of six above is this function's own callers, not the
-/// twin's.
-fn in_declaration_order(values: &ResolvedValues, mut names: Vec<String>) -> Vec<String> {
-    let index = |name: &String| values.index_of(name).unwrap_or(usize::MAX);
-    names.sort_by_key(index);
-    names.dedup();
-    names
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::env::{Fragment, Syntax, Var};
     use crate::config::merge::merge;
+    use crate::config::target::{Gen, Interactive};
     use crate::config::{Layer, LayerKind, parse_str};
+    use crate::shell::placement::vacated_fragments;
     use std::path::PathBuf;
 
     fn home() -> PathBuf {

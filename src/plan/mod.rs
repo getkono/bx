@@ -443,7 +443,7 @@ pub fn run(
             .get(path)
             .is_some_and(|entry| entry.mechanism == Mechanism::Own)
     };
-    targets.extend(resolve::vacated_fragments(
+    targets.extend(crate::shell::placement::vacated_fragments(
         &inputs.resolved.targets,
         owned,
         // bash's files sit where a `[[target]]` may have put a file bx owns
@@ -3083,7 +3083,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(state.root(), std::fs::Permissions::from_mode(0o700))
             .expect("a private state directory");
         let real = home.write("dotfiles/local.toml", "[values]\n");
-        let local = layers::local_layer_path(state.root());
+        let local = paths::local_layer_path(state.root());
         std::os::unix::fs::symlink(&real, &local).expect("the link");
         let inputs = load(home.path());
 

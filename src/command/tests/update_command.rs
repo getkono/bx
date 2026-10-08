@@ -329,6 +329,33 @@ fn an_external_one_account_switches_off_keeps_its_shared_lock_entry() {
 }
 
 #[test]
+fn an_external_only_local_toml_follows_is_never_locked_in_the_shared_lock() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(&home, &layer());
+    home.write(
+        ".local/state/bx/local.toml",
+        &format!(
+            "[[external]]\npath = \"~/.local/share/mine\"\nurl = \"{URL}\"\nbranch = \"master\"\n"
+        ),
+    );
+    let mut out = Vec::new();
+    let exit = update(&home, true, &mut out).expect("update");
+    assert_eq!(exit, Exit::Pending, "{}", text(&out));
+    assert!(
+        text(&out).contains(
+            "~/.local/share/mine: this account follows `master` of \
+             https://example.invalid/upstream, and the committed configuration does not follow it"
+        ),
+        "{}",
+        text(&out)
+    );
+    let lock = Lock::read(&home.child(".config/bx"), home.path()).expect("bx.lock");
+    let paths: Vec<&str> = lock.iter().map(|(path, _)| path.as_str()).collect();
+    assert_eq!(paths, [format!("~/{AT}").as_str()], "{}", text(&out));
+}
+
+#[test]
 fn update_refuses_a_lock_with_uncommitted_edits() {
     let home = guarded_home();
     upstream(&home, &["skills/a/SKILL.md"]);

@@ -400,8 +400,11 @@ fn remote_tip(git: &Git, home: &Path, url: &str, reference: &str) -> Result<Stri
 /// committed layers alone declare, or `None` when they cannot be merged
 /// without it. So an entry is kept while either follows its path — an
 /// external one account switched off, or moved, in its own `local.toml` is
-/// still another machine's — and a move is not set over an entry the
-/// committed configuration follows from another url or branch ([`repointed`]).
+/// still another machine's — and a move is set only for what the committed
+/// configuration follows from the same url and branch ([`unshared`]). A
+/// follow `local.toml` alone declares, or points elsewhere, is never locked:
+/// every other machine would drop the entry, and this one lock it again at
+/// whatever tip it found, with nothing locked to check it against.
 /// With `committed` unknown, no entry is dropped.
 #[must_use]
 pub fn proposed(
@@ -413,7 +416,7 @@ pub fn proposed(
     let mut next = lock.clone();
     for found in found {
         if let Some(tip) = found.moves_to() {
-            if repointed(found, committed) {
+            if unshared(found, committed) {
                 continue;
             }
             next.set(
@@ -438,17 +441,19 @@ pub fn followed(path: &Portable, externals: &[External]) -> bool {
         .any(|external| external.path == *path && external.follows().is_some())
 }
 
-/// Whether the committed configuration follows `found`'s path from another
-/// url or branch than this account's does: a `local.toml` pointing it
-/// elsewhere, whose commit the shared `bx.lock` does not take.
+/// Whether the committed configuration, where it is known, does not follow
+/// `found`'s path from the url and branch this account's does: a follow that
+/// `local.toml` alone declares, or points elsewhere, whose commit the shared
+/// `bx.lock` does not take.
 #[must_use]
-pub fn repointed(found: &Found, committed: Option<&[External]>) -> bool {
+pub fn unshared(found: &Found, committed: Option<&[External]>) -> bool {
     committed.is_some_and(|committed| {
-        committed.iter().any(|external| {
+        !committed.iter().any(|external| {
             external.path == found.path
-                && external.follows().is_some_and(|follow| {
-                    external.url != found.url || follow.branch != found.branch
-                })
+                && external.url == found.url
+                && external
+                    .follows()
+                    .is_some_and(|follow| follow.branch == found.branch)
         })
     })
 }
@@ -1303,12 +1308,17 @@ mod tests {
             branch: "mine".to_string(),
             ..found("~/moved", None, moves(B))
         };
-        assert!(repointed(&away, Some(&committed)));
-        assert!(!repointed(&away, None));
-        assert!(!repointed(
+        assert!(unshared(&away, Some(&committed)));
+        assert!(!unshared(&away, None));
+        assert!(!unshared(
             &found("~/moved", Some(A), moves(B)),
             Some(&committed)
         ));
+        let elsewhere = Found {
+            url: "https://h/o/elsewhere".to_string(),
+            ..found("~/moved", None, moves(B))
+        };
+        assert!(unshared(&elsewhere, Some(&committed)));
 
         let next = proposed(
             &lock,
@@ -1329,6 +1339,38 @@ mod tests {
         assert_eq!(next, lock);
         let next = proposed(&lock, &[away], &externals, None);
         assert_eq!(next.get(&portable("~/moved")).unwrap().branch, "mine");
+    }
+
+    #[test]
+    fn proposed_never_locks_a_follow_only_local_toml_declares() {
+        // `~/mine` is followed by this account's `local.toml` alone; the
+        // committed layers follow `~/shared`.
+        let externals = [
+            followed("~/shared", Check::Ask),
+            followed("~/mine", Check::Ask),
+        ];
+        let committed = [followed("~/shared", Check::Ask)];
+        let first = [
+            found("~/shared", None, moves(A)),
+            found("~/mine", None, moves(A)),
+        ];
+        assert!(unshared(&first[1], Some(&committed)));
+        let next = proposed(&Lock::default(), &first, &externals, Some(&committed));
+        assert_eq!(next.get(&portable("~/shared")).unwrap().rev, A);
+        assert!(
+            next.get(&portable("~/mine")).is_none(),
+            "the shared lock holds only what the committed configuration follows"
+        );
+
+        // Another machine, whose configuration is the committed one alone,
+        // proposes the same lock, so the two never take turns.
+        let elsewhere = proposed(
+            &next,
+            &[found("~/shared", Some(A), Verdict::Current)],
+            &committed,
+            Some(&committed),
+        );
+        assert_eq!(elsewhere, next);
     }
 
     #[test]

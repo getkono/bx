@@ -182,6 +182,7 @@ pub use crate::config::activation::ActivationDecl;
 
 impl ActivationDecl {
     /// The [`Fingerprints`] key zsh's cache entry lives under.
+    #[cfg(test)]
     #[must_use]
     pub fn key(&self) -> String {
         self.key_for(Shell::Zsh)

@@ -329,12 +329,14 @@ impl Session {
     }
 
     /// The journal this session is appending to.
+    #[cfg(test)]
     #[must_use]
     pub fn journal(&self) -> &Path {
         self.journal.path()
     }
 
     /// How many writes the session has published.
+    #[cfg(test)]
     #[must_use]
     pub const fn written(&self) -> usize {
         self.written

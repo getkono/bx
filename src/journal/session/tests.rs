@@ -1738,9 +1738,11 @@ fn entry_created_dirs(state: &StateDir, home: &Path, portable: &Portable) -> Vec
 #[test]
 fn a_target_spelled_absolutely_under_the_home_is_refused_before_anything_is_touched() {
     // Stack integration of #7's round 4: a caller holding a `Ledger` gets
-    // its home check. `new_entry` folds the destination into `~/…`, so the
-    // check inside `Ledger::check_record` cannot see a target spelled
-    // `/<home>/…`. That target renders to itself and used to be admitted:
+    // its home check. `Session::admit` puts the target, spelled as the
+    // request spells it, through the same `check_against` that
+    // `Ledger::check_record` applies, before anything is observed, so a
+    // target spelled `/<home>/…` is refused as `ForeignRecord`. That
+    // target renders to itself and used to be admitted:
     // the ledger keyed it `~/.conf`, the same file under that spelling got
     // past `Repeated`, and a crash left a journal the loader refuses.
     let home = guarded_home();

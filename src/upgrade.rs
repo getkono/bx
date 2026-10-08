@@ -355,8 +355,9 @@ pub struct Request {
 ///
 /// # Errors
 ///
-/// Whatever fetching, verifying and running the installer return, and
-/// [`Error::Output`] when `out` cannot be written.
+/// [`Error::Version`] when `current` is not a version bx can compare, before
+/// anything is fetched; whatever fetching, verifying and running the installer
+/// return; and [`Error::Output`] when `out` cannot be written.
 pub fn run(
     request: Request,
     current: &str,

@@ -236,8 +236,10 @@ impl Context {
     ///
     /// # Errors
     ///
-    /// [`Error::RepoMissing`] when there is no config repo, and
-    /// [`Error::Config`] for anything the configuration refuses.
+    /// [`Error::RepoMissing`] when there is no config repo,
+    /// [`Error::Config`] for anything the configuration refuses, and, when a
+    /// layer is read back for its trees, [`Error::Fs`] when it cannot be
+    /// observed and [`Error::Layer`] when it is not a UTF-8 file.
     pub fn load(env: &Env) -> Result<Self, Error> {
         let home = env.home.clone();
         let repo = paths::config_root_in(&home, env.xdg_config_home.as_deref());
@@ -906,9 +908,16 @@ fn lock(state: &StateDir) -> Result<ExclusiveLock, Error> {
 /// new target in `bx.toml`, and record ownership in the ledger — in that
 /// order, so a run that stops partway is finished by running it again.
 ///
+/// Before any of that it is a writing command like `apply`: it creates the
+/// state directory when there is none, and recovers an interrupted session it
+/// finds there — rolling it back, or bringing the ledger up to date
+/// ([`recover::lock_for_writing`]) — refusing when that session cannot be
+/// accounted for.
+///
 /// # Errors
 ///
-/// As [`plan_add`], plus whatever the lock, the writes, and the ledger return.
+/// As [`plan_add`], plus whatever the lock, the recovery, the writes, and the
+/// ledger return.
 pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
     let lock = lock(&ctx.state)?;
     let mut ledger = Ledger::open(&ctx.state, &lock, &ctx.home)?.value;

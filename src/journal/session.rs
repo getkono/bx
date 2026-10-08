@@ -213,8 +213,10 @@ impl Session {
     /// left in place, never replaced. [`Error::State`] with
     /// [`crate::state::Error::ForeignRecord`] when a scope entry is one the
     /// loader would refuse. [`Error::State`] when the directory
-    /// cannot be made or locked, and [`Error::Io`] when the journal cannot be
-    /// written.
+    /// cannot be made or locked, or the ledger cannot be opened.
+    /// [`Error::Write`] when the journal cannot be written, [`Error::Io`] when
+    /// it cannot be reopened for appending, and [`Error::Encode`] or
+    /// [`Error::FrameTooLarge`] when its `Begin` cannot be framed.
     pub fn open(
         state: &StateDir,
         kind: SessionKind,

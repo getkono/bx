@@ -208,7 +208,13 @@ pub struct Unfinished {
 }
 
 impl Unfinished {
-    /// The action `plan` reports for this target.
+    /// One action for this target, as the tests' [`Interrupted::actions`] and
+    /// [`Interrupted::exit`] read it.
+    ///
+    /// Not the row `plan` shows: `plan` reports each write as the row recovery
+    /// would make of it, which is a modify or unchanged where recovery can
+    /// act, and a conflict only where it cannot (see the module
+    /// documentation).
     ///
     /// Always [`Action::Conflict`], and deliberately not a sixth variant. Its
     /// documented meaning — *something bx does not currently own is in the way,
@@ -242,15 +248,18 @@ pub struct Interrupted {
     /// entries from the journal and unlinks it. What is at a destination now
     /// does not change that — a file edited since is the user's edit to a file
     /// bx manages, which `plan` reports like any other — so such a session is
-    /// blocked only by a prior snapshot recovery cannot read.
+    /// blocked only by a prior snapshot recovery cannot read, or by an entry
+    /// the ledger refuses to record ([`crate::state::Ledger::check_record`]),
+    /// as it refuses to adopt a changed shared file as its prior.
     pub complete: bool,
     /// Whether the journal is one no bx session could have written — see
     /// [`Loaded::Unreadable`] — so nothing in it is believed.
     ///
     /// Such a journal names no write, so `unfinished` is empty, `complete` is
     /// `false`, `kind` is [`SessionKind::Apply`] because no header was
-    /// believed, and `Interrupted::exit` is
-    /// [`Exit::Pending`](crate::report::Exit::Pending). The next writing command
+    /// believed, and a read-only command exits
+    /// [`Exit::Pending`](crate::report::Exit::Pending), as it does for any
+    /// interrupted session ([`crate::plan::exit`]). The next writing command
     /// sets the file aside and rolls nothing back, and `plan` then reports what
     /// the session may have written as conflicts. It is reported rather than
     /// hidden because a read-only command is otherwise the one place a user
@@ -275,7 +284,10 @@ impl Interrupted {
         self.unfinished.iter().map(Unfinished::action).collect()
     }
 
-    /// The process status a read-only command exits with.
+    /// The process status a read-only command exits with, as the tests compute
+    /// it from [`Interrupted::actions`]; the commands themselves exit through
+    /// [`crate::plan::exit`], which gives [`Exit::Pending`] for any interrupted
+    /// session.
     ///
     /// [`Exit::Pending`] whenever anything was interrupted — including a session
     /// with no writes in it, because the machine is still not converged and
@@ -294,7 +306,9 @@ impl Interrupted {
 /// What recovery did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// There was no interrupted session.
+    /// There was no interrupted session to undo: no journal, or one no bx
+    /// session could have written, which loading it under the lock set aside
+    /// and nothing in which was rolled back.
     Nothing,
     /// The interrupted session was rolled back.
     RolledBack {

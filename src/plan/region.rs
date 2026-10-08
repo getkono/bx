@@ -119,6 +119,8 @@ pub(super) fn splice(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     const BODY: &[u8] = b"[[ -r ~/.f ]] && source ~/.f\n";
@@ -201,6 +203,102 @@ mod tests {
                 other => panic!("{text:?}: {other:?}"),
             }
             assert!(splice(Some(text), '#', BODY).is_err());
+        }
+    }
+
+    /// The comment characters the properties draw from.
+    const COMMENTS: [char; 3] = ['#', ';', '"'];
+
+    /// One line of a generated file, without its newline: ordinary text, a
+    /// line that resembles a delimiter and is not one, or an exact delimiter in
+    /// some comment character.
+    fn line() -> impl Strategy<Value = String> {
+        let comment = proptest::sample::select(COMMENTS.to_vec());
+        prop_oneof![
+            6 => "[ -~]{0,12}",
+            2 => (comment.clone(), "[ \t]{1,2}", any::<bool>()).prop_map(|(c, pad, open)| {
+                let marker = if open { begin(c) } else { end(c) };
+                // Indented, or trailing text: never a delimiter.
+                if pad.len() == 1 { format!("{pad}{marker}") } else { format!("{marker}{pad}") }
+            }),
+            1 => (comment, any::<bool>())
+                .prop_map(|(c, open)| if open { begin(c) } else { end(c) }),
+        ]
+    }
+
+    /// A file of generated lines, with or without a final newline.
+    fn text() -> impl Strategy<Value = Vec<u8>> {
+        (proptest::collection::vec(line(), 0..8), any::<bool>()).prop_map(|(lines, newline)| {
+            let mut text = lines.join("\n");
+            if newline && !text.is_empty() {
+                text.push('\n');
+            }
+            text.into_bytes()
+        })
+    }
+
+    /// Text with no delimiter in `comment`.
+    fn plain(comment: char) -> impl Strategy<Value = Vec<u8>> {
+        text().prop_filter("holds a delimiter", move |text| {
+            find(text, comment) == Found::Absent
+        })
+    }
+
+    /// A comment character and a region body that is not itself a region.
+    fn comment_and_body() -> impl Strategy<Value = (char, Vec<u8>)> {
+        proptest::sample::select(COMMENTS.to_vec())
+            .prop_flat_map(|comment| (Just(comment), plain(comment)))
+    }
+
+    proptest! {
+        #[test]
+        fn splicing_keeps_every_user_byte_and_finds_its_region_again(
+            (comment, body) in comment_and_body(),
+            file in text(),
+        ) {
+            let spliced = splice(Some(&file), comment, &body);
+            let (kept_before, kept_after) = match find(&file, comment) {
+                Found::Damaged(why) => {
+                    prop_assert_eq!(spliced, Err(why));
+                    return Ok(());
+                }
+                // Appended after every byte, with a newline added only when
+                // the file's last line lacked one.
+                Found::Absent => (file.clone(), Vec::new()),
+                Found::At(span) => (file[..span.start].to_vec(), file[span.end..].to_vec()),
+            };
+            let spliced = spliced.expect("one region or none splices");
+            let region = block(comment, &body);
+            let start = spliced.len() - kept_after.len() - region.len();
+            prop_assert!(spliced.starts_with(&kept_before));
+            prop_assert!(spliced.ends_with(&kept_after));
+            prop_assert_eq!(&spliced[start..spliced.len() - kept_after.len()], &region[..]);
+            let gap = &spliced[kept_before.len()..start];
+            prop_assert!(gap.is_empty() || (gap == b"\n" && !kept_before.ends_with(b"\n")));
+            prop_assert_eq!(find(&spliced, comment), Found::At(start..start + region.len()));
+            // Splicing again is a no-op: idempotent.
+            prop_assert_eq!(splice(Some(&spliced), comment, &body), Ok(spliced.clone()));
+        }
+
+        #[test]
+        fn a_region_rewritten_and_rewritten_back_restores_the_file(
+            (comment, body, other, before, after) in comment_and_body().prop_flat_map(
+                |(comment, body)| (Just(comment), Just(body), plain(comment), plain(comment), plain(comment))
+            ),
+        ) {
+            let mut file = before;
+            if !file.is_empty() && !file.ends_with(b"\n") {
+                file.push(b'\n');
+            }
+            let at = file.len();
+            file.extend(block(comment, &body));
+            file.extend(&after);
+            prop_assert_eq!(find(&file, comment), Found::At(at..at + block(comment, &body).len()));
+
+            let rewritten = splice(Some(&file), comment, &other).expect("splices");
+            prop_assert_eq!(&rewritten[..at], &file[..at]);
+            prop_assert!(rewritten.ends_with(&after));
+            prop_assert_eq!(splice(Some(&rewritten), comment, &body), Ok(file));
         }
     }
 

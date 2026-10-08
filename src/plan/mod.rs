@@ -14,29 +14,30 @@
 //!   makes every write through one journalled session.
 //!
 //! The one environment read in the whole path is [`Env::from_process`], and
-//! the `PATH` a declared activation's tool is looked up along, which
-//! [`Inputs::load`] takes once through [`activation::System::from_env`]; every
-//! other function takes what it needs as an argument.
+//! the `PATH` a declared activation's tool and a generated file's `has:TOOL`
+//! condition are looked up along, which [`Inputs::load`] takes once through
+//! [`activation::System::from_env`]; every other function takes what it needs
+//! as an argument.
 
 mod decide;
 mod diff;
 mod execute;
 pub(crate) mod external;
 mod region;
+mod track;
 
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
-use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 pub(crate) use decide::read_repo_file;
-pub(crate) use diff::escape;
-pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
+pub use diff::{Diff, DiffKind, Palette, View, render};
 
 use crate::config::resolve::{self, Resolution, Resolved};
 use crate::config::target::{Body, Direction, Gen, Target};
 use crate::config::{self, Origin, layers, merge};
+use crate::env::Env;
 use crate::env_guard::RootSet;
+use crate::git::Git;
 use crate::journal::{self, Session, SessionKind};
 use crate::paths::{self, Portable};
 use crate::recover::{self, Interrupted};
@@ -45,7 +46,6 @@ use crate::shell::activation;
 use crate::state::{
     self, ExclusiveLock, Fingerprints, LedgerView, Mechanism, SharedLock, StateDir,
 };
-use crate::sync::Git;
 
 /// Which half of the traversal is running.
 ///
@@ -69,67 +69,6 @@ impl Mode {
     const fn writes(self) -> bool {
         matches!(self, Self::Apply | Self::Sync)
     }
-}
-
-/// Everything bx takes from the process it runs in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Env {
-    /// `$HOME`.
-    pub home: PathBuf,
-    /// `$XDG_CONFIG_HOME`, which places the config repo.
-    pub xdg_config_home: Option<OsString>,
-    /// `$XDG_STATE_HOME`, which places the state directory.
-    pub xdg_state_home: Option<OsString>,
-    /// Whether `$NO_COLOR` is set to something other than the empty string.
-    pub no_color: bool,
-    /// Whether standard output is a terminal.
-    pub stdout_tty: bool,
-    /// Whether standard input is a terminal, so a confirmation can be asked.
-    pub stdin_tty: bool,
-    /// Whether standard error is a terminal, so progress can be drawn.
-    pub stderr_tty: bool,
-}
-
-impl Env {
-    /// Read the environment of this process. The only place in the `plan`
-    /// path that does.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Home`] when `$HOME` is unset, empty or relative, and
-    /// [`Error::HomeParentComponent`] when it has a `..` component.
-    pub fn from_process() -> Result<Self, Error> {
-        Ok(Self {
-            home: usable_home(paths::home()?)?,
-            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
-            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
-            no_color: no_color(std::env::var_os("NO_COLOR").as_deref()),
-            stdout_tty: std::io::stdout().is_terminal(),
-            stdin_tty: std::io::stdin().is_terminal(),
-            stderr_tty: std::io::stderr().is_terminal(),
-        })
-    }
-}
-
-/// `home`, refused when it has a `..` component.
-///
-/// Not normalised: `/a/..` is not `/` when `/a` is a symlink, and every path bx
-/// writes is rendered against the home, so a home bx cannot name exactly is
-/// refused here, naming `HOME`, rather than by the first target beneath it.
-fn usable_home(home: PathBuf) -> Result<PathBuf, Error> {
-    if home
-        .components()
-        .any(|component| component == std::path::Component::ParentDir)
-    {
-        return Err(Error::HomeParentComponent(home));
-    }
-    Ok(home)
-}
-
-/// Whether a `NO_COLOR` value asks for no colour: set, to anything but the
-/// empty string.
-fn no_color(value: Option<&OsStr>) -> bool {
-    value.is_some_and(|value| !value.is_empty())
 }
 
 /// What a run decides against, loaded once.
@@ -304,17 +243,6 @@ impl Report {
 /// Everything that can stop a run.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// `$HOME` is not usable.
-    #[error(transparent)]
-    Home(#[from] paths::Error),
-    /// `$HOME` climbs out of a directory and back in, so bx cannot name the
-    /// home exactly.
-    #[error(
-        "HOME has a `..` component: {}; bx renders every path against HOME and will not guess \
-         which directory it names. Set HOME without `..`",
-        .0.display()
-    )]
-    HomeParentComponent(PathBuf),
     /// There is no config repo.
     #[error("no bx config repo at {}; run `bx init` to create one", .0.display())]
     RepoMissing(PathBuf),
@@ -376,27 +304,6 @@ pub enum Error {
     /// The rendering could not be written to its output.
     #[error("writing the plan: {0}")]
     Output(#[source] std::io::Error),
-}
-
-/// Whether a prompt ended because the person at it pressed Esc or Ctrl-C,
-/// rather than because it could not be asked.
-pub(crate) const fn abandoned(error: &inquire::InquireError) -> bool {
-    matches!(
-        error,
-        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted
-    )
-}
-
-impl Error {
-    /// What a confirmation prompt's failure is: [`Error::Canceled`] when it
-    /// was [`abandoned`], [`Error::Prompt`] otherwise.
-    pub(crate) fn from_prompt(error: inquire::InquireError) -> Self {
-        if abandoned(&error) {
-            Self::Canceled
-        } else {
-            Self::Prompt(error)
-        }
-    }
 }
 
 impl From<config::Error> for Error {
@@ -503,7 +410,7 @@ pub fn run(
     }
 
     let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
-    let bases = bases(inputs)?;
+    let bases = track::bases(inputs)?;
     // Every declared activation is decided here, once, against the cache as
     // it stands, read without a lock: what the interactive file is rendered
     // with below is what `apply` records, and nothing decides them again. A
@@ -521,6 +428,7 @@ pub fn run(
         secrets: &inputs.resolved.secrets,
         declared: &decide::Declared::new(),
         bases: &bases,
+        host: &inputs.host,
     };
     // A fragment bx wrote for a place no variable lands in any more is planned
     // empty, so switching a variable off takes it out of every shell.
@@ -587,7 +495,7 @@ pub fn run(
                 .iter()
                 .any(|step| step.action().is_pending());
             if ops.is_empty() && clones.is_empty() && !captured {
-                agree(inputs, &bases, &agreed, mode, false)?;
+                track::agree(inputs, &bases, &agreed, mode, false)?;
                 return Ok(report);
             }
             if !approve(&report)? {
@@ -633,7 +541,7 @@ pub fn run(
                 record_activations(&inputs.state, &report.activations)?;
             }
             report.executed = true;
-            agree(inputs, &bases, &agreed, mode, true)?;
+            track::agree(inputs, &bases, &agreed, mode, true)?;
             Ok(report)
         }
     }
@@ -728,134 +636,6 @@ fn undeclared_rows(
         })
         .map(|(_, entry)| decide::decide_undeclared(entry, &origin, &inputs.home))
         .collect()
-}
-
-/// What every fingerprint-cache key a tracked target's agreement is kept
-/// under begins with.
-const TRACK_PREFIX: &str = "track:";
-
-/// The fingerprint-cache key a tracked target's agreement is kept under.
-fn base_key(target: &Portable) -> String {
-    format!("{TRACK_PREFIX}{}", target.as_str())
-}
-
-/// Every target the configuration declares tracked.
-fn tracked(inputs: &Inputs) -> Vec<&Portable> {
-    inputs
-        .resolved
-        .targets
-        .iter()
-        .filter_map(|resolution| match resolution {
-            Resolution::Ready(target) if target.direction == Direction::Track => Some(&target.path),
-            _ => None,
-        })
-        .collect()
-}
-
-/// What each tracked target's two sides last agreed on, read from the
-/// fingerprint cache without the lock.
-///
-/// # Decision: the agreement is kept in the fingerprint cache
-///
-/// It is machine-owned, per account, and never published, which is what the
-/// state directory holds; and losing it is what the cache's contract allows,
-/// because [`decide`]'s tracked decision reads a missing agreement as "cannot
-/// tell which side moved" and asks a human rather than overwriting either
-/// side. The ledger is the wrong home: an entry there claims a file and holds
-/// the bytes `rm` puts back, and bx claims the machine's copy only where
-/// `apply` created it, while every tracked target has an agreement. Keeping it
-/// in the ledger would claim a copy the tool had before bx wrote to it, so
-/// `rm` would replace the tool's later bytes with ones the tool no longer
-/// holds.
-///
-/// What it keeps is bounded, and is the bytes themselves only while they are
-/// small: see [`decide::Base::fingerprint`].
-fn bases(inputs: &Inputs) -> Result<decide::Bases, Error> {
-    let tracked = tracked(inputs);
-    if tracked.is_empty() {
-        return Ok(decide::Bases::new());
-    }
-    let cache = Fingerprints::read(&inputs.state)?.value;
-    Ok(tracked
-        .into_iter()
-        .filter_map(|target| {
-            let base = decide::Base::from_fingerprint(cache.get(&base_key(target))?)?;
-            Some((target.clone(), base))
-        })
-        .collect())
-}
-
-/// The agreements `cache` keeps for targets the configuration no longer
-/// declares tracked, or none while any target is blocked.
-///
-/// # Decision: an agreement is forgotten once its target is not tracked
-///
-/// An agreement outlives nothing it could be used for: a target no longer
-/// tracked is never decided against it, and one tracked again later that
-/// finds none asks a human where the two copies differ, never overwriting
-/// either. A blocked target's direction cannot be read, so while any is
-/// blocked nothing is forgotten, and an agreement a target that is only
-/// waiting for a value still needs is kept for it.
-fn stale(inputs: &Inputs, cache: &Fingerprints) -> Vec<String> {
-    let blocked = inputs
-        .resolved
-        .targets
-        .iter()
-        .any(|resolution| matches!(resolution, Resolution::Blocked(_)));
-    if blocked {
-        return Vec::new();
-    }
-    let kept: BTreeSet<String> = tracked(inputs).into_iter().map(base_key).collect();
-    cache
-        .iter()
-        .map(|(key, _)| key)
-        .filter(|key| key.starts_with(TRACK_PREFIX) && !kept.contains(*key))
-        .cloned()
-        .collect()
-}
-
-/// Record what each tracked target's two sides now agree on: every agreement
-/// that holds already, and — once this run `executed` — those its writes made,
-/// a carry into the repo only in [`Mode::Sync`]; and forget every agreement
-/// [`stale`] names.
-///
-/// Written under the lock, and only when something changed, so a run with
-/// nothing new to record leaves the state directory as it found it.
-fn agree(
-    inputs: &Inputs,
-    bases: &decide::Bases,
-    agreed: &[decide::Agreed],
-    mode: Mode,
-    executed: bool,
-) -> Result<(), Error> {
-    let settled = agreed
-        .iter()
-        .filter(|agreed| match agreed.when {
-            decide::When::Now => true,
-            decide::When::Applied => executed,
-            decide::When::Synced => executed && mode == Mode::Sync,
-        })
-        .map(|agreed| (&agreed.target, decide::Base::of(&agreed.bytes)))
-        .filter(|(target, base)| bases.get(*target) != Some(base))
-        .map(|(target, base)| (base_key(target), base))
-        .collect::<Vec<_>>();
-    if settled.is_empty() && stale(inputs, &Fingerprints::read(&inputs.state)?.value).is_empty() {
-        return Ok(());
-    }
-    inputs.state.ensure()?;
-    let lock = ExclusiveLock::acquire(&inputs.state)?;
-    let before = Fingerprints::open(&inputs.state, &lock)?.value;
-    let mut cache = before.clone();
-    for key in stale(inputs, &before) {
-        cache.remove(&key);
-    }
-    for (key, base) in settled {
-        cache.set(key, base.fingerprint());
-    }
-    if cache != before {
-        cache.save(&inputs.state, &lock)?;
-    }
-    Ok(())
 }
 
 /// `target` as `plan` renders it: zsh's and bash's interactive files with
@@ -962,86 +742,13 @@ pub fn exit(report: &Report, mode: Mode) -> Exit {
 }
 
 /// Refuse anything in the state directory that is neither a regular file nor a
-/// directory, before any reader opens it.
-///
-/// bx only ever leaves a state file by rename, and a FIFO, a device or a link
-/// at one could make a read wait forever or never end: a FIFO blocks the open
-/// until a writer that never comes, and a link to `/dev/zero` fills memory
-/// without bound. Everything under the state root is bx's own, so nothing there
-/// is legitimately either.
-///
-/// # Decision 33: the scope is the tree, not a list of names
-///
-/// The check used to name three files — the ledger, the fingerprints and the
-/// journal — and its doc claimed that was every state file a run opens. It was
-/// not. `bx plan` also reads `<state>/restore/<digest>` through
-/// [`interrupted_rows`], with no file-type check anywhere on that path, and a
-/// FIFO there hung `bx plan` — the read-only command — forever. The blob was
-/// outside the guard by omission and not by judgement: decision 20's rationale
-/// covers it word for word, and it is left by rename like the other three.
-///
-/// A fourth name would have been the same artefact with the same defect
-/// waiting. A list of the state files a run reads has to be re-derived by hand
-/// every time a reader is added, and nothing fails when it is not: the three
-/// tests that exercised it mirrored the same three names, so the suite could
-/// not find what the list had missed. So the list is gone. The scope is now
-/// **everything under the state root**, walked from the filesystem, which is an
-/// over-approximation of what any reader could open and therefore cannot be
-/// short of it. A state file added tomorrow is covered on the day it is
-/// written, by nobody having done anything.
-///
-/// Directories are descended into and are not themselves refused; the root is
-/// not refused either, so an account that symlinks its whole state directory
-/// elsewhere still works. An absent state directory is fine — there is nothing
-/// to read — and so is an entry `lstat` cannot see, which the read then reports
-/// itself.
-///
-/// # Decision 38: `<state>/local.toml` is the user's, and is not walked
-///
-/// The walk's premise — everything under the state root is bx's own and is
-/// only ever left by rename — is false for exactly one path: the local layer,
-/// `<state>/local.toml`, which the user writes and which the base supports as a
-/// symbolic link ([`layers::layer_paths`], `state::dir`'s `check_local_layer`).
-/// Refusing it there made `bx`, `bx plan` and `bx apply` exit 1 for every
-/// account whose `local.toml` is linked. So that one path is skipped here,
-/// neither judged nor descended into, and is left to the judgement that already
-/// governs it: [`layers::layer_paths`] follows the link, loads it only when it
-/// ends at a regular file, and skips anything else unread, so a FIFO or a link
-/// to a device there is never opened. It was judged before this ran, by
-/// [`Inputs::load`].
-pub(crate) fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
-    fn walk(dir: &Path, local: &Path) -> Result<(), Error> {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            // Unreadable or absent: there is nothing bx can enumerate here, and
-            // whichever reader wants a file beneath it reports its own failure.
-            return Ok(());
-        };
-        // Sorted, so a directory holding two irregular entries is always
-        // refused naming the same one: `read_dir` yields in whatever order the
-        // filesystem happens to hold, and an error message that varies between
-        // identical runs is not one a test or a user can rely on.
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-        paths.sort();
-        for path in paths {
-            if path == local {
-                continue;
-            }
-            // `symlink_metadata`, so a symlink is judged as a symlink rather
-            // than as whatever it points at. `entry.file_type()` would do on
-            // Linux, but it is documented as possibly needing a stat, and this
-            // one must not follow.
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if meta.is_dir() {
-                walk(&path, local)?;
-            } else if !meta.file_type().is_file() {
-                return Err(Error::NotARegularFile { path });
-            }
-        }
-        Ok(())
+/// directory, before any reader opens it: the first
+/// [`StateDir::irregular_file`] finds.
+fn refuse_irregular_state_files(state: &StateDir) -> Result<(), Error> {
+    match state.irregular_file() {
+        Some(path) => Err(Error::NotARegularFile { path }),
+        None => Ok(()),
     }
-    walk(state.root(), &paths::local_layer_path(state.root()))
 }
 
 /// What a read-only run learns from the state directory before deciding.
@@ -1145,13 +852,14 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
             // symlink target's: the link recovery puts back was stored as
             // its text.
             (true, Some(state::Prior::Existed(reference))) if link => {
-                let prior = LedgerView::default()
-                    .restore_bytes(&inputs.state, reference)
+                let prior = state::restore::read(&inputs.state, reference)
                     .ok()
                     .map(|bytes| {
-                        PathBuf::from(<OsString as std::os::unix::ffi::OsStringExt>::from_vec(
-                            bytes,
-                        ))
+                        PathBuf::from(
+                            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(
+                                bytes,
+                            ),
+                        )
                     });
                 (
                     prior.map(|prior| Diff::link(observed.link.as_deref(), Some(&prior))),
@@ -1181,9 +889,7 @@ fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Ch
                 "rolls back: removes the directory the session created where empty",
             ),
             (true, Some(state::Prior::Existed(reference))) => {
-                let prior = LedgerView::default()
-                    .restore_bytes(&inputs.state, reference)
-                    .ok();
+                let prior = state::restore::read(&inputs.state, reference).ok();
                 let mode = observed
                     .mode
                     .filter(|mode| *mode != reference.mode)
@@ -1874,56 +1580,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn decision_21_a_home_with_a_parent_component_is_refused_and_any_other_is_kept() {
-        let climbing = "/var/home/../home/u";
-        let refused = usable_home(PathBuf::from(climbing)).expect_err("a `..` home");
-        assert!(
-            matches!(&refused, Error::HomeParentComponent(path) if path == Path::new(climbing)),
-            "{refused:?}"
-        );
-        assert!(
-            refused
-                .to_string()
-                .starts_with("HOME has a `..` component: /var/home/../home/u;"),
-            "{refused}"
-        );
-
-        // Kept exactly as spelled: bx does not normalise a home.
-        for kept in ["/var/home/u", "/var/home/u/", "/var//home/./u"] {
-            assert_eq!(
-                usable_home(PathBuf::from(kept)).expect("kept"),
-                PathBuf::from(kept)
-            );
-        }
-    }
-
-    #[test]
-    fn no_color_is_asked_for_by_any_value_but_the_empty_string() {
-        assert!(!no_color(None));
-        assert!(!no_color(Some(OsStr::new(""))));
-        assert!(no_color(Some(OsStr::new("1"))));
-        assert!(no_color(Some(OsStr::new("0"))));
-    }
-
-    #[test]
-    fn the_process_environment_is_read_as_it_is() {
-        let env = Env::from_process();
-        match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-            Some(home) if Path::new(&home).is_absolute() => {
-                let env = env.expect("a usable HOME");
-                assert_eq!(env.home, PathBuf::from(home));
-                assert_eq!(env.xdg_state_home, std::env::var_os("XDG_STATE_HOME"));
-                assert_eq!(env.xdg_config_home, std::env::var_os("XDG_CONFIG_HOME"));
-                assert_eq!(
-                    env.no_color,
-                    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
-                );
-            }
-            _ => assert!(matches!(env, Err(Error::Home(_)))),
-        }
-    }
-
-    #[test]
     fn state_errors_are_one_variant_wherever_they_come_from() {
         let failure = || state::Error::NotADirectory {
             path: PathBuf::from("/x"),
@@ -2466,6 +2122,27 @@ pub(crate) mod tests {
             std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file"),
             file
         );
+    }
+
+    #[test]
+    fn a_has_condition_looks_its_tool_up_on_the_host_the_inputs_were_loaded_with() {
+        // The lookup used to read the process's own `PATH`, which
+        // `Inputs::load` never took and no test controls. A tool only the
+        // host's `PATH` holds is found, and one it does not hold is not.
+        let home = guarded_home();
+        seed(
+            home.path(),
+            "[[alias]]\nname = \"s\"\ncommand = \"stub\"\nwhen = \"has:stub\"\n",
+        );
+        let written = |host| {
+            apply(&load(home.path()).with_host(host));
+            std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file")
+        };
+
+        let without = written(activation::System::new("", activation::TIMEOUT));
+        assert!(!without.contains("alias s="), "{without}");
+        let with = written(stub_tool(&home));
+        assert!(with.contains("alias s='stub'\n"), "{with}");
     }
 
     #[test]
@@ -3926,18 +3603,21 @@ pub(crate) mod tests {
             (home, inputs)
         }
 
-        fn kept(home: &Path, name: &str) -> Option<decide::Base> {
+        fn kept(home: &Path, name: &str) -> Option<crate::plan::track::Base> {
             let cache = Fingerprints::read(&StateDir::resolve(home))
                 .expect("the cache")
                 .value;
             let fingerprint = cache.get(&format!("track:~/.{name}"))?;
-            Some(decide::Base::from_fingerprint(fingerprint).expect("an agreement bx wrote"))
+            Some(
+                crate::plan::track::Base::from_fingerprint(fingerprint)
+                    .expect("an agreement bx wrote"),
+            )
         }
 
         fn base(home: &Path, name: &str) -> Option<Vec<u8>> {
             match kept(home, name)? {
-                decide::Base::Bytes(bytes) => Some(bytes),
-                decide::Base::Digest(_) => panic!("a small agreement is kept whole"),
+                crate::plan::track::Base::Bytes(bytes) => Some(bytes),
+                crate::plan::track::Base::Digest(_) => panic!("a small agreement is kept whole"),
             }
         }
 
@@ -3947,27 +3627,34 @@ pub(crate) mod tests {
 
         #[test]
         fn an_agreement_is_kept_whole_up_to_the_bound_and_as_a_digest_above_it() {
-            let whole = vec![b'a'; decide::Base::KEPT_WHOLE];
+            let whole = vec![b'a'; crate::plan::track::Base::KEPT_WHOLE];
             let mut large = whole.clone();
             large.push(b'a');
-            assert_eq!(decide::Base::of(&whole), decide::Base::Bytes(whole.clone()));
-            let digest = decide::Base::of(&large);
+            assert_eq!(
+                crate::plan::track::Base::of(&whole),
+                crate::plan::track::Base::Bytes(whole.clone())
+            );
+            let digest = crate::plan::track::Base::of(&large);
             assert_eq!(
                 digest,
-                decide::Base::Digest(*crate::state::ContentHash::of(&large).as_bytes())
+                crate::plan::track::Base::Digest(*crate::state::ContentHash::of(&large).as_bytes())
             );
             assert!(digest.holds(&large));
             assert!(!digest.holds(&whole));
-            assert!(decide::Base::of(&whole).holds(&whole));
-            assert!(!decide::Base::of(&whole).holds(&large));
-            for base in [decide::Base::of(b""), decide::Base::of(&whole), digest] {
+            assert!(crate::plan::track::Base::of(&whole).holds(&whole));
+            assert!(!crate::plan::track::Base::of(&whole).holds(&large));
+            for base in [
+                crate::plan::track::Base::of(b""),
+                crate::plan::track::Base::of(&whole),
+                digest,
+            ] {
                 assert_eq!(
-                    decide::Base::from_fingerprint(&base.fingerprint()),
+                    crate::plan::track::Base::from_fingerprint(&base.fingerprint()),
                     Some(base.clone())
                 );
             }
             assert_eq!(
-                decide::Base::of(b"ab").fingerprint().as_bytes(),
+                crate::plan::track::Base::of(b"ab").fingerprint().as_bytes(),
                 b"=ab",
                 "a tag, then the bytes"
             );
@@ -3977,7 +3664,9 @@ pub(crate) mod tests {
             overlong.extend_from_slice(&large);
             for foreign in [&b""[..], b"ab", b"#short", &overlong, &[b'#'; 34][..]] {
                 assert_eq!(
-                    decide::Base::from_fingerprint(&crate::state::Fingerprint::raw(foreign)),
+                    crate::plan::track::Base::from_fingerprint(&crate::state::Fingerprint::raw(
+                        foreign
+                    )),
                     None,
                     "{foreign:?}"
                 );
@@ -3986,9 +3675,9 @@ pub(crate) mod tests {
 
         #[test]
         fn a_large_tracked_file_is_agreed_by_digest_and_its_conflict_shows_the_two_sides() {
-            let large = "x\n".repeat(decide::Base::KEPT_WHOLE);
+            let large = "x\n".repeat(crate::plan::track::Base::KEPT_WHOLE);
             let (home, inputs) = agreed_home(&large);
-            let Some(decide::Base::Digest(_)) = kept(home.path(), "lock") else {
+            let Some(crate::plan::track::Base::Digest(_)) = kept(home.path(), "lock") else {
                 panic!("a large agreement is kept as a digest");
             };
             assert!(
@@ -4272,6 +3961,10 @@ pub(crate) mod tests {
                 Some("repo\n")
             );
             assert_eq!(read(&copy(home.path(), "new")), None);
+            // Only what the apply wrote is agreed: the carry it left undone
+            // is not.
+            assert_eq!(base(home.path(), "fresh").as_deref(), Some(&b"repo\n"[..]));
+            assert_eq!(base(home.path(), "new"), None);
             assert_eq!(
                 plan(&inputs).actions(),
                 vec![Action::Unchanged, Action::Sync, Action::Unchanged]

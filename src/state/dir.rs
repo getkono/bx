@@ -62,6 +62,96 @@ impl StateDir {
         &self.root
     }
 
+    /// The first thing in the state directory that is neither a regular file
+    /// nor a directory, which every reader must refuse before it opens
+    /// anything, or `None` when there is none.
+    ///
+    /// bx only ever leaves a state file by rename, and a FIFO, a device or a
+    /// link at one could make a read wait forever or never end: a FIFO blocks
+    /// the open until a writer that never comes, and a link to `/dev/zero`
+    /// fills memory without bound. Everything under the state root is bx's
+    /// own, so nothing there is legitimately either.
+    ///
+    /// # Decision 33: the scope is the tree, not a list of names
+    ///
+    /// The check used to name three files — the ledger, the fingerprints and
+    /// the journal — and its doc claimed that was every state file a run
+    /// opens. It was not. `bx plan` also reads `<state>/restore/<digest>`
+    /// through its interrupted rows, with no file-type check anywhere on that
+    /// path, and a FIFO there hung `bx plan` — the read-only command —
+    /// forever. The blob was outside the guard by omission and not by
+    /// judgement: decision 20's rationale covers it word for word, and it is
+    /// left by rename like the other three.
+    ///
+    /// A fourth name would have been the same artefact with the same defect
+    /// waiting. A list of the state files a run reads has to be re-derived by
+    /// hand every time a reader is added, and nothing fails when it is not:
+    /// the three tests that exercised it mirrored the same three names, so the
+    /// suite could not find what the list had missed. So the list is gone. The
+    /// scope is now **everything under the state root**, walked from the
+    /// filesystem, which is an over-approximation of what any reader could
+    /// open and therefore cannot be short of it. A state file added tomorrow
+    /// is covered on the day it is written, by nobody having done anything.
+    ///
+    /// Directories are descended into and are not themselves refused; the
+    /// root is not refused either, so an account that symlinks its whole state
+    /// directory elsewhere still works. An absent state directory is fine —
+    /// there is nothing to read — and so is an entry `lstat` cannot see, which
+    /// the read then reports itself.
+    ///
+    /// # Decision 38: `<state>/local.toml` is the user's, and is not walked
+    ///
+    /// The walk's premise — everything under the state root is bx's own and
+    /// is only ever left by rename — is false for exactly one path: the local
+    /// layer, `<state>/local.toml`, which the user writes and which the base
+    /// supports as a symbolic link
+    /// ([`crate::config::layers::layer_paths`], `check_local_layer` below).
+    /// Refusing it there made `bx`, `bx plan` and `bx apply` exit 1 for every
+    /// account whose `local.toml` is linked. So that one path is skipped here,
+    /// neither judged nor descended into, and is left to the judgement that
+    /// already governs it: [`crate::config::layers::layer_paths`] follows the
+    /// link, loads it only when it ends at a regular file, and skips anything
+    /// else unread, so a FIFO or a link to a device there is never opened. It
+    /// was judged before `plan` asks this, by [`crate::plan::Inputs::load`].
+    #[must_use]
+    pub fn irregular_file(&self) -> Option<PathBuf> {
+        fn walk(dir: &Path, local: &Path) -> Option<PathBuf> {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                // Unreadable or absent: there is nothing bx can enumerate
+                // here, and whichever reader wants a file beneath it reports
+                // its own failure.
+                return None;
+            };
+            // Sorted, so a directory holding two irregular entries is always
+            // refused naming the same one: `read_dir` yields in whatever order
+            // the filesystem happens to hold, and an error message that varies
+            // between identical runs is not one a test or a user can rely on.
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+            paths.sort();
+            for path in paths {
+                if path == local {
+                    continue;
+                }
+                // `symlink_metadata`, so a symlink is judged as a symlink
+                // rather than as whatever it points at. `entry.file_type()`
+                // would do on Linux, but it is documented as possibly needing
+                // a stat, and this one must not follow.
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    if let Some(found) = walk(&path, local) {
+                        return Some(found);
+                    }
+                } else if !meta.file_type().is_file() {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        walk(&self.root, &self.local_toml())
+    }
+
     /// `local.toml` — this account's own layer, which is never committed.
     ///
     /// Delegates to [`crate::paths::local_layer_path`], so the layer

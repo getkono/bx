@@ -13,8 +13,8 @@
 //!
 //! This module also holds the crate's **one** home-resolution mechanism. Every
 //! rule in it takes its environment as an argument — [`home_in`], [`xdg_base`],
-//! [`config_root_in`] — and [`home`] and [`config_root`] are one-line wrappers
-//! that read the process environment and nothing more. The crate never *writes*
+//! [`config_root_in`] — and [`home`] is the one-line wrapper that reads the
+//! process environment and nothing more. The crate never *writes*
 //! to the process environment: `std::env::set_var` is `unsafe` in edition 2024
 //! because its precondition is process-wide, and under `cargo test` no code can
 //! establish it. Design-by-parameter is how the rules stay testable without it.
@@ -66,32 +66,6 @@ pub fn render(portable: &str, home: &Path) -> PathBuf {
             None => PathBuf::from(portable),
         },
     }
-}
-
-/// Expand leading `~/` on every line of repo content.
-///
-/// Applied to file bodies bx writes out of the repo. Leading whitespace is
-/// preserved, so indented config keeps its shape.
-#[must_use]
-pub fn render_content(content: &str, home: &Path) -> String {
-    let home = home.to_string_lossy();
-    let mut out = String::with_capacity(content.len());
-    // split_inclusive keeps each line's newline attached, so the terminator is
-    // carried through untouched and a missing trailing newline stays missing.
-    for line in content.split_inclusive('\n') {
-        let indent_len = line.len() - line.trim_start().len();
-        let (indent, rest) = line.split_at(indent_len);
-        out.push_str(indent);
-        match rest.strip_prefix("~/") {
-            Some(tail) => {
-                out.push_str(&home);
-                out.push('/');
-                out.push_str(tail);
-            }
-            None => out.push_str(rest),
-        }
-    }
-    out
 }
 
 /// Everything that can go wrong resolving a path.
@@ -348,19 +322,6 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 #[must_use]
 pub fn systemd_user_dir_in(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
     xdg_base(xdg_config_home, home, ".config").join("systemd/user")
-}
-
-/// The config repo root, resolved from the process environment.
-///
-/// # Errors
-///
-/// Whatever [`home`] returns.
-pub fn config_root() -> Result<PathBuf, Error> {
-    let home = home()?;
-    Ok(config_root_in(
-        &home,
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-    ))
 }
 
 /// A path as the config repo stores it: `~`-rooted, or absolute.
@@ -699,6 +660,50 @@ pub fn normalize(path: &Path) -> PathBuf {
         return PathBuf::from(".");
     }
     out.into_iter().collect()
+}
+
+// Only tests call the two below. They sit last, beside the tests, so the
+// source scans that read everything above the first `#[cfg(test)]` as this
+// module's shipped code still read all of it.
+
+/// Expand leading `~/` on every line of repo content.
+///
+/// Leading whitespace is preserved, so indented config keeps its shape.
+#[cfg(test)]
+#[must_use]
+pub fn render_content(content: &str, home: &Path) -> String {
+    let home = home.to_string_lossy();
+    let mut out = String::with_capacity(content.len());
+    // split_inclusive keeps each line's newline attached, so the terminator is
+    // carried through untouched and a missing trailing newline stays missing.
+    for line in content.split_inclusive('\n') {
+        let indent_len = line.len() - line.trim_start().len();
+        let (indent, rest) = line.split_at(indent_len);
+        out.push_str(indent);
+        match rest.strip_prefix("~/") {
+            Some(tail) => {
+                out.push_str(&home);
+                out.push('/');
+                out.push_str(tail);
+            }
+            None => out.push_str(rest),
+        }
+    }
+    out
+}
+
+/// The config repo root, resolved from the process environment.
+///
+/// # Errors
+///
+/// Whatever [`home`] returns.
+#[cfg(test)]
+pub fn config_root() -> Result<PathBuf, Error> {
+    let home = home()?;
+    Ok(config_root_in(
+        &home,
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+    ))
 }
 
 #[cfg(test)]

@@ -334,21 +334,6 @@ fn filename_bytes(path: &Path) -> &[u8] {
         .map_or(&[], std::ffi::OsStr::as_encoded_bytes)
 }
 
-/// Read and parse every global layer in a config repo, **unmerged**.
-///
-/// Merging is entry A3's, and keeping the two apart is what lets `bx plan` name
-/// the layer that set a given entry.
-///
-/// # Errors
-///
-/// Whatever [`layer_files`] and [`load_layer`] return.
-pub fn load_layers(repo: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
-    layer_files(repo)?
-        .iter()
-        .map(|path| load_layer(path, repo, home))
-        .collect()
-}
-
 /// Read and parse one layer file, expanding its trees against `repo`.
 ///
 /// Any file in the layer schema, including the state directory's `local.toml`,
@@ -1026,6 +1011,23 @@ impl<'a> Ctx<'a> {
         Shells::from_names(&names)
             .map_err(|problem| self.bad(table, Shells::KEY, format!("{owner}: {problem}")))
     }
+}
+
+/// Read and parse every global layer in a config repo, **unmerged**.
+///
+/// Only tests call it, so it sits last, beside them: the source scans that
+/// read everything above the first `#[cfg(test)]` as this module's shipped
+/// code still read all of it.
+///
+/// # Errors
+///
+/// Whatever [`layer_files`] and [`load_layer`] return.
+#[cfg(test)]
+pub fn load_layers(repo: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
+    layer_files(repo)?
+        .iter()
+        .map(|path| load_layer(path, repo, home))
+        .collect()
 }
 
 #[cfg(test)]

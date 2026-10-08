@@ -132,11 +132,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs::{self, Mode, Observed};
+use crate::fs::remove::{open_dir, prune_dirs, sync_dir, unlink};
+use crate::fs::{self, Mode, Observed, refuse_moved};
 use crate::paths::Portable;
+use crate::state::restore;
 use crate::state::{
-    ContentHash, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior, PriorBytes,
-    RestoreRef, StateDir,
+    ContentHash, DIR_BYTES, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior,
+    PriorBytes, StateDir, dir_digest, dir_prior,
 };
 
 /// The seven bytes every journal starts with.
@@ -242,7 +244,7 @@ pub enum Error {
     /// so every command that looks for an interrupted session would hang —
     /// and no session writes one: [`Journal::create`] renames a regular file
     /// into place. It is left exactly where it is, never set aside by a
-    /// recovery, and [`crate::recover::abandon`] moves it aside.
+    /// recovery, and `crate::recover::abandon` moves it aside.
     #[error(
         "the write-ahead journal {} is {kind}; bx reads a journal only from a regular file, \
          so it did not open it, and will not write until it is moved",
@@ -257,7 +259,7 @@ pub enum Error {
     /// A session was asked to start while an unresolved interruption stands.
     ///
     /// The escape is [`crate::recover::recover`], which every writing command
-    /// runs first, or [`crate::recover::abandon`] when recovery is blocked.
+    /// runs first, or `crate::recover::abandon` when recovery is blocked.
     #[error(
         "an interrupted bx session is still recorded in {}; \
          it must be recovered before anything else is written",
@@ -334,6 +336,15 @@ pub enum Error {
     /// A destination could not be written.
     #[error(transparent)]
     Write(#[from] crate::fs::Error),
+}
+
+/// A durable removal that failed is reported as one of the session's own:
+/// [`Error::Io`], naming the path.
+impl From<fs::remove::Error> for Error {
+    fn from(error: fs::remove::Error) -> Self {
+        let fs::remove::Error { path, source } = error;
+        Self::Io { path, source }
+    }
 }
 
 /// What a session is for.
@@ -495,34 +506,6 @@ impl Intent {
     pub const fn creates(&self) -> bool {
         matches!(self.before, Prior::Absent)
     }
-}
-
-/// The bytes a directory stands for in a record: none.
-///
-/// A directory target's ledger entry and journal intents name it by the digest
-/// of these bytes and by its mode, so the shapes that describe a file describe
-/// a directory without a second vocabulary. The [`Mechanism`] or
-/// [`Intent::dir`] beside them says which is meant.
-pub const DIR_BYTES: &[u8] = b"";
-
-/// The digest a directory is recorded under: that of [`DIR_BYTES`].
-#[must_use]
-pub fn dir_digest() -> ContentHash {
-    ContentHash::of(DIR_BYTES)
-}
-
-/// A directory's earlier state at `mode`, in the shape a [`Prior`] takes.
-///
-/// No blob is stored for it: a directory's rollback is a `chmod` or a
-/// `mkdir`, which reads no bytes. [`crate::state::Ledger::record`] stores the
-/// empty blob itself when the ledger adopts this as an entry's prior.
-#[must_use]
-pub fn dir_prior(mode: Mode) -> Prior {
-    Prior::Existed(RestoreRef {
-        digest: dir_digest(),
-        mode,
-        len: 0,
-    })
 }
 
 /// A write that was published.
@@ -1782,7 +1765,7 @@ impl Session {
     /// other (#119). Journalled first, the destination is still `before`
     /// until the publish, and the rollback removes the temporary file and
     /// prunes the directories above it that it leaves empty
-    /// ([`prune_beneath`]). A directory the Intent names and the rollback
+    /// ([`fs::remove::prune_beneath`]). A directory the Intent names and the rollback
     /// finds without the temporary file in it is not shown to be bx's — a
     /// crash before the stage made nothing, and the user may have made it
     /// since — so it is left. A write refused after its stage cannot leave
@@ -1898,28 +1881,23 @@ impl Session {
         let (entry, mechanism) = match ownership {
             Ownership::Owned(mechanism) => (
                 Some({
-                    // `new_entry` claims everything the write made. The entry
-                    // and the Intent have to claim the same set, or a rollback
+                    // The entry claims `created_dirs`, the set the Intent
+                    // names. The two have to claim the same set, or a rollback
                     // and an `rm` would disagree about the home: `prune_claims`
                     // would reach a directory the Intent deliberately left out.
                     //
-                    // Two statements, not one expression: `portable_dirs`'
-                    // `Err` is unreachable *because* `new_entry` has already
-                    // made the same conversion and would have failed first,
-                    // and in one expression that reason would rest on the
-                    // receiver being evaluated before the argument — true of
-                    // Rust, and not something this file should need a reader
-                    // to know (`r3 round 7`, CL3).
+                    // `portable_dirs`' `Err` is unreachable here: see its
+                    // documentation.
                     //
                     // Assembled from the observation rather than a staged
                     // write, because none exists yet: the same fields
-                    // `fs::Filled::new_entry` fills in, from the same prior.
+                    // `NewEntry::for_write` fills in, from the same prior.
                     let entry = NewEntry::new(
                         target.clone(),
                         ContentHash::of(bytes),
                         mode,
                         mechanism.clone(),
-                        observed.prior_bytes(),
+                        PriorBytes::of(&observed),
                     );
                     entry.with_created_dirs(portable_dirs(&created_dirs, &self.home)?)
                 }),
@@ -2300,10 +2278,7 @@ impl Session {
     ) -> Result<(), Error> {
         let index = self.written;
         let announced = fs::compare_dir(planned, mode);
-        if !matches!(
-            announced.action,
-            crate::report::Action::Create | crate::report::Action::Modify
-        ) {
+        if !matches!(announced.drift, fs::Drift::Create | fs::Drift::Modify) {
             return Err(fs::Error::Changed {
                 path: dest,
                 detail: "plan announced nothing for bx to make here".to_string(),
@@ -2456,7 +2431,7 @@ impl Session {
         let mut claims = Vec::with_capacity(created_dirs.len() + 1);
         claims.push(dest);
         claims.extend(created_dirs);
-        prune_claims(&self.ledger, &self.home, &claims)?;
+        self.ledger.prune_claims(&self.home, &claims)?;
         self.released.extend(claims);
         self.crash.reached(index, Phase::AfterPublish);
 
@@ -2494,13 +2469,11 @@ impl Session {
     /// entry removes the directory too.
     fn settle_claims(&mut self) -> Result<(), Error> {
         let released = std::mem::take(&mut self.released);
-        prune_claims(&self.ledger, &self.home, &released)?;
+        self.ledger.prune_claims(&self.home, &released)?;
         let forgotten = std::mem::take(&mut self.forgotten);
-        hand_off_claims(
-            &mut self.ledger,
-            &self.home,
-            released.iter().chain(&forgotten),
-        )
+        Ok(self
+            .ledger
+            .hand_off_claims(&self.home, released.iter().chain(&forgotten))?)
     }
 
     /// End the session: [`End`], settle the claimed directories, save the
@@ -2681,7 +2654,7 @@ impl Crash {
 /// [`Error::Write`] when the snapshot cannot be stored. It is `fsync`ed, along
 /// with the directory entry naming it, before this returns.
 fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
-    store_prior_bytes(state, observed.prior_bytes())
+    Ok(restore::store(state, PriorBytes::of(observed))?)
 }
 
 /// [`store_prior`] for a symlink target: the link's text is its bytes.
@@ -2690,7 +2663,7 @@ fn store_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
 ///
 /// As [`store_prior`].
 fn store_link_prior(state: &StateDir, observed: &Observed) -> Result<Prior, Error> {
-    store_prior_bytes(state, link_prior_bytes(observed))
+    Ok(restore::store(state, link_prior_bytes(observed))?)
 }
 
 /// What a symlink target displaces, in the shape a ledger entry records: the
@@ -2705,27 +2678,6 @@ fn link_prior_bytes(observed: &Observed) -> PriorBytes {
         },
         None => PriorBytes::Absent,
     }
-}
-
-/// Store `prior` under its digest in `restore/`, durably.
-fn store_prior_bytes(state: &StateDir, prior: PriorBytes) -> Result<Prior, Error> {
-    let PriorBytes::Bytes { bytes, mode } = prior else {
-        return Ok(Prior::Absent);
-    };
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let reference = RestoreRef {
-        digest: ContentHash::of(&bytes),
-        mode,
-        len,
-    };
-    let path = state.restore().join(reference.blob_name());
-    // The ledger's own blob store's test, the same function: a content-addressed
-    // name holding the right number of bytes, as a one-link regular file, already
-    // holds these bytes.
-    if crate::state::blob_len(&path) != Some(len) {
-        fs::write_atomically(&path, &bytes, Mode::PRIVATE_FILE)?;
-    }
-    Ok(Prior::Existed(reference))
 }
 
 /// Look at `dest`, and refuse it unless it is still what `planned` observed.
@@ -2776,11 +2728,13 @@ fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
 /// # Errors
 ///
 /// [`Error::Write`] with [`crate::fs::Error::NotPortable`] for one that cannot
-/// be, which a ledger would refuse to store. Unreachable from the one caller,
-/// which calls [`crate::fs::Filled::new_entry`] in the statement before: that
-/// makes the same conversion, for a superset of the same paths and against the
-/// same home, and returns its failure first. The order is a statement
-/// boundary, not an evaluation rule (`r3 round 7`, CL3). Kept rather than unwrapped — a panic in a writer's durability
+/// be, which a ledger would refuse to store. Unreachable from both callers,
+/// [`Session::write`] and [`Session::write_link`], which pass the
+/// [`missing_parents`] of a destination [`Session::admit`] has already checked
+/// is its target rendered against the session's home. [`Session::open`]
+/// refuses a home that is not absolute or not UTF-8, so each such parent is an
+/// absolute, normalised UTF-8 path, which
+/// [`Portable::from_path`] always converts. Kept rather than unwrapped — a panic in a writer's durability
 /// path is worse than a returned error nothing produces — and named here so it
 /// reads as a gap on purpose (`r3 round 6`, COV3), like `plan_restore`'s own
 /// unreachable `Err` arm.
@@ -2796,62 +2750,6 @@ fn portable_dirs(dirs: &[PathBuf], home: &Path) -> Result<Vec<Portable>, Error> 
             })
         })
         .collect()
-}
-
-/// Remove `path` if it is there, and `fsync` the directory it was in.
-///
-/// Absence is success: the whole recovery path is re-runnable, and a second run
-/// finds what the first removed already gone. A missing directory is the same
-/// absence, since nothing can be in it.
-///
-/// The directory is opened **before** the unlink and `fsync`ed after it, the
-/// order `fs::write_atomically` keeps for a rename. Removing an entry needs
-/// write and search permission on its directory, and opening the directory
-/// needs read, so in a `0300` directory an open placed after the unlink fails
-/// with the file already gone: an `Err` from a removal that happened. Opened
-/// first, that failure happens while the file is still in place.
-///
-/// # Errors
-///
-/// [`Error::Io`] wrapping the failing `open` of the directory, `unlink`, or
-/// `fsync`. Only a failing `fsync` is returned after the file was removed.
-pub(crate) fn unlink(path: &Path) -> Result<(), Error> {
-    // `Path::parent` of a bare name is the empty path, which names the current
-    // directory the unlink resolves against, not a directory that is absent.
-    let dir = path.parent().map(|dir| {
-        if dir.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            dir
-        }
-    });
-    let opened = match dir {
-        None => None,
-        Some(dir) => match crate::fs::durable::Dir::open(dir) {
-            Ok(handle) => Some((dir, handle)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(Error::Io {
-                    path: dir.to_path_buf(),
-                    source,
-                });
-            }
-        },
-    };
-    match crate::fs::durable::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(Error::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    }
-    if let Some((dir, handle)) = &opened {
-        sync_dir(handle, dir)?;
-    }
-    Ok(())
 }
 
 /// Move a journal aside, durably, and never over one set aside earlier.
@@ -2885,74 +2783,6 @@ pub(crate) fn set_aside(path: &Path, lock: &ExclusiveLock) -> Result<PathBuf, Er
     Ok(aside)
 }
 
-/// Remove directories bx created, deepest first, stopping at the first that is
-/// not empty.
-///
-/// The stop is the point: a directory that has acquired anything else is no
-/// longer only bx's, and removing it would delete something bx did not put
-/// there. One that is no longer a directory at all stops the walk the same way.
-///
-/// # Errors
-///
-/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
-/// "not a directory".
-pub(crate) fn prune_dirs(dirs: &[PathBuf]) -> Result<(), Error> {
-    for dir in dirs {
-        if !remove_if_empty(dir)? {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Roll back the directories an interrupted write announced it would make,
-/// given that this rollback has just removed `below` — the write's own
-/// temporary file, its published destination, or a directory target's own
-/// directory — from the deepest of them.
-///
-/// An Intent names its directories **before** they are made, so a crash
-/// between the Intent and the stage leaves it naming directories bx never
-/// made. Standing empty proves nothing: one the user made after that crash is
-/// empty too. What proves a directory bx's is that it held bx's own artefact
-/// and nothing else, so each is removed only when the one entry this Intent
-/// names inside it — `below`, then each directory removed before it — was
-/// directly inside it and has just gone, and it now stands empty. The walk
-/// stops at the first that is not: one never made (absent), one holding
-/// anything else, or one the chain does not reach, such as the parent of a
-/// declared directory this Intent does not name. A predicted directory that
-/// is fully empty is therefore left, for `bx doctor` to report.
-///
-/// `dirs` is deepest first, as [`Intent::created_dirs`] is.
-///
-/// # Errors
-///
-/// [`Error::Io`] for a failure that is neither "not empty" nor "not a
-/// directory".
-pub(crate) fn prune_beneath(below: &Path, dirs: &[PathBuf]) -> Result<(), Error> {
-    let mut child = below;
-    for dir in dirs {
-        if child.parent() != Some(dir.as_path()) || !remove_made_dir(dir)? {
-            break;
-        }
-        child = dir;
-    }
-    Ok(())
-}
-
-/// Remove `dir` if it is an empty directory, and say whether this call
-/// removed it. Unlike [`remove_if_empty`], one already absent is **not**
-/// removed: nothing shows it was ever made.
-///
-/// # Errors
-///
-/// What [`remove_if_empty`] returns.
-pub(crate) fn remove_made_dir(dir: &Path) -> Result<bool, Error> {
-    if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
-        return Ok(false);
-    }
-    remove_if_empty(dir)
-}
-
 /// Hand on `error`, the refusal of a staged write, once the directories the
 /// stage just made — `made`, deepest first — are removed where they stand
 /// empty.
@@ -2963,7 +2793,7 @@ pub(crate) fn remove_made_dir(dir: &Path) -> Result<bool, Error> {
 /// between the prediction and the stage) is in neither the journal nor the
 /// ledger, and no rollback or `rm` would ever remove it; one it did predict no
 /// longer holds the temporary file, so the rollback could not show it was made
-/// (see [`prune_beneath`]). `rmdir` only, stopping at the first that is not
+/// (see [`fs::remove::prune_beneath`]). `rmdir` only, stopping at the first that is not
 /// empty, as [`prune_dirs`] does. A failure to remove one is logged and the
 /// refusal is still what is returned: it is the cause the user needs.
 ///
@@ -2980,225 +2810,13 @@ fn unmake(made: &[PathBuf], error: Error) -> Result<(), Error> {
     Err(error)
 }
 
-/// Remove a directory bx created if it is empty, and say whether it is gone.
-///
-/// A path that is no longer a directory — a symlink the user put in its
-/// place, or a file where it or one of its parents was — still stands, and is
-/// no longer bx's: it is left, as [`hand_off_claims`] leaves it. `rmdir` never
-/// follows its last component, so that is decided by the one call that would
-/// otherwise remove it, with no window between a look and the removal.
-///
-/// # Errors
-///
-/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
-/// "not a directory".
-fn remove_if_empty(dir: &Path) -> Result<bool, Error> {
-    match std::fs::remove_dir(dir) {
-        Ok(()) => {
-            tracing::debug!(dir = %dir.display(), "removed a directory bx created");
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        // `ENOTEMPTY` and `EEXIST` are both permitted spellings of "it is
-        // not empty", and `std::io::ErrorKind` maps neither stably.
-        Err(e)
-            if matches!(
-                e.raw_os_error().map(rustix::io::Errno::from_raw_os_error),
-                Some(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::EXIST)
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(e)
-            if e.raw_os_error().map(rustix::io::Errno::from_raw_os_error)
-                == Some(rustix::io::Errno::NOTDIR) =>
-        {
-            tracing::debug!(
-                dir = %dir.display(),
-                "left a directory bx created that is no longer a directory",
-            );
-            Ok(false)
-        }
-        Err(source) => Err(Error::Io {
-            path: dir.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-/// Remove each of `dirs` that is empty and that no entry `ledger` holds names,
-/// deepest first.
-///
-/// `dirs` are claims — possibly several targets' — so unlike [`prune_dirs`] a
-/// directory that is not empty does not stop the walk: it is skipped and the
-/// rest are tried. Its parents are not empty either, so they stay too. A claim
-/// that is no longer a directory is skipped the same way, and dropped with its
-/// target. A directory an entry names is somebody's target, whoever claimed
-/// it, and is never removed here.
-///
-/// # Errors
-///
-/// [`Error::Io`] for a failure that is neither "already gone", "not empty" nor
-/// "not a directory".
-pub(crate) fn prune_claims<'a>(
-    ledger: &LedgerView,
-    home: &Path,
-    dirs: impl IntoIterator<Item = &'a PathBuf>,
-) -> Result<(), Error> {
-    let named: std::collections::HashSet<PathBuf> =
-        ledger.iter().map(|(path, _)| path.render(home)).collect();
-    let mut dirs: Vec<&PathBuf> = dirs.into_iter().collect();
-    dirs.sort_by(|a, b| {
-        b.components()
-            .count()
-            .cmp(&a.components().count())
-            .then_with(|| a.cmp(b))
-    });
-    dirs.dedup();
-    for dir in dirs {
-        if !named.contains(dir) {
-            remove_if_empty(dir)?;
-        }
-    }
-    Ok(())
-}
-
-/// Give each claimed directory that still stands to an entry `ledger` holds
-/// beneath it, so the `rm` that removes that entry prunes it.
-///
-/// The heir is the first entry, in the ledger's own order, whose target is
-/// strictly inside the directory. A directory no entry is beneath — one only
-/// the user's files keep — is claimed by nobody from here on, and stays. The
-/// claim is merged by [`crate::state::Ledger::record`] with the heir's digest,
-/// mode and mechanism as they are and no prior, which keeps the stored prior
-/// and every superseded snapshot.
-///
-/// Bookkeeping only: no destination is touched. [`crate::recover`] runs the
-/// same hand-off when it rebuilds a terminated journal's ledger, so a crash
-/// between the `End` frame and the save loses no claim.
-///
-/// # Errors
-///
-/// [`Error::State`] when the ledger refuses the re-record, and
-/// [`Error::Write`] for a directory that cannot be made portable.
-pub(crate) fn hand_off_claims<'a>(
-    ledger: &mut Ledger,
-    home: &Path,
-    dirs: impl IntoIterator<Item = &'a PathBuf>,
-) -> Result<(), Error> {
-    let mut dirs: Vec<&PathBuf> = dirs.into_iter().collect();
-    dirs.sort();
-    dirs.dedup();
-    for dir in dirs {
-        if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
-            continue;
-        }
-        let Some(heir) = ledger
-            .iter()
-            .find(|(path, _)| {
-                let at = path.render(home);
-                at != *dir && at.starts_with(dir)
-            })
-            .map(|(_, entry)| entry.clone())
-        else {
-            continue;
-        };
-        let claim = Portable::from_path(dir, home).map_err(|source| fs::Error::NotPortable {
-            path: dir.clone(),
-            source,
-        })?;
-        if heir.created_dirs.contains(&claim) {
-            continue;
-        }
-        tracing::debug!(
-            dir = %dir.display(),
-            heir = %heir.path,
-            "handed a directory bx created to an entry still beneath it",
-        );
-        // `Absent` states no prior, and on a re-record `record` never lets an
-        // incoming `Absent` replace the stored one, so the heir keeps its own.
-        ledger.record(
-            NewEntry::new(
-                heir.path,
-                heir.written,
-                heir.mode,
-                heir.mechanism,
-                PriorBytes::Absent,
-            )
-            .with_created_dirs(vec![claim]),
-        )?;
-    }
-    Ok(())
-}
-
-/// Refuse unless `now` is still what `planned` observed: the same path, the
-/// same kind and the same stamp, or still nothing at all.
-///
-/// Shared with [`crate::recover`], whose rollback of a create checks the
-/// destination it judged the same way before unlinking it.
-///
-/// # Errors
-///
-/// [`Error::Write`] with [`crate::fs::Error::Changed`] naming what moved.
-pub(crate) fn refuse_moved(planned: &Observed, now: &Observed) -> Result<(), Error> {
-    if planned.path != now.path {
-        return Err(fs::Error::Changed {
-            path: now.path.clone(),
-            detail: format!("plan observed {}, not this path", planned.path.display()),
-        }
-        .into());
-    }
-    if (planned.kind, planned.stamp) == (now.kind, now.stamp) {
-        return Ok(());
-    }
-    let detail = match (planned.stamp, now.stamp) {
-        (_, None) => "it has been removed",
-        (None, Some(_)) => "nothing was there, and something is now",
-        (Some(_), Some(_)) => "it has been modified or replaced",
-    };
-    Err(fs::Error::Changed {
-        path: now.path.clone(),
-        detail: detail.to_string(),
-    }
-    .into())
-}
-
-/// Open a directory so that a rename or an unlink inside it can be made
-/// durable.
-///
-/// Call it **before** that operation and [`sync_dir`] after, never the two
-/// together afterwards: an open that fails after the operation reports an
-/// error for a change that has already happened. See [`unlink`].
-///
-/// # Errors
-///
-/// [`Error::Io`] naming `dir` for the failing `open`.
-pub(crate) fn open_dir(dir: &Path) -> Result<crate::fs::durable::Dir, Error> {
-    crate::fs::durable::Dir::open(dir).map_err(|source| Error::Io {
-        path: dir.to_path_buf(),
-        source,
-    })
-}
-
-/// `fsync` a directory [`open_dir`] opened, so a rename or an unlink made
-/// inside it since survives a power loss.
-///
-/// # Errors
-///
-/// [`Error::Io`] naming `dir` for the failing `fsync`.
-pub(crate) fn sync_dir(handle: &crate::fs::durable::Dir, dir: &Path) -> Result<(), Error> {
-    handle.sync().map_err(|source| Error::Io {
-        path: dir.to_path_buf(),
-        source,
-    })
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
     use std::os::unix::fs::PermissionsExt as _;
 
+    use crate::fs::remove::{prune_beneath, remove_made_dir};
     use crate::state::{LedgerView, Prior};
     use crate::testing::guarded_home;
 
@@ -4057,7 +3675,7 @@ pub(crate) mod tests {
         // cannot be opened to fsync the unlink.
         fs::set_mode(dir.path(), Mode::from_bits(0o300)).expect("chmod");
 
-        let result = unlink(&file);
+        let result = unlink(&file).map_err(Error::from);
         fs::set_mode(dir.path(), Mode::PRIVATE_DIR).expect("unlock for cleanup");
 
         match result {
@@ -5729,9 +5347,11 @@ pub(crate) mod tests {
     #[test]
     fn a_target_spelled_absolutely_under_the_home_is_refused_before_anything_is_touched() {
         // Stack integration of #7's round 4: a caller holding a `Ledger` gets
-        // its home check. `new_entry` folds the destination into `~/…`, so the
-        // check inside `Ledger::check_record` cannot see a target spelled
-        // `/<home>/…`. That target renders to itself and used to be admitted:
+        // its home check. `Session::admit` puts the target, spelled as the
+        // request spells it, through the same `check_against` that
+        // `Ledger::check_record` applies, before anything is observed, so a
+        // target spelled `/<home>/…` is refused as `ForeignRecord`. That
+        // target renders to itself and used to be admitted:
         // the ledger keyed it `~/.conf`, the same file under that spelling got
         // past `Repeated`, and a crash left a journal the loader refuses.
         let home = guarded_home();
@@ -6860,7 +6480,7 @@ pub(crate) mod tests {
                 WRITES_THROUGH_PERMISSIONS,
             );
         }
-        let err = prune_dirs(std::slice::from_ref(&child));
+        let err = prune_dirs(std::slice::from_ref(&child)).map_err(Error::from);
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
             .expect("chmod back");
         let err = err.expect_err("neither gone nor not empty");
@@ -6881,12 +6501,9 @@ pub(crate) mod tests {
         let link = dir.path().join("d");
         std::os::unix::fs::symlink(&real, &link).expect("the link");
         prune_dirs(std::slice::from_ref(&link)).expect("a link is not bx's directory");
-        prune_claims(
-            &LedgerView::default(),
-            dir.path(),
-            std::slice::from_ref(&link),
-        )
-        .expect("nor is it a claim to remove");
+        LedgerView::default()
+            .prune_claims(dir.path(), std::slice::from_ref(&link))
+            .expect("nor is it a claim to remove");
         assert!(
             std::fs::symlink_metadata(&link)
                 .expect("the link stays")
@@ -6901,7 +6518,9 @@ pub(crate) mod tests {
         std::fs::write(&file, "the user's\n").expect("a file where a directory was");
         let claims = [file.join("b"), file.clone()];
         prune_dirs(&claims).expect("prune");
-        prune_claims(&LedgerView::default(), dir.path(), &claims).expect("prune the claims");
+        LedgerView::default()
+            .prune_claims(dir.path(), &claims)
+            .expect("prune the claims");
         assert_eq!(std::fs::read(&file).expect("kept"), b"the user's\n");
     }
 
@@ -7020,10 +6639,14 @@ pub(crate) mod tests {
             .expect("an entry beneath the claim");
         let unusable = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff"));
 
-        let err = hand_off_claims(&mut ledger, &unusable, [&dir])
+        let err = ledger
+            .hand_off_claims(&unusable, [&dir])
             .expect_err("the claim cannot be made portable");
         assert!(
-            matches!(&err, Error::Write(fs::Error::NotPortable { path, .. }) if *path == dir),
+            matches!(
+                &err,
+                crate::state::Error::Write(fs::Error::NotPortable { path, .. }) if *path == dir
+            ),
             "got {err}"
         );
     }
@@ -7069,7 +6692,7 @@ pub(crate) mod tests {
                 .expect("an outside mv of the lock file");
             let second = ExclusiveLock::acquire(&state).expect("a second writer");
 
-            let handed = hand_off_claims(&mut ledger, home.path(), [&dir]);
+            let handed = ledger.hand_off_claims(home.path(), [&dir]);
             let after = ledger.get(&heir).cloned();
             drop(second);
 
@@ -7078,7 +6701,7 @@ pub(crate) mod tests {
             } else {
                 let err = handed.expect_err("a refused record is an error");
                 assert!(
-                    matches!(err, Error::State(crate::state::Error::WrongLock { .. })),
+                    matches!(err, crate::state::Error::WrongLock { .. }),
                     "{case}: got {err}"
                 );
             }
@@ -7632,9 +7255,7 @@ pub(crate) mod tests {
             panic!("a prior mode");
         };
         assert_eq!(
-            ledger
-                .restore_bytes(&state, reference)
-                .expect("the empty blob"),
+            crate::state::restore::read(&state, reference).expect("the empty blob"),
             DIR_BYTES
         );
     }
@@ -7920,9 +7541,7 @@ pub(crate) mod tests {
         );
         assert_eq!(reference.mode, Mode::LINK);
         assert_eq!(
-            LedgerView::default()
-                .restore_bytes(&state, reference)
-                .expect("the text is stored"),
+            crate::state::restore::read(&state, reference).expect("the text is stored"),
             b"../../src/tool"
         );
         session.finish().expect("finish");

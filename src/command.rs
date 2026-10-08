@@ -18,10 +18,12 @@ use crate::adopt::{self, Adoption, Removal};
 use crate::config::resolve::Resolution;
 use crate::config::target::Body;
 use crate::doctor::{self, Probes, systemd};
+use crate::env::Env;
+use crate::git::Git;
 use crate::init;
 use crate::paths;
-use crate::plan::{self, Env, Error, Inputs, Mode, Palette, Report, View};
-use crate::report::{Action, Exit};
+use crate::plan::{self, Error, Inputs, Mode, Palette, Report, View};
+use crate::report::{self, Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
 use crate::sync;
@@ -131,7 +133,17 @@ fn confirm() -> Result<bool, Error> {
     inquire::Confirm::new("Apply these changes?")
         .with_default(false)
         .prompt()
-        .map_err(Error::from_prompt)
+        .map_err(confirmation_failed)
+}
+
+/// What a confirmation prompt's failure is: [`Error::Canceled`] when it was
+/// [`init::abandoned`], [`Error::Prompt`] otherwise.
+fn confirmation_failed(error: inquire::InquireError) -> Error {
+    if init::abandoned(&error) {
+        Error::Canceled
+    } else {
+        Error::Prompt(error)
+    }
 }
 
 /// [`apply`], with the question asked through `ask`.
@@ -201,8 +213,8 @@ fn converge(
             writeln!(
                 out,
                 "  ! {}  stopped: {}",
-                plan::escape(&change.target),
-                plan::escape(change.note.as_deref().unwrap_or_default()),
+                report::escape(&change.target),
+                report::escape(change.note.as_deref().unwrap_or_default()),
             )
             .map_err(Error::Output)?;
         }
@@ -233,7 +245,7 @@ fn converge(
 ///
 /// Whatever [`sync::pull`] and [`sync::push`] return, and as [`apply`].
 pub fn sync(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, sync::Error> {
-    sync_with(env, yes, out, &sync::Git::new(env), &mut confirm)
+    sync_with(env, yes, out, &Git::new(env), &mut confirm)
 }
 
 /// [`sync`], through `git`, with the question asked through `ask`.
@@ -241,7 +253,7 @@ fn sync_with(
     env: &Env,
     yes: bool,
     out: &mut dyn Write,
-    git: &sync::Git,
+    git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, sync::Error> {
     let pulled = sync::pull(env, git)?;
@@ -774,6 +786,22 @@ mod tests {
             matches!(answer, Err(Error::Prompt(inquire::InquireError::NotTTY))),
             "{answer:?}"
         );
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_at_the_confirmation_are_a_cancel_and_every_other_failure_is_an_error() {
+        use inquire::InquireError;
+
+        for key in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            assert!(matches!(confirmation_failed(key), Error::Canceled));
+        }
+        assert!(matches!(
+            confirmation_failed(InquireError::NotTTY),
+            Error::Prompt(InquireError::NotTTY)
+        ));
     }
 
     #[test]

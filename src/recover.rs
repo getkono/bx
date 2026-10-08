@@ -2,7 +2,7 @@
 //!
 //! The second half of `CLAUDE.md` Invariant 4: *an interrupted `apply` must be
 //! detectable and recoverable*. [`pending`] is the detection, [`recover`] is the
-//! undo, and [`abandon`] is the escape when the undo cannot be taken.
+//! undo, and `abandon` is the escape when the undo cannot be taken.
 //!
 //! # Roll back, not forward
 //!
@@ -49,7 +49,7 @@
 //! diff, one already holding what was there before as [`Action::Unchanged`]
 //! (or a modify naming the directories recovery removes where empty), every
 //! write of a session that finished as [`Action::Unchanged`], and a write
-//! recovery cannot account for as an [`Action::Conflict`] naming [`abandon`].
+//! recovery cannot account for as an [`Action::Conflict`] naming `abandon`.
 //! It exits [`Exit::Pending`] whatever the rows are. That is what keeps `plan` usable from CI, a prompt segment or a login
 //! banner.
 //!
@@ -75,17 +75,23 @@
 //! and that does not lapse because a crash happened. The journal is **not**
 //! unlinked, so every writing command keeps refusing until it is resolved, and
 //! the message names the file, both digests it could legitimately hold, and
-//! [`abandon`] as the way out.
+//! `abandon` as the way out.
 //!
 //! A destination whose parent no longer resolves to a directory blocks
 //! recovery the same way: bx can neither confirm what is there nor write the
-//! undo through it, and the message names the parent and [`abandon`].
+//! undo through it, and the message names the parent and `abandon`.
+//!
+//! [`Action::Modify`]: crate::report::Action::Modify
+//! [`Action::Unchanged`]: crate::report::Action::Unchanged
+//! [`Action::Conflict`]: crate::report::Action::Conflict
+//! [`Exit::Pending`]: crate::report::Exit::Pending
 
 use std::path::{Path, PathBuf};
 
-use crate::fs::{self, Kind, Mode};
+use crate::fs::{self, Kind, Mode, remove};
 use crate::journal::{self, Intent, Loaded, SessionKind, Written};
 use crate::paths::Portable;
+#[cfg(test)]
 use crate::report::{Action, Exit};
 use crate::state::{
     ContentHash, ExclusiveLock, Ledger, LedgerView, NewEntry, Prior, PriorBytes, RestoreRef,
@@ -128,6 +134,13 @@ pub enum Error {
     },
 }
 
+/// A rollback's removal fails as the journal's own removals do.
+impl From<remove::Error> for Error {
+    fn from(error: remove::Error) -> Self {
+        Self::Journal(error.into())
+    }
+}
+
 /// What is at an interrupted write's destination, relative to the two states the
 /// journal says it may legitimately hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +165,7 @@ pub enum Standing {
 
 impl Standing {
     /// Whether recovery can act on this on its own.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_resolvable(self) -> bool {
         matches!(self, Self::Prior | Self::Written)
@@ -195,6 +209,7 @@ impl Unfinished {
     /// [`Action::needs_attention`] makes [`Exit::from_actions`] yield
     /// [`Exit::Pending`], which is the right signal for "a human has to look".
     /// [`Exit::Error`] would be wrong: nothing is going wrong now.
+    #[cfg(test)]
     #[must_use]
     pub const fn action(&self) -> Action {
         Action::Conflict
@@ -227,7 +242,7 @@ pub struct Interrupted {
     ///
     /// Such a journal names no write, so `unfinished` is empty, `complete` is
     /// `false`, `kind` is [`SessionKind::Apply`] because no header was
-    /// believed, and [`Interrupted::exit`] is
+    /// believed, and `Interrupted::exit` is
     /// [`Exit::Pending`](crate::report::Exit::Pending). The next writing command
     /// sets the file aside and rolls nothing back, and `plan` then reports what
     /// the session may have written as conflicts. It is reported rather than
@@ -245,6 +260,7 @@ impl Interrupted {
     }
 
     /// The action per target a read-only command reports.
+    #[cfg(test)]
     #[must_use]
     pub fn actions(&self) -> Vec<Action> {
         self.unfinished.iter().map(Unfinished::action).collect()
@@ -255,6 +271,7 @@ impl Interrupted {
     /// [`Exit::Pending`] whenever anything was interrupted — including a session
     /// with no writes in it, because the machine is still not converged and
     /// somebody has to run a writing command.
+    #[cfg(test)]
     #[must_use]
     pub fn exit(&self) -> Exit {
         if self.unfinished.is_empty() {
@@ -291,6 +308,7 @@ pub enum Outcome {
 
 impl Outcome {
     /// Whether the state directory is clear afterwards.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_clear(&self) -> bool {
         !matches!(self, Self::Blocked { .. })
@@ -318,8 +336,8 @@ impl Outcome {
 /// flight right now rather than to one that died. The two are told apart by the
 /// state directory's lock, not by the journal: a caller that wants to say "an
 /// apply is in progress" rather than "an apply was interrupted" asks
-/// [`crate::state::SharedLock::try_acquire`] first and reports the `None` case
-/// as the live one. A session creates its journal whole, by rename, so the most
+/// [`SharedLock::probe`](crate::state::SharedLock::probe) first, as `plan`
+/// and `doctor` do, and reports a held lock as the live one. A session creates its journal whole, by rename, so the most
 /// such a reader can see of one in flight is a torn tail frame, which it
 /// discards.
 ///
@@ -448,7 +466,7 @@ fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome
 ///
 /// As [`recover`], plus [`Error::Blocked`] when a destination cannot be
 /// accounted for — a command that is about to write must stop. The escape from
-/// that is [`abandon`].
+/// that is `abandon`.
 pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
     state.ensure()?;
     let lock = ExclusiveLock::acquire(state)?;
@@ -471,6 +489,7 @@ pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
 /// the journal cannot be moved, or with [`journal::Error::FutureVersion`] when
 /// a newer bx wrote it, which is left exactly where it is. A journal abandoned earlier is never renamed
 /// over: this one takes the next free set-aside name.
+#[cfg(test)]
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
     let lock = ExclusiveLock::acquire(state)?;
     #[cfg(test)]
@@ -567,14 +586,14 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
         // write nothing. `pending` names it in the write's note.
         //
         // Whether it was there to remove is what shows the directories the
-        // Intent names were made: see `journal::prune_beneath`.
+        // Intent names were made: see `fs::remove::prune_beneath`.
         let mut temp_removed = None;
         if !complete
             && !matches!(step, Step::Blocked)
             && let Some(temp) = &intent.temp
         {
             let present = std::fs::symlink_metadata(temp).is_ok();
-            match journal::unlink(temp) {
+            match remove::unlink(temp).map_err(journal::Error::from) {
                 Ok(()) if present => temp_removed = Some(temp),
                 Ok(()) => {}
                 Err(error) => tracing::warn!(
@@ -602,7 +621,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
                 if intent.creates()
                     && let Some(temp) = temp_removed
                 {
-                    journal::prune_beneath(temp, &intent.created_dirs)?;
+                    remove::prune_beneath(temp, &intent.created_dirs)?;
                 }
             }
             // Both act against the observation `decide` judged, never a fresh
@@ -619,16 +638,17 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             // parents go only in the chain above what this rollback removed,
             // as for `Step::Keep`.
             Step::Unlink { .. } if intent.dir => {
-                if journal::remove_made_dir(&intent.dest)? {
-                    journal::prune_beneath(&intent.dest, &intent.created_dirs)?;
+                if remove::remove_made_dir(&intent.dest)? {
+                    remove::prune_beneath(&intent.dest, &intent.created_dirs)?;
                 }
             }
             Step::Unlink { observed } => {
                 #[cfg(test)]
                 tests::before_act(&intent.dest);
-                journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
-                journal::unlink(&intent.dest)?;
-                journal::prune_beneath(&intent.dest, &intent.created_dirs)?;
+                fs::refuse_moved(&observed, &fs::observe(&intent.dest)?)
+                    .map_err(journal::Error::from)?;
+                remove::unlink(&intent.dest)?;
+                remove::prune_beneath(&intent.dest, &intent.created_dirs)?;
             }
             Step::Rewrite {
                 bytes,
@@ -651,7 +671,8 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
             // judged too: one whose mode or presence changed since is refused
             // with [`fs::Error::Changed`] rather than chmod'd or made over it.
             Step::Chmod { mode, observed } => {
-                journal::refuse_moved(&observed, &fs::observe(&intent.dest)?)?;
+                fs::refuse_moved(&observed, &fs::observe(&intent.dest)?)
+                    .map_err(journal::Error::from)?;
                 fs::set_mode(&intent.dest, mode)?;
             }
             Step::MakeDir { mode, observed } => {
@@ -709,7 +730,9 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
     }
 
     if let (Some(ledger), Some(home)) = (ledger.as_mut(), home) {
-        journal::hand_off_claims(ledger, home, &released)?;
+        ledger
+            .hand_off_claims(home, &released)
+            .map_err(journal::Error::from)?;
     }
 
     if let Some(ledger) = &mut ledger {
@@ -728,7 +751,7 @@ fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome, Error> {
              it was kept rather than deleted",
         );
     } else {
-        journal::unlink(&path)?;
+        remove::unlink(&path)?;
     }
 
     Ok(if complete {
@@ -982,7 +1005,7 @@ fn decide(
         // A directory's earlier state is its mode alone; there is no snapshot
         // to read.
         Prior::Existed(reference) if intent.dir => PriorBytes::Bytes {
-            bytes: journal::DIR_BYTES.to_vec(),
+            bytes: crate::state::DIR_BYTES.to_vec(),
             mode: reference.mode,
         },
         Prior::Existed(reference) => match snapshot(state, reference, spelling)? {
@@ -1085,10 +1108,9 @@ fn snapshot(
 ) -> Result<Result<Vec<u8>, String>, Error> {
     use crate::state::Error::{RestoreCorrupt, RestoreMissing};
 
-    // `restore_bytes` reads the content-addressed blob and consults no entry, so
-    // an empty view reads it exactly as the ledger would, and a read-only report
-    // needs no lock to do it.
-    match LedgerView::default().restore_bytes(state, reference) {
+    // `restore::read` reads the content-addressed blob and consults no entry,
+    // so a read-only report needs no lock to do it.
+    match crate::state::restore::read(state, reference) {
         Ok(bytes) => Ok(Ok(bytes)),
         Err(RestoreMissing { digest, path }) => Ok(Err(RestoreMissing {
             digest,
@@ -1193,7 +1215,7 @@ fn standing(intent: &Intent, found: &Found) -> Standing {
         (Found::Absent, _, _) => None,
         (Found::File { digest, mode }, false, false)
         | (Found::Link { digest, mode }, false, true) => Some((digest, mode)),
-        (Found::Dir { mode }, true, false) => Some((journal::dir_digest(), mode)),
+        (Found::Dir { mode }, true, false) => Some((crate::state::dir_digest(), mode)),
         (Found::File { .. } | Found::Dir { .. } | Found::Link { .. } | Found::Foreign, _, _) => {
             return Standing::Foreign;
         }
@@ -1275,9 +1297,9 @@ mod tests {
     use std::process::{Command, Output};
 
     use crate::journal::tests::{
-        WRITES_THROUGH_PERMISSIONS, cannot_build, crash_phases, finish_crash_phases, frame_starts,
-        link_at, link_to, names_in, peek, permissions_refuse, plant_file, raw_journal, seal,
-        state_beyond_set_aside_names, target, write_to,
+        WRITES_THROUGH_PERMISSIONS, cannot_build, crash_phases, dir_to, finish_crash_phases,
+        frame_starts, link_at, link_to, names_in, peek, permissions_refuse, plant_file,
+        raw_journal, seal, state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Begin, Content, Done, End, Ownership, Record, Request, Session};
     use crate::state::{LedgerView, Mechanism, RestoreRef};
@@ -1298,7 +1320,7 @@ mod tests {
             const { std::cell::Cell::new(None) };
     }
 
-    /// The seam [`recover`] and [`abandon`] call once they hold the lock.
+    /// The seam [`recover`] and `abandon` call once they hold the lock.
     pub(super) fn after_lock(state: &StateDir) {
         if let Some(mode) = AFTER_LOCK.with(std::cell::Cell::get) {
             fs::set_mode(state.root(), mode).expect("narrow the state directory");
@@ -1825,6 +1847,42 @@ mod tests {
         assert_eq!(entry.mechanism, Mechanism::Link);
         assert_eq!(entry.written, fs::link::digest(Path::new("/opt/tool")));
         assert_eq!(entry.mode, Mode::LINK);
+    }
+
+    /// A directory's earlier state is its mode, never a snapshot to read:
+    /// rolling forward a terminated chmod of one records that mode even with
+    /// the empty blob gone from `restore/`, where a file's missing snapshot
+    /// would block it.
+    #[test]
+    fn a_terminated_directory_session_records_its_earlier_mode_without_a_snapshot() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let dest = home.child(".vault");
+        std::fs::create_dir(&dest).expect("the prior directory");
+        fs::set_mode(&dest, Mode::DEFAULT_DIR).expect("its prior mode");
+        let request = dir_to(home.path(), ".vault", Mode::PRIVATE_DIR);
+        let portable = request.target.clone();
+        interrupted(&state, home.path(), vec![request]);
+        seal(&state.journal(), 1);
+        let empty = state.restore().join(crate::state::dir_digest().to_hex());
+        std::fs::remove_file(&empty).expect("delete the empty blob");
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 }
+        );
+        let entry = LedgerView::read(&state, home.path())
+            .expect("ledger")
+            .value
+            .get(&portable)
+            .cloned()
+            .expect("recorded");
+        assert_eq!(entry.mechanism, Mechanism::Dir);
+        assert_eq!(entry.mode, Mode::PRIVATE_DIR);
+        let Prior::Existed(reference) = entry.prior else {
+            panic!("the directory was there before: {:?}", entry.prior);
+        };
+        assert_eq!(reference.mode, Mode::DEFAULT_DIR);
     }
 
     /// The crashing half of [`a_killed_rm_rolls_back_into_the_directory_it_found`]:

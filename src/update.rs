@@ -551,8 +551,9 @@ pub fn rebasing(git: &Git, repo: &Path) -> bool {
 }
 
 /// Refuse a `bx.lock` with changes git has not committed, which a commit of
-/// the lock would sweep up. A config repo git does not manage has nothing to
-/// refuse.
+/// the lock would sweep up: one git has never seen among them, as a run
+/// killed before its first lock was committed leaves it, or as one written by
+/// hand is. A config repo git does not manage has nothing to refuse.
 ///
 /// # Errors
 ///
@@ -564,7 +565,7 @@ pub fn refuse_edited_lock(git: &Git, repo: &Path) -> Result<(), Error> {
         &[
             "status",
             "--porcelain",
-            "--untracked-files=no",
+            "--untracked-files=all",
             "--",
             lock::FILE,
         ],

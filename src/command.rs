@@ -3077,6 +3077,24 @@ mod tests {
         }
 
         #[test]
+        fn update_refuses_a_lock_git_has_never_seen() {
+            let home = guarded_home();
+            upstream(&home, &["skills/a/SKILL.md"]);
+            let repo = cloned(&home, &layer());
+            // As a run killed between writing its first lock and committing
+            // it leaves the file, or as one written by hand is.
+            std::fs::write(repo.join("bx.lock"), "# mine\n").expect("untracked");
+            let head = rev(home.path(), &repo, "HEAD");
+            let error = update(&home, true, &mut Vec::new()).expect_err("untracked");
+            assert!(matches!(error, update::Error::LockEdited(_)), "{error:?}");
+            assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing committed");
+            assert_eq!(
+                std::fs::read_to_string(repo.join("bx.lock")).expect("kept"),
+                "# mine\n"
+            );
+        }
+
+        #[test]
         fn a_rewritten_branch_is_reported_and_never_locked() {
             let home = guarded_home();
             let first = upstream(&home, &["skills/a/SKILL.md"]);

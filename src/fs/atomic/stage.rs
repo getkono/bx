@@ -13,6 +13,7 @@ use super::setid::{SET_ID, SPECIAL, verify_set_id_kept, without_set_id};
 use super::{CreatedDirs, Error, Observed, ParentState, Stamp};
 use crate::fs::durable;
 use crate::fs::mode::{Kind, Mode};
+#[cfg(test)]
 use crate::hash::ContentHash;
 
 /// The prefix every temporary file bx creates in a destination directory
@@ -60,6 +61,8 @@ pub struct Filled {
     pending: Pending,
     /// The digest of the bytes now in the temporary file. Not optional: a
     /// `Filled` cannot exist without them, so no accessor on it can fail.
+    /// Only tests read it.
+    #[cfg(test)]
     written: ContentHash,
 }
 
@@ -76,6 +79,7 @@ struct Pending {
     created_dirs: Vec<PathBuf>,
 }
 
+#[cfg(test)]
 impl Pending {
     fn temp_path(&self) -> &Path {
         self.temp.path()
@@ -271,12 +275,14 @@ fn stage_in(
 
 impl Staged {
     /// The destination this write will replace.
+    #[cfg(test)]
     #[must_use]
     pub fn dest(&self) -> &Path {
         &self.0.dest
     }
 
     /// The temporary file, in the destination directory, at its final mode.
+    #[cfg(test)]
     #[must_use]
     pub fn temp_path(&self) -> &Path {
         self.0.temp_path()
@@ -286,6 +292,7 @@ impl Staged {
     ///
     /// The temporary file already has it, except for a setuid or setgid bit,
     /// which [`Staged::fill`] adds after the content.
+    #[cfg(test)]
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.0.mode
@@ -293,6 +300,7 @@ impl Staged {
 
     /// What was at the destination before this write — the prior state a
     /// reversal restores from.
+    #[cfg(test)]
     #[must_use]
     pub const fn prior(&self) -> &Observed {
         &self.0.prior
@@ -343,10 +351,10 @@ impl Staged {
             verify_set_id_kept(self.0.temp.as_file(), self.0.mode, &self.0.dest)?;
         }
         durable::sync_file(self.0.temp.as_file(), &temp_path).map_err(fail)?;
-        let written = ContentHash::of(bytes);
         Ok(Filled {
             pending: self.0,
-            written,
+            #[cfg(test)]
+            written: ContentHash::of(bytes),
         })
     }
 
@@ -364,6 +372,7 @@ impl Staged {
     /// Discard the write. The destination is untouched and the temporary file
     /// is dropped — see [`Staged`] for what that is worth. Identical to
     /// dropping it; named so a caller can say so.
+    #[cfg(test)]
     pub fn abandon(self) {
         // A surviving mutant, and equivalent: `self` is dropped at the end of
         // this function whether or not the body says so, so emptying the body
@@ -374,27 +383,28 @@ impl Staged {
 
 impl Filled {
     /// The destination this write will replace.
+    #[cfg(test)]
     #[must_use]
     pub fn dest(&self) -> &Path {
         &self.pending.dest
     }
 
     /// The temporary file, holding the final content at the final mode.
-    ///
-    /// The path a journal records, so a leftover temporary file found after a
-    /// crash is identifiable as this write's rather than some other one's.
+    #[cfg(test)]
     #[must_use]
     pub fn temp_path(&self) -> &Path {
         self.pending.temp_path()
     }
 
     /// The mode the content is already at.
+    #[cfg(test)]
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.pending.mode
     }
 
     /// What was at the destination before this write.
+    #[cfg(test)]
     #[must_use]
     pub const fn prior(&self) -> &Observed {
         &self.pending.prior
@@ -402,9 +412,10 @@ impl Filled {
 
     /// The digest of the bytes now in the temporary file.
     ///
-    /// Computed while filling rather than re-read afterwards, so the ledger
-    /// records the digest of what was actually written rather than the digest of
-    /// whatever is at the path by the time somebody looks.
+    /// Computed while filling rather than re-read afterwards, so it is the
+    /// digest of what was actually written rather than the digest of whatever
+    /// is at the path by the time somebody looks.
+    #[cfg(test)]
     #[must_use]
     pub const fn written(&self) -> ContentHash {
         self.written
@@ -418,6 +429,7 @@ impl Filled {
     /// reversing this write can never remove a directory that is still
     /// declared. A reversal removes these in order, so a target that created
     /// `~/.config/a/b` leaves nothing behind.
+    #[cfg(test)]
     #[must_use]
     pub fn created_dirs(&self) -> &[PathBuf] {
         &self.pending.created_dirs
@@ -481,6 +493,7 @@ impl Filled {
         // no early return that forgets to: the closure is the only way out.
         let refused = |error: Error| Unpublished {
             error,
+            #[cfg(test)]
             dest: dest.clone(),
         };
         let publish = || -> Result<(), Error> {
@@ -508,6 +521,7 @@ impl Filled {
     /// Discard the write. The destination is untouched and the temporary file
     /// is dropped — see [`Staged`] for what that is worth. Identical to
     /// dropping it; named so a caller can say so.
+    #[cfg(test)]
     pub fn abandon(self) {
         // A surviving mutant, and equivalent: `self` is dropped at the end of
         // this function whether or not the body says so, so emptying the body
@@ -564,7 +578,9 @@ pub struct Unpublished {
     /// Why the write was refused.
     pub error: Error,
     /// The destination it would have replaced, and the path the entry to
-    /// withdraw is keyed on.
+    /// withdraw is keyed on. Only tests read it: no shipped caller records a
+    /// ledger entry before publishing.
+    #[cfg(test)]
     pub dest: PathBuf,
 }
 

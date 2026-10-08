@@ -1,13 +1,16 @@
 //! One target's record: how bx attached to it, what it displaced, and the
 //! rules every record of it must keep.
 
+#[cfg(test)]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 #[cfg(doc)]
 use super::{Ledger, LedgerView};
-use crate::fs::{Filled, Mode, Observed};
+#[cfg(test)]
+use crate::fs::Filled;
+use crate::fs::{Mode, Observed};
 use crate::hash::ContentHash;
 use crate::state::Error;
 
@@ -99,6 +102,7 @@ pub struct RestoreRef {
 
 impl RestoreRef {
     /// The file name of this snapshot inside `restore/`.
+    #[cfg(test)]
     #[must_use]
     pub fn blob_name(&self) -> String {
         self.digest.to_hex()
@@ -308,6 +312,7 @@ impl NewEntry {
     }
 
     /// Replace what this entry says the target held before.
+    #[cfg(test)]
     #[must_use]
     pub fn with_prior(mut self, prior: PriorBytes) -> Self {
         self.prior = prior;
@@ -369,6 +374,10 @@ impl NewEntry {
     /// [`crate::fs::Error::NotPortable`] if the destination or a created
     /// directory is not valid UTF-8, or `home` is not absolute: such a path has
     /// no key the ledger could record it under without naming a different file.
+    ///
+    /// Only tests call it: the shipped `apply` records an entry after its
+    /// publish lands, through the journal, so it has nothing to withdraw.
+    #[cfg(test)]
     pub fn for_write(
         filled: &Filled,
         home: &Path,

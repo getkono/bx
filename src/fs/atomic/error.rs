@@ -289,12 +289,13 @@ pub enum Error {
     /// words, less the path, so `apply` never reaches a target `plan` printed
     /// that way. No writer in `fs` raises it: [`stage`](super::stage()) writes the mode it is
     /// given, because a reversal restores a recorded prior mode through it. It
-    /// is the typed form of that verdict for a caller that refuses the
-    /// declaration itself.
+    /// is the typed form of that verdict, and no shipped caller raises it:
+    /// only tests build it, to pin that it and the note say the same words.
     ///
     /// A directory target's mode is not held to it. Whether a directory mode
     /// shuts bx out depends on the targets beneath the directory, which only
     /// the plan layer knows.
+    #[cfg(test)]
     #[error("{} {}. Nothing was changed", .path.display(), owner_locked_out(*.declared, *.needs))]
     OwnerLockedOut {
         /// The file target.
@@ -310,7 +311,7 @@ pub enum Error {
 /// its bytes.
 pub(super) const FILE_OWNER_NEEDS: Mode = Mode::from_bits(0o400);
 
-/// The words [`Error::OwnerLockedOut`] and `plan`'s conflict note share: the
+/// The words `Error::OwnerLockedOut` and `plan`'s conflict note share: the
 /// owner bits of `needs` that `declared` lacks, and why bx needs them.
 /// `names` as English: `""`, `"read"`, `"read and write"`, `"read, write and
 /// search"`.
@@ -432,8 +433,9 @@ fn bits_that_did_not_stick(declared: Mode, landed: Mode, what: &str) -> String {
     )
 }
 
+#[cfg(test)]
 impl Error {
-    /// The path the failure is about.
+    /// The path the failure is about. Only tests ask it.
     #[must_use]
     pub fn path(&self) -> &Path {
         match self {

@@ -150,7 +150,8 @@ impl Mode {
     ///
     /// This is `ssh`'s `StrictModes` predicate, and `gpg`'s: a group- or
     /// world-writable key, config or directory is refused outright rather than
-    /// used with a warning. `doctor` reads it.
+    /// used with a warning. Only tests ask it.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_group_or_world_writable(self) -> bool {
         self.bits() & 0o022 != 0

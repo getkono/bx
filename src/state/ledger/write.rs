@@ -29,8 +29,8 @@ use crate::state::store::{self, Loaded};
 /// the stronger property would mean a lifetime parameter on every signature that
 /// names a ledger, which is the threading this design exists to avoid.
 ///
-/// What is checked again, before every write — [`Ledger::record`],
-/// [`Ledger::adopt_current_as_prior`] and [`Ledger::save`] — is that the lock
+/// What is checked again, before every write — [`Ledger::record`], the
+/// test-only `Ledger::adopt_current_as_prior` and [`Ledger::save`] — is that the lock
 /// file this was opened under is still the file at the lock path. An outside
 /// `mv` or `rm` of a held lock file lets a second bx lock a new one, and a
 /// ledger that went on writing would be writing beside it.
@@ -105,6 +105,7 @@ impl Ledger {
     }
 
     /// The state directory this ledger was opened from.
+    #[cfg(test)]
     #[must_use]
     pub fn dir(&self) -> &StateDir {
         &self.dir
@@ -183,8 +184,8 @@ impl Ledger {
     ///   [`Error::PriorConflict`], stores nothing, and leaves the entry exactly
     ///   as it was. `plan` reports the same target as a conflict from `written`
     ///   alone, so an apply that shares its function never reaches this call.
-    ///   The way out that loses no byte is [`Ledger::adopt_current_as_prior`],
-    ///   run only because the user chose it.
+    ///   The way out that loses no byte is `Ledger::adopt_current_as_prior`,
+    ///   run only because the user chose it; no command offers it yet.
     ///
     /// The comparison is on content only. A file whose bytes still match
     /// `written` but whose mode the user changed is treated as bx's own output,
@@ -393,6 +394,9 @@ impl Ledger {
     ///
     /// [`Error::WrongLock`] if the lock file this ledger was opened under has
     /// been replaced or removed since; nothing is stored.
+    ///
+    /// No command offers it yet, so only tests call it.
+    #[cfg(test)]
     pub fn adopt_current_as_prior(
         &mut self,
         path: &crate::paths::Portable,
@@ -431,7 +435,7 @@ impl Ledger {
     ///
     /// Takes the directory rather than `&self` so that a caller holding a
     /// `&mut` borrow of the entries can still store a blob: see
-    /// [`Ledger::adopt_current_as_prior`], where the re-fetch that borrow
+    /// `Ledger::adopt_current_as_prior`, where the re-fetch that borrow
     /// used to force was a branch no input could take (r4 round 2, COV7).
     fn store_prior(dir: &StateDir, prior: PriorBytes) -> Result<Prior, Error> {
         match prior {

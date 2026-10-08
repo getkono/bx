@@ -46,8 +46,9 @@
 //! [`plan`] is where those pieces meet and Invariant 7 is kept: one traversal
 //! that decides every resolved target against the ledger and the one
 //! comparison, and a diff of each decision, shared by `bx plan`, `bx apply`
-//! and the status view. [`env`] is everything a command takes from the
-//! process it runs in, read once at the start. [`adopt`] is `bx add` and `bx rm`: existing config
+//! and the status view. [`env`](mod@env) is what a command takes from the
+//! process it runs in, read once at the start; the one other read is the
+//! `PATH` [`plan`] loads its inputs with. [`adopt`] is `bx add` and `bx rm`: existing config
 //! taken into the repo byte for byte, and handed back exactly. [`init`] is
 //! `bx init`'s setup before it plans: the repo created when there is none,
 //! this account's unset values asked for and saved to `local.toml`, and the

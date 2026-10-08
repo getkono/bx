@@ -1,9 +1,11 @@
 //! Everything bx takes from the process it runs in.
 //!
-//! [`Env::from_process`] is the one read of the process environment and its
-//! terminals on the path every command takes; every other function is handed
-//! the [`Env`] it read, so a test supplies its own instead of touching the
-//! process.
+//! [`Env::from_process`] reads the process environment and its terminals on
+//! the path every command takes; the one other read on that path is the
+//! `PATH` that `plan::Inputs::load` takes through
+//! `activation::System::from_env`, for a declared activation's tool and a
+//! `has:TOOL` condition. Every other function is handed the [`Env`] it read,
+//! so a test supplies its own instead of touching the process.
 
 use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal as _;

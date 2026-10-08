@@ -336,8 +336,8 @@ impl Outcome {
 /// flight right now rather than to one that died. The two are told apart by the
 /// state directory's lock, not by the journal: a caller that wants to say "an
 /// apply is in progress" rather than "an apply was interrupted" asks
-/// `SharedLock::try_acquire` first and reports the `None` case
-/// as the live one. A session creates its journal whole, by rename, so the most
+/// [`SharedLock::probe`](crate::state::SharedLock::probe) first, as `plan`
+/// and `doctor` do, and reports a held lock as the live one. A session creates its journal whole, by rename, so the most
 /// such a reader can see of one in flight is a torn tail frame, which it
 /// discards.
 ///

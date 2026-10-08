@@ -8,10 +8,10 @@ use std::path::Path;
 
 use toml_edit::Table;
 
+use super::shells::Shell;
 use super::values;
 use super::when::{self, When};
 use super::{Ctx, Error};
-use crate::shell::Shell;
 use crate::shell::function::{FunctionDecl, Hook};
 
 /// The section's header, as messages spell it.

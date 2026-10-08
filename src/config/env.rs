@@ -66,11 +66,11 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::path::{self, PathEntry};
+use super::shells::{Shell, Shells};
 use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
 use crate::lexical::is_variable_name;
 use crate::paths::Portable;
-use crate::shell::{Shell, Shells};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[env]]";

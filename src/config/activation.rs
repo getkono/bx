@@ -8,9 +8,9 @@ use std::path::Path;
 
 use toml_edit::Table;
 
+use super::shells::{Phase, Shell};
 use super::{Ctx, Error};
 use crate::shell::activation::ActivationDecl;
-use crate::shell::{Phase, Shell};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[activation]]";

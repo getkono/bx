@@ -36,6 +36,7 @@ pub mod resolution;
 pub mod resolve;
 pub mod secrets;
 pub mod shell_options;
+pub mod shells;
 pub mod source;
 pub mod target;
 pub mod toggle;
@@ -47,9 +48,9 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::Shells;
 use env::EnvDecl;
 pub use origin::Origin;
+use shells::Shells;
 use target::Target;
 use toml_edit::{Document, Item, Table};
 use values::{ValueAssignment, ValueDecl};

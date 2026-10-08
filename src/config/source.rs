@@ -9,10 +9,10 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::plugin::unsourceable;
+use super::shells::Phase;
 use super::values;
 use super::when::When;
 use super::{Ctx, Error};
-use crate::shell::Phase;
 use crate::shell::source::SourceDecl;
 
 /// The section header, as messages spell it.

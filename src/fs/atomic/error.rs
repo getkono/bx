@@ -108,8 +108,8 @@ pub enum Error {
     ///
     /// From [`Filled::publish`](super::Filled::publish) it arrives inside an [`Unpublished`](super::Unpublished), because
     /// "nothing was replaced" is not the whole obligation: a caller that
-    /// recorded a ledger entry before publishing, as [`crate::state::NewEntry::for_write`]
-    /// requires, is holding an entry for a write that did not happen, and must
+    /// recorded a ledger entry before publishing, as the test-only
+    /// `crate::state::NewEntry::for_write` requires, is holding an entry for a write that did not happen, and must
     /// withdraw it before it saves.
     #[error(
         "{} changed after bx looked at it ({detail}); nothing was replaced. Run plan again",

@@ -115,7 +115,7 @@ impl Pending {
 /// Every directory created here is added to `created`, this apply's
 /// [`CreatedDirs`]. [`ensure_dir`](super::ensure_dir) reads it, so a declared directory that this
 /// write created first is still the create `plan` announced for it. The write
-/// claims, in [`Filled::created_dirs`], every directory it created except a
+/// claims, in `Filled::created_dirs`, every directory it created except a
 /// declared one: that one is its directory target's alone, so each directory
 /// has exactly one claimant whichever target is applied first.
 ///
@@ -307,7 +307,7 @@ impl Staged {
     }
 
     /// The parent directories this write invented and claims, deepest first:
-    /// the set [`Filled::created_dirs`] names once the content is written.
+    /// the set `Filled::created_dirs` names once the content is written.
     #[must_use]
     pub fn created_dirs(&self) -> &[PathBuf] {
         &self.0.created_dirs
@@ -463,11 +463,11 @@ impl Filled {
     ///
     /// # Errors
     ///
-    /// [`Unpublished`], which names the destination as well as the cause, so a
-    /// caller that recorded a ledger entry for this write before calling — as
-    /// [`crate::state::NewEntry::for_write`] requires — can withdraw it. `publish` consumes the
-    /// `Filled`, so the refusal is the only thing left that knows which write
-    /// it was.
+    /// [`Unpublished`], which in a test build names the destination as well as
+    /// the cause, so a caller that recorded a ledger entry for this write
+    /// before calling — as the test-only `crate::state::NewEntry::for_write`
+    /// requires — can withdraw it. `publish` consumes the `Filled`, so the
+    /// refusal is the only thing left that knows which write it was.
     ///
     /// The cause is [`Error::Changed`] when the destination is no longer what
     /// [`stage`] observed; nothing is replaced. [`Error::Write`] wrapping the
@@ -532,17 +532,20 @@ impl Filled {
 
 /// A write [`Filled::publish`] refused: why, and which write it was.
 ///
-/// The second half is the point. [`crate::state::NewEntry::for_write`] must be called before
-/// `publish`, because the bytes a rename displaces have to be durable before
-/// anything displaces them — so by the time a publish is refused, a caller with
-/// a ledger has already recorded an entry for a write that did not happen. That
-/// record has to be withdrawn with [`crate::state::Ledger::withdraw`] before
-/// the ledger is saved, or `bx rm` will restore the recorded prior over content
-/// bx never replaced; see [`crate::state::NewEntry::for_write`].
+/// The second half is for a caller that records a ledger entry before
+/// `publish`, as the test-only `crate::state::NewEntry::for_write` requires,
+/// because the bytes a rename displaces have to be durable before anything
+/// displaces them — so by the time a publish is refused, such a caller has
+/// already recorded an entry for a write that did not happen. That record has
+/// to be withdrawn with [`crate::state::Ledger::withdraw`] before the ledger is
+/// saved, or `bx rm` will restore the recorded prior over content bx never
+/// replaced. The shipped `apply` records its entry only once the publish has
+/// landed, so it has nothing to withdraw, and `dest` is compiled for tests
+/// alone.
 ///
 /// `publish` consumes the [`Filled`], so nothing the caller still holds names
-/// the write afterwards. This does: [`Unpublished::dest`] is the path
-/// [`crate::state::NewEntry::for_write`] keyed the entry on.
+/// the write afterwards. This does: `Unpublished::dest` is the path
+/// `NewEntry::for_write` keyed the entry on.
 ///
 /// # It is deliberately not an error type
 ///
@@ -593,7 +596,7 @@ impl Unpublished {
     /// it. Writing this out says "there is no entry", which is true of
     /// [`Staged::commit`] and [`write_atomically`] and of nothing else here.
     ///
-    /// The [`Error`] it returns does not name [`Unpublished::dest`], because by
+    /// The [`Error`] it returns does not name `Unpublished::dest`, because by
     /// then the caller has said there is nothing keyed on it.
     #[must_use]
     pub fn into_error(self) -> Error {
@@ -740,7 +743,7 @@ pub(in crate::fs) fn prepare(
 /// `stage_as` makes every one of these checks again; what can differ is only
 /// what changed on disk in between.
 ///
-/// The observation is the prior the write displaces, as [`Staged::prior`]
+/// The observation is the prior the write displaces, as `Staged::prior`
 /// would report it: the check has just shown it to be the file `plan` saw.
 ///
 /// # Errors

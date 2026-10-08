@@ -121,7 +121,7 @@ pub struct EnsuredDir {
 ///   [`Error::DirectoryTargetPending`].
 /// * Every directory has exactly one claimant. A declared directory is claimed
 ///   by its own directory target's [`EnsuredDir::created_dirs`] alone:
-///   [`Filled::created_dirs`](super::Filled::created_dirs) and a deeper target's `created_dirs` leave it
+///   `Filled::created_dirs` and a deeper target's `created_dirs` leave it
 ///   out, whichever call made it. Any other directory is claimed by the call
 ///   that made it.
 /// * [`ensure_dir`] adopts a declared directory an earlier call in this apply

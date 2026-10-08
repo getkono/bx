@@ -242,21 +242,26 @@ fn refuse_overlapping_externals(
     }
 
     // A link's children land in its `to`: inside any checkout, they would be
-    // untracked files in it, as a target there would be.
+    // untracked files in it, as a target there would be; above one, a child
+    // could take the checkout's own name, or a directory on its way, and be
+    // a link another external is then cloned through.
     for (linking, link) in externals
         .iter()
         .flat_map(|external| external.links.iter().map(move |link| (external, link)))
     {
-        if let Some(external) = externals.iter().find(|external| {
-            matches!(
-                overlap(&external.path, &link.to),
-                Some(Overlap::Same | Overlap::Beneath)
-            )
-        }) {
+        if let Some((external, at)) = externals
+            .iter()
+            .find_map(|external| overlap(&external.path, &link.to).map(|at| (external, at)))
+        {
+            let place = if at == Overlap::Above {
+                "above"
+            } else {
+                "inside"
+            };
             return Err(Error::BadValue {
                 origin: link.origin.clone(),
                 message: format!(
-                    "a link of external `{}` puts its children in `{}`, inside external \
+                    "a link of external `{}` puts its children in `{}`, {place} external \
                      `{}` at {}; a checkout is a directory git owns whole",
                     linking.path, link.to, external.path, external.origin
                 ),
@@ -619,6 +624,23 @@ mod tests {
             external("~/b")
         );
         assert!(resolved(&beside, None).is_ok());
+    }
+
+    #[test]
+    fn a_link_above_an_external_is_refused_since_a_child_could_take_its_way() {
+        for (to, other) in [("~/src", "~/src/b"), ("~/src", "~/src/b/c"), ("~", "~/b")] {
+            let text = format!(
+                "{}[[external.link]]\nfrom = \"*\"\nto = \"{to}/*\"\n{}",
+                external("~/a"),
+                external(other)
+            );
+            let err = resolved(&text, None).expect_err(to);
+            assert!(err.starts_with("bx.toml:5: "), "at the link: {err}");
+            assert!(
+                err.contains(&format!("in `{to}`, above external `")),
+                "{err}"
+            );
+        }
     }
 
     #[test]

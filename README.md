@@ -272,7 +272,8 @@ fetches only the commit it names.
 the locked commit into a symlink of the same name in `to`, so a new skill
 upstream becomes a new link on the next update and a removed one is reported
 as undeclared, for `bx rm` to release. A link never replaces a file or link
-you made; it is reported as a conflict instead.
+you made; it is reported as a conflict instead. A `to` at, inside or above any
+external's checkout is refused when the configuration loads.
 
 **When bx asks.** An interactive zsh asks, at a prompt, at most once per shell:
 

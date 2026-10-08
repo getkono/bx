@@ -59,8 +59,8 @@
 //! checkout. `require` keeps only the children holding a file of that name.
 //! Both `from` and `to` end in `/*`, which is the only pattern there is: a
 //! link names a directory whose children it links, one level deep. `from` is
-//! relative to the checkout and stays inside it; `to` is beneath the home.
-//! The symlinks are ordinary symlink targets once expanded — owned, recorded
+//! relative to the checkout and stays inside it; `to` is beneath the home,
+//! and neither at, inside nor above any external's checkout. The symlinks are ordinary symlink targets once expanded — owned, recorded
 //! and released by `bx rm` like any other.
 //!
 //! # `path`

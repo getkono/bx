@@ -1,14 +1,29 @@
 //! The crate's one content digest.
+//!
+//! It sits at the crate root, below both [`crate::fs`] and [`crate::state`],
+//! because both name it: `fs` digests what it observes and writes, and `state`
+//! records those digests. Living under either would make the other import it
+//! back, and `state` already depends on `fs`. [`crate::state`] re-exports it as
+//! `state::ContentHash`.
 
 use std::fmt;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::{Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 
-use super::Error;
+/// A file [`ContentHash::of_file`] could not open or read.
+#[derive(Debug, thiserror::Error)]
+#[error("reading {}: {source}", .path.display())]
+pub struct Error {
+    /// The file being digested.
+    pub path: PathBuf,
+    /// The underlying failure.
+    #[source]
+    pub source: std::io::Error,
+}
 
 /// The width of a SHA-256 digest.
 const LEN: usize = 32;
@@ -50,9 +65,9 @@ impl ContentHash {
     ///
     /// # Errors
     ///
-    /// [`Error::Read`] if the file cannot be opened or read.
+    /// [`Error`] if the file cannot be opened or read.
     pub fn of_file(path: &Path) -> Result<Self, Error> {
-        let fail = |source| Error::Read {
+        let fail = |source| Error {
             path: path.to_path_buf(),
             source,
         };
@@ -223,7 +238,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nope");
         let err = ContentHash::of_file(&path).expect_err("must fail");
+        assert!(err.to_string().starts_with("reading "), "got {err}");
         assert!(err.to_string().contains("nope"), "got {err}");
+        assert_eq!(err.path, path);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

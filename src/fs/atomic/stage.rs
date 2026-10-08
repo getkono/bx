@@ -13,7 +13,7 @@ use super::setid::{SET_ID, SPECIAL, verify_set_id_kept, without_set_id};
 use super::{CreatedDirs, Error, Observed, ParentState, Stamp};
 use crate::fs::durable;
 use crate::fs::mode::{Kind, Mode};
-use crate::state::ContentHash;
+use crate::hash::ContentHash;
 
 /// The prefix every temporary file bx creates in a destination directory
 /// carries.

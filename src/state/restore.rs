@@ -11,9 +11,9 @@ use rustix::fs::{FileType, Mode as RawMode, OFlags};
 
 use super::Error;
 use super::dir::StateDir;
-use super::hash::ContentHash;
 use super::ledger::{Prior, PriorBytes, RestoreRef};
 use crate::fs::{Mode, write_atomically};
+use crate::hash::ContentHash;
 
 /// Store `prior` under its digest in `restore/`, durably, and say what a
 /// record names it by: [`Prior::Absent`] when there was no file, which stores

@@ -8,7 +8,7 @@ use rustix::io::Errno;
 
 use super::Error;
 use crate::fs::mode::{Kind, Mode};
-use crate::state::ContentHash;
+use crate::hash::ContentHash;
 
 /// What is at a destination right now.
 ///

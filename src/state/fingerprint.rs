@@ -25,9 +25,9 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use super::Error;
 use super::dir::StateDir;
-use super::hash::ContentHash;
 use super::lock::ExclusiveLock;
 use super::store::{self, Loaded, Loss};
+use crate::hash::ContentHash;
 
 /// The envelope tag for `fingerprints.mpk`.
 const KIND: &str = "bx.fingerprints";

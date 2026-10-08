@@ -96,7 +96,6 @@
 
 mod dir;
 mod fingerprint;
-mod hash;
 mod ledger;
 mod lock;
 pub mod restore;
@@ -106,10 +105,10 @@ use std::path::{Path, PathBuf};
 
 use crate::fs::Mode;
 
+pub use crate::hash::ContentHash;
 pub use dir::StateDir;
 pub(crate) use dir::{move_aside, quarantines};
 pub use fingerprint::{Fingerprint, Fingerprints};
-pub use hash::ContentHash;
 pub use ledger::RestoreRef;
 pub use ledger::{
     DIR_BYTES, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes,

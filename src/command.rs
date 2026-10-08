@@ -23,7 +23,7 @@ use crate::git::Git;
 use crate::init;
 use crate::paths;
 use crate::plan::{self, Error, Inputs, Mode, Palette, Report, View};
-use crate::report::{Action, Exit};
+use crate::report::{self, Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
 use crate::sync;
@@ -213,8 +213,8 @@ fn converge(
             writeln!(
                 out,
                 "  ! {}  stopped: {}",
-                plan::escape(&change.target),
-                plan::escape(change.note.as_deref().unwrap_or_default()),
+                report::escape(&change.target),
+                report::escape(change.note.as_deref().unwrap_or_default()),
             )
             .map_err(Error::Output)?;
         }

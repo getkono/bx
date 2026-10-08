@@ -28,7 +28,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub(crate) use decide::read_repo_file;
-pub(crate) use diff::escape;
 pub use diff::{Diff, DiffKind, Palette, TEXT_LIMIT, View, Why, render};
 
 use crate::config::resolve::{self, Resolution, Resolved};

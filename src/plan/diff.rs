@@ -15,7 +15,7 @@ use similar::TextDiff;
 use super::{Change, Report};
 use crate::fs::Mode;
 use crate::paths;
-use crate::report::{self, Action};
+use crate::report::{self, Action, escape};
 use crate::shell::activation;
 
 /// The largest body, in bytes, that is shown line by line.
@@ -274,28 +274,6 @@ fn unified(target: &str, (from, to): (&str, &str), old: &str, new: &str) -> Stri
         }
     }
     out
-}
-
-/// `text` with every control character but a tab spelled out — `\r`, `\n`,
-/// `\x1b` — so nothing a file or a path holds can move the cursor, colour the
-/// terminal, or start a line the rendering did not.
-pub(crate) fn escape(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.chars().any(|c| c != '\t' && c.is_control()) {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\t' => out.push(c),
-            '\r' => out.push_str("\\r"),
-            '\n' => out.push_str("\\n"),
-            c if c.is_control() => {
-                let _ = write!(out, "\\x{:02x}", u32::from(c));
-            }
-            c => out.push(c),
-        }
-    }
-    std::borrow::Cow::Owned(out)
 }
 
 /// Which rows a rendering shows.
@@ -1002,19 +980,6 @@ mod tests {
             "{rendered:?}"
         );
         assert!(!rendered.contains('\r'), "{rendered:?}");
-    }
-
-    #[test]
-    fn text_with_no_control_character_but_a_tab_is_shown_as_it_is() {
-        // The mutation run found this unpinned: `escape` could copy every
-        // string and still render the same text.
-        for text in ["plain", "a\ttab", ""] {
-            assert!(
-                matches!(escape(text), std::borrow::Cow::Borrowed(kept) if kept == text),
-                "{text:?}"
-            );
-        }
-        assert!(matches!(escape("a\rb"), std::borrow::Cow::Owned(_)));
     }
 
     #[test]

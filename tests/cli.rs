@@ -977,11 +977,13 @@ fn the_short_and_long_version_flags_print_the_same_build_details() {
     }
 }
 
-/// A `curl` on a tempdir `PATH` that serves this tree's `install.sh` and a
-/// `releases/latest` naming `latest`, and serves no release asset at all: a
-/// `bx self-upgrade` that tried to install would fail rather than replace the
-/// binary under test. Returns the `PATH` and the file each request is
-/// appended to.
+/// A `curl` on a tempdir `PATH` that serves this tree's `install.sh`, a
+/// `releases/latest` naming `latest`, and whatever release assets
+/// [`publish`] has put under `served/assets/TAG`, writing to the file `-o`
+/// names or to standard output. Until something is published it serves no
+/// release asset at all: a `bx self-upgrade` that tried to install would fail
+/// rather than replace the binary under test. Returns the `PATH` and the file
+/// each request is appended to.
 fn served(home: &Path, latest: &str) -> (std::ffi::OsString, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1005,13 +1007,23 @@ fn served(home: &Path, latest: &str) -> (std::ffi::OsString, std::path::PathBuf)
         &curl,
         format!(
             "#!/bin/sh\n\
-             for url; do :; done\n\
+             out=\n\
+             while [ $# -gt 0 ]; do\n\
+             case \"$1\" in\n\
+             -o) out=\"$2\"; shift 2 ;;\n\
+             -*) shift ;;\n\
+             *) url=\"$1\"; shift ;;\n\
+             esac\n\
+             done\n\
              printf '%s\\n' \"$url\" >>'{requests}'\n\
              case \"$url\" in\n\
-             */install.sh) cat '{root}/install.sh' ;;\n\
-             */releases/latest) cat '{root}/latest.json' ;;\n\
-             *) echo \"404 $url\" >&2; exit 22 ;;\n\
-             esac\n",
+             */install.sh) src='{root}/install.sh' ;;\n\
+             */releases/latest) src='{root}/latest.json' ;;\n\
+             */releases/download/*) src=\"{root}/assets/${{url#*/releases/download/}}\" ;;\n\
+             *) src= ;;\n\
+             esac\n\
+             [ -n \"$src\" ] && [ -f \"$src\" ] || {{ echo \"404 $url\" >&2; exit 22; }}\n\
+             if [ -n \"$out\" ]; then cp \"$src\" \"$out\"; else cat \"$src\"; fi\n",
             requests = requests.display(),
             root = root.display(),
         ),
@@ -1048,6 +1060,79 @@ fn self_upgrade(home: &Path, path: &std::ffi::OsStr, args: &[&str]) -> Output {
         .env("PATH", path)
         .output()
         .expect("run bx")
+}
+
+/// The `bx` a published release installs: a script that names its tag.
+fn release_bx(tag: &str) -> String {
+    format!("#!/bin/sh\necho {tag}\n")
+}
+
+/// Publish `tag` behind [`served`]'s stub, in the layout the release job
+/// uploads: the tarball holding [`release_bx`], and its `.sha256`. With
+/// `tampered`, the checksum is of other bytes, as when the tarball was
+/// altered after it was summed.
+fn publish(home: &Path, tag: &str, tampered: bool) {
+    use bx::hash::ContentHash;
+
+    let assets = home.join("served/assets").join(tag);
+    let staging = home.join("staging");
+    std::fs::create_dir_all(&assets).expect("the release assets");
+    std::fs::create_dir_all(&staging).expect("the staging directory");
+    std::fs::write(staging.join("bx"), release_bx(tag)).expect("the released bx");
+    let asset = format!("bx-{}-unknown-linux-musl.tar.gz", std::env::consts::ARCH);
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(assets.join(&asset))
+        .arg("-C")
+        .arg(&staging)
+        .arg("bx")
+        .status()
+        .expect("run tar");
+    assert!(status.success(), "tar: {status}");
+    let tarball = std::fs::read(assets.join(&asset)).expect("the tarball");
+    let summed = if tampered {
+        [tarball.as_slice(), b"tampered"].concat()
+    } else {
+        tarball
+    };
+    std::fs::write(
+        assets.join(format!("{asset}.sha256")),
+        format!("{}  {asset}\n", ContentHash::of(&summed).to_hex()),
+    )
+    .expect("the checksum");
+}
+
+/// A copy of the binary under test in `home/install`, so the directory
+/// `bx self-upgrade` replaces itself in is a tempdir rather than the build's
+/// own `target` directory. Returns the copy and its bytes.
+fn installed_copy(home: &Path) -> (std::path::PathBuf, Vec<u8>) {
+    let dir = home.join("install");
+    std::fs::create_dir_all(&dir).expect("the install directory");
+    let exe = dir.join("bx");
+    std::fs::copy(env!("CARGO_BIN_EXE_bx"), &exe).expect("a copy of bx");
+    let bytes = std::fs::read(&exe).expect("the copy's bytes");
+    (exe, bytes)
+}
+
+/// `EXE self-upgrade` with `path` as its `PATH`, retrying only while the
+/// freshly written copy is still held open by another test thread's fork, as
+/// [`served`] waits out its stub.
+fn self_upgrade_copy(exe: &Path, home: &Path, path: &std::ffi::OsStr) -> Output {
+    for _ in 0..200 {
+        match std::process::Command::new(exe)
+            .arg("self-upgrade")
+            .env("HOME", home)
+            .env("PATH", path)
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other.expect("run the copy of bx"),
+        }
+    }
+    panic!("the copy of bx stayed busy");
 }
 
 #[test]
@@ -1089,6 +1174,71 @@ fn self_upgrade_at_the_latest_release_exits_zero_and_installs_nothing() {
     );
     let requests = std::fs::read_to_string(requests).expect("the requests");
     assert!(!requests.contains("/download/"), "{requests}");
+}
+
+#[test]
+fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
+    let home = guarded_home();
+    let (path, requests) = served(home.path(), "v999.0.0");
+    publish(home.path(), "v999.0.0", false);
+    let (exe, _) = installed_copy(home.path());
+    // Where the kernel says the copy is, which is the directory bx names.
+    let dir = std::fs::canonicalize(home.path().join("install")).expect("the install directory");
+
+    let output = self_upgrade_copy(&exe, home.path(), &path);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "Installing bx v999.0.0 over v{} in {}...\nInstalled bx v999.0.0.\n",
+            bx::VERSION,
+            dir.display()
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(&exe).expect("the installed bx"),
+        release_bx("v999.0.0")
+    );
+    assert_eq!(
+        std::fs::read_link(dir.join("userbox")).expect("the userbox link"),
+        Path::new("bx")
+    );
+    let requests = std::fs::read_to_string(requests).expect("the requests");
+    assert!(
+        requests.contains("/releases/download/v999.0.0/"),
+        "{requests}"
+    );
+}
+
+#[test]
+fn self_upgrade_refuses_a_release_whose_checksum_does_not_match() {
+    let home = guarded_home();
+    let (path, _) = served(home.path(), "v999.0.0");
+    publish(home.path(), "v999.0.0", true);
+    let (exe, before) = installed_copy(home.path());
+
+    let output = self_upgrade_copy(&exe, home.path(), &path);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("checksum mismatch"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !stdout(&output).contains("Installed"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        std::fs::read(&exe).expect("the bx that ran") == before,
+        "the binary was replaced despite the bad checksum"
+    );
+    assert!(
+        !home.path().join("install/userbox").exists(),
+        "a userbox link was made despite the bad checksum"
+    );
 }
 
 #[test]

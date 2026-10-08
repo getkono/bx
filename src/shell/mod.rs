@@ -114,8 +114,19 @@ pub mod alias;
 pub mod bash;
 pub mod function;
 pub mod keybindings;
+pub mod placement;
 pub mod plugin;
 pub mod source;
+
+/// `text` as one single-quoted shell word that means exactly `text`, whatever
+/// it holds: an alias body, or a tool's cached activation output.
+///
+/// Each `'` becomes `'\''`; nothing else is touched, because nothing else has
+/// a meaning inside single quotes.
+#[must_use]
+pub fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
 
 /// Running generated shell text in a real shell, for the submodules' tests.
 #[cfg(test)]
@@ -244,26 +255,6 @@ impl Shells {
             Shell::Zsh => self.zsh,
             Shell::Bash => self.bash,
         }
-    }
-
-    /// Read `shells` from `table`, or [`Shells::EVERY`] when it is absent.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::config::Error::WrongType`] for a value that is not an array
-    /// of strings, and [`crate::config::Error::BadValue`] for an empty list
-    /// or a name that is not a shell bx generates for.
-    pub(crate) fn parse_in(
-        ctx: &crate::config::Ctx<'_>,
-        table: &toml_edit::Table,
-        owner: &str,
-    ) -> Result<Self, crate::config::Error> {
-        if table.get(Self::KEY).is_none() {
-            return Ok(Self::EVERY);
-        }
-        let names = ctx.str_array_at(table, Self::KEY)?;
-        Self::from_names(&names)
-            .map_err(|problem| ctx.bad(table, Self::KEY, format!("{owner}: {problem}")))
     }
 
     /// The shells `names` spell.

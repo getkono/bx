@@ -70,11 +70,11 @@ use crate::config::resolve::{Resolution, Resolved};
 use crate::config::target::{Attach, Body, Direction, Format};
 use crate::config::values::ResolvedValues;
 use crate::config::{self, Layer, Origin, layers, merge, resolve};
+use crate::env::Env;
 use crate::env_guard::{self, Reason, RootSet};
 use crate::fs::{self, Kind, Mode};
 use crate::journal;
 use crate::paths::{self, Portable};
-use crate::plan::Env;
 use crate::recover;
 use crate::restore::{self, Restored};
 use crate::state::{
@@ -181,7 +181,7 @@ pub struct Context {
     roots: RootSet,
     /// The `git` `rm` asks whether a checkout bx cloned holds anything of
     /// the user's.
-    git: crate::sync::Git,
+    git: crate::git::Git,
     trees: Vec<TreeDecl>,
 }
 
@@ -256,7 +256,7 @@ impl Context {
             layers,
             resolved,
             roots,
-            git: crate::sync::Git::new(env),
+            git: crate::git::Git::new(env),
             trees,
         })
     }
@@ -1196,7 +1196,7 @@ fn undeclare(
 ///
 /// The targets are every declaration of a path at or beneath `target`, in any
 /// layer, and every ledger entry there — so a target whose declaration was
-/// deleted by hand is still handed back. [`restore::restore`] decides and
+/// deleted by hand is still handed back. [`restore::restore_with`] decides and
 /// restores each; each one it released is then removed from every layer
 /// declaring it. A conflict is left declared and untouched, and a tree is
 /// handed back whole or not at all ([`hold_trees`]). Nothing to do is an

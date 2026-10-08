@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 
 use super::Finding;
 use crate::paths;
-use crate::plan;
 use crate::recover::{self, Interrupted};
 use crate::state::{
     self, Fingerprints, Health, LedgerView, Loaded, SharedLock, StateDir, Unlisted,
@@ -43,18 +42,14 @@ pub fn check(state: &StateDir, home: &Path) -> Found {
     let at = |path: &Path| paths::to_portable(path, home);
     let mut found = Found::default();
 
-    if let Err(error) = plan::refuse_irregular_state_files(state) {
-        let finding = match error {
-            plan::Error::NotARegularFile { path } => Finding {
-                subject: at(&path),
-                origin: None,
-                note: "is not a regular file, so doctor read nothing in the state directory; \
-                       move it out of the way"
-                    .to_string(),
-            },
-            other => unread(at(state.root()), &other),
-        };
-        found.damage.push(finding);
+    if let Some(path) = state.irregular_file() {
+        found.damage.push(Finding {
+            subject: at(&path),
+            origin: None,
+            note: "is not a regular file, so doctor read nothing in the state directory; move \
+                   it out of the way"
+                .to_string(),
+        });
         return found;
     }
 

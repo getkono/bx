@@ -48,15 +48,9 @@
 //! `zsh_binds_every_key_and_sets_no_variable` runs the rendered bytes in zsh
 //! and holds them to that.
 
-use std::path::Path;
-
-use toml_edit::Table;
-
 use super::{Assembly, Phase};
-use crate::config::{Ctx, Error, Origin};
-
-/// The section header, as messages spell it.
-pub(crate) const SECTION: &str = "[keybindings]";
+use crate::config::Origin;
+use crate::config::keybindings::SECTION;
 
 /// A key a binding may name.
 ///
@@ -251,50 +245,12 @@ pub fn contribute(assembly: &mut Assembly, keybindings: &Keybindings) {
     let _ = assembly.contribute(Phase::Keybindings, SECTION, keybindings.render_zsh());
 }
 
-/// Parse a `[keybindings]` table.
-///
-/// `text` is the whole layer file, because spans index into it.
-///
-/// # Errors
-///
-/// [`Error::UnknownKey`] for a key name this version does not know,
-/// [`Error::WrongType`] for an action that is not a string, and
-/// [`Error::BadValue`] for an action name this version does not know.
-pub fn parse_keybindings(table: &Table, file: &Path, text: &str) -> Result<Keybindings, Error> {
-    let ctx = Ctx::new(table, file, text, SECTION);
-    let names = Key::ALL.map(Key::name);
-    ctx.reject_unknown_keys(table, &names)?;
-    let mut keybindings = Keybindings::default();
-    for key in Key::ALL {
-        let Some(raw) = ctx.str_at(table, key.name())? else {
-            continue;
-        };
-        let action = Action::ALL
-            .into_iter()
-            .find(|action| action.name() == raw)
-            .ok_or_else(|| {
-                let known = Action::ALL
-                    .map(|action| format!("{:?}", action.name()))
-                    .join(", ");
-                ctx.bad(
-                    table,
-                    key.name(),
-                    format!("`{}` must be one of {known}; found {raw:?}", key.name()),
-                )
-            })?;
-        keybindings = keybindings.bind(key, action);
-    }
-    if !keybindings.is_empty() {
-        keybindings.origin = Some(ctx.origin().clone());
-    }
-    Ok(keybindings)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::parse_str;
+    use crate::config::{Error, parse_str};
     use crate::shell::testing::{installed, run};
+    use std::path::Path;
 
     /// The source configuration's bindings, written in its order.
     const SOURCE: &str = "[keybindings]\nhome = \"beginning-of-line\"\nend = \"end-of-line\"\n\

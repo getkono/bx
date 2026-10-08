@@ -139,8 +139,6 @@
 
 use std::path::Path;
 
-use toml_edit::Table;
-
 use super::env::EnvDecl;
 use super::external::External;
 use super::history::History;
@@ -152,14 +150,18 @@ use super::tool::ToolDecl;
 use super::values::{
     Piece, ResolvedValues, ValueAssignment, ValueDecl, ValueKind, scan, statements_named,
 };
-use super::{Config, Ctx, Error, Layer, LayerKind, Origin};
+use super::{Config, Error, Layer, LayerKind, Origin};
 use crate::paths::Portable;
-use crate::shell::activation::{self, ActivationDecl};
+use crate::shell::activation::ActivationDecl;
 use crate::shell::alias::AliasDecl;
 use crate::shell::function::FunctionDecl;
 use crate::shell::keybindings::Keybindings;
 use crate::shell::plugin::{self, PluginDecl};
 use crate::shell::source::SourceDecl;
+
+/// The toggle vocabulary, defined in [`super::toggle`] where a layer is
+/// parsed, and named here too, where the merge applies it.
+pub use super::toggle::{Section, Toggle};
 
 /// A list entry that merges by a natural key.
 ///
@@ -172,8 +174,6 @@ pub trait Keyed {
     /// As written. A target is merged by the file this names once substituted,
     /// which is not a function of the entry alone; see [`merge`].
     fn key(&self) -> &str;
-    /// The layer and line that last set this entry.
-    fn origin(&self) -> &Origin;
     /// Whether the entry survives into the resolved configuration.
     fn enabled(&self) -> bool;
     /// Flip the flag, as a toggle does.
@@ -186,9 +186,6 @@ impl Keyed for Target {
     fn key(&self) -> &str {
         self.path.as_str()
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -200,9 +197,6 @@ impl Keyed for Target {
 impl Keyed for ValueDecl {
     fn key(&self) -> &str {
         &self.name
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     // Unreachable from `merge`, which keeps disabled declarations with
     // `into_entries`; kept because `Keyed` requires it of a public list type.
@@ -218,9 +212,6 @@ impl Keyed for EnvDecl {
     fn key(&self) -> &str {
         &self.name
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -232,9 +223,6 @@ impl Keyed for EnvDecl {
 impl Keyed for AliasDecl {
     fn key(&self) -> &str {
         &self.name
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     fn enabled(&self) -> bool {
         self.enabled
@@ -248,9 +236,6 @@ impl Keyed for FunctionDecl {
     fn key(&self) -> &str {
         &self.name
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -262,9 +247,6 @@ impl Keyed for FunctionDecl {
 impl Keyed for PluginDecl {
     fn key(&self) -> &str {
         &self.name
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     fn enabled(&self) -> bool {
         self.enabled
@@ -278,9 +260,6 @@ impl Keyed for SourceDecl {
     fn key(&self) -> &str {
         &self.name
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -293,9 +272,6 @@ impl Keyed for ActivationDecl {
     fn key(&self) -> &str {
         &self.name
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -307,9 +283,6 @@ impl Keyed for ActivationDecl {
 impl Keyed for ToolDecl {
     fn key(&self) -> &str {
         &self.name
-    }
-    fn origin(&self) -> &Origin {
-        &self.origin
     }
     fn enabled(&self) -> bool {
         self.enabled
@@ -325,9 +298,6 @@ impl Keyed for External {
     fn key(&self) -> &str {
         self.path.as_str()
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -342,9 +312,6 @@ impl Keyed for PathEntry {
     fn key(&self) -> &str {
         &self.shell
     }
-    fn origin(&self) -> &Origin {
-        &self.origin
-    }
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -354,168 +321,6 @@ impl Keyed for PathEntry {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
-}
-
-/// Which keyed list an entry belongs to.
-///
-/// An enum rather than the section's name, because [`Toggle`], [`Config`],
-/// [`Layer`] and [`merge`] are all public: a section string with no arm in the
-/// merge would panic a library call, and a `&str` match has no exhaustiveness
-/// checking to stop one being written. The later entries that add keyed sections
-/// are exactly the callers that would have hit it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Section {
-    /// `[[target]]`, keyed by `path`.
-    Target,
-    /// `[[value]]`, keyed by `name`.
-    Value,
-    /// `[[env]]`, keyed by `name`.
-    Env,
-    /// `[[alias]]`, keyed by `name`. The flat `[aliases]` table holds no
-    /// toggle, since its entries have no `enabled` key to hold.
-    Alias,
-    /// `[[function]]`, keyed by `name`.
-    Function,
-    /// `[[plugin]]`, keyed by `name`.
-    Plugin,
-    /// `[[source]]`, keyed by `name`.
-    Source,
-    /// `[[activation]]`, keyed by `name`.
-    Activation,
-    /// `[[external]]`, keyed by `path`.
-    External,
-    /// `[[tool]]`, keyed by `name`.
-    Tool,
-}
-
-impl Section {
-    /// The TOML key the section is written under.
-    #[must_use]
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Target => "target",
-            Self::Value => "value",
-            Self::Env => "env",
-            Self::Alias => "alias",
-            Self::Function => "function",
-            Self::Plugin => "plugin",
-            Self::Source => "source",
-            Self::Activation => "activation",
-            Self::Tool => "tool",
-            Self::External => "external",
-        }
-    }
-
-    /// The section header, as messages spell it.
-    #[must_use]
-    pub fn header(self) -> &'static str {
-        match self {
-            Self::Target => super::target::SECTION,
-            Self::Value => super::values::DECL_SECTION,
-            Self::Env => super::env::SECTION,
-            Self::Alias => crate::shell::alias::SECTION,
-            Self::Function => crate::shell::function::SECTION,
-            Self::Plugin => plugin::SECTION,
-            Self::Source => crate::shell::source::SECTION,
-            Self::Activation => activation::SECTION,
-            Self::Tool => super::tool::SECTION,
-            Self::External => super::external::SECTION,
-        }
-    }
-
-    /// The natural key an entry in this section merges by.
-    #[must_use]
-    pub fn natural_key(self) -> &'static str {
-        match self {
-            Self::Target | Self::External => "path",
-            Self::Value
-            | Self::Env
-            | Self::Alias
-            | Self::Function
-            | Self::Plugin
-            | Self::Source
-            | Self::Activation
-            | Self::Tool => "name",
-        }
-    }
-
-    /// What a *full* entry in this section still needs.
-    ///
-    /// For the one message that has to cover both readings of a toggle-shaped
-    /// table: a toggle naming an entry nothing introduced, or an entry somebody
-    /// meant to write in full and left incomplete.
-    fn a_full_entry_needs(self) -> &'static str {
-        match self {
-            Self::Target => "one of `file`, `content`, `generated` or `dir`",
-            Self::Value => "a `kind`",
-            Self::Env => "a `value` and a `kind`",
-            Self::Alias => "a `command`",
-            Self::Function => "a `body`",
-            Self::Plugin => "a `source`",
-            Self::Source => "a `path`",
-            Self::Activation => "a `command`",
-            Self::Tool => "an `install`",
-            Self::External => "a `url` and a `rev`",
-        }
-    }
-}
-
-/// A list entry that restates only its key and its `enabled` flag.
-///
-/// Parsed rather than resolved: which list it belongs to is carried as a
-/// [`Section`] so one representation serves every keyed section.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Toggle {
-    /// The section it appeared in.
-    pub section: Section,
-    /// The natural key of the entry it flips.
-    pub key: String,
-    /// What to flip it to.
-    pub enabled: bool,
-    /// Where the toggle was written.
-    pub origin: Origin,
-}
-
-/// Read `table` as a toggle, if that is its whole shape.
-///
-/// A table whose keys are exactly the natural key and `enabled` is a toggle;
-/// anything else is a full entry and is handed to its own parser. The types are
-/// checked here rather than deferred, so `enabled = "false"` is reported as the
-/// wrong type for `enabled` rather than as a target with no body.
-///
-/// # Errors
-///
-/// [`Error::WrongType`] when the two keys are present but not as a string and a
-/// boolean.
-pub(crate) fn toggle_of(
-    table: &Table,
-    section: Section,
-    file: &Path,
-    text: &str,
-) -> Result<Option<Toggle>, Error> {
-    let natural_key = section.natural_key();
-    let keys: Vec<&str> = table.iter().map(|(key, _)| key).collect();
-    if keys.len() != 2 || !keys.contains(&natural_key) || !keys.contains(&"enabled") {
-        return Ok(None);
-    }
-
-    let ctx = Ctx::new(table, file, text, section.header());
-    let key = ctx.required_str(table, natural_key)?;
-    let enabled = ctx
-        .bool_at(table, "enabled")?
-        .ok_or_else(|| Error::WrongType {
-            origin: ctx.key_origin(table, "enabled"),
-            key: "enabled".to_string(),
-            expected: "a boolean",
-            found: "nothing",
-        })?;
-
-    Ok(Some(Toggle {
-        section,
-        key: key.to_string(),
-        enabled,
-        origin: ctx.origin().clone(),
-    }))
 }
 
 /// One keyed list, mid-merge.
@@ -3934,7 +3739,8 @@ mod tests {
     /// The layers merged and resolved with no conflict, no block and no error:
     /// a configuration that loads. The ready targets, as path and body.
     fn loads(layers: &[Layer]) -> Vec<(String, crate::config::target::Body)> {
-        use crate::config::resolve::{Resolution, resolve};
+        use crate::config::resolution::Resolution;
+        use crate::config::resolve::resolve;
 
         let config = merge(layers).unwrap_or_else(|e| panic!("the merge failed: {e}"));
         assert!(config.conflicts.is_empty(), "{:#?}", config.conflicts);
@@ -4853,16 +4659,13 @@ mod tests {
         //
         // `target.rs` parses every target a layer holds, against the home it is
         // handed. The `paths` module holds `Portable::parse_in` and
-        // `normalize`, which every module above calls, and also the crate's two
-        // deliberate reads of the environment: `home()` and `config_root()`,
-        // the edges that hand a resolution path its arguments. Each edge line
-        // is allowed only in `paths`, exactly once across the whole module and
-        // by its whole text, so a third read anywhere in it, or a second copy
-        // of either, still fails here.
-        const PATHS_EDGES: [&str; 2] = [
-            "home_in(std::env::var_os(\"HOME\").as_deref())",
-            "std::env::var_os(\"XDG_CONFIG_HOME\").as_deref(),",
-        ];
+        // `normalize`, which every module above calls, and also the crate's one
+        // deliberate read of the environment there: `home()`, the edge that
+        // hands a resolution path its argument. The edge line is allowed only
+        // in `paths`, exactly once across the whole module and by its whole
+        // text, so a second read anywhere in it, or a second copy of it, still
+        // fails here.
+        const PATHS_EDGES: [&str; 1] = ["home_in(std::env::var_os(\"HOME\").as_deref())"];
         let mut edges_seen = [0_usize; PATHS_EDGES.len()];
         for (module, edges) in [("config", &[][..]), ("paths", &PATHS_EDGES[..])] {
             for (path, source) in crate::testing::module_sources(module) {

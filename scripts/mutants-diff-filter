@@ -1,0 +1,211 @@
+#!/bin/sh
+# mutants-diff-filter — drop the lines a diff moves, keep the lines it writes.
+#
+#   scripts/mutants-diff-filter [DIFF] > SCOPED
+#
+# Reads `git diff` output (DIFF, or stdin) and writes it back with every moved
+# line taken out, for `cargo mutants --in-diff`. A pull request that moves code
+# verbatim between or within files puts every moved line in its diff, so every
+# mutant in that code would be selected although the pull request wrote none
+# of it. A line edited in place, and new logic, stay in scope.
+#
+# A moved block is a run of added lines, consecutive in the new file, whose
+# contents a run of removed lines consecutive in the old file holds in the same
+# order. Lines are compared with their leading and trailing whitespace trimmed,
+# so a block re-indented by the move (into a nested module, say) still counts.
+# Each removed line accounts for at most one added line. Starting from each
+# added line in diff order, the longest such run is taken, the earliest removed
+# run winning a tie, and it counts as moved only when its lines hold at least
+# 20 alphanumeric characters between them, as `git diff --color-moved` judges
+# it: a lone `}`, `Ok(())` or blank line is not a move however many the diff
+# removes elsewhere.
+#
+# Both halves of a move are dropped: the added lines, and the removed lines,
+# which cargo-mutants would otherwise read as a deletion and select the lines
+# beside it. The output stays a well-formed diff that cargo-mutants checks
+# against the tree: each hunk is cut at its moved lines into hunks of the lines
+# that remain, each header renumbered to where its lines stand in the old and
+# new files, so every remaining line keeps its true position. A hunk left with
+# no added or removed line is dropped, and a file left with no hunk is dropped
+# with its header; a file whose section never had a hunk (a pure rename, a mode
+# change, a binary) passes through as it is. Nothing depends on anything but
+# the input, so the same diff always gives the same output.
+#
+# A summary of what was dropped goes to stderr.
+
+set -eu
+
+LC_ALL=C exec awk '
+# Pass 1: classify and keep every line.
+#   kind: H file header, @ hunk header, " " context, + added, - removed,
+#         \ no-newline marker
+function trim(s) {
+	sub(/^[ \t\r\f\v]+/, "", s)
+	sub(/[ \t\r\f\v]+$/, "", s)
+	return s
+}
+function count(spec, comma) {
+	comma = index(spec, ",")
+	return comma ? substr(spec, comma + 1) + 0 : 1
+}
+function start(spec, comma) {
+	comma = index(spec, ",")
+	return (comma ? substr(spec, 2, comma - 2) : substr(spec, 2)) + 0
+}
+{
+	n++
+	text[n] = $0
+	c = substr($0, 1, 1)
+	if (rem_old > 0 || rem_new > 0) {
+		if (c == "+") { kind[n] = "+"; rem_new-- }
+		else if (c == "-") { kind[n] = "-"; rem_old-- }
+		else if (c == "\\") kind[n] = "\\"
+		else { kind[n] = " "; rem_old--; rem_new-- }
+	} else if (c == "\\" && n > 1 && kind[n - 1] != "H") {
+		kind[n] = "\\"
+	} else if (substr($0, 1, 3) == "@@ " && in_file) {
+		kind[n] = "@"
+		rem_old = count($2)
+		rem_new = count($3)
+	} else {
+		kind[n] = "H"
+		if (substr($0, 1, 5) == "diff ") in_file = 1
+	}
+	# A run is broken by anything but an added, removed or marker line, so two
+	# added lines share a run when they are consecutive in the new file, and two
+	# removed lines when they are consecutive in the old.
+	if (kind[n] != "+" && kind[n] != "-" && kind[n] != "\\") run++
+	runof[n] = run
+	if (kind[n] == "+" || kind[n] == "-") {
+		body = substr($0, 2)
+		key[n] = trim(body)
+		alnum[n] = gsub(/[A-Za-z0-9]/, "", body)
+	}
+	if (kind[n] == "+") {
+		if (last_add) next_add[last_add] = n
+		last_add = n
+		adds[++nadds] = n
+	} else if (kind[n] == "-") {
+		if (last_del) next_del[last_del] = n
+		last_del = n
+		# Removed lines by content, in diff order.
+		cands[key[n]] = cands[key[n]] " " n
+	}
+}
+
+# How many lines, from added line a and removed line r on, form one block.
+function extend(a, r, ra, rr, len) {
+	ra = runof[a]
+	rr = runof[r]
+	len = 0
+	while (a && r && runof[a] == ra && runof[r] == rr && !moved[a] && !moved[r] && key[a] == key[r]) {
+		len++
+		a = next_add[a]
+		r = next_del[r]
+	}
+	return len
+}
+
+# Close the hunk being cut, adding it to the output of its file if it changes
+# anything. A side with no lines is numbered from the line before it, as git
+# numbers one, unless that would start it inside the hunk before it: git never
+# writes two hunks that touch, but a cut does, and a parser that holds hunks in
+# order (cargo-mutants does) refuses a start before the previous hunk ends.
+function flush(i, os, ns) {
+	if (seg_changes) {
+		os = seg_oc ? seg_o : seg_o - 1
+		ns = seg_nc ? seg_n : seg_n - 1
+		if (os < o_end) os = o_end
+		if (ns < n_end) ns = n_end
+		o_end = os + seg_oc
+		n_end = ns + seg_nc
+		out = out sprintf("@@ -%d,%d +%d,%d @@%s\n", os, seg_oc, ns, seg_nc, suffix)
+		for (i = 1; i <= seg_len; i++) out = out seg[i] "\n"
+	}
+	seg_len = seg_oc = seg_nc = seg_changes = 0
+}
+
+function seg_add(line) {
+	if (!seg_len) { seg_o = o; seg_n = nw }
+	seg[++seg_len] = line
+}
+
+function end_file(i) {
+	flush()
+	if (!had_hunk || out != "") for (i = 1; i <= nhead; i++) print head[i]
+	printf "%s", out
+	out = ""
+	nhead = had_hunk = o_end = n_end = 0
+}
+
+END {
+	# Pass 2: find the moved blocks.
+	for (k = 1; k <= nadds; k++) {
+		a = adds[k]
+		if (moved[a]) continue
+		best = bestr = 0
+		m = split(cands[key[a]], cs, " ")
+		for (j = 1; j <= m; j++) {
+			r = cs[j] + 0
+			if (moved[r]) continue
+			len = extend(a, r)
+			if (len > best) { best = len; bestr = r }
+		}
+		chars = 0
+		x = a
+		for (j = 0; j < best; j++) { chars += alnum[x]; x = next_add[x] }
+		if (chars < 20) continue
+		x = a
+		y = bestr
+		for (j = 0; j < best; j++) {
+			moved[x] = moved[y] = 1
+			dropped_add++
+			dropped_del++
+			x = next_add[x]
+			y = next_del[y]
+		}
+	}
+
+	# Pass 3: write the diff back without them. The hunks of a file are held
+	# in `out` until the file ends, so a file whose every hunk is dropped
+	# loses its header too.
+	out = ""
+	for (i = 1; i <= n; i++) {
+		k = kind[i]
+		if (k == "H") {
+			if (substr(text[i], 1, 5) == "diff " || had_hunk) end_file()
+			head[++nhead] = text[i]
+			continue
+		}
+		if (k == "@") {
+			flush()
+			had_hunk = 1
+			split(text[i], f, " ")
+			o = start(f[2]) + (count(f[2]) ? 0 : 1)
+			nw = start(f[3]) + (count(f[3]) ? 0 : 1)
+			suffix = substr(text[i], index(substr(text[i], 3), "@@") + 4)
+			continue
+		}
+		if (k == "\\") {
+			if (!prev_moved && seg_len) seg_add(text[i])
+			continue
+		}
+		prev_moved = moved[i]
+		if (moved[i]) {
+			flush()
+			if (k == "+") nw++
+			else o++
+			continue
+		}
+		seg_add(text[i])
+		if (k == " ") { seg_oc++; seg_nc++; o++; nw++ }
+		else if (k == "+") { seg_nc++; seg_changes++; nw++ }
+		else { seg_oc++; seg_changes++; o++ }
+	}
+	flush()
+	end_file()
+
+	printf "mutants-diff-filter: dropped %d moved added lines and %d moved removed lines\n", \
+		dropped_add, dropped_del > "/dev/stderr"
+}
+' "$@"

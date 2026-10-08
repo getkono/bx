@@ -1748,8 +1748,8 @@ impl ResolvedValues {
         }
     }
 
-    /// Put `names` into declaration order, so two reports of one problem read
-    /// the same way regardless of which field was substituted first.
+    /// Put `names` into declaration order, deduplicated, indexing every
+    /// declaration, switched-off ones too ([`ResolvedValues::index_of`]).
     pub(crate) fn in_declaration_order(&self, mut names: Vec<String>) -> Vec<String> {
         names.sort_by_key(|name| self.index_of(name).unwrap_or(usize::MAX));
         names.dedup();

@@ -10,8 +10,8 @@
 //! repo is a git working tree that is meant to be published, and a file inside
 //! one can be committed by accident; the state directory is not a working tree
 //! and never becomes one. So `local.toml` lives in the state directory, and a
-//! `local.toml` found inside the config repo is **never loaded** — it is
-//! reported by [`stray_local`] so `bx doctor` can name the move. A state
+//! `local.toml` found inside the config repo is **never loaded**. No command
+//! reports one yet: `stray_local`, which finds it, has only its tests. A state
 //! directory that is itself inside the repo is refused outright, rather than
 //! loading its `local.toml` or silently dropping it.
 //!
@@ -67,7 +67,7 @@
 //!
 //! # Nothing here reads the environment
 //!
-//! [`state_dir`] takes both the home and the `XDG_STATE_HOME` override as
+//! [`paths::state_dir`] takes both the home and the `XDG_STATE_HOME` override as
 //! arguments. A resolution path that read the environment would make the merge
 //! impure and Invariant 3 unprovable, and the state directory has to be the same
 //! one entry A4's ledger picks — two resolvers that disagreed would put the
@@ -77,29 +77,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::{Error, Layer, LayerKind, load_layer};
-use crate::paths;
-
-/// The account's own layer, in the state directory.
-pub const LOCAL_FILE: &str = "local.toml";
-
-/// The state directory's default, relative to the home.
-const STATE_FALLBACK: &str = ".local/state";
-
-/// The state directory — `$XDG_STATE_HOME/bx`, default `~/.local/state/bx`.
-///
-/// Both inputs are explicit so the library reads no environment. The binary
-/// passes `std::env::var_os("XDG_STATE_HOME").as_deref()`; a test passes what it
-/// wants to test.
-#[must_use]
-pub fn state_dir(home: &Path, xdg_state_home: Option<&OsStr>) -> PathBuf {
-    paths::xdg_base(xdg_state_home, home, STATE_FALLBACK).join("bx")
-}
-
-/// This account's layer file inside `state_dir`.
-#[must_use]
-pub fn local_layer_path(state_dir: &Path) -> PathBuf {
-    state_dir.join(LOCAL_FILE)
-}
+use crate::paths::{self, LOCAL_FILE, local_layer_path};
 
 /// Every layer file, in merge order: the repo's globals, then the local layer.
 ///
@@ -109,8 +87,8 @@ pub fn local_layer_path(state_dir: &Path) -> PathBuf {
 ///
 /// Any `local.toml` **inside the repo** is filtered out here, wherever it sits.
 /// Loading one would merge account content out of a publishable git tree, which
-/// is the hole Invariant 5 exists to close; [`stray_local`] is how it gets
-/// reported instead of silently ignored.
+/// is the hole Invariant 5 exists to close. It is skipped without a word:
+/// `stray_local` finds one, but no command reports it yet.
 ///
 /// That includes the local layer itself. A state directory inside the repo —
 /// `XDG_STATE_HOME` equal to `XDG_CONFIG_HOME` makes it the repo — is
@@ -360,7 +338,7 @@ fn identity(path: &Path) -> Result<Option<(u64, u64)>, Error> {
 ///
 /// `home` is threaded in, never read here: it is what a target path is parsed
 /// against, so that `~/.gitconfig` in one layer and the absolute spelling in
-/// another are one key rather than two. It is the same `home` [`state_dir`]
+/// another are one key rather than two. It is the same `home` [`paths::state_dir`]
 /// takes, so a caller that found the state directory already holds it.
 ///
 /// # Errors
@@ -401,6 +379,7 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
 /// # Errors
 ///
 /// [`Error::Io`] naming the path that could not be examined.
+#[cfg(test)]
 pub fn stray_local(repo: &Path) -> Result<Option<PathBuf>, Error> {
     if !super::examine_root(repo)?.is_some_and(|meta| meta.is_dir()) {
         return Ok(None);
@@ -427,36 +406,6 @@ mod tests {
     /// A repo root and a state directory under a guarded home.
     fn repo_and_state(home: &crate::testing::GuardedHome) -> (PathBuf, PathBuf) {
         (home.child(".config/bx"), home.child(".local/state/bx"))
-    }
-
-    #[test]
-    fn state_dir_defaults_to_local_state_bx() {
-        assert_eq!(
-            state_dir(Path::new("/var/home/example"), None),
-            Path::new("/var/home/example/.local/state/bx")
-        );
-    }
-
-    #[test]
-    fn state_dir_honours_xdg_state_home() {
-        assert_eq!(
-            state_dir(
-                Path::new("/var/home/example"),
-                Some(OsStr::new("/var/mnt/scratch/one/state"))
-            ),
-            Path::new("/var/mnt/scratch/one/state/bx")
-        );
-    }
-
-    #[test]
-    fn a_relative_or_empty_xdg_state_home_falls_back() {
-        // The base-directory specification honours the variable only when it is
-        // non-empty and absolute; anything else is invalid and the default wins.
-        let home = Path::new("/var/home/example");
-        let default = home.join(".local/state/bx");
-
-        assert_eq!(state_dir(home, Some(OsStr::new(""))), default);
-        assert_eq!(state_dir(home, Some(OsStr::new("relative/state"))), default);
     }
 
     #[test]
@@ -528,7 +477,7 @@ mod tests {
         let home = guarded_home();
         let (repo, _) = repo_and_state(&home);
         let config_home = home.child(".config");
-        let state = state_dir(home.path(), Some(config_home.as_os_str()));
+        let state = paths::state_dir(home.path(), Some(config_home.as_os_str()));
         assert_eq!(state, repo, "the configuration this case is about");
         home.write(".config/bx/bx.toml", "");
         let local = home.write(".config/bx/local.toml", "[values]\nscratch_root = \"/x\"\n");

@@ -20,17 +20,25 @@
 //! binary through one install channel, so a repo and a binary are versioned
 //! together, and a silent no-op is the failure mode this tool exists to end.
 
+pub mod activation;
+pub mod alias;
 pub mod env;
 pub mod external;
+pub mod function;
 pub mod history;
+pub mod keybindings;
 pub mod layers;
 pub mod merge;
 pub mod origin;
 pub mod path;
+pub mod plugin;
+pub mod resolution;
 pub mod resolve;
 pub mod secrets;
 pub mod shell_options;
+pub mod source;
 pub mod target;
+pub mod toggle;
 pub mod tool;
 pub mod tree;
 pub mod values;
@@ -39,7 +47,7 @@ pub mod when;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::{activation, alias, function, keybindings, plugin, source};
+use crate::shell::Shells;
 use env::EnvDecl;
 pub use origin::Origin;
 use target::Target;
@@ -101,7 +109,7 @@ pub struct Config {
     /// `[[activation]]`'s entries, keyed by `name`, in the order written: the
     /// declared tool activations, run at `plan` time and cached. See
     /// [`crate::shell::activation`].
-    pub activations: Vec<activation::ActivationDecl>,
+    pub activations: Vec<crate::shell::activation::ActivationDecl>,
     /// `[[tool]]`'s entries, keyed by `name`, in the order written: the
     /// declared tool inventory `bx doctor` reports on and never installs. See
     /// [`tool`].
@@ -127,7 +135,7 @@ pub struct Config {
     /// section, each toggle carrying the section it came from.
     ///
     /// Always empty after [`merge::merge`], which consumes them.
-    pub toggles: Vec<merge::Toggle>,
+    pub toggles: Vec<toggle::Toggle>,
     /// Files one layer names more than once only because of this account's
     /// answers.
     ///
@@ -326,21 +334,6 @@ fn filename_bytes(path: &Path) -> &[u8] {
         .map_or(&[], std::ffi::OsStr::as_encoded_bytes)
 }
 
-/// Read and parse every global layer in a config repo, **unmerged**.
-///
-/// Merging is entry A3's, and keeping the two apart is what lets `bx plan` name
-/// the layer that set a given entry.
-///
-/// # Errors
-///
-/// Whatever [`layer_files`] and [`load_layer`] return.
-pub fn load_layers(repo: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
-    layer_files(repo)?
-        .iter()
-        .map(|path| load_layer(path, repo, home))
-        .collect()
-}
-
 /// Read and parse one layer file, expanding its trees against `repo`.
 ///
 /// Any file in the layer schema, including the state directory's `local.toml`,
@@ -399,7 +392,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     // A table whose only keys are `path` and `enabled` is a
                     // toggle, not a target with no body: it flips a flag on an
                     // entry an earlier layer introduced.
-                    match merge::toggle_of(table, merge::Section::Target, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Target, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => match target::parse_entry(table, file, text, home)? {
                             target::Entry::Target(target) => config.targets.push(target),
@@ -413,7 +406,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "external" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::External, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::External, file, text)? {
                         // Keyed by its one normalised spelling, as the full
                         // entry is, so `~/a/./b` reaches the entry at `~/a/b`.
                         Some(mut toggle) => {
@@ -434,7 +427,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "value" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::Value, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Value, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .values
@@ -444,7 +437,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "env" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::Env, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Env, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config.envs.push(env::parse_env(table, file, text)?),
                     }
@@ -517,7 +510,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "alias" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::Alias, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Alias, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config.aliases.push(alias::parse_alias(table, file, text)?),
                     }
@@ -525,7 +518,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "function" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::Function, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Function, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .functions
@@ -535,7 +528,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "plugin" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::Plugin, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Plugin, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .plugins
@@ -545,7 +538,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "source" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::Source, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Source, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .sources
@@ -555,7 +548,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "activation" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::Activation, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Activation, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config
                             .activations
@@ -565,7 +558,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             }
             "tool" => {
                 for table in entries(root, name, item, file, text)? {
-                    match merge::toggle_of(table, merge::Section::Tool, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Tool, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
                         None => config.tools.push(tool::parse_tool(table, file, text)?),
                     }
@@ -589,7 +582,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .targets
             .iter()
             .map(|t| (t.path.as_str(), &t.origin))
-            .chain(toggles_in(&config, merge::Section::Target))
+            .chain(toggles_in(&config, toggle::Section::Target))
             .collect(),
     )?;
     check_unique(
@@ -598,7 +591,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .externals
             .iter()
             .map(|e| (e.path.as_str(), &e.origin))
-            .chain(toggles_in(&config, merge::Section::External))
+            .chain(toggles_in(&config, toggle::Section::External))
             .collect(),
     )?;
     check_unique(
@@ -607,7 +600,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .values
             .iter()
             .map(|v| (v.name.as_str(), &v.origin))
-            .chain(toggles_in(&config, merge::Section::Value))
+            .chain(toggles_in(&config, toggle::Section::Value))
             .collect(),
     )?;
     check_unique(
@@ -616,7 +609,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .envs
             .iter()
             .map(|e| (e.name.as_str(), &e.origin))
-            .chain(toggles_in(&config, merge::Section::Env))
+            .chain(toggles_in(&config, toggle::Section::Env))
             .collect(),
     )?;
     check_unique(
@@ -634,7 +627,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .aliases
             .iter()
             .map(|a| (a.name.as_str(), &a.origin))
-            .chain(toggles_in(&config, merge::Section::Alias))
+            .chain(toggles_in(&config, toggle::Section::Alias))
             .collect(),
     )?;
     check_unique(
@@ -643,7 +636,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .functions
             .iter()
             .map(|f| (f.name.as_str(), &f.origin))
-            .chain(toggles_in(&config, merge::Section::Function))
+            .chain(toggles_in(&config, toggle::Section::Function))
             .collect(),
     )?;
     check_unique(
@@ -652,7 +645,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .plugins
             .iter()
             .map(|p| (p.name.as_str(), &p.origin))
-            .chain(toggles_in(&config, merge::Section::Plugin))
+            .chain(toggles_in(&config, toggle::Section::Plugin))
             .collect(),
     )?;
     check_unique(
@@ -661,7 +654,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .sources
             .iter()
             .map(|s| (s.name.as_str(), &s.origin))
-            .chain(toggles_in(&config, merge::Section::Source))
+            .chain(toggles_in(&config, toggle::Section::Source))
             .collect(),
     )?;
     check_unique(
@@ -670,7 +663,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .activations
             .iter()
             .map(|a| (a.name.as_str(), &a.origin))
-            .chain(toggles_in(&config, merge::Section::Activation))
+            .chain(toggles_in(&config, toggle::Section::Activation))
             .collect(),
     )?;
     check_unique(
@@ -679,7 +672,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .tools
             .iter()
             .map(|t| (t.name.as_str(), &t.origin))
-            .chain(toggles_in(&config, merge::Section::Tool))
+            .chain(toggles_in(&config, toggle::Section::Tool))
             .collect(),
     )?;
 
@@ -688,7 +681,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
 
 /// The toggles in `config` that belong to one section, as `check_unique` wants
 /// them.
-fn toggles_in(config: &Config, section: merge::Section) -> impl Iterator<Item = (&str, &Origin)> {
+fn toggles_in(config: &Config, section: toggle::Section) -> impl Iterator<Item = (&str, &Origin)> {
     config
         .toggles
         .iter()
@@ -1001,6 +994,40 @@ impl<'a> Ctx<'a> {
             })
             .collect()
     }
+
+    /// Read `shells` from `table`, or [`Shells::EVERY`] when it is absent.
+    /// `owner` names the entry, as the message for a bad list opens with.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] for a value that is not an array of strings, and
+    /// [`Error::BadValue`] for an empty list or a name that is not a shell bx
+    /// generates for.
+    pub(crate) fn shells_at(&self, table: &Table, owner: &str) -> Result<Shells, Error> {
+        if table.get(Shells::KEY).is_none() {
+            return Ok(Shells::EVERY);
+        }
+        let names = self.str_array_at(table, Shells::KEY)?;
+        Shells::from_names(&names)
+            .map_err(|problem| self.bad(table, Shells::KEY, format!("{owner}: {problem}")))
+    }
+}
+
+/// Read and parse every global layer in a config repo, **unmerged**.
+///
+/// Only tests call it, so it sits last, beside them: the source scans that
+/// read everything above the first `#[cfg(test)]` as this module's shipped
+/// code still read all of it.
+///
+/// # Errors
+///
+/// Whatever [`layer_files`] and [`load_layer`] return.
+#[cfg(test)]
+pub fn load_layers(repo: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
+    layer_files(repo)?
+        .iter()
+        .map(|path| load_layer(path, repo, home))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1562,7 +1589,7 @@ mod tests {
         assert_eq!(config.plugins.len(), 1);
         assert_eq!(config.plugins[0].name, "autosuggest");
         assert_eq!(config.toggles.len(), 1);
-        assert_eq!(config.toggles[0].section, merge::Section::Plugin);
+        assert_eq!(config.toggles[0].section, toggle::Section::Plugin);
 
         let twice = message(&format!("{entry}{entry}"));
         assert!(twice.contains("duplicate plugin `autosuggest`"), "{twice}");
@@ -1595,7 +1622,7 @@ mod tests {
             ["starship", "init", "zsh"].map(String::from)
         );
         assert_eq!(config.toggles.len(), 1);
-        assert_eq!(config.toggles[0].section, merge::Section::Activation);
+        assert_eq!(config.toggles[0].section, toggle::Section::Activation);
 
         let twice = message(&format!("{entry}{entry}"));
         assert!(twice.contains("duplicate activation `starship`"), "{twice}");

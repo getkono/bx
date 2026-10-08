@@ -76,11 +76,12 @@ usage = 'arg "[base]" help="Ref whose baseline this one may not outgrow (default
 run = 'scripts/line-check ${usage_base:-}'
 
 [tasks.shellcheck]
-description = "ShellCheck every shell script: the installer, the bench harness and its stubs, and the line check (CI, pre-commit)"
+description = "ShellCheck every shell script: the installer, the bench harness and its stubs, the line check and the mutants diff filter (CI, pre-commit)"
 # install.sh runs on machines with nothing else on them, so a shell bug there is
 # the one bug a user cannot work around; the bench and line-check scripts gate
-# the startup budget and the line limit, which a bug would silently disable.
-run = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh bench/stubs/fzf bench/stubs/mise bench/stubs/starship bench/stubs/zoxide scripts/line-check"
+# the startup budget and the line limit, which a bug would silently disable,
+# and the mutants diff filter decides which mutants a pull request is held to.
+run = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh bench/stubs/fzf bench/stubs/mise bench/stubs/starship bench/stubs/zoxide scripts/line-check scripts/mutants-diff-filter"
 
 [tasks.actionlint]
 description = "Lint the GitHub Actions workflows (CI, pre-commit)"
@@ -99,3 +100,8 @@ run = 'convco check --from-stdin --strip < "${usage_file}"'
 description = "Mutation testing — find logic the tests don't pin down (slow); args pass through"
 raw_args = true
 run = "cargo mutants"
+
+[tasks.mutants-diff-filter]
+description = "Write a diff with its moved lines taken out, for `mutants --in-diff` (CI)"
+usage = 'arg "[diff]" help="The `git diff` output to filter (default: stdin)"'
+run = 'scripts/mutants-diff-filter ${usage_diff:-}'

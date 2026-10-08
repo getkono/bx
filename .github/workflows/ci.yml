@@ -99,7 +99,9 @@ jobs:
     # install.sh runs on machines that have nothing else on them, so a bug there
     # is the one bug a user cannot work around. bench/run.sh gates the startup
     # budget, so a bug there silently disables that gate. scripts/line-check is
-    # the file-length gate, which a bug would disable just as silently.
+    # the file-length gate, which a bug would disable just as silently, and
+    # scripts/mutants-diff-filter decides which mutants a pull request is held
+    # to.
     #
     # Every check runs through the same mise task hk runs locally. shellcheck
     # and actionlint are the only tools this job calls, and `mise run` would
@@ -277,7 +279,7 @@ jobs:
     # Each mutant is a build and a full test run, about a minute, so one runner
     # gets through some fifty in the hour below. The diff's mutants are dealt
     # round-robin across four runners, each with its own baseline, which keeps
-    # a refactor that moves a few modules inside the cap. Every shard reports
+    # a diff of some two hundred mutants inside the cap. Every shard reports
     # on its own, so one failing does not cancel the others' evidence.
     strategy:
       fail-fast: false
@@ -320,8 +322,17 @@ jobs:
       # The checkout is the pull request merged into its base, so the merge
       # commit's first parent is the base as it stands now, and this is the
       # pull request's own change against it, whatever else master has gained.
+      #
+      # A line the pull request only moves, between files or within one, is
+      # code master already held to its tests, so the filter takes moved
+      # blocks out and leaves the lines the pull request writes or edits; a
+      # refactor that splits a large file is then held to its edits rather
+      # than to every mutant in the code it moved. See the script's header for
+      # what counts as a move.
       - name: Diff against the base
-        run: git diff HEAD^1 HEAD > pr.diff
+        run: |
+          git diff HEAD^1 HEAD > full.diff
+          mise run mutants-diff-filter full.diff > pr.diff
       # A diff that touches no Rust has no mutants, which cargo-mutants reports
       # and passes; a missed or timed-out mutant fails the job.
       - name: Mutants

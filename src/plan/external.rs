@@ -1781,6 +1781,48 @@ mod tests {
     }
 
     #[test]
+    fn only_git_exiting_1_reads_as_no_origin_or_not_an_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let dest = home.child(AT);
+        let git = git(home.path());
+
+        // Git exits 1 for an unset key and for a commit that is not an
+        // ancestor: each is an answer, not a failure.
+        git_run(home.path(), &dest, &["remote", "remove", "origin"]);
+        assert!(matches!(origin_url(&git, &dest), Ok(None)));
+        assert!(matches!(
+            is_ancestor(&git, &dest, &up.second, &up.first),
+            Ok(false)
+        ));
+
+        // Any other failure is git's, and is reported rather than answered.
+        let unknown = "0".repeat(40);
+        assert!(matches!(
+            is_ancestor(&git, &dest, &unknown, &up.first),
+            Err(git::Error::Failed { .. })
+        ));
+        let bin = home.child("bin");
+        std::fs::create_dir(&bin).expect("the stub's directory");
+        let stub = bin.join("git");
+        std::fs::write(&stub, "#!/bin/sh\nexit 2\n").expect("the stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let failing = Git::at_home(home.path()).with_env("PATH", &bin);
+        assert!(matches!(
+            origin_url(&failing, &dest),
+            Err(git::Error::Failed { .. })
+        ));
+        assert!(matches!(
+            is_ancestor(&failing, &dest, &up.first, &up.second),
+            Err(git::Error::Failed { .. })
+        ));
+    }
+
+    #[test]
     fn a_problem_names_what_git_said() {
         let home = guarded_home();
         let missing = Git::at_home(home.path()).with_env("PATH", "");

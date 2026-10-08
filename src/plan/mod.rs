@@ -3961,6 +3961,10 @@ pub(crate) mod tests {
                 Some("repo\n")
             );
             assert_eq!(read(&copy(home.path(), "new")), None);
+            // Only what the apply wrote is agreed: the carry it left undone
+            // is not.
+            assert_eq!(base(home.path(), "fresh").as_deref(), Some(&b"repo\n"[..]));
+            assert_eq!(base(home.path(), "new"), None);
             assert_eq!(
                 plan(&inputs).actions(),
                 vec![Action::Unchanged, Action::Sync, Action::Unchanged]

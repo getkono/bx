@@ -1,7 +1,6 @@
 # Files already over scripts/line-check's limit when the gate landed. This list
 # only shrinks: split a file below the limit, then delete its line. Never add one.
 src/config/merge.rs
-src/config/resolve.rs
 src/fs/atomic.rs
 src/journal.rs
 src/plan/decide.rs

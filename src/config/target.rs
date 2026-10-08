@@ -280,8 +280,8 @@ pub fn link_text(text: &str, home: &Path) -> PathBuf {
 /// Each variant carries everything its bytes are made of, so producing them is
 /// a pure function of the resolved target and whether each tool a
 /// `when = "has:TOOL"` names is present: the plan decides on exactly the bytes
-/// `apply` writes. `Gen::render`, which [`crate::shell`] implements, is that
-/// function.
+/// `apply` writes. [`Gen::render`], which [`crate::shell`] implements, is
+/// that function.
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
 /// ([`super::env`]), which also carries the `[[plugin]]` entries, the
@@ -467,7 +467,7 @@ impl Interactive {
 
     /// The file with `sources` added: the enabled declared optional sources
     /// as [`crate::shell::source::resolve`] resolved them, each ready one
-    /// written and each held-back one named by `Interactive::note`.
+    /// written and each held-back one named by [`Interactive::note`].
     #[must_use]
     pub fn with_sources(mut self, sources: Vec<Resolution<Source>>) -> Self {
         self.sources = sources;
@@ -483,7 +483,7 @@ impl Interactive {
 
     /// The file with `functions` added: the enabled functions as
     /// [`crate::shell::function::resolve`] resolved them, each ready one
-    /// written and each held-back one named by `Interactive::note`.
+    /// written and each held-back one named by [`Interactive::note`].
     #[must_use]
     pub fn with_functions(mut self, functions: Vec<Resolution<Function>>) -> Self {
         self.functions = functions;
@@ -499,7 +499,7 @@ impl Interactive {
     /// The file with `aliases` added, the disabled ones dropped.
     ///
     /// Whether a `has:TOOL` alias is written is not decided here: it is
-    /// decided by `Interactive::render`'s `present`, so the file carries
+    /// decided by [`Interactive::render`]'s `present`, so the file carries
     /// every enabled alias and the bytes follow the machine.
     #[must_use]
     pub fn with_aliases(mut self, aliases: &[AliasDecl]) -> Self {

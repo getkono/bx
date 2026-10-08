@@ -1,9 +1,10 @@
 //! zsh's placement graph: which files the shell declarations land in.
 //!
-//! The counterpart of [`super::bash::place`]. Resolution
-//! ([`crate::config::resolve::resolve`]) appends what this derives after
-//! every declared target, and `plan` asks [`vacated_fragments`] for the
-//! fragments a configuration no longer places.
+//! The counterpart of [`super::bash::place`]; [`place`] is both together.
+//! Resolution ([`crate::config::resolve::resolve`]) is handed [`place`] by its
+//! caller and appends what it derives after every declared target, and `plan`
+//! asks [`vacated_fragments`] for the fragments a configuration no longer
+//! places.
 
 use std::path::Path;
 
@@ -22,6 +23,22 @@ use super::function::FunctionDecl;
 use super::keybindings::Keybindings;
 use super::plugin::PluginDecl;
 use super::source::SourceDecl;
+
+/// Every target the shell declarations of `merged` place: zsh's
+/// ([`place_envs`]), then bash's ([`super::bash::place`]).
+///
+/// What a caller of [`crate::config::resolve::resolve`] hands it, so the
+/// placed targets are refused for sharing a file or overlapping an external
+/// alongside the declared ones.
+///
+/// # Errors
+///
+/// Whatever [`place_envs`] or [`super::bash::place`] returns.
+pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
+    let mut placed = place_envs(merged, values)?;
+    placed.extend(super::bash::place(merged, values)?);
+    Ok(placed)
+}
 
 /// The targets the `[[env]]` placement graph derives, after every declared
 /// target.

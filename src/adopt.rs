@@ -244,7 +244,7 @@ impl Context {
         let state = StateDir::resolve_in(&home, env.xdg_state_home.as_deref());
         let layers = layers::load_layer_set(&repo, state.root(), &home)?;
         let merged = merge::merge(&layers, &home)?;
-        let resolved = resolve::resolve(&merged, &home)?;
+        let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let roots = RootSet::from_values(&resolved.values)
             .owning(&[state.root().to_path_buf()])
             .with_config_repos(std::slice::from_ref(&repo));

@@ -2814,7 +2814,7 @@ mod tests {
             Resolution::Ready(Function {
                 name: name.to_string(),
                 body: body.to_string(),
-                hook: hook.map(|h| crate::shell::function::Hook::parse(h).expect("a hook")),
+                hook: hook.map(|h| crate::config::function::Hook::parse(h).expect("a hook")),
                 when: None,
             })
         }
@@ -2998,7 +2998,7 @@ mod tests {
                     command: vec![(*name).to_string()],
                     zsh: None,
                     bash: None,
-                    shells: crate::shell::Shells::EVERY,
+                    shells: crate::config::shells::Shells::EVERY,
                     phase: *phase,
                     enabled: true,
                     origin: super::super::super::Origin {
@@ -3013,7 +3013,7 @@ mod tests {
                 &crate::env_guard::RootSet::strict(),
                 &Echo,
             )
-            .rendered(crate::shell::Shell::Zsh)
+            .rendered(crate::config::shells::Shell::Zsh)
         }
 
         #[test]

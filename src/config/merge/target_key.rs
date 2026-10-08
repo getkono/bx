@@ -755,7 +755,7 @@ mod tests {
 
         let config = merge(layers).unwrap_or_else(|e| panic!("the merge failed: {e}"));
         assert!(config.conflicts.is_empty(), "{:#?}", config.conflicts);
-        resolve(&config, &home())
+        resolve(&config, &home(), crate::shell::placement::place)
             .unwrap_or_else(|e| panic!("the resolution failed: {e}"))
             .targets
             .into_iter()

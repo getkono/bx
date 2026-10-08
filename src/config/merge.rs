@@ -1069,7 +1069,7 @@ mod tests {
 
     #[test]
     fn keybindings_merge_key_by_key_the_last_layer_winning() {
-        use crate::shell::keybindings::{Action, Key};
+        use crate::config::keybindings::{Action, Key};
         let merged = merge(&[
             global(
                 "bx.toml",

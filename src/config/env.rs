@@ -498,7 +498,7 @@ mod tests {
              [[env]]\nname = \"B\"\nvalue = \"1\"\nkind = \"login\"\nshells = [\"bash\", \"zsh\"]\n",
         )
         .expect("parses");
-        assert_eq!(envs[0].shells, Shells::only(crate::shell::Shell::Zsh));
+        assert_eq!(envs[0].shells, Shells::only(Shell::Zsh));
         assert_eq!(envs[1].shells, Shells::EVERY);
         for (shells, expected) in [
             ("[\"fish\"]", "\"fish\" is not a shell bx generates for"),

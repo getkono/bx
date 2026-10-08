@@ -119,7 +119,20 @@ pub struct Resolved {
 /// claim the terminal slot; for two ready targets that name one file; and for
 /// an external whose checkout overlaps another external's or a ready target's
 /// path.
-pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
+///
+/// # Placement
+///
+/// `place` derives the targets the configuration's shell declarations land
+/// in from the merged configuration and its resolved values; they follow
+/// every declared target, and are held to the same refusals. The caller hands
+/// it over — [`crate::shell::placement::place`] in every caller but a test —
+/// because which files a shell reads, and what goes in them, is
+/// [`crate::shell`]'s, and this module reads nothing of it.
+pub fn resolve(
+    merged: &Config,
+    home: &Path,
+    place: impl FnOnce(&Config, &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error>,
+) -> Result<Resolved, Error> {
     let values = ResolvedValues::resolve(merged.values.clone(), &merged.value_assignments, home)?;
 
     let mut targets = merged
@@ -134,8 +147,7 @@ pub fn resolve(merged: &Config, home: &Path) -> Result<Resolved, Error> {
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    targets.extend(crate::shell::placement::place_envs(merged, &values)?);
-    targets.extend(crate::shell::bash::place(merged, &values)?);
+    targets.extend(place(merged, &values)?);
 
     refuse_shared_files(&targets)?;
     refuse_overlapping_externals(&merged.externals, &targets)?;
@@ -419,7 +431,7 @@ mod tests {
     use crate::config::merge::merge;
     use crate::config::target::{Attach, Format, Gen, Interactive};
     use crate::config::{Layer, LayerKind, parse_str};
-    use crate::shell::placement::vacated_fragments;
+    use crate::shell::placement::{place, vacated_fragments};
     use std::path::PathBuf;
 
     pub(super) fn home() -> PathBuf {
@@ -447,7 +459,7 @@ mod tests {
             layers.push(layer("local.toml", LayerKind::Local, local)?);
         }
         let merged = merge(&layers, &home()).map_err(|e| e.to_string())?;
-        resolve(&merged, &home()).map_err(|e| e.to_string())
+        resolve(&merged, &home(), place).map_err(|e| e.to_string())
     }
 
     /// The resolved targets' keys, blocked ones included and in position.
@@ -819,7 +831,9 @@ mod tests {
         let mut second = merged.plugins[0].clone();
         second.name = "two".to_string();
         merged.plugins.push(second);
-        let err = resolve(&merged, &home()).expect_err("refused").to_string();
+        let err = resolve(&merged, &home(), place)
+            .expect_err("refused")
+            .to_string();
         assert!(
             err.contains("plugin `two` claims the terminal slot"),
             "{err}"
@@ -1939,7 +1953,7 @@ mod tests {
                 layer("local.toml", LayerKind::Local, local)?,
             ];
             let merged = merge(&layers, &home()).map_err(|e| e.to_string())?;
-            resolve(&merged, &home()).map_err(|e| e.to_string())
+            resolve(&merged, &home(), place).map_err(|e| e.to_string())
         };
         // A base layer, the layer holding the pair, and each answer with whether
         // the pair meets under it.
@@ -2117,7 +2131,7 @@ mod tests {
             &home(),
         )
         .expect("an account's answer does not fail the merge");
-        let resolved = resolve(&merged, &home()).unwrap();
+        let resolved = resolve(&merged, &home(), place).unwrap();
 
         assert_eq!(keys(&resolved), ["~/.config/{{profile}}/s", "~/.zshrc"]);
         let entry = blocked(&resolved, 0);
@@ -2138,7 +2152,7 @@ mod tests {
             .map(|(file, kind, text)| layer(file, *kind, text).unwrap())
             .collect();
         let merged = merge(&layers, &home()).expect("an account's answer does not fail the merge");
-        let resolved = resolve(&merged, &home()).expect("nor the resolution");
+        let resolved = resolve(&merged, &home(), place).expect("nor the resolution");
         (merged, resolved)
     }
 
@@ -2454,7 +2468,7 @@ mod tests {
         let mut config = global.config;
         config.targets.extend(local.config.targets);
 
-        let message = resolve(&config, &home()).unwrap_err().to_string();
+        let message = resolve(&config, &home(), place).unwrap_err().to_string();
 
         assert!(message.contains("local.toml:1"), "{message}");
         assert!(

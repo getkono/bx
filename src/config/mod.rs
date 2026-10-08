@@ -1038,6 +1038,74 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The paths `code` reaches `crate::shell` by, each with its line: every
+    /// `shell::` that does not continue a longer name, so `crate::shell::`,
+    /// `super::super::shell::` and a grouped `{shell::…}` are found while
+    /// `shells::` and `shell_options::` are not.
+    fn shell_paths(code: &str) -> Vec<String> {
+        code.lines()
+            .filter(|line| {
+                line.match_indices("shell::").any(|(at, _)| {
+                    !line[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+            })
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_scan_finds_every_spelling_of_a_path_into_shell_and_nothing_else() {
+        let code = "use crate::shell::alias;\n\
+                    use super::super::shell::Phase;\n\
+                    use crate::{config, shell::bash};\n\
+                    let x = shell::quote(\"a\");\n\
+                    use super::shells::Shell;\n\
+                    use super::shell_options::ShellOptions;\n\
+                    let y = myshell::z;\n";
+        assert_eq!(
+            shell_paths(code),
+            [
+                "use crate::shell::alias;",
+                "use super::super::shell::Phase;",
+                "use crate::{config, shell::bash};",
+                "let x = shell::quote(\"a\");",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_config_module_names_anything_in_shell() {
+        // A structural test, because the property is a dependency direction:
+        // `shell` reads the values `config` parses and resolves, and `config`
+        // names nothing of `shell`'s, so a renderer can change without the
+        // configuration model knowing. Every file of the module is read off
+        // the directory at run time, so a file added to it is scanned without
+        // anyone listing it. The test module is left out — its tests may run
+        // what they parse through a shell's renderer — and so are whole-line
+        // comments, whose links say where a value is rendered without
+        // depending on it. Only the module: a `#[cfg(test)]` item above it
+        // is code the scan still reads, like everything around it.
+        for (path, source) in crate::testing::module_sources("config") {
+            let code: String = source
+                .split("#[cfg(test)]\nmod tests {")
+                .next()
+                .expect("the non-test half")
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let found = shell_paths(&code);
+            assert!(
+                found.is_empty(),
+                "{} names `crate::shell` outside its tests: {found:?}",
+                path.display()
+            );
+        }
+    }
+
     /// A config repo with the given files, each `(relative path, contents)`.
     fn repo(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().expect("a tempdir");

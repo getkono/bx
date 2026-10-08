@@ -109,8 +109,9 @@ impl Git {
     ///
     /// A declared external is cloned and fetched with nobody necessarily at
     /// the terminal, so a missing credential has to fail rather than wait.
-    /// Standard input is left as it is for each command: closed for a query,
-    /// inherited for one that may reach a remote. Every child runs with:
+    /// Every child an unattended `git` runs, the clone and fetch of a declared
+    /// external included, goes through [`Git::query`] with standard input
+    /// closed. Every child runs with:
     ///
     /// * `GIT_TERMINAL_PROMPT=0`, so git never asks on the terminal;
     /// * `GIT_ASKPASS` and `SSH_ASKPASS` set to `false`, and

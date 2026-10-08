@@ -277,7 +277,8 @@ impl Interrupted {
         self.unfinished.iter().filter(|write| !write.resolvable)
     }
 
-    /// The action per target a read-only command reports.
+    /// The tests' blanket view: [`Unfinished::action`] per target, which is
+    /// not the row `plan` shows for it.
     #[cfg(test)]
     #[must_use]
     pub fn actions(&self) -> Vec<Action> {

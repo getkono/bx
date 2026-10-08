@@ -273,8 +273,9 @@ enum Step<'a> {
 ///   answer of this account's — the site the other five and everything below
 ///   follow from;
 /// - `check_answer`, which refuses an answer to one;
-/// - [`ResolvedValues::decls`], [`ResolvedValues::unset`] and `unset_required`,
-///   each listing what this account may answer;
+/// - [`ResolvedValues::unset_required`], and the test-only
+///   `ResolvedValues::decls` and `ResolvedValues::unset`, each listing what
+///   this account may answer;
 /// - the answer edge here.
 ///
 /// The seventh is `merge`'s `<ValueDecl as Keyed>::enabled`, and it asks

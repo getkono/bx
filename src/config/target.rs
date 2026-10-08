@@ -718,7 +718,7 @@ pub fn parse_generated(_name: &str) -> Option<Gen> {
 /// refused with the decimal it would have meant. The bare-integer encoding the
 /// ledger writes is reachable only from a non-human-readable format, and never
 /// from a config file.
-pub use crate::fs::mode::{Mode, ModeError};
+pub use crate::fs::mode::Mode;
 
 /// How bx attaches to a file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -815,10 +815,7 @@ pub enum KeyPathError {
     EmptySegment(String),
 }
 
-/// Parse one `[[target]]` entry.
-///
-/// Exposed for entry A3, which parses a single entry out of a layer it is
-/// merging without going through a whole document.
+/// Parse one `[[target]]` entry, which may be a tree.
 ///
 /// `text` is the whole layer file, because spans index into it. `home` is the
 /// account's home directory: a target path is parsed against it so that a file
@@ -830,25 +827,6 @@ pub enum KeyPathError {
 /// # Errors
 ///
 /// Any [`Error`] the entry's own keys can produce. Every one carries an origin.
-/// A `tree` body is refused, since only a layer loaded from a repo can expand
-/// one; [`parse_entry`] takes both.
-pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Result<Target, Error> {
-    match parse_entry(table, file, text, home)? {
-        Entry::Target(target) => Ok(target),
-        Entry::Tree(_) => Err(Ctx::new(table, file, text, SECTION).bad(
-            table,
-            "tree",
-            "a `tree` expands into one target per file in the config repo, so it is \
-             read only as part of a layer loaded from one",
-        )),
-    }
-}
-
-/// Parse one `[[target]]` entry, which may be a tree.
-///
-/// # Errors
-///
-/// As [`parse_target`], less the refusal of a tree.
 pub fn parse_entry(table: &Table, file: &Path, text: &str, home: &Path) -> Result<Entry, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);
     ctx.reject_unknown_keys(table, &KEYS)?;
@@ -1549,9 +1527,33 @@ fn parse_format(ctx: &Ctx, table: &Table) -> Result<Format, Error> {
     }
 }
 
+/// Parse one `[[target]]` entry that is not a tree.
+///
+/// Only tests parse a lone entry outside a layer, so this sits last, beside
+/// them: the source scans that read everything above the first `#[cfg(test)]`
+/// as this module's shipped code still read all of it.
+///
+/// # Errors
+///
+/// Whatever [`parse_entry`] returns. A `tree` body is refused, since only a
+/// layer loaded from a repo can expand one.
+#[cfg(test)]
+pub fn parse_target(table: &Table, file: &Path, text: &str, home: &Path) -> Result<Target, Error> {
+    match parse_entry(table, file, text, home)? {
+        Entry::Target(target) => Ok(target),
+        Entry::Tree(_) => Err(Ctx::new(table, file, text, SECTION).bad(
+            table,
+            "tree",
+            "a `tree` expands into one target per file in the config repo, so it is \
+             read only as part of a layer loaded from one",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::mode::ModeError;
     use toml_edit::Document;
 
     /// The account's home every test in this module parses against.

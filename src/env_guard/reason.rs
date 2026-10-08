@@ -141,7 +141,7 @@ pub enum Reason {
     #[error("refers to a variable this fragment has not assigned")]
     UnresolvedReference,
     /// It refers to the home — `~`, `$HOME` — and the guard was given no home
-    /// to expand it against, as [`scan`](super::scan) is not.
+    /// to expand it against, as `scan` is not.
     #[error("refers to the home directory, and the guard was given none")]
     NoHome,
     /// It names a variable whose assignment the guard could not read, or comes

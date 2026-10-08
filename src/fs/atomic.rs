@@ -15,12 +15,14 @@
 //!    but a declared setuid or setgid bit, which a write would clear.
 //! 4. the content written, the set-id bits added if declared and read back to
 //!    confirm the kernel kept them, then `fsync`ed.
-//! 5. the prior state recorded — [`crate::state::NewEntry::for_write`] assembles it and
-//!    [`crate::state::Ledger::record`] makes it durable — **before** the
-//!    rename, so a crash after the rename still has a recoverable prior state.
-//!    Steps 6 and 7 can still refuse or fail, so this record can outlive a
-//!    write that never lands; [`Unpublished`] names the write so its record
-//!    can be withdrawn, and [`crate::state::NewEntry::for_write`] says when and how.
+//! 5. the prior state recorded **before** the rename, so a crash after the
+//!    rename still has a recoverable prior state. In `apply` the journal does
+//!    this ([`crate::journal`]); the test-only
+//!    `crate::state::NewEntry::for_write` assembles a ledger entry for it and
+//!    [`crate::state::Ledger::record`] makes it durable. Steps 6 and 7 can
+//!    still refuse or fail, so such a record can outlive a write that never
+//!    lands; [`Unpublished`] says so, and `NewEntry::for_write` says when and
+//!    how to withdraw it.
 //! 6. the destination `lstat`ed again and compared with what step 1 saw, and
 //!    the write refused if it changed.
 //! 7. `rename`.
@@ -58,8 +60,8 @@
 //! between the `fsync` of the temporary file and the `rename`. A write-ahead
 //! journal records its intent exactly there — before that point a crash leaves
 //! the destination untouched, after it the destination is already replaced — and
-//! it identifies a leftover temporary file by the path [`Staged::temp_path`]
-//! reports. An opaque `write(dest, bytes, mode)` cannot express that boundary,
+//! it identifies a leftover temporary file by the name [`temp_beside`] chose
+//! and [`stage_as`] was told to make. An opaque `write(dest, bytes, mode)` cannot express that boundary,
 //! and it cannot let a test observe the mode of the temporary file while it is
 //! still empty. [`Staged::commit`] is the shorthand for callers with nothing to
 //! interpose.

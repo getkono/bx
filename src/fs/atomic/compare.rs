@@ -91,7 +91,7 @@ pub struct Outcome {
 /// * [`Drift::Conflict`] — a directory, a symlink, or anything else that is
 ///   not a regular file; and, whatever is there, a declared mode that does not
 ///   grant the owner read (`0400`), because bx could not read the file back to
-///   compare it. The note is [`Error::OwnerLockedOut`](super::Error::OwnerLockedOut)'s words, less the path.
+///   compare it. The note is `Error::OwnerLockedOut`'s words, less the path.
 ///   [`stage`](super::stage()) does not refuse such a mode: a reversal restores a recorded
 ///   prior mode through it as recorded.
 ///
@@ -277,7 +277,8 @@ pub fn compare(observed: &Observed, desired: &Desired<'_>, home: &Path) -> Outco
 ///
 /// What `fs` still refuses is the case it *can* decide from one path: a
 /// **file** target whose declared mode denies the owner read, because bx reads
-/// a file back to compare it — [`Error::OwnerLockedOut`](super::Error::OwnerLockedOut), raised by [`compare`].
+/// a file back to compare it — the [`Drift::Conflict`] [`compare`] announces,
+/// whose note is `Error::OwnerLockedOut`'s words.
 #[must_use]
 pub fn compare_dir(observed: &Observed, mode: Mode) -> Outcome {
     if let Some(reason) = observed.parent.as_ref().and_then(Parent::unusable) {

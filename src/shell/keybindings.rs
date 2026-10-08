@@ -12,7 +12,8 @@
 //! ```
 //!
 //! The vocabulary is closed on both sides. A key is one of the six [`Key`]s
-//! and an action one of the four [`Action`]s; a key or an action this version
+//! and an action one of the four
+//! [`Action`](crate::config::keybindings::Action)s; a key or an action this version
 //! does not know is a load error naming its line, never a line silently
 //! dropped. Each action's name is the one zsh's line editor and bash's
 //! readline both call it, so one declaration means the same thing in either.
@@ -51,10 +52,10 @@
 use super::{Assembly, Phase};
 use crate::config::keybindings::SECTION;
 
-/// The keys and actions a binding may name, and what a `[keybindings]` table
-/// says, as [`crate::config::keybindings`] declares them, named here too,
-/// where every renderer already looks for them.
-pub use crate::config::keybindings::{Action, Key, Keybindings};
+/// The keys a binding may name, and what a `[keybindings]` table says, as
+/// [`crate::config::keybindings`] declares them, named here too, where every
+/// renderer already looks for them.
+pub use crate::config::keybindings::{Key, Keybindings};
 
 impl Key {
     /// The terminfo capability recording the key's sequence, where there is
@@ -127,6 +128,7 @@ pub fn contribute(assembly: &mut Assembly, keybindings: &Keybindings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::keybindings::Action;
     use crate::config::{Error, parse_str};
     use crate::shell::testing::{installed, run};
     use std::path::Path;

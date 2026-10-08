@@ -165,9 +165,9 @@ use super::{Config, Error, Layer, LayerKind};
 /// The toggle vocabulary, defined in [`super::toggle`] where a layer is
 /// parsed, and named here too, where the merge applies it.
 pub use super::toggle::{Section, Toggle};
-/// The list-merge vocabulary, defined in [`merged`] and named here too, where
-/// every keyed list section is folded.
-pub use merged::{Keyed, Merged};
+/// The list merge, defined in [`merged`] and named here too, where every keyed
+/// list section is folded.
+pub use merged::Merged;
 /// A file one layer names twice because of this account's answers, defined in
 /// [`target_key`] and named here too, where resolution reads it off the merge.
 pub(crate) use target_key::Conflict;

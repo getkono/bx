@@ -306,12 +306,14 @@ impl LedgerView {
     }
 
     /// How many targets bx has written.
+    #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether bx has written anything.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

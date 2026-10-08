@@ -46,7 +46,7 @@ pub fn digest(text: &Path) -> ContentHash {
 
 /// A link made beside its destination and not yet renamed over it.
 ///
-/// Dropping it removes the temporary link — see [`crate::fs::Staged`] for
+/// Dropping it removes the temporary link — see [`crate::fs::atomic::Staged`] for
 /// what that is worth — and leaves the destination exactly as it was.
 #[derive(Debug)]
 pub struct StagedLink {
@@ -168,19 +168,21 @@ fn refuse_unlinkable(observed: &Observed) -> Result<(), Error> {
 
 impl StagedLink {
     /// The destination this link will replace.
+    #[cfg(test)]
     #[must_use]
     pub fn dest(&self) -> &Path {
         &self.dest
     }
 
     /// The temporary link, beside the destination, already holding its text.
+    #[cfg(test)]
     #[must_use]
     pub fn temp_path(&self) -> &Path {
         self.temp.path()
     }
 
     /// The parent directories this write invented and claims, deepest first,
-    /// as [`crate::fs::Filled::created_dirs`].
+    /// as `crate::fs::Filled::created_dirs`.
     #[must_use]
     pub fn created_dirs(&self) -> &[PathBuf] {
         &self.created_dirs
@@ -202,6 +204,7 @@ impl StagedLink {
         } = self;
         let refused = |error: Error| Unpublished {
             error,
+            #[cfg(test)]
             dest: dest.clone(),
         };
         let publish = || -> Result<(), Error> {

@@ -225,8 +225,8 @@ pub enum Error {
     /// replaced or removed while it was held — an outside `mv` or `rm` — so a
     /// second bx may have locked a new file at that path. The message then says
     /// so, and names the path once. [`Ledger::record`],
-    /// [`Ledger::adopt_current_as_prior`] and [`Ledger::save`] check for this
-    /// before they write.
+    /// the test-only `Ledger::adopt_current_as_prior` and [`Ledger::save`]
+    /// check for this before they write.
     #[error("{}", wrong_lock(.held, .needed))]
     WrongLock {
         /// The lock file the presented guard holds.
@@ -578,8 +578,8 @@ pub enum Error {
     /// Any edit outside bx's lines raises this, and re-recording converges
     /// nowhere, so the message names the two ways out, and what the second
     /// leaves behind. Putting the file back needs nothing from bx. Accepting the
-    /// file as it is now is [`Ledger::adopt_current_as_prior`], which the
-    /// command that reports the conflict must offer. Afterwards `bx rm`
+    /// file as it is now is `Ledger::adopt_current_as_prior`, which no command
+    /// offers yet, so only tests reach it. Afterwards `bx rm`
     /// restores the file exactly as it was accepted — bx's region or include
     /// line in it as it was then, stale and no longer managed, for the user to
     /// remove by hand — and what was there before bx stays in the ledger's

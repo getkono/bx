@@ -46,7 +46,7 @@ impl Observed {
     ///
     /// For a mode-only `Modify` this is the `written` its ledger entry records:
     /// that change is applied through [`stage`](super::stage()) with the bytes already there,
-    /// so [`Filled::written`](super::Filled::written) is the digest of the same bytes.
+    /// so what that write fills is the same bytes, with the same digest.
     #[must_use]
     pub fn digest(&self) -> Option<ContentHash> {
         self.bytes.as_deref().map(ContentHash::of)

@@ -106,7 +106,9 @@ impl ContentHash {
     /// Parse the form [`ContentHash::to_hex`] produces.
     ///
     /// Returns `None` for anything that is not exactly 64 hex digits, so a
-    /// stray file in `restore/` cannot be mistaken for a snapshot.
+    /// stray file in `restore/` cannot be mistaken for a snapshot. Only tests
+    /// parse one back.
+    #[cfg(test)]
     #[must_use]
     pub fn from_hex(text: &str) -> Option<Self> {
         if text.len() != LEN * 2 {
@@ -139,6 +141,7 @@ fn nibble(value: u8) -> char {
 /// Spelled out rather than `to_digit(16).and_then(|d| u8::try_from(d).ok())`,
 /// whose `try_from` could not fail — `to_digit(16)` returns less than 16 — so
 /// the `None` it would have produced was unreachable and unpinnable.
+#[cfg(test)]
 fn unnibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),

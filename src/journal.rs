@@ -16,7 +16,7 @@
 //!    staged against the [`crate::fs::Observed`] the request's plan compared, so
 //!    a destination that changed since plan is refused here, before anything is
 //!    stored, announced or published.
-//! 2. [`crate::fs::Staged::fill`] writes the content and `fsync`s it. The
+//! 2. [`crate::fs::atomic::Staged::fill`] writes the content and `fsync`s it. The
 //!    destination is still untouched.
 //! 3. the **prior** bytes are copied into `restore/` and `fsync`ed, so the
 //!    bytes a rollback needs are durable before anything can displace them.

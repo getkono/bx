@@ -389,6 +389,7 @@ impl Assembly {
     }
 
     /// Whether nothing with any content has been contributed.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.phases.iter().flatten().all(|c| c.body.is_empty())

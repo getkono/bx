@@ -35,7 +35,9 @@ mod track;
 use std::collections::BTreeSet;
 
 pub(crate) use decide::read_repo_file;
-pub use diff::{Diff, DiffKind, Palette, View, render};
+#[cfg(test)]
+pub use diff::DiffKind;
+pub use diff::{Diff, Palette, View, render};
 pub use error::Error;
 pub use inputs::Inputs;
 

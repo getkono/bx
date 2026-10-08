@@ -2,7 +2,6 @@
 # only shrinks: split a file below the limit, then delete its line. Never add one.
 src/config/merge.rs
 src/config/resolve.rs
-src/env_guard.rs
 src/fs/atomic.rs
 src/journal.rs
 src/plan/decide.rs

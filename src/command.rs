@@ -421,7 +421,7 @@ pub fn update(
     mode: UpdateMode,
     out: &mut dyn Write,
 ) -> Result<Exit, update::Error> {
-    let git = crate::git::Git::new(env);
+    let git = Git::new(env);
     match mode {
         UpdateMode::Update { yes } => update_with(env, names, yes, out, &git, &mut confirm),
         UpdateMode::Check => update::check(env, names, false, &git, out),
@@ -437,7 +437,7 @@ fn update_with(
     names: &[String],
     yes: bool,
     out: &mut dyn Write,
-    git: &crate::git::Git,
+    git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, update::Error> {
     if !yes && !env.stdin_tty {
@@ -535,7 +535,7 @@ fn update_with(
         say(out, &found.summary())?;
         if let update::Verdict::Moves { log: Some(log), .. } = &found.verdict {
             for line in log {
-                say(out, &format!("    {}", crate::report::escape(line)))?;
+                say(out, &format!("    {}", report::escape(line)))?;
             }
         }
     }

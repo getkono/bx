@@ -107,15 +107,15 @@
 //! hook-env)"` — is the tool's own behaviour at runtime, outside what bx
 //! emits. [`crate::shell::activation::relocations`] is that search.
 //!
-//! The shell-init snippet is the one file under the no-assignment rule
-//! above: fixed text that sets no environment variable outside
+//! Two files are under the no-assignment rule above. The first is the
+//! shell-init snippet: fixed text that sets no environment variable outside
 //! bx's own `BX_` namespace, and gets every other variable by sourcing a
 //! guarded environment fragment.
 //! `tests::the_init_snippet_is_not_an_environment_fragment` holds the
 //! snippet's bytes to the rule rather than assuming it, and holds the bytes
-//! the repository actually keeps — `bench/fixtures/bx/bx-init.zsh`, which at
-//! this head is the snippet's only copy, because no bx code generates shell
-//! content yet. The zsh update prompt is the second: it assigns only its
+//! the repository actually keeps — `bench/fixtures/bx/bx-init.zsh`, the
+//! snippet's only copy, since no bx generator emits it. The zsh update
+//! prompt is the second: it assigns only its
 //! locals, `BX_` names and zsh's `precmd_functions` hook array, and
 //! `tests::the_update_prompt_is_not_an_environment_fragment` holds
 //! [`crate::shell::update_prompt::ZSH`] to that. Nothing holds a *third*

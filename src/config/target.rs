@@ -65,18 +65,19 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::shell::activation;
-use crate::shell::alias::AliasDecl;
-use crate::shell::function::Function;
-use crate::shell::keybindings::Keybindings;
-use crate::shell::plugin::PluginDecl;
-use crate::shell::source::Source;
-use crate::shell::{Assembly, Phase};
-
 use toml_edit::Table;
 
+use super::alias::AliasDecl;
+use super::env::Var;
+use super::function::Function;
 use super::history::History;
-use super::resolution::{BlockedEntry, Resolution};
+use super::keybindings::Keybindings;
+use super::path::PathEntry;
+use super::plugin::PluginDecl;
+use super::resolution::Resolution;
+use super::shell_options::ShellOptions;
+use super::shells::Phase;
+use super::source::Source;
 use super::{Ctx, Error, Origin};
 use crate::paths::Portable;
 
@@ -279,7 +280,8 @@ pub fn link_text(text: &str, home: &Path) -> PathBuf {
 /// Each variant carries everything its bytes are made of, so producing them is
 /// a pure function of the resolved target and whether each tool a
 /// `when = "has:TOOL"` names is present: the plan decides on exactly the bytes
-/// `apply` writes. [`Gen::render`] is that function.
+/// `apply` writes. `Gen::render`, which [`crate::shell`] implements, is that
+/// function.
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
 /// ([`super::env`]), which also carries the `[[plugin]]` entries, the
@@ -308,47 +310,34 @@ pub enum Gen {
     /// as [`Gen::Interactive`] is: by its `env` phase, its one environment
     /// fragment, and the history file it names. Boxed for the reason
     /// [`Gen::Interactive`] is.
-    Bash(Box<crate::shell::bash::Bash>),
+    Bash(Box<Bash>),
     /// `~/.inputrc`, the declared keybindings in readline's syntax; see
     /// [`crate::shell::bash::render_inputrc`]. Readline's syntax has no
     /// environment variable to judge.
     Inputrc(Keybindings),
 }
 
-impl Gen {
-    /// The body this generator produces.
-    ///
-    /// `present` answers whether a tool a `when = "has:TOOL"` names is usable
-    /// on this machine: the one input besides the target itself, asked while
-    /// `plan` and `apply` decide, never by the generated shell.
-    #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
-        match self {
-            Self::Env(fragment) => fragment.render(present),
-            Self::Source(fragment) => super::env::source_line(fragment),
-            Self::Interactive(file) => file.render(present),
-            Self::Bash(file) => file.render(present),
-            Self::Inputrc(keybindings) => crate::shell::bash::render_inputrc(keybindings),
-        }
-    }
-
-    /// What the generator's plan row says beside its bytes: for zsh's and
-    /// bash's interactive files, the functions and sources held back from it,
-    /// each with what would release it, and the declarations that do not
-    /// reach that shell. `None` for every other generator, and for an
-    /// interactive file with nothing to say.
-    #[must_use]
-    pub fn note(&self) -> Option<String> {
-        match self {
-            Self::Interactive(file) => file.note(),
-            Self::Bash(file) => file.note(),
-            Self::Env(_) | Self::Source(_) | Self::Inputrc(_) => None,
-        }
-    }
+/// One tool activation's text in an interactive file, as the plan decided it:
+/// what [`crate::shell::activation::plan`] reused or captured for one shell,
+/// already written as the text its phase holds.
+///
+/// The interactive files carry this rather than the plan itself, because
+/// running a tool and caching what it printed are the plan's and
+/// [`crate::shell`]'s business, and what a file needs is the decided text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activated {
+    /// The phase the text lands in.
+    pub phase: Phase,
+    /// The activation's name, which owns the text in its phase.
+    pub name: String,
+    /// The text: a comment naming the activation, then one `eval` of a
+    /// single-quoted literal holding the output.
+    pub body: String,
 }
 
 /// The interactive shell file, `~/.local/share/bx/zshrc.zsh`, rendered through
-/// [`crate::shell::Assembly`] in its fixed phase order.
+/// [`crate::shell::Assembly`] in its fixed phase order by
+/// [`crate::shell::zsh`].
 ///
 /// The interactive `[[env]]` fragment lands in the `env` phase, whole, and is
 /// the one part of the file [`crate::env_guard`] judges; every enabled
@@ -364,7 +353,7 @@ impl Gen {
 /// whose path resolved lands in the phase it names, after that phase's own
 /// declarations, as the one guarded line [`Source::render_in`] renders; and
 /// every declared tool activation the plan reused or captured lands in the phase it
-/// names, as the one `eval` of a literal [`activation::Step::body`] renders,
+/// names, as the one `eval` of a literal [`Activated::body`] holds,
 /// before any source in that phase. No phase
 /// but `env` holds an environment assignment (Invariant 2): the `options`
 /// phase assigns only zsh's own unexported history parameters, which
@@ -393,10 +382,10 @@ pub struct Interactive {
     /// The enabled declared optional sources, each resolved or held back in
     /// its own position, in the merged configuration's order.
     sources: Vec<Resolution<Source>>,
-    /// The declared tool activations, as `plan` decided them. Empty until the
-    /// plan attaches them ([`Interactive::with_activations`]): resolution
-    /// runs no tool, so it cannot know their output.
-    activations: activation::Plan,
+    /// zsh's tool activations, as `plan` decided them, in declaration order.
+    /// Empty until the plan attaches them ([`Interactive::with_activations`]):
+    /// resolution runs no tool, so it cannot know their output.
+    activations: Vec<Activated>,
     /// What the file's plan row says of the declarations that do not reach
     /// zsh ([`crate::shell::omitted`]), if any.
     omitted: Option<String>,
@@ -415,7 +404,7 @@ impl Interactive {
             functions: Vec::new(),
             keybindings: Keybindings::default(),
             sources: Vec::new(),
-            activations: activation::Plan::default(),
+            activations: Vec::new(),
             omitted: None,
         }
     }
@@ -428,13 +417,26 @@ impl Interactive {
         self
     }
 
-    /// The file with `activations` in its `activations` and `completions`
-    /// phases: every step that reused or captured an output, in declaration
-    /// order. An omitted step adds nothing.
+    /// What the file's plan row says of the declarations that do not reach
+    /// zsh, if anything.
     #[must_use]
-    pub fn with_activations(mut self, activations: activation::Plan) -> Self {
+    pub fn omitted(&self) -> Option<&str> {
+        self.omitted.as_deref()
+    }
+
+    /// The file with `activations` in its `activations` and `completions`
+    /// phases: zsh's text for every step that reused or captured an output,
+    /// in declaration order. An omitted step has no text to add.
+    #[must_use]
+    pub fn with_activations(mut self, activations: Vec<Activated>) -> Self {
         self.activations = activations;
         self
+    }
+
+    /// zsh's tool activations the plan attached, in declaration order.
+    #[must_use]
+    pub fn activations(&self) -> &[Activated] {
+        &self.activations
     }
 
     /// The file with `keybindings` in its `keybindings` phase.
@@ -442,6 +444,12 @@ impl Interactive {
     pub fn with_keybindings(mut self, keybindings: Keybindings) -> Self {
         self.keybindings = keybindings;
         self
+    }
+
+    /// The declared keybindings.
+    #[must_use]
+    pub const fn keybindings(&self) -> &Keybindings {
+        &self.keybindings
     }
 
     /// The file with `history` in its `options` phase.
@@ -459,7 +467,7 @@ impl Interactive {
 
     /// The file with `sources` added: the enabled declared optional sources
     /// as [`crate::shell::source::resolve`] resolved them, each ready one
-    /// written and each held-back one named by [`Interactive::note`].
+    /// written and each held-back one named by `Interactive::note`.
     #[must_use]
     pub fn with_sources(mut self, sources: Vec<Resolution<Source>>) -> Self {
         self.sources = sources;
@@ -475,7 +483,7 @@ impl Interactive {
 
     /// The file with `functions` added: the enabled functions as
     /// [`crate::shell::function::resolve`] resolved them, each ready one
-    /// written and each held-back one named by [`Interactive::note`].
+    /// written and each held-back one named by `Interactive::note`.
     #[must_use]
     pub fn with_functions(mut self, functions: Vec<Resolution<Function>>) -> Self {
         self.functions = functions;
@@ -488,38 +496,10 @@ impl Interactive {
         &self.functions
     }
 
-    /// The note the file's plan row carries: every function held back from
-    /// it, then every source, each named with what would release it, or
-    /// `None` when none is.
-    ///
-    /// Decided by the values alone, never by `present`, so the note is the
-    /// same whichever tools this machine has.
-    #[must_use]
-    pub fn note(&self) -> Option<String> {
-        fn held<T>(resolutions: &[Resolution<T>]) -> Vec<&BlockedEntry> {
-            resolutions
-                .iter()
-                .filter_map(|resolution| match resolution {
-                    Resolution::Blocked(entry) => Some(entry),
-                    Resolution::Ready(_) => None,
-                })
-                .collect()
-        }
-        let notes: Vec<String> = [
-            crate::shell::function::note(&held(&self.functions)),
-            crate::shell::source::note(&held(&self.sources)),
-            self.omitted.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        (!notes.is_empty()).then(|| notes.join("; "))
-    }
-
     /// The file with `aliases` added, the disabled ones dropped.
     ///
     /// Whether a `has:TOOL` alias is written is not decided here: it is
-    /// decided by [`Interactive::render`]'s `present`, so the file carries
+    /// decided by `Interactive::render`'s `present`, so the file carries
     /// every enabled alias and the bytes follow the machine.
     #[must_use]
     pub fn with_aliases(mut self, aliases: &[AliasDecl]) -> Self {
@@ -556,76 +536,159 @@ impl Interactive {
     pub fn plugins(&self) -> &[PluginDecl] {
         &self.plugins
     }
-
-    /// The file's bytes.
-    ///
-    /// The fragment is contributed only when it holds a variable, so a file
-    /// with plugins alone has no `env` phase, a history declaring nothing zsh
-    /// reads adds no `options` phase, a file whose every alias is gated on a
-    /// missing tool has no `aliases` phase, and a file whose every function is
-    /// held back has no `functions` phase, and a file binding no key has no
-    /// `keybindings` phase. The bytes are a function of the variables, the
-    /// plugins, the history, the aliases, the functions, the keybindings, the
-    /// sources, the activations the plan attached and `present`'s answers
-    /// alone: never of whether a plugin's or a source's file exists.
-    ///
-    /// A file holding a plugin, a source line or an activation closes with
-    /// [`SETTLE`]. A guarded line whose file is absent returns 1, an
-    /// activation's `eval` returns whatever the tool's code last did, and a
-    /// file sourced at
-    /// startup returns the status of its last command, so a file ending on one
-    /// would stop a shell running under `ERR_EXIT` before its prompt — and
-    /// show every other shell a failed status at its first prompt.
-    #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
-        let mut assembly = Assembly::new();
-        let contributed = if self.env.vars.is_empty() {
-            Ok(())
-        } else {
-            assembly.contribute(Phase::Env, super::env::SECTION, self.env.render(present))
-        }
-        .and_then(|()| crate::shell::plugin::contribute(&mut assembly, &self.plugins))
-        .and_then(|()| {
-            assembly.contribute(
-                Phase::Options,
-                super::history::SECTION,
-                self.history.render_zsh(),
-            )
-        });
-        // Only the terminal slot refuses a contribution, and `with_plugins`
-        // admitted at most one claimant.
-        contributed.expect("an `Interactive` holds at most one terminal claimant");
-        crate::shell::alias::contribute(&mut assembly, &self.aliases, present);
-        // The held-back functions are the note's to name, not the bytes'.
-        crate::shell::function::contribute(&mut assembly, &self.functions, present);
-        crate::shell::keybindings::contribute(&mut assembly, &self.keybindings);
-        // An activation lands only in `activations` or `completions`, neither
-        // of which refuses a contribution.
-        self.activations
-            .contribute(&mut assembly, crate::shell::Shell::Zsh)
-            .expect("an activation never claims the terminal slot");
-        let activated = self.activations.renders(crate::shell::Shell::Zsh);
-        // Last, so each source follows its phase's own declarations; the
-        // held-back ones are the note's to name.
-        let sourced = crate::shell::source::contribute(
-            &mut assembly,
-            &self.sources,
-            crate::shell::Shell::Zsh,
-            present,
-        );
-        let mut out = assembly.render();
-        if !self.plugins.is_empty() || sourced || activated {
-            out.push_str(SETTLE);
-        }
-        out
-    }
 }
 
-/// The lines that close an interactive file holding a plugin or a source line:
-/// a comment, and a command that sets nothing and returns 0. The comment's
-/// words predate declared sources and are kept, so a file written before them
-/// is not rewritten for a comment.
-pub(crate) const SETTLE: &str = "\n# bx: done, whichever plugins were found\ntrue\n";
+/// One variable bash's `env` phase holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashVar {
+    /// The variable, its value substituted.
+    pub var: Var,
+    /// Whether only a login shell sets it: a `kind = "login"` variable, which
+    /// zsh reads from `~/.zprofile`.
+    pub login: bool,
+}
+
+/// What bash's generated interactive file holds, rendered by
+/// [`crate::shell::bash`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Bash {
+    /// The variables, `environment` then `login` then `interactive`, each
+    /// kind in the merged configuration's order.
+    env: Vec<BashVar>,
+    /// The `[path]` entries that reach bash, in the merged configuration's
+    /// order.
+    path: Vec<PathEntry>,
+    /// The enabled aliases, in the merged configuration's order.
+    aliases: Vec<AliasDecl>,
+    /// The declared history, rendered in bash's names.
+    history: History,
+    /// The declared shell options.
+    options: ShellOptions,
+    /// The enabled functions bash defines, each resolved or held back.
+    functions: Vec<Resolution<Function>>,
+    /// The enabled sources bash reads, each resolved or held back.
+    sources: Vec<Resolution<Source>>,
+    /// bash's tool activations, as `plan` decided them, in declaration order.
+    /// Empty until the plan attaches them.
+    activations: Vec<Activated>,
+    /// What the file's plan row says of the declarations that do not reach
+    /// bash ([`crate::shell::omitted`]).
+    omitted: Option<String>,
+}
+
+impl Bash {
+    /// The file holding `aliases` — the disabled ones dropped — `history` and
+    /// `options`, and nothing else yet.
+    #[must_use]
+    pub fn new(aliases: &[AliasDecl], history: History, options: ShellOptions) -> Self {
+        Self {
+            aliases: aliases.iter().filter(|a| a.enabled).cloned().collect(),
+            history,
+            options,
+            ..Self::default()
+        }
+    }
+
+    /// The file with `env` in its `env` phase.
+    #[must_use]
+    pub fn with_env(mut self, env: Vec<BashVar>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// The file with `entries` in its `path` phase.
+    #[must_use]
+    pub fn with_path(mut self, entries: Vec<PathEntry>) -> Self {
+        self.path = entries;
+        self
+    }
+
+    /// The file with `functions` in its `functions` phase, as
+    /// [`crate::shell::function::resolve_bash`] resolved them.
+    #[must_use]
+    pub fn with_functions(mut self, functions: Vec<Resolution<Function>>) -> Self {
+        self.functions = functions;
+        self
+    }
+
+    /// The file with `sources`, each in the phase it names.
+    #[must_use]
+    pub fn with_sources(mut self, sources: Vec<Resolution<Source>>) -> Self {
+        self.sources = sources;
+        self
+    }
+
+    /// The file with `activations`, bash's text for every step that reused
+    /// or captured an output, in their phases.
+    #[must_use]
+    pub fn with_activations(mut self, activations: Vec<Activated>) -> Self {
+        self.activations = activations;
+        self
+    }
+
+    /// The file with `omitted` as what its plan row says of the declarations
+    /// that do not reach bash.
+    #[must_use]
+    pub fn with_omitted(mut self, omitted: Option<String>) -> Self {
+        self.omitted = omitted;
+        self
+    }
+
+    /// The variables, in the order the `env` phase holds them.
+    #[must_use]
+    pub fn env_vars(&self) -> &[BashVar] {
+        &self.env
+    }
+
+    /// The `[path]` entries that reach bash.
+    #[must_use]
+    pub fn path(&self) -> &[PathEntry] {
+        &self.path
+    }
+
+    /// The enabled aliases, in the merged configuration's order.
+    #[must_use]
+    pub fn aliases(&self) -> &[AliasDecl] {
+        &self.aliases
+    }
+
+    /// The declared history, whose bash file the plan judges.
+    #[must_use]
+    pub const fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// The declared shell options.
+    #[must_use]
+    pub const fn options(&self) -> &ShellOptions {
+        &self.options
+    }
+
+    /// The enabled functions bash defines, each resolved or held back.
+    #[must_use]
+    pub fn functions(&self) -> &[Resolution<Function>] {
+        &self.functions
+    }
+
+    /// The enabled sources bash reads, each resolved or held back.
+    #[must_use]
+    pub fn sources(&self) -> &[Resolution<Source>] {
+        &self.sources
+    }
+
+    /// bash's tool activations the plan attached, in declaration order.
+    #[must_use]
+    pub fn activations(&self) -> &[Activated] {
+        &self.activations
+    }
+
+    /// What the file's plan row says of the declarations that do not reach
+    /// bash, if anything.
+    #[must_use]
+    pub fn omitted(&self) -> Option<&str> {
+        self.omitted.as_deref()
+    }
+}
 
 /// Resolve the name a config author wrote as `generated = "…"`.
 ///
@@ -2586,6 +2649,8 @@ mod tests {
 
         use super::super::super::env::{Fragment, Syntax, Var};
         use super::*;
+        use crate::config::resolution::BlockedEntry;
+        use crate::shell::activation;
         use crate::shell::testing::{installed, run};
 
         /// The fragment the interactive place holds, with `vars`.
@@ -2924,7 +2989,8 @@ mod tests {
             }
         }
 
-        fn activations(decls: &[(&str, Phase)]) -> activation::Plan {
+        /// zsh's text for `decls`, as the plan decides it on [`Echo`].
+        fn activations(decls: &[(&str, Phase)]) -> Vec<Activated> {
             let decls: Vec<activation::ActivationDecl> = decls
                 .iter()
                 .map(|(name, phase)| activation::ActivationDecl {
@@ -2947,6 +3013,7 @@ mod tests {
                 &crate::env_guard::RootSet::strict(),
                 &Echo,
             )
+            .rendered(crate::shell::Shell::Zsh)
         }
 
         #[test]

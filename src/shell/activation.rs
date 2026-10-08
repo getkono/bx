@@ -148,6 +148,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{Assembly, Shell, quote};
+use crate::config::target::Activated;
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
 use crate::report::Action;
@@ -578,12 +579,24 @@ impl Plan {
     /// Whatever [`Assembly::contribute`] refuses. An activation lands only in
     /// `activations` or `completions`, neither of which refuses anything.
     pub fn contribute(&self, assembly: &mut Assembly, shell: Shell) -> Result<(), super::Error> {
-        for step in self.steps.iter().filter(|step| step.shell == shell) {
-            if let Some(body) = step.body() {
-                assembly.contribute(step.decl.phase, step.decl.name.clone(), body)?;
-            }
-        }
-        Ok(())
+        contribute(assembly, &self.rendered(shell))
+    }
+
+    /// `shell`'s text for every step that renders anything, in declaration
+    /// order: what that shell's interactive file carries.
+    #[must_use]
+    pub fn rendered(&self, shell: Shell) -> Vec<Activated> {
+        self.steps
+            .iter()
+            .filter(|step| step.shell == shell)
+            .filter_map(|step| {
+                step.body().map(|body| Activated {
+                    phase: step.decl.phase,
+                    name: step.decl.name.clone(),
+                    body,
+                })
+            })
+            .collect()
     }
 
     /// Whether any step for `shell` renders anything.
@@ -624,6 +637,23 @@ impl Plan {
             cache.remove(&key);
         }
     }
+}
+
+/// Add each of `activated` to its phase, in order.
+///
+/// # Errors
+///
+/// Whatever [`Assembly::contribute`] refuses. An activation lands only in
+/// `activations` or `completions`, neither of which refuses anything.
+pub fn contribute(assembly: &mut Assembly, activated: &[Activated]) -> Result<(), super::Error> {
+    for activation in activated {
+        assembly.contribute(
+            activation.phase,
+            activation.name.clone(),
+            activation.body.clone(),
+        )?;
+    }
+    Ok(())
 }
 
 /// A cache entry: the inputs that produced an output, and the output.

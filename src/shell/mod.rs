@@ -117,6 +117,60 @@ pub mod keybindings;
 pub mod placement;
 pub mod plugin;
 pub mod source;
+pub mod zsh;
+
+use crate::config::resolution::{BlockedEntry, Resolution};
+use crate::config::target::Gen;
+
+impl Gen {
+    /// The body this generator produces.
+    ///
+    /// `present` answers whether a tool a `when = "has:TOOL"` names is usable
+    /// on this machine: the one input besides the target itself, asked while
+    /// `plan` and `apply` decide, never by the generated shell.
+    #[must_use]
+    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+        match self {
+            Self::Env(fragment) => fragment.render(present),
+            Self::Source(fragment) => crate::config::env::source_line(fragment),
+            Self::Interactive(file) => file.render(present),
+            Self::Bash(file) => file.render(present),
+            Self::Inputrc(keybindings) => bash::render_inputrc(keybindings),
+        }
+    }
+
+    /// What the generator's plan row says beside its bytes: for zsh's and
+    /// bash's interactive files, the functions and sources held back from it,
+    /// each with what would release it, and the declarations that do not
+    /// reach that shell. `None` for every other generator, and for an
+    /// interactive file with nothing to say.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Self::Interactive(file) => file.note(),
+            Self::Bash(file) => file.note(),
+            Self::Env(_) | Self::Source(_) | Self::Inputrc(_) => None,
+        }
+    }
+}
+
+/// The lines that close an interactive file holding a plugin or a source line:
+/// a comment, and a command that sets nothing and returns 0. The comment's
+/// words predate declared sources and are kept, so a file written before them
+/// is not rewritten for a comment.
+pub(crate) const SETTLE: &str = "\n# bx: done, whichever plugins were found\ntrue\n";
+
+/// The entries of `resolutions` that are held back, in their order: what an
+/// interactive file's note names.
+fn held<T>(resolutions: &[Resolution<T>]) -> Vec<&BlockedEntry> {
+    resolutions
+        .iter()
+        .filter_map(|resolution| match resolution {
+            Resolution::Blocked(entry) => Some(entry),
+            Resolution::Ready(_) => None,
+        })
+        .collect()
+}
 
 /// `text` as one single-quoted shell word that means exactly `text`, whatever
 /// it holds: an alias body, or a tool's cached activation output.

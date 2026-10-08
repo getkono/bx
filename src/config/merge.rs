@@ -4853,16 +4853,13 @@ mod tests {
         //
         // `target.rs` parses every target a layer holds, against the home it is
         // handed. The `paths` module holds `Portable::parse_in` and
-        // `normalize`, which every module above calls, and also the crate's two
-        // deliberate reads of the environment: `home()` and `config_root()`,
-        // the edges that hand a resolution path its arguments. Each edge line
-        // is allowed only in `paths`, exactly once across the whole module and
-        // by its whole text, so a third read anywhere in it, or a second copy
-        // of either, still fails here.
-        const PATHS_EDGES: [&str; 2] = [
-            "home_in(std::env::var_os(\"HOME\").as_deref())",
-            "std::env::var_os(\"XDG_CONFIG_HOME\").as_deref(),",
-        ];
+        // `normalize`, which every module above calls, and also the crate's one
+        // deliberate read of the environment there: `home()`, the edge that
+        // hands a resolution path its argument. The edge line is allowed only
+        // in `paths`, exactly once across the whole module and by its whole
+        // text, so a second read anywhere in it, or a second copy of it, still
+        // fails here.
+        const PATHS_EDGES: [&str; 1] = ["home_in(std::env::var_os(\"HOME\").as_deref())"];
         let mut edges_seen = [0_usize; PATHS_EDGES.len()];
         for (module, edges) in [("config", &[][..]), ("paths", &PATHS_EDGES[..])] {
             for (path, source) in crate::testing::module_sources(module) {

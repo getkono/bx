@@ -244,7 +244,7 @@ pub enum Error {
     /// so every command that looks for an interrupted session would hang —
     /// and no session writes one: [`Journal::create`] renames a regular file
     /// into place. It is left exactly where it is, never set aside by a
-    /// recovery, and [`crate::recover::abandon`] moves it aside.
+    /// recovery, and `crate::recover::abandon` moves it aside.
     #[error(
         "the write-ahead journal {} is {kind}; bx reads a journal only from a regular file, \
          so it did not open it, and will not write until it is moved",
@@ -259,7 +259,7 @@ pub enum Error {
     /// A session was asked to start while an unresolved interruption stands.
     ///
     /// The escape is [`crate::recover::recover`], which every writing command
-    /// runs first, or [`crate::recover::abandon`] when recovery is blocked.
+    /// runs first, or `crate::recover::abandon` when recovery is blocked.
     #[error(
         "an interrupted bx session is still recorded in {}; \
          it must be recovered before anything else is written",

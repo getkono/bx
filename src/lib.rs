@@ -46,7 +46,9 @@
 //! [`plan`] is where those pieces meet and Invariant 7 is kept: one traversal
 //! that decides every resolved target against the ledger and the one
 //! comparison, and a diff of each decision, shared by `bx plan`, `bx apply`
-//! and the status view. [`adopt`] is `bx add` and `bx rm`: existing config
+//! and the status view. [`env`](mod@env) is what a command takes from the
+//! process it runs in, read once at the start; the one other read is the
+//! `PATH` [`plan`] loads its inputs with. [`adopt`] is `bx add` and `bx rm`: existing config
 //! taken into the repo byte for byte, and handed back exactly. [`init`] is
 //! `bx init`'s setup before it plans: the repo created when there is none,
 //! this account's unset values asked for and saved to `local.toml`, and the
@@ -54,7 +56,8 @@
 //! holds the commands' bodies, `bx doctor`'s among them, so the binary only
 //! parses its arguments and dispatches. [`sync`] is the git on either side of
 //! `bx sync`'s apply: a fast-forward-only pull before it, and a push after it
-//! that never carries a state file. [`upgrade`] is `bx self-upgrade`: the
+//! that never carries a state file. [`git`] runs the user's own `git` for it,
+//! for a declared external, and for `bx rm`'s checks on a checkout. [`upgrade`] is `bx self-upgrade`: the
 //! installer a fresh install runs, fetched from master and run only while its
 //! digest is the one this release pins.
 //!
@@ -116,8 +119,10 @@ pub mod command;
 pub mod config;
 pub mod detect;
 pub mod doctor;
+pub mod env;
 pub mod env_guard;
 pub mod fs;
+pub mod git;
 pub mod init;
 pub mod journal;
 pub mod paths;

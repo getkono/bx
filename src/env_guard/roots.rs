@@ -69,11 +69,12 @@ pub struct RootSet {
 impl RootSet {
     /// The set that declares nothing, and therefore permits no relocation.
     ///
-    /// This is what [`scan`](super::scan) uses, and it needs no home: with no root declared
+    /// This is what `scan` uses, and it needs no home: with no root declared
     /// every location is a violation before it is compared with anything. A
     /// program, a search list or a socket needs no root, and without a home
     /// the set cannot say where bx's state directory is — so it owns every
-    /// directory that could be it. See [`RootSet::owns`].
+    /// directory that could be it. See [`RootSet::owns`]. Only tests build one.
+    #[cfg(test)]
     #[must_use]
     pub fn strict() -> Self {
         Self {
@@ -93,7 +94,7 @@ impl RootSet {
     /// compared have been through the same rules.
     ///
     /// A root that does not clear [`admissible_root`] is **not honoured**. It is
-    /// kept, as declared, in [`RootSet::inadmissible`], logged at error level,
+    /// kept, as declared, in `RootSet::inadmissible`, logged at error level,
     /// and it changes the verdict: a set left with no admissible root refuses
     /// every relocation as [`Reason::InadmissibleRoot`], never as
     /// [`Reason::NoRootsDeclared`] — a user whose configuration visibly declares
@@ -198,7 +199,7 @@ impl RootSet {
     /// root: `refuses_entry_bx`, for a location or a list of them — once
     /// per `:`-entry through `refuses_entry_placement` and once for a
     /// location's whole value — and `refuses_anchor`, for an exported
-    /// anchor. The only set without a home is [`RootSet::strict`], which
+    /// anchor. The only set without a home is the test-only `RootSet::strict`, which
     /// declares none. A later kind given a containing check must not simply
     /// call this: unless it is judged behind the same refusal, under `scan` it
     /// would get no protection at all, and it needs its own answer to the
@@ -222,7 +223,7 @@ impl RootSet {
     /// containment and outranks it — a user may declare their home a root, and
     /// `CARGO_HOME=~/.local/state/bx` is still refused.
     ///
-    /// A set without a home — [`RootSet::strict`] — cannot show that a path is
+    /// A set without a home — `RootSet::strict` — cannot show that a path is
     /// *not* bx's state directory, whose default place is under the home. So it
     /// owns every path that passes through `.local/state/bx`, whoever's home
     /// that is. A set with a home knows where its state directory is, and owns
@@ -258,6 +259,7 @@ impl RootSet {
     }
 
     /// Whether no admissible root is declared.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.roots.is_empty()
@@ -265,8 +267,9 @@ impl RootSet {
 
     /// The declared roots that were refused, exactly as they were declared.
     ///
-    /// A caller reporting a configuration prints these: they are the mistake a
-    /// [`Reason::InadmissibleRoot`] verdict is about.
+    /// They are the mistake a [`Reason::InadmissibleRoot`] verdict is about.
+    /// Only tests read them back.
+    #[cfg(test)]
     #[must_use]
     pub fn inadmissible(&self) -> &[PathBuf] {
         &self.inadmissible

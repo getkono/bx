@@ -43,8 +43,8 @@
 //! that judged by a list of location names, or by whether a value looked like
 //! a path, approved a tool it had not heard of. The guard judges only what bx
 //! generates, so the table grows with the generators and with nothing else.
-//! [`check`] is the verdict. Declare no root — [`RootSet::strict`], which is
-//! what [`scan`] uses — and no location, no list of locations and no anchor
+//! [`check`] is the verdict. Declare no root — `RootSet::strict`, which is
+//! what the test-only `scan` uses — and no location, no list of locations and no anchor
 //! may be set at all. A program, a search list and a socket say what a tool
 //! runs, where it looks and what it connects to rather than where its files
 //! live, so they move nothing and need no root — but no more than any other
@@ -383,11 +383,12 @@ pub fn scan_exported(content: &str, roots: &RootSet) -> Vec<Violation> {
 
 /// Find every forbidden assignment in a block of shell bx is about to write.
 ///
-/// Equivalent to [`scan_with`] against [`RootSet::strict`]: with no root
+/// Equivalent to [`scan_with`] against `RootSet::strict`: with no root
 /// declared, every location is a violation, and a program, a search list or a
 /// socket may not pass through a default state directory under any home. This
 /// is the check for a caller that has no configuration to consult, and it is
-/// why it needs no home.
+/// why it needs no home. Every shipped caller has one, so only tests call it.
+#[cfg(test)]
 #[must_use]
 pub fn scan(content: &str) -> Vec<Violation> {
     scan_with(content, &RootSet::strict())

@@ -92,7 +92,8 @@
 //! [`plan`] is the one function: it decides every activation, runs whatever
 //! has to run, and returns [`Step`]s that say which were reused, captured or
 //! omitted. `apply` does not decide again. It hands the same
-//! [`Plan`] to [`Plan::contribute`], which renders the file, and to
+//! [`Plan`] to [`Plan::rendered`], whose text each interactive file carries
+//! and renders through [`contribute`], and to
 //! [`Plan::record`], which writes the captures into the cache it then saves. A
 //! second `plan` against an unchanged machine therefore reuses every entry,
 //! starts no process, and renders the same bytes.
@@ -147,8 +148,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Assembly, Phase, Shell, Shells, quote};
-use crate::config::Origin;
+use super::{Assembly, Shell, quote};
+use crate::config::target::Activated;
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
 use crate::report::Action;
@@ -174,28 +175,10 @@ pub const LIMIT: usize = 1 << 20;
 /// How much of a failing command's standard error a note quotes.
 const STDERR_KEPT: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivationDecl {
-    /// The activation's name, its natural key.
-    pub name: String,
-    /// The command every shell runs, `{shell}` spelled as the shell's name,
-    /// `command[0]` being the tool. Empty when only per-shell commands are
-    /// declared.
-    pub command: Vec<String>,
-    /// zsh's own command, in place of `command`.
-    pub zsh: Option<Vec<String>>,
-    /// bash's own command, in place of `command`.
-    pub bash: Option<Vec<String>>,
-    /// The shells whose generated file it lands in.
-    pub shells: Shells,
-    /// The phase its output lands in.
-    pub phase: Phase,
-    /// `false` in any layer removes the activation from the resolved
-    /// configuration.
-    pub enabled: bool,
-    /// Where the entry was written.
-    pub origin: Origin,
-}
+/// A declared tool activation, as [`crate::config::activation`] parses it,
+/// named here too, where everything that runs and renders one already looks
+/// for it.
+pub use crate::config::activation::ActivationDecl;
 
 impl ActivationDecl {
     /// The [`Fingerprints`] key zsh's cache entry lives under.
@@ -589,28 +572,21 @@ impl Plan {
         &self.steps
     }
 
-    /// Add every step for `shell` that renders anything to its phase, in
-    /// declaration order.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`Assembly::contribute`] refuses. An activation lands only in
-    /// `activations` or `completions`, neither of which refuses anything.
-    pub fn contribute(&self, assembly: &mut Assembly, shell: Shell) -> Result<(), super::Error> {
-        for step in self.steps.iter().filter(|step| step.shell == shell) {
-            if let Some(body) = step.body() {
-                assembly.contribute(step.decl.phase, step.decl.name.clone(), body)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether any step for `shell` renders anything.
+    /// `shell`'s text for every step that renders anything, in declaration
+    /// order: what that shell's interactive file carries.
     #[must_use]
-    pub fn renders(&self, shell: Shell) -> bool {
+    pub fn rendered(&self, shell: Shell) -> Vec<Activated> {
         self.steps
             .iter()
-            .any(|step| step.shell == shell && step.body().is_some())
+            .filter(|step| step.shell == shell)
+            .filter_map(|step| {
+                step.body().map(|body| Activated {
+                    phase: step.decl.phase,
+                    name: step.decl.name.clone(),
+                    body,
+                })
+            })
+            .collect()
     }
 
     /// Bring `cache` up to date with the plan: record every capture, and
@@ -643,6 +619,23 @@ impl Plan {
             cache.remove(&key);
         }
     }
+}
+
+/// Add each of `activated` to its phase, in order.
+///
+/// # Errors
+///
+/// Whatever [`Assembly::contribute`] refuses. An activation lands only in
+/// `activations` or `completions`, neither of which refuses anything.
+pub fn contribute(assembly: &mut Assembly, activated: &[Activated]) -> Result<(), super::Error> {
+    for activation in activated {
+        assembly.contribute(
+            activation.phase,
+            activation.name.clone(),
+            activation.body.clone(),
+        )?;
+    }
+    Ok(())
 }
 
 /// A cache entry: the inputs that produced an output, and the output.
@@ -1378,7 +1371,9 @@ fn line_of(chars: &[char], at: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Origin;
     use crate::config::activation::parse_activation;
+    use crate::config::shells::{Phase, Shells};
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use toml_edit::Document;
@@ -1516,7 +1511,7 @@ mod tests {
     fn apply(decls: &[ActivationDecl], cache: &mut Fingerprints, host: &Fake) -> (Plan, String) {
         let plan = plan(decls, cache, &RootSet::strict(), host);
         let mut assembly = Assembly::new();
-        plan.contribute(&mut assembly, Shell::Zsh)
+        contribute(&mut assembly, &plan.rendered(Shell::Zsh))
             .expect("activations never claim the terminal slot");
         plan.record(cache);
         (plan, assembly.render())
@@ -1638,9 +1633,7 @@ mod tests {
             "+ activation `starship` for bash: run twice, output agreed; cached"
         );
         let mut bash = Assembly::new();
-        decided
-            .contribute(&mut bash, Shell::Bash)
-            .expect("contributes");
+        contribute(&mut bash, &decided.rendered(Shell::Bash)).expect("contributes");
         let bash = bash.render();
         for name in ["starship", "fzf", "bonly"] {
             assert!(
@@ -1654,7 +1647,9 @@ mod tests {
                 "{bash}"
             );
         }
-        assert!(decided.renders(Shell::Bash) && decided.renders(Shell::Zsh));
+        assert!(
+            !decided.rendered(Shell::Bash).is_empty() && !decided.rendered(Shell::Zsh).is_empty()
+        );
         decided.record(&mut cache);
         let mut keys: Vec<&String> = cache.iter().map(|(key, _)| key).collect();
         keys.sort_unstable();
@@ -2348,9 +2343,7 @@ mod tests {
             step("after", "export Y=ok\n"),
         ];
         let mut assembly = Assembly::new();
-        Plan { steps }
-            .contribute(&mut assembly, Shell::Zsh)
-            .expect("contributes");
+        contribute(&mut assembly, &Plan { steps }.rendered(Shell::Zsh)).expect("contributes");
         let dir = tempfile::TempDir::new().expect("tempdir");
         let file = dir.path().join("zshrc.zsh");
         std::fs::write(&file, assembly.render()).expect("write");

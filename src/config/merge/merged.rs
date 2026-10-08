@@ -7,17 +7,17 @@
 
 use super::Toggle;
 use crate::config::Error;
+use crate::config::activation::ActivationDecl;
+use crate::config::alias::AliasDecl;
 use crate::config::env::EnvDecl;
 use crate::config::external::External;
+use crate::config::function::FunctionDecl;
 use crate::config::path::PathEntry;
+use crate::config::plugin::PluginDecl;
+use crate::config::source::SourceDecl;
 use crate::config::target::Target;
 use crate::config::tool::ToolDecl;
 use crate::config::values::ValueDecl;
-use crate::shell::activation::ActivationDecl;
-use crate::shell::alias::AliasDecl;
-use crate::shell::function::FunctionDecl;
-use crate::shell::plugin::PluginDecl;
-use crate::shell::source::SourceDecl;
 
 /// A list entry that merges by a natural key.
 ///

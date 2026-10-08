@@ -9,11 +9,45 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::plugin::unsourceable;
+use super::shells::{Phase, Shells};
 use super::values;
 use super::when::When;
-use super::{Ctx, Error};
-use crate::shell::Phase;
-use crate::shell::source::SourceDecl;
+use super::{Ctx, Error, Origin};
+
+/// One `[[source]]` entry, as written: its path not yet substituted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDecl {
+    /// The source's name, its natural key.
+    pub name: String,
+    /// The path as written, `{{name}}` references and all.
+    pub path: String,
+    /// The phase it loads in.
+    pub phase: Phase,
+    /// The condition it is gated on, if any.
+    pub when: Option<When>,
+    /// The shells whose generated file sources it.
+    pub shells: Shells,
+    /// `false` in any layer removes the source from the resolved
+    /// configuration.
+    pub enabled: bool,
+    /// Where the entry was written.
+    pub origin: Origin,
+}
+
+/// One source ready to write: its path substituted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// The name it was declared under.
+    pub name: String,
+    /// The substituted path, as the line spells it.
+    pub path: String,
+    /// The phase it loads in.
+    pub phase: Phase,
+    /// The condition it is gated on, if any.
+    pub when: Option<When>,
+    /// Where the entry was written.
+    pub origin: Origin,
+}
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[source]]";

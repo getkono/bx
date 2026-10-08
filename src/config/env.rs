@@ -66,11 +66,11 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::path::{self, PathEntry};
+use super::shells::{Shell, Shells};
 use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
 use crate::lexical::is_variable_name;
 use crate::paths::Portable;
-use crate::shell::{Shell, Shells};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[env]]";
@@ -498,7 +498,7 @@ mod tests {
              [[env]]\nname = \"B\"\nvalue = \"1\"\nkind = \"login\"\nshells = [\"bash\", \"zsh\"]\n",
         )
         .expect("parses");
-        assert_eq!(envs[0].shells, Shells::only(crate::shell::Shell::Zsh));
+        assert_eq!(envs[0].shells, Shells::only(Shell::Zsh));
         assert_eq!(envs[1].shells, Shells::EVERY);
         for (shells, expected) in [
             ("[\"fish\"]", "\"fish\" is not a shell bx generates for"),

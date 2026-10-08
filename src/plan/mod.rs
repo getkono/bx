@@ -46,7 +46,7 @@ use crate::journal::{Session, SessionKind};
 use crate::paths::{self, Portable};
 use crate::recover::{self, Interrupted};
 use crate::report::{Action, Exit};
-use crate::shell::activation;
+use crate::shell::{Shell, activation};
 use crate::state::{
     self, ExclusiveLock, Fingerprints, LedgerView, Mechanism, SharedLock, StateDir,
 };
@@ -443,10 +443,16 @@ fn with_activations(
         Resolution::Ready(mut ready) => {
             match &mut ready.body {
                 Body::Generated(Gen::Interactive(file)) => {
-                    **file = file.as_ref().clone().with_activations(activations.clone());
+                    **file = file
+                        .as_ref()
+                        .clone()
+                        .with_activations(activations.rendered(Shell::Zsh));
                 }
                 Body::Generated(Gen::Bash(file)) => {
-                    **file = file.as_ref().clone().with_activations(activations.clone());
+                    **file = file
+                        .as_ref()
+                        .clone()
+                        .with_activations(activations.rendered(Shell::Bash));
                 }
                 _ => {}
             }

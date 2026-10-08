@@ -71,9 +71,9 @@ use std::path::Path;
 
 use toml_edit::{InlineTable, Table, Value};
 
+use super::shells::{Shell, Shells};
 use super::{Ctx, Error, Origin};
 use crate::lexical::is_variable_name;
-use crate::shell::{Shell, Shells};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[path]";

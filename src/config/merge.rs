@@ -145,22 +145,22 @@ mod written_form;
 
 use std::path::Path;
 
+use super::activation::ActivationDecl;
+use super::alias::AliasDecl;
 use super::env::EnvDecl;
 use super::external::External;
+use super::function::FunctionDecl;
 use super::history::History;
+use super::keybindings::Keybindings;
 use super::path::PathEntry;
+use super::plugin::{self, PluginDecl};
 use super::secrets::Secrets;
 use super::shell_options::ShellOptions;
+use super::source::SourceDecl;
 use super::target::Target;
 use super::tool::ToolDecl;
 use super::values::{ResolvedValues, ValueAssignment, ValueDecl};
 use super::{Config, Error, Layer, LayerKind};
-use crate::shell::activation::ActivationDecl;
-use crate::shell::alias::AliasDecl;
-use crate::shell::function::FunctionDecl;
-use crate::shell::keybindings::Keybindings;
-use crate::shell::plugin::{self, PluginDecl};
-use crate::shell::source::SourceDecl;
 
 /// The toggle vocabulary, defined in [`super::toggle`] where a layer is
 /// parsed, and named here too, where the merge applies it.
@@ -1073,7 +1073,7 @@ mod tests {
 
     #[test]
     fn keybindings_merge_key_by_key_the_last_layer_winning() {
-        use crate::shell::keybindings::{Action, Key};
+        use crate::config::keybindings::{Action, Key};
         let merged = merge(&[
             global(
                 "bx.toml",

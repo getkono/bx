@@ -92,8 +92,9 @@ impl Git {
     /// `git` on `PATH`, seeing `home` and git's own default for the config
     /// home.
     ///
-    /// For a caller that has the home and not the whole [`Env`]: `bx rm`'s
-    /// checks on a checkout, which read only that repository.
+    /// For a caller that has the home and not the whole [`Env`]:
+    /// [`crate::restore::plan_restore`], whose checks on a checkout read only
+    /// that repository. `bx rm` itself asks through [`Git::new`].
     #[must_use]
     pub fn at_home(home: &Path) -> Self {
         Self {
@@ -108,7 +109,8 @@ impl Git {
     ///
     /// A declared external is cloned and fetched with nobody necessarily at
     /// the terminal, so a missing credential has to fail rather than wait.
-    /// Every child runs with its standard input closed, and:
+    /// Standard input is left as it is for each command: closed for a query,
+    /// inherited for one that may reach a remote. Every child runs with:
     ///
     /// * `GIT_TERMINAL_PROMPT=0`, so git never asks on the terminal;
     /// * `GIT_ASKPASS` and `SSH_ASKPASS` set to `false`, and

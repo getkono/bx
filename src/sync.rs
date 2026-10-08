@@ -28,7 +28,9 @@
 //!
 //! The branch is compared with its upstream after the fetch. Behind, it is
 //! fast-forwarded; ahead, its commits are pushed once the apply is done; both,
-//! and `sync` stops with [`Error::Diverged`] before it changes anything. It
+//! and `sync` stops with [`Error::Diverged`] before it applies anything, its
+//! only change by then being the commit of copies an interrupted sync carried
+//! ([`pull`] says when that is made). It
 //! never merges, rebases, resets or force-pushes: a diverged history is a
 //! human's to reconcile, and `sync` is run again once they have.
 //!
@@ -205,8 +207,12 @@ pub struct Pulled {
 ///
 /// # Errors
 ///
-/// [`plan::Error::RepoMissing`] when there is no config repo, and every other
-/// [`Error`] as its step says.
+/// [`plan::Error::RepoMissing`] when there is no config repo;
+/// [`Error::StateInRepo`], [`Error::NotARepo`], [`Error::Detached`],
+/// [`Error::NoUpstream`], [`Error::Diverged`] and [`Error::WouldPushState`]
+/// as their steps say; [`Error::Unexpected`] when git's ahead/behind count
+/// cannot be read; [`Error::Git`] when git cannot be started or refuses a
+/// step; and whatever [`commit_carried`] returns.
 pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
     let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
     if !repo.is_dir() {

@@ -4,4 +4,3 @@ src/config/merge.rs
 src/config/resolve.rs
 src/plan/decide.rs
 src/plan/mod.rs
-src/state/ledger.rs

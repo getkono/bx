@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use super::track::{Agreed, Base, Bases, When};
 use super::{Change, Diff, Error, region};
 use crate::config::Origin;
 use crate::config::env::Syntax;
@@ -30,7 +31,7 @@ use crate::fs::{self, Desired, Kind, Mode, Observed};
 use crate::journal::{Content, Ownership, Request};
 use crate::paths::{self, Portable};
 use crate::report::Action;
-use crate::state::{ContentHash, Fingerprint, LedgerEntry, LedgerView, Mechanism};
+use crate::state::{LedgerEntry, LedgerView, Mechanism};
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -50,119 +51,6 @@ pub(super) struct Ctx<'a> {
     pub declared: &'a Declared,
     /// The bytes each tracked target's two sides last agreed on.
     pub bases: &'a Bases,
-}
-
-/// What each tracked target's copy on this machine and copy in the repo last
-/// agreed on, keyed by the target: what "changed since the last sync" is
-/// measured from. Read from the fingerprint cache — see [`super::bases`].
-pub(super) type Bases = BTreeMap<Portable, Base>;
-
-/// What a tracked target's two sides last agreed on, as the fingerprint cache
-/// keeps it: the bytes themselves while they are small, and otherwise only
-/// their digest. See [`Base::fingerprint`] for why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Base {
-    /// The agreed bytes, kept whole so a conflict can show each side's diff
-    /// from them.
-    Bytes(Vec<u8>),
-    /// The SHA-256 of agreed bytes larger than [`Base::KEPT_WHOLE`].
-    Digest([u8; 32]),
-}
-
-impl Base {
-    /// The largest agreement kept whole, in bytes.
-    pub(super) const KEPT_WHOLE: usize = 64 * 1024;
-
-    /// The tag of an agreement kept whole.
-    const BYTES: u8 = b'=';
-
-    /// The tag of an agreement kept as a digest.
-    const DIGEST: u8 = b'#';
-
-    /// The agreement on `bytes`, as it is kept.
-    pub(super) fn of(bytes: &[u8]) -> Self {
-        if bytes.len() <= Self::KEPT_WHOLE {
-            Self::Bytes(bytes.to_vec())
-        } else {
-            Self::Digest(*ContentHash::of(bytes).as_bytes())
-        }
-    }
-
-    /// Whether `bytes` are what was agreed on.
-    pub(super) fn holds(&self, bytes: &[u8]) -> bool {
-        match self {
-            Self::Bytes(agreed) => agreed == bytes,
-            Self::Digest(digest) => digest == ContentHash::of(bytes).as_bytes(),
-        }
-    }
-
-    /// The fingerprint-cache entry this agreement is kept as: a tag byte, then
-    /// the bytes or the digest.
-    ///
-    /// # Decision: small agreements are kept whole, large ones as a digest
-    ///
-    /// Deciding which side moved needs only a comparison, which a digest
-    /// answers. Showing a conflict does not: issue #32 asks for *both sides'
-    /// diffs*, each measured from the last agreement, and a diff needs the
-    /// bytes it is measured from. Nothing else holds them — the repo's copy
-    /// may have been rewritten by another machine since, and the machine's by
-    /// the tool — so the cache keeps them.
-    ///
-    /// The fingerprint cache is for short inputs, so what it keeps is bounded:
-    /// an agreement of at most [`Base::KEPT_WHOLE`] bytes is kept whole, and a
-    /// larger one only as its digest, whose conflict shows the one diff
-    /// between the two sides instead. A plugin manager's lock file, the
-    /// target track mode exists for, is a few kilobytes.
-    pub(super) fn fingerprint(&self) -> Fingerprint {
-        let mut kept = Vec::new();
-        match self {
-            Self::Bytes(bytes) => {
-                kept.push(Self::BYTES);
-                kept.extend_from_slice(bytes);
-            }
-            Self::Digest(digest) => {
-                kept.push(Self::DIGEST);
-                kept.extend_from_slice(digest);
-            }
-        }
-        Fingerprint::raw(kept)
-    }
-
-    /// The agreement a fingerprint-cache entry keeps, or `None` for one in no
-    /// shape [`Base::fingerprint`] writes — which reads as no agreement, and
-    /// so costs a question rather than an overwrite.
-    pub(super) fn from_fingerprint(fingerprint: &Fingerprint) -> Option<Self> {
-        match fingerprint.as_bytes().split_first()? {
-            (&Self::BYTES, bytes) if bytes.len() <= Self::KEPT_WHOLE => {
-                Some(Self::Bytes(bytes.to_vec()))
-            }
-            (&Self::DIGEST, digest) => Some(Self::Digest(digest.try_into().ok()?)),
-            _ => None,
-        }
-    }
-}
-
-/// When the bytes a tracked target's two sides hold become the bytes they
-/// last agreed on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum When {
-    /// Already: both sides hold them.
-    Now,
-    /// Once `apply` has written the repo's copy onto this machine.
-    Applied,
-    /// Once `sync` has carried this machine's copy into the repo.
-    Synced,
-}
-
-/// What a tracked target's two sides will agree on, and when.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Agreed {
-    /// The tracked target.
-    pub target: Portable,
-    /// The bytes both sides hold once [`Agreed::when`] has happened.
-    pub bytes: Vec<u8>,
-    /// What has to happen first.
-    pub when: When,
 }
 
 /// The directories whose targets apply leaves at a declared mode — created,
@@ -2428,28 +2316,6 @@ mod tests {
         assert_eq!(row_for(&plan_of(&inputs), "~/.d/f").action, Action::Create);
         assert!(apply_of(&inputs).executed);
         assert_eq!(mode_on_disk(control.path(), ".d"), Some(Mode::DEFAULT_DIR));
-    }
-
-    #[test]
-    fn an_agreement_of_up_to_64_kib_is_kept_whole_and_a_larger_one_as_its_digest() {
-        // Written out rather than read from `Base::KEPT_WHOLE`, so a change to
-        // the bound is a change a test names.
-        const SIXTY_FOUR_KIB: usize = 65_536;
-        let whole = vec![b'a'; SIXTY_FOUR_KIB];
-        let large = vec![b'a'; SIXTY_FOUR_KIB + 1];
-        assert_eq!(Base::of(&whole), Base::Bytes(whole.clone()));
-        assert_eq!(
-            Base::of(&large),
-            Base::Digest(*ContentHash::of(&large).as_bytes())
-        );
-        // Each reads back from the cache as it was kept; whole bytes past the
-        // bound are no shape the cache writes.
-        for base in [Base::of(&whole), Base::of(&large)] {
-            assert_eq!(Base::from_fingerprint(&base.fingerprint()), Some(base));
-        }
-        let mut past = vec![Base::BYTES];
-        past.extend_from_slice(&large);
-        assert_eq!(Base::from_fingerprint(&Fingerprint::raw(past)), None);
     }
 
     #[test]

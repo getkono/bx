@@ -23,6 +23,7 @@ mod diff;
 mod execute;
 pub(crate) mod external;
 mod region;
+mod track;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -408,7 +409,7 @@ pub fn run(
     }
 
     let ledger = LedgerView::read(&inputs.state, &inputs.home)?.value;
-    let bases = bases(inputs)?;
+    let bases = track::bases(inputs)?;
     // Every declared activation is decided here, once, against the cache as
     // it stands, read without a lock: what the interactive file is rendered
     // with below is what `apply` records, and nothing decides them again. A
@@ -492,7 +493,7 @@ pub fn run(
                 .iter()
                 .any(|step| step.action().is_pending());
             if ops.is_empty() && clones.is_empty() && !captured {
-                agree(inputs, &bases, &agreed, mode, false)?;
+                track::agree(inputs, &bases, &agreed, mode, false)?;
                 return Ok(report);
             }
             if !approve(&report)? {
@@ -538,7 +539,7 @@ pub fn run(
                 record_activations(&inputs.state, &report.activations)?;
             }
             report.executed = true;
-            agree(inputs, &bases, &agreed, mode, true)?;
+            track::agree(inputs, &bases, &agreed, mode, true)?;
             Ok(report)
         }
     }
@@ -633,134 +634,6 @@ fn undeclared_rows(
         })
         .map(|(_, entry)| decide::decide_undeclared(entry, &origin, &inputs.home))
         .collect()
-}
-
-/// What every fingerprint-cache key a tracked target's agreement is kept
-/// under begins with.
-const TRACK_PREFIX: &str = "track:";
-
-/// The fingerprint-cache key a tracked target's agreement is kept under.
-fn base_key(target: &Portable) -> String {
-    format!("{TRACK_PREFIX}{}", target.as_str())
-}
-
-/// Every target the configuration declares tracked.
-fn tracked(inputs: &Inputs) -> Vec<&Portable> {
-    inputs
-        .resolved
-        .targets
-        .iter()
-        .filter_map(|resolution| match resolution {
-            Resolution::Ready(target) if target.direction == Direction::Track => Some(&target.path),
-            _ => None,
-        })
-        .collect()
-}
-
-/// What each tracked target's two sides last agreed on, read from the
-/// fingerprint cache without the lock.
-///
-/// # Decision: the agreement is kept in the fingerprint cache
-///
-/// It is machine-owned, per account, and never published, which is what the
-/// state directory holds; and losing it is what the cache's contract allows,
-/// because [`decide`]'s tracked decision reads a missing agreement as "cannot
-/// tell which side moved" and asks a human rather than overwriting either
-/// side. The ledger is the wrong home: an entry there claims a file and holds
-/// the bytes `rm` puts back, and bx claims the machine's copy only where
-/// `apply` created it, while every tracked target has an agreement. Keeping it
-/// in the ledger would claim a copy the tool had before bx wrote to it, so
-/// `rm` would replace the tool's later bytes with ones the tool no longer
-/// holds.
-///
-/// What it keeps is bounded, and is the bytes themselves only while they are
-/// small: see [`decide::Base::fingerprint`].
-fn bases(inputs: &Inputs) -> Result<decide::Bases, Error> {
-    let tracked = tracked(inputs);
-    if tracked.is_empty() {
-        return Ok(decide::Bases::new());
-    }
-    let cache = Fingerprints::read(&inputs.state)?.value;
-    Ok(tracked
-        .into_iter()
-        .filter_map(|target| {
-            let base = decide::Base::from_fingerprint(cache.get(&base_key(target))?)?;
-            Some((target.clone(), base))
-        })
-        .collect())
-}
-
-/// The agreements `cache` keeps for targets the configuration no longer
-/// declares tracked, or none while any target is blocked.
-///
-/// # Decision: an agreement is forgotten once its target is not tracked
-///
-/// An agreement outlives nothing it could be used for: a target no longer
-/// tracked is never decided against it, and one tracked again later that
-/// finds none asks a human where the two copies differ, never overwriting
-/// either. A blocked target's direction cannot be read, so while any is
-/// blocked nothing is forgotten, and an agreement a target that is only
-/// waiting for a value still needs is kept for it.
-fn stale(inputs: &Inputs, cache: &Fingerprints) -> Vec<String> {
-    let blocked = inputs
-        .resolved
-        .targets
-        .iter()
-        .any(|resolution| matches!(resolution, Resolution::Blocked(_)));
-    if blocked {
-        return Vec::new();
-    }
-    let kept: BTreeSet<String> = tracked(inputs).into_iter().map(base_key).collect();
-    cache
-        .iter()
-        .map(|(key, _)| key)
-        .filter(|key| key.starts_with(TRACK_PREFIX) && !kept.contains(*key))
-        .cloned()
-        .collect()
-}
-
-/// Record what each tracked target's two sides now agree on: every agreement
-/// that holds already, and — once this run `executed` — those its writes made,
-/// a carry into the repo only in [`Mode::Sync`]; and forget every agreement
-/// [`stale`] names.
-///
-/// Written under the lock, and only when something changed, so a run with
-/// nothing new to record leaves the state directory as it found it.
-fn agree(
-    inputs: &Inputs,
-    bases: &decide::Bases,
-    agreed: &[decide::Agreed],
-    mode: Mode,
-    executed: bool,
-) -> Result<(), Error> {
-    let settled = agreed
-        .iter()
-        .filter(|agreed| match agreed.when {
-            decide::When::Now => true,
-            decide::When::Applied => executed,
-            decide::When::Synced => executed && mode == Mode::Sync,
-        })
-        .map(|agreed| (&agreed.target, decide::Base::of(&agreed.bytes)))
-        .filter(|(target, base)| bases.get(*target) != Some(base))
-        .map(|(target, base)| (base_key(target), base))
-        .collect::<Vec<_>>();
-    if settled.is_empty() && stale(inputs, &Fingerprints::read(&inputs.state)?.value).is_empty() {
-        return Ok(());
-    }
-    inputs.state.ensure()?;
-    let lock = ExclusiveLock::acquire(&inputs.state)?;
-    let before = Fingerprints::open(&inputs.state, &lock)?.value;
-    let mut cache = before.clone();
-    for key in stale(inputs, &before) {
-        cache.remove(&key);
-    }
-    for (key, base) in settled {
-        cache.set(key, base.fingerprint());
-    }
-    if cache != before {
-        cache.save(&inputs.state, &lock)?;
-    }
-    Ok(())
 }
 
 /// `target` as `plan` renders it: zsh's and bash's interactive files with
@@ -3707,18 +3580,21 @@ pub(crate) mod tests {
             (home, inputs)
         }
 
-        fn kept(home: &Path, name: &str) -> Option<decide::Base> {
+        fn kept(home: &Path, name: &str) -> Option<crate::plan::track::Base> {
             let cache = Fingerprints::read(&StateDir::resolve(home))
                 .expect("the cache")
                 .value;
             let fingerprint = cache.get(&format!("track:~/.{name}"))?;
-            Some(decide::Base::from_fingerprint(fingerprint).expect("an agreement bx wrote"))
+            Some(
+                crate::plan::track::Base::from_fingerprint(fingerprint)
+                    .expect("an agreement bx wrote"),
+            )
         }
 
         fn base(home: &Path, name: &str) -> Option<Vec<u8>> {
             match kept(home, name)? {
-                decide::Base::Bytes(bytes) => Some(bytes),
-                decide::Base::Digest(_) => panic!("a small agreement is kept whole"),
+                crate::plan::track::Base::Bytes(bytes) => Some(bytes),
+                crate::plan::track::Base::Digest(_) => panic!("a small agreement is kept whole"),
             }
         }
 
@@ -3728,27 +3604,34 @@ pub(crate) mod tests {
 
         #[test]
         fn an_agreement_is_kept_whole_up_to_the_bound_and_as_a_digest_above_it() {
-            let whole = vec![b'a'; decide::Base::KEPT_WHOLE];
+            let whole = vec![b'a'; crate::plan::track::Base::KEPT_WHOLE];
             let mut large = whole.clone();
             large.push(b'a');
-            assert_eq!(decide::Base::of(&whole), decide::Base::Bytes(whole.clone()));
-            let digest = decide::Base::of(&large);
+            assert_eq!(
+                crate::plan::track::Base::of(&whole),
+                crate::plan::track::Base::Bytes(whole.clone())
+            );
+            let digest = crate::plan::track::Base::of(&large);
             assert_eq!(
                 digest,
-                decide::Base::Digest(*crate::state::ContentHash::of(&large).as_bytes())
+                crate::plan::track::Base::Digest(*crate::state::ContentHash::of(&large).as_bytes())
             );
             assert!(digest.holds(&large));
             assert!(!digest.holds(&whole));
-            assert!(decide::Base::of(&whole).holds(&whole));
-            assert!(!decide::Base::of(&whole).holds(&large));
-            for base in [decide::Base::of(b""), decide::Base::of(&whole), digest] {
+            assert!(crate::plan::track::Base::of(&whole).holds(&whole));
+            assert!(!crate::plan::track::Base::of(&whole).holds(&large));
+            for base in [
+                crate::plan::track::Base::of(b""),
+                crate::plan::track::Base::of(&whole),
+                digest,
+            ] {
                 assert_eq!(
-                    decide::Base::from_fingerprint(&base.fingerprint()),
+                    crate::plan::track::Base::from_fingerprint(&base.fingerprint()),
                     Some(base.clone())
                 );
             }
             assert_eq!(
-                decide::Base::of(b"ab").fingerprint().as_bytes(),
+                crate::plan::track::Base::of(b"ab").fingerprint().as_bytes(),
                 b"=ab",
                 "a tag, then the bytes"
             );
@@ -3758,7 +3641,9 @@ pub(crate) mod tests {
             overlong.extend_from_slice(&large);
             for foreign in [&b""[..], b"ab", b"#short", &overlong, &[b'#'; 34][..]] {
                 assert_eq!(
-                    decide::Base::from_fingerprint(&crate::state::Fingerprint::raw(foreign)),
+                    crate::plan::track::Base::from_fingerprint(&crate::state::Fingerprint::raw(
+                        foreign
+                    )),
                     None,
                     "{foreign:?}"
                 );
@@ -3767,9 +3652,9 @@ pub(crate) mod tests {
 
         #[test]
         fn a_large_tracked_file_is_agreed_by_digest_and_its_conflict_shows_the_two_sides() {
-            let large = "x\n".repeat(decide::Base::KEPT_WHOLE);
+            let large = "x\n".repeat(crate::plan::track::Base::KEPT_WHOLE);
             let (home, inputs) = agreed_home(&large);
-            let Some(decide::Base::Digest(_)) = kept(home.path(), "lock") else {
+            let Some(crate::plan::track::Base::Digest(_)) = kept(home.path(), "lock") else {
                 panic!("a large agreement is kept as a digest");
             };
             assert!(

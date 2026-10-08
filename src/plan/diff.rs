@@ -296,6 +296,7 @@ pub struct Palette {
 
 impl Palette {
     /// No escape sequences at all.
+    #[cfg(test)]
     pub const PLAIN: Self = Self { color: false };
 
     /// Colour only on a terminal, and only when `NO_COLOR` is unset or empty —
@@ -308,6 +309,7 @@ impl Palette {
     }
 
     /// Whether this palette emits colour.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_colored(self) -> bool {
         self.color

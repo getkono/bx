@@ -1196,7 +1196,7 @@ fn undeclare(
 ///
 /// The targets are every declaration of a path at or beneath `target`, in any
 /// layer, and every ledger entry there — so a target whose declaration was
-/// deleted by hand is still handed back. [`restore::restore`] decides and
+/// deleted by hand is still handed back. [`restore::restore_with`] decides and
 /// restores each; each one it released is then removed from every layer
 /// declaring it. A conflict is left declared and untouched, and a tree is
 /// handed back whole or not at all ([`hold_trees`]). Nothing to do is an

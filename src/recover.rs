@@ -2,7 +2,7 @@
 //!
 //! The second half of `CLAUDE.md` Invariant 4: *an interrupted `apply` must be
 //! detectable and recoverable*. [`pending`] is the detection, [`recover`] is the
-//! undo, and [`abandon`] is the escape when the undo cannot be taken.
+//! undo, and `abandon` is the escape when the undo cannot be taken.
 //!
 //! # Roll back, not forward
 //!
@@ -49,7 +49,7 @@
 //! diff, one already holding what was there before as [`Action::Unchanged`]
 //! (or a modify naming the directories recovery removes where empty), every
 //! write of a session that finished as [`Action::Unchanged`], and a write
-//! recovery cannot account for as an [`Action::Conflict`] naming [`abandon`].
+//! recovery cannot account for as an [`Action::Conflict`] naming `abandon`.
 //! It exits [`Exit::Pending`] whatever the rows are. That is what keeps `plan` usable from CI, a prompt segment or a login
 //! banner.
 //!
@@ -75,17 +75,23 @@
 //! and that does not lapse because a crash happened. The journal is **not**
 //! unlinked, so every writing command keeps refusing until it is resolved, and
 //! the message names the file, both digests it could legitimately hold, and
-//! [`abandon`] as the way out.
+//! `abandon` as the way out.
 //!
 //! A destination whose parent no longer resolves to a directory blocks
 //! recovery the same way: bx can neither confirm what is there nor write the
-//! undo through it, and the message names the parent and [`abandon`].
+//! undo through it, and the message names the parent and `abandon`.
+//!
+//! [`Action::Modify`]: crate::report::Action::Modify
+//! [`Action::Unchanged`]: crate::report::Action::Unchanged
+//! [`Action::Conflict`]: crate::report::Action::Conflict
+//! [`Exit::Pending`]: crate::report::Exit::Pending
 
 use std::path::{Path, PathBuf};
 
 use crate::fs::{self, Kind, Mode, remove};
 use crate::journal::{self, Intent, Loaded, SessionKind, Written};
 use crate::paths::Portable;
+#[cfg(test)]
 use crate::report::{Action, Exit};
 use crate::state::{
     ContentHash, ExclusiveLock, Ledger, LedgerView, NewEntry, Prior, PriorBytes, RestoreRef,
@@ -159,6 +165,7 @@ pub enum Standing {
 
 impl Standing {
     /// Whether recovery can act on this on its own.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_resolvable(self) -> bool {
         matches!(self, Self::Prior | Self::Written)
@@ -202,6 +209,7 @@ impl Unfinished {
     /// [`Action::needs_attention`] makes [`Exit::from_actions`] yield
     /// [`Exit::Pending`], which is the right signal for "a human has to look".
     /// [`Exit::Error`] would be wrong: nothing is going wrong now.
+    #[cfg(test)]
     #[must_use]
     pub const fn action(&self) -> Action {
         Action::Conflict
@@ -234,7 +242,7 @@ pub struct Interrupted {
     ///
     /// Such a journal names no write, so `unfinished` is empty, `complete` is
     /// `false`, `kind` is [`SessionKind::Apply`] because no header was
-    /// believed, and [`Interrupted::exit`] is
+    /// believed, and `Interrupted::exit` is
     /// [`Exit::Pending`](crate::report::Exit::Pending). The next writing command
     /// sets the file aside and rolls nothing back, and `plan` then reports what
     /// the session may have written as conflicts. It is reported rather than
@@ -252,6 +260,7 @@ impl Interrupted {
     }
 
     /// The action per target a read-only command reports.
+    #[cfg(test)]
     #[must_use]
     pub fn actions(&self) -> Vec<Action> {
         self.unfinished.iter().map(Unfinished::action).collect()
@@ -262,6 +271,7 @@ impl Interrupted {
     /// [`Exit::Pending`] whenever anything was interrupted — including a session
     /// with no writes in it, because the machine is still not converged and
     /// somebody has to run a writing command.
+    #[cfg(test)]
     #[must_use]
     pub fn exit(&self) -> Exit {
         if self.unfinished.is_empty() {
@@ -298,6 +308,7 @@ pub enum Outcome {
 
 impl Outcome {
     /// Whether the state directory is clear afterwards.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_clear(&self) -> bool {
         !matches!(self, Self::Blocked { .. })
@@ -325,7 +336,7 @@ impl Outcome {
 /// flight right now rather than to one that died. The two are told apart by the
 /// state directory's lock, not by the journal: a caller that wants to say "an
 /// apply is in progress" rather than "an apply was interrupted" asks
-/// [`crate::state::SharedLock::try_acquire`] first and reports the `None` case
+/// `SharedLock::try_acquire` first and reports the `None` case
 /// as the live one. A session creates its journal whole, by rename, so the most
 /// such a reader can see of one in flight is a torn tail frame, which it
 /// discards.
@@ -455,7 +466,7 @@ fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome
 ///
 /// As [`recover`], plus [`Error::Blocked`] when a destination cannot be
 /// accounted for — a command that is about to write must stop. The escape from
-/// that is [`abandon`].
+/// that is `abandon`.
 pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
     state.ensure()?;
     let lock = ExclusiveLock::acquire(state)?;
@@ -478,6 +489,7 @@ pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
 /// the journal cannot be moved, or with [`journal::Error::FutureVersion`] when
 /// a newer bx wrote it, which is left exactly where it is. A journal abandoned earlier is never renamed
 /// over: this one takes the next free set-aside name.
+#[cfg(test)]
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
     let lock = ExclusiveLock::acquire(state)?;
     #[cfg(test)]
@@ -1308,7 +1320,7 @@ mod tests {
             const { std::cell::Cell::new(None) };
     }
 
-    /// The seam [`recover`] and [`abandon`] call once they hold the lock.
+    /// The seam [`recover`] and `abandon` call once they hold the lock.
     pub(super) fn after_lock(state: &StateDir) {
         if let Some(mode) = AFTER_LOCK.with(std::cell::Cell::get) {
             fs::set_mode(state.root(), mode).expect("narrow the state directory");

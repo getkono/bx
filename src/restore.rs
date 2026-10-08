@@ -42,7 +42,7 @@
 //! # `plan` and `rm` share one function
 //!
 //! [`plan_restore`] decides what will happen to one target and writes nothing;
-//! [`restore`] calls it and then does exactly what it said. That is Invariant 7
+//! [`restore_with`] calls it and then does exactly what it said. That is Invariant 7
 //! applied to the removal path: `rm` cannot do work its own preview did not
 //! announce.
 
@@ -526,6 +526,16 @@ fn plan_restore_clone(
     }
 }
 
+/// [`restore_with`], asking the user's own `git` at `home`.
+#[cfg(test)]
+pub fn restore(
+    state: &StateDir,
+    home: &Path,
+    targets: &[Portable],
+) -> Result<Vec<Restored>, Error> {
+    restore_with(state, home, targets, &Git::at_home(home))
+}
+
 /// Put back what bx displaced at each of `targets`, through a journalled
 /// session.
 ///
@@ -552,26 +562,16 @@ fn plan_restore_clone(
 /// and [`Error::Read`] when a destination cannot be looked at at all. Each of
 /// these stops `rm` where it is and leaves its journal, so the next writing
 /// run rolls back every target this `rm` had already restored: nothing is left
-/// half-done, and running `rm` again restores them.
-pub fn restore(
-    state: &StateDir,
-    home: &Path,
-    targets: &[Portable],
-) -> Result<Vec<Restored>, Error> {
-    restore_with(state, home, targets, &Git::at_home(home))
-}
-
-/// [`restore`], asking `git` about a checkout bx cloned.
+/// half-done, and running `rm` again restores them. [`Error::Journal`] too
+/// when a checkout cannot be removed.
 ///
-/// A clone is not a write a journal can roll back — its bytes are git's, not
-/// bx's — so it is removed outside the session, under the same lock and
-/// before the session opens, by [`remove_clone`]. Every other target is
-/// restored through the session exactly as [`restore`] says. The results are
-/// in the order of `targets`.
+/// # A checkout bx cloned
 ///
-/// # Errors
-///
-/// As [`restore`], and [`Error::Journal`] when a checkout cannot be removed.
+/// `git` is asked about it. A clone is not a write a journal can roll back —
+/// its bytes are git's, not bx's — so it is removed outside the session, under
+/// the same lock and before the session opens, by [`remove_clone`]. Every
+/// other target is restored through the session as above. The results are in
+/// the order of `targets`.
 pub fn restore_with(
     state: &StateDir,
     home: &Path,

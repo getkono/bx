@@ -13,8 +13,8 @@
 //!
 //! This module also holds the crate's **one** home-resolution mechanism. Every
 //! rule in it takes its environment as an argument — [`home_in`], [`xdg_base`],
-//! [`config_root_in`] — and [`home`] and [`config_root`] are one-line wrappers
-//! that read the process environment and nothing more. The crate never *writes*
+//! [`config_root_in`] — and [`home`] is the one-line wrapper that reads the
+//! process environment and nothing more. The crate never *writes*
 //! to the process environment: `std::env::set_var` is `unsafe` in edition 2024
 //! because its precondition is process-wide, and under `cargo test` no code can
 //! establish it. Design-by-parameter is how the rules stay testable without it.
@@ -66,32 +66,6 @@ pub fn render(portable: &str, home: &Path) -> PathBuf {
             None => PathBuf::from(portable),
         },
     }
-}
-
-/// Expand leading `~/` on every line of repo content.
-///
-/// Applied to file bodies bx writes out of the repo. Leading whitespace is
-/// preserved, so indented config keeps its shape.
-#[must_use]
-pub fn render_content(content: &str, home: &Path) -> String {
-    let home = home.to_string_lossy();
-    let mut out = String::with_capacity(content.len());
-    // split_inclusive keeps each line's newline attached, so the terminator is
-    // carried through untouched and a missing trailing newline stays missing.
-    for line in content.split_inclusive('\n') {
-        let indent_len = line.len() - line.trim_start().len();
-        let (indent, rest) = line.split_at(indent_len);
-        out.push_str(indent);
-        match rest.strip_prefix("~/") {
-            Some(tail) => {
-                out.push_str(&home);
-                out.push('/');
-                out.push_str(tail);
-            }
-            None => out.push_str(rest),
-        }
-    }
-    out
 }
 
 /// Everything that can go wrong resolving a path.
@@ -317,6 +291,28 @@ pub fn config_root_in(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
     xdg_base(xdg_config_home, home, ".config").join("bx")
 }
 
+/// The account's own layer file's name, in the [`state_dir`].
+pub const LOCAL_FILE: &str = "local.toml";
+
+/// The state directory's default, relative to the home.
+const STATE_FALLBACK: &str = ".local/state";
+
+/// The state directory — `$XDG_STATE_HOME/bx`, default `~/.local/state/bx`.
+///
+/// Both inputs are explicit so the library reads no environment. The binary
+/// passes `std::env::var_os("XDG_STATE_HOME").as_deref()`; a test passes what it
+/// wants to test.
+#[must_use]
+pub fn state_dir(home: &Path, xdg_state_home: Option<&OsStr>) -> PathBuf {
+    xdg_base(xdg_state_home, home, STATE_FALLBACK).join("bx")
+}
+
+/// This account's layer file inside `state_dir`.
+#[must_use]
+pub fn local_layer_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(LOCAL_FILE)
+}
+
 /// The systemd user unit directory — `$XDG_CONFIG_HOME/systemd/user`, default
 /// `~/.config/systemd/user`.
 ///
@@ -326,19 +322,6 @@ pub fn config_root_in(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
 #[must_use]
 pub fn systemd_user_dir_in(home: &Path, xdg_config_home: Option<&OsStr>) -> PathBuf {
     xdg_base(xdg_config_home, home, ".config").join("systemd/user")
-}
-
-/// The config repo root, resolved from the process environment.
-///
-/// # Errors
-///
-/// Whatever [`home`] returns.
-pub fn config_root() -> Result<PathBuf, Error> {
-    let home = home()?;
-    Ok(config_root_in(
-        &home,
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-    ))
 }
 
 /// A path as the config repo stores it: `~`-rooted, or absolute.
@@ -679,6 +662,50 @@ pub fn normalize(path: &Path) -> PathBuf {
     out.into_iter().collect()
 }
 
+// Only tests call the two below. They sit last, beside the tests, so the
+// source scans that read everything above the first `#[cfg(test)]` as this
+// module's shipped code still read all of it.
+
+/// Expand leading `~/` on every line of repo content.
+///
+/// Leading whitespace is preserved, so indented config keeps its shape.
+#[cfg(test)]
+#[must_use]
+pub fn render_content(content: &str, home: &Path) -> String {
+    let home = home.to_string_lossy();
+    let mut out = String::with_capacity(content.len());
+    // split_inclusive keeps each line's newline attached, so the terminator is
+    // carried through untouched and a missing trailing newline stays missing.
+    for line in content.split_inclusive('\n') {
+        let indent_len = line.len() - line.trim_start().len();
+        let (indent, rest) = line.split_at(indent_len);
+        out.push_str(indent);
+        match rest.strip_prefix("~/") {
+            Some(tail) => {
+                out.push_str(&home);
+                out.push('/');
+                out.push_str(tail);
+            }
+            None => out.push_str(rest),
+        }
+    }
+    out
+}
+
+/// The config repo root, resolved from the process environment.
+///
+/// # Errors
+///
+/// Whatever [`home`] returns.
+#[cfg(test)]
+pub fn config_root() -> Result<PathBuf, Error> {
+    let home = home()?;
+    Ok(config_root_in(
+        &home,
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,6 +714,36 @@ mod tests {
         // A deliberately non-standard home: nothing here may name a real
         // account, and nothing here may assume `/home/<user>`.
         PathBuf::from("/var/home/example")
+    }
+
+    #[test]
+    fn state_dir_defaults_to_local_state_bx() {
+        assert_eq!(
+            state_dir(Path::new("/var/home/example"), None),
+            Path::new("/var/home/example/.local/state/bx")
+        );
+    }
+
+    #[test]
+    fn state_dir_honours_xdg_state_home() {
+        assert_eq!(
+            state_dir(
+                Path::new("/var/home/example"),
+                Some(OsStr::new("/var/mnt/scratch/one/state"))
+            ),
+            Path::new("/var/mnt/scratch/one/state/bx")
+        );
+    }
+
+    #[test]
+    fn a_relative_or_empty_xdg_state_home_falls_back() {
+        // The base-directory specification honours the variable only when it is
+        // non-empty and absolute; anything else is invalid and the default wins.
+        let home = Path::new("/var/home/example");
+        let default = home.join(".local/state/bx");
+
+        assert_eq!(state_dir(home, Some(OsStr::new(""))), default);
+        assert_eq!(state_dir(home, Some(OsStr::new("relative/state"))), default);
     }
 
     #[test]

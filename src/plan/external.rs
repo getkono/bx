@@ -48,6 +48,7 @@ use super::{Change, Diff, Error};
 use crate::config::external::{External, Pin};
 use crate::config::lock::{self, Lock, Lookup};
 use crate::fs::{self, Kind};
+use crate::git::{self, Git};
 use crate::journal;
 use crate::paths::{self, Portable};
 use crate::report::Action;
@@ -55,7 +56,6 @@ use crate::state::{
     self, ExclusiveLock, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, PriorBytes,
     StateDir, clone_written,
 };
-use crate::sync::{self, Git};
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -507,7 +507,7 @@ fn clone(
             Ok(()) => made.push(dir.clone()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
-                journal::prune_dirs(&deepest_first(&made))?;
+                fs::remove::prune_dirs(&deepest_first(&made)).map_err(journal::Error::from)?;
                 return Ok(Err(format!(
                     "{} cannot be created: {error}",
                     paths::to_portable(dir, home)
@@ -567,7 +567,7 @@ fn clone(
                 })?;
             }
             let _ = ledger.withdraw(before);
-            journal::prune_dirs(&made)?;
+            fs::remove::prune_dirs(&made).map_err(journal::Error::from)?;
             ledger.save()?;
             Ok(Err(note))
         }
@@ -715,12 +715,12 @@ fn record_rev(op: &Op, ledger: &mut Ledger) -> Result<(), state::Error> {
 }
 
 /// A git failure, in the words a row's note uses.
-pub(crate) fn problem(error: &sync::Error) -> String {
+pub(crate) fn problem(error: &git::Error) -> String {
     match error {
-        sync::Error::Spawn { source, .. } => {
+        git::Error::Spawn { source, .. } => {
             format!("git could not be started: {source}; bx needs git on PATH")
         }
-        sync::Error::Git { args, stderr, .. } => {
+        git::Error::Failed { args, stderr, .. } => {
             let stderr = stderr.trim();
             if stderr.is_empty() {
                 format!("`git {args}` failed")
@@ -728,7 +728,7 @@ pub(crate) fn problem(error: &sync::Error) -> String {
                 format!("`git {args}` failed: {}", stderr.replace('\n', "; "))
             }
         }
-        other => other.to_string(),
+        other @ git::Error::TimedOut { .. } => other.to_string(),
     }
 }
 
@@ -753,7 +753,7 @@ pub(crate) fn own_checkout(git: &Git, dest: &Path) -> Result<(), String> {
 }
 
 /// The commit checked out in `dest`.
-pub(crate) fn head(git: &Git, dest: &Path) -> Result<String, sync::Error> {
+pub(crate) fn head(git: &Git, dest: &Path) -> Result<String, git::Error> {
     git.query(dest, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
 }
 
@@ -777,16 +777,16 @@ pub(crate) fn bx_clone(ledger: &LedgerView, path: &Portable) -> bool {
 }
 
 /// The url of `origin`, or `None` when there is no such remote.
-pub(crate) fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, sync::Error> {
+pub(crate) fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, git::Error> {
     match git.query(dest, &["config", "--get", "remote.origin.url"]) {
         Ok(url) => Ok(Some(url)),
-        Err(sync::Error::Git { status, .. }) if status.code() == Some(1) => Ok(None),
+        Err(git::Error::Failed { status, .. }) if status.code() == Some(1) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
 /// Whether a tracked file differs from the commit checked out, staged or not.
-fn dirty(git: &Git, dest: &Path) -> Result<bool, sync::Error> {
+fn dirty(git: &Git, dest: &Path) -> Result<bool, git::Error> {
     git.query(dest, &["status", "--porcelain", "--untracked-files=no"])
         .map(|status| !status.is_empty())
 }
@@ -803,10 +803,10 @@ pub(crate) fn is_ancestor(
     dest: &Path,
     ancestor: &str,
     descendant: &str,
-) -> Result<bool, sync::Error> {
+) -> Result<bool, git::Error> {
     match git.query(dest, &["merge-base", "--is-ancestor", ancestor, descendant]) {
         Ok(_) => Ok(true),
-        Err(sync::Error::Git { status, .. }) if status.code() == Some(1) => Ok(false),
+        Err(git::Error::Failed { status, .. }) if status.code() == Some(1) => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -1502,6 +1502,133 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_that_cannot_be_made_at_apply_stops_the_clone_and_records_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Reopens `~/.zsh` so the tempdir home can be removed.
+        struct Reopen(std::path::PathBuf);
+        impl Drop for Reopen {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let home = guarded_home();
+        let up = upstream(&home);
+        let zsh = home.child(".zsh");
+        let mut reopen = None;
+        // Between plan and apply, the user makes the first parent plan said
+        // apply creates, at a mode that denies its owner write.
+        let applied = apply_after(&home, &layer(&up.first), || {
+            std::fs::create_dir(&zsh).expect("the user's directory");
+            std::fs::set_permissions(&zsh, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+            reopen = Some(Reopen(zsh.clone()));
+        });
+        if std::fs::create_dir(zsh.join("probe")).is_ok() {
+            crate::testing::skip_unconstructible("a directory its owner can write at 0500");
+            return;
+        }
+
+        let note = stopped_note(&applied);
+        assert!(
+            note.starts_with("~/.zsh/plugins cannot be created: "),
+            "{note}"
+        );
+        drop(reopen);
+        assert!(zsh.is_dir(), "the user's directory is left");
+        assert!(!home.child(".zsh/plugins").exists(), "nothing was made");
+        assert!(entry(&home).is_none(), "nothing recorded");
+    }
+
+    #[test]
+    fn missing_dirs_names_every_absent_parent_and_refuses_one_that_cannot_hold_a_clone() {
+        let home = guarded_home();
+        let at = |rel: &str| home.child(rel);
+        assert_eq!(
+            missing_dirs(&at("a/b/c"), home.path()),
+            Ok(vec![at("a/b"), at("a")]),
+            "deepest first, stopping at the home"
+        );
+        home.write("file", "x\n");
+        assert_eq!(
+            missing_dirs(&at("file/c"), home.path()),
+            Err("~/file is not a directory, so there is nowhere to clone it".to_string())
+        );
+        let beneath = missing_dirs(&at("file/b/c"), home.path()).expect_err("beneath a file");
+        assert!(
+            beneath.starts_with("~/file/b cannot be looked at: "),
+            "{beneath}"
+        );
+    }
+
+    #[test]
+    fn a_directory_inside_another_checkout_is_not_its_own_checkout() {
+        let home = guarded_home();
+        let outer = home.child("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).expect("the directories");
+        git_run(home.path(), &outer, &["init", "--quiet"]);
+        let git = git(home.path());
+
+        assert_eq!(own_checkout(&git, &outer), Ok(()));
+        let top = std::fs::canonicalize(&outer).expect("canonical");
+        assert_eq!(
+            own_checkout(&git, &inner),
+            Err(format!(
+                "is not a git checkout of its own (git answers from {}); bx left it as it is",
+                top.display()
+            ))
+        );
+        let unread = own_checkout(&Git::at_home(home.path()).with_env("PATH", ""), &outer)
+            .expect_err("no git to ask");
+        assert!(
+            unread.starts_with("is not a git checkout bx can read: ")
+                && unread.ends_with("bx needs git on PATH"),
+            "{unread}"
+        );
+    }
+
+    #[test]
+    fn a_git_failure_counting_local_commits_is_named() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let recorded = entry(&home).expect("recorded");
+        let missing = Git::at_home(home.path()).with_env("PATH", "");
+
+        let note = not_forward(&missing, &home.child(AT), &up.first, &up.side, &recorded);
+
+        assert!(note.contains("bx needs git on PATH"), "{note}");
+    }
+
+    #[test]
+    fn a_local_commit_count_git_answers_with_something_other_than_a_number_is_not_counted() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let recorded = entry(&home).expect("recorded");
+        let bin = home.child("bin");
+        std::fs::create_dir(&bin).expect("the stub's directory");
+        let stub = bin.join("git");
+        std::fs::write(&stub, "#!/bin/sh\necho many\n").expect("the stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let garbled = Git::at_home(home.path()).with_env("PATH", &bin);
+
+        let note = not_forward(&garbled, &home.child(AT), &up.first, &up.side, &recorded);
+
+        assert_eq!(
+            note,
+            format!(
+                "{} is not a fast-forward from {}; bx left it as it is",
+                up.side, up.first
+            )
+        );
+    }
+
+    #[test]
     fn a_checkout_that_changed_after_plan_is_not_fast_forwarded() {
         // Edited between plan and apply.
         let home = guarded_home();
@@ -1773,6 +1900,48 @@ mod tests {
         std::fs::write(home.child(AT), "a file\n").expect("and put a file there");
         assert!(matches!(rm(&home).as_slice(), [Restored::Conflict { .. }]));
         assert!(home.child(AT).is_file());
+    }
+
+    #[test]
+    fn only_git_exiting_1_reads_as_no_origin_or_not_an_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = guarded_home();
+        let up = upstream(&home);
+        apply(&home, &layer(&up.first));
+        let dest = home.child(AT);
+        let git = git(home.path());
+
+        // Git exits 1 for an unset key and for a commit that is not an
+        // ancestor: each is an answer, not a failure.
+        git_run(home.path(), &dest, &["remote", "remove", "origin"]);
+        assert!(matches!(origin_url(&git, &dest), Ok(None)));
+        assert!(matches!(
+            is_ancestor(&git, &dest, &up.second, &up.first),
+            Ok(false)
+        ));
+
+        // Any other failure is git's, and is reported rather than answered.
+        let unknown = "0".repeat(40);
+        assert!(matches!(
+            is_ancestor(&git, &dest, &unknown, &up.first),
+            Err(git::Error::Failed { .. })
+        ));
+        let bin = home.child("bin");
+        std::fs::create_dir(&bin).expect("the stub's directory");
+        let stub = bin.join("git");
+        std::fs::write(&stub, "#!/bin/sh\nexit 2\n").expect("the stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let failing = Git::at_home(home.path()).with_env("PATH", &bin);
+        assert!(matches!(
+            origin_url(&failing, &dest),
+            Err(git::Error::Failed { .. })
+        ));
+        assert!(matches!(
+            is_ancestor(&failing, &dest, &up.first, &up.second),
+            Err(git::Error::Failed { .. })
+        ));
     }
 
     #[test]

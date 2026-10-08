@@ -96,24 +96,23 @@
 
 mod dir;
 mod fingerprint;
-mod hash;
 mod ledger;
 mod lock;
+pub mod restore;
 mod store;
 
 use std::path::{Path, PathBuf};
 
 use crate::fs::Mode;
 
+pub use crate::hash::ContentHash;
 pub use dir::StateDir;
 pub(crate) use dir::{move_aside, quarantines};
 pub use fingerprint::{Fingerprint, Fingerprints};
-pub use hash::ContentHash;
 pub use ledger::RestoreRef;
-pub(crate) use ledger::blob_len;
 pub use ledger::{
-    Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, Withdrawal,
-    clone_written,
+    DIR_BYTES, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, Prior, PriorBytes,
+    clone_written, dir_digest, dir_prior,
 };
 pub use lock::{ExclusiveLock, Holder, SharedLock};
 pub use store::{Damage, Health, Loaded, MAX_STATE_FILE, Unlisted};
@@ -226,8 +225,8 @@ pub enum Error {
     /// replaced or removed while it was held — an outside `mv` or `rm` — so a
     /// second bx may have locked a new file at that path. The message then says
     /// so, and names the path once. [`Ledger::record`],
-    /// [`Ledger::adopt_current_as_prior`] and [`Ledger::save`] check for this
-    /// before they write.
+    /// the test-only `Ledger::adopt_current_as_prior` and [`Ledger::save`]
+    /// check for this before they write.
     #[error("{}", wrong_lock(.held, .needed))]
     WrongLock {
         /// The lock file the presented guard holds.
@@ -549,7 +548,7 @@ pub enum Error {
     /// `/dev/zero`, so the read side refuses anything but a regular file.
     ///
     /// A second hard link is **not** one of them: see
-    /// [`LedgerView::restore_bytes`] for why the write side's `nlink` test is
+    /// [`restore::read`] for why the write side's `nlink` test is
     /// not repeated on the read side.
     #[error(
         "the restore snapshot {digest} is not the plain file bx wrote: {} is a symbolic link, a \
@@ -579,8 +578,8 @@ pub enum Error {
     /// Any edit outside bx's lines raises this, and re-recording converges
     /// nowhere, so the message names the two ways out, and what the second
     /// leaves behind. Putting the file back needs nothing from bx. Accepting the
-    /// file as it is now is [`Ledger::adopt_current_as_prior`], which the
-    /// command that reports the conflict must offer. Afterwards `bx rm`
+    /// file as it is now is `Ledger::adopt_current_as_prior`, which no command
+    /// offers yet, so only tests reach it. Afterwards `bx rm`
     /// restores the file exactly as it was accepted — bx's region or include
     /// line in it as it was then, stale and no longer managed, for the user to
     /// remove by hand — and what was there before bx stays in the ledger's

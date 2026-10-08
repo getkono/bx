@@ -10,6 +10,10 @@
 //! destruction is spent instead on [`Action::Conflict`] — the case that actually
 //! matters for a non-invasive tool, where something bx does not own is in the
 //! way.
+//!
+//! `escape` is here too: `plan`'s rendering, `apply`'s stopped rows and
+//! `doctor`'s findings all spell out the control characters in a path, a note
+//! or a file's bytes through it before they reach the terminal.
 
 use std::fmt;
 
@@ -193,9 +197,46 @@ pub fn summary(actions: &[Action]) -> String {
     )
 }
 
+/// `text` with every control character but a tab spelled out — `\r`, `\n`,
+/// `\x1b` — so nothing a file or a path holds can move the cursor, colour the
+/// terminal, or start a line the rendering did not.
+pub(crate) fn escape(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::fmt::Write as _;
+
+    if !text.chars().any(|c| c != '\t' && c.is_control()) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\t' => out.push(c),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:02x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_with_no_control_character_but_a_tab_is_shown_as_it_is() {
+        // The mutation run found this unpinned: `escape` could copy every
+        // string and still render the same text.
+        for text in ["plain", "a\ttab", ""] {
+            assert!(
+                matches!(escape(text), std::borrow::Cow::Borrowed(kept) if kept == text),
+                "{text:?}"
+            );
+        }
+        assert!(matches!(escape("a\rb"), std::borrow::Cow::Owned(_)));
+    }
 
     #[test]
     fn every_action_has_a_distinct_symbol() {

@@ -55,12 +55,12 @@
 //! `phase` names where the line loads, from the phases whose content is not an
 //! environment fragment and that nothing but bx's own setup owns:
 //! `activations`, `completions`, `plugins`, `aliases`, `functions`,
-//! `keybindings` and `options` ([`PHASES`]). `env` and `path` are refused
-//! because they hold only fragments the environment guard judges, `completion`
-//! because it is the completion system's own setup, and `terminal` because it
-//! is the single slot one plugin may claim, which a source never does. Within
-//! its phase a source loads after that phase's own declarations, in
-//! declaration order.
+//! `keybindings` and `options` ([`crate::config::source::PHASES`]). `env` and
+//! `path` are refused because they hold only fragments the environment guard
+//! judges, `completion` because it is the completion system's own setup, and
+//! `terminal` because it is the single slot one plugin may claim, which a
+//! source never does. Within its phase a source loads after that phase's own
+//! declarations, in declaration order.
 //!
 //! `when` is one condition from the closed set [`crate::config::when`]
 //! defines, and it gates the line: `has:TOOL` is decided while `plan` renders,
@@ -78,69 +78,18 @@
 
 use std::path::{Path, PathBuf};
 
-use toml_edit::Table;
-
-use super::plugin::{guarded, unsourceable};
-use super::{Assembly, Phase, Shell, Shells};
-use crate::config::resolve::{BlockReason, BlockedEntry, Resolution};
+use super::plugin::guarded;
+use super::{Assembly, Shell};
+use crate::config::Error;
+use crate::config::plugin::unsourceable;
+use crate::config::resolution::{BlockReason, BlockedEntry, Resolution};
 use crate::config::values::{self, ResolvedValues, Unresolved};
 use crate::config::when::{self, Gate, When};
-use crate::config::{Ctx, Error, Origin};
 
-/// The section header, as messages spell it.
-pub(crate) const SECTION: &str = "[[source]]";
-
-/// Every key a `[[source]]` entry may carry.
-const KEYS: [&str; 6] = ["name", "path", "phase", "when", "shells", "enabled"];
-
-/// The phases a source may load in, in load order.
-pub const PHASES: [Phase; 7] = [
-    Phase::Activations,
-    Phase::Completions,
-    Phase::Plugins,
-    Phase::Aliases,
-    Phase::Functions,
-    Phase::Keybindings,
-    Phase::Options,
-];
-
-/// The phase a source loads in when it names none.
-pub const DEFAULT_PHASE: Phase = Phase::Plugins;
-
-/// One `[[source]]` entry, as written: its path not yet substituted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceDecl {
-    /// The source's name, its natural key.
-    pub name: String,
-    /// The path as written, `{{name}}` references and all.
-    pub path: String,
-    /// The phase it loads in.
-    pub phase: Phase,
-    /// The condition it is gated on, if any.
-    pub when: Option<When>,
-    /// The shells whose generated file sources it.
-    pub shells: Shells,
-    /// `false` in any layer removes the source from the resolved
-    /// configuration.
-    pub enabled: bool,
-    /// Where the entry was written.
-    pub origin: Origin,
-}
-
-/// One source ready to write: its path substituted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Source {
-    /// The name it was declared under.
-    pub name: String,
-    /// The substituted path, as the line spells it.
-    pub path: String,
-    /// The phase it loads in.
-    pub phase: Phase,
-    /// The condition it is gated on, if any.
-    pub when: Option<When>,
-    /// Where the entry was written.
-    pub origin: Origin,
-}
+/// A declared optional source, and one ready to write, as
+/// [`crate::config::source`] declares them, named here too, where every
+/// renderer already looks for them.
+pub use crate::config::source::{Source, SourceDecl};
 
 impl Source {
     /// The one line that sources the file when it is readable.
@@ -149,25 +98,19 @@ impl Source {
         guarded(&self.path)
     }
 
-    /// What the source contributes to the file: its line, the line inside a
-    /// guarded block, or nothing when `when` is `has:TOOL` and the tool is
-    /// missing.
+    /// What the source contributes to `shell`'s file: its line, the line
+    /// inside a guarded block, or nothing when `when` is `has:TOOL` and the
+    /// tool is missing. A runtime condition is asked in that shell's words
+    /// ([`When::test_bash`] for bash).
     ///
     /// `present` answers whether a `has:TOOL` tool is usable on this machine,
     /// asked while `plan` and `apply` render, never by the generated shell.
-    #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
-        self.render_in(Shell::Zsh, present)
-    }
-
-    /// [`Source::render`] for `shell`: the same line, and a runtime condition
-    /// asked in that shell's words ([`When::test_bash`] for bash).
     #[must_use]
     pub fn render_in(&self, shell: Shell, present: &dyn Fn(&str) -> bool) -> String {
         let line = self.line();
         let gate = |when: &When| match shell {
             Shell::Zsh => when.gate(present),
-            Shell::Bash => when.gate_bash(present),
+            Shell::Bash => super::bash::gate(when, present),
         };
         match self.when.as_ref().map(gate) {
             None | Some(Gate::Always) => line,
@@ -187,86 +130,6 @@ impl Source {
             .strip_prefix("~/")
             .map_or_else(|| PathBuf::from(&self.path), |rest| home.join(rest))
     }
-}
-
-/// Read a `phase` string a config author wrote.
-///
-/// # Errors
-///
-/// Why `raw` is not a phase a source may load in, listing the ones it may.
-pub fn parse_phase(raw: &str) -> Result<Phase, String> {
-    if let Some(phase) = PHASES.into_iter().find(|phase| phase.name() == raw) {
-        return Ok(phase);
-    }
-    let names: Vec<String> = PHASES.iter().map(|p| format!("{:?}", p.name())).collect();
-    let why = match Phase::ALL.into_iter().find(|phase| phase.name() == raw) {
-        Some(Phase::Terminal) => {
-            "; `terminal` is the single slot one plugin may claim, and a source never claims it"
-        }
-        Some(Phase::Env | Phase::Path) => {
-            "; that phase holds only environment fragments bx judges, and a source is not one"
-        }
-        Some(Phase::Completion) => "; that phase is the completion system's own setup",
-        _ => "",
-    };
-    Err(format!(
-        "`phase` must be one of {}; got {raw:?}{why}",
-        names.join(", ")
-    ))
-}
-
-/// Parse one `[[source]]` entry.
-///
-/// `text` is the whole layer file, because spans index into it.
-///
-/// # Errors
-///
-/// Any [`Error`] the entry's own keys can produce. Every one carries an origin.
-pub fn parse_source(table: &Table, file: &Path, text: &str) -> Result<SourceDecl, Error> {
-    let ctx = Ctx::new(table, file, text, SECTION);
-    ctx.reject_unknown_keys(table, &KEYS)?;
-
-    let name = ctx.required_str(table, "name")?.to_string();
-    if name.is_empty() || name.chars().any(char::is_control) {
-        return Err(ctx.bad(
-            table,
-            "name",
-            format!("{name:?} is not a source name: a name is non-empty and on one line"),
-        ));
-    }
-
-    let path = ctx.required_str(table, "path")?.to_string();
-    match values::placeholders(&path) {
-        Err(problem) => return Err(ctx.bad(table, "path", format!("source `{name}`: {problem}"))),
-        // Nothing to substitute, so the path is final and is checked now.
-        Ok(names) if names.is_empty() => {
-            if let Some(problem) = unsourceable("path", &path) {
-                return Err(ctx.bad(table, "path", format!("source `{name}`: {problem}")));
-            }
-        }
-        Ok(_) => {}
-    }
-
-    let phase = match ctx.str_at(table, "phase")? {
-        None => DEFAULT_PHASE,
-        Some(raw) => parse_phase(raw).map_err(|problem| ctx.bad(table, "phase", problem))?,
-    };
-    let when = match ctx.str_at(table, "when")? {
-        None => None,
-        Some(raw) => Some(When::parse(raw).map_err(|problem| ctx.bad(table, "when", problem))?),
-    };
-
-    let shells = Shells::parse_in(&ctx, table, &format!("source `{name}`"))?;
-
-    Ok(SourceDecl {
-        name,
-        path,
-        phase,
-        when,
-        shells,
-        enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
-        origin: ctx.origin().clone(),
-    })
 }
 
 /// Substitute every enabled source's path, or explain why it cannot be.
@@ -413,7 +276,9 @@ pub fn missing<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::parse_str;
+    use crate::config::shells::{Phase, Shells};
+    use crate::config::source::{DEFAULT_PHASE, PHASES, parse_phase};
+    use crate::config::{Origin, parse_str};
     use crate::shell::testing::{installed, run};
 
     const FILE: &str = "/repo/bx.toml";

@@ -20,10 +20,12 @@ use crate::adopt::{self, Adoption, Removal};
 use crate::config::resolve::Resolution;
 use crate::config::target::Body;
 use crate::doctor::{self, Probes, systemd};
+use crate::env::Env;
+use crate::git::Git;
 use crate::init;
 use crate::paths;
-use crate::plan::{self, Env, Error, Inputs, Mode, Palette, Report, View};
-use crate::report::{Action, Exit};
+use crate::plan::{self, Error, Inputs, Mode, Palette, Report, View};
+use crate::report::{self, Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
 use crate::sync;
@@ -89,6 +91,10 @@ fn doctor_with(
 
 /// Bare `bx`: every target, unchanged ones included.
 ///
+/// Writes nothing, but it is not free of processes: deciding the plan runs
+/// each declared activation's command whose output is not cached yet, and asks
+/// the user's `git` about each declared external's checkout.
+///
 /// # Errors
 ///
 /// Whatever loading or deciding returns, and [`Error::Output`] when `out`
@@ -98,6 +104,9 @@ pub fn status(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 }
 
 /// `bx plan`: what `apply` would do, writing nothing.
+///
+/// Spawns what [`status`] spawns: uncached activation commands, and `git` for
+/// declared externals.
 ///
 /// # Errors
 ///
@@ -134,7 +143,17 @@ fn confirm() -> Result<bool, Error> {
     inquire::Confirm::new("Apply these changes?")
         .with_default(false)
         .prompt()
-        .map_err(Error::from_prompt)
+        .map_err(confirmation_failed)
+}
+
+/// What a confirmation prompt's failure is: [`Error::Canceled`] when it was
+/// [`init::abandoned`], [`Error::Prompt`] otherwise.
+fn confirmation_failed(error: inquire::InquireError) -> Error {
+    if init::abandoned(&error) {
+        Error::Canceled
+    } else {
+        Error::Prompt(error)
+    }
 }
 
 /// [`apply`], with the question asked through `ask`.
@@ -227,8 +246,8 @@ fn converge_inputs(
             writeln!(
                 out,
                 "  ! {}  stopped: {}",
-                plan::escape(&change.target),
-                plan::escape(change.note.as_deref().unwrap_or_default()),
+                report::escape(&change.target),
+                report::escape(change.note.as_deref().unwrap_or_default()),
             )
             .map_err(Error::Output)?;
         }
@@ -242,8 +261,11 @@ fn converge_inputs(
 /// `bx apply` does, and push what this machine committed.
 ///
 /// [`sync::pull`] runs first and refuses a diverged branch, a missing
-/// upstream, and a push that would carry a state file, all before anything is
-/// changed. The apply is [`apply`]'s, with its one confirmation and its `yes`.
+/// upstream, and a push that would carry a state file, all before the apply
+/// changes anything. It is not free of writes itself: before the fetch it
+/// commits the tracked copies an interrupted sync wrote and never committed
+/// ([`sync::commit_carried`]), so a refusal can follow that commit.
+/// The apply is [`apply`]'s, with its one confirmation and its `yes`.
 /// The apply runs in [`Mode::Sync`], so each tracked target this machine
 /// changed is carried into the repo, and [`sync::commit_carried`] commits
 /// those files in one commit before the push.
@@ -257,9 +279,11 @@ fn converge_inputs(
 ///
 /// # Errors
 ///
-/// Whatever [`sync::pull`] and [`sync::push`] return, and as [`apply`].
+/// Whatever [`sync::pull`] and [`sync::push`] return, and as [`apply`]; and
+/// whatever [`sync::commit_carried`] returns after the apply, which leaves
+/// what the apply wrote on disk and uncommitted for the next `sync` to commit.
 pub fn sync(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, sync::Error> {
-    sync_with(env, yes, out, &sync::Git::new(env), &mut confirm)
+    sync_with(env, yes, out, &Git::new(env), &mut confirm)
 }
 
 /// [`sync`], through `git`, with the question asked through `ask`.
@@ -267,7 +291,7 @@ fn sync_with(
     env: &Env,
     yes: bool,
     out: &mut dyn Write,
-    git: &sync::Git,
+    git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, sync::Error> {
     let pulled = sync::pull(env, git)?;
@@ -397,7 +421,7 @@ pub fn update(
     mode: UpdateMode,
     out: &mut dyn Write,
 ) -> Result<Exit, update::Error> {
-    let git = sync::Git::new(env);
+    let git = crate::git::Git::new(env);
     match mode {
         UpdateMode::Update { yes } => update_with(env, names, yes, out, &git, &mut confirm),
         UpdateMode::Check => update::check(env, names, false, &git, out),
@@ -413,7 +437,7 @@ fn update_with(
     names: &[String],
     yes: bool,
     out: &mut dyn Write,
-    git: &sync::Git,
+    git: &crate::git::Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, update::Error> {
     if !yes && !env.stdin_tty {
@@ -511,7 +535,7 @@ fn update_with(
         say(out, &found.summary())?;
         if let update::Verdict::Moves { log: Some(log), .. } = &found.verdict {
             for line in log {
-                say(out, &format!("    {}", plan::escape(line)))?;
+                say(out, &format!("    {}", crate::report::escape(line)))?;
             }
         }
     }
@@ -1054,6 +1078,22 @@ mod tests {
             matches!(answer, Err(Error::Prompt(inquire::InquireError::NotTTY))),
             "{answer:?}"
         );
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_at_the_confirmation_are_a_cancel_and_every_other_failure_is_an_error() {
+        use inquire::InquireError;
+
+        for key in [
+            InquireError::OperationCanceled,
+            InquireError::OperationInterrupted,
+        ] {
+            assert!(matches!(confirmation_failed(key), Error::Canceled));
+        }
+        assert!(matches!(
+            confirmation_failed(InquireError::NotTTY),
+            Error::Prompt(InquireError::NotTTY)
+        ));
     }
 
     #[test]

@@ -66,11 +66,11 @@ use std::path::Path;
 use toml_edit::Table;
 
 use super::path::{self, PathEntry};
+use super::shells::{Shell, Shells};
 use super::when::{self, Gate, When};
 use super::{Ctx, Error, Origin};
-use crate::env_guard::is_variable_name;
+use crate::lexical::is_variable_name;
 use crate::paths::Portable;
-use crate::shell::{Shell, Shells};
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[env]]";
@@ -213,7 +213,7 @@ pub fn parse_env(table: &Table, file: &Path, text: &str) -> Result<EnvDecl, Erro
         }
     };
 
-    let shells = Shells::parse_in(&ctx, table, &format!("`{name}`"))?;
+    let shells = ctx.shells_at(table, &format!("`{name}`"))?;
     if kind.places().contains(&Place::EnvironmentD) && table.get(Shells::KEY).is_some() {
         return Err(ctx.bad(
             table,
@@ -338,18 +338,6 @@ pub struct Var {
     pub when: Option<When>,
 }
 
-impl Var {
-    /// A variable written unconditionally.
-    #[must_use]
-    pub fn always(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
-            when: None,
-        }
-    }
-}
-
 /// An environment fragment: the variables one place holds, substituted and in
 /// declaration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,6 +439,22 @@ pub fn source_line(fragment: &Portable) -> String {
     format!("[[ -r {path} ]] && source {path}\n")
 }
 
+// Only tests build a `Var` by hand, so this sits last, beside them: the source
+// scans that read everything above the first `#[cfg(test)]` as this module's
+// shipped code still read all of it.
+#[cfg(test)]
+impl Var {
+    /// A variable written unconditionally.
+    #[must_use]
+    pub fn always(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            when: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,7 +502,7 @@ mod tests {
              [[env]]\nname = \"B\"\nvalue = \"1\"\nkind = \"login\"\nshells = [\"bash\", \"zsh\"]\n",
         )
         .expect("parses");
-        assert_eq!(envs[0].shells, Shells::only(crate::shell::Shell::Zsh));
+        assert_eq!(envs[0].shells, Shells::only(Shell::Zsh));
         assert_eq!(envs[1].shells, Shells::EVERY);
         for (shells, expected) in [
             ("[\"fish\"]", "\"fish\" is not a shell bx generates for"),

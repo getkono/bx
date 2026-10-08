@@ -12,7 +12,7 @@
 //! **process-wide** — no other thread may be reading or writing the environment,
 //! including through `getenv` inside libc and inside `std` itself. A mutex this
 //! module owns cannot establish that: `std::env::temp_dir()` reads `TMPDIR` on
-//! every `TempDir::new()`, and [`crate::detect::locate_in_env`] reads `PATH`, and
+//! every `TempDir::new()`, and `crate::detect::locate_in_env` reads `PATH`, and
 //! `cargo test` runs all of it concurrently in one process. glibc's `unsetenv`
 //! shifts `environ` in place, so a concurrent `getenv` can read a stale pointer.
 //! The symptom would have been a flaky failure in a test that has nothing to do
@@ -22,8 +22,8 @@
 //! `unsafe` at all. Every library function that needs a home takes it as an
 //! argument — [`crate::paths::home_in`], [`crate::paths::xdg_base`] and
 //! [`crate::paths::config_root_in`] are the parameterised forms, and
-//! [`crate::paths::home`] and [`crate::paths::config_root`] are one-line wrappers
-//! that read the real environment and are tested by agreeing with it.
+//! [`crate::paths::home`] is the one-line wrapper that reads the real
+//! environment and is tested by agreeing with it.
 //!
 //! # The rule for every later entry
 //!

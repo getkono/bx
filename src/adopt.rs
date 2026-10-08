@@ -70,11 +70,11 @@ use crate::config::resolve::{Resolution, Resolved};
 use crate::config::target::{Attach, Body, Direction, Format};
 use crate::config::values::ResolvedValues;
 use crate::config::{self, Layer, Origin, layers, merge, resolve};
+use crate::env::Env;
 use crate::env_guard::{self, Reason, RootSet};
 use crate::fs::{self, Kind, Mode};
 use crate::journal;
 use crate::paths::{self, Portable};
-use crate::plan::Env;
 use crate::recover;
 use crate::restore::{self, Restored};
 use crate::state::{
@@ -181,7 +181,7 @@ pub struct Context {
     roots: RootSet,
     /// The `git` `rm` asks whether a checkout bx cloned holds anything of
     /// the user's.
-    git: crate::sync::Git,
+    git: crate::git::Git,
     trees: Vec<TreeDecl>,
 }
 
@@ -236,15 +236,17 @@ impl Context {
     ///
     /// # Errors
     ///
-    /// [`Error::RepoMissing`] when there is no config repo, and
-    /// [`Error::Config`] for anything the configuration refuses.
+    /// [`Error::RepoMissing`] when there is no config repo,
+    /// [`Error::Config`] for anything the configuration refuses, and, when a
+    /// layer is read back for its trees, [`Error::Fs`] when it cannot be
+    /// observed and [`Error::Layer`] when it is not a UTF-8 file.
     pub fn load(env: &Env) -> Result<Self, Error> {
         let home = env.home.clone();
         let repo = paths::config_root_in(&home, env.xdg_config_home.as_deref());
         let state = StateDir::resolve_in(&home, env.xdg_state_home.as_deref());
         let layers = layers::load_layer_set(&repo, state.root(), &home)?;
         let merged = merge::merge(&layers, &home)?;
-        let resolved = resolve::resolve(&merged, &home)?;
+        let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let roots = RootSet::from_values(&resolved.values)
             .owning(&[state.root().to_path_buf()])
             .with_config_repos(std::slice::from_ref(&repo));
@@ -256,7 +258,7 @@ impl Context {
             layers,
             resolved,
             roots,
-            git: crate::sync::Git::new(env),
+            git: crate::git::Git::new(env),
             trees,
         })
     }
@@ -906,9 +908,16 @@ fn lock(state: &StateDir) -> Result<ExclusiveLock, Error> {
 /// new target in `bx.toml`, and record ownership in the ledger — in that
 /// order, so a run that stops partway is finished by running it again.
 ///
+/// Before any of that it is a writing command like `apply`: it creates the
+/// state directory when there is none, and recovers an interrupted session it
+/// finds there — rolling it back, or bringing the ledger up to date
+/// ([`recover::lock_for_writing`]) — refusing when that session cannot be
+/// accounted for.
+///
 /// # Errors
 ///
-/// As [`plan_add`], plus whatever the lock, the writes, and the ledger return.
+/// As [`plan_add`], plus whatever the lock, the recovery, the writes, and the
+/// ledger return.
 pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
     let lock = lock(&ctx.state)?;
     let mut ledger = Ledger::open(&ctx.state, &lock, &ctx.home)?.value;
@@ -1196,7 +1205,7 @@ fn undeclare(
 ///
 /// The targets are every declaration of a path at or beneath `target`, in any
 /// layer, and every ledger entry there — so a target whose declaration was
-/// deleted by hand is still handed back. [`restore::restore`] decides and
+/// deleted by hand is still handed back. [`restore::restore_with`] decides and
 /// restores each; each one it released is then removed from every layer
 /// declaring it. A conflict is left declared and untouched, and a tree is
 /// handed back whole or not at all ([`hold_trees`]). Nothing to do is an

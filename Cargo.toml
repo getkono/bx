@@ -81,6 +81,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+proptest = "1.11.0"
 
 [profile.release]
 # bx is a short-lived, frequently-installed binary fetched over the network:

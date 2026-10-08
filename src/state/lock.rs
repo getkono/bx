@@ -18,16 +18,17 @@
 //!
 //! # A reader creates the state directory too
 //!
-//! [`SharedLock::acquire`] — the lock a read-only `plan` or `doctor` takes —
-//! goes through [`open_lock_file`], which calls
-//! [`ensure_dir`][super::dir::ensure_dir] on the state **root** and nothing
-//! else. So `bx plan` on a machine that has never applied anything creates
-//! `~/.local/state/bx` and `lock` in it, and sets the directory to `0700` and
-//! the lock file to `0600`. That is deliberate.
+//! `SharedLock::acquire` — the lock a read-only `plan` or `doctor` took until
+//! decision 8 had them ask [`SharedLock::probe`] instead, which creates
+//! nothing, and which only tests take now — goes through [`open_lock_file`],
+//! which calls [`ensure_dir`][super::dir::ensure_dir] on the state **root**
+//! and nothing else. So a shared lock taken on a machine that has never
+//! applied anything creates `~/.local/state/bx` and `lock` in it, and sets the
+//! directory to `0700` and the lock file to `0600`. That is deliberate.
 //!
 //! It does **not** create `restore/` or `shell/`: a read that stores no
 //! snapshot and writes no fragment needs neither, and `restore/` is created by
-//! [`Ledger::store_blob`][super::Ledger] on the write that first needs it.
+//! [`Ledger::record`][super::Ledger] on the write that first needs it.
 //! [`StateDir::ensure`][super::StateDir::ensure] is what creates all three, and
 //! on this branch no command calls it — `apply` is the entry that will. The
 //! consequence is that the `ForeignOwner`, `SharedLinkedDir` and
@@ -219,6 +220,7 @@ pub struct SharedLock {
     /// Kept open for the lock's lifetime; closing it releases the lock.
     fd: OwnedFd,
     /// The lock file, for error messages.
+    #[cfg(test)]
     path: PathBuf,
 }
 
@@ -247,11 +249,13 @@ impl ExclusiveLock {
     /// # Errors
     ///
     /// As [`ExclusiveLock::acquire`], minus [`Error::Locked`].
+    #[cfg(test)]
     pub fn try_acquire(dir: &StateDir) -> Result<Option<Self>, Error> {
         optional(Self::acquire(dir))
     }
 
     /// The lock file this guard holds.
+    #[cfg(test)]
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.held.path
@@ -272,6 +276,7 @@ impl SharedLock {
     /// # Errors
     ///
     /// As [`ExclusiveLock::acquire`].
+    #[cfg(test)]
     pub fn acquire(dir: &StateDir) -> Result<Self, Error> {
         let path = dir.lock();
         let (fd, _) = open_lock_file(dir, &path)?;
@@ -281,17 +286,19 @@ impl SharedLock {
 
     /// Take a shared lock, or return `None` while an apply holds the directory.
     ///
-    /// This is the call `plan` and `doctor` make: `None` means "an apply is in
-    /// progress", which they report and then carry on read-only.
+    /// `None` means "an apply is in progress". A read-only command asks
+    /// [`SharedLock::probe`] instead, which writes nothing.
     ///
     /// # Errors
     ///
     /// As [`ExclusiveLock::acquire`], minus [`Error::Locked`].
+    #[cfg(test)]
     pub fn try_acquire(dir: &StateDir) -> Result<Option<Self>, Error> {
         optional(Self::acquire(dir))
     }
 
     /// The lock file this guard holds.
+    #[cfg(test)]
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -328,7 +335,7 @@ impl SharedLock {
     /// holder. A read-only `bx plan` can therefore make a concurrent write
     /// fail, and the user reruns it. The window is not avoidable with `flock`:
     /// it has no test-without-taking operation, and
-    /// [`SharedLock::try_acquire`], which `plan` used before decision 8, has
+    /// `SharedLock::try_acquire`, which `plan` used before decision 8, has
     /// the identical window. `fcntl`/OFD `F_GETLK` would answer without
     /// acquiring, but this repository's lock is `flock` throughout, so adopting
     /// it is a design change and not a defect repair. Plan E1 (#40) records the
@@ -420,6 +427,7 @@ fn is_lock_file(stat: &rustix::fs::Stat) -> bool {
 }
 
 /// Turn a refusal into `None`, keeping every other failure.
+#[cfg(test)]
 fn optional<T>(result: Result<T, Error>) -> Result<Option<T>, Error> {
     match result {
         Ok(lock) => Ok(Some(lock)),

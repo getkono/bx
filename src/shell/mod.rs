@@ -114,9 +114,74 @@ pub mod alias;
 pub mod bash;
 pub mod function;
 pub mod keybindings;
+pub mod placement;
 pub mod plugin;
 pub mod source;
 pub mod update_prompt;
+pub mod zsh;
+
+use crate::config::resolution::{BlockedEntry, Resolution};
+use crate::config::target::Gen;
+
+impl Gen {
+    /// The body this generator produces.
+    ///
+    /// `present` answers whether a tool a `when = "has:TOOL"` names is usable
+    /// on this machine: the one input besides the target itself, asked while
+    /// `plan` and `apply` decide, never by the generated shell.
+    #[must_use]
+    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+        match self {
+            Self::Env(fragment) => fragment.render(present),
+            Self::Source(fragment) => crate::config::env::source_line(fragment),
+            Self::Interactive(file) => file.render(present),
+            Self::Bash(file) => file.render(present),
+            Self::Inputrc(keybindings) => bash::render_inputrc(keybindings),
+        }
+    }
+
+    /// What the generator's plan row says beside its bytes: for zsh's and
+    /// bash's interactive files, the functions and sources held back from it,
+    /// each with what would release it, and the declarations that do not
+    /// reach that shell. `None` for every other generator, and for an
+    /// interactive file with nothing to say.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Self::Interactive(file) => file.note(),
+            Self::Bash(file) => file.note(),
+            Self::Env(_) | Self::Source(_) | Self::Inputrc(_) => None,
+        }
+    }
+}
+
+/// The lines that close an interactive file holding a plugin or a source line:
+/// a comment, and a command that sets nothing and returns 0. The comment's
+/// words predate declared sources and are kept, so a file written before them
+/// is not rewritten for a comment.
+pub(crate) const SETTLE: &str = "\n# bx: done, whichever plugins were found\ntrue\n";
+
+/// The entries of `resolutions` that are held back, in their order: what an
+/// interactive file's note names.
+fn held<T>(resolutions: &[Resolution<T>]) -> Vec<&BlockedEntry> {
+    resolutions
+        .iter()
+        .filter_map(|resolution| match resolution {
+            Resolution::Blocked(entry) => Some(entry),
+            Resolution::Ready(_) => None,
+        })
+        .collect()
+}
+
+/// `text` as one single-quoted shell word that means exactly `text`, whatever
+/// it holds: an alias body, or a tool's cached activation output.
+///
+/// Each `'` becomes `'\''`; nothing else is touched, because nothing else has
+/// a meaning inside single quotes.
+#[must_use]
+pub fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
 
 /// Running generated shell text in a real shell, for the submodules' tests.
 #[cfg(test)]
@@ -165,146 +230,10 @@ pub(crate) mod testing {
     }
 }
 
-/// A shell bx generates configuration for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Shell {
-    /// zsh.
-    Zsh,
-    /// bash.
-    Bash,
-}
-
-impl Shell {
-    /// Every shell, in the order messages list them.
-    pub const ALL: [Self; 2] = [Self::Zsh, Self::Bash];
-
-    /// The shell's name, as `bx.toml` and its own `init` commands spell it.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Zsh => "zsh",
-            Self::Bash => "bash",
-        }
-    }
-
-    /// The shell a config author spelled, if it is one.
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|shell| shell.name() == raw)
-    }
-}
-
-/// The shells one declaration renders into.
-///
-/// # The `shells` key
-///
-/// `[[env]]`, `[[function]]`, `[[source]]` and `[[activation]]` entries, and
-/// a `[path]` entry written as an inline table, each take an optional
-/// `shells = ["zsh"]`, naming the shells the declaration is
-/// kept to. Without it a declaration reaches every shell, so zsh and bash are
-/// configured alike from one declaration. A name that is not a shell bx
-/// generates for, or an empty list, fails the load; a declaration restricted
-/// away from a shell is named on that shell's generated file's plan row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Shells {
-    /// Whether it reaches zsh.
-    zsh: bool,
-    /// Whether it reaches bash.
-    bash: bool,
-}
-
-impl Default for Shells {
-    fn default() -> Self {
-        Self::EVERY
-    }
-}
-
-impl Shells {
-    /// Every shell: what a declaration with no `shells` key reaches.
-    pub const EVERY: Self = Self {
-        zsh: true,
-        bash: true,
-    };
-
-    /// The key, as a config author writes it.
-    pub const KEY: &'static str = "shells";
-
-    /// Only `shell`.
-    #[must_use]
-    pub const fn only(shell: Shell) -> Self {
-        Self {
-            zsh: matches!(shell, Shell::Zsh),
-            bash: matches!(shell, Shell::Bash),
-        }
-    }
-
-    /// Whether the declaration reaches `shell`.
-    #[must_use]
-    pub const fn includes(self, shell: Shell) -> bool {
-        match shell {
-            Shell::Zsh => self.zsh,
-            Shell::Bash => self.bash,
-        }
-    }
-
-    /// Read `shells` from `table`, or [`Shells::EVERY`] when it is absent.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::config::Error::WrongType`] for a value that is not an array
-    /// of strings, and [`crate::config::Error::BadValue`] for an empty list
-    /// or a name that is not a shell bx generates for.
-    pub(crate) fn parse_in(
-        ctx: &crate::config::Ctx<'_>,
-        table: &toml_edit::Table,
-        owner: &str,
-    ) -> Result<Self, crate::config::Error> {
-        if table.get(Self::KEY).is_none() {
-            return Ok(Self::EVERY);
-        }
-        let names = ctx.str_array_at(table, Self::KEY)?;
-        Self::from_names(&names)
-            .map_err(|problem| ctx.bad(table, Self::KEY, format!("{owner}: {problem}")))
-    }
-
-    /// The shells `names` spell.
-    ///
-    /// # Errors
-    ///
-    /// Why the list names no shell, or names one bx does not generate for.
-    pub fn from_names(names: &[String]) -> Result<Self, String> {
-        let known = || {
-            Shell::ALL
-                .iter()
-                .map(|shell| format!("{:?}", shell.name()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        if names.is_empty() {
-            return Err(format!(
-                "`shells` names no shell; list one or more of {}, or set `enabled = false`",
-                known()
-            ));
-        }
-        let mut shells = Self {
-            zsh: false,
-            bash: false,
-        };
-        for name in names {
-            match Shell::parse(name) {
-                Some(Shell::Zsh) => shells.zsh = true,
-                Some(Shell::Bash) => shells.bash = true,
-                None => {
-                    return Err(format!(
-                        "{name:?} is not a shell bx generates for; `shells` lists {}",
-                        known()
-                    ));
-                }
-            }
-        }
-        Ok(shells)
-    }
-}
+/// The shell vocabulary a declaration is written in, which this module reads.
+/// Declared in [`crate::config::shells`] and named here too, where every
+/// renderer already looks for it.
+pub use crate::config::shells::{Phase, Shell, Shells};
 
 /// The note `shell`'s generated file's plan row carries for the enabled
 /// declarations of `merged` that do not reach it, or `None` when every one
@@ -376,77 +305,6 @@ pub fn omitted(shell: Shell, merged: &crate::config::Config) -> Option<String> {
             }),
     );
     (!notes.is_empty()).then(|| notes.join("; "))
-}
-
-/// One named section of the generated interactive shell file.
-///
-/// Declared in load order, so the derived `Ord` is the load order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Phase {
-    /// Environment variables.
-    Env,
-    /// `PATH` edits.
-    Path,
-    /// Tool activations that put a tool on `PATH` or `fpath`.
-    Activations,
-    /// The completion system's own setup.
-    Completion,
-    /// Tool integrations that register a completion or a widget.
-    Completions,
-    /// Plugins, each sourced only once it is readable.
-    Plugins,
-    /// Aliases.
-    Aliases,
-    /// Functions, and the hooks they register.
-    Functions,
-    /// Keybindings.
-    Keybindings,
-    /// Shell options and history settings.
-    Options,
-    /// The single slot that loads after everything else.
-    Terminal,
-}
-
-impl Phase {
-    /// Every phase, in load order.
-    pub const ALL: [Self; 11] = [
-        Self::Env,
-        Self::Path,
-        Self::Activations,
-        Self::Completion,
-        Self::Completions,
-        Self::Plugins,
-        Self::Aliases,
-        Self::Functions,
-        Self::Keybindings,
-        Self::Options,
-        Self::Terminal,
-    ];
-
-    /// The phase's name, as its heading in the generated file spells it.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Env => "env",
-            Self::Path => "path",
-            Self::Activations => "activations",
-            Self::Completion => "completion",
-            Self::Completions => "completions",
-            Self::Plugins => "plugins",
-            Self::Aliases => "aliases",
-            Self::Functions => "functions",
-            Self::Keybindings => "keybindings",
-            Self::Options => "options",
-            Self::Terminal => "terminal",
-        }
-    }
-
-    /// Whether the phase may hold an environment assignment: only `env` and
-    /// `path`, whose content must be an environment fragment the plan judges.
-    #[must_use]
-    pub const fn assigns(self) -> bool {
-        matches!(self, Self::Env | Self::Path)
-    }
 }
 
 /// Why a contribution cannot be assembled.
@@ -532,6 +390,7 @@ impl Assembly {
     }
 
     /// Whether nothing with any content has been contributed.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.phases.iter().flatten().all(|c| c.body.is_empty())
@@ -582,51 +441,6 @@ mod tests {
                 .expect("one terminal claimant");
         }
         assembly.render()
-    }
-
-    #[test]
-    fn there_are_eleven_phases_in_load_order_each_named_once() {
-        assert_eq!(Phase::ALL.len(), 11);
-        for (index, phase) in Phase::ALL.iter().enumerate() {
-            assert_eq!(*phase as usize, index, "{phase:?}");
-        }
-        assert!(Phase::ALL.is_sorted());
-        let mut names: Vec<_> = Phase::ALL.iter().map(|p| p.name()).collect();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), 11);
-        assert_eq!(Phase::ALL[0], Phase::Env);
-        assert_eq!(Phase::ALL[10], Phase::Terminal);
-    }
-
-    #[test]
-    fn completion_is_set_up_after_path_and_before_anything_that_registers_one() {
-        let completion = Phase::Completion;
-        for before in [Phase::Env, Phase::Path, Phase::Activations] {
-            assert!(before < completion, "{before:?}");
-        }
-        for after in [
-            Phase::Completions,
-            Phase::Plugins,
-            Phase::Aliases,
-            Phase::Functions,
-            Phase::Keybindings,
-            Phase::Options,
-            Phase::Terminal,
-        ] {
-            assert!(completion < after, "{after:?}");
-        }
-    }
-
-    #[test]
-    fn only_env_and_path_may_assign() {
-        for phase in Phase::ALL {
-            assert_eq!(
-                phase.assigns(),
-                matches!(phase, Phase::Env | Phase::Path),
-                "{phase:?}"
-            );
-        }
     }
 
     #[test]

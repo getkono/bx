@@ -36,7 +36,7 @@ use tempfile::NamedTempFile;
 
 use super::atomic::{self, CreatedDirs, Error, Observed, Parent, TEMP_PREFIX, Unpublished};
 use super::{Kind, durable};
-use crate::state::ContentHash;
+use crate::hash::ContentHash;
 
 /// The digest a link holding `text` is recorded under: that of its bytes.
 #[must_use]
@@ -46,13 +46,12 @@ pub fn digest(text: &Path) -> ContentHash {
 
 /// A link made beside its destination and not yet renamed over it.
 ///
-/// Dropping it removes the temporary link — see [`crate::fs::Staged`] for
+/// Dropping it removes the temporary link — see [`crate::fs::atomic::Staged`] for
 /// what that is worth — and leaves the destination exactly as it was.
 #[derive(Debug)]
 pub struct StagedLink {
     temp: NamedTempFile<()>,
     dest: PathBuf,
-    text: PathBuf,
     prior: Observed,
     created_dirs: Vec<PathBuf>,
 }
@@ -138,7 +137,6 @@ fn stage_link_in(
     Ok(StagedLink {
         temp,
         dest,
-        text: text.to_path_buf(),
         prior,
         created_dirs,
     })
@@ -170,31 +168,21 @@ fn refuse_unlinkable(observed: &Observed) -> Result<(), Error> {
 
 impl StagedLink {
     /// The destination this link will replace.
+    #[cfg(test)]
     #[must_use]
     pub fn dest(&self) -> &Path {
         &self.dest
     }
 
     /// The temporary link, beside the destination, already holding its text.
+    #[cfg(test)]
     #[must_use]
     pub fn temp_path(&self) -> &Path {
         self.temp.path()
     }
 
-    /// What was at the destination before: nothing, or a link.
-    #[must_use]
-    pub const fn prior(&self) -> &Observed {
-        &self.prior
-    }
-
-    /// The digest of the text the link holds.
-    #[must_use]
-    pub fn written(&self) -> ContentHash {
-        digest(&self.text)
-    }
-
     /// The parent directories this write invented and claims, deepest first,
-    /// as [`crate::fs::Filled::created_dirs`].
+    /// as `crate::fs::Filled::created_dirs`.
     #[must_use]
     pub fn created_dirs(&self) -> &[PathBuf] {
         &self.created_dirs
@@ -216,6 +204,7 @@ impl StagedLink {
         } = self;
         let refused = |error: Error| Unpublished {
             error,
+            #[cfg(test)]
             dest: dest.clone(),
         };
         let publish = || -> Result<(), Error> {
@@ -452,6 +441,83 @@ mod tests {
             refuse_stage_link(&file, &planned, &CreatedDirs::new()),
             Err(Error::Changed { .. })
         ));
+    }
+
+    #[test]
+    fn a_staged_link_reports_what_it_replaces_and_what_it_holds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dest = root.path().join("tool");
+        std::os::unix::fs::symlink("old", &dest).expect("seed");
+        let planned = observe(&dest).expect("observe");
+
+        let staged =
+            stage_link(&dest, Path::new("new"), &planned, &mut CreatedDirs::new()).expect("stage");
+
+        assert_eq!(staged.dest(), dest);
+        assert_eq!(
+            std::fs::read_link(staged.temp_path()).expect("the staged link"),
+            Path::new("new")
+        );
+        assert_eq!(
+            std::fs::read_link(&dest).expect("the link it replaces"),
+            Path::new("old")
+        );
+        assert_eq!(staged.created_dirs(), [] as [PathBuf; 0]);
+        staged.publish().expect("publish");
+        assert_eq!(
+            std::fs::read_link(&dest).expect("published"),
+            Path::new("new")
+        );
+    }
+
+    #[test]
+    fn a_link_whose_directory_cannot_be_opened_is_not_published() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Reopens the directory so the tempdir can be removed.
+        struct Reopen(PathBuf);
+        impl Drop for Reopen {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("a directory");
+        let dest = dir.join("tool");
+        let planned = observe(&dest).expect("observe");
+        let staged =
+            stage_link(&dest, Path::new("x"), &planned, &mut CreatedDirs::new()).expect("stage");
+        let temp = staged.temp_path().to_path_buf();
+        // Still writable and searchable, so the rename itself could be made,
+        // but not readable, so the directory cannot be opened to sync it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+        let reopen = Reopen(dir.clone());
+        if std::fs::File::open(&dir).is_ok() {
+            crate::testing::skip_unconstructible("a directory its owner can open at 0300");
+            return;
+        }
+
+        let refused = staged
+            .publish()
+            .expect_err("the directory cannot be opened");
+
+        assert_eq!(refused.dest, dest);
+        assert!(
+            matches!(&refused.error, Error::Write { path, .. } if *path == dir),
+            "{:?}",
+            refused.error
+        );
+        drop(reopen);
+        assert!(
+            std::fs::symlink_metadata(&dest).is_err(),
+            "nothing is renamed over the destination before the directory is open"
+        );
+        assert!(
+            std::fs::symlink_metadata(&temp).is_err(),
+            "the temporary link is gone"
+        );
     }
 
     fn names(dir: &Path) -> Vec<String> {

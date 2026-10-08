@@ -25,9 +25,10 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use super::Error;
 use super::dir::StateDir;
-use super::hash::ContentHash;
 use super::lock::ExclusiveLock;
 use super::store::{self, Loaded, Loss};
+#[cfg(test)]
+use crate::hash::ContentHash;
 
 /// The envelope tag for `fingerprints.mpk`.
 const KIND: &str = "bx.fingerprints";
@@ -54,6 +55,7 @@ impl Fingerprint {
 
     /// The SHA-256 of these bytes. The usual case: the inputs are long, and
     /// only whether they changed matters.
+    #[cfg(test)]
     #[must_use]
     pub fn hashed(bytes: &[u8]) -> Self {
         Self(ContentHash::of(bytes).as_bytes().to_vec())
@@ -175,6 +177,7 @@ impl Fingerprints {
     /// An unknown key is `false`. A missing fingerprint must invalidate rather
     /// than validate: the cost of recomputing is a delay, and the cost of
     /// wrongly skipping is a stale environment.
+    #[cfg(test)]
     #[must_use]
     pub fn matches(&self, key: &str, fingerprint: &Fingerprint) -> bool {
         self.get(key) == Some(fingerprint)
@@ -191,12 +194,14 @@ impl Fingerprints {
     }
 
     /// How many fingerprints are recorded.
+    #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether anything is recorded.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

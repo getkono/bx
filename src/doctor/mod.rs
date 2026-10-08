@@ -54,8 +54,8 @@ use std::path::Path;
 
 use crate::config::Origin;
 use crate::paths;
-use crate::plan::{Inputs, escape};
-use crate::report::Exit;
+use crate::plan::Inputs;
+use crate::report::{Exit, escape};
 
 /// One thing worth a human's attention.
 #[derive(Debug, Clone, PartialEq, Eq)]

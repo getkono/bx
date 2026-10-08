@@ -409,7 +409,7 @@ impl ValueKind {
     ///
     /// # Errors
     ///
-    /// [`ValueError::Malformed`] when `answer` is not of this kind.
+    /// [`ValueError::Malformed`] or [`ValueError::NotAbsolute`] for an answer not of this kind.
     pub(crate) fn check(self, answer: &str, home: &Path) -> Result<String, ValueError> {
         let malformed = |expected: &'static str| ValueError::Malformed {
             kind: self,
@@ -1713,7 +1713,7 @@ impl ResolvedValues {
 
     /// The declaration index of `name`, switched off or not.
     ///
-    /// Unfiltered, unlike [`ResolvedValues::decls`]: a declaration's position is
+    /// Unfiltered, unlike `ResolvedValues::decls`: a declaration's position is
     /// where it was written, and `enabled` does not move it. That is what lets
     /// `resolve`'s `in_declaration_order` order the names of a block that is
     /// *about* switched-off declarations.
@@ -1725,9 +1725,9 @@ impl ResolvedValues {
     ///
     /// # Errors
     ///
-    /// [`Unresolved::Unset`] when a referenced value has no answer — which makes
-    /// a target blocked, not the load failed. [`Unresolved::Malformed`] and
-    /// [`Unresolved::Undeclared`] are repo defects and do fail the load.
+    /// [`Unresolved::Unset`], [`Unresolved::Disabled`] or [`Unresolved::Invalid`] when a value is
+    /// unanswered, switched off, or made invalid by the account: a target blocks, not the load.
+    /// [`Unresolved::Malformed`] and [`Unresolved::Undeclared`] are repo defects that fail the load.
     pub fn substitute(&self, text: &str) -> Result<String, Unresolved> {
         let expanded = expand(text, &|name: &str| match self.index_of(name) {
             Some(index) => self.lookup_at(index),
@@ -1748,8 +1748,8 @@ impl ResolvedValues {
         }
     }
 
-    /// Put `names` into declaration order, so two reports of one problem read
-    /// the same way regardless of which field was substituted first.
+    /// Put `names` into declaration order, deduplicated, indexing every
+    /// declaration, switched-off ones too ([`ResolvedValues::index_of`]).
     pub(crate) fn in_declaration_order(&self, mut names: Vec<String>) -> Vec<String> {
         names.sort_by_key(|name| self.index_of(name).unwrap_or(usize::MAX));
         names.dedup();
@@ -1769,36 +1769,11 @@ impl ResolvedValues {
         self.index_of(name).map(|index| &self.decls[index])
     }
 
-    /// Every **enabled** declaration, in declaration order.
-    ///
-    /// The order `bx init` walks. A declaration a layer switched off is not one
-    /// of this account's values, so it is absent here and is never prompted for;
-    /// it is still findable by [`ResolvedValues::decl`], which is what keeps a
-    /// reference to it distinguishable from a reference to a name no layer ever
-    /// declared.
-    #[must_use]
-    pub fn decls(&self) -> Vec<&ValueDecl> {
-        self.decls.iter().filter(|decl| decl.enabled).collect()
-    }
-
-    /// Every enabled declaration with no answer, in declaration order.
-    ///
-    /// What `bx doctor` lists.
-    #[must_use]
-    pub fn unset(&self) -> Vec<&ValueDecl> {
-        self.decls
-            .iter()
-            .zip(&self.answers)
-            .filter(|(decl, answer)| decl.enabled && answer.value().is_none())
-            .map(|(decl, _)| decl)
-            .collect()
-    }
-
     /// Every **required** declaration that needs an answer of its own, in
     /// declaration order.
     ///
-    /// What `bx init` prompts for, each carrying its `description` for the
-    /// prompt and its `default` for the pre-fill.
+    /// What `bx init` prompts for and `bx doctor` lists, each carrying its
+    /// `description` for the prompt and its `default` for the pre-fill.
     ///
     /// A declaration whose `default` merely failed to resolve is **not** here.
     /// With `root` unanswered and `cache` defaulting to `{{root}}/cache`, both
@@ -1806,9 +1781,6 @@ impl ResolvedValues {
     /// would pre-fill the literal `{{root}}/cache` and then ask the twenty-four
     /// questions that deriving a default exists to avoid. The blocked entry
     /// already names only `root`, and this agrees with it.
-    ///
-    /// [`ResolvedValues::unset`] is unaffected — doctor lists everything that
-    /// has no answer, whatever the reason.
     #[must_use]
     pub fn unset_required(&self) -> Vec<&ValueDecl> {
         self.decls
@@ -1820,18 +1792,6 @@ impl ResolvedValues {
                     && matches!(answer, Answer::Unset(names) if names == slice::from_ref(&decl.name))
             })
             .map(|(decl, _)| decl)
-            .collect()
-    }
-
-    /// The **names** of every required declaration with no answer.
-    ///
-    /// Names rather than a predicate, because a report has to say *which* value
-    /// is missing or the user cannot act on it.
-    #[must_use]
-    pub fn unset_required_names(&self) -> Vec<&str> {
-        self.unset_required()
-            .into_iter()
-            .map(|decl| decl.name.as_str())
             .collect()
     }
 
@@ -1862,6 +1822,46 @@ impl ResolvedValues {
     #[must_use]
     pub fn home(&self) -> &Path {
         &self.home
+    }
+}
+
+// Only tests list these, so they sit last: the source scans read everything
+// above the first `#[cfg(test)]` as this module's shipped code.
+#[cfg(test)]
+impl ResolvedValues {
+    /// Every **enabled** declaration, in declaration order.
+    ///
+    /// A declaration a layer switched off is not one of this account's values,
+    /// so it is absent here; it is still findable by
+    /// [`ResolvedValues::decl`], which is what keeps a reference to it
+    /// distinguishable from a reference to a name no layer ever declared.
+    #[must_use]
+    pub fn decls(&self) -> Vec<&ValueDecl> {
+        self.decls.iter().filter(|decl| decl.enabled).collect()
+    }
+
+    /// Every enabled declaration with no answer, in declaration order,
+    /// whatever the reason.
+    #[must_use]
+    pub fn unset(&self) -> Vec<&ValueDecl> {
+        self.decls
+            .iter()
+            .zip(&self.answers)
+            .filter(|(decl, answer)| decl.enabled && answer.value().is_none())
+            .map(|(decl, _)| decl)
+            .collect()
+    }
+
+    /// The **names** of every required declaration with no answer.
+    ///
+    /// Names rather than a predicate, because a report has to say *which* value
+    /// is missing or the user cannot act on it.
+    #[must_use]
+    pub fn unset_required_names(&self) -> Vec<&str> {
+        self.unset_required()
+            .into_iter()
+            .map(|decl| decl.name.as_str())
+            .collect()
     }
 }
 
@@ -2245,7 +2245,6 @@ mod tests {
         // The guard's only enforcement mechanism, switched off invisibly.
         let mut root = a_decl("scratch_root", ValueKind::Path);
         root.is_root = true;
-
         let values = resolve(vec![root.clone()], &[answer("scratch_root", "/")]).unwrap();
         assert!(values.roots().is_empty(), "refused, and admits nothing");
 
@@ -2256,10 +2255,11 @@ mod tests {
         let message = values.check_answer("scratch_root", "/a/../..").unwrap_err();
         assert!(message.to_string().contains("may not be `/`"), "{message}");
 
-        // A value that is not a root is unaffected: it names a location, and
-        // nothing is admitted on the strength of it.
+        // A value that is not a root is unaffected: it is kept, and admits nothing.
         let plain = a_decl("brew_prefix", ValueKind::Path);
-        assert!(resolve(vec![plain], &[answer("brew_prefix", "/")]).is_ok());
+        let values = resolve(vec![plain], &[answer("brew_prefix", "/")]).unwrap();
+        assert_eq!(values.get("brew_prefix").unwrap().text, "/");
+        assert!(values.roots().is_empty(), "and it admits nothing");
     }
 
     #[test]

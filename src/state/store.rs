@@ -385,6 +385,7 @@ impl Health {
     /// that means *nothing bx wrote is left* must ask
     /// `health.damage().is_some_and(Damage::is_partial)` as well, or look at
     /// the value.
+    #[cfg(test)]
     #[must_use]
     pub fn is_reset(&self) -> bool {
         matches!(self, Self::Reset(_))

@@ -80,17 +80,6 @@ pub fn set(doc: &mut DocumentMut, name: &str, answer: &str) {
     }
 }
 
-/// Remove `name`, reporting whether it was there.
-///
-/// The `[values]` table itself is left behind even when it empties: an empty
-/// table is a valid, readable statement that this account has answered nothing,
-/// and removing it would discard whatever comments sat above it.
-pub fn unset(doc: &mut DocumentMut, name: &str) -> bool {
-    doc.get_mut(VALUES)
-        .and_then(Item::as_table_mut)
-        .is_some_and(|table| table.remove(name).is_some())
-}
-
 /// The `[values]` table, created as a real (not dotted, not inline) table if
 /// this document has none.
 fn values_table(doc: &mut DocumentMut) -> &mut Table {
@@ -105,6 +94,22 @@ fn values_table(doc: &mut DocumentMut) -> &mut Table {
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()
         .expect("the entry is a table, or was just made one")
+}
+
+/// Remove `name`, reporting whether it was there.
+///
+/// The `[values]` table itself is left behind even when it empties: an empty
+/// table is a valid, readable statement that this account has answered nothing,
+/// and removing it would discard whatever comments sat above it.
+///
+/// Only tests call it, so it sits last, beside them: the source scans that
+/// read everything above the first `#[cfg(test)]` as this module's shipped
+/// code still read all of it.
+#[cfg(test)]
+pub fn unset(doc: &mut DocumentMut, name: &str) -> bool {
+    doc.get_mut(VALUES)
+        .and_then(Item::as_table_mut)
+        .is_some_and(|table| table.remove(name).is_some())
 }
 
 #[cfg(test)]

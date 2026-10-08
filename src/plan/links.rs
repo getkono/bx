@@ -48,9 +48,9 @@ use crate::config::external::{External, Link};
 use crate::config::lock::Lock;
 use crate::config::resolve::Resolution;
 use crate::config::target::{Attach, Body, Direction, Format, Target};
+use crate::git::Git;
 use crate::paths::Portable;
 use crate::report::Action;
-use crate::sync::Git;
 
 /// Every link of every external, as far as this run can expand them.
 #[derive(Debug, Default)]

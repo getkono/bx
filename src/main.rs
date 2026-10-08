@@ -119,7 +119,7 @@ fn main() -> Result<()> {
         out.flush()?;
         std::process::exit(exit.code());
     }
-    let env = bx::plan::Env::from_process()?;
+    let env = bx::env::Env::from_process()?;
     let exit = match command {
         // No subcommand is the status view.
         None => bx::command::status(&env, &mut out)?,

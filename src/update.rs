@@ -17,7 +17,7 @@
 //! rewritten branch, without reaching the network again. An external with no
 //! checkout yet is asked with `git ls-remote`, which fetches nothing. Every
 //! command is the user's own `git`, unattended
-//! ([`crate::sync::Git::unattended`]), so a missing credential fails rather
+//! ([`crate::git::Git::unattended`]), so a missing credential fails rather
 //! than waits.
 //!
 //! A branch that was rewritten, so its new tip does not descend from the
@@ -49,10 +49,11 @@ use crate::config::external::{Check, External};
 use crate::config::lock::{self, Lock, Locked};
 use crate::config::update::Interval;
 use crate::fs::Mode;
+use crate::git::{self, Git};
 use crate::paths::{self, Portable};
 use crate::plan::external::{self as checkout, problem};
 use crate::state::StateDir;
-use crate::sync::{self, Git};
+use crate::sync;
 
 /// How long `bx update --background` may take, from start to finish.
 pub const BACKGROUND_BOUND: Duration = Duration::from_secs(30);
@@ -129,6 +130,14 @@ pub enum Error {
     /// Writing to the output failed.
     #[error("writing output: {0}")]
     Output(#[source] std::io::Error),
+}
+
+/// A git command in the config repo failed: reported as `bx sync`'s own git
+/// failures are.
+impl From<git::Error> for Error {
+    fn from(error: git::Error) -> Self {
+        Self::Sync(error.into())
+    }
 }
 
 /// What a remote says about one followed external, against its lock.
@@ -376,7 +385,7 @@ fn remote_tip(git: &Git, home: &Path, url: &str, reference: &str) -> Result<Stri
                 (name == reference).then(|| rev.to_string())
             })
             .ok_or_else(|| format!("{url} has no {reference}")),
-        Err(sync::Error::Git { status, .. }) if status.code() == Some(2) => {
+        Err(git::Error::Failed { status, .. }) if status.code() == Some(2) => {
             Err(format!("{url} has no {reference}"))
         }
         Err(error) => Err(problem(&error)),
@@ -794,7 +803,7 @@ pub fn now() -> Epoch {
 ///
 /// As [`crate::plan::Inputs::load`], [`select`] and [`Stamps::set`].
 pub fn check(
-    env: &crate::plan::Env,
+    env: &crate::env::Env,
     names: &[String],
     background: bool,
     git: &Git,
@@ -834,7 +843,7 @@ pub fn check(
 
 /// [`check`], under `update/check.lock`.
 fn looked(
-    env: &crate::plan::Env,
+    env: &crate::env::Env,
     names: &[String],
     background: bool,
     git: &Git,
@@ -937,7 +946,7 @@ pub fn offered(previous: &str, found: &[Found]) -> Vec<String> {
 ///
 /// As [`crate::plan::Inputs::load`] and [`Stamps::set`].
 pub fn snooze(
-    env: &crate::plan::Env,
+    env: &crate::env::Env,
     out: &mut dyn std::io::Write,
 ) -> Result<crate::report::Exit, Error> {
     snooze_waiting(env, SNOOZE_WAIT, out)
@@ -945,7 +954,7 @@ pub fn snooze(
 
 /// [`snooze`], waiting at most `wait` for a running check to let go.
 pub(crate) fn snooze_waiting(
-    env: &crate::plan::Env,
+    env: &crate::env::Env,
     wait: Duration,
     out: &mut dyn std::io::Write,
 ) -> Result<crate::report::Exit, Error> {

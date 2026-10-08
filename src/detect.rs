@@ -64,6 +64,7 @@ impl Presence {
     }
 
     /// The path bx found, if it found anything at all.
+    #[cfg(test)]
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match self {
@@ -129,6 +130,10 @@ pub fn locate(tool: impl AsRef<OsStr>, path_var: impl AsRef<OsStr>) -> Presence 
 /// The edge of the module: everything below it is pure. An unset `PATH` is
 /// treated as an empty one rather than an error, so an absolute `tool` still
 /// resolves — it never needed a search path.
+///
+/// Only tests call it: every shipped caller hands [`locate`] the `PATH` it
+/// was itself given.
+#[cfg(test)]
 #[must_use]
 pub fn locate_in_env(tool: impl AsRef<OsStr>) -> Presence {
     locate(tool, std::env::var_os("PATH").unwrap_or_default())

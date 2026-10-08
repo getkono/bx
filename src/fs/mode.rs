@@ -150,7 +150,8 @@ impl Mode {
     ///
     /// This is `ssh`'s `StrictModes` predicate, and `gpg`'s: a group- or
     /// world-writable key, config or directory is refused outright rather than
-    /// used with a warning. `doctor` reads it.
+    /// used with a warning. Only tests ask it.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_group_or_world_writable(self) -> bool {
         self.bits() & 0o022 != 0
@@ -533,7 +534,7 @@ mod tests {
         assert_eq!(crate::config::target::Mode::DEFAULT_DIR, Mode::DEFAULT_DIR);
         assert_eq!(
             crate::config::target::Mode::parse_octal("8"),
-            Err(crate::config::target::ModeError::Invalid("8".to_string())),
+            Err(ModeError::Invalid("8".to_string())),
         );
     }
 

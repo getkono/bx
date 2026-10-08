@@ -13,7 +13,8 @@
 //!   `apply` recovers an interrupted session before it decides anything, and
 //!   makes every write through one journalled session.
 //!
-//! The one environment read in the whole path is [`Env::from_process`], and
+//! The one environment read in the whole path is
+//! [`crate::env::Env::from_process`], and
 //! the `PATH` a declared activation's tool and a generated file's `has:TOOL`
 //! condition are looked up along, which [`Inputs::load`] takes once through
 //! [`activation::System::from_env`]; every other function takes what it needs
@@ -21,24 +22,25 @@
 
 mod decide;
 mod diff;
+mod error;
 mod execute;
 pub(crate) mod external;
+mod inputs;
+mod interrupted;
 mod region;
 mod track;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
 pub(crate) use decide::read_repo_file;
 pub use diff::{Diff, DiffKind, Palette, View, render};
+pub use error::Error;
+pub use inputs::Inputs;
 
-use crate::config::resolve::{self, Resolution, Resolved};
+use crate::config::resolve::Resolution;
 use crate::config::target::{Body, Direction, Gen, Target};
-use crate::config::{self, Origin, layers, merge};
-use crate::env::Env;
-use crate::env_guard::RootSet;
-use crate::git::Git;
-use crate::journal::{self, Session, SessionKind};
+use crate::config::{self, Origin};
+use crate::journal::{Session, SessionKind};
 use crate::paths::{self, Portable};
 use crate::recover::{self, Interrupted};
 use crate::report::{Action, Exit};
@@ -68,116 +70,6 @@ impl Mode {
     /// Whether this run writes.
     const fn writes(self) -> bool {
         matches!(self, Self::Apply | Self::Sync)
-    }
-}
-
-/// What a run decides against, loaded once.
-#[derive(Debug, Clone)]
-pub struct Inputs {
-    home: PathBuf,
-    repo: PathBuf,
-    state: StateDir,
-    /// Every enabled target as the merged layers wrote it, before substitution:
-    /// one per entry of `resolved.targets`, in the same order, so a blocked
-    /// target's body is still known.
-    declared: Vec<Target>,
-    resolved: Resolved,
-    roots: RootSet,
-    progress: bool,
-    /// The `git` a declared external is looked at and moved with: the user's
-    /// own, seeing the home and config home this run resolved, and unable to
-    /// ask anything.
-    git: Git,
-    /// Every enabled `[[activation]]`, in the merged configuration's order.
-    activations: Vec<activation::ActivationDecl>,
-    /// The machine an activation's tool is looked up and run on.
-    host: activation::System,
-}
-
-impl Inputs {
-    /// Locate the config repo and the state directory, and load, merge and
-    /// resolve the layer set.
-    ///
-    /// Reads configuration files only; nothing is created.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::RepoMissing`] when there is no config repo, and
-    /// [`Error::Config`] for anything else the configuration refuses.
-    pub fn load(env: &Env) -> Result<Self, Error> {
-        let home = env.home.clone();
-        let repo = paths::config_root_in(&home, env.xdg_config_home.as_deref());
-        let state = StateDir::resolve_in(&home, env.xdg_state_home.as_deref());
-        let layers = layers::load_layer_set(&repo, state.root(), &home)?;
-        let merged = merge::merge(&layers, &home)?;
-        let resolved = resolve::resolve(&merged, &home)?;
-        let roots = RootSet::from_values(&resolved.values)
-            .owning(&[state.root().to_path_buf()])
-            .with_config_repos(std::slice::from_ref(&repo));
-        Ok(Self {
-            home,
-            repo,
-            state,
-            declared: merged.targets,
-            resolved,
-            roots,
-            progress: env.stderr_tty,
-            git: Git::new(env).unattended(),
-            activations: merged.activations,
-            host: activation::System::from_env(),
-        })
-    }
-
-    /// The same inputs, looking at externals through `git`.
-    #[cfg(test)]
-    pub(crate) fn with_git(mut self, git: Git) -> Self {
-        self.git = git;
-        self
-    }
-
-    /// The same inputs, running activations on `host`.
-    #[cfg(test)]
-    pub(crate) fn with_host(mut self, host: activation::System) -> Self {
-        self.host = host;
-        self
-    }
-
-    /// The resolved configuration.
-    #[must_use]
-    pub const fn resolved(&self) -> &Resolved {
-        &self.resolved
-    }
-
-    /// Every enabled target as written, paired with its resolution, in
-    /// configuration order.
-    pub fn declared_targets(&self) -> impl Iterator<Item = (&Target, &Resolution<Target>)> {
-        self.declared.iter().zip(&self.resolved.targets)
-    }
-
-    /// The account's home.
-    #[must_use]
-    pub fn home(&self) -> &Path {
-        &self.home
-    }
-
-    /// The config repo.
-    #[must_use]
-    pub fn repo(&self) -> &Path {
-        &self.repo
-    }
-
-    /// The state directory.
-    #[must_use]
-    pub const fn state(&self) -> &StateDir {
-        &self.state
-    }
-
-    /// Every enabled target, ready or held back, in configuration order — the
-    /// list `plan` decides, for a read-only command that looks at the same
-    /// targets without deciding them.
-    #[must_use]
-    pub fn targets(&self) -> &[Resolution<Target>] {
-        &self.resolved.targets
     }
 }
 
@@ -240,106 +132,6 @@ impl Report {
     }
 }
 
-/// Everything that can stop a run.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// There is no config repo.
-    #[error("no bx config repo at {}; run `bx init` to create one", .0.display())]
-    RepoMissing(PathBuf),
-    /// The configuration could not be loaded, merged or resolved.
-    #[error(transparent)]
-    Config(config::Error),
-    /// A target's `file` body could not be read from the config repo.
-    #[error("{origin}: reading the body {}: {source}", .path.display())]
-    Body {
-        /// Where the target was declared.
-        origin: Origin,
-        /// The file that could not be read.
-        path: PathBuf,
-        /// Why.
-        #[source]
-        source: std::io::Error,
-    },
-    /// The state directory failed, including another bx holding it.
-    #[error(transparent)]
-    State(state::Error),
-    /// A state file bx reads is something other than a regular file — a FIFO,
-    /// a device, a link — which a read could wait on forever or never finish.
-    #[error(
-        "{} is not a regular file, so bx will not read it; move it out of the way and run bx \
-         again",
-        .path.display()
-    )]
-    NotARegularFile {
-        /// The state file.
-        path: PathBuf,
-    },
-    /// An interrupted session could not be inspected or resolved, including a
-    /// recovery that is blocked on files it cannot account for.
-    #[error(transparent)]
-    Recover(recover::Error),
-    /// The session refused or failed a write.
-    #[error(transparent)]
-    Journal(journal::Error),
-    /// A destination could not be observed.
-    #[error(transparent)]
-    Fs(#[from] crate::fs::Error),
-    /// There is something to apply, no `--yes`, and no terminal to ask on.
-    /// The plan has been shown and none of it was applied. Names no command:
-    /// `init` and `sync` reach it too, and `init` has by then written the
-    /// answers it was given.
-    #[error(
-        "bx applies only what was confirmed, and there is no terminal to ask on; nothing \
-         in the plan above was applied. Review it and rerun with --yes"
-    )]
-    NeedsConfirmation,
-    /// The confirmation prompt failed.
-    #[error("asking for confirmation: {0}")]
-    Prompt(#[source] inquire::InquireError),
-    /// The confirmation prompt was abandoned with Esc or Ctrl-C. Not a
-    /// failure: the command says so in a line and exits [`Exit::Canceled`],
-    /// so this never reaches the error report.
-    #[error("canceled at the confirmation prompt")]
-    Canceled,
-    /// The rendering could not be written to its output.
-    #[error("writing the plan: {0}")]
-    Output(#[source] std::io::Error),
-}
-
-impl From<config::Error> for Error {
-    fn from(error: config::Error) -> Self {
-        match error {
-            config::Error::RepoMissing(repo) => Self::RepoMissing(repo),
-            other => Self::Config(other),
-        }
-    }
-}
-
-impl From<state::Error> for Error {
-    fn from(error: state::Error) -> Self {
-        Self::State(error)
-    }
-}
-
-impl From<journal::Error> for Error {
-    fn from(error: journal::Error) -> Self {
-        match error {
-            journal::Error::State(error) => Self::State(error),
-            other => Self::Journal(other),
-        }
-    }
-}
-
-impl From<recover::Error> for Error {
-    fn from(error: recover::Error) -> Self {
-        match error {
-            recover::Error::State(error) => Self::State(error),
-            recover::Error::Journal(error) => error.into(),
-            other => Self::Recover(other),
-        }
-    }
-}
-
 /// Decide every target, report, and — in [`Mode::Apply`], once `approve` says
 /// so — write.
 ///
@@ -385,7 +177,7 @@ pub fn run(
         .into());
     }
     if let Some(interrupted) = report.interrupted.clone() {
-        report.changes = interrupted_rows(inputs, &interrupted)?;
+        report.changes = interrupted::interrupted_rows(inputs, &interrupted)?;
         if mode == Mode::Plan {
             return Ok(report);
         }
@@ -766,180 +558,16 @@ fn look_at_state(inputs: &Inputs, report: &mut Report) -> Result<(), Error> {
     Ok(())
 }
 
-/// The rows an interrupted session gives a run: what recovery would do to each
-/// write the session announced, in the order it announced them.
-///
-/// A write in a session that did not finish, and that recovery can resolve on
-/// its own, is rolled back. Its row is a modify with the diff from what is on
-/// disk to what was there before — every line removed, for a file the session
-/// created — and names the directories the session created that recovery
-/// removes where empty. A write in a session that finished is only recorded,
-/// which touches no file, so its row is unchanged. A write recovery cannot
-/// account for is a conflict whose note names abandon.
-///
-/// The prior bytes a diff shows are read from the journal and its restore
-/// snapshot, lockless, as `pending` read them. A snapshot that cannot be read
-/// now leaves the row without a diff rather than guessing at one.
-fn interrupted_rows(inputs: &Inputs, interrupted: &Interrupted) -> Result<Vec<Change>, Error> {
-    let loaded = journal::load(&inputs.state.journal())?;
-    let mut rows = Vec::with_capacity(interrupted.unfinished.len());
-    for unfinished in &interrupted.unfinished {
-        let target = unfinished.target.as_str();
-        // The target as written, found by where it resolved to or, when its
-        // resolution is blocked, by the path as written. Whether it is a
-        // secret is read from the declared body, which a blocked resolution
-        // still has.
-        let configured = inputs
-            .declared_targets()
-            .find(|(declared, resolution)| match resolution {
-                Resolution::Ready(ready) => ready.path.as_str() == target,
-                Resolution::Blocked(_) => declared.path.as_str() == target,
-            })
-            .map(|(declared, _)| declared);
-        let origin = configured.map_or_else(
-            || Origin::unknown(&interrupted.journal),
-            |declared| declared.origin.clone(),
-        );
-        // A secret's plaintext is on one side of its roll back, or both, and
-        // is never shown here either. A write no declared target claims is
-        // concealed too: the journal does not say whether it was a secret, and
-        // a secret whose target was removed, whose path was edited, or whose
-        // path now resolves elsewhere or waits on a value leaves exactly such
-        // a write. Showing a secret's bytes is worse than hiding an ordinary
-        // file's.
-        let conceal = configured
-            .is_none_or(|declared| matches!(declared.body, crate::config::target::Body::Secret(_)));
-        let between = if conceal {
-            Diff::concealed
-        } else {
-            Diff::between
-        };
-        let row = |action, diff, note: String| Change {
-            target: target.to_string(),
-            origin: origin.clone(),
-            action,
-            diff,
-            note: Some(note),
-        };
-
-        if !unfinished.resolvable {
-            let note = if unfinished.note.contains("abandon") {
-                unfinished.note.clone()
-            } else {
-                format!(
-                    "{}; recovery cannot put it back, so the interrupted session has to be \
-                     abandoned",
-                    unfinished.note
-                )
-            };
-            rows.push(row(Action::Conflict, None, note));
-            continue;
-        }
-        if interrupted.complete {
-            rows.push(row(Action::Unchanged, None, unfinished.note.clone()));
-            continue;
-        }
-
-        let intent = loaded
-            .intents()
-            .find(|intent| intent.target == unfinished.target);
-        let observed = crate::fs::observe(&unfinished.dest)?;
-        let written = unfinished.standing == recover::Standing::Written;
-        let dir = intent.is_some_and(|intent| intent.dir);
-        let link = intent.is_some_and(|intent| intent.link);
-        let (diff, what) = match (written, intent.map(|intent| &intent.before)) {
-            // A link's row shows its text on each side, as `plan` shows a
-            // symlink target's: the link recovery puts back was stored as
-            // its text.
-            (true, Some(state::Prior::Existed(reference))) if link => {
-                let prior = state::restore::read(&inputs.state, reference)
-                    .ok()
-                    .map(|bytes| {
-                        PathBuf::from(
-                            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(
-                                bytes,
-                            ),
-                        )
-                    });
-                (
-                    prior.map(|prior| Diff::link(observed.link.as_deref(), Some(&prior))),
-                    "rolls back: puts back the link that was there before",
-                )
-            }
-            (true, Some(state::Prior::Absent)) if link => (
-                Some(Diff::link(observed.link.as_deref(), None)),
-                "rolls back: removes the link the session made",
-            ),
-            // A directory has no bytes to diff: its row says what recovery
-            // does to it, and a mode it puts back is shown as one.
-            (true, Some(state::Prior::Existed(reference))) if dir => {
-                match (observed.mode, intent.map(|intent| intent.after)) {
-                    (Some(found), Some(journal::Written::Present { .. })) => (
-                        Some(Diff::mode(found, reference.mode)),
-                        "rolls back: puts back the mode it had",
-                    ),
-                    _ => (
-                        None,
-                        "rolls back: makes the directory the session removed again",
-                    ),
-                }
-            }
-            (true, Some(state::Prior::Absent)) if dir => (
-                None,
-                "rolls back: removes the directory the session created where empty",
-            ),
-            (true, Some(state::Prior::Existed(reference))) => {
-                let prior = state::restore::read(&inputs.state, reference).ok();
-                let mode = observed
-                    .mode
-                    .filter(|mode| *mode != reference.mode)
-                    .map(|mode| (mode, reference.mode));
-                (
-                    prior
-                        .and_then(|prior| between(target, observed.bytes.as_deref(), &prior, mode)),
-                    "rolls back: puts back what was there before",
-                )
-            }
-            (true, Some(state::Prior::Absent)) => (
-                between(target, observed.bytes.as_deref(), b"", None),
-                "rolls back: removes the file the session created",
-            ),
-            (true, None) => (None, "rolls back what the session wrote"),
-            (false, _) => (None, "rolls back: it already holds what was there before"),
-        };
-        let dirs: Vec<String> = intent
-            .map(|intent| {
-                intent
-                    .created_dirs
-                    .iter()
-                    .rev()
-                    .filter(|dir| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()))
-                    .map(|dir| paths::to_portable(dir, &inputs.home))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let note = if dirs.is_empty() {
-            what.to_string()
-        } else {
-            format!("{what}; removes {} where empty", dirs.join(", "))
-        };
-        let action = if written || !dirs.is_empty() {
-            Action::Modify
-        } else {
-            Action::Unchanged
-        };
-        rows.push(row(action, diff, note));
-    }
-    Ok(rows)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
     use super::*;
+    use crate::env::Env;
     use crate::fs::{self, Mode as FileMode};
+    use crate::journal;
     use crate::journal::tests::{crash_phases, finish_crash_phases};
     use crate::journal::{Content, Ownership, Request};
     use crate::paths::Portable;
@@ -967,7 +595,7 @@ pub(crate) mod tests {
     }
 
     /// Load the inputs for `home`.
-    fn load(home: &Path) -> Inputs {
+    pub(super) fn load(home: &Path) -> Inputs {
         Inputs::load(&env(home)).expect("the inputs load")
     }
 
@@ -982,11 +610,11 @@ pub(crate) mod tests {
         format!("[[target]]\npath = \"{path}\"\ncontent = \"{content}\"\n")
     }
 
-    fn plan(inputs: &Inputs) -> Report {
+    pub(super) fn plan(inputs: &Inputs) -> Report {
         run(inputs, Mode::Plan, &mut |_| panic!("plan never asks")).expect("plan runs")
     }
 
-    fn apply(inputs: &Inputs) -> Report {
+    pub(super) fn apply(inputs: &Inputs) -> Report {
         run(inputs, Mode::Apply, &mut |_| Ok(true)).expect("apply runs")
     }
 
@@ -1338,11 +966,11 @@ pub(crate) mod tests {
     }
 
     /// A secret target for `~/.token`, its ciphertext at `secrets/token.age`.
-    const SECRET_TARGET: &str =
+    pub(super) const SECRET_TARGET: &str =
         "[[target]]\npath = \"~/.token\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n";
 
     /// Encrypt `plaintext` to `recipient` as the repo's `secrets/token.age`.
-    fn seal(home: &GuardedHome, recipient: &str, plaintext: &[u8]) {
+    pub(super) fn seal(home: &GuardedHome, recipient: &str, plaintext: &[u8]) {
         let path = home.child(".config/bx/secrets/token.age");
         std::fs::create_dir_all(path.parent().expect("a parent")).expect("secrets/");
         std::fs::write(path, crate::secret::tests::encrypt_to(recipient, plaintext))
@@ -1350,7 +978,7 @@ pub(crate) mod tests {
     }
 
     /// A fresh age identity, written where `local.toml` names it.
-    fn age_identity(home: &GuardedHome) -> String {
+    pub(super) fn age_identity(home: &GuardedHome) -> String {
         let key = age::x25519::Identity::generate();
         home.write(
             ".config/age/key.txt",
@@ -1516,97 +1144,6 @@ pub(crate) mod tests {
             shown.contains("secret, not shown: 5 bytes -> 8 bytes"),
             "{shown}"
         );
-    }
-
-    #[test]
-    fn a_missing_config_repo_says_to_run_bx_init() {
-        let home = guarded_home();
-
-        let error = Inputs::load(&env(home.path())).expect_err("no repo");
-
-        assert!(matches!(error, Error::RepoMissing(_)), "{error:?}");
-        assert!(error.to_string().contains("run `bx init`"), "{error}");
-    }
-
-    #[test]
-    fn a_malformed_layer_is_a_config_error_not_a_missing_repo() {
-        // P42R1-COV3. Only a missing repo becomes `RepoMissing`; everything
-        // else the configuration refuses stays the configuration's error.
-        let home = guarded_home();
-        seed(home.path(), "[[target]\npath = \n");
-
-        let error = Inputs::load(&env(home.path())).expect_err("a malformed layer");
-
-        assert!(matches!(error, Error::Config(_)), "{error:?}");
-        assert!(!error.to_string().contains("run `bx init`"), "{error}");
-    }
-
-    #[test]
-    fn the_inputs_name_the_places_they_were_loaded_from() {
-        let home = guarded_home();
-        let inputs = inputs(&home, "");
-
-        assert_eq!(inputs.home(), home.path());
-        assert_eq!(inputs.repo(), home.child(".config/bx"));
-        assert_eq!(inputs.state(), &StateDir::resolve(home.path()));
-        assert!(!inputs.progress);
-    }
-
-    #[test]
-    fn a_repo_the_environment_moved_is_the_repo_a_generated_fragment_may_not_name() {
-        // The env guard's r3 round gave `RootSet` the config repo, derived
-        // from the home unless a caller that read `XDG_CONFIG_HOME` names it.
-        // The whole home is a declared root, so only the repo refuses it.
-        let home = guarded_home();
-        let xdg = home.child("cfg");
-        let repo = xdg.join("bx");
-        std::fs::create_dir_all(&repo).expect("the moved repo");
-        std::fs::write(
-            repo.join("bx.toml"),
-            "[[value]]\nname = \"all\"\nkind = \"path\"\nis_root = true\ndefault = \"~\"\n",
-        )
-        .expect("bx.toml");
-        let inputs = Inputs::load(&Env {
-            xdg_config_home: Some(xdg.into_os_string()),
-            ..env(home.path())
-        })
-        .expect("the inputs load");
-        assert_eq!(inputs.repo(), repo);
-
-        let fragment = format!("CARGO_HOME={}\n", repo.join("cargo").display());
-        let note = decide::guard_fragment(&fragment, &inputs.roots).expect("refused");
-        let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();
-        assert!(note.contains(&inside), "{note}");
-    }
-
-    #[test]
-    fn state_errors_are_one_variant_wherever_they_come_from() {
-        let failure = || state::Error::NotADirectory {
-            path: PathBuf::from("/x"),
-        };
-        assert!(matches!(Error::from(failure()), Error::State(_)));
-        assert!(matches!(
-            Error::from(recover::Error::State(failure())),
-            Error::State(_)
-        ));
-        assert!(matches!(
-            Error::from(journal::Error::State(failure())),
-            Error::State(_)
-        ));
-        assert!(matches!(
-            Error::from(recover::Error::Journal(journal::Error::State(failure()))),
-            Error::State(_)
-        ));
-        assert!(matches!(
-            Error::from(recover::Error::Journal(journal::Error::InProgress {
-                path: PathBuf::from("/j")
-            })),
-            Error::Journal(_)
-        ));
-        assert!(matches!(
-            Error::from(recover::Error::Blocked { conflicts: vec![] }),
-            Error::Recover(_)
-        ));
     }
 
     #[test]
@@ -2184,12 +1721,12 @@ pub(crate) mod tests {
     }
 
     /// One symlink target, as TOML.
-    fn symlink(path: &str, text: &str) -> String {
+    pub(super) fn symlink(path: &str, text: &str) -> String {
         format!("[[target]]\npath = \"{path}\"\nsymlink = \"{text}\"\n")
     }
 
     /// The two sides of a row's link diff.
-    fn link(change: &Change) -> (Option<&str>, Option<&str>) {
+    pub(super) fn link(change: &Change) -> (Option<&str>, Option<&str>) {
         match change.diff.as_ref().map(|diff| &diff.kind) {
             Some(DiffKind::Link { from, to }) => (from.as_deref(), to.as_deref()),
             other => panic!("expected a link diff, found {other:?}"),
@@ -2197,269 +1734,8 @@ pub(crate) mod tests {
     }
 
     /// The text of the link at `path`.
-    fn text_of(path: &Path) -> PathBuf {
+    pub(super) fn text_of(path: &Path) -> PathBuf {
         std::fs::read_link(path).expect("a link")
-    }
-
-    #[test]
-    fn a_symlink_and_an_empty_file_are_delivered_and_a_second_plan_is_empty() {
-        let home = guarded_home();
-        let layer = [
-            symlink("~/.local/bin/tool", "../../src/tool/bin/tool"),
-            symlink("~/.toolrc", "~/dotfiles/toolrc"),
-            "[[target]]\npath = \"~/.hushlogin\"\ncontent = \"\"\nmode = \"0600\"\n".to_string(),
-        ]
-        .concat();
-        let inputs = inputs(&home, &layer);
-
-        let planned = plan(&inputs);
-        assert_eq!(planned.actions(), vec![Action::Create; 3]);
-        assert_eq!(
-            link(&planned.changes[0]),
-            (None, Some("../../src/tool/bin/tool"))
-        );
-        let rendered = format!("{}/dotfiles/toolrc", home.path().display());
-        assert_eq!(
-            link(&planned.changes[1]),
-            (None, Some(rendered.as_str())),
-            "a leading `~` is the one thing rendered"
-        );
-        let shown = render(&planned, View::Plan, Palette::PLAIN, home.path());
-        assert!(
-            shown.contains("\n    + symlink ../../src/tool/bin/tool\n"),
-            "{shown}"
-        );
-
-        let applied = apply(&inputs);
-        assert!(applied.executed);
-        assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
-        let tool = home.child(".local/bin/tool");
-        assert_eq!(text_of(&tool), Path::new("../../src/tool/bin/tool"));
-        assert!(!tool.exists(), "made dangling, and never followed");
-        assert_eq!(text_of(&home.child(".toolrc")), Path::new(&rendered));
-        let empty = std::fs::symlink_metadata(home.child(".hushlogin")).expect("a file");
-        assert!(empty.is_file());
-        assert_eq!(empty.len(), 0, "an empty body is a zero-byte file");
-        assert_eq!(empty.permissions().mode() & 0o7777, 0o600);
-
-        let after = plan(&inputs);
-        assert_eq!(after.actions(), vec![Action::Unchanged; 3]);
-        assert_eq!(exit(&after, Mode::Plan), Exit::Converged);
-        let written = snapshot(home.path(), &[".local/state/bx/lock"]);
-        let second = run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve"))
-            .expect("the second apply");
-        assert!(!second.executed);
-        assert_eq!(snapshot(home.path(), &[".local/state/bx/lock"]), written);
-        assert_eq!(text_of(&tool), Path::new("../../src/tool/bin/tool"));
-    }
-
-    #[test]
-    fn a_link_bx_made_is_retargeted_showing_the_old_and_new_text() {
-        let home = guarded_home();
-        apply(&inputs(&home, &symlink("~/.tool", "/opt/one")));
-        let inputs = inputs(&home, &symlink("~/.tool", "/opt/two"));
-
-        let planned = plan(&inputs);
-        assert_eq!(planned.actions(), vec![Action::Modify]);
-        assert_eq!(
-            link(&planned.changes[0]),
-            (Some("/opt/one"), Some("/opt/two"))
-        );
-        let shown = render(&planned, View::Plan, Palette::PLAIN, home.path());
-        assert!(
-            shown.contains("\n    - symlink /opt/one\n    + symlink /opt/two\n"),
-            "{shown}"
-        );
-
-        apply(&inputs);
-        assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/two"));
-        assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
-    }
-
-    #[test]
-    fn a_path_bx_did_not_link_is_never_replaced_and_a_link_already_right_is_adopted() {
-        let home = guarded_home();
-        std::os::unix::fs::symlink("elsewhere", home.child(".a")).expect("the user's link");
-        std::os::unix::fs::symlink("/opt/b", home.child(".b")).expect("the user's link");
-        home.write(".c", "mine\n");
-        std::fs::create_dir(home.child(".d")).expect("a directory");
-        let layer = [
-            symlink("~/.a", "/opt/a"),
-            symlink("~/.b", "/opt/b"),
-            symlink("~/.c", "/opt/c"),
-            symlink("~/.d", "/opt/d"),
-            symlink("~/.c/inner", "/opt/inner"),
-        ]
-        .concat();
-        let inputs = inputs(&home, &layer);
-
-        let planned = plan(&inputs);
-        assert_eq!(
-            planned.actions(),
-            vec![
-                Action::Conflict,
-                Action::Unchanged,
-                Action::Conflict,
-                Action::Conflict,
-                Action::Conflict,
-            ]
-        );
-        assert!(
-            planned.changes[4]
-                .note
-                .as_deref()
-                .is_some_and(|note| note.starts_with("~/.c ")),
-            "an unusable parent is named portably: {:?}",
-            planned.changes[4].note
-        );
-        let note = |at: usize| planned.changes[at].note.clone().unwrap_or_default();
-        assert!(note(0).contains("a symlink bx did not make"), "{}", note(0));
-        assert_eq!(
-            link(&planned.changes[0]),
-            (Some("elsewhere"), Some("/opt/a"))
-        );
-        assert!(note(2).contains("a regular file"), "{}", note(2));
-        assert!(note(3).contains("a directory"), "{}", note(3));
-        assert_eq!(planned.changes[2].diff, None);
-
-        let applied = apply(&inputs);
-        assert!(!applied.executed, "nothing to write");
-        assert_eq!(text_of(&home.child(".a")), Path::new("elsewhere"));
-        assert_eq!(std::fs::read(home.child(".c")).expect("kept"), b"mine\n");
-        assert!(home.child(".d").is_dir());
-        let ledger = LedgerView::read(inputs.state(), home.path())
-            .expect("the ledger")
-            .value;
-        assert!(ledger.is_empty(), "an adopted link is recorded by no write");
-    }
-
-    #[test]
-    fn link_text_that_differs_only_by_normalisation_is_different_text() {
-        // `Path` equality would call each pair equal; the link text is compared
-        // byte for byte, as it is stored exactly as written.
-        let pairs = [
-            ("/opt/x", "/opt/x/"),
-            ("/opt/x/", "/opt/x"),
-            ("a//b", "a/b"),
-            ("a/./b", "a/b"),
-        ];
-        for (made, declared) in pairs {
-            // A link bx made is retargeted to the declared text.
-            let home = guarded_home();
-            apply(&inputs(&home, &symlink("~/.tool", made)));
-            let retarget = inputs(&home, &symlink("~/.tool", declared));
-            let planned = plan(&retarget);
-            assert_eq!(
-                planned.actions(),
-                vec![Action::Modify],
-                "{made} -> {declared}"
-            );
-            assert_eq!(link(&planned.changes[0]), (Some(made), Some(declared)));
-            apply(&retarget);
-            assert_eq!(
-                text_of(&home.child(".tool")).as_os_str(),
-                std::ffi::OsStr::new(declared)
-            );
-            assert_eq!(plan(&retarget).actions(), vec![Action::Unchanged]);
-
-            // A user's link with that text is theirs, not adopted.
-            let home = guarded_home();
-            std::os::unix::fs::symlink(made, home.child(".tool")).expect("the user's link");
-            let theirs = inputs(&home, &symlink("~/.tool", declared));
-            assert_eq!(
-                plan(&theirs).actions(),
-                vec![Action::Conflict],
-                "{made} -> {declared}"
-            );
-            assert!(!apply(&theirs).executed);
-            let os = std::fs::read_link(home.child(".tool")).expect("a link");
-            assert_eq!(os.as_os_str(), std::ffi::OsStr::new(made));
-        }
-    }
-
-    #[test]
-    fn a_link_retargeted_since_bx_made_it_and_a_path_bx_owns_otherwise_are_conflicts() {
-        let home = guarded_home();
-        apply(&inputs(&home, &symlink("~/.tool", "/opt/one")));
-        std::fs::remove_file(home.child(".tool")).expect("unlink");
-        std::os::unix::fs::symlink("/opt/theirs", home.child(".tool")).expect("retarget");
-        own(home.path(), ".f", b"bx\n", Mechanism::Own);
-        std::fs::remove_file(home.child(".f")).expect("the user removes it");
-        let inputs = inputs(
-            &home,
-            &[symlink("~/.tool", "/opt/two"), symlink("~/.f", "/opt/f")].concat(),
-        );
-
-        let planned = plan(&inputs);
-        assert_eq!(planned.actions(), vec![Action::Conflict; 2]);
-        assert_eq!(
-            planned.changes[0].note.as_deref(),
-            Some("retargeted since bx made it")
-        );
-        assert_eq!(
-            planned.changes[1].note.as_deref(),
-            Some("bx attached to this path as the whole file")
-        );
-        assert!(!apply(&inputs).executed);
-        assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/theirs"));
-    }
-
-    #[test]
-    fn an_interrupted_link_is_shown_as_the_link_recovery_puts_back() {
-        let home = guarded_home();
-        apply(&inputs(&home, &symlink("~/.tool", "/opt/one")));
-        let inputs = inputs(
-            &home,
-            &[
-                symlink("~/.tool", "/opt/two"),
-                symlink("~/.new", "/opt/new"),
-            ]
-            .concat(),
-        );
-        let mut session = Session::open(inputs.state(), SessionKind::Apply, home.path(), vec![])
-            .expect("a session");
-        session
-            .apply(crate::journal::tests::link_to(
-                home.path(),
-                ".tool",
-                "/opt/two",
-            ))
-            .expect("retarget");
-        session
-            .apply(crate::journal::tests::link_to(
-                home.path(),
-                ".new",
-                "/opt/new",
-            ))
-            .expect("create");
-        drop(session);
-
-        let report = plan(&inputs);
-        let row = |target: &str| {
-            report
-                .changes
-                .iter()
-                .find(|change| change.target == target)
-                .expect("a row")
-        };
-        assert_eq!(row("~/.tool").action, Action::Modify);
-        assert_eq!(link(row("~/.tool")), (Some("/opt/two"), Some("/opt/one")));
-        assert_eq!(
-            row("~/.tool").note.as_deref(),
-            Some("rolls back: puts back the link that was there before")
-        );
-        assert_eq!(link(row("~/.new")), (Some("/opt/new"), None));
-        assert_eq!(
-            row("~/.new").note.as_deref(),
-            Some("rolls back: removes the link the session made")
-        );
-
-        apply(&inputs);
-        assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/one"));
-        assert!(std::fs::symlink_metadata(home.child(".new")).is_err());
-        apply(&inputs);
-        assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/two"));
-        assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged; 2]);
     }
 
     /// The home the crash child applies in. Passed per command.
@@ -2467,7 +1743,7 @@ pub(crate) mod tests {
 
     /// Two writes: a create under a directory bx must invent, then a modify of
     /// a file bx owns.
-    fn seed_crash(home: &Path) {
+    pub(super) fn seed_crash(home: &Path) {
         std::fs::create_dir_all(home).expect("the crash home");
         own(home, ".owned", b"before\n", Mechanism::Own);
         seed(
@@ -2481,11 +1757,11 @@ pub(crate) mod tests {
     }
 
     /// How many writes [`seed_crash`]'s apply makes.
-    const CRASH_WRITES: usize = 2;
+    pub(super) const CRASH_WRITES: usize = 2;
 
     /// Re-run this test binary as an apply that aborts at `phase` of write
     /// `index`.
-    fn spawn_crash_child(home: &Path, index: usize, phase: &str) -> Output {
+    pub(super) fn spawn_crash_child(home: &Path, index: usize, phase: &str) -> Output {
         Command::new(std::env::current_exe().expect("the test binary"))
             .args([
                 "--exact",
@@ -2626,200 +1902,6 @@ pub(crate) mod tests {
             "a declined apply reported converged over a standing journal"
         );
         assert_eq!(exit(&declined, Mode::Apply), exit(&planned, Mode::Plan));
-    }
-
-    #[test]
-    fn decision_35_a_finished_sessions_rows_are_shown_in_the_plan_view() {
-        // P42R2-CL3. `command::apply_with` renders its approval prompt with
-        // View::Plan, which hides Unchanged rows — and over a finished session
-        // every row IS Unchanged, so the user was asked to confirm a recovery
-        // that named none of the files it was about to record.
-        let guard = guarded_home();
-        let home = guard.child("home");
-        seed_crash(&home);
-        assert!(
-            !spawn_crash_child(&home, CRASH_WRITES, finish_crash_phases()[0])
-                .status
-                .success()
-        );
-        let loaded = load(&home);
-        let report = plan(&loaded);
-        assert_eq!(report.actions(), vec![Action::Unchanged; CRASH_WRITES]);
-
-        let shown = render(&report, View::Plan, Palette::PLAIN, &home);
-
-        for change in &report.changes {
-            assert!(
-                shown.contains(&change.target),
-                "the approval prompt does not name {}: {shown}",
-                change.target
-            );
-        }
-
-        // The rule the exception is carved out of still holds: with no
-        // interruption standing, an unchanged configured target stays hidden.
-        let settled_home = guarded_home();
-        let settled = inputs(&settled_home, &inline("~/.settled", "x\\n"));
-        assert!(apply(&settled).executed);
-        let converged = plan(&settled);
-        assert_eq!(converged.interrupted, None);
-        assert_eq!(converged.actions(), vec![Action::Unchanged]);
-        assert!(
-            !render(&converged, View::Plan, Palette::PLAIN, settled_home.path())
-                .contains("~/.settled"),
-            "an unchanged target is shown with no interruption standing"
-        );
-    }
-
-    #[test]
-    fn t14_a_standing_interruption_is_reported_as_its_roll_back_and_plan_writes_nothing() {
-        // Decision 18 reverses this test's earlier expectation, that every
-        // interrupted write is a conflict. A write recovery resolves on its own
-        // is announced as the roll back `apply` makes, with its diff, and no
-        // configured target is decided against the disk before it.
-        let guard = guarded_home();
-        let home = guard.child("home");
-        seed_crash(&home);
-        assert!(
-            !spawn_crash_child(&home, 1, "after-publish")
-                .status
-                .success()
-        );
-        let before = snapshot(&home, &[]);
-
-        let report = plan(&load(&home));
-
-        let interrupted = report.interrupted.as_ref().expect("an interruption");
-        assert_eq!(interrupted.unfinished.len(), CRASH_WRITES);
-        assert_eq!(
-            report.changes.len(),
-            CRASH_WRITES,
-            "a configured target was decided: {:?}",
-            report.changes
-        );
-        for unfinished in &interrupted.unfinished {
-            let change = report
-                .changes
-                .iter()
-                .find(|change| change.target == unfinished.target.as_str())
-                .expect("a row for every unfinished write");
-            assert_eq!(change.action, Action::Modify, "{change:?}");
-            assert!(
-                change
-                    .note
-                    .as_deref()
-                    .is_some_and(|note| note.starts_with("rolls back")),
-                "{change:?}"
-            );
-            assert!(change.diff.is_some(), "{change:?}");
-            // Each row keeps the origin of the target it rolls back.
-            let line = if change.target == "~/.owned" { 4 } else { 1 };
-            assert_eq!(change.origin.line, line, "{change:?}");
-        }
-        assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
-        assert_eq!(snapshot(&home, &[]), before, "plan changed the tree");
-
-        // A target the configuration no longer names is still reported.
-        seed(&home, "");
-        let report = plan(&load(&home));
-        assert_eq!(report.actions(), vec![Action::Modify; CRASH_WRITES]);
-        assert_eq!(report.changes[0].origin.line, 0);
-    }
-
-    #[test]
-    fn decision_14_an_unreadable_restore_snapshot_is_named_by_its_portable_path() {
-        let home = guarded_home();
-        home.write(".conf", "old\n");
-        let inputs = inputs(&home, &inline("~/.conf", "new\\n"));
-        // An apply that dies once its write is published: the journal stands
-        // over "new\n", and rolling it back needs the snapshot of "old\n".
-        let target = Portable::parse_in("~/.conf", home.path()).expect("a portable target");
-        let dest = home.child(".conf");
-        let mut session = Session::open(
-            inputs.state(),
-            SessionKind::Apply,
-            home.path(),
-            vec![target.clone()],
-        )
-        .expect("a session");
-        session
-            .apply(Request {
-                target,
-                dest: dest.clone(),
-                content: Content::Bytes {
-                    bytes: b"new\n".to_vec(),
-                    planned: fs::observe(&dest).expect("observe"),
-                },
-                mode: FileMode::DEFAULT_FILE,
-                ownership: Ownership::Owned(Mechanism::Own),
-            })
-            .expect("the write");
-        drop(session);
-
-        let digest = crate::state::ContentHash::of(b"old\n");
-        let blob = inputs.state().restore().join(digest.to_hex());
-        let portable = PathBuf::from(format!("~/.local/state/bx/restore/{}", digest.to_hex()));
-        let absolute = home.path().to_string_lossy().into_owned();
-        let corrupt = || std::fs::write(&blob, "not what it claims to be").expect("corrupt it");
-        let remove = || std::fs::remove_file(&blob).expect("remove it");
-        let cases: [(&dyn Fn(), state::Error); 2] = [
-            (
-                &corrupt,
-                state::Error::RestoreCorrupt {
-                    digest,
-                    path: portable.clone(),
-                },
-            ),
-            (
-                &remove,
-                state::Error::RestoreMissing {
-                    digest,
-                    path: portable,
-                },
-            ),
-        ];
-        for (damage, want) in cases {
-            damage();
-
-            let report = plan(&inputs);
-
-            assert_eq!(report.actions(), vec![Action::Conflict]);
-            let note = report.changes[0].note.as_deref().expect("a note");
-            // Decision 18 adds that the session has to be abandoned.
-            assert!(note.starts_with(&want.to_string()), "{note}");
-            assert!(note.contains("abandon"), "{note}");
-            let shown = diff::render(
-                &report,
-                View::Plan,
-                Palette::resolve(true, false),
-                home.path(),
-            );
-            assert!(shown.contains(note), "{shown}");
-            assert!(!shown.contains(&absolute), "{shown}");
-
-            // Decision 18: apply refuses on what `pending` found, before any
-            // recovery runs, so it names the snapshot as plan does and writes
-            // nothing.
-            let error = run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect_err("blocked");
-            assert!(
-                matches!(error, Error::Recover(recover::Error::Blocked { .. })),
-                "{error:?}"
-            );
-            assert!(error.to_string().contains(&want.to_string()), "{error}");
-            assert_eq!(std::fs::read(&dest).expect("untouched"), b"new\n");
-            assert!(inputs.state().journal().exists(), "the journal went");
-
-            // Recovery's own error keeps the absolute path.
-            let recovery = match recover::recover(inputs.state()).expect("recover") {
-                recover::Outcome::Blocked { conflicts } => recover::Error::Blocked { conflicts },
-                outcome => panic!("recovered: {outcome:?}"),
-            };
-            assert!(
-                recovery.to_string().contains(&blob.display().to_string()),
-                "{recovery}"
-            );
-            assert_eq!(std::fs::read(&dest).expect("untouched"), b"new\n");
-        }
     }
 
     /// Make `path` a FIFO. Opening it to read waits for a writer that never
@@ -3129,236 +2211,6 @@ pub(crate) mod tests {
             );
         }
         assert!(!home.child(".b").exists(), "written from a refused body");
-    }
-
-    #[test]
-    fn an_interrupted_mode_only_write_is_rolled_back_to_the_mode_it_had() {
-        // The mutation run found the roll back row's mode change unpinned.
-        let home = guarded_home();
-        own(home.path(), ".m", b"same\n", Mechanism::Own);
-        let inputs = inputs(&home, &inline("~/.m", "same\\n"));
-        let target = Portable::parse_in("~/.m", home.path()).expect("a portable target");
-        let dest = home.child(".m");
-        let mut session = Session::open(
-            inputs.state(),
-            SessionKind::Apply,
-            home.path(),
-            vec![target.clone()],
-        )
-        .expect("a session");
-        session
-            .apply(Request {
-                target,
-                dest: dest.clone(),
-                content: Content::Bytes {
-                    bytes: b"same\n".to_vec(),
-                    planned: fs::observe(&dest).expect("observe"),
-                },
-                mode: FileMode::PRIVATE_FILE,
-                ownership: Ownership::Owned(Mechanism::Own),
-            })
-            .expect("the write");
-        drop(session);
-
-        let report = plan(&inputs);
-
-        assert_eq!(report.actions(), vec![Action::Modify]);
-        assert_eq!(
-            report.changes[0].diff,
-            Some(Diff {
-                kind: DiffKind::Mode {
-                    from: FileMode::PRIVATE_FILE,
-                    to: FileMode::DEFAULT_FILE
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn d1_an_interrupted_secret_write_is_rolled_back_without_showing_either_side() {
-        let home = guarded_home();
-        let recipient = age_identity(&home);
-        seal(&home, &recipient, b"hunter3\n");
-        own(home.path(), ".token", b"hunter2\n", Mechanism::Own);
-        std::fs::set_permissions(home.child(".token"), std::fs::Permissions::from_mode(0o600))
-            .expect("private");
-        let inputs = inputs(&home, SECRET_TARGET);
-        let target = Portable::parse_in("~/.token", home.path()).expect("a portable target");
-        let dest = home.child(".token");
-        let mut session = Session::open(
-            inputs.state(),
-            SessionKind::Apply,
-            home.path(),
-            vec![target.clone()],
-        )
-        .expect("a session");
-        session
-            .apply(Request {
-                target,
-                dest: dest.clone(),
-                content: Content::Bytes {
-                    bytes: b"hunter3\n".to_vec(),
-                    planned: fs::observe(&dest).expect("observe"),
-                },
-                mode: FileMode::PRIVATE_FILE,
-                ownership: Ownership::Owned(Mechanism::Own),
-            })
-            .expect("the write");
-        drop(session);
-
-        let report = plan(&inputs);
-        assert_eq!(report.actions(), vec![Action::Modify]);
-        let shown = render(&report, View::Plan, Palette::PLAIN, home.path());
-        assert!(!shown.contains("hunter"), "{shown}");
-        assert!(
-            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
-            "{shown}"
-        );
-    }
-
-    /// Leave an interrupted write of `hunter3` over `~/.token`'s `hunter2`,
-    /// then plan `layer` and render the plan.
-    fn render_an_interrupted_token_write(layer: &str) -> String {
-        let home = guarded_home();
-        age_identity(&home);
-        own(home.path(), ".token", b"hunter2\n", Mechanism::Own);
-        let inputs = inputs(&home, layer);
-        let target = Portable::parse_in("~/.token", home.path()).expect("a portable target");
-        let dest = home.child(".token");
-        let mut session = Session::open(
-            inputs.state(),
-            SessionKind::Apply,
-            home.path(),
-            vec![target.clone()],
-        )
-        .expect("a session");
-        session
-            .apply(Request {
-                target,
-                dest: dest.clone(),
-                content: Content::Bytes {
-                    bytes: b"hunter3\n".to_vec(),
-                    planned: fs::observe(&dest).expect("observe"),
-                },
-                mode: FileMode::PRIVATE_FILE,
-                ownership: Ownership::Owned(Mechanism::Own),
-            })
-            .expect("the write");
-        drop(session);
-
-        let report = plan(&inputs);
-        render(&report, View::Plan, Palette::PLAIN, home.path())
-    }
-
-    const WHO: &str = "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n";
-
-    #[test]
-    fn d1_an_interrupted_write_of_a_blocked_secret_is_rolled_back_without_showing_it() {
-        // The secret's body waits on an unanswered value, so its resolution is
-        // blocked; the declared body still says it is a secret.
-        let layer = format!(
-            "{WHO}[[target]]\npath = \"~/.token\"\nsecret = \"secrets/{{{{who}}}}.age\"\n\
-             mode = \"0600\"\n"
-        );
-        let shown = render_an_interrupted_token_write(&layer);
-        assert!(!shown.contains("hunter"), "{shown}");
-        assert!(
-            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
-            "{shown}"
-        );
-    }
-
-    #[test]
-    fn d1_a_blocked_secret_path_conceals_a_write_no_target_claims() {
-        // The secret's path waits on the value, so the write cannot be matched
-        // to it; it is concealed rather than risk printing the secret.
-        let layer = format!(
-            "{WHO}[[target]]\npath = \"~/.{{{{who}}}}\"\nsecret = \"secrets/token.age\"\n\
-             mode = \"0600\"\n"
-        );
-        let shown = render_an_interrupted_token_write(&layer);
-        assert!(!shown.contains("hunter"), "{shown}");
-    }
-
-    #[test]
-    fn d1_an_interrupted_secret_write_whose_path_was_edited_is_concealed() {
-        // The secret now lives at `~/.other`, so no declared target claims the
-        // write it left at `~/.token`, and nothing is blocked.
-        let shown = render_an_interrupted_token_write(
-            "[[target]]\npath = \"~/.other\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n",
-        );
-        assert!(!shown.contains("hunter"), "{shown}");
-        assert!(
-            shown.contains("secret, not shown: 8 bytes -> 8 bytes"),
-            "{shown}"
-        );
-    }
-
-    #[test]
-    fn d1_an_interrupted_secret_write_whose_path_resolves_elsewhere_is_concealed() {
-        // `{{who}}` is answered, by its default, with something else than the
-        // write was made under, so the ready target claims another path.
-        let shown = render_an_interrupted_token_write(
-            "[[value]]\nname = \"who\"\nkind = \"string\"\ndefault = \"other\"\n\
-             [[target]]\npath = \"~/.{{who}}\"\nsecret = \"secrets/token.age\"\n\
-             mode = \"0600\"\n",
-        );
-        assert!(!shown.contains("hunter"), "{shown}");
-    }
-
-    #[test]
-    fn an_interrupted_write_no_target_claims_is_concealed_and_a_claimed_file_is_shown() {
-        // The journal does not say whether an unclaimed write was a secret.
-        let shown = render_an_interrupted_token_write(WHO);
-        assert!(!shown.contains("hunter"), "{shown}");
-        assert!(shown.contains("secret, not shown"), "{shown}");
-
-        // An ordinary target that claims the write still shows its diff.
-        let shown = render_an_interrupted_token_write(
-            "[[target]]\npath = \"~/.token\"\ncontent = \"hunter3\\n\"\n",
-        );
-        assert!(shown.contains("hunter"), "{shown}");
-    }
-
-    #[test]
-    fn an_interrupted_write_already_put_back_names_only_what_recovery_still_removes() {
-        // The mutation run found unpinned whether such a row is a modify or
-        // unchanged: only the directories the session created are left to do.
-        let guard = guarded_home();
-        let home = guard.child("home");
-        seed_crash(&home);
-        assert!(
-            !spawn_crash_child(&home, 1, "after-publish")
-                .status
-                .success()
-        );
-        std::fs::remove_file(home.join(".config/made/new.conf")).expect("put back the create");
-        std::fs::write(home.join(".owned"), "before\n").expect("put back the modify");
-
-        let report = plan(&load(&home));
-
-        let row = |target: &str| {
-            report
-                .changes
-                .iter()
-                .find(|change| change.target == target)
-                .unwrap_or_else(|| panic!("no row for {target}: {report:?}"))
-        };
-        let made = row("~/.config/made/new.conf");
-        assert_eq!(made.action, Action::Modify, "{made:?}");
-        assert_eq!(
-            made.note.as_deref(),
-            Some(
-                "rolls back: it already holds what was there before; removes ~/.config/made \
-                 where empty"
-            )
-        );
-        let owned = row("~/.owned");
-        assert_eq!(owned.action, Action::Unchanged, "{owned:?}");
-        assert_eq!(
-            owned.note.as_deref(),
-            Some("rolls back: it already holds what was there before")
-        );
     }
 
     #[test]

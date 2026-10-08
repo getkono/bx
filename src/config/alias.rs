@@ -9,8 +9,24 @@ use std::path::Path;
 use toml_edit::{Item, Table};
 
 use super::when::When;
-use super::{Ctx, Error};
-use crate::shell::alias::AliasDecl;
+use super::{Ctx, Error, Origin};
+
+/// One declared alias, from either table.
+///
+/// How it is rendered into each shell's file is [`crate::shell::alias`]'s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasDecl {
+    /// The alias's name, its natural key.
+    pub name: String,
+    /// What it expands to, exactly as written.
+    pub command: String,
+    /// The condition it is gated on, if any. Always `None` from `[aliases]`.
+    pub when: Option<When>,
+    /// `false` in any layer removes the alias from the resolved configuration.
+    pub enabled: bool,
+    /// Where the entry was written.
+    pub origin: Origin,
+}
 
 /// The conditional list's header, as messages spell it.
 pub(crate) const SECTION: &str = "[[alias]]";

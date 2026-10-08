@@ -116,124 +116,27 @@
 //! the user chose to set there. Passing bodies through [`crate::env_guard`]
 //! would refuse ordinary user shell code.
 
-use super::{Assembly, Phase, Shell, Shells};
+use super::{Assembly, Phase, Shell};
+use crate::config::Error;
 use crate::config::function::unwritable;
 use crate::config::resolution::{BlockReason, BlockedEntry, Resolution};
 use crate::config::values::{self, ResolvedValues, Unresolved};
-use crate::config::when::{self, Gate, When};
-use crate::config::{Error, Origin};
+use crate::config::when::{self, Gate};
+
+/// A declared function, the hook points it may register on, and a function
+/// ready to write, as [`crate::config::function`] declares them, named here
+/// too, where every renderer already looks for them.
+pub use crate::config::function::{Function, FunctionDecl, Hook};
 
 /// The prefix a hooked function is defined under.
 const HOOKED: &str = "__bx_hook_";
 
-/// One of zsh's own hook points: the closed set a function may register on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Hook {
-    /// The working directory changed.
-    Chpwd,
-    /// Every `$PERIOD` seconds, just before a prompt.
-    Periodic,
-    /// Before each prompt.
-    Precmd,
-    /// After a command line is read, before it runs.
-    Preexec,
-    /// Before a line is added to history.
-    Zshaddhistory,
-    /// As the shell exits.
-    Zshexit,
-    /// Dynamic named directories.
-    ZshDirectoryName,
-}
-
 impl Hook {
-    /// Every hook point, in the order messages list them.
-    pub const ALL: [Self; 7] = [
-        Self::Chpwd,
-        Self::Periodic,
-        Self::Precmd,
-        Self::Preexec,
-        Self::Zshaddhistory,
-        Self::Zshexit,
-        Self::ZshDirectoryName,
-    ];
-
-    /// The hook's name, as zsh and `bx.toml` spell it.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Chpwd => "chpwd",
-            Self::Periodic => "periodic",
-            Self::Precmd => "precmd",
-            Self::Preexec => "preexec",
-            Self::Zshaddhistory => "zshaddhistory",
-            Self::Zshexit => "zshexit",
-            Self::ZshDirectoryName => "zsh_directory_name",
-        }
-    }
-
     /// The array zsh runs every function of at this hook.
     #[must_use]
     pub fn array(self) -> String {
         format!("{}_functions", self.name())
     }
-
-    /// Read a `hook` string a config author wrote.
-    ///
-    /// # Errors
-    ///
-    /// Why `raw` is not one of zsh's hook points, listing them.
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        Self::ALL
-            .into_iter()
-            .find(|hook| hook.name() == raw)
-            .ok_or_else(|| {
-                let names: Vec<String> = Self::ALL
-                    .iter()
-                    .map(|h| format!("{:?}", h.name()))
-                    .collect();
-                format!(
-                    "`hook` must be one of zsh's own hook points, {}; got {raw:?}",
-                    names.join(", ")
-                )
-            })
-    }
-}
-
-/// One declared function, as written: its body not yet substituted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FunctionDecl {
-    /// The function's name, its natural key.
-    pub name: String,
-    /// The body as written, `{{name}}` references and all.
-    pub body: String,
-    /// bash's own body, when it differs from `body`: written in bash's file in
-    /// its place, and the bash equivalent of a hooked function.
-    pub bash: Option<String>,
-    /// The tool the body runs, if the author named one. Never a gate.
-    pub tool: Option<String>,
-    /// The hook point the function registers on, if any.
-    pub hook: Option<Hook>,
-    /// The condition the registration is gated on. Only with `hook`.
-    pub when: Option<When>,
-    /// The shells whose generated file defines it.
-    pub shells: Shells,
-    /// `false` in any layer removes the function from the resolved configuration.
-    pub enabled: bool,
-    /// Where the entry was written.
-    pub origin: Origin,
-}
-
-/// One function ready to write: its body substituted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Function {
-    /// The name it was declared under.
-    pub name: String,
-    /// The substituted body.
-    pub body: String,
-    /// The hook point it registers on, if any.
-    pub hook: Option<Hook>,
-    /// The condition the registration is gated on.
-    pub when: Option<When>,
 }
 
 impl Function {
@@ -458,7 +361,9 @@ pub fn note(held: &[&BlockedEntry]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::parse_str;
+    use crate::config::shells::Shells;
+    use crate::config::when::When;
+    use crate::config::{Origin, parse_str};
     use crate::shell::testing::{installed, run};
     use std::path::{Path, PathBuf};
 

@@ -68,23 +68,11 @@
 //! holds them to that.
 
 use super::{Assembly, Phase, quote};
-use crate::config::Origin;
-use crate::config::when::{self, Gate, When};
+use crate::config::when::{self, Gate};
 
-/// One declared alias, from either table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AliasDecl {
-    /// The alias's name, its natural key.
-    pub name: String,
-    /// What it expands to, exactly as written.
-    pub command: String,
-    /// The condition it is gated on, if any. Always `None` from `[aliases]`.
-    pub when: Option<When>,
-    /// `false` in any layer removes the alias from the resolved configuration.
-    pub enabled: bool,
-    /// Where the entry was written.
-    pub origin: Origin,
-}
+/// A declared alias, as [`crate::config::alias`] parses it, named here
+/// too, where every renderer already looks for it.
+pub use crate::config::alias::AliasDecl;
 
 impl AliasDecl {
     /// The line that defines the alias.
@@ -105,7 +93,7 @@ impl AliasDecl {
 
     /// [`AliasDecl::render`] for bash: the same line, a `has:TOOL` decided
     /// the same way, and a runtime condition asked in bash's words
-    /// ([`When::test_bash`]).
+    /// ([`crate::config::when::When::test_bash`]).
     #[must_use]
     pub fn render_bash(&self, present: &dyn Fn(&str) -> bool) -> String {
         self.render_gated(
@@ -145,7 +133,8 @@ pub fn contribute(assembly: &mut Assembly, aliases: &[AliasDecl], present: &dyn 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::parse_str;
+    use crate::config::when::When;
+    use crate::config::{Origin, parse_str};
     use crate::shell::testing::{installed, run};
     use std::path::{Path, PathBuf};
 

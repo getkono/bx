@@ -22,7 +22,7 @@
 //! command.
 //!
 //! `terminal = true` claims the single slot that loads after everything else.
-//! At most one enabled plugin may claim it: [`check_terminal`] refuses a second
+//! At most one enabled plugin may claim it: [`check_terminal`](crate::config::plugin::check_terminal) refuses a second
 //! at load, naming both.
 //!
 //! A plugin takes no `when` key, unlike `[[env]]`: an unknown key is refused,
@@ -30,38 +30,15 @@
 //! test already gates each plugin on its file being installed, which is the
 //! condition a `has:TOOL` gate would otherwise stand in for, so a `when` would
 //! add nothing a plugin needs; and a conditional terminal claimant would need
-//! [`check_terminal`] to reason about which conditions can hold together.
+//! [`check_terminal`](crate::config::plugin::check_terminal) to reason about which conditions can hold together.
 
-use super::{Assembly, Phase};
-use crate::config::{Error, Origin};
+use super::Assembly;
 
-/// One `[[plugin]]` entry, as written.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginDecl {
-    /// The plugin's name, its natural key.
-    pub name: String,
-    /// The file sourced, as written.
-    pub source: String,
-    /// Whether it claims the terminal slot.
-    pub terminal: bool,
-    /// `false` in any layer removes the plugin from the resolved
-    /// configuration.
-    pub enabled: bool,
-    /// Where the entry was written.
-    pub origin: Origin,
-}
+/// A `[[plugin]]` entry, as [`crate::config::plugin`] parses it, named here
+/// too, where every renderer already looks for it.
+pub use crate::config::plugin::PluginDecl;
 
 impl PluginDecl {
-    /// The phase the plugin loads in.
-    #[must_use]
-    pub const fn phase(&self) -> Phase {
-        if self.terminal {
-            Phase::Terminal
-        } else {
-            Phase::Plugins
-        }
-    }
-
     /// The one line that sources the plugin when it is readable.
     #[must_use]
     pub fn line(&self) -> String {
@@ -76,41 +53,13 @@ pub(crate) fn guarded(path: &str) -> String {
     format!("[[ -r {path} ]] && source {path}\n")
 }
 
-/// Refuse a second enabled plugin that claims the terminal slot.
-///
-/// Run once the layers are merged, over the plugins that survived it, so a
-/// claim a later layer switched off does not count.
-///
-/// # Errors
-///
-/// [`Error::BadValue`] at the second claimant's origin, naming both plugins and
-/// where the first was declared.
-pub fn check_terminal(plugins: &[PluginDecl]) -> Result<(), Error> {
-    let mut claimants = plugins.iter().filter(|p| p.enabled && p.terminal);
-    let Some(first) = claimants.next() else {
-        return Ok(());
-    };
-    match claimants.next() {
-        None => Ok(()),
-        Some(second) => Err(Error::BadValue {
-            origin: second.origin.clone(),
-            message: format!(
-                "plugin `{}` claims the terminal slot, which plugin `{}` already claims at {}; \
-                 only one plugin can load after everything else, so set `terminal = false` \
-                 on one of them",
-                second.name, first.name, first.origin
-            ),
-        }),
-    }
-}
-
 /// Add every enabled plugin to `assembly`, in declaration order, each in its
 /// phase.
 ///
 /// # Errors
 ///
 /// [`super::Error::TerminalClaimed`] when two enabled plugins claim the
-/// terminal slot — which [`check_terminal`] refuses at load, so a caller that
+/// terminal slot — which [`check_terminal`](crate::config::plugin::check_terminal) refuses at load, so a caller that
 /// ran it never sees this.
 pub fn contribute(assembly: &mut Assembly, plugins: &[PluginDecl]) -> Result<(), super::Error> {
     for plugin in plugins.iter().filter(|p| p.enabled) {
@@ -122,7 +71,9 @@ pub fn contribute(assembly: &mut Assembly, plugins: &[PluginDecl]) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::plugin::{parse_plugin, unsourceable};
+    use crate::config::Origin;
+    use crate::config::plugin::{check_terminal, parse_plugin, unsourceable};
+    use crate::config::shells::Phase;
     use std::path::{Path, PathBuf};
     use toml_edit::Document;
 

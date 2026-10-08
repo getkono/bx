@@ -537,10 +537,10 @@ impl Interactive {
     ///
     /// # Errors
     ///
-    /// Whatever [`crate::shell::plugin::check_terminal`] returns: a second
+    /// Whatever [`super::plugin::check_terminal`] returns: a second
     /// enabled plugin claiming the terminal slot, named with the first.
     pub fn with_plugins(mut self, plugins: &[PluginDecl]) -> Result<Self, super::Error> {
-        crate::shell::plugin::check_terminal(plugins)?;
+        super::plugin::check_terminal(plugins)?;
         self.plugins = plugins.iter().filter(|p| p.enabled).cloned().collect();
         Ok(self)
     }

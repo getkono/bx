@@ -147,8 +147,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Assembly, Phase, Shell, Shells, quote};
-use crate::config::Origin;
+use super::{Assembly, Shell, quote};
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
 use crate::report::Action;
@@ -174,28 +173,10 @@ pub const LIMIT: usize = 1 << 20;
 /// How much of a failing command's standard error a note quotes.
 const STDERR_KEPT: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivationDecl {
-    /// The activation's name, its natural key.
-    pub name: String,
-    /// The command every shell runs, `{shell}` spelled as the shell's name,
-    /// `command[0]` being the tool. Empty when only per-shell commands are
-    /// declared.
-    pub command: Vec<String>,
-    /// zsh's own command, in place of `command`.
-    pub zsh: Option<Vec<String>>,
-    /// bash's own command, in place of `command`.
-    pub bash: Option<Vec<String>>,
-    /// The shells whose generated file it lands in.
-    pub shells: Shells,
-    /// The phase its output lands in.
-    pub phase: Phase,
-    /// `false` in any layer removes the activation from the resolved
-    /// configuration.
-    pub enabled: bool,
-    /// Where the entry was written.
-    pub origin: Origin,
-}
+/// A declared tool activation, as [`crate::config::activation`] parses it,
+/// named here too, where everything that runs and renders one already looks
+/// for it.
+pub use crate::config::activation::ActivationDecl;
 
 impl ActivationDecl {
     /// The [`Fingerprints`] key zsh's cache entry lives under.
@@ -1378,7 +1359,9 @@ fn line_of(chars: &[char], at: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Origin;
     use crate::config::activation::parse_activation;
+    use crate::config::shells::{Phase, Shells};
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use toml_edit::Document;

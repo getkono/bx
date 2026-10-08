@@ -1,15 +1,71 @@
-//! Reading `[[plugin]]` into [`PluginDecl`]s, and the rule every path a
-//! guarded `source` line is written with must keep.
+//! Reading `[[plugin]]` into [`PluginDecl`]s, the one-claimant rule for the
+//! terminal slot, and the rule every path a guarded `source` line is written
+//! with must keep.
 //!
-//! The line itself, and the phases a plugin loads in, are
-//! [`crate::shell::plugin`]'s.
+//! The line itself is [`crate::shell::plugin`]'s.
 
 use std::path::Path;
 
 use toml_edit::Table;
 
-use super::{Ctx, Error};
-use crate::shell::plugin::PluginDecl;
+use super::shells::Phase;
+use super::{Ctx, Error, Origin};
+
+/// One `[[plugin]]` entry, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDecl {
+    /// The plugin's name, its natural key.
+    pub name: String,
+    /// The file sourced, as written.
+    pub source: String,
+    /// Whether it claims the terminal slot.
+    pub terminal: bool,
+    /// `false` in any layer removes the plugin from the resolved
+    /// configuration.
+    pub enabled: bool,
+    /// Where the entry was written.
+    pub origin: Origin,
+}
+
+impl PluginDecl {
+    /// The phase the plugin loads in.
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        if self.terminal {
+            Phase::Terminal
+        } else {
+            Phase::Plugins
+        }
+    }
+}
+
+/// Refuse a second enabled plugin that claims the terminal slot.
+///
+/// Run once the layers are merged, over the plugins that survived it, so a
+/// claim a later layer switched off does not count.
+///
+/// # Errors
+///
+/// [`Error::BadValue`] at the second claimant's origin, naming both plugins and
+/// where the first was declared.
+pub fn check_terminal(plugins: &[PluginDecl]) -> Result<(), Error> {
+    let mut claimants = plugins.iter().filter(|p| p.enabled && p.terminal);
+    let Some(first) = claimants.next() else {
+        return Ok(());
+    };
+    match claimants.next() {
+        None => Ok(()),
+        Some(second) => Err(Error::BadValue {
+            origin: second.origin.clone(),
+            message: format!(
+                "plugin `{}` claims the terminal slot, which plugin `{}` already claims at {}; \
+                 only one plugin can load after everything else, so set `terminal = false` \
+                 on one of them",
+                second.name, first.name, first.origin
+            ),
+        }),
+    }
+}
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[plugin]]";

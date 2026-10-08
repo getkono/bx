@@ -8,9 +8,32 @@ use std::path::Path;
 
 use toml_edit::Table;
 
-use super::shells::{Phase, Shell};
-use super::{Ctx, Error};
-use crate::shell::activation::ActivationDecl;
+use super::shells::{Phase, Shell, Shells};
+use super::{Ctx, Error, Origin};
+
+/// One `[[activation]]` entry, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationDecl {
+    /// The activation's name, its natural key.
+    pub name: String,
+    /// The command every shell runs, `{shell}` spelled as the shell's name,
+    /// `command[0]` being the tool. Empty when only per-shell commands are
+    /// declared.
+    pub command: Vec<String>,
+    /// zsh's own command, in place of `command`.
+    pub zsh: Option<Vec<String>>,
+    /// bash's own command, in place of `command`.
+    pub bash: Option<Vec<String>>,
+    /// The shells whose generated file it lands in.
+    pub shells: Shells,
+    /// The phase its output lands in.
+    pub phase: Phase,
+    /// `false` in any layer removes the activation from the resolved
+    /// configuration.
+    pub enabled: bool,
+    /// Where the entry was written.
+    pub origin: Origin,
+}
 
 /// The section header, as messages spell it.
 pub(crate) const SECTION: &str = "[[activation]]";

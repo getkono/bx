@@ -96,21 +96,23 @@ pub struct Config {
     pub path: Vec<path::PathEntry>,
     /// `[aliases]` and `[[alias]]` together, keyed by `name`: table by table,
     /// in the order each table first appears in the file, and each table's
-    /// entries in the order written. See [`crate::shell::alias`].
-    pub aliases: Vec<crate::shell::alias::AliasDecl>,
+    /// entries in the order written. See [`alias`], and
+    /// [`crate::shell::alias`] for how each is rendered.
+    pub aliases: Vec<alias::AliasDecl>,
     /// `[[function]]`'s entries, keyed by `name`, in the order written. See
-    /// [`crate::shell::function`].
-    pub functions: Vec<crate::shell::function::FunctionDecl>,
+    /// [`function`], and [`crate::shell::function`] for how each is rendered.
+    pub functions: Vec<function::FunctionDecl>,
     /// `[[plugin]]`'s entries, keyed by `name`, in the order written. See
-    /// [`crate::shell::plugin`].
-    pub plugins: Vec<crate::shell::plugin::PluginDecl>,
+    /// [`plugin`], and [`crate::shell::plugin`] for how each is rendered.
+    pub plugins: Vec<plugin::PluginDecl>,
     /// `[[source]]`'s entries, keyed by `name`, in the order written: the
-    /// declared optional sources. See [`crate::shell::source`].
-    pub sources: Vec<crate::shell::source::SourceDecl>,
+    /// declared optional sources. See [`source`], and
+    /// [`crate::shell::source`] for how each is rendered.
+    pub sources: Vec<source::SourceDecl>,
     /// `[[activation]]`'s entries, keyed by `name`, in the order written: the
     /// declared tool activations, run at `plan` time and cached. See
-    /// [`crate::shell::activation`].
-    pub activations: Vec<crate::shell::activation::ActivationDecl>,
+    /// [`activation`], and [`crate::shell::activation`] for how each is run.
+    pub activations: Vec<activation::ActivationDecl>,
     /// `[[tool]]`'s entries, keyed by `name`, in the order written: the
     /// declared tool inventory `bx doctor` reports on and never installs. See
     /// [`tool`].
@@ -124,9 +126,9 @@ pub struct Config {
     pub history: history::History,
     /// `[shell-options]`: a table, merged key by key. See [`shell_options`].
     pub shell_options: shell_options::ShellOptions,
-    /// `[keybindings]`: a table, merged key by key. See
-    /// [`crate::shell::keybindings`].
-    pub keybindings: crate::shell::keybindings::Keybindings,
+    /// `[keybindings]`: a table, merged key by key. See [`keybindings`], and
+    /// [`crate::shell::keybindings`] for how it is rendered.
+    pub keybindings: keybindings::Keybindings,
     /// List entries that restate only their natural key and `enabled`.
     ///
     /// A **toggle**: it flips the flag on an entry an earlier layer introduced

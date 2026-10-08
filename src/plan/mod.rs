@@ -1239,6 +1239,198 @@ pub(crate) mod tests {
         assert_eq!(rows(&shown.expect("apply asked")), rows(&planned));
     }
 
+    /// What is on disk at a generated target before bx runs.
+    #[derive(Debug, Clone)]
+    enum Before {
+        Absent,
+        /// The user wrote these bytes; bx never touched the file.
+        Users(String),
+        /// bx wrote it, holding this body: the target's own when `same`.
+        Owned {
+            body: String,
+            same: bool,
+        },
+        /// bx wrote it and the user has since rewritten it.
+        Edited(String),
+    }
+
+    /// One generated `[[target]]` and what its file holds beforehand.
+    #[derive(Debug, Clone)]
+    struct Generated {
+        nested: bool,
+        region: bool,
+        body: String,
+        before: Before,
+    }
+
+    impl Generated {
+        /// Its path under the home, distinct for each `index`.
+        fn rel(&self, index: usize) -> String {
+            if self.nested {
+                format!(".d{index}/p")
+            } else {
+                format!(".p{index}")
+            }
+        }
+
+        /// Its `[[target]]`, as TOML.
+        fn toml(&self, index: usize) -> String {
+            let mut toml = inline(
+                &format!("~/{}", self.rel(index)),
+                &self.body.replace('\n', "\\n"),
+            );
+            if self.region {
+                toml.push_str("attach = \"region\"\ncomment = \"#\"\n");
+            }
+            toml
+        }
+
+        /// The file bx would have left for `body`.
+        fn written(&self, body: &str) -> Vec<u8> {
+            if self.region {
+                region::block('#', body.as_bytes())
+            } else {
+                body.as_bytes().to_vec()
+            }
+        }
+
+        /// Put its `before` on disk under `home`.
+        fn lay_down(&self, home: &Path, index: usize) {
+            let rel = self.rel(index);
+            let path = home.join(&rel);
+            let mechanism = if self.region {
+                Mechanism::Region { comment: '#' }
+            } else {
+                Mechanism::Own
+            };
+            match &self.before {
+                Before::Absent => {}
+                Before::Users(text) => {
+                    std::fs::create_dir_all(path.parent().expect("a parent")).expect("a parent");
+                    std::fs::write(&path, text).expect("the user's file");
+                }
+                Before::Owned { body, same } => {
+                    let body = if *same { &self.body } else { body };
+                    own(home, &rel, &self.written(body), mechanism);
+                }
+                Before::Edited(text) => {
+                    own(home, &rel, &self.written(&self.body), mechanism);
+                    std::fs::write(&path, text).expect("the user's edit");
+                }
+            }
+        }
+    }
+
+    fn generated() -> impl proptest::strategy::Strategy<Value = Vec<Generated>> {
+        use proptest::prelude::*;
+        let text = || "([a-z =]{0,6}\n){0,3}";
+        let before = prop_oneof![
+            Just(Before::Absent),
+            text().prop_map(Before::Users),
+            (text(), any::<bool>()).prop_map(|(body, same)| Before::Owned { body, same }),
+            text().prop_map(Before::Edited),
+        ];
+        let target = (any::<bool>(), any::<bool>(), "([a-z]{1,6}\n){1,3}", before).prop_map(
+            |(nested, region, body, before)| Generated {
+                nested,
+                region,
+                body,
+                before,
+            },
+        );
+        proptest::collection::vec(target, 1..=4)
+    }
+
+    /// Every path under `home` outside bx's records and the repo, keyed to
+    /// its bytes and mode.
+    fn tree(home: &Path) -> std::collections::BTreeMap<PathBuf, (Option<Vec<u8>>, u32)> {
+        snapshot(home, &OUTSIDE)
+            .into_iter()
+            .map(|(path, bytes, mode)| (path, (bytes, mode)))
+            .collect()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Invariants 3 and 7 over generated configurations: apply changes
+        /// exactly the files plan announced and announces what plan did, and
+        /// the plan after it announces no work.
+        #[test]
+        fn apply_changes_what_plan_announced_and_a_second_plan_is_empty(
+            targets in generated(),
+        ) {
+            let home = guarded_home();
+            for (index, target) in targets.iter().enumerate() {
+                target.lay_down(home.path(), index);
+            }
+            let layer = targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| target.toml(index))
+                .collect::<String>();
+            let inputs = inputs(&home, &layer);
+
+            let untouched = snapshot(home.path(), &[]);
+            let planned = plan(&inputs);
+            proptest::prop_assert_eq!(snapshot(home.path(), &[]), untouched, "plan wrote");
+            let announced = planned
+                .changes
+                .iter()
+                .filter(|change| matches!(change.action, Action::Create | Action::Modify))
+                .map(|change| PathBuf::from(change.target.strip_prefix("~/").expect("in home")))
+                .collect::<BTreeSet<_>>();
+
+            let before = tree(home.path());
+            let applied = apply(&inputs);
+            let after = tree(home.path());
+            let rows = |report: &Report| {
+                report
+                    .changes
+                    .iter()
+                    .map(|c| (c.target.clone(), c.action, c.diff.clone(), c.note.clone()))
+                    .collect::<Vec<_>>()
+            };
+            proptest::prop_assert_eq!(rows(&applied), rows(&planned));
+            proptest::prop_assert_eq!(applied.executed, !announced.is_empty());
+
+            let changed = before
+                .keys()
+                .chain(after.keys())
+                .filter(|path| before.get(*path) != after.get(*path))
+                .collect::<BTreeSet<_>>();
+            let files = changed
+                .iter()
+                .filter(|path| !home.path().join(path).is_dir())
+                .map(|path| (*path).clone())
+                .collect::<BTreeSet<_>>();
+            proptest::prop_assert_eq!(&files, &announced);
+            // A directory changes only by being created as a parent of one.
+            for path in changed.iter().filter(|path| home.path().join(path).is_dir()) {
+                proptest::prop_assert!(
+                    !before.contains_key(*path)
+                        && announced.iter().any(|file| file.starts_with(path)),
+                    "{} changed",
+                    path.display()
+                );
+            }
+
+            let second = plan(&inputs);
+            proptest::prop_assert!(
+                second
+                    .changes
+                    .iter()
+                    .all(|change| !matches!(change.action, Action::Create | Action::Modify)),
+                "{:?}",
+                second.actions()
+            );
+            let again = run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve"))
+                .expect("the second apply");
+            proptest::prop_assert!(!again.executed);
+            proptest::prop_assert_eq!(tree(home.path()), after);
+        }
+    }
+
     #[test]
     fn t11_a_mode_only_drift_is_a_journalled_modify_that_converges() {
         let home = guarded_home();

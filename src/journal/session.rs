@@ -1342,9 +1342,10 @@ fn link_prior_bytes(observed: &Observed) -> PriorBytes {
 ///
 /// # Errors
 ///
-/// [`Error::Read`] when the destination cannot be looked at — a parent that
-/// does not resolve, or one this process may not search — and [`Error::Write`]
-/// with [`crate::fs::Error::Changed`] when it is no longer what plan saw.
+/// [`Error::Write`] with [`crate::fs::Error::Read`] when the destination cannot
+/// be looked at — a parent that does not resolve, or one this process may not
+/// search — and with [`crate::fs::Error::Changed`] when it is no longer what
+/// plan saw.
 fn refuse_unplanned(dest: &Path, planned: &Observed) -> Result<Observed, Error> {
     let observed = fs::observe(dest)?;
     refuse_moved(planned, &observed)?;

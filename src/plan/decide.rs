@@ -536,6 +536,11 @@ enum Wanted {
 /// A shape this entry does not write is blocked before anything is read.
 /// Bodies are written verbatim: an inline body was substituted by `resolve`,
 /// and a file body is the repo's bytes.
+///
+/// Not a pure read of the repo, in `plan` as in `apply`: a secret body is
+/// decrypted here with the account's identity, never prompting, and a
+/// generated body's `has:TOOL` conditions are decided by looking each tool up
+/// along the `PATH` [`Inputs`](super::Inputs) took.
 fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
     if let Some(note) = unsupported(target) {
         return Ok(Wanted::Blocked(note.to_string()));

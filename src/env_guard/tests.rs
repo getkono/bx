@@ -2044,7 +2044,7 @@ fn every_site_that_reaches_the_guard_is_known() {
     // into a further file is a new caller, as it was when sites were
     // matched by file. "This module" is the `env_guard` module wherever
     // its files are — `env_guard.rs` and everything beneath `env_guard/`.
-    const KNOWN: [&str; 13] = [
+    const KNOWN: [&str; 14] = [
         // `bx add`'s advisory scan.
         "use crate::env_guard::{self, Reason, RootSet};",
         "env_guard::scan_with(text, roots)",
@@ -2056,6 +2056,9 @@ fn every_site_that_reaches_the_guard_is_known() {
         // The interactive file's history path, judged beside its `env`
         // phase, which still goes through `scan_with` above.
         "env_guard::refuses_bx_location(&path, roots)",
+        // The root set's type, named where the plan's inputs hold it and
+        // where a decision borrows it; neither judges anything.
+        "use crate::env_guard::RootSet;",
         "use crate::env_guard::RootSet;",
         "let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();",
         // Cached activation output: the name search, once over names as

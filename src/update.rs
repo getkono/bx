@@ -1631,4 +1631,31 @@ mod tests {
             "{seen:?}"
         );
     }
+
+    #[test]
+    fn a_held_check_lock_is_waited_on_for_the_whole_wait_and_taken_once_let_go() {
+        let home = guarded_home();
+        let stamps = Stamps::of(&StateDir::resolve(home.path()));
+        let held = stamps.try_hold().expect("hold").expect("free");
+
+        // Held throughout: `hold` keeps trying until `wait` is spent, then
+        // gives up.
+        let wait = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        assert!(stamps.hold(wait).expect("hold").is_none());
+        assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+
+        // Let go partway: the waiting `hold` takes it.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        assert!(
+            stamps
+                .hold(Duration::from_secs(30))
+                .expect("hold")
+                .is_some()
+        );
+        releaser.join().expect("released");
+    }
 }

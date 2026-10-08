@@ -577,6 +577,45 @@ fn a_replay_that_stops_for_signing_is_not_called_a_conflict() {
 }
 
 #[test]
+fn a_replay_that_cannot_be_put_back_is_named_as_an_open_rebase() {
+    let home = guarded_home();
+    let repo = diverged(&home);
+    for (key, value) in [
+        ("commit.gpgsign", "true"),
+        ("gpg.format", "ssh"),
+        ("user.signingkey", "/nonexistent/bx-test-key"),
+    ] {
+        run(home.path(), &repo, &["config", key, value]);
+    }
+    // git, except that `rebase --abort` fails.
+    let wrapper = home.child("bin/git");
+    std::fs::create_dir_all(wrapper.parent().expect("a parent")).expect("bin");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = --abort ] && exit 1; done\nexec git \"$@\"\n",
+    )
+    .expect("the wrapper");
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("executable");
+    let error = update_with(
+        &env(home.path()),
+        &[],
+        true,
+        &mut Vec::new(),
+        &git(home.path()).with_program(&wrapper),
+        &mut never,
+    )
+    .expect_err("left open");
+    assert!(matches!(error, update::Error::Rebasing(_)), "{error:?}");
+    assert!(update::rebasing(&git(home.path()), &repo), "open, as named");
+    let again = update(&home, true, &mut Vec::new()).expect_err("still open");
+    assert!(matches!(again, update::Error::Rebasing(_)), "{again:?}");
+}
+
+#[test]
 fn a_replay_the_upstream_already_holds_says_so() {
     let home = guarded_home();
     upstream(&home, &["skills/a/SKILL.md"]);

@@ -471,8 +471,9 @@ pub enum Replay {
 ///
 /// # Errors
 ///
-/// [`Error::Sync`] when git cannot list the commits, or cannot put the
-/// branch back after a replay that failed.
+/// [`Error::Sync`] when git cannot list the commits, or a replay failed and
+/// was put back, and [`Error::Rebasing`] when a replay that failed could not
+/// be put back, so it stands open for a person to finish or abort.
 pub fn replay_own_lock_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
     let listed = git.query(
         repo,
@@ -526,11 +527,14 @@ pub fn replay_own_lock_commits(git: &Git, repo: &Path) -> Result<Replay, Error> 
         Err(error) if !rebasing(git, repo) => Err(error.into()),
         Err(error) => {
             // Asked before the abort, and never in its way: a replay is
-            // never left open.
+            // never left open by choice. One whose abort fails is open all
+            // the same, and is named as one, as the next run would name it.
             let unmerged = git
                 .query(repo, &["diff", "--name-only", "--diff-filter=U"])
                 .unwrap_or_default();
-            git.query(repo, &["rebase", "--abort"])?;
+            if git.query(repo, &["rebase", "--abort"]).is_err() {
+                return Err(Error::Rebasing(repo.to_path_buf()));
+            }
             if unmerged.is_empty() {
                 // Stopped for something else, signing above all.
                 Err(error.into())

@@ -457,11 +457,12 @@ fn update_with(
     let _held = update::Stamps::of(&state)
         .hold(update::HOLD_WAIT)?
         .ok_or(update::Error::Busy)?;
-    update::refuse_edited_lock(git, &repo)?;
     // One an interrupted replay left, or the user's own: theirs to finish.
+    // Named first, since a replay left open leaves `bx.lock` changed too.
     if update::rebasing(git, &repo) {
         return Err(update::Error::Rebasing(repo));
     }
+    update::refuse_edited_lock(git, &repo)?;
     // Diverged only by this machine's own unpushed lock commits: those are
     // replayed on top of the upstream, keeping every lock they hold.
     let pulled = match sync::pull(env, git) {

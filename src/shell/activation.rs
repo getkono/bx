@@ -92,7 +92,8 @@
 //! [`plan`] is the one function: it decides every activation, runs whatever
 //! has to run, and returns [`Step`]s that say which were reused, captured or
 //! omitted. `apply` does not decide again. It hands the same
-//! [`Plan`] to [`Plan::contribute`], which renders the file, and to
+//! [`Plan`] to [`Plan::rendered`], whose text each interactive file carries
+//! and renders through [`contribute`], and to
 //! [`Plan::record`], which writes the captures into the cache it then saves. A
 //! second `plan` against an unchanged machine therefore reuses every entry,
 //! starts no process, and renders the same bytes.
@@ -571,17 +572,6 @@ impl Plan {
         &self.steps
     }
 
-    /// Add every step for `shell` that renders anything to its phase, in
-    /// declaration order.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`Assembly::contribute`] refuses. An activation lands only in
-    /// `activations` or `completions`, neither of which refuses anything.
-    pub fn contribute(&self, assembly: &mut Assembly, shell: Shell) -> Result<(), super::Error> {
-        contribute(assembly, &self.rendered(shell))
-    }
-
     /// `shell`'s text for every step that renders anything, in declaration
     /// order: what that shell's interactive file carries.
     #[must_use]
@@ -597,14 +587,6 @@ impl Plan {
                 })
             })
             .collect()
-    }
-
-    /// Whether any step for `shell` renders anything.
-    #[must_use]
-    pub fn renders(&self, shell: Shell) -> bool {
-        self.steps
-            .iter()
-            .any(|step| step.shell == shell && step.body().is_some())
     }
 
     /// Bring `cache` up to date with the plan: record every capture, and
@@ -1529,7 +1511,7 @@ mod tests {
     fn apply(decls: &[ActivationDecl], cache: &mut Fingerprints, host: &Fake) -> (Plan, String) {
         let plan = plan(decls, cache, &RootSet::strict(), host);
         let mut assembly = Assembly::new();
-        plan.contribute(&mut assembly, Shell::Zsh)
+        contribute(&mut assembly, &plan.rendered(Shell::Zsh))
             .expect("activations never claim the terminal slot");
         plan.record(cache);
         (plan, assembly.render())
@@ -1651,9 +1633,7 @@ mod tests {
             "+ activation `starship` for bash: run twice, output agreed; cached"
         );
         let mut bash = Assembly::new();
-        decided
-            .contribute(&mut bash, Shell::Bash)
-            .expect("contributes");
+        contribute(&mut bash, &decided.rendered(Shell::Bash)).expect("contributes");
         let bash = bash.render();
         for name in ["starship", "fzf", "bonly"] {
             assert!(
@@ -1667,7 +1647,9 @@ mod tests {
                 "{bash}"
             );
         }
-        assert!(decided.renders(Shell::Bash) && decided.renders(Shell::Zsh));
+        assert!(
+            !decided.rendered(Shell::Bash).is_empty() && !decided.rendered(Shell::Zsh).is_empty()
+        );
         decided.record(&mut cache);
         let mut keys: Vec<&String> = cache.iter().map(|(key, _)| key).collect();
         keys.sort_unstable();
@@ -2361,9 +2343,7 @@ mod tests {
             step("after", "export Y=ok\n"),
         ];
         let mut assembly = Assembly::new();
-        Plan { steps }
-            .contribute(&mut assembly, Shell::Zsh)
-            .expect("contributes");
+        contribute(&mut assembly, &Plan { steps }.rendered(Shell::Zsh)).expect("contributes");
         let dir = tempfile::TempDir::new().expect("tempdir");
         let file = dir.path().join("zshrc.zsh");
         std::fs::write(&file, assembly.render()).expect("write");

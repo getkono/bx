@@ -114,6 +114,7 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
     ));
     findings.extend(externals::check(
         &resolved.externals,
+        inputs.committed_externals(),
         inputs.lock(),
         inputs.repo(),
         inputs.state(),

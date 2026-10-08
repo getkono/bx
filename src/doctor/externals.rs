@@ -19,12 +19,22 @@ use crate::config::Origin;
 use crate::config::external::External;
 use crate::config::lock::{self, Lock, Lookup};
 use crate::state::StateDir;
-use crate::update::Stamps;
+use crate::update::{Stamps, followed};
 
 /// A finding for every followed external the lock does not hold, then every
 /// lock entry nothing follows, then every unreadable stamp.
+///
+/// `externals` is this account's merged configuration and `committed` the
+/// committed layers' alone, as [`crate::update::proposed`] takes them: an
+/// entry either follows is one the next `bx update` keeps.
 #[must_use]
-pub fn check(externals: &[External], lock: &Lock, repo: &Path, state: &StateDir) -> Vec<Finding> {
+pub fn check(
+    externals: &[External],
+    committed: Option<&[External]>,
+    lock: &Lock,
+    repo: &Path,
+    state: &StateDir,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     for external in externals {
         let Some(follow) = external.follows() else {
@@ -54,10 +64,8 @@ pub fn check(externals: &[External], lock: &Lock, repo: &Path, state: &StateDir)
         });
     }
     for (path, locked) in lock.iter() {
-        let followed = externals
-            .iter()
-            .any(|external| external.path == *path && external.follows().is_some());
-        if !followed {
+        let kept = followed(path, externals) || committed.is_none_or(|c| followed(path, c));
+        if !kept {
             findings.push(Finding {
                 subject: path.to_string(),
                 origin: Some(Origin::unknown(&Lock::path_in(repo))),
@@ -141,9 +149,19 @@ mod tests {
             external(home.path(), "~/new", follow("main")),
             external(home.path(), "~/pinned", Pin::Rev(REV.to_string())),
         ];
-        let findings = check(&externals, &lock, home.path(), &state);
+        let findings = check(&externals, Some(&externals), &lock, home.path(), &state);
         let subjects: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
         assert_eq!(subjects, ["~/stale", "~/new", "~/gone"]);
+        // Followed by the committed configuration, though not by this
+        // account's, or with that unknown: kept, so no finding.
+        let committed = [external(home.path(), "~/gone", follow("main"))];
+        for committed in [Some(&committed[..]), None] {
+            let findings = check(&externals, committed, &lock, home.path(), &state);
+            assert!(
+                findings.iter().all(|f| f.subject != "~/gone"),
+                "{findings:?}"
+            );
+        }
         assert!(
             findings[0].note.contains("locks it for `old`"),
             "{}",
@@ -183,7 +201,7 @@ mod tests {
                 rev: REV.to_string(),
             },
         );
-        let findings = check(&followed, &lock, home.path(), &state);
+        let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
             findings[0].note.contains("ask-due holds no time"),
@@ -192,6 +210,15 @@ mod tests {
         );
 
         let pinned = [external(home.path(), "~/a", Pin::Rev(REV.to_string()))];
-        assert!(check(&pinned, &Lock::default(), home.path(), &state).is_empty());
+        assert!(
+            check(
+                &pinned,
+                Some(&pinned),
+                &Lock::default(),
+                home.path(),
+                &state
+            )
+            .is_empty()
+        );
     }
 }

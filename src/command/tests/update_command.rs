@@ -262,6 +262,73 @@ fn update_without_yes_or_a_terminal_reaches_nothing() {
 }
 
 #[test]
+fn an_external_one_account_switches_off_keeps_its_shared_lock_entry() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let other = format!(
+        "[[external]]\npath = \"~/.local/share/other\"\nurl = \"{URL}\"\nbranch = \"master\"\n"
+    );
+    cloned(&home, &format!("{}{other}", layer()));
+    update(&home, true, &mut Vec::new()).expect("both locked");
+    let lock = || Lock::read(&home.child(".config/bx"), home.path()).expect("bx.lock");
+    let entry = |lock: &Lock, at: &str| {
+        lock.iter()
+            .find(|(path, _)| path.as_str() == at)
+            .map(|(_, locked)| locked.rev.clone())
+    };
+    let before = entry(&lock(), "~/.local/share/other").expect("locked");
+
+    home.write(
+        ".local/state/bx/local.toml",
+        "[[external]]\npath = \"~/.local/share/other\"\nenabled = false\n",
+    );
+    let next = publish(&home, &["skills/b/SKILL.md"]);
+    let mut out = Vec::new();
+    update(&home, true, &mut out).expect("update");
+    assert_eq!(
+        entry(&lock(), &format!("~/{AT}")).as_deref(),
+        Some(next.as_str()),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        entry(&lock(), "~/.local/share/other").as_deref(),
+        Some(before.as_str()),
+        "another machine's entry stands"
+    );
+
+    // Pointed at another branch in `local.toml`: said, and not locked.
+    run(home.path(), &home.child("upstream"), &["branch", "mine"]);
+    home.write(
+        ".local/state/bx/local.toml",
+        &format!(
+            "[[external]]\npath = \"~/.local/share/other\"\nurl = \"{URL}\"\nbranch = \"mine\"\n"
+        ),
+    );
+    let mut out = Vec::new();
+    let exit = update(&home, true, &mut out).expect("update");
+    assert_eq!(exit, Exit::Pending, "{}", text(&out));
+    assert!(
+        text(&out).contains(
+            "~/.local/share/other: this account follows `mine` of https://example.invalid/upstream, \
+             and the committed configuration another branch or url"
+        ),
+        "{}",
+        text(&out)
+    );
+    let kept = lock();
+    let shared = kept
+        .iter()
+        .find(|(path, _)| path.as_str() == "~/.local/share/other")
+        .expect("kept")
+        .1;
+    assert_eq!(
+        (shared.branch.as_str(), shared.rev.as_str()),
+        ("master", before.as_str())
+    );
+}
+
+#[test]
 fn update_refuses_a_lock_with_uncommitted_edits() {
     let home = guarded_home();
     upstream(&home, &["skills/a/SKILL.md"]);

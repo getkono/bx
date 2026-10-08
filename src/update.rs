@@ -392,13 +392,30 @@ fn remote_tip(git: &Git, home: &Path, url: &str, reference: &str) -> Result<Stri
     }
 }
 
-/// `lock` with every move in `found` set, and every entry no followed
-/// external in `externals` declares any more dropped.
+/// `lock` with every move in `found` set, and every entry nothing follows
+/// any more dropped.
+///
+/// `bx.lock` is committed and shared, while `externals` is this account's
+/// merged configuration, `local.toml` included; `committed` is what the
+/// committed layers alone declare, or `None` when they cannot be merged
+/// without it. So an entry is kept while either follows its path — an
+/// external one account switched off, or moved, in its own `local.toml` is
+/// still another machine's — and a move is not set over an entry the
+/// committed configuration follows from another url or branch ([`repointed`]).
+/// With `committed` unknown, no entry is dropped.
 #[must_use]
-pub fn proposed(lock: &Lock, found: &[Found], externals: &[External]) -> Lock {
+pub fn proposed(
+    lock: &Lock,
+    found: &[Found],
+    externals: &[External],
+    committed: Option<&[External]>,
+) -> Lock {
     let mut next = lock.clone();
     for found in found {
         if let Some(tip) = found.moves_to() {
+            if repointed(found, committed) {
+                continue;
+            }
             next.set(
                 found.path.clone(),
                 Locked {
@@ -409,12 +426,31 @@ pub fn proposed(lock: &Lock, found: &[Found], externals: &[External]) -> Lock {
             );
         }
     }
-    next.retain(|path| {
-        externals
-            .iter()
-            .any(|external| external.path == *path && external.follows().is_some())
-    });
+    next.retain(|path| followed(path, externals) || committed.is_none_or(|c| followed(path, c)));
     next
+}
+
+/// Whether any of `externals` follows a branch at `path`.
+#[must_use]
+pub fn followed(path: &Portable, externals: &[External]) -> bool {
+    externals
+        .iter()
+        .any(|external| external.path == *path && external.follows().is_some())
+}
+
+/// Whether the committed configuration follows `found`'s path from another
+/// url or branch than this account's does: a `local.toml` pointing it
+/// elsewhere, whose commit the shared `bx.lock` does not take.
+#[must_use]
+pub fn repointed(found: &Found, committed: Option<&[External]>) -> bool {
+    committed.is_some_and(|committed| {
+        committed.iter().any(|external| {
+            external.path == found.path
+                && external.follows().is_some_and(|follow| {
+                    external.url != found.url || follow.branch != found.branch
+                })
+        })
+    })
 }
 
 /// The commit message for moving `before` to `after`: what moved, by path,
@@ -1213,6 +1249,7 @@ mod tests {
                 found("~/c", None, Verdict::Unreachable("offline".to_string())),
             ],
             &externals,
+            Some(&externals),
         );
         assert_eq!(next.get(&portable("~/a")).unwrap().rev, B);
         assert!(
@@ -1228,7 +1265,8 @@ mod tests {
             proposed(
                 &lock,
                 &[found("~/a", Some(A), Verdict::Current)],
-                &externals[..1]
+                &externals[..1],
+                Some(&externals[..1])
             ),
             {
                 let mut kept = Lock::default();
@@ -1236,6 +1274,61 @@ mod tests {
                 kept
             }
         );
+    }
+
+    #[test]
+    fn proposed_keeps_what_the_committed_configuration_follows() {
+        let mut lock = Lock::default();
+        let entry = |path: &str| Locked {
+            url: format!("https://h/o/{}", &path[2..]),
+            branch: "main".to_string(),
+            rev: A.to_string(),
+        };
+        for path in ["~/off", "~/moved", "~/gone"] {
+            lock.set(portable(path), entry(path));
+        }
+        // This account switched `~/off` off and points `~/moved` at another
+        // branch in its `local.toml`; the committed layers follow both.
+        let mut moved = followed("~/moved", Check::Ask);
+        moved.pin = Pin::Follow(Follow {
+            branch: "mine".to_string(),
+            check: Check::Ask,
+        });
+        let externals = [moved];
+        let committed = [
+            followed("~/off", Check::Ask),
+            followed("~/moved", Check::Ask),
+        ];
+        let away = Found {
+            branch: "mine".to_string(),
+            ..found("~/moved", None, moves(B))
+        };
+        assert!(repointed(&away, Some(&committed)));
+        assert!(!repointed(&away, None));
+        assert!(!repointed(
+            &found("~/moved", Some(A), moves(B)),
+            Some(&committed)
+        ));
+
+        let next = proposed(
+            &lock,
+            std::slice::from_ref(&away),
+            &externals,
+            Some(&committed),
+        );
+        assert_eq!(next.get(&portable("~/off")), Some(&entry("~/off")));
+        assert_eq!(
+            next.get(&portable("~/moved")),
+            Some(&entry("~/moved")),
+            "the committed one's commit stands"
+        );
+        assert!(next.get(&portable("~/gone")).is_none());
+
+        // With the committed layers unknown, nothing is dropped.
+        let next = proposed(&lock, &[], &[], None);
+        assert_eq!(next, lock);
+        let next = proposed(&lock, &[away], &externals, None);
+        assert_eq!(next.get(&portable("~/moved")).unwrap().branch, "mine");
     }
 
     #[test]

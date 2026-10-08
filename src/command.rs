@@ -544,7 +544,23 @@ fn update_with(
     }
 
     let before = inputs.lock().clone();
-    let after = update::proposed(&before, &found, externals);
+    let committed = inputs.committed_externals();
+    let repointed: Vec<&update::Found> = found
+        .iter()
+        .filter(|found| found.moves_to().is_some() && update::repointed(found, committed))
+        .collect();
+    for found in &repointed {
+        say(
+            out,
+            &format!(
+                "{}: this account follows `{}` of {}, and the committed configuration another \
+                 branch or url; the shared bx.lock keeps the committed one's, so this is not \
+                 locked",
+                found.path, found.branch, found.url
+            ),
+        )?;
+    }
+    let after = update::proposed(&before, &found, externals, committed);
     let message = update::message(&before, &after);
     let changed = after != before;
     let inputs = inputs.with_lock(after.clone());
@@ -625,14 +641,15 @@ fn update_with(
         }
     }
     update::finished(&inputs)?;
-    let attention = found.iter().any(|found| {
-        matches!(
-            found.verdict,
-            update::Verdict::Rewritten { .. }
-                | update::Verdict::Unproven { .. }
-                | update::Verdict::Unreachable(_)
-        )
-    });
+    let attention = !repointed.is_empty()
+        || found.iter().any(|found| {
+            matches!(
+                found.verdict,
+                update::Verdict::Rewritten { .. }
+                    | update::Verdict::Unproven { .. }
+                    | update::Verdict::Unreachable(_)
+            )
+        });
     Ok(match plan::exit(&report, Mode::Apply) {
         Exit::Converged if attention => Exit::Pending,
         exit => exit,

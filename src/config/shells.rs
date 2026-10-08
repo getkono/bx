@@ -72,15 +72,6 @@ impl Shells {
     /// The key, as a config author writes it.
     pub const KEY: &'static str = "shells";
 
-    /// Only `shell`.
-    #[must_use]
-    pub const fn only(shell: Shell) -> Self {
-        Self {
-            zsh: matches!(shell, Shell::Zsh),
-            bash: matches!(shell, Shell::Bash),
-        }
-    }
-
     /// Whether the declaration reaches `shell`.
     #[must_use]
     pub const fn includes(self, shell: Shell) -> bool {
@@ -192,7 +183,25 @@ impl Phase {
             Self::Terminal => "terminal",
         }
     }
+}
 
+// Only tests ask these, so they sit last, beside them: the source scans that
+// read everything above the first `#[cfg(test)]` as this module's shipped code
+// still read all of it.
+#[cfg(test)]
+impl Shells {
+    /// Only `shell`.
+    #[must_use]
+    pub const fn only(shell: Shell) -> Self {
+        Self {
+            zsh: matches!(shell, Shell::Zsh),
+            bash: matches!(shell, Shell::Bash),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Phase {
     /// Whether the phase may hold an environment assignment: only `env` and
     /// `path`, whose content must be an environment fragment the plan judges.
     #[must_use]

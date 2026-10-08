@@ -43,23 +43,6 @@ pub enum Section {
 }
 
 impl Section {
-    /// The TOML key the section is written under.
-    #[must_use]
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Target => "target",
-            Self::Value => "value",
-            Self::Env => "env",
-            Self::Alias => "alias",
-            Self::Function => "function",
-            Self::Plugin => "plugin",
-            Self::Source => "source",
-            Self::Activation => "activation",
-            Self::Tool => "tool",
-            Self::External => "external",
-        }
-    }
-
     /// The section header, as messages spell it.
     #[must_use]
     pub fn header(self) -> &'static str {
@@ -170,4 +153,27 @@ pub(crate) fn toggle_of(
         enabled,
         origin: ctx.origin().clone(),
     }))
+}
+
+// Only tests ask this, so it sits last: the source scans that read everything
+// above the first `#[cfg(test)]` as this module's shipped code still read all
+// of it.
+#[cfg(test)]
+impl Section {
+    /// The TOML key the section is written under.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Target => "target",
+            Self::Value => "value",
+            Self::Env => "env",
+            Self::Alias => "alias",
+            Self::Function => "function",
+            Self::Plugin => "plugin",
+            Self::Source => "source",
+            Self::Activation => "activation",
+            Self::Tool => "tool",
+            Self::External => "external",
+        }
+    }
 }

@@ -338,18 +338,6 @@ pub struct Var {
     pub when: Option<When>,
 }
 
-impl Var {
-    /// A variable written unconditionally.
-    #[must_use]
-    pub fn always(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
-            when: None,
-        }
-    }
-}
-
 /// An environment fragment: the variables one place holds, substituted and in
 /// declaration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +437,22 @@ fn quoted(value: &str) -> String {
 pub fn source_line(fragment: &Portable) -> String {
     let path = fragment.as_str();
     format!("[[ -r {path} ]] && source {path}\n")
+}
+
+// Only tests build a `Var` by hand, so this sits last, beside them: the source
+// scans that read everything above the first `#[cfg(test)]` as this module's
+// shipped code still read all of it.
+#[cfg(test)]
+impl Var {
+    /// A variable written unconditionally.
+    #[must_use]
+    pub fn always(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            when: None,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(crate::config::target::Mode::DEFAULT_DIR, Mode::DEFAULT_DIR);
         assert_eq!(
             crate::config::target::Mode::parse_octal("8"),
-            Err(crate::config::target::ModeError::Invalid("8".to_string())),
+            Err(ModeError::Invalid("8".to_string())),
         );
     }
 

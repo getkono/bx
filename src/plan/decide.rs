@@ -25,12 +25,12 @@ use crate::config::env::Syntax;
 use crate::config::resolve::Resolution;
 use crate::config::secrets::Secrets;
 use crate::config::target::{Attach, Body, Direction, Format, Gen, Target};
-use crate::detect;
 use crate::env_guard::{self, RootSet};
 use crate::fs::{self, Desired, Kind, Mode, Observed};
 use crate::journal::{Content, Ownership, Request};
 use crate::paths::{self, Portable};
 use crate::report::Action;
+use crate::shell::activation::{self, Host as _};
 use crate::state::{LedgerEntry, LedgerView, Mechanism};
 
 /// What a decision may read: nothing it could change.
@@ -51,6 +51,9 @@ pub(super) struct Ctx<'a> {
     pub declared: &'a Declared,
     /// The bytes each tracked target's two sides last agreed on.
     pub bases: &'a Bases,
+    /// The machine a generated file's `has:TOOL` condition looks the tool up
+    /// on: the `PATH` [`super::Inputs::load`] read once.
+    pub host: &'a activation::System,
 }
 
 /// The directories whose targets apply leaves at a declared mode — created,
@@ -1025,7 +1028,7 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
         // A `has:TOOL` condition is decided here, by looking the tool up on
         // this machine, so the generated shell carries no `command -v`.
         Body::Generated(generator) => {
-            let present = |tool: &str| detect::locate_in_env(tool).is_usable();
+            let present = |tool: &str| ctx.host.locate(tool).is_usable();
             let content = generator.render(&present);
             if let Some(note) = guard_generated(generator, &content, ctx.roots, &present) {
                 return Ok(Wanted::Blocked(note));
@@ -1937,6 +1940,7 @@ mod tests {
             secrets: &Secrets::default(),
             declared: &Declared::new(),
             bases: &Bases::new(),
+            host: &activation::System::from_env(),
         };
         let shaped = |change: fn(&mut Target)| {
             let mut target = a_target(home.path(), "~/.a");
@@ -2010,6 +2014,7 @@ mod tests {
             secrets: &Secrets::default(),
             declared: &Declared::new(),
             bases: &Bases::new(),
+            host: &activation::System::from_env(),
         };
         let tracked = |change: fn(&mut Target)| {
             let mut target = a_target(home.path(), "~/.a");
@@ -2053,6 +2058,7 @@ mod tests {
             secrets: &Secrets::default(),
             declared: &Declared::new(),
             bases: &Bases::new(),
+            host: &activation::System::from_env(),
         };
 
         let (change, op) =
@@ -2108,6 +2114,7 @@ mod tests {
                 secrets: &Secrets::default(),
                 declared: &Declared::new(),
                 bases: &Bases::new(),
+                host: &activation::System::from_env(),
             };
 
             let (change, op) =
@@ -2828,6 +2835,7 @@ mod tests {
             secrets: &Secrets::default(),
             declared: &Declared::new(),
             bases: &Bases::new(),
+            host: &activation::System::from_env(),
         };
         let mut target = a_target(home.path(), "/");
         target.body = Body::Dir;

@@ -14,9 +14,10 @@
 //!   makes every write through one journalled session.
 //!
 //! The one environment read in the whole path is [`Env::from_process`], and
-//! the `PATH` a declared activation's tool is looked up along, which
-//! [`Inputs::load`] takes once through [`activation::System::from_env`]; every
-//! other function takes what it needs as an argument.
+//! the `PATH` a declared activation's tool and a generated file's `has:TOOL`
+//! condition are looked up along, which [`Inputs::load`] takes once through
+//! [`activation::System::from_env`]; every other function takes what it needs
+//! as an argument.
 
 mod decide;
 mod diff;
@@ -427,6 +428,7 @@ pub fn run(
         secrets: &inputs.resolved.secrets,
         declared: &decide::Declared::new(),
         bases: &bases,
+        host: &inputs.host,
     };
     // A fragment bx wrote for a place no variable lands in any more is planned
     // empty, so switching a variable off takes it out of every shell.
@@ -2120,6 +2122,27 @@ pub(crate) mod tests {
             std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file"),
             file
         );
+    }
+
+    #[test]
+    fn a_has_condition_looks_its_tool_up_on_the_host_the_inputs_were_loaded_with() {
+        // The lookup used to read the process's own `PATH`, which
+        // `Inputs::load` never took and no test controls. A tool only the
+        // host's `PATH` holds is found, and one it does not hold is not.
+        let home = guarded_home();
+        seed(
+            home.path(),
+            "[[alias]]\nname = \"s\"\ncommand = \"stub\"\nwhen = \"has:stub\"\n",
+        );
+        let written = |host| {
+            apply(&load(home.path()).with_host(host));
+            std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file")
+        };
+
+        let without = written(activation::System::new("", activation::TIMEOUT));
+        assert!(!without.contains("alias s="), "{without}");
+        let with = written(stub_tool(&home));
+        assert!(with.contains("alias s='stub'\n"), "{with}");
     }
 
     #[test]

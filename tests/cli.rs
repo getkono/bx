@@ -1,5 +1,5 @@
 //! The binary's surface for `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
-//! `bx add`, `bx rm` and `bx self-upgrade`:
+//! `bx update`, `bx add`, `bx rm` and `bx self-upgrade`:
 //! exit codes, what reaches standard output, and what is written.
 //!
 //! Every invocation gets its home per command, from a guarded tempdir; nothing
@@ -888,6 +888,61 @@ fn sync_fast_forwards_applies_and_exits_zero_and_refuses_a_diverged_branch_with_
         stderr(&diverged)
     );
     assert_eq!(git(home.path(), &repo, &["rev-parse", "HEAD"]), mine);
+}
+
+#[test]
+fn update_check_exits_two_when_something_moved_and_background_and_snooze_parse_as_the_hook_calls_them()
+ {
+    let home = guarded_home();
+    // An upstream at `~/upstream`, reached as https://example.invalid/upstream.
+    let upstream = home.child("upstream");
+    std::fs::create_dir_all(&upstream).expect("the upstream");
+    git(home.path(), &upstream, &["init", "--quiet", "-b", "master"]);
+    std::fs::write(upstream.join("f"), "f\n").expect("a file");
+    git(home.path(), &upstream, &["add", "-A"]);
+    git(home.path(), &upstream, &["commit", "--quiet", "-m", "f"]);
+    let tip = git(home.path(), &upstream, &["rev-parse", "HEAD"]);
+    std::fs::write(
+        home.child(".gitconfig"),
+        format!(
+            "[url \"file://{}/\"]\n\tinsteadOf = https://example.invalid/\n",
+            home.path().display()
+        ),
+    )
+    .expect("~/.gitconfig");
+    seed(
+        home.path(),
+        "[[external]]\npath = \"~/.local/share/up\"\nurl = \"https://example.invalid/upstream\"\n\
+         branch = \"master\"\n",
+    );
+
+    let checked = bx(home.path(), &["update", "--check"]);
+    assert_eq!(checked.status.code(), Some(2), "{}", stderr(&checked));
+    assert_eq!(
+        stdout(&checked),
+        format!("~/.local/share/up: locks master at {}\n", &tip[..12])
+    );
+    assert_eq!(stderr(&checked), "", "a usage error says so here");
+    assert!(!home.child(".config/bx/bx.lock").exists(), "nothing locked");
+
+    // The hook's own calls, as it makes them: nothing on standard output or
+    // standard error, and no usage error.
+    let background = bx(home.path(), &["update", "--background"]);
+    assert_eq!(background.status.code(), Some(0), "{}", stderr(&background));
+    assert_eq!(stdout(&background), "");
+    assert_eq!(stderr(&background), "");
+
+    let snoozed = bx(home.path(), &["update", "--snooze"]);
+    assert_eq!(snoozed.status.code(), Some(0), "{}", stderr(&snoozed));
+    assert_eq!(
+        stdout(&snoozed),
+        "bx will ask about updates again in 7d; run `bx update` any time before.\n"
+    );
+    assert_eq!(stderr(&snoozed), "");
+    assert!(
+        !home.child(".local/state/bx/update/available").exists(),
+        "the offer is dropped"
+    );
 }
 
 #[test]

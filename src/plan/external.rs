@@ -2088,7 +2088,13 @@ mod tests {
         assert_eq!(row.action, Action::Blocked, "{row:?}");
         let note = row.note.as_deref().expect("a note");
         assert!(note.contains("locks it for `master`"), "{note}");
-        assert!(note.ends_with(remedy), "{note}");
+        assert!(
+            note.ends_with(
+                "`bx update` locks the branch and url the committed configuration follows \
+                 here, not this one; pin it with `rev`"
+            ),
+            "{note}"
+        );
     }
 
     /// Commit `files` on the upstream's `master`, and return the commit.

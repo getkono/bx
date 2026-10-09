@@ -453,18 +453,26 @@ pub fn unshared(found: &Found, committed: Option<&[External]>) -> bool {
 /// What `bx update` cannot do for `external`'s follow, which `local.toml`
 /// alone declares or points elsewhere ([`unshared`]): the remedy that locks
 /// it instead, or `None` for a follow `bx update` does lock, and for a pin.
+///
+/// A follow the committed configuration already declares elsewhere is not
+/// told to declare it in a committed layer, as `bx update`'s own message for
+/// that case does not: that would change what every account follows.
 #[must_use]
 pub fn unshared_remedy(
     external: &External,
     committed: Option<&[External]>,
 ) -> Option<&'static str> {
-    external
-        .follows()
-        .filter(|follow| unshared_at(&external.path, &external.url, &follow.branch, committed))
-        .map(|_| {
-            "`bx update` locks only what the committed configuration follows; declare it in a \
-             committed layer, or pin it with `rev`"
-        })
+    let follow = external.follows()?;
+    if !unshared_at(&external.path, &external.url, &follow.branch, committed) {
+        return None;
+    }
+    Some(if committed.is_some_and(|c| followed(&external.path, c)) {
+        "`bx update` locks the branch and url the committed configuration follows here, not \
+         this one; pin it with `rev`"
+    } else {
+        "`bx update` locks only what the committed configuration follows; declare it in a \
+         committed layer, or pin it with `rev`"
+    })
 }
 
 /// [`unshared`], for the follow of `branch` of `url` at `path`.

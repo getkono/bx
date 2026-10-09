@@ -6,9 +6,10 @@
 //!
 //! * a followed external `bx.lock` holds no commit for, or holds one for
 //!   another url or branch than the one declared: `apply` leaves it as it is
-//!   until `bx update` locks it, or, for a follow `local.toml` alone declares
-//!   or points elsewhere, which `bx update` never locks, until a committed
-//!   layer declares it or a `rev` pins it;
+//!   until `bx update` locks it, or, for a follow `local.toml` alone declares,
+//!   which `bx update` never locks, until a committed layer declares it or a
+//!   `rev` pins it, and for one `local.toml` points elsewhere than the
+//!   committed layers, until a `rev` pins it;
 //! * an entry in `bx.lock` for a path no `[[external]]` follows any more,
 //!   which the next `bx update` drops;
 //! * an update stamp that holds no time, so an interactive shell never asks
@@ -221,8 +222,19 @@ mod tests {
         let findings = check(&externals, Some(&committed), &lock, home.path(), &state);
         let subjects: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
         assert_eq!(subjects, ["~/stale", "~/new"]);
+        let elsewhere = "the committed configuration follows here, not this one; pin it with `rev`";
+        assert!(
+            findings[0].note.ends_with(elsewhere),
+            "{}",
+            findings[0].note
+        );
+        assert!(
+            !findings[0].note.contains("committed layer"),
+            "{}",
+            findings[0].note
+        );
+        assert!(findings[1].note.ends_with(remedy), "{}", findings[1].note);
         for finding in &findings {
-            assert!(finding.note.ends_with(remedy), "{}", finding.note);
             assert!(!finding.note.contains("locks one"), "{}", finding.note);
         }
     }

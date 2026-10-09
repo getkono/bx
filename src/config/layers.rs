@@ -10,10 +10,10 @@
 //! repo is a git working tree that is meant to be published, and a file inside
 //! one can be committed by accident; the state directory is not a working tree
 //! and never becomes one. So `local.toml` lives in the state directory, and a
-//! `local.toml` found inside the config repo is **never loaded**. No command
-//! reports one yet: `stray_local`, which finds it, has only its tests. A state
-//! directory that is itself inside the repo is refused outright, rather than
-//! loading its `local.toml` or silently dropping it.
+//! `local.toml` found inside the config repo is **never loaded**; `bx doctor`
+//! reports one, through [`stray_local`], with the move that makes it count. A
+//! state directory that is itself inside the repo is refused outright, rather
+//! than loading its `local.toml` or silently dropping it.
 //!
 //! # Why the local layer is a full layer
 //!
@@ -87,8 +87,8 @@ use crate::paths::{self, LOCAL_FILE, local_layer_path};
 ///
 /// Any `local.toml` **inside the repo** is filtered out here, wherever it sits.
 /// Loading one would merge account content out of a publishable git tree, which
-/// is the hole Invariant 5 exists to close. It is skipped without a word:
-/// `stray_local` finds one, but no command reports it yet.
+/// is the hole Invariant 5 exists to close. It is skipped here, and `bx doctor`
+/// reports it through [`stray_local`].
 ///
 /// That includes the local layer itself. A state directory inside the repo —
 /// `XDG_STATE_HOME` equal to `XDG_CONFIG_HOME` makes it the repo — is
@@ -379,7 +379,6 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
 /// # Errors
 ///
 /// [`Error::Io`] naming the path that could not be examined.
-#[cfg(test)]
 pub fn stray_local(repo: &Path) -> Result<Option<PathBuf>, Error> {
     if !super::examine_root(repo)?.is_some_and(|meta| meta.is_dir()) {
         return Ok(None);

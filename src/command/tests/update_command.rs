@@ -316,6 +316,15 @@ fn an_external_one_account_switches_off_keeps_its_shared_lock_entry() {
         "{}",
         text(&out)
     );
+    let said = "~/.local/share/other: this account follows `mine` of \
+                https://example.invalid/upstream, and the committed configuration another \
+                branch or url; the shared bx.lock keeps the committed one's, so this is not \
+                locked";
+    assert!(
+        text(&out).lines().any(|line| line == said),
+        "{}",
+        text(&out)
+    );
     let kept = lock();
     let shared = kept
         .iter()
@@ -347,6 +356,16 @@ fn an_external_only_local_toml_follows_is_never_locked_in_the_shared_lock() {
             "~/.local/share/mine: this account follows `master` of \
              https://example.invalid/upstream, and the committed configuration does not follow it"
         ),
+        "{}",
+        text(&out)
+    );
+    let said = "~/.local/share/mine: this account follows `master` of \
+                https://example.invalid/upstream, and the committed configuration does not \
+                follow it; the shared bx.lock holds only what the committed configuration \
+                follows. Declare it in a committed layer, or pin it with `rev`, so this is \
+                not locked";
+    assert!(
+        text(&out).lines().any(|line| line == said),
         "{}",
         text(&out)
     );
@@ -520,6 +539,105 @@ fn a_background_check_looks_at_auto_externals_only_and_never_twice_at_once() {
         due <= update::now() + 24 * 60 * 60,
         "its own interval: {due}"
     );
+}
+
+/// One day, in seconds.
+const DAY: u64 = 24 * 60 * 60;
+
+#[test]
+fn a_foreground_check_starts_a_new_ask_interval() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    std::fs::write(stamps.ask_due(), "1\n").expect("due long ago");
+
+    let before = update::now();
+    update::check(
+        &env(home.path()),
+        &[],
+        false,
+        &git(home.path()),
+        &mut Vec::new(),
+    )
+    .expect("check");
+    let after = update::now();
+    let due = Stamps::read(&stamps.ask_due()).expect("ask-due");
+    assert!(
+        (before + 7 * DAY..=after + 7 * DAY).contains(&due),
+        "the default interval from now: {due}"
+    );
+    assert!(!stamps.check_due().exists(), "nothing checks on its own");
+}
+
+#[test]
+fn a_background_check_sets_check_due_to_the_auto_interval_exactly() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(
+        &home,
+        &layer().replace(
+            "branch = \"master\"\n",
+            "branch = \"master\"\ncheck = \"auto\"\ninterval = \"1d\"\n",
+        ),
+    );
+    update(&home, true, &mut Vec::new()).expect("update");
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+
+    let before = update::now();
+    update::check(
+        &env(home.path()),
+        &[],
+        true,
+        &git(home.path()),
+        &mut Vec::new(),
+    )
+    .expect("background");
+    let after = update::now();
+    let due = Stamps::read(&stamps.check_due()).expect("check-due");
+    assert!(
+        (before + DAY..=after + DAY).contains(&due),
+        "the external's own interval, not the hour a failure waits: {due}"
+    );
+}
+
+#[test]
+fn an_apply_leaves_an_existing_ask_due_and_check_due_alone() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let auto = format!(
+        "[[external]]\npath = \"~/.local/share/other\"\nurl = \"{URL}\"\nbranch = \"master\"\n\
+         check = \"auto\"\n"
+    );
+    cloned(&home, &format!("{}{auto}", layer()));
+    update(&home, true, &mut Vec::new()).expect("update");
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    std::fs::write(stamps.ask_due(), "5\n").expect("ask-due");
+    std::fs::write(stamps.check_due(), "6\n").expect("check-due");
+    std::fs::remove_file(home.child(".claude/skills/a")).expect("one write to make");
+
+    apply(&env(home.path()), true, &mut Vec::new()).expect("apply");
+    assert!(home.child(".claude/skills/a").exists(), "the apply wrote");
+    assert_eq!(
+        std::fs::read_to_string(stamps.ask_due()).expect("ask-due"),
+        "5\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(stamps.check_due()).expect("check-due"),
+        "6\n"
+    );
+}
+
+#[test]
+fn a_check_with_nothing_followed_says_so_and_converges() {
+    let home = guarded_home();
+    crate::plan::tests::seed(home.path(), "");
+    let mut out = Vec::new();
+    let exit =
+        update::check(&env(home.path()), &[], false, &git(home.path()), &mut out).expect("check");
+    assert_eq!(exit, Exit::Converged);
+    assert_eq!(text(&out), "No [[external]] follows a branch.\n");
 }
 
 #[test]

@@ -670,6 +670,48 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         }
     }
 
+    proptest::proptest! {
+        #[test]
+        fn a_version_round_trips_through_its_tag_and_orders_as_its_triple(
+            a in (0..u64::MAX, 0..u64::MAX, 0..u64::MAX),
+            b in (0..4u64, 0..4u64, 0..4u64),
+        ) {
+            let version = |(major, minor, patch)| Version { major, minor, patch };
+            let tag = version(a).to_string();
+            proptest::prop_assert_eq!(&tag, &format!("v{}.{}.{}", a.0, a.1, a.2));
+            proptest::prop_assert_eq!(Version::parse(&tag).ok(), Some(version(a)));
+            proptest::prop_assert_eq!(Version::parse(&tag[1..]).ok(), Some(version(a)));
+            // Small triples, so equal parts and every ordering turn up.
+            proptest::prop_assert_eq!(version(b).cmp(&version(a)), b.cmp(&a));
+            let small = (a.0 % 4, a.1 % 4, a.2 % 4);
+            proptest::prop_assert_eq!(version(b).cmp(&version(small)), b.cmp(&small));
+        }
+    }
+
+    #[test]
+    fn a_childs_stderr_is_its_trimmed_text_after_a_colon_or_nothing() {
+        assert_eq!(stderr_suffix(b""), "");
+        assert_eq!(stderr_suffix(b"  \n\t"), "");
+        assert_eq!(stderr_suffix(b"\n404 https://x\n "), ": 404 https://x");
+        assert_eq!(stderr_suffix(b"a\nb\n"), ": a\nb");
+        assert_eq!(stderr_suffix(b"bad \xff byte"), ": bad \u{fffd} byte");
+    }
+
+    #[test]
+    fn an_unparseable_current_version_is_refused_before_any_request() {
+        let served = Served::new(INSTALL_SH, "v0.2.0");
+        for request in [CHECK, UPGRADE, FORCE] {
+            let (result, out) = served.run(request, "0.2.0-dev");
+            assert!(
+                matches!(&result, Err(Error::Version(t)) if t == "0.2.0-dev"),
+                "{result:?}"
+            );
+            assert_eq!(out, "");
+        }
+        assert_eq!(served.requests(), "", "nothing was fetched");
+        assert_eq!(served.installed(), None);
+    }
+
     #[test]
     fn check_reports_a_newer_release_as_pending_and_installs_nothing() {
         let served = Served::new(INSTALL_SH, "v0.2.0");

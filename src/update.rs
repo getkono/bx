@@ -447,13 +447,35 @@ pub fn followed(path: &Portable, externals: &[External]) -> bool {
 /// `bx.lock` does not take.
 #[must_use]
 pub fn unshared(found: &Found, committed: Option<&[External]>) -> bool {
+    unshared_at(&found.path, &found.url, &found.branch, committed)
+}
+
+/// What `bx update` cannot do for `external`'s follow, which `local.toml`
+/// alone declares or points elsewhere ([`unshared`]): the remedy that locks
+/// it instead, or `None` for a follow `bx update` does lock, and for a pin.
+#[must_use]
+pub fn unshared_remedy(
+    external: &External,
+    committed: Option<&[External]>,
+) -> Option<&'static str> {
+    external
+        .follows()
+        .filter(|follow| unshared_at(&external.path, &external.url, &follow.branch, committed))
+        .map(|_| {
+            "`bx update` locks only what the committed configuration follows; declare it in a \
+             committed layer, or pin it with `rev`"
+        })
+}
+
+/// [`unshared`], for the follow of `branch` of `url` at `path`.
+fn unshared_at(path: &Portable, url: &str, branch: &str, committed: Option<&[External]>) -> bool {
     committed.is_some_and(|committed| {
         !committed.iter().any(|external| {
-            external.path == found.path
-                && external.url == found.url
+            external.path == *path
+                && external.url == url
                 && external
                     .follows()
-                    .is_some_and(|follow| follow.branch == found.branch)
+                    .is_some_and(|follow| follow.branch == branch)
         })
     })
 }

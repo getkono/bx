@@ -45,9 +45,9 @@ path = "src/main.rs"
 unsafe_code = "forbid"
 
 [dependencies]
-# CLI surface + dynamic completions (values come from `bx __complete`).
+# CLI surface. Shell completions are planned: `clap_complete` comes back with
+# the body of the hidden `bx __complete`, which is a stub today.
 clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
-clap_complete = "4.6.9"
 # Interactive prompts for `init` and every confirmation. There is no TUI.
 inquire = "0.9.4"
 # Rendering: diffs for `plan`, colour, progress.

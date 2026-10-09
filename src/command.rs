@@ -288,6 +288,14 @@ pub fn sync(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, sync::Err
     sync_with(env, yes, out, &Git::new(env), &mut confirm)
 }
 
+/// The line `sync` and `update` say after a pull that moved the branch.
+fn fast_forwarded(pulled: &sync::Pulled) -> String {
+    format!(
+        "Fast-forwarded {} by {} commit(s) from {}.",
+        pulled.branch, pulled.fast_forwarded, pulled.upstream.short
+    )
+}
+
 /// [`sync`], through `git`, with the question asked through `ask`.
 fn sync_with(
     env: &Env,
@@ -298,12 +306,7 @@ fn sync_with(
 ) -> Result<Exit, sync::Error> {
     let pulled = sync::pull(env, git)?;
     if pulled.fast_forwarded > 0 {
-        writeln!(
-            out,
-            "Fast-forwarded {} by {} commit(s) from {}.",
-            pulled.branch, pulled.fast_forwarded, pulled.upstream.short
-        )
-        .map_err(sync::Error::Output)?;
+        writeln!(out, "{}", fast_forwarded(&pulled)).map_err(sync::Error::Output)?;
     }
     if pulled.recovered > 0 {
         writeln!(
@@ -499,13 +502,7 @@ fn update_with(
         other => other,
     };
     match pulled {
-        Ok(pulled) if pulled.fast_forwarded > 0 => say(
-            out,
-            &format!(
-                "Fast-forwarded {} by {} commit(s) from {}.",
-                pulled.branch, pulled.fast_forwarded, pulled.upstream.short
-            ),
-        )?,
+        Ok(pulled) if pulled.fast_forwarded > 0 => say(out, &fast_forwarded(&pulled))?,
         Ok(_) => {}
         Err(sync::Error::NoUpstream { branch, .. }) => say(
             out,

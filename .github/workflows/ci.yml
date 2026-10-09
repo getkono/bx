@@ -269,7 +269,7 @@ jobs:
           path: lcov.info
 
   mutants:
-    name: Mutation testing (diff, shard ${{ matrix.shard }}/4)
+    name: Mutation testing (diff, shard ${{ matrix.shard }}/12)
     runs-on: ubuntu-latest
     # The whole crate is thousands of mutants, far past any CI budget, so a
     # pull request is held only to the mutants its own diff introduces: new
@@ -278,13 +278,13 @@ jobs:
     if: github.event_name == 'pull_request'
     # Each mutant is a build and a full test run, about a minute, so one runner
     # gets through some fifty in the hour below. The diff's mutants are dealt
-    # round-robin across four runners, each with its own baseline, which keeps
-    # a diff of some two hundred mutants inside the cap. Every shard reports
+    # round-robin across twelve runners, each with its own baseline, which keeps
+    # a diff of some six hundred mutants inside the cap. Every shard reports
     # on its own, so one failing does not cancel the others' evidence.
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     # A wall-clock cap: a diff too large to mutate in an hour fails here rather
     # than holding a runner for the default six.
     timeout-minutes: 60
@@ -338,7 +338,7 @@ jobs:
       - name: Mutants
         run: >-
           mise run mutants --in-diff pr.diff
-          --shard ${{ matrix.shard }}/4 --sharding round-robin
+          --shard ${{ matrix.shard }}/12 --sharding round-robin
       - name: Upload mutants.out
         if: always()
         uses: actions/upload-artifact@v4

@@ -1090,6 +1090,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_carried_copy_the_user_edited_is_not_committed() {
+        let home = guarded_home();
+        let repo = cloned(
+            &home,
+            "[[target]]\npath = \"~/.lock\"\nfile = \"lock\"\ndirection = \"track\"\n",
+        );
+        std::fs::write(repo.join("lock"), "a\n").expect("the repo copy");
+        commit_all(home.path(), &repo, "track");
+        home.write(".lock", "a\n");
+        let sync = |what: &str| {
+            let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+            crate::plan::run(&inputs, crate::plan::Mode::Sync, &mut |_| Ok(true)).expect(what);
+        };
+        sync("the agreeing run");
+        home.write(".lock", "b\n");
+        sync("the carrying run");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("lock")).expect("carried"),
+            "b\n"
+        );
+        // The user edits the copy bx carried before it is committed.
+        std::fs::write(repo.join("lock"), "mine\n").expect("an edit");
+        let head = rev(home.path(), &repo, "HEAD");
+
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("nothing to commit");
+
+        assert_eq!(committed, 0);
+        assert_eq!(rev(home.path(), &repo, "HEAD"), head, "no commit made");
+        assert_eq!(
+            run(home.path(), &repo, &["status", "--porcelain"]),
+            "M lock",
+            "the edit is the user's, left unstaged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("lock")).expect("kept"),
+            "mine\n"
+        );
+    }
+
+    #[test]
     fn names_near_a_state_file_are_not_state_files() {
         let home = guarded_home();
         let names = StateNames::of(&StateDir::resolve(home.path()));

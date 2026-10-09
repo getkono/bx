@@ -11,18 +11,11 @@
 //!
 //! # Git is the user's own `git`
 //!
-//! Every git operation runs the `git` on `PATH`, in the config repo, never a
-//! library of bx's own. `sync` fetches and pushes over whatever transport,
-//! credential helper, ssh agent and configuration the user's clone already
-//! uses, and a config repo that git can clone is one git can sync. Nothing
-//! here is on the shell-startup path, so spawning a process costs nothing that
-//! Invariant 6 budgets.
-//!
-//! The child sees the same `HOME` and `XDG_CONFIG_HOME` bx resolved its own
-//! paths from, so git reads the configuration of the account bx is serving,
-//! and none of the variables that would point git at a *different* repository
-//! (`GIT_DIR`, `GIT_WORK_TREE`, …) — a `bx sync` run from inside a git hook
-//! must still sync the config repo, not the repository whose hook it is.
+//! Every git operation runs the `git` on `PATH`, in the config repo, through
+//! [`crate::git`], whose documentation says what the child sees. `sync`
+//! fetches and pushes over whatever transport, credential helper, ssh agent
+//! and configuration the user's clone already uses, so a config repo that git
+//! can clone is one git can sync.
 //!
 //! # Fast-forward only
 //!

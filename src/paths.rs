@@ -272,7 +272,7 @@ pub fn home() -> Result<PathBuf, Error> {
 /// `".config"`, `".local/state"`, `".local/share"`, `".cache"`.
 ///
 /// Taking the environment as an argument rather than reading it is what lets the
-/// state directory (entry A4) reuse this function instead of adding a second
+/// state directory ([`state_dir`]) reuse this function instead of adding a second
 /// mechanism that could drift from this one.
 #[must_use]
 pub fn xdg_base(explicit: Option<&OsStr>, home: &Path, fallback_rel: &str) -> PathBuf {
@@ -326,8 +326,9 @@ pub fn systemd_user_dir_in(home: &Path, xdg_config_home: Option<&OsStr>) -> Path
 
 /// A path as the config repo stores it: `~`-rooted, or absolute.
 ///
-/// The natural key of a [`crate::config::target::Target`], and the key entry
-/// A4's ledger and entry A6's journal are written against — which is why it
+/// The natural key of a [`crate::config::target::Target`], and the key the
+/// ledger ([`crate::state`]) and the journal ([`crate::journal`]) are written
+/// against — which is why it
 /// derives `Ord`, `Hash` and serde here rather than being newtyped again in
 /// each of them.
 ///
@@ -344,7 +345,7 @@ pub fn systemd_user_dir_in(home: &Path, xdg_config_home: Option<&OsStr>) -> Path
 /// depend on that and neither is optional:
 ///
 /// * Its `Ord` and `Hash` are over the stored string, and it is the key of a
-///   target, of entry A4's ledger and of entry A6's journal. Without
+///   target, of the ledger and of the journal. Without
 ///   normalisation `~/.ssh/config` and `~/.ssh/./config` are two keys for one
 ///   file, so one file acquires two ledger rows and Invariant 4 fails at the key
 ///   rather than at the writer.
@@ -357,7 +358,7 @@ pub fn systemd_user_dir_in(home: &Path, xdg_config_home: Option<&OsStr>) -> Path
 ///
 /// A derived `Deserialize` would take the inner string verbatim, so
 /// [`Portable::parse_in`] and [`Portable::from_path`] would not in fact be the
-/// only constructors: entry A4's ledger and entry A6's journal are `rmp-serde`
+/// only constructors: the ledger and the journal are `rmp-serde`
 /// documents, and a truncated, restored or hand-edited one would decode
 /// `~/../../etc/passwd` — the value named above as the one that must never
 /// exist — or a `~other/…` that renders to a *relative* path, so `bx rm` would
@@ -492,7 +493,7 @@ impl Portable {
     /// with `/var/home/u`, so it is not refused and not folded to `~/.gitconfig`.
     /// A layer set saying `~/.gitconfig` in one place and `/home/u/.gitconfig` in
     /// another therefore carries two keys for one file, and `check_unique` and
-    /// entry A3's merge see two targets. The same holds for a home reached through
+    /// [`crate::config::merge`] see two targets. The same holds for a home reached through
     /// any other symlink or bind mount.
     ///
     /// That limit is deliberate. Resolving it would make this function read the
@@ -536,7 +537,7 @@ impl Portable {
     /// home is `/var/home/example` it is a second key for `~/.gitconfig` — one
     /// file with two ledger rows, which is Invariant 4 failing at the key.
     ///
-    /// **For entry A4 and entry A6**: call this on every key you load from a
+    /// **For the ledger and the journal**: call this on every key you load from a
     /// stored document, against the home the document was written under. A key
     /// that fails it is a corrupt document, to be degraded to recomputation
     /// rather than believed.

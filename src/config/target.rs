@@ -358,7 +358,9 @@ pub struct Activated {
 /// but `env` holds an environment assignment (Invariant 2): the `options`
 /// phase assigns only zsh's own unexported history parameters, which
 /// [`super::history`]'s tests hold it to, and the `functions` phase assigns
-/// only zsh's hook arrays, which no process inherits.
+/// only zsh's hook arrays, the update prompt's unexported `BX_` names and, in
+/// bash's file, an append to an unexported `PROMPT_COMMAND`, none of which
+/// a process inherits, as [`crate::env_guard`]'s non-fragment files say.
 ///
 /// The fields are private so that every value holds at most one terminal
 /// claimant: [`Interactive::with_plugins`] refuses a second, which is what

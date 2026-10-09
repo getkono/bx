@@ -283,6 +283,11 @@ pub fn select<'a>(
 /// first; when that fails — a force-push took it from the remote — or there
 /// is no checkout to ask, nothing can show it, and the verdict is
 /// [`Verdict::Unproven`] or [`Verdict::Rewritten`], never a lock.
+///
+/// # Panics
+///
+/// When `external` follows no branch: only a followed external is looked at,
+/// and every caller selects those first.
 #[must_use]
 pub fn look(
     git: &Git,
@@ -877,7 +882,9 @@ pub fn now() -> Epoch {
 ///
 /// # Errors
 ///
-/// As [`crate::plan::Inputs::load`], [`select`] and [`Stamps::set`].
+/// As [`crate::plan::Inputs::load`], [`select`] and [`Stamps::set`], and,
+/// for a foreground check, [`Error::Busy`] when another check or `bx update`
+/// still holds `update/check.lock` after [`HOLD_WAIT`].
 pub fn check(
     env: &crate::env::Env,
     names: &[String],
@@ -1028,7 +1035,8 @@ pub fn snooze(
     snooze_waiting(env, SNOOZE_WAIT, out)
 }
 
-/// [`snooze`], waiting at most `wait` for a running check to let go.
+/// [`snooze`], waiting at most `wait` for a running check to let go, and
+/// carrying on without the lock once that wait runs out.
 pub(crate) fn snooze_waiting(
     env: &crate::env::Env,
     wait: Duration,

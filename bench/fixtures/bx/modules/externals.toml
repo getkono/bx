@@ -3,8 +3,9 @@
 #
 # To follow a branch instead, write `branch = "master"` in place of `rev`:
 # `bx update` then locks its newest commit in bx.lock, beside bx.toml, and an
-# interactive zsh asks once a week whether to look for more. A link puts the
-# checkout's children where a tool looks for them:
+# interactive zsh or bash asks, once each `[update] interval` (7d unless
+# bx.toml sets one), whether to look for more. A link puts the checkout's
+# children where a tool looks for them:
 #
 #   [[external.link]]
 #   from    = "skills/*"

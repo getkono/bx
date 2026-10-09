@@ -61,16 +61,16 @@
 //! cannot be examined is an [`Error::Io`] naming it. It is not on the
 //! shell-start path, so Invariant 6 is untouched, and Invariant 3 is unchanged:
 //! the answer depends on the filesystem, as the layer list already did, not on
-//! the time or the order of anything. The `local.toml` writer entry A8 adds may
-//! take a clean answer from [`layer_paths`] as the state directory being
-//! outside the repo at the moment it was checked.
+//! the time or the order of anything. The `local.toml` writer, `bx init`'s
+//! ([`crate::init`]), may take a clean answer from [`layer_paths`] as the state
+//! directory being outside the repo at the moment it was checked.
 //!
 //! # Nothing here reads the environment
 //!
 //! [`paths::state_dir`] takes both the home and the `XDG_STATE_HOME` override as
 //! arguments. A resolution path that read the environment would make the merge
 //! impure and Invariant 3 unprovable, and the state directory has to be the same
-//! one entry A4's ledger picks — two resolvers that disagreed would put the
+//! one the ledger ([`crate::state`]) picks — two resolvers that disagreed would put the
 //! ledger and the local layer in different directories.
 
 use std::ffi::OsStr;
@@ -366,7 +366,9 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
 /// loaded; `bx doctor` reports it and names the move to the state directory.
 ///
 /// Both the repo root and `modules/` are checked, because either would be
-/// picked up by a `git add .`.
+/// picked up by a `git add .`. The answer is the first of the two that holds
+/// one: when the root does, it is returned and `modules/` is not examined, so
+/// a second stray there is reported only once the first has moved.
 ///
 /// Each place is examined the way [`super::layer_files`] examines it, so the two
 /// agree about what is there: a repo root that is absent, lies beneath a

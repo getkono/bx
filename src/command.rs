@@ -416,7 +416,13 @@ impl UpdateMode {
 ///
 /// [`update::Error`] for a refused pull, an edited `bx.lock`, a name that is
 /// not a followed external, a lock that cannot be written or committed, and
-/// as [`apply`].
+/// as [`apply`]; besides those, for [`UpdateMode::Update`]:
+/// [`Error::NeedsConfirmation`] without `yes` and a terminal,
+/// [`Error::RepoMissing`] with no config repo, [`update::Error::Busy`] while
+/// another `bx update` or check holds the stamps, [`update::Error::Rebasing`]
+/// while a rebase or `git am` stands open in the config repo, and
+/// [`update::Error::LockDiverged`] when this machine's unpushed lock commits
+/// and the upstream both changed `bx.lock`.
 pub fn update(
     env: &Env,
     names: &[String],

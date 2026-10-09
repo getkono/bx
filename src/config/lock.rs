@@ -30,6 +30,12 @@
 //! guess. An entry for a path no external follows any more is left alone by
 //! `apply` and dropped by the next `bx update`.
 //!
+//! `bx update` locks only a follow the committed layers declare, since the
+//! file is shared by every account: one that `local.toml` alone declares, or
+//! points at another url or branch than they do, is never locked. It stays
+//! blocked until a `rev` pins it or, for one `local.toml` alone declares, a
+//! committed layer declares it ([`crate::update`]).
+//!
 //! The file is TOML rather than MessagePack, the format of bx's other
 //! machine-written files, because it is committed: a lock is reviewed in a
 //! diff before it is pushed. A file that does not parse is a load error naming

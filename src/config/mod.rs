@@ -3,14 +3,14 @@
 //! A config repo is a set of **layers**. `bx.toml` is the first, `modules/*.toml`
 //! follow in lexicographic filename order, and the account's `local.toml` in the
 //! state directory is last. This module discovers and parses them. It does not
-//! merge them, resolve a value, or substitute anything: that is entry A3's, and
-//! keeping the two apart is what lets a merge be a pure function of the layer
-//! files.
+//! merge them, resolve a value, or substitute anything: that is [`merge`]'s
+//! and [`resolve`]'s, and keeping the two apart is what lets a merge be a pure
+//! function of the layer files.
 //!
 //! Documents are read through `toml_edit`'s DOM and never through `serde`.
 //! `serde` deserialisation discards the spans [`Origin`] is built from, and the
-//! DOM is also what will let a future `bx add` edit a hand-written file without
-//! reflowing a byte the user wrote.
+//! DOM is also what lets `bx add` ([`crate::adopt`]) edit a hand-written file
+//! without reflowing a byte the user wrote.
 //!
 //! # Unknown keys are errors
 //!
@@ -732,7 +732,7 @@ fn section_origin(root: &Table, name: &str, file: &Path, text: &str) -> Origin {
 
 /// Reject a natural key that appears twice in one layer.
 ///
-/// Replacing an entry in place across layers is entry A3's merge rule. Twice in
+/// Replacing an entry in place across layers is [`merge`]'s rule. Twice in
 /// one file is a typo, and silently keeping one of them is how a config stops
 /// meaning what it says.
 ///
@@ -1172,7 +1172,7 @@ mod tests {
         // `Ctx::new` asks `toml_edit` for the entry header's span, and a table
         // nothing parsed has none. Line 0 says "this file, position unknown"
         // rather than pretending it is line 1 -- and rather than panicking on
-        // an `expect`, which is what a caller like entry A3 would hit.
+        // an `expect`, which is what a caller like `merge` would hit.
         let file = Path::new("bx.toml");
         let target = target::parse_target(&in_memory_target(&[]), file, "", home()).unwrap();
 
@@ -1804,8 +1804,8 @@ mod tests {
     /// `parse_str` or `parse_target` directly and never reach the loader. So the
     /// home threads through five call sites and the first two — `load_layers`
     /// into `load_layer`, `load_layer` into `parse_str` — were unpinned, and
-    /// `load_layers` is the function entry A3's merge and every later entry read
-    /// a config repo through.
+    /// `load_layers` is the function `merge` and every other reader of a
+    /// config repo reads it through.
     ///
     /// An **absolutely** spelled target path is the discriminating input: it is
     /// admissible under one home and refused under another, so the error can

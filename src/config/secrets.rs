@@ -28,8 +28,9 @@
 //! [`super::merge`] refuses the misplaced one, as it refuses a committed
 //! `[values]` table.
 //!
-//! Recipients are parsed and checked, and nothing more: adding, removing and
-//! rotating them is a later entry's.
+//! Recipients are parsed and checked, and nothing more: nothing under
+//! `bx secret` writes, so adding, removing and rotating them is a hand edit of
+//! the `recipients` list.
 
 use std::path::Path;
 

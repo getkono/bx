@@ -1,7 +1,8 @@
 //! Declared git externals: one decision per `[[external]]`, and the work it
 //! announces.
 //!
-//! An external is a repository bx keeps checked out at one pinned commit. Its
+//! An external is a repository bx keeps checked out at one commit, pinned by
+//! `rev` or locked in `bx.lock`. Its
 //! configuration half is [`crate::config::external`]; this is the half that
 //! looks at the machine and moves it.
 //!

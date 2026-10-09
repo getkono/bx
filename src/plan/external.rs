@@ -45,7 +45,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{Change, Diff, Error};
-use crate::config::external::External;
+use crate::config::external::{External, Pin};
+use crate::config::lock::{self, Lock, Lookup};
 use crate::fs::{self, Kind};
 use crate::git::{self, Git};
 use crate::journal;
@@ -65,6 +66,8 @@ pub(super) struct Ctx<'a> {
     pub home: &'a Path,
     /// The `git` every question is put to.
     pub git: &'a Git,
+    /// The commits followed externals are kept at.
+    pub lock: &'a Lock,
 }
 
 /// The work one decision announced. Only this module can make one.
@@ -116,7 +119,20 @@ pub(super) fn decide_all(
     let mut rows = Vec::with_capacity(externals.len());
     let mut ops = Vec::new();
     for (at, external) in externals.iter().enumerate() {
-        let (change, work) = decide(external, ctx)?;
+        let rev = match rev(external, ctx.lock) {
+            Ok(rev) => rev,
+            Err(note) => {
+                rows.push(Change {
+                    target: external.path.as_str().to_string(),
+                    origin: external.origin.clone(),
+                    action: Action::Blocked,
+                    diff: None,
+                    note: Some(note),
+                });
+                continue;
+            }
+        };
+        let (change, work) = decide(external, rev, ctx)?;
         rows.push(change);
         if let Some(work) = work {
             ops.push(Op {
@@ -124,7 +140,7 @@ pub(super) fn decide_all(
                 target: external.path.clone(),
                 dest: external.path.render(ctx.home),
                 url: external.url.clone(),
-                rev: external.rev.clone(),
+                rev: rev.to_string(),
                 work,
             });
         }
@@ -132,11 +148,43 @@ pub(super) fn decide_all(
     Ok((rows, ops))
 }
 
-/// Decide one external: its row, and the work `apply` does for it.
-fn decide(external: &External, ctx: &Ctx<'_>) -> Decision {
+/// The commit `external` is kept at: its `rev`, or what `lock` holds for the
+/// branch it follows.
+///
+/// # Errors
+///
+/// The note for a blocked row, when a followed external has no commit locked
+/// for the url and branch it declares. Nothing is guessed: `plan` and `apply`
+/// never ask a remote where a branch is, so only `bx update` can say.
+pub(crate) fn rev<'a>(external: &'a External, lock: &'a Lock) -> Result<&'a str, String> {
+    let follow = match &external.pin {
+        Pin::Rev(rev) => return Ok(rev),
+        Pin::Follow(follow) => follow,
+    };
+    match lock.lookup(external) {
+        Lookup::Locked(rev) => Ok(rev),
+        Lookup::Missing => Err(format!(
+            "follows `{}`, and {} holds no commit for it yet; `bx update` locks one",
+            follow.branch,
+            lock::FILE
+        )),
+        Lookup::Stale(locked) => Err(format!(
+            "follows `{}` of {}, and {} locks it for `{}` of {}; `bx update` locks it again",
+            follow.branch,
+            external.url,
+            lock::FILE,
+            locked.branch,
+            locked.url
+        )),
+    }
+}
+
+/// Decide one external kept at `rev`: its row, and the work `apply` does for
+/// it.
+fn decide(external: &External, rev: &str, ctx: &Ctx<'_>) -> Decision {
     let dest = external.path.render(ctx.home);
     let observed = fs::observe(&dest)?;
-    let (url, rev) = (external.url.as_str(), external.rev.as_str());
+    let url = external.url.as_str();
     let row = |action, diff, note: Option<String>| Change {
         target: external.path.as_str().to_string(),
         origin: external.origin.clone(),
@@ -221,7 +269,9 @@ fn decide(external: &External, ctx: &Ctx<'_>) -> Decision {
                  directory it did not create"
                     .to_string(),
             ),
-            Some(entry) => decide_checkout(external, entry, &dest, ctx, &row, &blocked, &conflict),
+            Some(entry) => {
+                decide_checkout((url, rev), entry, &dest, ctx, &row, &blocked, &conflict)
+            }
         },
         kind => conflict(if entry.is_some() {
             format!("is {kind}, not the checkout bx cloned")
@@ -236,7 +286,7 @@ type Decision = Result<(Change, Option<Work>), Error>;
 
 /// [`decide`] for a checkout bx cloned and finished.
 fn decide_checkout(
-    external: &External,
+    (url, rev): (&str, &str),
     entry: &LedgerEntry,
     dest: &Path,
     ctx: &Ctx<'_>,
@@ -244,7 +294,7 @@ fn decide_checkout(
     blocked: &dyn Fn(String) -> Decision,
     conflict: &dyn Fn(String) -> Decision,
 ) -> Decision {
-    let (git, url, rev) = (ctx.git, external.url.as_str(), external.rev.as_str());
+    let git = ctx.git;
     if let Err(note) = own_checkout(git, dest) {
         return conflict(note);
     }
@@ -678,6 +728,7 @@ pub(crate) fn problem(error: &git::Error) -> String {
                 format!("`git {args}` failed: {}", stderr.replace('\n', "; "))
             }
         }
+        other @ git::Error::TimedOut { .. } => other.to_string(),
     }
 }
 
@@ -706,8 +757,27 @@ pub(crate) fn head(git: &Git, dest: &Path) -> Result<String, git::Error> {
     git.query(dest, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
 }
 
+/// Whether the ledger records `path` as a clone bx made and finished: the one
+/// kind of directory bx fetches into, or reads an external's children from.
+#[must_use]
+pub(crate) fn finished_clone(ledger: &LedgerView, path: &Portable) -> bool {
+    ledger.get(path).is_some_and(|entry| {
+        entry.mechanism == Mechanism::Clone && entry.written != clone_written(None)
+    })
+}
+
+/// Whether the ledger records `path` as a clone of bx's, finished or not: a
+/// directory an apply clones into, or clones again, rather than someone
+/// else's.
+#[must_use]
+pub(crate) fn bx_clone(ledger: &LedgerView, path: &Portable) -> bool {
+    ledger
+        .get(path)
+        .is_some_and(|entry| entry.mechanism == Mechanism::Clone)
+}
+
 /// The url of `origin`, or `None` when there is no such remote.
-fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, git::Error> {
+pub(crate) fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, git::Error> {
     match git.query(dest, &["config", "--get", "remote.origin.url"]) {
         Ok(url) => Ok(Some(url)),
         Err(git::Error::Failed { status, .. }) if status.code() == Some(1) => Ok(None),
@@ -722,13 +792,13 @@ fn dirty(git: &Git, dest: &Path) -> Result<bool, git::Error> {
 }
 
 /// Whether `rev` is a commit `dest` already holds.
-fn has_commit(git: &Git, dest: &Path, rev: &str) -> bool {
+pub(crate) fn has_commit(git: &Git, dest: &Path, rev: &str) -> bool {
     git.query(dest, &["cat-file", "-e", &format!("{rev}^{{commit}}")])
         .is_ok()
 }
 
 /// Whether `ancestor` is `descendant` or one of its ancestors.
-fn is_ancestor(
+pub(crate) fn is_ancestor(
     git: &Git,
     dest: &Path,
     ancestor: &str,
@@ -913,9 +983,17 @@ mod tests {
         .expect("rm")
     }
 
+    /// The one row that is not the interactive zsh file a followed external
+    /// places for its update prompt, or the `~/.zshrc` region sourcing it.
     fn only(report: &Report) -> &Change {
-        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
-        &report.changes[0]
+        let rows: Vec<&Change> = report.changes.iter().filter(|row| !shell(row)).collect();
+        assert_eq!(rows.len(), 1, "{:?}", report.changes);
+        rows[0]
+    }
+
+    /// Whether `row` is the generated interactive zsh file or its region.
+    fn shell(row: &Change) -> bool {
+        row.target == "~/.zshrc" || row.target.starts_with("~/.local/share/bx/")
     }
 
     #[test]
@@ -1262,6 +1340,50 @@ mod tests {
             super::super::exit(&applied, Mode::Apply),
             crate::report::Exit::Pending
         );
+    }
+
+    #[test]
+    fn only_a_finished_clone_is_one_bx_reads_or_fetches_into() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("the state directory");
+        let other = Portable::parse_in("~/other", home.path()).expect("a path");
+        let record = |path: &Portable, written, mechanism| {
+            let lock = ExclusiveLock::acquire(&state).expect("the lock");
+            let mut ledger = Ledger::open(&state, &lock, home.path())
+                .expect("open")
+                .value;
+            ledger
+                .record(NewEntry::new(
+                    path.clone(),
+                    written,
+                    fs::Mode::DEFAULT_DIR,
+                    mechanism,
+                    PriorBytes::Absent,
+                ))
+                .expect("record");
+            ledger.save().expect("save");
+        };
+        let view = || {
+            LedgerView::read(&state, home.path())
+                .expect("the ledger")
+                .value
+        };
+        assert!(!finished_clone(&view(), &target(&home)), "no entry");
+        assert!(!bx_clone(&view(), &target(&home)), "no entry");
+        record(&target(&home), clone_written(None), Mechanism::Clone);
+        assert!(!finished_clone(&view(), &target(&home)), "unfinished");
+        assert!(bx_clone(&view(), &target(&home)), "bx's, unfinished");
+        record(
+            &target(&home),
+            clone_written(Some(&"a".repeat(40))),
+            Mechanism::Clone,
+        );
+        assert!(finished_clone(&view(), &target(&home)));
+        assert!(bx_clone(&view(), &target(&home)));
+        record(&other, clone_written(Some(&"a".repeat(40))), Mechanism::Own);
+        assert!(!finished_clone(&view(), &other), "another kind of entry");
+        assert!(!bx_clone(&view(), &other), "another kind of entry");
     }
 
     #[test]
@@ -1834,5 +1956,441 @@ mod tests {
             .query(home.path(), &["rev-parse", "--verify", "no-such-ref"])
             .expect_err("no such ref");
         assert!(problem(&failed).starts_with("`git rev-parse --verify no-such-ref` failed"));
+    }
+
+    /// One `[[external]]` at [`AT`] from [`URL`], following `branch`.
+    fn followed(branch: &str) -> String {
+        format!("[[external]]\npath = \"~/{AT}\"\nurl = \"{URL}\"\nbranch = \"{branch}\"\n")
+    }
+
+    /// Write `bx.lock`, locking [`AT`] for `url` and `branch` at `rev`.
+    fn lock(home: &GuardedHome, url: &str, branch: &str, rev: &str) {
+        let mut lock = Lock::default();
+        lock.set(
+            target(home),
+            lock::Locked {
+                url: url.to_string(),
+                branch: branch.to_string(),
+                rev: rev.to_string(),
+            },
+        );
+        let repo = home.child(".config/bx");
+        std::fs::create_dir_all(&repo).expect("the config repo");
+        std::fs::write(Lock::path_in(&repo), lock.render()).expect("bx.lock");
+    }
+
+    #[test]
+    fn a_followed_external_is_kept_at_the_commit_bx_lock_holds() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        let layer = followed("master");
+
+        lock(&home, URL, "master", &up.first);
+        let row = only(&plan(&home, &layer)).clone();
+        assert_eq!(row.action, Action::Create, "{row:?}");
+        let note = row.note.expect("a note");
+        assert!(note.contains(&format!("at {}", up.first)), "{note}");
+        apply(&home, &layer);
+        assert_eq!(
+            checked_out(&home),
+            up.first,
+            "the locked commit, not the tip"
+        );
+        assert_eq!(only(&plan(&home, &layer)).action, Action::Unchanged);
+
+        lock(&home, URL, "master", &up.second);
+        assert_eq!(only(&plan(&home, &layer)).action, Action::Modify);
+        apply(&home, &layer);
+        assert_eq!(checked_out(&home), up.second);
+        assert_eq!(only(&plan(&home, &layer)).action, Action::Unchanged);
+    }
+
+    #[test]
+    fn a_followed_external_bx_lock_holds_nothing_for_is_blocked_on_bx_update() {
+        let home = guarded_home();
+        let up = upstream(&home);
+
+        let applied = apply(&home, &followed("master"));
+        let row = only(&applied);
+        assert_eq!(row.action, Action::Blocked);
+        let note = row.note.as_deref().expect("a note");
+        assert!(note.contains("follows `master`"), "{note}");
+        assert!(note.contains("bx.lock holds no commit"), "{note}");
+        assert!(note.contains("`bx update`"), "{note}");
+        assert!(!home.child(AT).exists(), "nothing is cloned on a guess");
+
+        for (url, branch) in [(URL, "side"), ("https://example.invalid/other", "master")] {
+            lock(&home, url, branch, &up.side);
+            let planned = plan(&home, &followed("master"));
+            let row = only(&planned);
+            assert_eq!(row.action, Action::Blocked, "{url} {branch}");
+            let note = row.note.as_deref().expect("a note");
+            assert!(
+                note.contains(&format!("locks it for `{branch}` of {url}")),
+                "{note}"
+            );
+        }
+    }
+
+    /// Commit `files` on the upstream's `master`, and return the commit.
+    fn commit_upstream(home: &GuardedHome, files: &[&str]) -> String {
+        let dir = home.child("upstream");
+        for file in files {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+            std::fs::write(path, "x\n").expect("a file");
+        }
+        commit_all(home.path(), &dir, "more");
+        git_run(home.path(), &dir, &["rev-parse", "HEAD"])
+    }
+
+    /// [`followed`], linking each child of `skills/` holding `SKILL.md` into
+    /// `~/.claude/skills`.
+    fn linking(branch: &str) -> String {
+        format!(
+            "{}[[external.link]]\nfrom = \"skills/*\"\nto = \"~/.claude/skills/*\"\n\
+             require = \"SKILL.md\"\n",
+            followed(branch)
+        )
+    }
+
+    /// Each row's target and action, in order.
+    fn rows(report: &Report) -> Vec<(String, Action)> {
+        report
+            .changes
+            .iter()
+            .filter(|row| !shell(row))
+            .map(|row| (row.target.clone(), row.action))
+            .collect()
+    }
+
+    /// The row for `target`.
+    fn row<'a>(report: &'a Report, target: &str) -> &'a Change {
+        report
+            .changes
+            .iter()
+            .find(|row| row.target == target)
+            .unwrap_or_else(|| panic!("no row for {target}: {:?}", rows(report)))
+    }
+
+    /// The targets of the rows `report` stopped short of.
+    fn stopped(report: &Report) -> Vec<&str> {
+        report
+            .stopped
+            .iter()
+            .map(|&at| report.changes[at].target.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_link_is_pending_until_its_clone_then_each_child_is_linked_and_converges() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(
+            &home,
+            &["skills/a/SKILL.md", "skills/b/SKILL.md", "skills/c/x"],
+        );
+        lock(&home, URL, "master", &rev);
+        let layer = linking("master");
+
+        let planned = plan(&home, &layer);
+        assert_eq!(
+            rows(&planned),
+            [
+                (format!("~/{AT}"), Action::Create),
+                ("~/.claude/skills/*".to_string(), Action::Create),
+            ]
+        );
+        let note = row(&planned, "~/.claude/skills/*")
+            .note
+            .as_deref()
+            .expect("a note");
+        assert!(
+            note.contains(&format!("`skills/*` holding `SKILL.md` in ~/{AT} at {rev}")),
+            "{note}"
+        );
+
+        let applied = apply(&home, &layer);
+        assert!(applied.stopped.is_empty(), "{applied:?}");
+        assert_eq!(
+            rows(&applied)[2..],
+            [
+                ("~/.claude/skills/a".to_string(), Action::Create),
+                ("~/.claude/skills/b".to_string(), Action::Create),
+            ],
+            "the children, appended once the clone brought them"
+        );
+        for skill in ["a", "b"] {
+            let link = home.child(format!(".claude/skills/{skill}"));
+            assert_eq!(
+                std::fs::read_link(&link).expect("a link"),
+                home.child(format!("{AT}/skills/{skill}"))
+            );
+            assert!(
+                link.join("SKILL.md").is_file(),
+                "resolves into the checkout"
+            );
+        }
+        assert!(!home.child(".claude/skills/c").exists(), "no SKILL.md");
+
+        let again = plan(&home, &layer);
+        assert!(
+            again
+                .changes
+                .iter()
+                .all(|row| row.action == Action::Unchanged),
+            "{:?}",
+            rows(&again)
+        );
+        assert_eq!(rows(&again).len(), 3, "the external and its two children");
+
+        // A commit fetched but not checked out yet is not read until the
+        // checkout moves to it: the link waits for its external, and then a
+        // child the commit adds is linked, and one it drops is left as bx
+        // made it, for `bx rm` to release.
+        std::fs::remove_dir_all(home.child("upstream/skills/a")).expect("drop a");
+        let next = commit_upstream(&home, &["skills/d/SKILL.md"]);
+        git_run(
+            home.path(),
+            &home.child(AT),
+            &["fetch", "--quiet", "origin"],
+        );
+        lock(&home, URL, "master", &next);
+        let planned = plan(&home, &layer);
+        assert_eq!(
+            rows(&planned),
+            [
+                (format!("~/{AT}"), Action::Modify),
+                ("~/.claude/skills/*".to_string(), Action::Create),
+            ],
+            "the external, then its link, waiting for it"
+        );
+        assert!(planned.stopped.is_empty());
+        apply(&home, &layer);
+        assert_eq!(checked_out(&home), next);
+        assert!(home.child(".claude/skills/d/SKILL.md").is_file());
+        assert!(
+            std::fs::symlink_metadata(home.child(".claude/skills/a")).is_ok(),
+            "left as bx made it"
+        );
+        assert_eq!(
+            rows(&plan(&home, &layer))
+                .into_iter()
+                .filter(|(_, action)| *action != Action::Unchanged)
+                .collect::<Vec<_>>(),
+            [("~/.claude/skills/a".to_string(), Action::Undeclared)],
+            "what nothing declares any more"
+        );
+    }
+
+    #[test]
+    fn a_link_whose_clone_failed_is_stopped_with_why() {
+        let home = guarded_home();
+        upstream(&home);
+        let missing = "c".repeat(40);
+        lock(&home, URL, "master", &missing);
+        // Two links, so the second's row is not the first after the
+        // externals: each stopped row is the one its link announced.
+        let layer = format!(
+            "{}[[external.link]]\nfrom = \"*\"\nto = \"~/.other/*\"\n",
+            linking("master")
+        );
+        let applied = apply(&home, &layer);
+        assert_eq!(
+            stopped(&applied),
+            [
+                format!("~/{AT}").as_str(),
+                "~/.claude/skills/*",
+                "~/.other/*"
+            ],
+            "{:?}",
+            rows(&applied)
+        );
+        for target in ["~/.claude/skills/*", "~/.other/*"] {
+            let row = row(&applied, target);
+            assert_eq!(row.action, Action::Blocked);
+            let note = row.note.as_deref().expect("a note");
+            assert!(note.contains("is not at"), "{note}");
+        }
+        assert!(!home.child(".claude").exists());
+    }
+
+    #[test]
+    fn a_blocked_external_links_nothing_from_the_commit_it_was_not_moved_to() {
+        let home = guarded_home();
+        upstream(&home);
+        let first = commit_upstream(&home, &["skills/a/SKILL.md"]);
+        lock(&home, URL, "master", &first);
+        let layer = linking("master");
+        apply(&home, &layer);
+        assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+
+        let next = commit_upstream(&home, &["skills/b/SKILL.md"]);
+        git_run(
+            home.path(),
+            &home.child(AT),
+            &["fetch", "--quiet", "origin"],
+        );
+        lock(&home, URL, "master", &next);
+        std::fs::write(home.child(AT).join("skills/a/SKILL.md"), "edited\n").expect("an edit");
+        let applied = apply(&home, &layer);
+        assert_eq!(
+            rows(&applied)
+                .into_iter()
+                .filter(|(_, action)| *action != Action::Unchanged)
+                .collect::<Vec<_>>(),
+            [(format!("~/{AT}"), Action::Blocked)],
+            "no row for its link, and nothing it made called undeclared"
+        );
+        assert_eq!(checked_out(&home), first);
+        assert!(
+            std::fs::symlink_metadata(home.child(".claude/skills/b")).is_err(),
+            "nothing linked from a commit the checkout is not at"
+        );
+        assert!(home.child(".claude/skills/a").exists(), "left as it was");
+    }
+
+    #[test]
+    fn a_child_a_target_already_declares_is_a_conflict_it_keeps() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(&home, &["skills/a/SKILL.md", "skills/b/SKILL.md"]);
+        lock(&home, URL, "master", &rev);
+        let layer = format!(
+            "{}[[target]]\npath = \"~/.claude/skills/a\"\ncontent = \"mine\"\n",
+            linking("master")
+        );
+        apply(&home, &layer);
+        assert_eq!(
+            std::fs::read_to_string(home.child(".claude/skills/a")).expect("the target"),
+            "mine"
+        );
+        assert!(home.child(".claude/skills/b/SKILL.md").is_file());
+        let planned = plan(&home, &layer);
+        assert_eq!(
+            row(&planned, "~/.claude/skills/a").action,
+            Action::Unchanged,
+            "the target keeps it"
+        );
+        let conflicts: Vec<&Change> = planned
+            .changes
+            .iter()
+            .filter(|row| row.action == Action::Conflict)
+            .collect();
+        assert_eq!(conflicts.len(), 1, "{:?}", rows(&planned));
+        assert_eq!(conflicts[0].target, "~/.claude/skills/a");
+        let note = conflicts[0].note.as_deref().expect("a note");
+        assert!(note.contains("another declaration already puts"), "{note}");
+    }
+
+    #[test]
+    fn a_link_of_an_unlocked_external_holds_what_it_made() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(&home, &["skills/a/SKILL.md"]);
+        lock(&home, URL, "master", &rev);
+        apply(&home, &linking("master"));
+        // The declaration moves to another branch, which nothing locked yet.
+        let planned = plan(&home, &linking("side"));
+        assert_eq!(
+            rows(&planned),
+            [(format!("~/{AT}"), Action::Blocked)],
+            "the link bx made is not reported as undeclared"
+        );
+    }
+
+    #[test]
+    fn a_pending_child_something_of_the_users_stands_at_is_reported_as_stopped() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(&home, &["skills/a/SKILL.md", "skills/b/SKILL.md"]);
+        lock(&home, URL, "master", &rev);
+        home.write(".claude/skills/b", "the user's own\n");
+        // A second link, so each rule row is found by its own index.
+        let layer = format!(
+            "{}[[external.link]]\nfrom = \"skills/*\"\nto = \"~/.more/*\"\n",
+            linking("master")
+        );
+        let applied = apply(&home, &layer);
+        assert_eq!(
+            stopped(&applied),
+            ["~/.claude/skills/b"],
+            "{:?}",
+            rows(&applied)
+        );
+        assert_eq!(row(&applied, "~/.claude/skills/b").action, Action::Conflict);
+        for rule in ["~/.claude/skills/*", "~/.more/*"] {
+            assert_eq!(
+                row(&applied, rule).action,
+                Action::Unchanged,
+                "{rule}: the rule itself wrote nothing"
+            );
+        }
+        assert!(home.child(".more/b/SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(home.child(".claude/skills/b")).expect("kept"),
+            "the user's own\n"
+        );
+        assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn an_interrupted_clone_with_links_converges_in_one_apply() {
+        let home = guarded_home();
+        upstream(&home);
+        let rev = commit_upstream(&home, &["skills/a/SKILL.md"]);
+        lock(&home, URL, "master", &rev);
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("the state directory");
+        {
+            let lock = ExclusiveLock::acquire(&state).expect("the lock");
+            let mut ledger = Ledger::open(&state, &lock, home.path())
+                .expect("open")
+                .value;
+            ledger
+                .record(NewEntry::new(
+                    target(&home),
+                    clone_written(None),
+                    fs::Mode::DEFAULT_DIR,
+                    Mechanism::Clone,
+                    PriorBytes::Absent,
+                ))
+                .expect("record");
+            ledger.save().expect("save");
+        }
+        std::fs::create_dir_all(home.child(AT).join(".git")).expect("a partial clone");
+        let layer = linking("master");
+
+        let planned = plan(&home, &layer);
+        assert_eq!(
+            row(&planned, "~/.claude/skills/*").action,
+            Action::Create,
+            "pending on the clone that replaces it: {:?}",
+            rows(&planned)
+        );
+        apply(&home, &layer);
+        assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+        let again = plan(&home, &layer);
+        assert!(
+            again
+                .changes
+                .iter()
+                .all(|row| row.action == Action::Unchanged),
+            "{:?}",
+            rows(&again)
+        );
+    }
+
+    #[test]
+    fn a_pinned_external_reads_no_lock() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        lock(&home, URL, "master", &up.second);
+        apply(&home, &layer(&up.first));
+        assert_eq!(
+            checked_out(&home),
+            up.first,
+            "`rev` wins over any lock entry"
+        );
     }
 }

@@ -28,6 +28,7 @@ pub mod function;
 pub mod history;
 pub mod keybindings;
 pub mod layers;
+pub mod lock;
 pub mod merge;
 pub mod origin;
 pub mod path;
@@ -42,6 +43,7 @@ pub mod target;
 pub mod toggle;
 pub mod tool;
 pub mod tree;
+pub mod update;
 pub mod values;
 pub mod when;
 
@@ -129,6 +131,8 @@ pub struct Config {
     /// `[keybindings]`: a table, merged key by key. See [`keybindings`], and
     /// [`crate::shell::keybindings`] for how it is rendered.
     pub keybindings: keybindings::Keybindings,
+    /// `[update]`: a table, merged key by key. See [`update`].
+    pub update: update::Update,
     /// List entries that restate only their natural key and `enabled`.
     ///
     /// A **toggle**: it flips the flag on an entry an earlier layer introduced
@@ -490,6 +494,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     found: item.type_name(),
                 })?;
                 config.shell_options = shell_options::parse_shell_options(table, file, text)?;
+            }
+            "update" => {
+                let table = item.as_table().ok_or_else(|| Error::WrongType {
+                    origin: section_origin(root, name, file, text),
+                    key: name.to_string(),
+                    expected: "a table `[update]`",
+                    found: item.type_name(),
+                })?;
+                config.update = update::parse_update(table, file, text)?;
             }
             "keybindings" => {
                 let table = item.as_table().ok_or_else(|| Error::WrongType {

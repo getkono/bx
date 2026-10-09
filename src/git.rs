@@ -1,7 +1,9 @@
 //! The user's own `git`, run as a child process in one repository.
 //!
 //! [`Git`] is every git operation bx makes: `bx sync`'s pull and push, a
-//! declared external's clone and fetch, and `bx rm`'s checks on a checkout.
+//! declared external's clone and fetch, `bx update`'s look at a followed
+//! branch and the `bx.lock` commit it makes, and `bx rm`'s checks on a
+//! checkout.
 //! It runs the `git` on `PATH`, never a library of bx's own, so each of them
 //! goes over whatever transport, credential helper, ssh agent and
 //! configuration the user's clone already uses. Nothing here is on the
@@ -16,7 +18,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::env::Env;
 
@@ -45,6 +48,12 @@ pub enum Error {
         /// Why it could not be started.
         #[source]
         source: std::io::Error,
+    },
+    /// `git` ran past the deadline it was given, and was killed.
+    #[error("`git {args}` did not finish in time, and was stopped")]
+    TimedOut {
+        /// The arguments it was given.
+        args: String,
     },
     /// `git` ran and failed.
     #[error("`git {args}` failed ({status}){}", stderr_suffix(.stderr))]
@@ -75,6 +84,10 @@ pub struct Git {
     home: PathBuf,
     xdg_config_home: Option<OsString>,
     extra: Vec<(OsString, OsString)>,
+    /// When every command must have finished, or `None` for no bound.
+    deadline: Option<Instant>,
+    /// Whether a bounded command leads a process group of its own.
+    own_group: bool,
 }
 
 impl Git {
@@ -86,6 +99,8 @@ impl Git {
             home: env.home.clone(),
             xdg_config_home: env.xdg_config_home.clone(),
             extra: Vec::new(),
+            deadline: None,
+            own_group: false,
         }
     }
 
@@ -102,6 +117,8 @@ impl Git {
             home: home.to_path_buf(),
             xdg_config_home: None,
             extra: Vec::new(),
+            deadline: None,
+            own_group: false,
         }
     }
 
@@ -131,6 +148,34 @@ impl Git {
             .with_env("SSH_ASKPASS", "false")
             .with_env("SSH_ASKPASS_REQUIRE", "force")
             .with_env("GCM_INTERACTIVE", "never")
+    }
+
+    /// The same `git`, every command killed and failed with
+    /// [`Error::TimedOut`] once `deadline` passes.
+    ///
+    /// For a question to a remote, whose network has to be bounded: one that
+    /// accepts the connection and never answers would otherwise hold a person
+    /// at `bx update`, or a background check, until the next boot.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// The same `git`, each bounded command run in a process group of its
+    /// own, so its deadline also reaches the `ssh` or `git-remote-https` git
+    /// starts.
+    ///
+    /// Only for a run nobody is at the terminal for — `bx update
+    /// --background` — since a group of its own is also out of reach of the
+    /// Ctrl-C a person presses. Without it a deadline kills git alone, and a
+    /// transport git started that is waiting on a silent remote outlives it
+    /// until the remote answers or closes: the price of Ctrl-C still reaching
+    /// a person's `bx update`.
+    #[must_use]
+    pub const fn in_own_group(mut self) -> Self {
+        self.own_group = true;
+        self
     }
 
     /// Set `name` to `value` in every child as well.
@@ -166,7 +211,7 @@ impl Git {
         command
     }
 
-    /// Run `git args` in `repo` and return what it printed, trimmed.
+    /// Run `git args` in `repo` and return what it printed, whole.
     ///
     /// `stdin` is inherited by a command that may talk to a remote, so a
     /// credential or host-key prompt has somewhere to be answered, and is
@@ -177,14 +222,19 @@ impl Git {
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        let output = self
-            .command(repo, args)
-            .stdin(stdin)
-            .output()
-            .map_err(|source| Error::Spawn {
-                args: shown.clone(),
-                source,
-            })?;
+        let mut command = self.command(repo, args);
+        command.stdin(stdin);
+        let output = match self.deadline {
+            None => command.output(),
+            Some(deadline) => match bounded(&mut command, deadline, self.own_group) {
+                Some(output) => output,
+                None => return Err(Error::TimedOut { args: shown }),
+            },
+        }
+        .map_err(|source| Error::Spawn {
+            args: shown.clone(),
+            source,
+        })?;
         if !output.status.success() {
             return Err(Error::Failed {
                 args: shown,
@@ -192,21 +242,99 @@ impl Git {
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Run `git args` in `repo` with its standard input closed: a read-only
-    /// question, or any command that must not ask one.
+    /// question, or any command that must not ask one. What it printed is
+    /// returned trimmed.
     pub(crate) fn query(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
+        self.query_whole(repo, args)
+            .map(|printed| printed.trim().to_string())
+    }
+
+    /// [`Git::query`], returning what it printed untrimmed: for `-z` output,
+    /// whose names may begin or end with whitespace that is part of them.
+    pub(crate) fn query_whole(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         self.output(repo, &args, Stdio::null())
+    }
+
+    /// A `git commit`, with standard input inherited so the user's own hooks
+    /// and signing can ask what they ask on any commit they make.
+    pub(crate) fn commit(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
+        self.remote(repo, args)
     }
 
     /// A command that may reach the remote.
     pub(crate) fn remote(&self, repo: &Path, args: &[&str]) -> Result<String, Error> {
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         self.output(repo, &args, Stdio::inherit())
+            .map(|printed| printed.trim().to_string())
     }
+}
+
+/// Run `command` to its end, or kill it once `deadline` passes: the command
+/// alone, or with `own_group` the process group it leads, and so whatever it
+/// started.
+///
+/// `None` when it was killed. Each stream is read on its own thread, so a
+/// child that fills one pipe while this waits on the other cannot stall.
+fn bounded(
+    command: &mut Command,
+    deadline: Instant,
+    own_group: bool,
+) -> Option<std::io::Result<Output>> {
+    use std::io::Read as _;
+
+    if own_group {
+        std::os::unix::process::CommandExt::process_group(command, 0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Some(Err(error)),
+    };
+    let group = rustix::process::Pid::from_child(&child);
+    let kill = |child: &mut std::process::Child| {
+        if own_group {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let read = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = read(child.stdout.take().map(|s| Box::new(s) as _));
+    let stderr = read(child.stderr.take().map(|s| Box::new(s) as _));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    kill(&mut child);
+                    return None;
+                }
+                std::thread::sleep(left.min(Duration::from_millis(10)));
+            }
+            Err(error) => {
+                kill(&mut child);
+                return Some(Err(error));
+            }
+        }
+    };
+    Some(Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    }))
 }
 
 #[cfg(test)]
@@ -331,5 +459,73 @@ mod tests {
                 .get_envs()
                 .any(|(k, v)| k == "XDG_CONFIG_HOME" && v.is_none())
         );
+    }
+
+    #[test]
+    fn a_command_past_its_deadline_is_killed_and_one_within_it_is_not() {
+        let started = Instant::now();
+        let mut slow = Command::new("sleep");
+        slow.arg("3").stdout(Stdio::piped()).stderr(Stdio::piped());
+        assert!(bounded(&mut slow, started + Duration::from_millis(50), false).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "killed, not waited on"
+        );
+
+        let mut quick = Command::new("sh");
+        quick
+            .args(["-c", "echo out; echo err >&2; exit 3"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = bounded(&mut quick, Instant::now() + Duration::from_secs(30), false)
+            .expect("in time")
+            .expect("ran");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+
+        let mut missing = Command::new("/nonexistent/bx-test");
+        assert!(matches!(
+            bounded(&mut missing, Instant::now() + Duration::from_secs(1), false),
+            Some(Err(_))
+        ));
+
+        // In a group of its own, what the command started is stopped too.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let pid_file = scratch.path().join("pid");
+        let mut parent = Command::new("sh");
+        parent
+            .args([
+                "-c",
+                &format!("sleep 30 & echo $! > {}; wait", pid_file.display()),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        assert!(bounded(&mut parent, started + Duration::from_millis(300), true).is_none());
+        let pid = std::fs::read_to_string(&pid_file).expect("the grandchild's pid");
+        let proc = PathBuf::from("/proc").join(pid.trim());
+        let gone = (0..100).any(|_| {
+            // A killed process lingers as a zombie until its parent reaps
+            // it; either way it no longer runs.
+            let state = std::fs::read_to_string(proc.join("stat")).unwrap_or_default();
+            let running = !state.is_empty() && !state.contains(") Z ");
+            if running {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !running
+        });
+        assert!(gone, "the grandchild {} still runs", pid.trim());
+
+        let home = guarded_home();
+        let error = git(home.path())
+            .with_deadline(Instant::now())
+            .query(home.path(), &["version"]);
+        if let Err(error) = error {
+            assert!(
+                error.to_string().contains("did not finish in time"),
+                "{error}"
+            );
+        }
     }
 }

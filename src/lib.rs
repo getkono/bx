@@ -59,7 +59,10 @@
 //! parses its arguments and dispatches. [`sync`] is the git on either side of
 //! `bx sync`'s apply: a fast-forward-only pull before it, and a push after it
 //! that never carries a state file. [`git`] runs the user's own `git` for it,
-//! for a declared external, and for `bx rm`'s checks on a checkout. [`upgrade`] is `bx self-upgrade`: the
+//! for a declared external, and for `bx rm`'s checks on a checkout. [`update`]
+//! is `bx update`'s own part: where a followed external's branch is now,
+//! `bx.lock` written and committed before anything moves, and the stamps an
+//! interactive zsh reads to decide whether to ask. [`upgrade`] is `bx self-upgrade`: the
 //! installer a fresh install runs, fetched from master and run only while its
 //! digest is the one this release pins.
 //!
@@ -140,6 +143,7 @@ pub mod state;
 pub mod sync;
 #[doc(hidden)]
 pub mod testing;
+pub mod update;
 pub mod upgrade;
 pub mod version;
 

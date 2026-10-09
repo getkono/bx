@@ -158,6 +158,13 @@ pub(crate) fn place_envs(
         .iter()
         .find(|a| a.enabled && a.command_for(Shell::Zsh).is_some())
         .map(|a| &a.origin);
+    // The first external that follows a branch: the interactive file asks
+    // about its updates, and is placed for that alone when nothing else is.
+    let followed_origin = merged
+        .externals
+        .iter()
+        .find(|external| external.follows().is_some())
+        .map(|external| &external.origin);
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))
@@ -204,7 +211,10 @@ pub(crate) fn place_envs(
             (None, None, None, None, None, Some(table), _) => table.clone(),
             (None, None, None, None, None, None, Some(source)) => source.origin.clone(),
             (None, None, None, None, None, None, None) => {
-                match activation_origin.filter(|_| place == Place::Zshrc) {
+                match activation_origin
+                    .or(followed_origin)
+                    .filter(|_| place == Place::Zshrc)
+                {
                     Some(origin) => origin.clone(),
                     None => continue,
                 }
@@ -240,7 +250,8 @@ pub(crate) fn place_envs(
                         .with_aliases(declared)
                         .with_functions(bodies.clone())
                         .with_sources(sourced.clone())
-                        .with_omitted(super::omitted(Shell::Zsh, merged)),
+                        .with_omitted(super::omitted(Shell::Zsh, merged))
+                        .with_update_prompt(followed_origin.is_some()),
                 )),
                 other => other,
             };

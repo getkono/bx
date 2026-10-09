@@ -389,6 +389,9 @@ pub struct Interactive {
     /// What the file's plan row says of the declarations that do not reach
     /// zsh ([`crate::shell::omitted`]), if any.
     omitted: Option<String>,
+    /// Whether an external follows a branch, so the file asks about its
+    /// updates ([`crate::shell::update_prompt`]).
+    update_prompt: bool,
 }
 
 impl Interactive {
@@ -406,7 +409,22 @@ impl Interactive {
             sources: Vec::new(),
             activations: Vec::new(),
             omitted: None,
+            update_prompt: false,
         }
+    }
+
+    /// The file asking, at a prompt, about followed externals' updates when
+    /// `follows`.
+    #[must_use]
+    pub const fn with_update_prompt(mut self, follows: bool) -> Self {
+        self.update_prompt = follows;
+        self
+    }
+
+    /// Whether the file asks about followed externals' updates.
+    #[must_use]
+    pub const fn update_prompt(&self) -> bool {
+        self.update_prompt
     }
 
     /// The file with `omitted` as what its plan row says of the declarations

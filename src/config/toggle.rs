@@ -92,7 +92,7 @@ impl Section {
             Self::Source => "a `path`",
             Self::Activation => "a `command`",
             Self::Tool => "an `install`",
-            Self::External => "a `url` and a `rev`",
+            Self::External => "a `url` and a `rev` or a `branch`",
         }
     }
 }

@@ -226,7 +226,9 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
         .query(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map_err(|error| match error {
             git::Error::Spawn { .. } => error.into(),
-            git::Error::Failed { .. } => Error::Detached(repo.clone()),
+            git::Error::Failed { .. } | git::Error::TimedOut { .. } => {
+                Error::Detached(repo.clone())
+            }
         })?;
     let upstream = upstream(git, &repo, &branch)?;
     // Tracked copies an interrupted sync wrote and never committed are
@@ -398,11 +400,11 @@ fn refuse_state_in_repo(repo: &Path, state: &Path) -> Result<(), Error> {
 /// all, or a directory inside some other repository, whose history `sync`
 /// must not pull into or push from. A `git` that cannot be started at all is
 /// [`git::Error::Spawn`], not a missing repository: `git init` would not help.
-fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
+pub(crate) fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
     let top = match git.query(repo, &["rev-parse", "--show-toplevel"]) {
         Ok(top) => top,
         Err(error @ git::Error::Spawn { .. }) => return Err(error.into()),
-        Err(git::Error::Failed { .. }) => {
+        Err(git::Error::Failed { .. } | git::Error::TimedOut { .. }) => {
             return Err(Error::NotARepo {
                 repo: repo.to_path_buf(),
                 toplevel: None,

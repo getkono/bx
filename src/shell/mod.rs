@@ -117,6 +117,7 @@ pub mod keybindings;
 pub mod placement;
 pub mod plugin;
 pub mod source;
+pub mod update_prompt;
 pub mod zsh;
 
 use crate::config::resolution::{BlockedEntry, Resolution};

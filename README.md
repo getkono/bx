@@ -59,7 +59,7 @@ Answers you typed in a run that stopped at a later value question are not kept.
 
 ## Commands
 
-There are eleven. You should not need a manual.
+There are twelve. You should not need a manual.
 
 | | |
 |---|---|
@@ -70,13 +70,16 @@ There are eleven. You should not need a manual.
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
 | `bx sync` | pull, apply, push — no git knowledge required |
+| `bx update` | move [dependencies](#dependencies) that follow a branch to its new commits: pull, look, lock and commit, apply |
 | `bx secret list` | list declared secrets, and whether each decrypts here |
 | `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
 | `bx shell-init` | the one line for your shell rc — not built yet |
 | `bx self-upgrade` | install the latest release over this one; `--check` only looks, `--force` reinstalls even when this one is not older |
 
-`init`, `apply` and `sync` take `--yes`, and `init` takes `--set NAME=VALUE`
-for each value it would ask for, so all three run without a terminal.
+`init`, `apply`, `sync` and `update` take `--yes`, and `init` takes
+`--set NAME=VALUE` for each value it would ask for, so all four run without a
+terminal. `bx update --check` only looks, exiting `2` when something is new,
+and `bx update --snooze` puts the next question off.
 
 `add` and `rm` need the file or directory to act on; without one they refuse
 and point you at `bx init`, which offers the config already on the machine.
@@ -206,8 +209,9 @@ path, `bx rm` when a conflict left something as it was, and
   no answer, a damaged state file, an interrupted or running session, a
   directory wider than a private file in it, a declared optional source that is
   not readable, a unit file systemd has not reloaded, enabled or loaded, or that
-  has failed, a declared reference that is not on disk, and a temporary file an
-  interrupted write left behind. It has no notion of a cache's size limit or of
+  has failed, a declared reference that is not on disk, a temporary file an
+  interrupted write left behind, and a dependency that follows a branch
+  `bx.lock` holds no commit for. It has no notion of a cache's size limit or of
   an integration gone stale, and reports neither.
 
 ### Fast enough to forget
@@ -215,6 +219,9 @@ path, `bx rm` when a conflict left something as it was, and
 - `bx` runs at every shell start and must be unmeasurable. Its budget is **5 ms**
   and the budget is enforced by a benchmark in CI, not by good intentions.
 - The shell startup path spawns no process and parses no configuration file.
+  The one process a shell ever starts on its own is a dependency's background
+  check, after the first prompt, and only for a dependency you set to
+  `check = "auto"` once its interval has passed.
 - Where `bx` can make *your other tools* start faster without changing their
   behaviour, it does.
 
@@ -226,6 +233,66 @@ Your config repo lives wherever you want it; `bx init` proposes
 
 Everything specific to you or to one machine — answers, the write record, caches,
 and the key that decrypts your secrets — stays outside the repo, on the machine.
+
+## Dependencies
+
+A git repository you want on every machine — a zsh plugin, a theme, a
+collection of agent skills — is an `[[external]]`: `bx` clones it where you
+say, keeps it at one commit, and never moves it without showing you first.
+It is the job git submodules do, without a superproject.
+
+```toml
+[[external]]
+path   = "~/.local/share/skills"            # where the checkout lives
+url    = "git@github.com:you/skills.git"     # https or ssh; credentials stay in git
+branch = "master"                            # follow a branch…
+# rev  = "0e810e5afa27acbd074398eefbe28d13005dbc15"   # …or pin a commit
+
+[[external.link]]                            # put its children where a tool looks
+from    = "skills/*"
+to      = "~/.claude/skills/*"
+require = "SKILL.md"
+```
+
+**Pinned or followed.** An external says exactly one of `rev` and `branch`.
+A pinned one moves only when you edit `rev`: the form for code you review
+before it runs. A followed one is kept at the commit `bx.lock` holds — a file
+beside `bx.toml`, committed with it, so every machine checks out the same
+commit — and `bx update` is the only thing that moves it.
+
+**`bx update`** brings the config repo level with its upstream, asks each
+followed branch where it is now, lists the new commits, and shows the plan the
+new lock would make. Once you approve, it writes and commits `bx.lock` *before*
+it moves any checkout, then applies; `bx sync` pushes the commit. If another
+machine pushed first, `bx update` replays this machine's own unpushed lock
+commits on top of theirs; when both changed `bx.lock`, or any other commit is
+local, it changes nothing and says how to reconcile. A new commit
+is locked only once it is shown to descend from the one locked before, so a
+branch whose history was rewritten is reported and never locked. `plan` and
+`apply` never ask a remote where a branch is: they read the lock, and `apply`
+fetches only the commit it names.
+
+**Links.** Each `[[external.link]]` turns every child directory of `from` in
+the locked commit into a symlink of the same name in `to`, so a new skill
+upstream becomes a new link on the next update and a removed one is reported
+as undeclared, for `bx rm` to release. A link never replaces a file or link
+you made; it is reported as a conflict instead. A `to` at, inside or above any
+external's checkout is refused when the configuration loads.
+
+**When bx asks.** An interactive zsh asks, at a prompt, at most once per shell:
+
+| the dependency says | what happens |
+|---|---|
+| `check = "ask"` (the default) | once `[update] interval` (default `7d`) has passed, the prompt asks whether to check now; nothing reaches the network until you answer `y` |
+| `check = "auto"`, with its own `interval` | once that interval has passed, the shell starts one quiet, time-bounded check after its first prompt, and a later prompt offers whatever it found; nothing is applied until you answer `y` |
+
+Answering anything but `y` puts the question off for one interval. Nothing
+asks, and nothing is checked, unless the shell is interactive with a terminal
+on both ends: a script, `zsh -c`, a service, continuous integration
+(`CI`), and coding agents (`CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`,
+`CURSOR_AGENT`) never see a question. Set `BX_NO_UPDATE_PROMPT=1` to never be
+asked. bx cannot tell a metered or mobile connection from any other, which is
+why the default is to ask first. bash is not asked yet.
 
 ## License
 

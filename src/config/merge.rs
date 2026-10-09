@@ -207,6 +207,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut history = History::default();
     let mut shell_options = ShellOptions::default();
     let mut keybindings = Keybindings::default();
+    let mut update = super::update::Update::default();
 
     // Values first, across every layer. A value never depends on a target, and
     // a target's key depends on the values — the final ones, because the file a
@@ -233,6 +234,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         history.absorb(&layer.config.history);
         shell_options.absorb(&layer.config.shell_options);
         keybindings.absorb(&layer.config.keybindings);
+        update.absorb(&layer.config.update);
 
         values.absorb(layer.config.values.iter().cloned());
         envs.absorb(layer.config.envs.iter().cloned());
@@ -326,6 +328,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         history,
         shell_options,
         keybindings,
+        update,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
         conflicts: clashes
@@ -681,7 +684,10 @@ mod tests {
                 (
                     e.path.as_str(),
                     e.url.as_str(),
-                    &e.rev[..1],
+                    match &e.pin {
+                        super::super::external::Pin::Rev(rev) => &rev[..1],
+                        super::super::external::Pin::Follow(_) => "",
+                    },
                     e.origin.file.as_path(),
                 )
             })
@@ -699,7 +705,10 @@ mod tests {
             local("[[external]]\npath = \"~/z\"\nenabled = true\n"),
         ]);
         assert!(message.contains("`~/z`"), "{message}");
-        assert!(message.contains("a `url` and a `rev`"), "{message}");
+        assert!(
+            message.contains("a `url` and a `rev` or a `branch`"),
+            "{message}"
+        );
     }
 
     #[test]

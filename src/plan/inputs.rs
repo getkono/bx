@@ -4,10 +4,13 @@
 use std::path::{Path, PathBuf};
 
 use super::Error;
+use crate::config::external::External;
 use crate::config::layers;
+use crate::config::lock::Lock;
 use crate::config::merge;
 use crate::config::resolve::{self, Resolution, Resolved};
 use crate::config::target::Target;
+use crate::config::{Layer, LayerKind};
 use crate::env::Env;
 use crate::env_guard::RootSet;
 use crate::git::Git;
@@ -38,6 +41,11 @@ pub struct Inputs {
     pub(super) activations: Vec<activation::ActivationDecl>,
     /// The machine an activation's tool is looked up and run on.
     pub(super) host: activation::System,
+    /// `bx.lock`: the commit each followed external is kept at.
+    pub(super) lock: Lock,
+    /// Every enabled external the committed layers declare without this
+    /// account's `local.toml`, or `None` when they cannot be merged alone.
+    pub(super) committed_externals: Option<Vec<External>>,
 }
 
 impl Inputs {
@@ -56,7 +64,18 @@ impl Inputs {
         let state = StateDir::resolve_in(&home, env.xdg_state_home.as_deref());
         let layers = layers::load_layer_set(&repo, state.root(), &home)?;
         let merged = merge::merge(&layers, &home)?;
+        // What every machine sharing the config repo declares: the layers
+        // `bx.lock` is committed beside, without this account's own.
+        let committed: Vec<Layer> = layers
+            .iter()
+            .filter(|layer| layer.kind == LayerKind::Global)
+            .cloned()
+            .collect();
+        let committed_externals = merge::merge(&committed, &home)
+            .ok()
+            .map(|config| config.externals);
         let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
+        let lock = Lock::read(&repo, &home)?;
         let roots = RootSet::from_values(&resolved.values)
             .owning(&[state.root().to_path_buf()])
             .with_config_repos(std::slice::from_ref(&repo));
@@ -71,7 +90,32 @@ impl Inputs {
             git: Git::new(env).unattended(),
             activations: merged.activations,
             host: activation::System::from_env(),
+            lock,
+            committed_externals,
         })
+    }
+
+    /// `bx.lock`, as this run read it.
+    #[must_use]
+    pub const fn lock(&self) -> &Lock {
+        &self.lock
+    }
+
+    /// Every enabled external the committed layers declare on their own,
+    /// without this account's `local.toml`: what the shared `bx.lock` is
+    /// kept for. `None` when those layers cannot be merged without it.
+    #[must_use]
+    pub fn committed_externals(&self) -> Option<&[External]> {
+        self.committed_externals.as_deref()
+    }
+
+    /// The same inputs, keeping followed externals at the commits `lock`
+    /// holds rather than the file's: what `bx update` plans against before
+    /// it writes the lock it proposes.
+    #[must_use]
+    pub fn with_lock(mut self, lock: Lock) -> Self {
+        self.lock = lock;
+        self
     }
 
     /// The same inputs, looking at externals through `git`.

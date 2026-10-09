@@ -1,11 +1,13 @@
 //! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
-//! `bx doctor`, `bx add`, `bx rm`, `bx secret list` and `bx self-upgrade`, and
-//! the refusal of `bx shell-init` and `bx __complete`, which have none yet.
+//! `bx update`, `bx doctor`, `bx add`, `bx rm`, `bx secret list` and
+//! `bx self-upgrade`, and the refusal of `bx shell-init` and `bx __complete`,
+//! which have none yet.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
 //! or, for `doctor`, the read-only checks in [`crate::doctor`], for `add` and
 //! `rm`, [`crate::adopt`], for `init`, [`crate::init`] before the
-//! traversal, and for `sync`, [`crate::sync`] around it — writes the rendering
+//! traversal, for `sync`, [`crate::sync`] around it, and for `update`,
+//! [`crate::update`] before it — writes the rendering
 //! to the output it is
 //! handed, and returns the exit status. `self-upgrade` reads no configuration:
 //! it is [`crate::upgrade`] run for the binary that is running. `main` does
@@ -27,6 +29,7 @@ use crate::report::{self, Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
 use crate::sync;
+use crate::update;
 use crate::upgrade;
 
 /// `bx self-upgrade`: install the latest release over the running binary, as
@@ -184,20 +187,45 @@ fn converge(
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Report, Error> {
     let inputs = Inputs::load(env)?;
+    let report = converge_inputs(&inputs, env, mode, yes, out, ask, &mut |_, approved| {
+        approved
+    })?;
+    // A machine that just began following a branch starts its interval now,
+    // so its shells ask once it has passed rather than never.
+    if report.executed {
+        update::seed(&inputs);
+    }
+    Ok(report)
+}
+
+/// [`converge`] over `inputs` already loaded, telling `decided` the answer to
+/// the one question, with the report it was put about, as soon as it is
+/// given, and writing only when it returns `true`: the seam `bx update`
+/// commits its lock through, between the approval and the first write.
+fn converge_inputs(
+    inputs: &Inputs,
+    env: &Env,
+    mode: Mode,
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut() -> Result<bool, Error>,
+    decided: &mut dyn FnMut(&Report, bool) -> bool,
+) -> Result<Report, Error> {
     let mut shown = false;
-    let report = plan::run(&inputs, mode, &mut |report| {
+    let report = plan::run(inputs, mode, &mut |report| {
         emit(out, report, View::Plan, env)?;
         // On screen before the question about it is put, whatever buffers
         // the output.
         out.flush().map_err(Error::Output)?;
         shown = true;
-        if yes {
-            Ok(true)
+        let approved = if yes {
+            true
         } else if env.stdin_tty {
-            ask()
+            ask()?
         } else {
-            Err(Error::NeedsConfirmation)
-        }
+            return Err(Error::NeedsConfirmation);
+        };
+        Ok(decided(report, approved))
     })?;
 
     if !shown {
@@ -328,6 +356,311 @@ fn sync_with(
         .map_err(sync::Error::Output)?;
     }
     Ok(plan::exit(&report, Mode::Sync))
+}
+
+/// What `bx update` is asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMode {
+    /// Pull the config repo, look for new commits, show the plan, and on
+    /// approval lock, commit and apply.
+    Update {
+        /// Approve without asking.
+        yes: bool,
+    },
+    /// Look for new commits and say what was found; change nothing but the
+    /// stamps and the objects fetched into checkouts.
+    Check,
+    /// [`UpdateMode::Check`] for the externals set to `check = "auto"`, from
+    /// an interactive shell's prompt hook: quietly, bounded by
+    /// [`update::BACKGROUND_BOUND`], and not at all while another runs.
+    Background,
+    /// Put off the next question by one interval.
+    Snooze,
+}
+
+impl UpdateMode {
+    /// The mode `bx update`'s flags ask for: `--background` over `--snooze`
+    /// over `--check`, though the command line admits no two of them
+    /// together; with none, an update, approved by `--yes`.
+    #[must_use]
+    pub const fn from_flags(yes: bool, check: bool, snooze: bool, background: bool) -> Self {
+        if background {
+            Self::Background
+        } else if snooze {
+            Self::Snooze
+        } else if check {
+            Self::Check
+        } else {
+            Self::Update { yes }
+        }
+    }
+}
+
+/// `bx update`: move followed externals to their branches' new commits.
+///
+/// [`UpdateMode::Update`] first brings the config repo level with its
+/// upstream, as `bx sync` does, so the lock it writes is written on top of
+/// every other machine's. It then asks each followed external's remote where
+/// its branch is ([`update::look`]), says what it found, and shows the plan
+/// for the lock that would follow — the same rendering and the same one
+/// confirmation `bx apply` has. Once approved, `bx.lock` is written and
+/// committed **before** any checkout moves, and then the plan is applied: the
+/// work that runs is the work shown. Nothing is pushed; `bx sync` pushes. With
+/// nothing new it still pulls and applies, so the machine ends where the
+/// configuration says.
+///
+/// Without `yes` it needs a terminal to ask on, and refuses before reaching
+/// the network.
+///
+/// # Errors
+///
+/// [`update::Error`] for a refused pull, an edited `bx.lock`, a name that is
+/// not a followed external, a lock that cannot be written or committed, and
+/// as [`apply`].
+pub fn update(
+    env: &Env,
+    names: &[String],
+    mode: UpdateMode,
+    out: &mut dyn Write,
+) -> Result<Exit, update::Error> {
+    let git = Git::new(env);
+    match mode {
+        UpdateMode::Update { yes } => update_with(env, names, yes, out, &git, &mut confirm),
+        UpdateMode::Check => update::check(env, names, false, &git, out),
+        UpdateMode::Background => update::check(env, names, true, &git, out),
+        UpdateMode::Snooze => update::snooze(env, out),
+    }
+}
+
+/// [`update`]'s [`UpdateMode::Update`], through `git`, with the question
+/// asked through `ask`.
+fn update_with(
+    env: &Env,
+    names: &[String],
+    yes: bool,
+    out: &mut dyn Write,
+    git: &Git,
+    ask: &mut dyn FnMut() -> Result<bool, Error>,
+) -> Result<Exit, update::Error> {
+    if !yes && !env.stdin_tty {
+        return Err(Error::NeedsConfirmation.into());
+    }
+    let say =
+        |out: &mut dyn Write, text: &str| writeln!(out, "{text}").map_err(update::Error::Output);
+    let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
+    if !repo.is_dir() {
+        return Err(Error::RepoMissing(repo).into());
+    }
+    // Held to the end, so two shells answering `y` at once, or a background
+    // check fetching into a checkout this run moves, never overlap.
+    let state = crate::state::StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
+    let _held = update::Stamps::of(&state)
+        .hold(update::HOLD_WAIT)?
+        .ok_or(update::Error::Busy)?;
+    // One an interrupted replay left, or the user's own: theirs to finish.
+    // Named first, since a replay left open leaves `bx.lock` changed too.
+    if update::rebasing(git, &repo) {
+        return Err(update::Error::Rebasing(repo));
+    }
+    update::refuse_edited_lock(git, &repo)?;
+    // Diverged only by this machine's own unpushed lock commits: those are
+    // replayed on top of the upstream, keeping every lock they hold.
+    let pulled = match sync::pull(env, git) {
+        Err(diverged @ sync::Error::Diverged { .. }) => {
+            match update::replay_own_lock_commits(git, &repo)? {
+                update::Replay::Replayed(replayed) => {
+                    say(
+                        out,
+                        &if replayed == 0 {
+                            "This machine's unpushed bx.lock commits were already in what \
+                             another machine pushed."
+                                .to_string()
+                        } else {
+                            format!(
+                                "Replayed {replayed} unpushed bx.lock commit(s) of this \
+                                 machine's on top of what another machine pushed."
+                            )
+                        },
+                    )?;
+                    sync::pull(env, git)
+                }
+                update::Replay::Conflicted(commits) => {
+                    return Err(update::Error::LockDiverged { commits, repo });
+                }
+                update::Replay::NotOwn => Err(diverged),
+            }
+        }
+        other => other,
+    };
+    match pulled {
+        Ok(pulled) if pulled.fast_forwarded > 0 => say(
+            out,
+            &format!(
+                "Fast-forwarded {} by {} commit(s) from {}.",
+                pulled.branch, pulled.fast_forwarded, pulled.upstream.short
+            ),
+        )?,
+        Ok(_) => {}
+        Err(sync::Error::NoUpstream { branch, .. }) => say(
+            out,
+            &format!(
+                "The config repo's {branch} has no upstream, so there is nothing to pull; \
+                 bx update locks on top of it as it stands."
+            ),
+        )?,
+        Err(sync::Error::NotARepo { .. }) => say(
+            out,
+            "The config repo is not a git repository, so there is nothing to pull or commit; \
+             bx update writes bx.lock there and commits nothing.",
+        )?,
+        Err(other) => return Err(other.into()),
+    }
+
+    let inputs = Inputs::load(env)?;
+    let externals = &inputs.resolved().externals;
+    let chosen = update::select(externals, names, &env.home)?;
+    let ledger = crate::state::LedgerView::read(inputs.state(), &env.home)
+        .map_err(Error::from)?
+        .value;
+    // Each remote has its own bound, so one that never answers holds the
+    // question up for a minute rather than until someone presses Ctrl-C.
+    let found: Vec<update::Found> = chosen
+        .iter()
+        .map(|external| {
+            let looker = git
+                .clone()
+                .unattended()
+                .with_deadline(std::time::Instant::now() + update::LOOK_BOUND);
+            update::look(&looker, &env.home, external, inputs.lock(), &ledger)
+        })
+        .collect();
+    for found in &found {
+        say(out, &found.summary())?;
+        if let update::Verdict::Moves { log: Some(log), .. } = &found.verdict {
+            for line in log {
+                say(out, &format!("    {}", report::escape(line)))?;
+            }
+        }
+    }
+
+    let before = inputs.lock().clone();
+    let committed = inputs.committed_externals();
+    let unshared: Vec<&update::Found> = found
+        .iter()
+        .filter(|found| found.moves_to().is_some() && update::unshared(found, committed))
+        .collect();
+    for found in &unshared {
+        let elsewhere = committed.is_some_and(|committed| update::followed(&found.path, committed));
+        let why = if elsewhere {
+            "and the committed configuration another branch or url; the shared bx.lock keeps \
+             the committed one's"
+        } else {
+            "and the committed configuration does not follow it; the shared bx.lock holds only \
+             what the committed configuration follows. Declare it in a committed layer, or pin \
+             it with `rev`"
+        };
+        say(
+            out,
+            &format!(
+                "{}: this account follows `{}` of {}, {why}, so this is not locked",
+                found.path, found.branch, found.url
+            ),
+        )?;
+    }
+    let after = update::proposed(&before, &found, externals, committed);
+    let message = update::message(&before, &after);
+    let changed = after != before;
+    let inputs = inputs.with_lock(after.clone());
+    let mut asked = false;
+    let mut recovering = false;
+    let mut failed: Option<update::Error> = None;
+    let lock = |failed: &mut Option<update::Error>| match update::write_and_commit(
+        git, &repo, &after, &message,
+    ) {
+        Ok(_) => true,
+        Err(error) => {
+            *failed = Some(error);
+            false
+        }
+    };
+    let converged = converge_inputs(
+        &inputs,
+        env,
+        Mode::Apply,
+        yes,
+        out,
+        ask,
+        &mut |report, approved| {
+            asked = true;
+            if report.interrupted.is_some() {
+                // The plan shown was recovery's alone, and never announced the
+                // lock: recovery runs if approved, and nothing is locked.
+                recovering = true;
+                return approved;
+            }
+            // Committed before the first write, so a checkout never stands at a
+            // commit the config repo does not name.
+            approved && (!changed || lock(&mut failed))
+        },
+    );
+    let report = match converged {
+        Ok(report) => report,
+        Err(Error::Canceled) => {
+            say(out, "Canceled. Nothing was locked or applied.")?;
+            return Ok(Exit::Canceled);
+        }
+        Err(other) => return Err(other.into()),
+    };
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    if recovering {
+        say(
+            out,
+            "Nothing was locked: an interrupted apply had to be dealt with first. Run bx update \
+             again.",
+        )?;
+        return Ok(match plan::exit(&report, Mode::Apply) {
+            Exit::Converged => Exit::Pending,
+            exit => exit,
+        });
+    }
+    // A lock that moves nothing `apply` writes — an entry dropped, or a
+    // checkout that is a conflict either way — is still the user's to approve.
+    if changed && !asked {
+        let approved = if yes {
+            true
+        } else {
+            match ask() {
+                Ok(approved) => approved,
+                Err(Error::Canceled) => {
+                    say(out, "Canceled. Nothing was locked.")?;
+                    return Ok(Exit::Canceled);
+                }
+                Err(other) => return Err(other.into()),
+            }
+        };
+        if approved && lock(&mut failed) {
+            say(out, "Locked.")?;
+        }
+        if let Some(error) = failed {
+            return Err(error);
+        }
+    }
+    update::finished(&inputs)?;
+    let attention = !unshared.is_empty()
+        || found.iter().any(|found| {
+            matches!(
+                found.verdict,
+                update::Verdict::Rewritten { .. }
+                    | update::Verdict::Unproven { .. }
+                    | update::Verdict::Unreachable(_)
+            )
+        });
+    Ok(match plan::exit(&report, Mode::Apply) {
+        Exit::Converged if attention => Exit::Pending,
+        exit => exit,
+    })
 }
 
 /// `bx init`: create the repo when there is none, answer this account's unset
@@ -2516,4 +2849,6 @@ mod tests {
             );
         }
     }
+
+    mod update_command;
 }

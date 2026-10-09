@@ -194,6 +194,13 @@ impl StateDir {
         self.root.join("shell")
     }
 
+    /// `update/` — when an interactive shell next asks about followed
+    /// externals, and what the last check found. See [`crate::update`].
+    #[must_use]
+    pub fn update(&self) -> PathBuf {
+        self.root.join("update")
+    }
+
     /// `lock` — the advisory lock file. Created once and never unlinked.
     #[must_use]
     pub fn lock(&self) -> PathBuf {
@@ -264,6 +271,19 @@ impl StateDir {
         ensure_dir(&self.root, Mode::PRIVATE_DIR)?;
         ensure_dir(&self.restore(), Mode::PRIVATE_DIR)?;
         ensure_dir(&self.shell(), Mode::PRIVATE_DIR)
+    }
+
+    /// Create the directory and `update/` within it, each at `0700`.
+    ///
+    /// Separate from [`StateDir::ensure`], so an account that follows no
+    /// branch never has one.
+    ///
+    /// # Errors
+    ///
+    /// As [`StateDir::ensure`].
+    pub fn ensure_update(&self) -> Result<(), Error> {
+        self.ensure()?;
+        ensure_dir(&self.update(), Mode::PRIVATE_DIR)
     }
 }
 

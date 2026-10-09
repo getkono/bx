@@ -34,7 +34,11 @@
 //!    is not on disk.
 //! 9. [`orphans`] — a `.bx-` temporary file an interrupted write left beside
 //!    a destination, which no journal names and recovery never removes.
+//! 10. [`externals`] — an external that follows a branch `bx.lock` holds no
+//!     commit for, a lock entry nothing follows, and an update stamp that
+//!     holds no time.
 
+pub mod externals;
 pub mod modes;
 pub mod orphans;
 pub mod references;
@@ -107,6 +111,13 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
         &state.ledger,
         inputs.state(),
         home,
+    ));
+    findings.extend(externals::check(
+        &resolved.externals,
+        inputs.committed_externals(),
+        inputs.lock(),
+        inputs.repo(),
+        inputs.state(),
     ));
     Report { findings }
 }

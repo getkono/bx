@@ -98,6 +98,8 @@ pub struct Resolved {
     ///
     /// Nothing in one is substituted, so none is ever held back.
     pub tools: Vec<super::tool::ToolDecl>,
+    /// The merged `[update]` table: nothing in it is substituted.
+    pub update: super::update::Update,
 }
 
 /// Resolve a merged configuration.
@@ -161,6 +163,7 @@ pub fn resolve(
         externals: merged.externals.clone(),
         secrets: merged.secrets.clone(),
         tools: merged.tools.clone(),
+        update: merged.update.clone(),
     })
 }
 
@@ -233,6 +236,34 @@ fn refuse_overlapping_externals(
                     "external `{}` overlaps external `{}` at {}; one checkout inside \
                      another is an untracked directory in it",
                     later.path, earlier.path, earlier.origin
+                ),
+            });
+        }
+    }
+
+    // A link's children land in its `to`: inside any checkout, they would be
+    // untracked files in it, as a target there would be; above one, a child
+    // could take the checkout's own name, or a directory on its way, and be
+    // a link another external is then cloned through.
+    for (linking, link) in externals
+        .iter()
+        .flat_map(|external| external.links.iter().map(move |link| (external, link)))
+    {
+        if let Some((external, at)) = externals
+            .iter()
+            .find_map(|external| overlap(&external.path, &link.to).map(|at| (external, at)))
+        {
+            let place = if at == Overlap::Above {
+                "above"
+            } else {
+                "inside"
+            };
+            return Err(Error::BadValue {
+                origin: link.origin.clone(),
+                message: format!(
+                    "a link of external `{}` puts its children in `{}`, {place} external \
+                     `{}` at {}; a checkout is a directory git owns whole",
+                    linking.path, link.to, external.path, external.origin
                 ),
             });
         }
@@ -533,6 +564,83 @@ mod tests {
         }
         // A shared prefix that is not a parent is no overlap.
         assert!(resolved(&format!("{}{}", external("~/a"), external("~/ab")), None).is_ok());
+    }
+
+    #[test]
+    fn a_followed_external_places_the_update_prompt_and_a_pinned_one_does_not() {
+        let interactive = |text: &str| -> Option<String> {
+            let resolved = resolved(text, None).unwrap();
+            resolved
+                .targets
+                .iter()
+                .find_map(|resolution| match resolution {
+                    Resolution::Ready(Target {
+                        body: Body::Generated(generated @ Gen::Interactive(_)),
+                        ..
+                    }) => Some(generated.render(&|_| true)),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            interactive(&external("~/a")),
+            None,
+            "a pinned external alone"
+        );
+
+        let followed = "[[external]]\npath = \"~/a\"\nurl = \"https://h/o/a\"\nbranch = \"main\"\n";
+        let file = interactive(followed).expect("placed for the prompt alone");
+        assert!(file.contains("precmd_functions+=(__bx_update)"), "{file}");
+
+        let alias = "[[alias]]\nname = \"ll\"\ncommand = \"ls -l\"\n";
+        let without = interactive(&format!("{alias}{}", external("~/a"))).expect("an alias");
+        assert!(!without.contains("__bx_update"), "{without}");
+        let with = interactive(&format!("{alias}{followed}")).expect("an alias");
+        assert!(
+            with.contains("alias ll") && with.contains("__bx_update"),
+            "{with}"
+        );
+    }
+
+    #[test]
+    fn a_link_into_another_external_is_refused_naming_both() {
+        for to in ["~/b", "~/b/sub"] {
+            let text = format!(
+                "{}[[external.link]]\nfrom = \"*\"\nto = \"{to}/*\"\n{}",
+                external("~/a"),
+                external("~/b")
+            );
+            let err = resolved(&text, None).expect_err(to);
+            assert!(err.starts_with("bx.toml:5: "), "at the link: {err}");
+            assert!(
+                err.contains(&format!(
+                    "puts its children in `{to}`, inside external `~/b`"
+                )),
+                "{err}"
+            );
+        }
+        let beside = format!(
+            "{}[[external.link]]\nfrom = \"*\"\nto = \"~/bin/*\"\n{}",
+            external("~/a"),
+            external("~/b")
+        );
+        assert!(resolved(&beside, None).is_ok());
+    }
+
+    #[test]
+    fn a_link_above_an_external_is_refused_since_a_child_could_take_its_way() {
+        for (to, other) in [("~/src", "~/src/b"), ("~/src", "~/src/b/c"), ("~", "~/b")] {
+            let text = format!(
+                "{}[[external.link]]\nfrom = \"*\"\nto = \"{to}/*\"\n{}",
+                external("~/a"),
+                external(other)
+            );
+            let err = resolved(&text, None).expect_err(to);
+            assert!(err.starts_with("bx.toml:5: "), "at the link: {err}");
+            assert!(
+                err.contains(&format!("in `{to}`, above external `")),
+                "{err}"
+            );
+        }
     }
 
     #[test]

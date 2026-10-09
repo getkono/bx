@@ -1863,6 +1863,53 @@ fn the_init_snippet_is_not_an_environment_fragment() {
     );
 }
 
+#[test]
+fn the_update_prompt_is_not_an_environment_fragment() {
+    // The second generated file under the no-assignment rule, after the
+    // init snippet, and held to it the same way: every name the hook's
+    // bytes give a value to is found, and each must be one of bx's own
+    // `BX_` names, a local of the function that assigns it, or zsh's
+    // `precmd_functions` — a hook array zsh cannot export, which says what
+    // runs at a prompt and moves no tool's files, as the functions phase's
+    // registrations do.
+    let hook = crate::shell::update_prompt::ZSH;
+    let locals: Vec<&str> = hook
+        .lines()
+        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
+        .flat_map(str::split_whitespace)
+        .filter(|word| !word.starts_with('-'))
+        .map(|declared| declared.split('=').next().unwrap_or(declared))
+        .collect();
+    let assigned = assignments_in(hook);
+    for name in &assigned {
+        assert!(
+            name.starts_with("BX_") || locals.contains(name) || *name == "precmd_functions",
+            "the update prompt gives {name} a value, which is neither one of bx's own \
+             names, a local, nor zsh's precmd hook array"
+        );
+    }
+    // Not vacuous: the once-per-shell markers and the registration.
+    for name in [
+        "BX_UPDATE_ASKED",
+        "BX_UPDATE_CHECKING",
+        "precmd_functions",
+        "answer",
+    ] {
+        assert!(assigned.contains(&name), "{name}: {assigned:?}");
+    }
+    // Nothing is exported, and nothing the guard would have to judge.
+    assert!(!hook.contains("export"), "the hook exports nothing");
+    for (idx, line) in hook.split('\n').enumerate() {
+        if let Statement::Assign { name, .. } = statement(line) {
+            assert!(
+                locals.contains(&name) || name.starts_with("BX_") || name == "precmd_functions",
+                "line {} assigns {name}, which the guard would have to judge",
+                idx + 1
+            );
+        }
+    }
+}
+
 /// `text` with its comments removed, line by line, carrying block state.
 ///
 /// Written because a `//`-prefix test is not comment handling: round 5

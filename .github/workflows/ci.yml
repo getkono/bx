@@ -338,7 +338,7 @@ jobs:
       - name: Mutants
         run: >-
           mise run mutants --in-diff pr.diff
-          --shard ${{ matrix.shard }}/12--sharding round-robin
+          --shard ${{ matrix.shard }}/12 --sharding round-robin
       - name: Upload mutants.out
         if: always()
         uses: actions/upload-artifact@v4

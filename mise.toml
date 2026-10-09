@@ -63,7 +63,7 @@ run = [
 ]
 
 [tasks.bench]
-description = "Measure what bx's generated files cost zsh startup against its 5 ms budget"
+description = "Measure what bx's generated files cost zsh and bash startup against its 5 ms budget"
 # The budget is a product requirement, so it is measured, not assumed. The bench
 # applies the example configuration with the real binary, so it builds that
 # binary first: a bench that measured without one would pass by measuring

@@ -1429,6 +1429,37 @@ mod tests {
     }
 
     #[test]
+    fn the_unshared_remedy_says_exactly_what_locks_the_follow_instead() {
+        let mine = followed("~/mine", Check::Ask);
+        let mut elsewhere = followed("~/mine", Check::Ask);
+        elsewhere.pin = Pin::Follow(Follow {
+            branch: "other".to_string(),
+            check: Check::Ask,
+        });
+        assert_eq!(unshared_remedy(&pinned("~/mine"), Some(&[])), None, "a pin");
+        assert_eq!(
+            unshared_remedy(&mine, Some(std::slice::from_ref(&mine))),
+            None,
+            "a follow the committed configuration declares"
+        );
+        assert_eq!(unshared_remedy(&mine, None), None, "committed unknown");
+        assert_eq!(
+            unshared_remedy(&mine, Some(&[])),
+            Some(
+                "`bx update` locks only what the committed configuration follows; declare it \
+                 in a committed layer, or pin it with `rev`"
+            )
+        );
+        assert_eq!(
+            unshared_remedy(&mine, Some(&[elsewhere])),
+            Some(
+                "`bx update` locks the branch and url the committed configuration follows \
+                 here, not this one; pin it with `rev`"
+            )
+        );
+    }
+
+    #[test]
     fn the_message_names_what_moved_by_path_and_nothing_else() {
         let entry = |rev: &str| Locked {
             url: "https://h/o/a".to_string(),

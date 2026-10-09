@@ -6,7 +6,10 @@
 //!
 //! * a followed external `bx.lock` holds no commit for, or holds one for
 //!   another url or branch than the one declared: `apply` leaves it as it is
-//!   until `bx update` locks it;
+//!   until `bx update` locks it, or, for a follow `local.toml` alone declares,
+//!   which `bx update` never locks, until a committed layer declares it or a
+//!   `rev` pins it, and for one `local.toml` points elsewhere than the
+//!   committed layers, until a `rev` pins it;
 //! * an entry in `bx.lock` for a path no `[[external]]` follows any more,
 //!   which the next `bx update` drops;
 //! * an update stamp that holds no time, so an interactive shell never asks
@@ -19,7 +22,7 @@ use crate::config::Origin;
 use crate::config::external::External;
 use crate::config::lock::{self, Lock, Lookup};
 use crate::state::StateDir;
-use crate::update::{Stamps, followed};
+use crate::update::{Stamps, followed, unshared_remedy};
 
 /// A finding for every followed external the lock does not hold, then every
 /// lock entry nothing follows, then every unreadable stamp.
@@ -40,21 +43,23 @@ pub fn check(
         let Some(follow) = external.follows() else {
             continue;
         };
+        let remedy = unshared_remedy(external, committed);
         let note = match lock.lookup(external) {
             Lookup::Locked(_) => continue,
             Lookup::Missing => format!(
-                "follows `{}`, and {} holds no commit for it, so apply leaves it as it is; \
-                 `bx update` locks one",
+                "follows `{}`, and {} holds no commit for it, so apply leaves it as it is; {}",
                 follow.branch,
-                lock::FILE
+                lock::FILE,
+                remedy.unwrap_or("`bx update` locks one")
             ),
             Lookup::Stale(locked) => format!(
-                "follows `{}` of {}, and {} locks it for `{}` of {}; `bx update` locks it again",
+                "follows `{}` of {}, and {} locks it for `{}` of {}; {}",
                 follow.branch,
                 external.url,
                 lock::FILE,
                 locked.branch,
-                locked.url
+                locked.url,
+                remedy.unwrap_or("`bx update` locks it again")
             ),
         };
         findings.push(Finding {
@@ -181,6 +186,57 @@ mod tests {
             findings[2].origin.as_ref().unwrap().file,
             home.path().join("bx.lock")
         );
+    }
+
+    #[test]
+    fn a_follow_bx_update_never_locks_names_a_committed_layer_or_a_rev() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let remedy = "declare it in a committed layer, or pin it with `rev`";
+        let mut lock = Lock::default();
+        let portable = |raw: &str| Portable::parse_in(raw, home.path()).unwrap();
+        lock.set(
+            portable("~/stale"),
+            Locked {
+                url: "https://h/o/a".to_string(),
+                branch: "old".to_string(),
+                rev: REV.to_string(),
+            },
+        );
+        let externals = [
+            external(home.path(), "~/stale", follow("main")),
+            external(home.path(), "~/new", follow("main")),
+        ];
+        // Committed as this account declares them: `bx update` locks both.
+        for committed in [Some(&externals[..]), None] {
+            let findings = check(&externals, committed, &lock, home.path(), &state);
+            assert!(findings[0].note.ends_with("`bx update` locks it again"));
+            assert!(findings[1].note.ends_with("`bx update` locks one"));
+        }
+        // `local.toml` alone follows `~/new`, and points `~/stale` at another
+        // branch than the committed layers do: `bx update` locks neither.
+        let committed = [
+            external(home.path(), "~/stale", follow("old")),
+            external(home.path(), "~/new", Pin::Rev(REV.to_string())),
+        ];
+        let findings = check(&externals, Some(&committed), &lock, home.path(), &state);
+        let subjects: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
+        assert_eq!(subjects, ["~/stale", "~/new"]);
+        let elsewhere = "the committed configuration follows here, not this one; pin it with `rev`";
+        assert!(
+            findings[0].note.ends_with(elsewhere),
+            "{}",
+            findings[0].note
+        );
+        assert!(
+            !findings[0].note.contains("committed layer"),
+            "{}",
+            findings[0].note
+        );
+        assert!(findings[1].note.ends_with(remedy), "{}", findings[1].note);
+        for finding in &findings {
+            assert!(!finding.note.contains("locks one"), "{}", finding.note);
+        }
     }
 
     #[test]

@@ -45,8 +45,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{Change, Diff, Error};
-use crate::config::external::{External, Pin};
-use crate::config::lock::{self, Lock, Lookup};
+use crate::config::external::{External, Follow, Pin};
+use crate::config::lock::{self, Lock, Locked, Lookup};
 use crate::fs::{self, Kind};
 use crate::git::{self, Git};
 use crate::journal;
@@ -56,6 +56,7 @@ use crate::state::{
     self, ExclusiveLock, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, PriorBytes,
     StateDir, clone_written,
 };
+use crate::update;
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +69,9 @@ pub(super) struct Ctx<'a> {
     pub git: &'a Git,
     /// The commits followed externals are kept at.
     pub lock: &'a Lock,
+    /// Every external the committed layers declare on their own, or `None`
+    /// when that is unknown: what `bx update` locks a follow for.
+    pub committed: Option<&'a [External]>,
 }
 
 /// The work one decision announced. Only this module can make one.
@@ -121,7 +125,8 @@ pub(super) fn decide_all(
     for (at, external) in externals.iter().enumerate() {
         let rev = match rev(external, ctx.lock) {
             Ok(rev) => rev,
-            Err(note) => {
+            Err((follow, stale)) => {
+                let note = unlocked(external, follow, stale, ctx.committed);
                 rows.push(Change {
                     target: external.path.as_str().to_string(),
                     origin: external.origin.clone(),
@@ -153,29 +158,54 @@ pub(super) fn decide_all(
 ///
 /// # Errors
 ///
-/// The note for a blocked row, when a followed external has no commit locked
-/// for the url and branch it declares. Nothing is guessed: `plan` and `apply`
+/// The branch followed, and what `lock` holds for another url or branch at
+/// its path, if anything, when a followed external has no commit locked for
+/// the url and branch it declares. Nothing is guessed: `plan` and `apply`
 /// never ask a remote where a branch is, so only `bx update` can say.
-pub(crate) fn rev<'a>(external: &'a External, lock: &'a Lock) -> Result<&'a str, String> {
+pub(crate) fn rev<'a>(
+    external: &'a External,
+    lock: &'a Lock,
+) -> Result<&'a str, (&'a Follow, Option<&'a Locked>)> {
     let follow = match &external.pin {
         Pin::Rev(rev) => return Ok(rev),
         Pin::Follow(follow) => follow,
     };
     match lock.lookup(external) {
         Lookup::Locked(rev) => Ok(rev),
-        Lookup::Missing => Err(format!(
-            "follows `{}`, and {} holds no commit for it yet; `bx update` locks one",
+        Lookup::Missing => Err((follow, None)),
+        Lookup::Stale(locked) => Err((follow, Some(locked))),
+    }
+}
+
+/// The note for the blocked row of `external`, which follows `follow` and
+/// which `lock` holds `stale` for, if anything ([`rev`]).
+///
+/// `bx update` locks the follow, unless `local.toml` alone declares it or
+/// points it elsewhere than `committed` does, which the shared `bx.lock`
+/// never takes; the note then names what does lock it.
+fn unlocked(
+    external: &External,
+    follow: &Follow,
+    stale: Option<&Locked>,
+    committed: Option<&[External]>,
+) -> String {
+    let remedy = update::unshared_remedy(external, committed);
+    match stale {
+        None => format!(
+            "follows `{}`, and {} holds no commit for it yet; {}",
             follow.branch,
-            lock::FILE
-        )),
-        Lookup::Stale(locked) => Err(format!(
-            "follows `{}` of {}, and {} locks it for `{}` of {}; `bx update` locks it again",
+            lock::FILE,
+            remedy.unwrap_or("`bx update` locks one")
+        ),
+        Some(locked) => format!(
+            "follows `{}` of {}, and {} locks it for `{}` of {}; {}",
             follow.branch,
             external.url,
             lock::FILE,
             locked.branch,
-            locked.url
-        )),
+            locked.url,
+            remedy.unwrap_or("`bx update` locks it again")
+        ),
     }
 }
 
@@ -2016,7 +2046,7 @@ mod tests {
         let note = row.note.as_deref().expect("a note");
         assert!(note.contains("follows `master`"), "{note}");
         assert!(note.contains("bx.lock holds no commit"), "{note}");
-        assert!(note.contains("`bx update`"), "{note}");
+        assert!(note.ends_with("`bx update` locks one"), "{note}");
         assert!(!home.child(AT).exists(), "nothing is cloned on a guess");
 
         for (url, branch) in [(URL, "side"), ("https://example.invalid/other", "master")] {
@@ -2029,7 +2059,42 @@ mod tests {
                 note.contains(&format!("locks it for `{branch}` of {url}")),
                 "{note}"
             );
+            assert!(note.ends_with("`bx update` locks it again"), "{note}");
         }
+    }
+
+    #[test]
+    fn a_follow_bx_update_never_locks_is_blocked_on_a_committed_layer_or_a_rev() {
+        let home = guarded_home();
+        let up = upstream(&home);
+        let remedy = "`bx update` locks only what the committed configuration follows; \
+                      declare it in a committed layer, or pin it with `rev`";
+
+        // Only `local.toml` follows it, and bx.lock holds nothing for it.
+        home.write(".local/state/bx/local.toml", &followed("master"));
+        let planned = plan(&home, "");
+        let row = only(&planned);
+        assert_eq!(row.action, Action::Blocked, "{row:?}");
+        let note = row.note.as_deref().expect("a note");
+        assert!(note.contains("bx.lock holds no commit"), "{note}");
+        assert!(note.ends_with(remedy), "{note}");
+
+        // `local.toml` points the committed follow at another branch, and
+        // bx.lock holds the committed one's commit.
+        lock(&home, URL, "master", &up.first);
+        home.write(".local/state/bx/local.toml", &followed("side"));
+        let planned = plan(&home, &followed("master"));
+        let row = only(&planned);
+        assert_eq!(row.action, Action::Blocked, "{row:?}");
+        let note = row.note.as_deref().expect("a note");
+        assert!(note.contains("locks it for `master`"), "{note}");
+        assert!(
+            note.ends_with(
+                "`bx update` locks the branch and url the committed configuration follows \
+                 here, not this one; pin it with `rev`"
+            ),
+            "{note}"
+        );
     }
 
     /// Commit `files` on the upstream's `master`, and return the commit.

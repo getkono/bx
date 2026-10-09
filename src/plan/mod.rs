@@ -264,6 +264,7 @@ pub fn run(
             home: &inputs.home,
             git: &inputs.git,
             lock: &inputs.lock,
+            committed: inputs.committed_externals(),
         },
     )?;
     // Every external's links, as symlink targets decided with the rest: each

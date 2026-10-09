@@ -328,8 +328,9 @@ pub fn commit_carried(env: &Env, git: &Git, repo: &Path) -> Result<usize, Error>
         "--",
     ];
     staged.extend(&written);
+    // Untrimmed, so a first path that begins with whitespace keeps it.
     let changed: BTreeSet<String> = git
-        .query(repo, &staged)?
+        .query_whole(repo, &staged)?
         .split('\0')
         .filter(|path| !path.is_empty())
         .map(str::to_string)
@@ -482,7 +483,9 @@ fn refuse_outgoing_state(
     state: &StateDir,
     upstream: &Upstream,
 ) -> Result<(), Error> {
-    let listed = git.query(
+    // Untrimmed, so a first path that begins with whitespace keeps it: the
+    // newline git prints before each commit's paths is all that is stripped.
+    let listed = git.query_whole(
         repo,
         &[
             "log",
@@ -957,6 +960,64 @@ pub(crate) mod tests {
             panic!("{error:?}");
         };
         assert_eq!(paths, &vec!["sub/ledger.mpk".to_string()]);
+    }
+
+    #[test]
+    fn a_first_outgoing_path_that_begins_with_whitespace_keeps_it() {
+        // ` local.toml` is not `local.toml`, so it is not a state file.
+        let home = guarded_home();
+        let repo = cloned(&home, "");
+        std::fs::write(repo.join(" local.toml"), "x\n").expect(" local.toml");
+        commit_all(home.path(), &repo, "spaced");
+
+        pull(&env(home.path()), &git(home.path())).expect("not a state file");
+
+        // And a state file under ` sub` is named as git names it.
+        let home = guarded_home();
+        let repo = cloned(&home, "");
+        std::fs::create_dir_all(repo.join(" sub")).expect(" sub");
+        std::fs::write(repo.join(" sub/ledger.mpk"), "x\n").expect("ledger");
+        commit_all(home.path(), &repo, "oops");
+
+        let error = pull(&env(home.path()), &git(home.path())).expect_err("a state file");
+        let Error::WouldPushState { paths, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(paths, &vec![" sub/ledger.mpk".to_string()]);
+    }
+
+    #[test]
+    fn a_carried_copy_whose_path_begins_with_whitespace_is_committed_under_it() {
+        let home = guarded_home();
+        let repo = cloned(
+            &home,
+            "[[target]]\npath = \"~/.lock\"\nfile = \" lock\"\ndirection = \"track\"\n",
+        );
+        std::fs::write(repo.join(" lock"), "a\n").expect("the repo copy");
+        commit_all(home.path(), &repo, "track");
+        run(home.path(), &repo, &["push", "--quiet"]);
+        home.write(".lock", "a\n");
+        let sync = |what: &str| {
+            let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+            crate::plan::run(&inputs, crate::plan::Mode::Sync, &mut |_| Ok(true)).expect(what);
+        };
+        sync("the agreeing run");
+        home.write(".lock", "b\n");
+        sync("the carrying run");
+
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("committed");
+
+        assert_eq!(committed, 1);
+        assert_eq!(
+            run(home.path(), &repo, &["show", "HEAD:./ lock"]),
+            "b",
+            "the copy is committed under its own name"
+        );
+        assert_eq!(
+            run(home.path(), &repo, &["log", "-1", "--format=%B"]),
+            format!("{CARRIED_SUBJECT}\n\n lock")
+        );
     }
 
     #[test]

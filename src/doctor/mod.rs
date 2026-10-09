@@ -37,6 +37,8 @@
 //! 10. [`externals`] — an external that follows a branch `bx.lock` holds no
 //!     commit for, a lock entry nothing follows, and an update stamp that
 //!     holds no time.
+//! 11. [`stray_local`] — a `local.toml` inside the config repo, which bx
+//!     never loads, with the move to the state directory that makes it count.
 
 pub mod externals;
 pub mod modes;
@@ -44,6 +46,7 @@ pub mod orphans;
 pub mod references;
 pub mod sources;
 pub mod state;
+pub mod stray_local;
 pub mod systemd;
 pub mod tools;
 pub mod values;
@@ -119,6 +122,7 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
         inputs.repo(),
         inputs.state(),
     ));
+    findings.extend(stray_local::check(inputs.repo(), inputs.state(), home));
     Report { findings }
 }
 
@@ -399,6 +403,7 @@ install = \"sudo dnf install bx-no-such-tool\"
         std::fs::write(state.fingerprints(), b"not MessagePack").unwrap();
         interrupt(home.path());
         home.write(".config/systemd/user/.bx-Ab3dEf", "");
+        home.write(".config/bx/local.toml", "[values]\n");
         let systemd = Every::unit(disabled());
 
         let (first, code) = doctor_of(&home, EVERY_CHECK, OsStr::new(""), &systemd);
@@ -424,7 +429,10 @@ install = \"sudo dnf install bx-no-such-tool\"
              \x20 ! ~/.config/systemd/user/.bx-Ab3dEf is a temporary file a bx write left when \
              it was interrupted before its journal named it, so recovery never removes it and \
              nothing reads it; look at it, then delete it\n\
-             Doctor: 8 finding(s).\n"
+             \x20 ! ~/.config/bx/local.toml is inside the config repo, so bx never loads it \
+             and could publish it; move what it holds into ~/.local/state/bx/local.toml, the \
+             local layer bx loads\n\
+             Doctor: 9 finding(s).\n"
         );
         assert_eq!(code, Exit::Pending);
         assert_eq!(first, second, "two runs print the same bytes");

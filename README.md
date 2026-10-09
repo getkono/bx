@@ -210,8 +210,9 @@ path, `bx rm` when a conflict left something as it was, and
   directory wider than a private file in it, a declared optional source that is
   not readable, a unit file systemd has not reloaded, enabled or loaded, or that
   has failed, a declared reference that is not on disk, a temporary file an
-  interrupted write left behind, and a dependency that follows a branch
-  `bx.lock` holds no commit for. It has no notion of a cache's size limit or of
+  interrupted write left behind, a dependency that follows a branch
+  `bx.lock` holds no commit for, and a `local.toml` inside the config repo,
+  which bx never loads. It has no notion of a cache's size limit or of
   an integration gone stale, and reports neither.
 
 ### Fast enough to forget

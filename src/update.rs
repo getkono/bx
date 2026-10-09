@@ -45,7 +45,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::external::{Check, External};
+use crate::config::external::{Check, External, first_followed};
 use crate::config::lock::{self, Lock, Locked};
 use crate::config::update::Interval;
 use crate::fs::Mode;
@@ -1088,10 +1088,7 @@ pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
 /// apply, so a failure is logged and nothing more.
 pub fn seed(inputs: &crate::plan::Inputs) {
     let externals = &inputs.resolved().externals;
-    if !externals
-        .iter()
-        .any(|external| external.follows().is_some())
-    {
+    if first_followed(externals).is_none() {
         return;
     }
     let stamps = Stamps::of(inputs.state());

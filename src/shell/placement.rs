@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use crate::config::env::{self, EnvDecl, Fragment, Place, Syntax, Var};
+use crate::config::external::first_followed;
 use crate::config::history::History;
 use crate::config::path::PathEntry;
 use crate::config::resolution::{BlockReason, BlockedEntry, Resolution};
@@ -160,11 +161,7 @@ pub(crate) fn place_envs(
         .map(|a| &a.origin);
     // The first external that follows a branch: the interactive file asks
     // about its updates, and is placed for that alone when nothing else is.
-    let followed_origin = merged
-        .externals
-        .iter()
-        .find(|external| external.follows().is_some())
-        .map(|external| &external.origin);
+    let followed_origin = first_followed(&merged.externals).map(|external| &external.origin);
     let resolved = envs
         .iter()
         .map(|decl| Ok((decl, resolve_env(decl, values)?)))

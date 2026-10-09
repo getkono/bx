@@ -115,6 +115,7 @@ use super::placement::{held_together, resolve_env};
 use super::source::SourceDecl;
 use super::{Assembly, Phase, SETTLE, Shell, activation, held};
 use crate::config::env::{EnvDecl, EnvKind, assignment};
+use crate::config::external::first_followed;
 use crate::config::history;
 use crate::config::path::{self, PathEntry};
 use crate::config::resolution::{BlockedEntry, Resolution};
@@ -339,11 +340,7 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
         .find(|a| a.enabled && a.command_for(Shell::Bash).is_some());
     // The first external that follows a branch: the file asks about its
     // updates, and is placed for that alone when nothing else is.
-    let followed = merged
-        .externals
-        .iter()
-        .find(|external| external.follows().is_some())
-        .map(|external| &external.origin);
+    let followed = first_followed(&merged.externals).map(|external| &external.origin);
 
     let bash = Bash::new(
         &merged.aliases,

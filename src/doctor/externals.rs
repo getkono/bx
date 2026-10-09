@@ -19,7 +19,7 @@ use std::path::Path;
 
 use super::Finding;
 use crate::config::Origin;
-use crate::config::external::External;
+use crate::config::external::{External, first_followed};
 use crate::config::lock::{self, Lock, Lookup};
 use crate::state::StateDir;
 use crate::update::{Stamps, followed, unshared_remedy};
@@ -84,10 +84,7 @@ pub fn check(
             });
         }
     }
-    if externals
-        .iter()
-        .any(|external| external.follows().is_some())
-    {
+    if first_followed(externals).is_some() {
         let stamps = Stamps::of(state);
         for stamp in [stamps.ask_due(), stamps.check_due()] {
             if stamp.exists() && Stamps::read(&stamp).is_none() {

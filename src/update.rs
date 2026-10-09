@@ -1072,15 +1072,32 @@ pub fn seed(inputs: &crate::plan::Inputs) {
     }
 }
 
+/// `update/check.lock`, held until this is dropped.
+#[derive(Debug)]
+#[must_use = "the lock is let go as soon as this is dropped"]
+pub struct CheckLock(std::fs::File);
+
+impl Drop for CheckLock {
+    fn drop(&mut self) {
+        // Unlocked explicitly rather than by the close: a process spawned
+        // from another thread while the file is open has a copy of it until
+        // it execs, and the close alone would leave the lock held by that
+        // copy, so a check that gives way to a held lock would give way to
+        // one nobody holds. A failure here has nowhere to go; the close
+        // still lets go once every copy is closed.
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 impl Stamps {
-    /// Hold `update/check.lock` for as long as the returned file is open, or
-    /// `None` when another check holds it.
+    /// Hold `update/check.lock` until the returned [`CheckLock`] is dropped,
+    /// or `None` when another check holds it.
     ///
     /// # Errors
     ///
     /// [`Error::State`] when the directory cannot be made, and
     /// [`Error::Write`] when the lock file cannot be opened.
-    pub fn try_hold(&self) -> Result<Option<std::fs::File>, Error> {
+    pub fn try_hold(&self) -> Result<Option<CheckLock>, Error> {
         self.state.ensure_update()?;
         let path = self.dir.join("check.lock");
         let file = std::fs::OpenOptions::new()
@@ -1096,7 +1113,7 @@ impl Stamps {
                 },
             })?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(file)),
+            Ok(()) => Ok(Some(CheckLock(file))),
             Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
             Err(errno) => Err(Error::Write {
                 path: path.clone(),
@@ -1115,7 +1132,7 @@ impl Stamps {
     /// # Errors
     ///
     /// As [`Stamps::try_hold`].
-    pub fn hold(&self, wait: Duration) -> Result<Option<std::fs::File>, Error> {
+    pub fn hold(&self, wait: Duration) -> Result<Option<CheckLock>, Error> {
         let until = std::time::Instant::now() + wait;
         loop {
             if let Some(held) = self.try_hold()? {
@@ -1657,5 +1674,21 @@ mod tests {
                 .is_some()
         );
         releaser.join().expect("released");
+    }
+
+    #[test]
+    fn a_check_lock_let_go_is_free_while_a_copy_of_it_is_still_open() {
+        let home = guarded_home();
+        let stamps = Stamps::of(&StateDir::resolve(home.path()));
+        let held = stamps.try_hold().expect("hold").expect("free");
+        // What a process another thread spawns holds until it execs.
+        let copy = held.0.try_clone().expect("a copy");
+        assert!(stamps.try_hold().expect("busy").is_none(), "held");
+        drop(held);
+        assert!(
+            stamps.try_hold().expect("hold").is_some(),
+            "let go, though a copy is open"
+        );
+        drop(copy);
     }
 }

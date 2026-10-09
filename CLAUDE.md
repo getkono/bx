@@ -128,6 +128,12 @@ Validate changes with `mise run`:
 - `coverage` — ≥ 80% lines, `main.rs` excluded
 - `bench` — the 5 ms shell-startup budget
 - `mutants` — mutation testing, to find logic the tests do not pin down
+- `shellcheck` — every shell script: the installer, the bench harness and its
+  stubs, and `scripts/`
+- `actionlint` — the GitHub workflows
+- `line-check` — no file newly grows past the line limit, and the baseline of
+  files already over it only shrinks
 
-`hk` runs format + lint on pre-commit and the full gate on pre-push. Commit
-messages are Conventional Commits, enforced by `convco`.
+`hk` runs `format`, `lint-fix`, `shellcheck`, `actionlint` and `line-check` on
+pre-commit, and `format-check`, `lint`, `test` and `coverage` on pre-push.
+Commit messages are Conventional Commits, enforced by `convco`.

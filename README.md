@@ -1,6 +1,6 @@
 # bx
 
-> Project Status: Alpha. Linux support is ready but documentation is missing.
+> Project Status: Alpha. Linux only.
 
 `bx` is a single-binary developer-environment manager. One `bx init` and
 one `bx apply` replace setting up mise, sccache, uv, git, ssh, gh, starship and
@@ -10,8 +10,6 @@ your machine converges to it.
 It is **additive**: it never deletes or rewrites config you wrote, and it never
 moves another tool's config, data or cache anywhere you did not declare. Remove
 `bx` and every tool you manage with it still works exactly as before.
-
-Linux ready. macOS coming soon. No Windows unless refuted.
 
 ## Install
 
@@ -29,11 +27,9 @@ if `bx` ever collides with something on your machine, drop the short name and
 nothing else changes. (`fd` ships `fdfind` on Debian for the same reason.)
 
 To upgrade, run `bx self-upgrade`: it runs this same installer over the
-installed binary. `bx self-upgrade --check` only reports whether a newer
-release exists, exiting `2` when one does, and `bx self-upgrade --force`
-reinstalls the latest release even when yours is not older. Each release pins the installer's checksum, so if the installer
-has changed since your release, `bx self-upgrade` refuses and sends you here.
-Reinstall with the line above.
+installed binary. Each release pins the installer's checksum, so if the
+installer has changed since your release, `bx self-upgrade` refuses and sends
+you here; reinstall with the line above.
 
 ## Getting started
 
@@ -69,8 +65,8 @@ There are twelve. You should not need a manual.
 | `bx rm PATH` | stop managing it, and restore the original |
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
-| `bx sync` | pull, apply, push — no git knowledge required |
-| `bx update` | move [dependencies](#dependencies) that follow a branch to its new commits: pull, look, lock and commit, apply |
+| `bx sync` | pull, apply, carry this machine's copies of tracked files into the repo and commit them, push — no git knowledge required |
+| `bx update` | move [externals](#externals) that follow a branch to its new commits: pull, look, lock and commit, apply |
 | `bx secret list` | list declared secrets, and whether each decrypts here |
 | `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
 | `bx shell-init` | the one line for your shell rc — not built yet |
@@ -91,21 +87,26 @@ module, edited by hand, and a secret is encrypted or re-encrypted to them with
 
 ### Reading a plan
 
-Six symbols, and none of them is "destroy". A tool that only adds never has
+Seven symbols, and none of them is "destroy". A tool that only adds never has
 one, so those slots go to the cases that actually matter for a tool that must
-not be invasive: something it does not own is in the way, the tool it is
-configuring for is not on this machine, and a file it wrote is no longer
-declared.
+not be invasive: something it does not own is in the way, something a target
+needs is missing, and a file it wrote is no longer declared.
 
 ```
   +  create     it does not exist yet
   ~  modify     bx owns it and the content differs
+  <  sync       a tracked file this machine changed; `bx sync` carries
+                this machine's copy into the repo and commits it
   !  conflict   it exists, differs, and bx does not own it — or you edited
                 bx's output. Reported and skipped, never overwritten.
-  ?  blocked    the tool this configures is not installed, or is installed
-                where you cannot run it. Reported and skipped until you
-                install it — writing the config anyway would break your
-                shell or your builds, not just that one tool.
+  ?  blocked    something it needs is missing: a value with no answer, or
+                one switched off or invalid; a secret that does not decrypt
+                here; a followed external `bx.lock` holds no commit for; a
+                variable bx may not set; a shape bx does not support; or,
+                for a tool activation, the tool. Reported and skipped while
+                everything else is applied. A missing tool never blocks
+                its own config file, which is written before the tool is
+                installed.
   *  undeclared bx wrote it, and the configuration no longer declares it.
                 Left exactly as it is; `bx rm` releases it.
   =  unchanged  already converged (hidden unless you ask)
@@ -185,7 +186,7 @@ path, `bx rm` when a conflict left something as it was, and
 
 - All configuration lives in an ordinary git repo you can read, edit, review,
   and host wherever you like. `bx` is not required to understand it.
-- Editing the repo by hand and running an `bx` command are the same operation:
+- Editing the repo by hand and running a `bx` command are the same operation:
   commands edit the same files, preserving your comments and formatting.
 - **Nothing user-specific is ever committed.** Identity, hostnames, absolute
   paths, and per-machine choices are asked for at setup and stay on the machine.
@@ -210,9 +211,10 @@ path, `bx rm` when a conflict left something as it was, and
   directory wider than a private file in it, a declared optional source that is
   not readable, a unit file systemd has not reloaded, enabled or loaded, or that
   has failed, a declared reference that is not on disk, a temporary file an
-  interrupted write left behind, a dependency that follows a branch
-  `bx.lock` holds no commit for, and a `local.toml` inside the config repo,
-  which bx never loads. It has no notion of a cache's size limit or of
+  interrupted write left behind, an external that follows a branch
+  `bx.lock` holds no commit for, a `bx.lock` entry nothing follows any more,
+  an update stamp that holds no time, and a `local.toml` inside the config
+  repo, which bx never loads. It has no notion of a cache's size limit or of
   an integration gone stale, and reports neither.
 
 ### Fast enough to forget
@@ -220,9 +222,12 @@ path, `bx rm` when a conflict left something as it was, and
 - `bx` runs at every shell start and must be unmeasurable. Its budget is **5 ms**
   and the budget is enforced by a benchmark in CI, not by good intentions.
 - The shell startup path spawns no process and parses no configuration file.
-  The one process a shell ever starts on its own is a dependency's background
-  check, after the first prompt, and only for a dependency you set to
-  `check = "auto"` once its interval has passed.
+  The one process a shell ever starts on its own is an external's background
+  check, after the first prompt, and only for an external you set to
+  `check = "auto"` once its interval has passed. The benchmark's configuration
+  follows no branch, so it never generates the update question; that the
+  question starts no process at a prompt with nothing due is held by its unit
+  tests.
 - Where `bx` can make *your other tools* start faster without changing their
   behaviour, it does.
 
@@ -235,7 +240,7 @@ Your config repo lives wherever you want it; `bx init` proposes
 Everything specific to you or to one machine — answers, the write record, caches,
 and the key that decrypts your secrets — stays outside the repo, on the machine.
 
-## Dependencies
+## Externals
 
 A git repository you want on every machine — a zsh plugin, a theme, a
 collection of agent skills — is an `[[external]]`: `bx` clones it where you
@@ -259,7 +264,11 @@ require = "SKILL.md"
 A pinned one moves only when you edit `rev`: the form for code you review
 before it runs. A followed one is kept at the commit `bx.lock` holds — a file
 beside `bx.toml`, committed with it, so every machine checks out the same
-commit — and `bx update` is the only thing that moves it.
+commit — and `bx update` is the only thing that moves it. Until `bx update`
+has locked it, `plan` reports it blocked. Because `bx.lock` is shared, a
+follow only your `local.toml` declares, or one it points at another url or
+branch than the committed config does, is never locked: pin it with `rev`,
+or move a follow only `local.toml` declares into a committed file.
 
 **`bx update`** brings the config repo level with its upstream, asks each
 followed branch where it is now, lists the new commits, and shows the plan the
@@ -280,9 +289,9 @@ as undeclared, for `bx rm` to release. A link never replaces a file or link
 you made; it is reported as a conflict instead. A `to` at, inside or above any
 external's checkout is refused when the configuration loads.
 
-**When bx asks.** An interactive zsh or bash asks, at a prompt, at most once per shell:
+**When bx asks.** zsh or bash asks at a prompt, at most once per shell:
 
-| the dependency says | what happens |
+| the external says | what happens |
 |---|---|
 | `check = "ask"` (the default) | once `[update] interval` (default `7d`) has passed, the prompt asks whether to check now; nothing reaches the network until you answer `y` |
 | `check = "auto"`, with its own `interval` | once that interval has passed, the shell starts one quiet, time-bounded check after its first prompt, and a later prompt offers whatever it found; nothing is applied until you answer `y` |

@@ -202,13 +202,17 @@ path, `bx rm` when a conflict left something as it was, and
 
 - A managed file edited by hand is a conflict: `plan` and `apply` report it,
   and `apply` skips it, leaving your edit exactly as it is.
+- `bx` asks nothing about a conflict: there is no prompt to keep the edit,
+  discard it, or skip the module. You settle it by hand, in the file or in
+  your configuration, and the next `plan` reads what you decided.
 - `doctor` reports a declared tool that is not on `PATH`, a required value with
   no answer, a damaged state file, an interrupted or running session, a
   directory wider than a private file in it, a declared optional source that is
   not readable, a unit file systemd has not reloaded, enabled or loaded, or that
   has failed, a declared reference that is not on disk, a temporary file an
   interrupted write left behind, and a dependency that follows a branch
-  `bx.lock` holds no commit for.
+  `bx.lock` holds no commit for. It has no notion of a cache's size limit or of
+  an integration gone stale, and reports neither.
 
 ### Fast enough to forget
 

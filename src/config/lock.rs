@@ -405,6 +405,78 @@ mod tests {
     }
 
     #[test]
+    fn each_lock_error_names_the_file_and_no_line_yet() {
+        let entry = |extra: &str| {
+            format!(
+                "[[external]]\npath = \"~/a\"\nurl = \"https://h/o/a\"\nbranch = \"main\"\n\
+                 rev = \"{REV}\"\n{extra}"
+            )
+        };
+        // Text that is not TOML at all is named as the parser places it, as
+        // in any layer file.
+        let err = parse("[[external]\n").unwrap_err();
+        assert!(
+            err.starts_with("/repo/bx.lock: TOML parse error at line 1, column 12"),
+            "{err}"
+        );
+        // Every other error names the file and line 0, "position unknown":
+        // the lock is parsed into a `DocumentMut`, which keeps no spans
+        // (#220). Each case carries the line it should name instead.
+        for (text, line) in [
+            ("[locks]\n".to_string(), 1),
+            ("\nexternal = 1\n".to_string(), 2),
+            (entry("extra = 1\n"), 6),
+            (entry("").replace("rev = ", "commit = "), 5),
+            (entry("").replace(REV, "main"), 5),
+            (entry("").replace("\"main\"", "\"-x\""), 4),
+            (entry("").replace("https://h/o/a", "file:///a"), 3),
+            (entry("").replace("~/a", "/opt/a"), 2),
+            (format!("{}\n{}", entry(""), entry("")), 8),
+            (entry("").replace("branch = \"main\"\n", ""), 1),
+        ] {
+            let err = parse(&text).unwrap_err();
+            assert!(
+                err.starts_with("/repo/bx.lock:0: "),
+                "{text:?}, whose error belongs at line {line}: {err}"
+            );
+        }
+    }
+
+    /// Any lock an `[[external]]` could be given: zero to five entries, each
+    /// at a path under the home, with an https or scp-style url, a branch of
+    /// one or two parts and a full commit id.
+    fn any_lock() -> impl proptest::strategy::Strategy<Value = Lock> {
+        use proptest::prelude::*;
+        let url = prop_oneof![
+            "[a-z0-9]{1,8}".prop_map(|repo| format!("https://h/o/{repo}")),
+            "[a-z]{1,8}".prop_map(|repo| format!("git@h:o/{repo}.git")),
+        ];
+        let entry = (
+            "[a-z][a-z0-9]{0,6}(/[a-z][a-z0-9]{0,6})?",
+            url,
+            "[a-z][a-z0-9]{0,6}(/[a-z][a-z0-9]{0,6})?",
+            "[0-9a-f]{40}",
+        );
+        proptest::collection::vec(entry, 0..5).prop_map(|entries| {
+            let mut lock = Lock::default();
+            for (path, url, branch, rev) in entries {
+                lock.set(portable(&format!("~/{path}")), locked(&url, &branch, &rev));
+            }
+            lock
+        })
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn any_lock_renders_parses_and_renders_byte_identically(lock in any_lock()) {
+            let text = lock.render();
+            let parsed = parse(&text).map_err(proptest::test_runner::TestCaseError::fail)?;
+            proptest::prop_assert_eq!(&parsed, &lock);
+            proptest::prop_assert_eq!(parsed.render(), text);
+        }
+    }
+
+    #[test]
     fn read_is_empty_without_a_file_and_names_one_it_cannot_read() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(Lock::read(dir.path(), &home()).unwrap(), Lock::default());

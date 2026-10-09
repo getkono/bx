@@ -88,8 +88,9 @@ wrong even if it passes CI.
 
 ## Packages
 
-- **clap + clap_complete** — CLI surface and completions. Dynamic values come
-  from the hidden `bx __complete`; never put completion generation on the
+- **clap** — CLI surface. Completions are planned: `clap_complete` comes back
+  with the body of the hidden `bx __complete`, which is a stub today, and
+  dynamic values will come from it. Never put completion generation on the
   shell-startup path.
 - **inquire** — interactive prompts for `init` and confirmations. There is no
   TUI beyond these.

@@ -295,7 +295,9 @@ asked. bx cannot tell a metered or mobile connection from any other, which is
 why the default is to ask first. bash asks through `PROMPT_COMMAND`, which bx
 only appends to, keeping the status your prompt shows; a bash whose
 `PROMPT_COMMAND` is exported or read-only, or a bash older than 4.4, is not
-asked, and `bx update` and `bx update --check` work there as anywhere.
+asked, and `bx update` and `bx update --check` work there as anywhere. If a
+line after bx's region exports `PROMPT_COMMAND`, a child bash inherits bx's
+entry, which does nothing there.
 
 ## License
 

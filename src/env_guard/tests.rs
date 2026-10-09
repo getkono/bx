@@ -1917,7 +1917,10 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
     // `PROMPT_COMMAND`. A parent can export that, so it is admitted only in
     // the shapes that append to it, never replace it, and only behind the
     // test that leaves an exported or read-only one alone — so the append is
-    // to a shell variable no process inherits, as a zsh hook array is.
+    // to a shell variable no process inherits, as a zsh hook array is. A line
+    // after bx's region can still export it, so the appended entry names no
+    // function: it expands the unexported BX_UPDATE_HOOK, and is nothing in a
+    // child that inherits it.
     let hook = crate::shell::update_prompt::BASH;
     let locals: Vec<&str> = hook
         .lines()
@@ -1937,6 +1940,7 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
     for name in [
         "BX_UPDATE_ASKED",
         "BX_UPDATE_CHECKING",
+        "BX_UPDATE_HOOK",
         "PROMPT_COMMAND",
         "answer",
         "now",
@@ -1946,8 +1950,8 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
     // Every assignment to PROMPT_COMMAND is one of the two appends, each
     // keeping the value it finds whole.
     let appends = [
-        "PROMPT_COMMAND+=(__bx_update)",
-        "PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND$'\\n'}__bx_update",
+        "PROMPT_COMMAND+=('${BX_UPDATE_HOOK-}')",
+        "PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND$'\\n'}'${BX_UPDATE_HOOK-}'",
     ];
     let mut registered = 0;
     for (at, _) in hook.match_indices("PROMPT_COMMAND") {

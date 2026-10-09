@@ -48,7 +48,9 @@ wrong even if it passes CI.
    `the_update_prompt_is_not_an_environment_fragment` holds its bytes to that.
    The bash update prompt is the third: it assigns only its locals, `BX_`
    names and `PROMPT_COMMAND`, which it only appends to and only when it is
-   neither exported nor read-only, so the append reaches no process, and
+   neither exported nor read-only. A later line of the user's can still
+   export it, so the appended entry names no function: it expands an
+   unexported `BX_` variable, and is nothing in a child that inherits it.
    `the_bash_update_prompt_is_not_an_environment_fragment` holds its bytes to
    that. Nothing holds a *fourth* such file to it, so the change that generates one
    carries the proof of its own bytes with it. Cached tool activation

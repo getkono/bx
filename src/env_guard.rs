@@ -121,7 +121,10 @@
 //! [`crate::shell::update_prompt::ZSH`] to that. The bash update prompt is
 //! the third: it assigns only its locals, `BX_` names and `PROMPT_COMMAND`,
 //! which it only appends to, and only when bash says it is neither exported
-//! nor read-only, so the append is to a shell variable no process inherits;
+//! nor read-only, so the append is to a shell variable no process inherits.
+//! A line the user wrote after bx's region can still export it, so the
+//! appended entry names no function: it expands the unexported
+//! `BX_UPDATE_HOOK`, and is nothing in a child that inherits it;
 //! `tests::the_bash_update_prompt_is_not_an_environment_fragment` holds
 //! [`crate::shell::update_prompt::BASH`] to that. Nothing holds a *fourth*
 //! non-fragment file to the rule, so the generator that adds one carries the

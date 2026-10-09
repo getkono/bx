@@ -42,13 +42,18 @@
 //! `precmd_functions` is:
 //!
 //! - **Appended, never replaced.** A scalar `PROMPT_COMMAND` keeps every
-//!   byte it held and gains one line, `__bx_update`; an array one (bash 5.1)
-//!   gains one element. One already holding `__bx_update` — a `~/.bashrc`
-//!   sourced twice — is left as it is.
-//! - **Never in the environment.** An exported or read-only
-//!   `PROMPT_COMMAND` is left alone and that shell is not asked, so bx's
-//!   append never reaches a process the shell starts. One that was unset
-//!   becomes a shell variable, which no process inherits.
+//!   byte it held and gains one line, `${BX_UPDATE_HOOK-}`; an array one
+//!   (bash 5.1) gains one element. One already holding that entry — a
+//!   `~/.bashrc` sourced twice — is left as it is.
+//! - **Not in the environment, and harmless if put there.** An exported or
+//!   read-only `PROMPT_COMMAND` is left alone and that shell is not asked;
+//!   one that was unset becomes a shell variable, which no process inherits.
+//!   bx cannot stop a line that runs after its own — a later
+//!   `export PROMPT_COMMAND` in `~/.bashrc` — from exporting the appended
+//!   entry, so the entry names no function: it expands the unexported
+//!   `BX_UPDATE_HOOK`, which holds `__bx_update`. A child shell that
+//!   inherits the entry has no `BX_UPDATE_HOOK`, so the entry expands to
+//!   nothing there and prints no `command not found`.
 //! - **The status kept.** `__bx_update` returns the status it was called
 //!   with, so a prompt that shows the last command's status shows the same
 //!   one it would without bx.
@@ -71,7 +76,8 @@
 //! Generated shell content that is not an environment fragment may assign
 //! nothing but bx's own `BX_` names, a function's locals, zsh's hook arrays
 //! and an append to an unexported `PROMPT_COMMAND`. The hook assigns its
-//! locals, `BX_UPDATE_ASKED` and `BX_UPDATE_CHECKING` (never exported), and
+//! locals, `BX_UPDATE_ASKED`, `BX_UPDATE_CHECKING` and, in bash,
+//! `BX_UPDATE_HOOK` (never exported), and
 //! registers itself as above; `env_guard`'s
 //! `the_update_prompt_is_not_an_environment_fragment` and
 //! `the_bash_update_prompt_is_not_an_environment_fragment` hold the bytes to
@@ -197,16 +203,22 @@ __bx_update_due() {
   return 0
 }
 # Appended to PROMPT_COMMAND, never replacing it, and only where it is not
-# exported or read-only, so the append reaches no process this shell starts.
+# exported or read-only. The entry names the hook through BX_UPDATE_HOOK, an
+# unexported variable, so where a later line exports PROMPT_COMMAND a child
+# shell that inherits the entry expands it to nothing rather than failing to
+# find a function it never defined.
 if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 404 )); then
   case ${PROMPT_COMMAND@a} in
     *[xr]*) ;;
     *a*)
-      [[ " ${PROMPT_COMMAND[*]} " == *" __bx_update "* ]] || PROMPT_COMMAND+=(__bx_update)
+      BX_UPDATE_HOOK=__bx_update
+      [[ " ${PROMPT_COMMAND[*]} " == *' ${BX_UPDATE_HOOK-} '* ]] \
+        || PROMPT_COMMAND+=('${BX_UPDATE_HOOK-}')
       ;;
     *)
-      [[ $'\n'${PROMPT_COMMAND-}$'\n' == *$'\n'__bx_update$'\n'* ]] \
-        || PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__bx_update
+      BX_UPDATE_HOOK=__bx_update
+      [[ $'\n'${PROMPT_COMMAND-}$'\n' == *$'\n''${BX_UPDATE_HOOK-}'$'\n'* ]] \
+        || PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}'${BX_UPDATE_HOOK-}'
       ;;
   esac
 fi
@@ -474,25 +486,25 @@ mod tests {
         if crate::shell::testing::installed("bash").is_none() {
             return;
         }
-        assert_eq!(prompt_command(""), "[]\n[__bx_update]\n", "unset");
+        assert_eq!(prompt_command(""), "[]\n[${BX_UPDATE_HOOK-}]\n", "unset");
         assert_eq!(
             prompt_command("PROMPT_COMMAND='history -a; echo hi'"),
-            "[]\n[history -a; echo hi\n__bx_update]\n",
+            "[]\n[history -a; echo hi\n${BX_UPDATE_HOOK-}]\n",
             "every byte it held is kept"
         );
         assert_eq!(
             prompt_command(&format!("PROMPT_COMMAND=x\n{BASH}")),
-            "[]\n[x\n__bx_update]\n",
+            "[]\n[x\n${BX_UPDATE_HOOK-}]\n",
             "a ~/.bashrc sourced twice appends once"
         );
         assert_eq!(
             prompt_command("PROMPT_COMMAND=(a 'b c')"),
-            "[a]\n[a]\n[b c]\n[__bx_update]\n",
+            "[a]\n[a]\n[b c]\n[${BX_UPDATE_HOOK-}]\n",
             "an array gains one element"
         );
         assert_eq!(
             prompt_command(&format!("PROMPT_COMMAND=(a)\n{BASH}")),
-            "[a]\n[a]\n[__bx_update]\n",
+            "[a]\n[a]\n[${BX_UPDATE_HOOK-}]\n",
             "an array once"
         );
     }
@@ -526,10 +538,30 @@ mod tests {
     }
 
     #[test]
+    fn a_later_export_carries_an_entry_a_child_bash_runs_without_error() {
+        if crate::shell::testing::installed("bash").is_none() {
+            return;
+        }
+        // A line of ~/.bashrc after bx's region exports PROMPT_COMMAND. In
+        // this shell the entry still runs the hook and keeps the status; in a
+        // child bash without bx's file it expands to nothing, so the child
+        // prints no `command not found` at its prompt.
+        let rig = Rig::new(Shell::Bash);
+        let (printed, _) = rig.run(
+            "export PROMPT_COMMAND\n\
+             (exit 7); eval \"$PROMPT_COMMAND\"; echo \"[$?]\"\n\
+             bash --norc --noprofile -c 'eval \"$PROMPT_COMMAND\"; echo \"[$?]\"'",
+            "",
+            &[],
+        );
+        assert_eq!(printed, "[7]\n[0]\n");
+    }
+
+    #[test]
     fn the_hook_is_contributed_only_when_something_follows_a_branch() {
         for (shell, registration) in [
             (Shell::Zsh, "precmd_functions+=(__bx_update)"),
-            (Shell::Bash, "PROMPT_COMMAND+=(__bx_update)"),
+            (Shell::Bash, "PROMPT_COMMAND+=('${BX_UPDATE_HOOK-}')"),
         ] {
             let mut none = Assembly::new();
             contribute(&mut none, false, shell);

@@ -435,6 +435,114 @@ mod tests {
     }
 
     #[test]
+    fn a_due_question_answered_no_snoozes() {
+        for shell in SHELLS {
+            let rig = Rig::new(shell);
+            rig.stamp("ask-due", "1\n");
+            let (printed, calls) = rig.run("__bx_update_due", "n", &[]);
+            assert!(
+                printed.contains(
+                    "bx: check now whether what this configuration follows has new commits? \
+                     [y/N] "
+                ),
+                "{shell:?}: {printed}"
+            );
+            assert_eq!(calls, "update --snooze\n", "{shell:?}");
+        }
+    }
+
+    #[test]
+    fn a_hook_with_no_bx_on_path_is_silent() {
+        for shell in SHELLS {
+            let rig = Rig::new(shell);
+            std::fs::remove_file(rig.home.path().join("bin/bx")).expect("no bx");
+            rig.stamp("available", "~/a: x\n");
+            rig.stamp("check-due", "1\n");
+            rig.stamp("ask-due", "1\n");
+            // Only the home's own `bin` on `PATH`, so no bx installed on this
+            // machine is found; the script's `sleep` is a function.
+            let path = rig.home.path().join("bin");
+            let path = path.to_str().expect("a UTF-8 tempdir");
+            let (printed, calls) =
+                rig.run_after("sleep() { :; }", "__bx_update_due", "y", &[("PATH", path)]);
+            assert_eq!(
+                (printed, calls),
+                (String::new(), String::new()),
+                "{shell:?}"
+            );
+        }
+    }
+
+    /// The bx calls the hook makes at a prompt of an interactive `shell` whose
+    /// standard input and output are a terminal and whose `TERM` is `term`,
+    /// with a background check due; `None` where zsh's `zpty`, which supplies
+    /// the terminal, is not available.
+    fn calls_at_a_terminal(shell: Shell, term: &str) -> Option<String> {
+        let zsh = crate::shell::testing::installed("zsh")?;
+        let rig = Rig::new(shell);
+        rig.stamp("check-due", "1\n");
+        let (program, flags, hook) = match shell {
+            Shell::Zsh => (zsh.clone(), "-f -i", ZSH),
+            Shell::Bash => (
+                crate::shell::testing::installed("bash")?,
+                "--norc --noprofile -i",
+                BASH,
+            ),
+        };
+        let script = rig.home.path().join("script");
+        std::fs::write(&script, format!("{hook}\n__bx_update\nwait\nsleep 0.2\n"))
+            .expect("the script");
+        let driver = rig.home.path().join("driver");
+        std::fs::write(
+            &driver,
+            format!(
+                "zmodload zsh/zpty || exit 3\n\
+                 zpty t 'TERM={term} exec {} {flags} {}'\n\
+                 for i in {{1..100}}; do zpty -t t || break; sleep 0.1; done\n\
+                 zpty -d t\n",
+                program.display(),
+                script.display()
+            ),
+        )
+        .expect("the driver");
+        let output = Command::new(&zsh)
+            .arg("-f")
+            .arg(&driver)
+            .env_clear()
+            .env("HOME", rig.home.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", rig.home.path().join("bin").display()),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .expect("the driver runs");
+        if output.status.code() == Some(3) {
+            return None;
+        }
+        assert!(output.status.success(), "{output:?}");
+        Some(std::fs::read_to_string(rig.home.path().join("calls")).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_dumb_terminal_is_never_asked() {
+        for shell in SHELLS {
+            let Some(at_a_terminal) = calls_at_a_terminal(shell, "xterm") else {
+                return;
+            };
+            assert_eq!(
+                at_a_terminal, "update --background\n",
+                "{shell:?}: the terminal is one the hook acts at"
+            );
+            assert_eq!(
+                calls_at_a_terminal(shell, "dumb").as_deref(),
+                Some(""),
+                "{shell:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_agent_ci_or_an_opt_out_is_never_asked() {
         for shell in SHELLS {
             let rig = Rig::new(shell);

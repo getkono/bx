@@ -197,6 +197,18 @@ pub fn summary(actions: &[Action]) -> String {
     )
 }
 
+/// `: STDERR` when a child said anything, and nothing otherwise: its
+/// standard error trimmed, read as UTF-8 with anything else replaced.
+pub(crate) fn stderr_suffix(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
 /// `text` with every control character but a tab spelled out — `\r`, `\n`,
 /// `\x1b` — so nothing a file or a path holds can move the cursor, colour the
 /// terminal, or start a line the rendering did not.
@@ -224,6 +236,15 @@ pub(crate) fn escape(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_childs_stderr_is_its_trimmed_text_after_a_colon_or_nothing() {
+        assert_eq!(stderr_suffix(b""), "");
+        assert_eq!(stderr_suffix(b"  \n\t"), "");
+        assert_eq!(stderr_suffix(b"\n404 https://x\n "), ": 404 https://x");
+        assert_eq!(stderr_suffix(b"a\nb\n"), ": a\nb");
+        assert_eq!(stderr_suffix(b"bad \xff byte"), ": bad \u{fffd} byte");
+    }
 
     #[test]
     fn text_with_no_control_character_but_a_tab_is_shown_as_it_is() {

@@ -38,8 +38,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use crate::detect;
-use crate::report::Exit;
-use crate::state::ContentHash;
+use crate::hash::ContentHash;
+use crate::report::{Exit, stderr_suffix};
 
 /// Where a fresh install fetches the installer from, and so where an upgrade
 /// does.
@@ -124,17 +124,6 @@ pub enum Error {
     /// The output could not be written.
     #[error("writing the output: {0}")]
     Output(#[source] std::io::Error),
-}
-
-/// `: STDERR` when a child said anything, and nothing otherwise.
-fn stderr_suffix(stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        String::new()
-    } else {
-        format!(": {stderr}")
-    }
 }
 
 /// A release version: `MAJOR.MINOR.PATCH`, ordered numerically.
@@ -686,15 +675,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
             let small = (a.0 % 4, a.1 % 4, a.2 % 4);
             proptest::prop_assert_eq!(version(b).cmp(&version(small)), b.cmp(&small));
         }
-    }
-
-    #[test]
-    fn a_childs_stderr_is_its_trimmed_text_after_a_colon_or_nothing() {
-        assert_eq!(stderr_suffix(b""), "");
-        assert_eq!(stderr_suffix(b"  \n\t"), "");
-        assert_eq!(stderr_suffix(b"\n404 https://x\n "), ": 404 https://x");
-        assert_eq!(stderr_suffix(b"a\nb\n"), ": a\nb");
-        assert_eq!(stderr_suffix(b"bad \xff byte"), ": bad \u{fffd} byte");
     }
 
     #[test]

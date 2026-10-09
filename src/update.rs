@@ -45,7 +45,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::external::{Check, External};
+use crate::config::external::{Check, External, first_followed};
 use crate::config::lock::{self, Lock, Locked};
 use crate::config::update::Interval;
 use crate::fs::Mode;
@@ -268,6 +268,44 @@ pub fn select<'a>(
     Ok(chosen)
 }
 
+/// How long [`look_all`] lets `git` wait on the remotes it asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// Each remote on its own, for [`LOOK_BOUND`] from when it is asked: a
+    /// person's check, or `bx update`, where one remote that never answers
+    /// holds the question up for a minute rather than until Ctrl-C.
+    EachRemote,
+    /// Every remote together, until this deadline, each `git` in its own
+    /// process group: the background check.
+    Background(std::time::Instant),
+}
+
+/// [`look`] at each of `chosen`, with no prompt from `git` and its time
+/// bounded by `bound`, in the order chosen.
+///
+/// Never fails, as [`look`] does not.
+#[must_use]
+pub fn look_all(
+    git: &Git,
+    bound: Bound,
+    home: &Path,
+    chosen: &[&External],
+    lock: &Lock,
+    ledger: &crate::state::LedgerView,
+) -> Vec<Found> {
+    chosen
+        .iter()
+        .map(|external| {
+            let looker = git.clone().unattended();
+            let looker = match bound {
+                Bound::EachRemote => looker.with_deadline(std::time::Instant::now() + LOOK_BOUND),
+                Bound::Background(deadline) => looker.with_deadline(deadline).in_own_group(),
+            };
+            look(&looker, home, external, lock, ledger)
+        })
+        .collect()
+}
+
 /// Ask where `external`'s branch is, against the commit `lock` holds.
 ///
 /// Never fails: a remote that cannot be asked is
@@ -434,8 +472,16 @@ pub fn proposed(
             );
         }
     }
-    next.retain(|path| followed(path, externals) || committed.is_none_or(|c| followed(path, c)));
+    next.retain(|path| kept(path, externals, committed));
     next
+}
+
+/// Whether [`proposed`] keeps the lock entry for `path`: while `externals`,
+/// this account's merged configuration, or `committed`, the committed layers
+/// alone, follows it, and always while `committed` is unknown.
+#[must_use]
+pub fn kept(path: &Portable, externals: &[External], committed: Option<&[External]>) -> bool {
+    followed(path, externals) || committed.is_none_or(|c| followed(path, c))
 }
 
 /// Whether any of `externals` follows a branch at `path`.
@@ -455,28 +501,49 @@ pub fn unshared(found: &Found, committed: Option<&[External]>) -> bool {
     unshared_at(&found.path, &found.url, &found.branch, committed)
 }
 
-/// What `bx update` cannot do for `external`'s follow, which `local.toml`
-/// alone declares or points elsewhere ([`unshared`]): the remedy that locks
-/// it instead, or `None` for a follow `bx update` does lock, and for a pin.
-///
-/// A follow the committed configuration already declares elsewhere is not
-/// told to declare it in a committed layer, as `bx update`'s own message for
-/// that case does not: that would change what every account follows.
+/// Why the shared `bx.lock` does not take a follow ([`unshared`]), which
+/// decides the remedy each message names for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unshared {
+    /// The committed configuration follows the path too, from another url or
+    /// branch: only a `rev` locks this one, because declaring it in a
+    /// committed layer would change what every account follows.
+    Elsewhere,
+    /// The committed configuration does not follow the path at all: a
+    /// committed layer that declares the follow, or a `rev`, locks it.
+    NotCommitted,
+}
+
+/// Why `found`'s follow is [`unshared`], or `None` when it is not.
 #[must_use]
-pub fn unshared_remedy(
-    external: &External,
-    committed: Option<&[External]>,
-) -> Option<&'static str> {
+pub fn why_unshared(found: &Found, committed: Option<&[External]>) -> Option<Unshared> {
+    why_unshared_at(&found.path, &found.url, &found.branch, committed)
+}
+
+/// What `bx update` cannot do for `external`'s follow, which `local.toml`
+/// alone declares or points elsewhere ([`unshared`]): why, which names the
+/// remedy that locks it instead, or `None` for a follow `bx update` does
+/// lock, and for a pin.
+#[must_use]
+pub fn unshared_remedy(external: &External, committed: Option<&[External]>) -> Option<Unshared> {
     let follow = external.follows()?;
-    if !unshared_at(&external.path, &external.url, &follow.branch, committed) {
+    why_unshared_at(&external.path, &external.url, &follow.branch, committed)
+}
+
+/// [`why_unshared`], for the follow of `branch` of `url` at `path`.
+fn why_unshared_at(
+    path: &Portable,
+    url: &str,
+    branch: &str,
+    committed: Option<&[External]>,
+) -> Option<Unshared> {
+    if !unshared_at(path, url, branch, committed) {
         return None;
     }
-    Some(if committed.is_some_and(|c| followed(&external.path, c)) {
-        "`bx update` locks the branch and url the committed configuration follows here, not \
-         this one; pin it with `rev`"
+    Some(if committed.is_some_and(|c| followed(path, c)) {
+        Unshared::Elsewhere
     } else {
-        "`bx update` locks only what the committed configuration follows; declare it in a \
-         committed layer, or pin it with `rev`"
+        Unshared::NotCommitted
     })
 }
 
@@ -805,7 +872,7 @@ impl Stamps {
     /// # Errors
     ///
     /// [`Error::Write`].
-    pub fn write(&self, path: &Path, text: &str) -> Result<(), Error> {
+    pub(crate) fn write(&self, path: &Path, text: &str) -> Result<(), Error> {
         crate::fs::write_atomically(path, text.as_bytes(), Mode::PRIVATE_FILE).map_err(|source| {
             Error::Write {
                 path: path.to_path_buf(),
@@ -946,18 +1013,10 @@ fn looked(
     }
     // The whole background run shares one bound; a person's check bounds each
     // remote on its own.
-    let started = std::time::Instant::now();
-    let git = |started: std::time::Instant| {
-        if background {
-            git.clone()
-                .unattended()
-                .with_deadline(started + BACKGROUND_BOUND)
-                .in_own_group()
-        } else {
-            git.clone()
-                .unattended()
-                .with_deadline(std::time::Instant::now() + LOOK_BOUND)
-        }
+    let bound = if background {
+        Bound::Background(std::time::Instant::now() + BACKGROUND_BOUND)
+    } else {
+        Bound::EachRemote
     };
     let chosen: Vec<&External> = select(externals, names, &env.home)?
         .into_iter()
@@ -969,10 +1028,7 @@ fn looked(
                 )
         })
         .collect();
-    let found: Vec<Found> = chosen
-        .iter()
-        .map(|external| look(&git(started), &env.home, external, inputs.lock(), &ledger))
-        .collect();
+    let found = look_all(git, bound, &env.home, &chosen, inputs.lock(), &ledger);
 
     let available = offered(
         &std::fs::read_to_string(stamps.available()).unwrap_or_default(),
@@ -1088,10 +1144,7 @@ pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
 /// apply, so a failure is logged and nothing more.
 pub fn seed(inputs: &crate::plan::Inputs) {
     let externals = &inputs.resolved().externals;
-    if !externals
-        .iter()
-        .any(|external| external.follows().is_some())
-    {
+    if first_followed(externals).is_none() {
         return;
     }
     let stamps = Stamps::of(inputs.state());
@@ -1429,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn the_unshared_remedy_says_exactly_what_locks_the_follow_instead() {
+    fn the_unshared_remedy_says_why_the_shared_lock_does_not_take_the_follow() {
         let mine = followed("~/mine", Check::Ask);
         let mut elsewhere = followed("~/mine", Check::Ask);
         elsewhere.pin = Pin::Follow(Follow {
@@ -1445,17 +1498,26 @@ mod tests {
         assert_eq!(unshared_remedy(&mine, None), None, "committed unknown");
         assert_eq!(
             unshared_remedy(&mine, Some(&[])),
-            Some(
-                "`bx update` locks only what the committed configuration follows; declare it \
-                 in a committed layer, or pin it with `rev`"
-            )
+            Some(Unshared::NotCommitted)
         );
         assert_eq!(
-            unshared_remedy(&mine, Some(&[elsewhere])),
-            Some(
-                "`bx update` locks the branch and url the committed configuration follows \
-                 here, not this one; pin it with `rev`"
-            )
+            unshared_remedy(&mine, Some(std::slice::from_ref(&elsewhere))),
+            Some(Unshared::Elsewhere)
+        );
+        let looked = found("~/mine", Some(A), Verdict::Current);
+        assert_eq!(why_unshared(&looked, None), None, "committed unknown");
+        assert_eq!(
+            why_unshared(&looked, Some(std::slice::from_ref(&mine))),
+            None,
+            "a follow the committed configuration declares"
+        );
+        assert_eq!(
+            why_unshared(&looked, Some(&[])),
+            Some(Unshared::NotCommitted)
+        );
+        assert_eq!(
+            why_unshared(&looked, Some(&[elsewhere])),
+            Some(Unshared::Elsewhere)
         );
     }
 

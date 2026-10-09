@@ -167,6 +167,15 @@ impl External {
     }
 }
 
+/// The first of `externals` that follows a branch, or `None` when every one
+/// is pinned.
+#[must_use]
+pub fn first_followed(externals: &[External]) -> Option<&External> {
+    externals
+        .iter()
+        .find(|external| external.follows().is_some())
+}
+
 /// Where an external's commit comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pin {
@@ -699,6 +708,21 @@ mod tests {
 
         let defaulted = parse(&entry("~/a", "https://github.com/o/a", REV)).unwrap();
         assert!(defaulted[0].enabled, "enabled defaults to true");
+    }
+
+    #[test]
+    fn first_followed_is_the_first_external_that_follows_a_branch() {
+        let pinned = entry("~/a", "https://h/o/a", REV);
+        let follows = |path: &str| {
+            format!("[[external]]\npath = \"{path}\"\nurl = \"https://h/o/b\"\nbranch = \"main\"\n")
+        };
+        let parsed = parse(&format!("{pinned}{}{}", follows("~/b"), follows("~/c"))).unwrap();
+        assert_eq!(
+            first_followed(&parsed).map(|external| external.path.as_str()),
+            Some("~/b")
+        );
+        assert_eq!(first_followed(&parsed[..1]), None, "every one pinned");
+        assert_eq!(first_followed(&[]), None);
     }
 
     #[test]

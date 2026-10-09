@@ -19,10 +19,11 @@ use std::path::Path;
 
 use super::Finding;
 use crate::config::Origin;
-use crate::config::external::External;
+use crate::config::external::{External, first_followed};
 use crate::config::lock::{self, Lock, Lookup};
+use crate::plan::external::unlocked_note;
 use crate::state::StateDir;
-use crate::update::{Stamps, followed, unshared_remedy};
+use crate::update::{Stamps, kept};
 
 /// A finding for every followed external the lock does not hold, then every
 /// lock entry nothing follows, then every unreadable stamp.
@@ -43,25 +44,18 @@ pub fn check(
         let Some(follow) = external.follows() else {
             continue;
         };
-        let remedy = unshared_remedy(external, committed);
-        let note = match lock.lookup(external) {
+        let stale = match lock.lookup(external) {
             Lookup::Locked(_) => continue,
-            Lookup::Missing => format!(
-                "follows `{}`, and {} holds no commit for it, so apply leaves it as it is; {}",
-                follow.branch,
-                lock::FILE,
-                remedy.unwrap_or("`bx update` locks one")
-            ),
-            Lookup::Stale(locked) => format!(
-                "follows `{}` of {}, and {} locks it for `{}` of {}; {}",
-                follow.branch,
-                external.url,
-                lock::FILE,
-                locked.branch,
-                locked.url,
-                remedy.unwrap_or("`bx update` locks it again")
-            ),
+            Lookup::Missing => None,
+            Lookup::Stale(locked) => Some(locked),
         };
+        let note = unlocked_note(
+            external,
+            follow,
+            stale,
+            committed,
+            ", so apply leaves it as it is",
+        );
         findings.push(Finding {
             subject: external.path.to_string(),
             origin: Some(external.origin.clone()),
@@ -69,8 +63,7 @@ pub fn check(
         });
     }
     for (path, locked) in lock.iter() {
-        let kept = followed(path, externals) || committed.is_none_or(|c| followed(path, c));
-        if !kept {
+        if !kept(path, externals, committed) {
             findings.push(Finding {
                 subject: path.to_string(),
                 origin: Some(Origin::unknown(&Lock::path_in(repo))),
@@ -84,10 +77,7 @@ pub fn check(
             });
         }
     }
-    if externals
-        .iter()
-        .any(|external| external.follows().is_some())
-    {
+    if first_followed(externals).is_some() {
         let stamps = Stamps::of(state);
         for stamp in [stamps.ask_due(), stamps.check_due()] {
             if stamp.exists() && Stamps::read(&stamp).is_none() {

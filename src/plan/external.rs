@@ -127,7 +127,7 @@ pub(super) fn decide_all(
         let rev = match rev(external, ctx.lock) {
             Ok(rev) => rev,
             Err((follow, stale)) => {
-                let note = unlocked(external, follow, stale, ctx.committed);
+                let note = unlocked_note(external, follow, stale, ctx.committed, " yet");
                 rows.push(Change {
                     target: external.path.as_str().to_string(),
                     origin: external.origin.clone(),
@@ -178,22 +178,34 @@ pub(crate) fn rev<'a>(
     }
 }
 
-/// The note for the blocked row of `external`, which follows `follow` and
-/// which `lock` holds `stale` for, if anything ([`rev`]).
+/// What a followed `external` that `bx.lock` does not hold says, in `plan`'s
+/// blocked row and in `doctor`'s finding alike: it follows `follow`, and the
+/// lock holds `stale` for it, or nothing ([`rev`]), where `missing` is what
+/// the note says after "holds no commit for it".
 ///
 /// `bx update` locks the follow, unless `local.toml` alone declares it or
 /// points it elsewhere than `committed` does, which the shared `bx.lock`
 /// never takes; the note then names what does lock it.
-fn unlocked(
+pub(crate) fn unlocked_note(
     external: &External,
     follow: &Follow,
     stale: Option<&Locked>,
     committed: Option<&[External]>,
+    missing: &str,
 ) -> String {
-    let remedy = update::unshared_remedy(external, committed);
+    let remedy = update::unshared_remedy(external, committed).map(|unshared| match unshared {
+        update::Unshared::Elsewhere => {
+            "`bx update` locks the branch and url the committed configuration follows here, \
+             not this one; pin it with `rev`"
+        }
+        update::Unshared::NotCommitted => {
+            "`bx update` locks only what the committed configuration follows; declare it in \
+             a committed layer, or pin it with `rev`"
+        }
+    });
     match stale {
         None => format!(
-            "follows `{}`, and {} holds no commit for it yet; {}",
+            "follows `{}`, and {} holds no commit for it{missing}; {}",
             follow.branch,
             lock::FILE,
             remedy.unwrap_or("`bx update` locks one")

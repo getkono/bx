@@ -22,7 +22,7 @@ use crate::config::Origin;
 use crate::config::external::{External, first_followed};
 use crate::config::lock::{self, Lock, Lookup};
 use crate::state::StateDir;
-use crate::update::{Stamps, followed, unshared_remedy};
+use crate::update::{Stamps, kept, unshared_remedy};
 
 /// A finding for every followed external the lock does not hold, then every
 /// lock entry nothing follows, then every unreadable stamp.
@@ -69,8 +69,7 @@ pub fn check(
         });
     }
     for (path, locked) in lock.iter() {
-        let kept = followed(path, externals) || committed.is_none_or(|c| followed(path, c));
-        if !kept {
+        if !kept(path, externals, committed) {
             findings.push(Finding {
                 subject: path.to_string(),
                 origin: Some(Origin::unknown(&Lock::path_in(repo))),

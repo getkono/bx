@@ -434,8 +434,16 @@ pub fn proposed(
             );
         }
     }
-    next.retain(|path| followed(path, externals) || committed.is_none_or(|c| followed(path, c)));
+    next.retain(|path| kept(path, externals, committed));
     next
+}
+
+/// Whether [`proposed`] keeps the lock entry for `path`: while `externals`,
+/// this account's merged configuration, or `committed`, the committed layers
+/// alone, follows it, and always while `committed` is unknown.
+#[must_use]
+pub fn kept(path: &Portable, externals: &[External], committed: Option<&[External]>) -> bool {
+    followed(path, externals) || committed.is_none_or(|c| followed(path, c))
 }
 
 /// Whether any of `externals` follows a branch at `path`.

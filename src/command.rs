@@ -548,19 +548,22 @@ fn update_with(
 
     let before = inputs.lock().clone();
     let committed = inputs.committed_externals();
-    let unshared: Vec<&update::Found> = found
+    let unshared: Vec<(&update::Found, update::Unshared)> = found
         .iter()
-        .filter(|found| found.moves_to().is_some() && update::unshared(found, committed))
+        .filter(|found| found.moves_to().is_some())
+        .filter_map(|found| Some((found, update::why_unshared(found, committed)?)))
         .collect();
-    for found in &unshared {
-        let elsewhere = committed.is_some_and(|committed| update::followed(&found.path, committed));
-        let why = if elsewhere {
-            "and the committed configuration another branch or url; the shared bx.lock keeps \
-             the committed one's"
-        } else {
-            "and the committed configuration does not follow it; the shared bx.lock holds only \
-             what the committed configuration follows. Declare it in a committed layer, or pin \
-             it with `rev`"
+    for (found, unshared) in &unshared {
+        let why = match unshared {
+            update::Unshared::Elsewhere => {
+                "and the committed configuration another branch or url; the shared bx.lock \
+                 keeps the committed one's"
+            }
+            update::Unshared::NotCommitted => {
+                "and the committed configuration does not follow it; the shared bx.lock holds \
+                 only what the committed configuration follows. Declare it in a committed \
+                 layer, or pin it with `rev`"
+            }
         };
         say(
             out,

@@ -463,28 +463,49 @@ pub fn unshared(found: &Found, committed: Option<&[External]>) -> bool {
     unshared_at(&found.path, &found.url, &found.branch, committed)
 }
 
-/// What `bx update` cannot do for `external`'s follow, which `local.toml`
-/// alone declares or points elsewhere ([`unshared`]): the remedy that locks
-/// it instead, or `None` for a follow `bx update` does lock, and for a pin.
-///
-/// A follow the committed configuration already declares elsewhere is not
-/// told to declare it in a committed layer, as `bx update`'s own message for
-/// that case does not: that would change what every account follows.
+/// Why the shared `bx.lock` does not take a follow ([`unshared`]), which
+/// decides the remedy each message names for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unshared {
+    /// The committed configuration follows the path too, from another url or
+    /// branch: only a `rev` locks this one, because declaring it in a
+    /// committed layer would change what every account follows.
+    Elsewhere,
+    /// The committed configuration does not follow the path at all: a
+    /// committed layer that declares the follow, or a `rev`, locks it.
+    NotCommitted,
+}
+
+/// Why `found`'s follow is [`unshared`], or `None` when it is not.
 #[must_use]
-pub fn unshared_remedy(
-    external: &External,
-    committed: Option<&[External]>,
-) -> Option<&'static str> {
+pub fn why_unshared(found: &Found, committed: Option<&[External]>) -> Option<Unshared> {
+    why_unshared_at(&found.path, &found.url, &found.branch, committed)
+}
+
+/// What `bx update` cannot do for `external`'s follow, which `local.toml`
+/// alone declares or points elsewhere ([`unshared`]): why, which names the
+/// remedy that locks it instead, or `None` for a follow `bx update` does
+/// lock, and for a pin.
+#[must_use]
+pub fn unshared_remedy(external: &External, committed: Option<&[External]>) -> Option<Unshared> {
     let follow = external.follows()?;
-    if !unshared_at(&external.path, &external.url, &follow.branch, committed) {
+    why_unshared_at(&external.path, &external.url, &follow.branch, committed)
+}
+
+/// [`why_unshared`], for the follow of `branch` of `url` at `path`.
+fn why_unshared_at(
+    path: &Portable,
+    url: &str,
+    branch: &str,
+    committed: Option<&[External]>,
+) -> Option<Unshared> {
+    if !unshared_at(path, url, branch, committed) {
         return None;
     }
-    Some(if committed.is_some_and(|c| followed(&external.path, c)) {
-        "`bx update` locks the branch and url the committed configuration follows here, not \
-         this one; pin it with `rev`"
+    Some(if committed.is_some_and(|c| followed(path, c)) {
+        Unshared::Elsewhere
     } else {
-        "`bx update` locks only what the committed configuration follows; declare it in a \
-         committed layer, or pin it with `rev`"
+        Unshared::NotCommitted
     })
 }
 
@@ -1434,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn the_unshared_remedy_says_exactly_what_locks_the_follow_instead() {
+    fn the_unshared_remedy_says_why_the_shared_lock_does_not_take_the_follow() {
         let mine = followed("~/mine", Check::Ask);
         let mut elsewhere = followed("~/mine", Check::Ask);
         elsewhere.pin = Pin::Follow(Follow {
@@ -1450,17 +1471,26 @@ mod tests {
         assert_eq!(unshared_remedy(&mine, None), None, "committed unknown");
         assert_eq!(
             unshared_remedy(&mine, Some(&[])),
-            Some(
-                "`bx update` locks only what the committed configuration follows; declare it \
-                 in a committed layer, or pin it with `rev`"
-            )
+            Some(Unshared::NotCommitted)
         );
         assert_eq!(
-            unshared_remedy(&mine, Some(&[elsewhere])),
-            Some(
-                "`bx update` locks the branch and url the committed configuration follows \
-                 here, not this one; pin it with `rev`"
-            )
+            unshared_remedy(&mine, Some(std::slice::from_ref(&elsewhere))),
+            Some(Unshared::Elsewhere)
+        );
+        let looked = found("~/mine", Some(A), Verdict::Current);
+        assert_eq!(why_unshared(&looked, None), None, "committed unknown");
+        assert_eq!(
+            why_unshared(&looked, Some(std::slice::from_ref(&mine))),
+            None,
+            "a follow the committed configuration declares"
+        );
+        assert_eq!(
+            why_unshared(&looked, Some(&[])),
+            Some(Unshared::NotCommitted)
+        );
+        assert_eq!(
+            why_unshared(&looked, Some(&[elsewhere])),
+            Some(Unshared::Elsewhere)
         );
     }
 

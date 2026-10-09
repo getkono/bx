@@ -30,7 +30,7 @@
 //! fast-forwarded; ahead, its commits are pushed once the apply is done; both,
 //! and `sync` stops with [`Error::Diverged`] before it applies anything, its
 //! only change by then being the commit of copies an interrupted sync carried
-//! ([`pull`] says when that is made). It
+//! ([`pull`] says when that is made), which the error names when it was made. It
 //! never merges, rebases, resets or force-pushes: a diverged history is a
 //! human's to reconcile, and `sync` is run again once they have.
 //!
@@ -110,8 +110,9 @@ pub enum Error {
     /// Both the branch and its upstream have commits the other lacks.
     #[error(
         "{branch} and {upstream} have diverged ({ahead} commit(s) only here, {behind} only \
-         there); bx sync only fast-forwards and changed nothing. Merge or rebase {branch} \
-         yourself, then run bx sync again"
+         there); bx sync only fast-forwards and {}. Merge or rebase {branch} yourself, then \
+         run bx sync again",
+        diverged_changes(*.recovered)
     )]
     Diverged {
         /// The branch.
@@ -122,6 +123,9 @@ pub enum Error {
         ahead: u64,
         /// Commits on the upstream the branch lacks.
         behind: u64,
+        /// Tracked copies an interrupted sync left uncommitted, which [`pull`]
+        /// committed before it found the divergence; counted in `ahead`.
+        recovered: usize,
     },
     /// The state directory is inside the config repo, where a commit would
     /// publish it.
@@ -162,6 +166,19 @@ pub enum Error {
     /// The output could not be written.
     #[error("writing the output: {0}")]
     Output(#[source] std::io::Error),
+}
+
+/// What [`Error::Diverged`] says `sync` changed before it refused: nothing,
+/// or only the commit of the `recovered` copies an interrupted sync carried.
+fn diverged_changes(recovered: usize) -> String {
+    if recovered == 0 {
+        "changed nothing".to_string()
+    } else {
+        format!(
+            "changed nothing but committing the {recovered} tracked file(s) an interrupted \
+             sync had left uncommitted"
+        )
+    }
 }
 
 /// The branch's upstream, as git's configuration names it.
@@ -244,6 +261,7 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
             upstream: upstream.short,
             ahead,
             behind,
+            recovered,
         });
     }
     if ahead > 0 {
@@ -820,14 +838,72 @@ pub(crate) mod tests {
                 Error::Diverged {
                     ahead: 1,
                     behind: 1,
+                    recovered: 0,
                     ..
                 }
             ),
             "{error:?}"
         );
-        assert!(error.to_string().contains("changed nothing"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("only fast-forwards and changed nothing. Merge"),
+            "{error}"
+        );
         assert_eq!(rev(home.path(), &repo, "HEAD"), mine, "the branch moved");
         assert!(!repo.join("theirs.toml").exists());
+    }
+
+    #[test]
+    fn a_diverged_branch_refused_after_a_recovered_commit_names_that_commit() {
+        let home = guarded_home();
+        let repo = cloned(
+            &home,
+            "[[target]]\npath = \"~/.lock\"\nfile = \"lock\"\ndirection = \"track\"\n",
+        );
+        std::fs::write(repo.join("lock"), "a\n").expect("the repo copy");
+        commit_all(home.path(), &repo, "track");
+        run(home.path(), &repo, &["push", "--quiet"]);
+        home.write(".lock", "a\n");
+        let sync = |what: &str| {
+            let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+            crate::plan::run(&inputs, crate::plan::Mode::Sync, &mut |_| Ok(true)).expect(what);
+        };
+        sync("the agreeing run");
+        home.write(".lock", "b\n");
+        sync("the carrying run");
+        let other = other(&home);
+        std::fs::write(other.join("theirs.toml"), "").expect("theirs");
+        commit_all(home.path(), &other, "theirs");
+        run(home.path(), &other, &["push", "--quiet"]);
+
+        let error = pull(&env(home.path()), &git(home.path())).expect_err("diverged");
+
+        assert!(
+            matches!(
+                &error,
+                Error::Diverged {
+                    ahead: 1,
+                    behind: 1,
+                    recovered: 1,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "changed nothing but committing the 1 tracked file(s) an interrupted sync \
+                 had left uncommitted. Merge"
+            ),
+            "{message}"
+        );
+        assert_eq!(
+            run(home.path(), &repo, &["log", "-1", "--format=%s"]),
+            CARRIED_SUBJECT,
+            "the recovered commit the message names is on the branch"
+        );
     }
 
     #[test]

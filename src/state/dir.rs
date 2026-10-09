@@ -1536,14 +1536,28 @@ mod tests {
         // follows, to a file whose real path is longer than `PATH_MAX`, can be
         // examined but not resolved.
         //
-        // The over-long real path is staged as a *chain* of short links: each
-        // one names a single 200-byte component under the link before it, so
-        // no symlink target grows past ~204 bytes and no path handed to a
-        // syscall is long either. A filesystem that caps one symlink target
-        // well below `PATH_MAX` — XFS caps it at 1024 bytes — stages this as
-        // readily as any other. The chain grows until `canonicalize` of the
-        // cursor itself is the failure under test, so the length that is
-        // enough is measured here rather than assumed.
+        // The over-long real path is staged as a *chain* of links: each one
+        // names four 200-byte components under the link before it, so no
+        // symlink target grows past ~810 bytes and no path handed to a syscall
+        // is long either. A filesystem that caps one symlink target well below
+        // `PATH_MAX` — XFS caps it at 1024 bytes — stages this as readily as
+        // any other. The chain grows until `canonicalize` of the cursor itself
+        // is the failure under test, so the length that is enough is measured
+        // here rather than assumed.
+        //
+        // Issue #196: the chain is kept *short*, not merely under the kernel's
+        // 40-link limit. Following `local.toml` costs one link per step of the
+        // chain plus the state-directory link and `local.toml` itself, and the
+        // kernel does not reset that count when a lockless (RCU) path walk
+        // gives up and the walk is retried with references
+        // (`filename_lookup` keeps `total_link_count` across the retry). A
+        // chain of ~21 one-component links cost ~23 per walk, so a retried
+        // `stat` — which a concurrent change to the dcache or mount table can
+        // provoke — counts ~46 and fails with `ELOOP`: the precondition below
+        // failed that way once on CI, with its errno unrecorded. Four
+        // components a link needs ~6 links, ~8 per walk, and the cap of 10
+        // links is 12 per walk, so even three passes stay under 40.
+        const PER_LINK: usize = 4;
         let (home, _target, dir) = linked_state(0o711);
         let part = "d".repeat(200);
         std::fs::create_dir(home.child("deep")).expect("deep");
@@ -1555,12 +1569,15 @@ mod tests {
                 Err(e) if e.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error()) => break,
                 Err(e) => panic!("staging the chain at {}: {e}", cursor.display()),
             }
-            // The kernel refuses more than 40 nested links, and each step here
-            // costs one. A real path over `PATH_MAX` needs ~21 of them, so
-            // failing to get there is a surprise worth reporting, not a skip.
-            assert!(links < 32, "no real path over PATH_MAX after {links} links");
-            let next = cursor.join(&part);
-            std::fs::create_dir(home.child(&next)).expect("one component deeper");
+            // A real path over `PATH_MAX` needs ~6 links, and the budget above
+            // holds to 10, so failing to get there by then is a surprise worth
+            // reporting, not a skip.
+            assert!(links < 10, "no real path over PATH_MAX after {links} links");
+            let mut next = cursor.clone();
+            for _ in 0..PER_LINK {
+                next.push(&part);
+                std::fs::create_dir(home.child(&next)).expect("one component deeper");
+            }
             let link = PathBuf::from(format!("s{links}"));
             std::os::unix::fs::symlink(&next, home.child(&link)).expect("a short link to it");
             cursor = link;
@@ -1569,10 +1586,10 @@ mod tests {
         let near = home.child(&cursor);
         std::fs::write(near.join("local.toml"), "[values]\n").expect("local.toml");
         std::os::unix::fs::symlink(near.join("local.toml"), dir.local_toml()).expect("symlink");
-        assert!(
-            std::fs::metadata(dir.local_toml()).is_ok_and(|meta| meta.is_file()),
-            "the link can be followed",
-        );
+        match std::fs::metadata(dir.local_toml()) {
+            Ok(meta) => assert!(meta.is_file(), "the link names a file: {meta:?}"),
+            Err(e) => panic!("the link can be followed after {links} links: {e:?}"),
+        }
 
         let err = dir
             .ensure()

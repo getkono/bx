@@ -101,12 +101,13 @@ needs is missing, and a file it wrote is no longer declared.
                 bx's output. Reported and skipped, never overwritten.
   ?  blocked    something it needs is missing: a value with no answer, or
                 one switched off or invalid; a secret that does not decrypt
-                here; a followed external `bx.lock` holds no commit for; a
-                variable bx may not set; a shape bx does not support; or,
-                for a tool activation, the tool. Reported and skipped while
-                everything else is applied. A missing tool never blocks
-                its own config file, which is written before the tool is
-                installed.
+                here; a followed external `bx.lock` holds no commit for; an
+                external whose clone or fetch failed during `apply`, and a
+                link that needed its commit; a variable bx may not set; a
+                shape bx does not support; or, for a tool activation, the
+                tool. Reported and skipped while everything else is
+                applied. A missing tool never blocks its own config file,
+                which is written before the tool is installed.
   *  undeclared bx wrote it, and the configuration no longer declares it.
                 Left exactly as it is; `bx rm` releases it.
   =  unchanged  already converged (hidden unless you ask)

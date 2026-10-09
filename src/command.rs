@@ -525,18 +525,14 @@ fn update_with(
     let ledger = crate::state::LedgerView::read(inputs.state(), &env.home)
         .map_err(Error::from)?
         .value;
-    // Each remote has its own bound, so one that never answers holds the
-    // question up for a minute rather than until someone presses Ctrl-C.
-    let found: Vec<update::Found> = chosen
-        .iter()
-        .map(|external| {
-            let looker = git
-                .clone()
-                .unattended()
-                .with_deadline(std::time::Instant::now() + update::LOOK_BOUND);
-            update::look(&looker, &env.home, external, inputs.lock(), &ledger)
-        })
-        .collect();
+    let found = update::look_all(
+        git,
+        update::Bound::EachRemote,
+        &env.home,
+        &chosen,
+        inputs.lock(),
+        &ledger,
+    );
     for found in &found {
         say(out, &found.summary())?;
         if let update::Verdict::Moves { log: Some(log), .. } = &found.verdict {

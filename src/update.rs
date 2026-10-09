@@ -268,6 +268,44 @@ pub fn select<'a>(
     Ok(chosen)
 }
 
+/// How long [`look_all`] lets `git` wait on the remotes it asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// Each remote on its own, for [`LOOK_BOUND`] from when it is asked: a
+    /// person's check, or `bx update`, where one remote that never answers
+    /// holds the question up for a minute rather than until Ctrl-C.
+    EachRemote,
+    /// Every remote together, until this deadline, each `git` in its own
+    /// process group: the background check.
+    Background(std::time::Instant),
+}
+
+/// [`look`] at each of `chosen`, with no prompt from `git` and its time
+/// bounded by `bound`, in the order chosen.
+///
+/// Never fails, as [`look`] does not.
+#[must_use]
+pub fn look_all(
+    git: &Git,
+    bound: Bound,
+    home: &Path,
+    chosen: &[&External],
+    lock: &Lock,
+    ledger: &crate::state::LedgerView,
+) -> Vec<Found> {
+    chosen
+        .iter()
+        .map(|external| {
+            let looker = git.clone().unattended();
+            let looker = match bound {
+                Bound::EachRemote => looker.with_deadline(std::time::Instant::now() + LOOK_BOUND),
+                Bound::Background(deadline) => looker.with_deadline(deadline).in_own_group(),
+            };
+            look(&looker, home, external, lock, ledger)
+        })
+        .collect()
+}
+
 /// Ask where `external`'s branch is, against the commit `lock` holds.
 ///
 /// Never fails: a remote that cannot be asked is
@@ -975,18 +1013,10 @@ fn looked(
     }
     // The whole background run shares one bound; a person's check bounds each
     // remote on its own.
-    let started = std::time::Instant::now();
-    let git = |started: std::time::Instant| {
-        if background {
-            git.clone()
-                .unattended()
-                .with_deadline(started + BACKGROUND_BOUND)
-                .in_own_group()
-        } else {
-            git.clone()
-                .unattended()
-                .with_deadline(std::time::Instant::now() + LOOK_BOUND)
-        }
+    let bound = if background {
+        Bound::Background(std::time::Instant::now() + BACKGROUND_BOUND)
+    } else {
+        Bound::EachRemote
     };
     let chosen: Vec<&External> = select(externals, names, &env.home)?
         .into_iter()
@@ -998,10 +1028,7 @@ fn looked(
                 )
         })
         .collect();
-    let found: Vec<Found> = chosen
-        .iter()
-        .map(|external| look(&git(started), &env.home, external, inputs.lock(), &ledger))
-        .collect();
+    let found = look_all(git, bound, &env.home, &chosen, inputs.lock(), &ledger);
 
     let available = offered(
         &std::fs::read_to_string(stamps.available()).unwrap_or_default(),

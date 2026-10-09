@@ -25,7 +25,7 @@
 //! [`crate::paths::home`] is the one-line wrapper that reads the real
 //! environment and is tested by agreeing with it.
 //!
-//! # The rule for every later entry
+//! # The rule for every test
 //!
 //! * A test that reads or writes anything under a home directory opens with
 //!   `let home = bx::testing::guarded_home();` and passes `home.path()` down.

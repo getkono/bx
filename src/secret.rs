@@ -28,8 +28,8 @@
 //! [`Unlock::Ask`], and only when standard input is a terminal.
 //!
 //! Every call reads and unlocks the identity afresh. A passphrase entered for
-//! one secret is not kept for the next one: caching it is a later entry's
-//! decision, and not one to make by accident.
+//! one secret is not kept for the next one: bx does not cache it, and caching
+//! it is not a decision to make by accident.
 
 use std::io::{BufReader, Read as _};
 use std::path::Path;

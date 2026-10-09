@@ -71,7 +71,8 @@
 //!
 //! # `url`
 //!
-//! One of the two transports a pinned clone needs and nothing else:
+//! One of the two transports a clone, pinned by `rev` or locked in `bx.lock`,
+//! needs and nothing else:
 //!
 //! * `https://host/…`, with **no** user information. A token written into the
 //!   url is a cleartext secret in a committed file, which Invariant 5 forbids,

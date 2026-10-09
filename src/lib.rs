@@ -62,7 +62,7 @@
 //! for a declared external, and for `bx rm`'s checks on a checkout. [`update`]
 //! is `bx update`'s own part: where a followed external's branch is now,
 //! `bx.lock` written and committed before anything moves, and the stamps an
-//! interactive zsh reads to decide whether to ask. [`upgrade`] is `bx self-upgrade`: the
+//! interactive zsh or bash reads to decide whether to ask. [`upgrade`] is `bx self-upgrade`: the
 //! installer a fresh install runs, fetched from master and run only while its
 //! digest is the one this release pins.
 //!
@@ -83,15 +83,10 @@
 //! every assignment it makes to a variable that relocates a tool.
 //!
 //! [`doctor`] reads the same resolved configuration without deciding it, and
-//! asks read-only questions about the machine — whether each declared tool is
-//! on `PATH`, whether a required value is unanswered, whether a state file is
-//! damaged or a session was interrupted, whether a directory is wider than a
-//! private file in it, whether a declared optional source is there, whether
-//! systemd has reloaded, enabled, or failed a unit file bx wrote, whether a
-//! path a written target declares in `references` is on disk, and whether an
-//! interrupted write left a `.bx-` temporary file beside its destination —
-//! changing nothing itself and installing nothing: a declared tool's install
-//! command is printed, never run.
+//! asks read-only questions about the machine, changing nothing itself and
+//! installing nothing: a declared tool's install command is printed, never
+//! run. Its checks, in the order it reports them, are listed in
+//! [`doctor`]'s own documentation.
 //!
 //! # How one repo serves many accounts
 //!

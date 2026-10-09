@@ -20,11 +20,13 @@ use crate::paths::Portable;
 /// same `present` as the file, since that phase is its one environment
 /// fragment; every other phase holds plugin and alias lines that set nothing,
 /// and function definitions whose registrations assign only zsh's hook
-/// arrays, which the guard's grammar would refuse as unreadable. The tests of
+/// arrays, the update prompt's unexported `BX_` names and, in bash's file, an
+/// append to an unexported `PROMPT_COMMAND`, which the guard's grammar
+/// would refuse as unreadable. The tests of
 /// [`crate::config::target::Interactive`] hold the plugin and alias lines to
-/// carrying no assignment, and those of [`crate::shell::function`] and this
+/// carrying no assignment, those of [`crate::shell::function`] and this
 /// module hold the `functions` phase to changing no parameter but a hook
-/// array.
+/// array, and [`crate::env_guard`]'s hold the update prompts to theirs.
 /// A line number in the note is still the file's own: the phase is found in
 /// the file's bytes, and each line is counted from the top of the file.
 ///

@@ -279,7 +279,7 @@ as undeclared, for `bx rm` to release. A link never replaces a file or link
 you made; it is reported as a conflict instead. A `to` at, inside or above any
 external's checkout is refused when the configuration loads.
 
-**When bx asks.** An interactive zsh asks, at a prompt, at most once per shell:
+**When bx asks.** An interactive zsh or bash asks, at a prompt, at most once per shell:
 
 | the dependency says | what happens |
 |---|---|
@@ -288,11 +288,14 @@ external's checkout is refused when the configuration loads.
 
 Answering anything but `y` puts the question off for one interval. Nothing
 asks, and nothing is checked, unless the shell is interactive with a terminal
-on both ends: a script, `zsh -c`, a service, continuous integration
+on both ends: a script, `zsh -c`, `bash -c`, a service, continuous integration
 (`CI`), and coding agents (`CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`,
 `CURSOR_AGENT`) never see a question. Set `BX_NO_UPDATE_PROMPT=1` to never be
 asked. bx cannot tell a metered or mobile connection from any other, which is
-why the default is to ask first. bash is not asked yet.
+why the default is to ask first. bash asks through `PROMPT_COMMAND`, which bx
+only appends to, keeping the status your prompt shows; a bash whose
+`PROMPT_COMMAND` is exported or read-only, or a bash older than 4.4, is not
+asked, and `bx update` and `bx update --check` work there as anywhere.
 
 ## License
 

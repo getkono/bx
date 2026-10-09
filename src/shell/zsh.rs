@@ -72,7 +72,7 @@ impl Interactive {
         super::alias::contribute(&mut assembly, self.aliases(), present);
         // The held-back functions are the note's to name, not the bytes'.
         super::function::contribute(&mut assembly, self.functions(), present);
-        super::update_prompt::contribute(&mut assembly, self.update_prompt());
+        super::update_prompt::contribute(&mut assembly, self.update_prompt(), Shell::Zsh);
         super::keybindings::contribute(&mut assembly, self.keybindings());
         // An activation lands only in `activations` or `completions`, neither
         // of which refuses a contribution.

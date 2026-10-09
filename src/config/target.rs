@@ -592,6 +592,9 @@ pub struct Bash {
     /// What the file's plan row says of the declarations that do not reach
     /// bash ([`crate::shell::omitted`]).
     omitted: Option<String>,
+    /// Whether an external follows a branch, so the file asks about its
+    /// updates ([`crate::shell::update_prompt`]).
+    update_prompt: bool,
 }
 
 impl Bash {
@@ -650,6 +653,20 @@ impl Bash {
     pub fn with_omitted(mut self, omitted: Option<String>) -> Self {
         self.omitted = omitted;
         self
+    }
+
+    /// The file asking, at a prompt, about followed externals' updates when
+    /// `follows`.
+    #[must_use]
+    pub const fn with_update_prompt(mut self, follows: bool) -> Self {
+        self.update_prompt = follows;
+        self
+    }
+
+    /// Whether the file asks about followed externals' updates.
+    #[must_use]
+    pub const fn update_prompt(&self) -> bool {
+        self.update_prompt
     }
 
     /// The variables, in the order the `env` phase holds them.

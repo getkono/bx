@@ -43,7 +43,10 @@
 //!   words.
 //! - `functions` holds every function bash defines, from its `bash` body when
 //!   it declares one ([`super::function::resolve_bash`]); bash has no hook
-//!   points, so nothing registers.
+//!   points, so none of them registers. When an `[[external]]` follows a
+//!   branch it then holds [`super::update_prompt::BASH`], the one thing
+//!   registered on bash's prompt: appended to an unexported
+//!   `PROMPT_COMMAND`, as that module's *bash's hook* says.
 //! - `options` holds the declared `[history]` as
 //!   [`crate::config::history::History::render_bash`] renders it, then the
 //!   declared `[shell-options]` as
@@ -53,8 +56,8 @@
 //!
 //! The file is placed when anything above reaches bash: a variable, a
 //! `[path]` entry, an enabled alias — gated on a missing tool or not, as
-//! zsh's is — a history or shell option bash reads, a function, a source, or an activation with a
-//! bash command. Its region in `~/.bashrc` is the one [`crate::config::env`]
+//! zsh's is — a history or shell option bash reads, a function, a source, an activation with a
+//! bash command, or an `[[external]]` that follows a branch. Its region in `~/.bashrc` is the one [`crate::config::env`]
 //! attaches to every zsh startup file: the region's delimiters around one
 //! line that sources the file only when it is readable. Its bytes name the
 //! file and nothing else, so they are the same for every declaration and
@@ -90,7 +93,10 @@
 //! passes through the guard ([`Bash::env`]), every opener and every removal
 //! in it one the guard reads. The `aliases`
 //! phase defines aliases and nothing else; the `functions` phase defines
-//! functions, whose bodies are the user's templates as zsh's are; source
+//! functions, whose bodies are the user's templates as zsh's are, and the
+//! update prompt, which assigns its locals and `BX_` names and appends to an
+//! unexported `PROMPT_COMMAND` (`env_guard`'s
+//! `the_bash_update_prompt_is_not_an_environment_fragment`); source
 //! lines test a file and source it; the activation phases hold a tool's
 //! output under the relocation rule [`super::activation`] applies to zsh's;
 //! the `options` phase assigns only bash's own history variables and then
@@ -251,6 +257,7 @@ impl Bash {
             }
         }
         super::function::contribute(&mut assembly, self.functions(), present);
+        super::update_prompt::contribute(&mut assembly, self.update_prompt(), Shell::Bash);
         let _ = assembly.contribute(
             Phase::Options,
             history::SECTION,
@@ -330,6 +337,13 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
         .activations
         .iter()
         .find(|a| a.enabled && a.command_for(Shell::Bash).is_some());
+    // The first external that follows a branch: the file asks about its
+    // updates, and is placed for that alone when nothing else is.
+    let followed = merged
+        .externals
+        .iter()
+        .find(|external| external.follows().is_some())
+        .map(|external| &external.origin);
 
     let bash = Bash::new(
         &merged.aliases,
@@ -339,7 +353,8 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
     // What places the file: the first variable, else the first `[path]`
     // entry, else the first enabled alias, else the history when it says
     // anything bash reads, else the shell options when they do, else the
-    // first function, source or activation bash gets.
+    // first function, source or activation bash gets, else the first
+    // external that follows a branch.
     let origin = envs
         .first()
         .map(|e| &e.origin)
@@ -372,6 +387,7 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
                 .map(|s| &s.origin)
         })
         .or_else(|| activation.map(|a| &a.origin))
+        .or(followed)
         .cloned();
 
     let mut placed = Vec::new();
@@ -401,7 +417,8 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
                 .with_path(entries)
                 .with_functions(functions)
                 .with_sources(sources)
-                .with_omitted(super::omitted(Shell::Bash, merged));
+                .with_omitted(super::omitted(Shell::Bash, merged))
+                .with_update_prompt(followed.is_some());
             Resolution::Ready(target(
                 file.clone(),
                 Gen::Bash(Box::new(bash)),
@@ -700,6 +717,35 @@ mod tests {
         ] {
             assert!(paths(text).is_empty(), "{text}");
         }
+    }
+
+    #[test]
+    fn a_followed_external_places_the_update_prompt_and_a_pinned_one_does_not() {
+        let followed = "[[external]]\npath = \"~/a\"\nurl = \"https://h/o/a\"\nbranch = \"main\"\n";
+        let pinned = format!(
+            "[[external]]\npath = \"~/a\"\nurl = \"https://h/o/a\"\nrev = \"{}\"\n",
+            "a".repeat(40)
+        );
+        assert!(placed_by(&load(&pinned)).expect("places").is_empty());
+
+        let placed = described(&placed_by(&load(followed)).expect("places"));
+        assert_eq!(placed.len(), 2, "the file and its region: {placed:?}");
+        assert_eq!(placed[0].0, FILE);
+        assert!(
+            placed[0].2.contains(crate::shell::update_prompt::BASH),
+            "{}",
+            placed[0].2
+        );
+
+        let alias = "[aliases]\nll = \"ls\"\n";
+        let without = described(&placed_by(&load(&format!("{alias}{pinned}"))).expect("places"));
+        assert!(!without[0].2.contains("__bx_update"), "{}", without[0].2);
+        let with = described(&placed_by(&load(&format!("{alias}{followed}"))).expect("places"));
+        assert!(
+            with[0].2.contains("alias ll='ls'") && with[0].2.contains("PROMPT_COMMAND"),
+            "{}",
+            with[0].2
+        );
     }
 
     #[test]

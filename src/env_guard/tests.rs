@@ -1910,6 +1910,96 @@ fn the_update_prompt_is_not_an_environment_fragment() {
     }
 }
 
+#[test]
+fn the_bash_update_prompt_is_not_an_environment_fragment() {
+    // The third generated file under the no-assignment rule, held to it as
+    // the zsh hook is, with the one name bash has instead of a hook array:
+    // `PROMPT_COMMAND`. A parent can export that, so it is admitted only in
+    // the shapes that append to it, never replace it, and only behind the
+    // test that leaves an exported or read-only one alone — so the append is
+    // to a shell variable no process inherits, as a zsh hook array is.
+    let hook = crate::shell::update_prompt::BASH;
+    let locals: Vec<&str> = hook
+        .lines()
+        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
+        .flat_map(str::split_whitespace)
+        .filter(|word| !word.starts_with('-'))
+        .map(|declared| declared.split('=').next().unwrap_or(declared))
+        .collect();
+    let assigned = assignments_in(hook);
+    for name in &assigned {
+        assert!(
+            name.starts_with("BX_") || locals.contains(name) || *name == "PROMPT_COMMAND",
+            "the bash update prompt gives {name} a value, which is neither one of bx's own \
+             names, a local, nor bash's PROMPT_COMMAND"
+        );
+    }
+    for name in [
+        "BX_UPDATE_ASKED",
+        "BX_UPDATE_CHECKING",
+        "PROMPT_COMMAND",
+        "answer",
+        "now",
+    ] {
+        assert!(assigned.contains(&name), "{name}: {assigned:?}");
+    }
+    // Every assignment to PROMPT_COMMAND is one of the two appends, each
+    // keeping the value it finds whole.
+    let appends = [
+        "PROMPT_COMMAND+=(__bx_update)",
+        "PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND$'\\n'}__bx_update",
+    ];
+    let mut registered = 0;
+    for (at, _) in hook.match_indices("PROMPT_COMMAND") {
+        let rest = &hook[at..];
+        if rest.starts_with("PROMPT_COMMAND=") || rest.starts_with("PROMPT_COMMAND+=") {
+            assert!(
+                appends.iter().any(|append| rest.starts_with(append)),
+                "PROMPT_COMMAND is assigned by something other than an append: {}",
+                rest.lines().next().unwrap_or_default()
+            );
+            registered += 1;
+        }
+    }
+    assert_eq!(registered, 2, "the scalar and the array append");
+    assert_eq!(
+        assigned
+            .iter()
+            .filter(|name| **name == "PROMPT_COMMAND")
+            .count(),
+        registered,
+        "PROMPT_COMMAND is assigned in a form the appends above do not cover"
+    );
+    // Both appends sit behind the case that leaves an exported or read-only
+    // PROMPT_COMMAND alone.
+    let guard = hook
+        .find("case ${PROMPT_COMMAND@a} in\n    *[xr]*) ;;")
+        .expect("the attribute test");
+    assert!(
+        appends
+            .iter()
+            .all(|append| hook.find(append).is_some_and(|at| at > guard)),
+        "an append outside the attribute test"
+    );
+    // Nothing is exported, and nothing the guard would have to judge.
+    // The hook's comments say "exported"; no line runs `export`.
+    assert!(
+        hook.lines()
+            .all(|line| line.trim_start().starts_with('#') || !line.contains("export")),
+        "the hook exports nothing"
+    );
+    assert!(!hook.contains("declare"), "nor declares a global");
+    for (idx, line) in hook.split('\n').enumerate() {
+        if let Statement::Assign { name, .. } = statement(line) {
+            assert!(
+                locals.contains(&name) || name.starts_with("BX_") || name == "PROMPT_COMMAND",
+                "line {} assigns {name}, which the guard would have to judge",
+                idx + 1
+            );
+        }
+    }
+}
+
 /// `text` with its comments removed, line by line, carrying block state.
 ///
 /// Written because a `//`-prefix test is not comment handling: round 5

@@ -1013,17 +1013,20 @@ mod tests {
         .expect("rm")
     }
 
-    /// The one row that is not the interactive zsh file a followed external
-    /// places for its update prompt, or the `~/.zshrc` region sourcing it.
+    /// The one row that is not an interactive zsh or bash file a followed
+    /// external places for its update prompt, or the region sourcing it.
     fn only(report: &Report) -> &Change {
         let rows: Vec<&Change> = report.changes.iter().filter(|row| !shell(row)).collect();
         assert_eq!(rows.len(), 1, "{:?}", report.changes);
         rows[0]
     }
 
-    /// Whether `row` is the generated interactive zsh file or its region.
+    /// Whether `row` is a generated interactive zsh or bash file or its
+    /// region.
     fn shell(row: &Change) -> bool {
-        row.target == "~/.zshrc" || row.target.starts_with("~/.local/share/bx/")
+        row.target == "~/.zshrc"
+            || row.target == "~/.bashrc"
+            || row.target.starts_with("~/.local/share/bx/")
     }
 
     #[test]

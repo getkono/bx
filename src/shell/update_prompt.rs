@@ -99,7 +99,8 @@ __bx_update_due() {
   [[ -z $BX_UPDATE_ASKED ]] || return 0
   [[ -z ${CI-}${CLAUDECODE-}${CODEX_SANDBOX-}${GEMINI_CLI-}${CURSOR_AGENT-}${BX_NO_UPDATE_PROMPT-} ]] || return 0
   (( ${+commands[bx]} )) || return 0
-  local dir=${XDG_STATE_HOME:-$HOME/.local/state}/bx/update
+  local dir=$HOME/.local/state/bx/update
+  [[ ${XDG_STATE_HOME-} == /* ]] && dir=$XDG_STATE_HOME/bx/update
   local now=${(%):-%D{%s}} due line answer
   local -a found
   if [[ -s $dir/available ]]; then
@@ -160,7 +161,8 @@ __bx_update_due() {
   [[ -z $BX_UPDATE_ASKED ]] || return 0
   [[ -z ${CI-}${CLAUDECODE-}${CODEX_SANDBOX-}${GEMINI_CLI-}${CURSOR_AGENT-}${BX_NO_UPDATE_PROMPT-} ]] || return 0
   type -P bx >/dev/null || return 0
-  local dir=${XDG_STATE_HOME:-$HOME/.local/state}/bx/update
+  local dir=$HOME/.local/state/bx/update
+  [[ ${XDG_STATE_HOME-} == /* ]] && dir=$XDG_STATE_HOME/bx/update
   local now due line answer
   local -a found
   printf -v now '%(%s)T' -1
@@ -465,6 +467,38 @@ mod tests {
                 (String::new(), String::new()),
                 "{shell:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_hook_reads_the_stamps_where_bx_writes_them_for_every_xdg_state_home() {
+        for shell in SHELLS {
+            let rig = Rig::new(shell);
+            let elsewhere = rig.home.path().join("elsewhere");
+            let absolute = elsewhere.to_str().expect("a UTF-8 tempdir");
+            // Unset, empty, absolute, relative: bx honours only the absolute
+            // one, and the hook must look where bx resolves, not where the
+            // shell's own `${XDG_STATE_HOME:-...}` would.
+            for value in [None, Some(""), Some(absolute), Some("relative")] {
+                let update = crate::state::StateDir::resolve_in(
+                    rig.home.path(),
+                    value.map(std::ffi::OsStr::new),
+                )
+                .update();
+                std::fs::create_dir_all(&update).expect("update/");
+                std::fs::write(update.join("available"), "~/a: 1 new commit(s) on main\n")
+                    .expect("a stamp");
+                let env: Vec<(&str, &str)> =
+                    value.map(|v| ("XDG_STATE_HOME", v)).into_iter().collect();
+                let (printed, calls) = rig.run("__bx_update_due", "y", &env);
+                assert!(
+                    printed.contains("~/a: 1 new commit(s) on main"),
+                    "{shell:?}, XDG_STATE_HOME={value:?}: {printed}"
+                );
+                assert_eq!(calls, "update\n", "{shell:?}, XDG_STATE_HOME={value:?}");
+                std::fs::remove_file(update.join("available")).expect("the stamp goes");
+                std::fs::remove_file(rig.home.path().join("calls")).expect("the calls go");
+            }
         }
     }
 

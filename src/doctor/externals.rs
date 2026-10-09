@@ -177,6 +177,16 @@ mod tests {
             "{}",
             findings[1].note
         );
+        assert_eq!(
+            findings[0].note,
+            "follows `main` of https://h/o/a, and bx.lock locks it for `old` of https://h/o/a; \
+             `bx update` locks it again"
+        );
+        assert_eq!(
+            findings[1].note,
+            "follows `main`, and bx.lock holds no commit for it, so apply leaves it as it is; \
+             `bx update` locks one"
+        );
         assert!(
             findings[2].note.contains("drops the entry"),
             "{}",
@@ -234,6 +244,18 @@ mod tests {
             findings[0].note
         );
         assert!(findings[1].note.ends_with(remedy), "{}", findings[1].note);
+        assert_eq!(
+            findings[0].note,
+            "follows `main` of https://h/o/a, and bx.lock locks it for `old` of https://h/o/a; \
+             `bx update` locks the branch and url the committed configuration follows here, \
+             not this one; pin it with `rev`"
+        );
+        assert_eq!(
+            findings[1].note,
+            "follows `main`, and bx.lock holds no commit for it, so apply leaves it as it is; \
+             `bx update` locks only what the committed configuration follows; declare it in a \
+             committed layer, or pin it with `rev`"
+        );
         for finding in &findings {
             assert!(!finding.note.contains("locks one"), "{}", finding.note);
         }

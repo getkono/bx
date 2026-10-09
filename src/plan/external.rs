@@ -2051,6 +2051,10 @@ mod tests {
         assert!(note.contains("follows `master`"), "{note}");
         assert!(note.contains("bx.lock holds no commit"), "{note}");
         assert!(note.ends_with("`bx update` locks one"), "{note}");
+        assert_eq!(
+            note,
+            "follows `master`, and bx.lock holds no commit for it yet; `bx update` locks one"
+        );
         assert!(!home.child(AT).exists(), "nothing is cloned on a guess");
 
         for (url, branch) in [(URL, "side"), ("https://example.invalid/other", "master")] {
@@ -2064,6 +2068,13 @@ mod tests {
                 "{note}"
             );
             assert!(note.ends_with("`bx update` locks it again"), "{note}");
+            assert_eq!(
+                note,
+                format!(
+                    "follows `master` of {URL}, and bx.lock locks it for `{branch}` of {url}; \
+                     `bx update` locks it again"
+                )
+            );
         }
     }
 
@@ -2082,6 +2093,10 @@ mod tests {
         let note = row.note.as_deref().expect("a note");
         assert!(note.contains("bx.lock holds no commit"), "{note}");
         assert!(note.ends_with(remedy), "{note}");
+        assert_eq!(
+            note,
+            format!("follows `master`, and bx.lock holds no commit for it yet; {remedy}")
+        );
 
         // `local.toml` points the committed follow at another branch, and
         // bx.lock holds the committed one's commit.
@@ -2098,6 +2113,14 @@ mod tests {
                  here, not this one; pin it with `rev`"
             ),
             "{note}"
+        );
+        assert_eq!(
+            note,
+            format!(
+                "follows `side` of {URL}, and bx.lock locks it for `master` of {URL}; \
+                 `bx update` locks the branch and url the committed configuration follows \
+                 here, not this one; pin it with `rev`"
+            )
         );
     }
 

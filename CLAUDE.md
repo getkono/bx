@@ -46,7 +46,11 @@ wrong even if it passes CI.
    rule. The zsh update prompt is the second: it assigns only its locals,
    `BX_` names and zsh's `precmd_functions` hook array, and
    `the_update_prompt_is_not_an_environment_fragment` holds its bytes to that.
-   Nothing holds a *third* such file to it, so the change that generates one
+   The bash update prompt is the third: it assigns only its locals, `BX_`
+   names and `PROMPT_COMMAND`, which it only appends to and only when it is
+   neither exported nor read-only, so the append reaches no process, and
+   `the_bash_update_prompt_is_not_an_environment_fragment` holds its bytes to
+   that. Nothing holds a *fourth* such file to it, so the change that generates one
    carries the proof of its own bytes with it. Cached tool activation
    output is the other admitted non-fragment file, and the one exception to
    the no-assignment rule: it is searched by name for every relocating

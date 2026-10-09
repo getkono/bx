@@ -23,9 +23,9 @@
 #             never gated: it depends on which tools are integrated, so a
 #             threshold would be arbitrary.
 #
-# And, gated, invariant 6 traced on the running shells: the processes the
-# kernel started while bx's startup files ran, beyond the baseline's, and the
-# files under the configuration and state directories they read.
+# And, gated, invariant 6 traced on the running shells: any process started
+# while bx's startup files ran alone, which must be none, and the files under
+# the configuration and state directories they read.
 #
 # Environment:
 #   BX_BIN        the bx binary to apply with (default: target/release/bx,
@@ -63,8 +63,8 @@ command -v python3 >/dev/null 2>&1 || {
 	echo "error: python3 is required to read hyperfine's JSON." >&2
 	exit 1
 }
-[ -r /proc/stat ] || {
-	echo "error: /proc/stat is required to count the processes a start spawns." >&2
+[ -r /proc/self/stat ] || {
+	echo "error: /proc/self/stat is required to count the processes a start spawns." >&2
 	exit 1
 }
 

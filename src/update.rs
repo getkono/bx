@@ -805,7 +805,7 @@ impl Stamps {
     /// # Errors
     ///
     /// [`Error::Write`].
-    pub fn write(&self, path: &Path, text: &str) -> Result<(), Error> {
+    pub(crate) fn write(&self, path: &Path, text: &str) -> Result<(), Error> {
         crate::fs::write_atomically(path, text.as_bytes(), Mode::PRIVATE_FILE).map_err(|source| {
             Error::Write {
                 path: path.to_path_buf(),

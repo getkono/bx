@@ -34,7 +34,7 @@ use toml_edit::Table;
 use super::{Ctx, Error, Origin};
 
 /// The section header, as messages spell it.
-pub(crate) const SECTION: &str = "[update]";
+const SECTION: &str = "[update]";
 
 /// Every key an `[update]` table may carry.
 const KEYS: [&str; 1] = ["interval"];

@@ -188,13 +188,9 @@ impl Lock {
         self.entries.insert(path, locked);
     }
 
-    /// Drop every entry whose path `keep` refuses, and return their paths.
-    pub fn retain(&mut self, keep: impl Fn(&Portable) -> bool) -> Vec<Portable> {
-        let dropped: Vec<Portable> = self.entries.keys().filter(|p| !keep(p)).cloned().collect();
-        for path in &dropped {
-            self.entries.remove(path);
-        }
-        dropped
+    /// Drop every entry whose path `keep` refuses.
+    pub fn retain(&mut self, keep: impl Fn(&Portable) -> bool) {
+        self.entries.retain(|path, _| keep(path));
     }
 
     /// Every entry, in path order.
@@ -203,6 +199,7 @@ impl Lock {
     }
 
     /// Whether the lock holds no entry.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -359,12 +356,17 @@ mod tests {
     }
 
     #[test]
-    fn retain_drops_and_names_what_it_dropped() {
+    fn retain_drops_every_entry_it_refuses_and_keeps_the_rest() {
         let mut lock = Lock::default();
         lock.set(portable("~/a"), locked("https://h/o/a", "main", REV));
         lock.set(portable("~/b"), locked("https://h/o/b", "main", REV));
-        let dropped = lock.retain(|path| path.as_str() == "~/a");
-        assert_eq!(dropped, [portable("~/b")]);
+        lock.retain(|path| path.as_str() == "~/a");
+        assert_eq!(
+            lock.iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            [portable("~/a")]
+        );
         assert!(lock.get(&portable("~/a")).is_some());
         assert!(lock.get(&portable("~/b")).is_none());
         assert!(!lock.is_empty());

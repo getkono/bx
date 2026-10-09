@@ -22,6 +22,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::env::Env;
+use crate::report::stderr_suffix;
 
 /// Variables that make git operate on a repository other than the one it is
 /// run in. Removed from every child, so `-C REPO` is what decides.
@@ -56,7 +57,7 @@ pub enum Error {
         args: String,
     },
     /// `git` ran and failed.
-    #[error("`git {args}` failed ({status}){}", stderr_suffix(.stderr))]
+    #[error("`git {args}` failed ({status}){}", stderr_suffix(.stderr.as_bytes()))]
     Failed {
         /// The arguments it was given.
         args: String,
@@ -65,16 +66,6 @@ pub enum Error {
         /// What it said.
         stderr: String,
     },
-}
-
-/// `: STDERR` when git said anything, and nothing otherwise.
-fn stderr_suffix(stderr: &str) -> String {
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        String::new()
-    } else {
-        format!(": {stderr}")
-    }
 }
 
 /// The `git` program and the environment it runs with.
@@ -428,8 +419,8 @@ mod tests {
                 .to_string()
                 .starts_with("`git rev-parse --verify no-such-ref` failed (")
         );
-        assert_eq!(stderr_suffix("  \n"), "");
-        assert_eq!(stderr_suffix("fatal: x\n"), ": fatal: x");
+        assert_eq!(stderr_suffix(b"  \n"), "");
+        assert_eq!(stderr_suffix(b"fatal: x\n"), ": fatal: x");
     }
 
     #[test]

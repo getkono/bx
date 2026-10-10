@@ -325,8 +325,15 @@ mod tests {
                 command.env(name, value);
             }
             let mut child = command.spawn().expect("the shell runs");
-            std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), input.as_bytes())
-                .expect("input");
+            // A hook that asks nothing never reads its input, so the shell can
+            // exit before it is written: a closed pipe is then not a failure.
+            match std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), input.as_bytes())
+            {
+                Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+                    panic!("input: {error:?}")
+                }
+                _ => {}
+            }
             let output = child.wait_with_output().expect("the shell finishes");
             assert!(output.status.success(), "{output:?}");
             let calls = std::fs::read_to_string(self.home.path().join("calls")).unwrap_or_default();

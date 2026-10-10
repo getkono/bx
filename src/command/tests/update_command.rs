@@ -1193,3 +1193,66 @@ fn a_name_that_is_not_a_followed_external_is_refused() {
     .expect_err("not followed");
     assert!(matches!(error, update::Error::NotFollowed(_)), "{error:?}");
 }
+
+#[test]
+fn a_lock_that_cannot_be_written_is_named_once() {
+    let home = guarded_home();
+    let repo = home.child("repo");
+    let path = Lock::path_in(&repo);
+    std::fs::create_dir_all(&path).expect("a directory where bx.lock goes");
+    let error = update::write_and_commit(&git(home.path()), &repo, &Lock::default(), "lock")
+        .expect_err("a directory is not written over");
+    assert_eq!(
+        error.to_string(),
+        format!("{} is a directory, not a file bx can write", path.display())
+    );
+}
+
+#[test]
+fn a_stamp_that_cannot_be_written_is_named_once() {
+    let home = guarded_home();
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    std::fs::create_dir_all(stamps.available()).expect("a directory where a stamp goes");
+    let error = stamps
+        .set(0, None, None, Some(&["offered".to_string()]))
+        .expect_err("a directory is not written over");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "{} is a directory, not a file bx can write",
+            stamps.available().display()
+        )
+    );
+}
+
+#[test]
+fn a_stamp_that_cannot_be_removed_says_removing() {
+    let home = guarded_home();
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    std::fs::create_dir_all(stamps.ask_due()).expect("a directory where a stamp goes");
+    let error = stamps
+        .set(0, Some(None), None, None)
+        .expect_err("a directory is not removed");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "removing {}: Is a directory (os error 21)",
+            stamps.ask_due().display()
+        )
+    );
+}
+
+#[test]
+fn a_check_lock_that_cannot_be_opened_says_opening() {
+    let home = guarded_home();
+    let state = crate::state::StateDir::resolve(home.path());
+    let path = state.update().join("check.lock");
+    std::fs::create_dir_all(&path).expect("a directory where check.lock goes");
+    let error = Stamps::of(&state)
+        .try_hold()
+        .expect_err("a directory is not opened for writing");
+    assert_eq!(
+        error.to_string(),
+        format!("opening {}: Is a directory (os error 21)", path.display())
+    );
+}

@@ -115,14 +115,22 @@ pub enum Error {
          bx update again"
     )]
     Busy,
-    /// A file under the state directory could not be written.
-    #[error("{}: {source}", .path.display())]
-    Write {
+    /// `bx.lock`, or a file under the state directory, could not be written.
+    /// Every [`crate::fs::Error`] names its own path, so this adds none.
+    #[error(transparent)]
+    Write(crate::fs::Error),
+    /// A file under the state directory could not be removed, or
+    /// `update/check.lock` could not be opened or locked.
+    #[error("{op} {}: {source}", .path.display())]
+    Io {
+        /// What was being done to the file: `removing`, `opening` or
+        /// `locking`.
+        op: &'static str,
         /// The file.
         path: PathBuf,
         /// Why.
         #[source]
-        source: crate::fs::Error,
+        source: std::io::Error,
     },
     /// The state directory could not be made.
     #[error(transparent)]
@@ -740,12 +748,7 @@ pub fn write_and_commit(git: &Git, repo: &Path, lock: &Lock, message: &str) -> R
     let path = Lock::path_in(repo);
     let prior = std::fs::read(&path).ok();
     let write = |bytes: &[u8]| {
-        crate::fs::write_atomically(&path, bytes, Mode::DEFAULT_FILE).map_err(|source| {
-            Error::Write {
-                path: path.clone(),
-                source,
-            }
-        })
+        crate::fs::write_atomically(&path, bytes, Mode::DEFAULT_FILE).map_err(Error::Write)
     };
     write(lock.render().as_bytes())?;
     if sync::own_repository(git, repo).is_err() {
@@ -831,8 +834,9 @@ impl Stamps {
     ///
     /// # Errors
     ///
-    /// [`Error::State`] when the directory cannot be made, and
-    /// [`Error::Write`] when a file cannot be written or removed.
+    /// [`Error::State`] when the directory cannot be made, [`Error::Write`]
+    /// when a file cannot be written, and [`Error::Io`] when one cannot be
+    /// removed.
     pub fn set(
         &self,
         now: Epoch,
@@ -873,12 +877,7 @@ impl Stamps {
     ///
     /// [`Error::Write`].
     pub(crate) fn write(&self, path: &Path, text: &str) -> Result<(), Error> {
-        crate::fs::write_atomically(path, text.as_bytes(), Mode::PRIVATE_FILE).map_err(|source| {
-            Error::Write {
-                path: path.to_path_buf(),
-                source,
-            }
-        })
+        crate::fs::write_atomically(path, text.as_bytes(), Mode::PRIVATE_FILE).map_err(Error::Write)
     }
 
     /// Remove `path` if it is there.
@@ -886,12 +885,10 @@ impl Stamps {
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(Error::Write {
+            Err(source) => Err(Error::Io {
+                op: "removing",
                 path: path.to_path_buf(),
-                source: crate::fs::Error::Write {
-                    path: path.to_path_buf(),
-                    source,
-                },
+                source,
             }),
         }
     }
@@ -1187,7 +1184,7 @@ impl Stamps {
     /// # Errors
     ///
     /// [`Error::State`] when the directory cannot be made, and
-    /// [`Error::Write`] when the lock file cannot be opened.
+    /// [`Error::Io`] when the lock file cannot be opened or locked.
     pub fn try_hold(&self) -> Result<Option<CheckLock>, Error> {
         self.state.ensure_update()?;
         let path = self.dir.join("check.lock");
@@ -1196,22 +1193,18 @@ impl Stamps {
             .truncate(false)
             .write(true)
             .open(&path)
-            .map_err(|source| Error::Write {
+            .map_err(|source| Error::Io {
+                op: "opening",
                 path: path.clone(),
-                source: crate::fs::Error::Write {
-                    path: path.clone(),
-                    source,
-                },
+                source,
             })?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(Some(CheckLock(file))),
             Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-            Err(errno) => Err(Error::Write {
-                path: path.clone(),
-                source: crate::fs::Error::Write {
-                    path,
-                    source: errno.into(),
-                },
+            Err(errno) => Err(Error::Io {
+                op: "locking",
+                path,
+                source: errno.into(),
             }),
         }
     }

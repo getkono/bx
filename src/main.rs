@@ -78,6 +78,7 @@ enum Command {
     /// Print the one line for your shell rc (not built yet)
     ShellInit { shell: String },
     /// Install the latest release over this one, as a fresh install would
+    #[command(visible_alias = "self-update")]
     SelfUpgrade {
         /// Only report whether a newer release exists: exit 0 when not, 2
         /// when there is

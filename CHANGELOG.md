@@ -9,6 +9,77 @@ Conventional Commit messages.
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/getkono/bx/compare/v0.1.1...v0.1.2) - 2026-10-10
+
+### Added
+
+- *(doctor)* report a local.toml inside the config repo ([#202](https://github.com/getkono/bx/pull/202))
+- *(shell)* ask about followed externals' updates at a bash prompt ([#200](https://github.com/getkono/bx/pull/200))
+- follow a branch through bx.lock, link checkout children, and add bx update ([#163](https://github.com/getkono/bx/pull/163))
+- add bx self-upgrade
+- *(install)* print the latest release with --latest
+
+### Fixed
+
+- *(update)* name the path once, and the operation that failed, in state-file errors ([#224](https://github.com/getkono/bx/pull/224))
+- *(shell)* resolve XDG_STATE_HOME in the update-prompt hook as bx does ([#218](https://github.com/getkono/bx/pull/218))
+- *(sync)* name the recovered commit when refusing a diverged branch ([#201](https://github.com/getkono/bx/pull/201))
+- *(plan)* name the committed-layer or rev remedy for a follow bx update never locks ([#199](https://github.com/getkono/bx/pull/199))
+- *(sync)* split git -z output before trimming, so a leading-whitespace path keeps it ([#198](https://github.com/getkono/bx/pull/198))
+- restore green CI on clippy 1.99.0 and pin the Rust toolchain ([#149](https://github.com/getkono/bx/pull/149))
+- *(init)* claim no more about a deferred adoption than a journal shows
+- *(init)* keep every closing and cancel line true in the states review found
+- *(init)* refuse a config repo path that is not a directory
+- *(init)* say what it found, each write as it happens, and what is next
+- *(cli)* describe bx secret and bx add as they are in --help
+- *(cli)* refuse shell-init and __complete instead of panicking
+- *(command)* end a canceled prompt with one line and exit 130
+- *(cli)* report build details from -V and --version
+- *(cli)* drop color-eyre's location and backtrace sections from errors
+
+### Other
+
+- give each followed-external rule and message one implementation ([#222](https://github.com/getkono/bx/pull/222))
+- *(deps)* drop clap_complete until bx __complete is built ([#221](https://github.com/getkono/bx/pull/221))
+- pin bx update, its prompt hook, sync and self-upgrade promises ([#219](https://github.com/getkono/bx/pull/219))
+- align the README, CLAUDE.md and module docs with the shipped behaviour ([#217](https://github.com/getkono/bx/pull/217))
+- *(state)* stage the over-PATH_MAX local.toml with few enough links to survive a retried walk ([#197](https://github.com/getkono/bx/pull/197))
+- deal diff mutants across twelve shards instead of four ([#195](https://github.com/getkono/bx/pull/195))
+- *(bench)* time bash startup and trace spawns and config reads ([#190](https://github.com/getkono/bx/pull/190))
+- run bx self-upgrade end to end, replacing a copied binary and refusing a bad checksum ([#189](https://github.com/getkono/bx/pull/189))
+- *(readme)* state that bx has no drift prompt and no cache or staleness checks ([#188](https://github.com/getkono/bx/pull/188))
+- narrow the remaining test-only items to cfg(test) ([#185](https://github.com/getkono/bx/pull/185))
+- make the config to shell dependency one-directional ([#184](https://github.com/getkono/bx/pull/184))
+- make doc comments match the functions beneath them ([#183](https://github.com/getkono/bx/pull/183))
+- *(plan)* state the additivity and plan/apply laws as property tests ([#181](https://github.com/getkono/bx/pull/181))
+- move ContentHash to a crate-level hash module so fs imports nothing from state ([#180](https://github.com/getkono/bx/pull/180))
+- *(plan)* split decide.rs and mod.rs along their cohesion lines ([#179](https://github.com/getkono/bx/pull/179))
+- split recover.rs and state/ledger.rs along their cohesion lines ([#178](https://github.com/getkono/bx/pull/178))
+- split config/resolve.rs and config/merge.rs along their cohesion lines ([#177](https://github.com/getkono/bx/pull/177))
+- split fs/atomic.rs and journal.rs along their cohesion lines ([#168](https://github.com/getkono/bx/pull/168))
+- *(env_guard)* split the guard along its cohesion lines ([#176](https://github.com/getkono/bx/pull/176))
+- break the config, shell and env_guard cycles by rehoming misplaced items ([#161](https://github.com/getkono/bx/pull/161))
+- rehome plan, sync and process-context helpers and narrow test-only items ([#169](https://github.com/getkono/bx/pull/169))
+- hold pull-request mutation testing to the lines a diff writes, not those it moves ([#175](https://github.com/getkono/bx/pull/175))
+- *(journal)* reword comments that name the removed new_entry ([#173](https://github.com/getkono/bx/pull/173))
+- rehome fs, journal and ledger primitives into the modules that own them ([#158](https://github.com/getkono/bx/pull/158))
+- copy .git into cargo-mutants' scratch tree so the baseline passes ([#166](https://github.com/getkono/bx/pull/166))
+- pin the behaviours mutation testing and coverage left unconstrained ([#150](https://github.com/getkono/bx/pull/150))
+- *(deps)* remove dependencies nothing references ([#157](https://github.com/getkono/bx/pull/157))
+- run cargo-mutants on each pull request diff ([#156](https://github.com/getkono/bx/pull/156))
+- derive the no-user-specific-data needles from the running machine ([#155](https://github.com/getkono/bx/pull/155))
+- read source-scanning tests' files by module directory walk ([#154](https://github.com/getkono/bx/pull/154))
+- correct top-level documentation to the shipped behaviour ([#153](https://github.com/getkono/bx/pull/153))
+- bring CI, mise and hk gates into parity and keep coverage profiles out of the tree ([#152](https://github.com/getkono/bx/pull/152))
+- gate file length at 3743 lines against a shrinking baseline ([#151](https://github.com/getkono/bx/pull/151))
+- *(readme)* document bx self-upgrade
+- *(init)* say a deferral may be a running apply's, and when a re-run writes
+- Revise project status and platform compatibility
+- *(init)* pin that a run which only adopted is set up, not already set up
+- say what a re-run of bx init asks and keeps, and how errors are installed
+- *(readme)* describe the commands this release ships
+- *(release)* forward the commit date into the cross build
+
 ## [0.1.1](https://github.com/getkono/bx/compare/v0.1.0...v0.1.1) - 2026-09-28
 
 ### Added

@@ -1307,3 +1307,53 @@ fn self_upgrade_check_and_force_are_exclusive() {
         stderr(&output)
     );
 }
+
+#[test]
+fn self_update_is_a_visible_alias_of_self_upgrade() {
+    let home = guarded_home();
+    let upgrade = bx(home.path(), &["self-upgrade", "--help"]);
+    let update = bx(home.path(), &["self-update", "--help"]);
+
+    assert_eq!(upgrade.status.code(), Some(0), "{}", stderr(&upgrade));
+    assert_eq!(update.status.code(), Some(0), "{}", stderr(&update));
+    assert_eq!(stdout(&update), stdout(&upgrade));
+    assert!(
+        stdout(&upgrade).contains("Install the latest release over this one"),
+        "{}",
+        stdout(&upgrade)
+    );
+
+    // Visible: the top-level help names it, however clap wraps the line.
+    let help = bx(home.path(), &["--help"]);
+    let words = stdout(&help)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(words.contains("[alias: self-update]"), "{}", stdout(&help));
+}
+
+#[test]
+fn self_update_check_reports_exactly_as_self_upgrade_check() {
+    for (tag, code) in [("v999.0.0".to_owned(), 2), (format!("v{}", bx::VERSION), 0)] {
+        let home = guarded_home();
+        let (path, requests) = served(home.path(), &tag);
+        let check = |spelling: &str| {
+            Command::cargo_bin("bx")
+                .expect("the bx binary")
+                .args([spelling, "--check"])
+                .env("HOME", home.path())
+                .env("PATH", &path)
+                .output()
+                .expect("run bx")
+        };
+
+        let upgrade = check("self-upgrade");
+        let update = check("self-update");
+
+        assert_eq!(upgrade.status.code(), Some(code), "{}", stderr(&upgrade));
+        assert_eq!(update.status.code(), Some(code), "{}", stderr(&update));
+        assert_eq!(stdout(&update), stdout(&upgrade));
+        let requests = std::fs::read_to_string(requests).expect("the requests");
+        assert!(!requests.contains("/download/"), "{requests}");
+    }
+}

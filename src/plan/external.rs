@@ -49,6 +49,7 @@ use super::{Change, Diff, Error};
 use crate::config::external::{External, Follow, Pin};
 use crate::config::lock::{self, Lock, Locked, Lookup};
 use crate::fs::{self, Kind};
+use crate::git::checkout::{has_commit, head, is_ancestor, origin_url, own_checkout, problem};
 use crate::git::{self, Git};
 use crate::journal;
 use crate::paths::{self, Portable};
@@ -57,7 +58,6 @@ use crate::state::{
     self, ExclusiveLock, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, PriorBytes,
     StateDir, clone_written,
 };
-use crate::update;
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -193,12 +193,12 @@ pub(crate) fn unlocked_note(
     committed: Option<&[External]>,
     missing: &str,
 ) -> String {
-    let remedy = update::unshared_remedy(external, committed).map(|unshared| match unshared {
-        update::Unshared::Elsewhere => {
+    let remedy = lock::unshared_remedy(external, committed).map(|unshared| match unshared {
+        lock::Unshared::Elsewhere => {
             "`bx update` locks the branch and url the committed configuration follows here, \
              not this one; pin it with `rev`"
         }
-        update::Unshared::NotCommitted => {
+        lock::Unshared::NotCommitted => {
             "`bx update` locks only what the committed configuration follows; declare it in \
              a committed layer, or pin it with `rev`"
         }
@@ -757,49 +757,6 @@ fn record_rev(op: &Op, ledger: &mut Ledger) -> Result<(), state::Error> {
     ledger.save()
 }
 
-/// A git failure, in the words a row's note uses.
-pub(crate) fn problem(error: &git::Error) -> String {
-    match error {
-        git::Error::Spawn { source, .. } => {
-            format!("git could not be started: {source}; bx needs git on PATH")
-        }
-        git::Error::Failed { args, stderr, .. } => {
-            let stderr = stderr.trim();
-            if stderr.is_empty() {
-                format!("`git {args}` failed")
-            } else {
-                format!("`git {args}` failed: {}", stderr.replace('\n', "; "))
-            }
-        }
-        other @ git::Error::TimedOut { .. } => other.to_string(),
-    }
-}
-
-/// Refuse a directory that is not the top of a git checkout of its own, so no
-/// question is ever answered by a repository around it.
-///
-/// # Errors
-///
-/// The note for a row.
-pub(crate) fn own_checkout(git: &Git, dest: &Path) -> Result<(), String> {
-    let top = git
-        .query(dest, &["rev-parse", "--show-toplevel"])
-        .map_err(|error| format!("is not a git checkout bx can read: {}", problem(&error)))?;
-    let same = std::fs::canonicalize(dest).is_ok_and(|dest| dest == Path::new(&top));
-    if same {
-        Ok(())
-    } else {
-        Err(format!(
-            "is not a git checkout of its own (git answers from {top}); bx left it as it is"
-        ))
-    }
-}
-
-/// The commit checked out in `dest`.
-pub(crate) fn head(git: &Git, dest: &Path) -> Result<String, git::Error> {
-    git.query(dest, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-}
-
 /// Whether the ledger records `path` as a clone bx made and finished: the one
 /// kind of directory bx fetches into, or reads an external's children from.
 #[must_use]
@@ -819,39 +776,10 @@ pub(crate) fn bx_clone(ledger: &LedgerView, path: &Portable) -> bool {
         .is_some_and(|entry| entry.mechanism == Mechanism::Clone)
 }
 
-/// The url of `origin`, or `None` when there is no such remote.
-pub(crate) fn origin_url(git: &Git, dest: &Path) -> Result<Option<String>, git::Error> {
-    match git.query(dest, &["config", "--get", "remote.origin.url"]) {
-        Ok(url) => Ok(Some(url)),
-        Err(git::Error::Failed { status, .. }) if status.code() == Some(1) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 /// Whether a tracked file differs from the commit checked out, staged or not.
 fn dirty(git: &Git, dest: &Path) -> Result<bool, git::Error> {
     git.query(dest, &["status", "--porcelain", "--untracked-files=no"])
         .map(|status| !status.is_empty())
-}
-
-/// Whether `rev` is a commit `dest` already holds.
-pub(crate) fn has_commit(git: &Git, dest: &Path, rev: &str) -> bool {
-    git.query(dest, &["cat-file", "-e", &format!("{rev}^{{commit}}")])
-        .is_ok()
-}
-
-/// Whether `ancestor` is `descendant` or one of its ancestors.
-pub(crate) fn is_ancestor(
-    git: &Git,
-    dest: &Path,
-    ancestor: &str,
-    descendant: &str,
-) -> Result<bool, git::Error> {
-    match git.query(dest, &["merge-base", "--is-ancestor", ancestor, descendant]) {
-        Ok(_) => Ok(true),
-        Err(git::Error::Failed { status, .. }) if status.code() == Some(1) => Ok(false),
-        Err(error) => Err(error),
-    }
 }
 
 /// Why `rm` must leave the checkout at `dest`, or `None` when nothing in it

@@ -16,6 +16,8 @@
 //! (`GIT_DIR`, `GIT_WORK_TREE`, …) — a `bx sync` run from inside a git hook
 //! must still sync the config repo, not the repository whose hook it is.
 
+pub(crate) mod checkout;
+
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

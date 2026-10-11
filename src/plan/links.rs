@@ -54,7 +54,7 @@ use crate::config::external::{External, Link};
 use crate::config::lock::Lock;
 use crate::config::resolve::Resolution;
 use crate::config::target::{Attach, Body, Direction, Format, Target};
-use crate::git::Git;
+use crate::git::{Git, checkout};
 use crate::paths::Portable;
 use crate::report::Action;
 
@@ -281,10 +281,10 @@ fn from_shown(link: &Link) -> String {
 /// sorted, or `None` when the checkout is not at `rev`: a link made before
 /// the checkout moves would point at what it does not hold yet.
 fn children(git: &Git, dest: &Path, rev: &str, link: &Link) -> Option<Vec<String>> {
-    if !dest.is_dir() || super::external::own_checkout(git, dest).is_err() {
+    if !dest.is_dir() || checkout::own_checkout(git, dest).is_err() {
         return None;
     }
-    if super::external::head(git, dest).ok()? != rev {
+    if checkout::head(git, dest).ok()? != rev {
         return None;
     }
     // `from` is a directory's name, never a pattern: a leading `:` is not

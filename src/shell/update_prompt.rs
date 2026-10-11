@@ -480,6 +480,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_rig_survives_a_shell_that_exits_without_reading_its_input() {
+        // More input than a pipe holds: a hook that asks nothing never reads
+        // it, so the write always meets a closed pipe once the shell exits.
+        let input = "y\n".repeat(1 << 20);
+        for shell in SHELLS {
+            let rig = Rig::new(shell);
+            assert_eq!(
+                rig.run("__bx_update_due", &input, &[]),
+                (String::new(), String::new()),
+                "{shell:?}"
+            );
+        }
+    }
+
     /// The bx calls the hook makes at a prompt of an interactive `shell` whose
     /// standard input and output are a terminal and whose `TERM` is `term`,
     /// with a background check due; `None` where zsh's `zpty`, which supplies

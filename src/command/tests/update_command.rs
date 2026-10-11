@@ -572,6 +572,43 @@ fn a_foreground_check_starts_a_new_ask_interval() {
 }
 
 #[test]
+fn a_check_that_could_not_look_is_not_up_to_date() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    // A second followed external whose url leads nowhere.
+    let gone = "~/.local/share/gone";
+    let auto = "branch = \"master\"\ncheck = \"auto\"\ninterval = \"1d\"\n";
+    cloned(
+        &home,
+        &format!(
+            "{}[[external]]\npath = \"{gone}\"\nurl = \"https://example.invalid/gone\"\n{auto}",
+            layer().replace("branch = \"master\"\n", auto)
+        ),
+    );
+    let env = env(home.path());
+    let names = [gone.to_string()];
+
+    let mut out = Vec::new();
+    let exit = update::check(&env, &names, false, &git(home.path()), &mut out).expect("check");
+    assert_eq!(exit, Exit::Error, "{}", text(&out));
+    assert!(
+        text(&out).starts_with(&format!("{gone}: not checked: ")),
+        "{}",
+        text(&out)
+    );
+
+    let mut out = Vec::new();
+    let exit = update::check(&env, &[], false, &git(home.path()), &mut out).expect("check");
+    assert_eq!(exit, Exit::Pending, "something new wins: {}", text(&out));
+
+    let mut quiet = Vec::new();
+    let exit =
+        update::check(&env, &names, true, &git(home.path()), &mut quiet).expect("background");
+    assert_eq!(exit, Exit::Converged, "the shell's own check stays quiet");
+    assert!(quiet.is_empty());
+}
+
+#[test]
 fn a_background_check_sets_check_due_to_the_auto_interval_exactly() {
     let home = guarded_home();
     upstream(&home, &["skills/a/SKILL.md"]);

@@ -946,6 +946,34 @@ fn update_check_exits_two_when_something_moved_and_background_and_snooze_parse_a
 }
 
 #[test]
+fn update_check_exits_one_when_it_could_not_reach_an_external() {
+    let home = guarded_home();
+    // https://example.invalid/upstream leads to `~/upstream`, which is not there.
+    std::fs::write(
+        home.child(".gitconfig"),
+        format!(
+            "[url \"file://{}/\"]\n\tinsteadOf = https://example.invalid/\n",
+            home.path().display()
+        ),
+    )
+    .expect("~/.gitconfig");
+    seed(
+        home.path(),
+        "[[external]]\npath = \"~/.local/share/up\"\nurl = \"https://example.invalid/upstream\"\n\
+         branch = \"master\"\n",
+    );
+
+    let checked = bx(home.path(), &["update", "--check"]);
+    assert_eq!(checked.status.code(), Some(1), "{}", stderr(&checked));
+    assert!(
+        stdout(&checked).starts_with("~/.local/share/up: not checked: "),
+        "{}",
+        stdout(&checked)
+    );
+    assert!(!home.child(".config/bx/bx.lock").exists(), "nothing locked");
+}
+
+#[test]
 fn bare_bx_is_the_status_view_with_plan_exit_codes() {
     let home = guarded_home();
     seed(home.path(), A_TARGET);

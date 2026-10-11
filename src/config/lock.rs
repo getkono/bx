@@ -270,6 +270,77 @@ fn parse_entry(
     ))
 }
 
+/// Whether any of `externals` follows a branch at `path`.
+#[must_use]
+pub fn followed(path: &Portable, externals: &[External]) -> bool {
+    externals
+        .iter()
+        .any(|external| external.path == *path && external.follows().is_some())
+}
+
+/// Why the shared `bx.lock` does not take a follow ([`unshared_at`]), which
+/// decides the remedy each message names for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unshared {
+    /// The committed configuration follows the path too, from another url or
+    /// branch: only a `rev` locks this one, because declaring it in a
+    /// committed layer would change what every account follows.
+    Elsewhere,
+    /// The committed configuration does not follow the path at all: a
+    /// committed layer that declares the follow, or a `rev`, locks it.
+    NotCommitted,
+}
+
+/// What `bx update` cannot do for `external`'s follow, which `local.toml`
+/// alone declares or points elsewhere ([`unshared_at`]): why, which names the
+/// remedy that locks it instead, or `None` for a follow `bx update` does
+/// lock, and for a pin.
+#[must_use]
+pub fn unshared_remedy(external: &External, committed: Option<&[External]>) -> Option<Unshared> {
+    let follow = external.follows()?;
+    why_unshared_at(&external.path, &external.url, &follow.branch, committed)
+}
+
+/// Why the follow of `branch` of `url` at `path` is [`unshared_at`], or
+/// `None` when it is not.
+#[must_use]
+pub fn why_unshared_at(
+    path: &Portable,
+    url: &str,
+    branch: &str,
+    committed: Option<&[External]>,
+) -> Option<Unshared> {
+    if !unshared_at(path, url, branch, committed) {
+        return None;
+    }
+    Some(if committed.is_some_and(|c| followed(path, c)) {
+        Unshared::Elsewhere
+    } else {
+        Unshared::NotCommitted
+    })
+}
+
+/// Whether the committed configuration, where it is known, does not follow
+/// `path` from `url` and `branch`: a follow that `local.toml` alone declares,
+/// or points elsewhere, whose commit the shared `bx.lock` does not take.
+#[must_use]
+pub fn unshared_at(
+    path: &Portable,
+    url: &str,
+    branch: &str,
+    committed: Option<&[External]>,
+) -> bool {
+    committed.is_some_and(|committed| {
+        !committed.iter().any(|external| {
+            external.path == *path
+                && external.url == url
+                && external
+                    .follows()
+                    .is_some_and(|follow| follow.branch == branch)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

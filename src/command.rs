@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::adopt::{self, Adoption, Removal};
+use crate::config::lock::Unshared;
 use crate::config::resolve::Resolution;
 use crate::config::target::Body;
 use crate::doctor::{self, Probes, systemd};
@@ -544,18 +545,18 @@ fn update_with(
 
     let before = inputs.lock().clone();
     let committed = inputs.committed_externals();
-    let unshared: Vec<(&update::Found, update::Unshared)> = found
+    let unshared: Vec<(&update::Found, Unshared)> = found
         .iter()
         .filter(|found| found.moves_to().is_some())
         .filter_map(|found| Some((found, update::why_unshared(found, committed)?)))
         .collect();
     for (found, unshared) in &unshared {
         let why = match unshared {
-            update::Unshared::Elsewhere => {
+            Unshared::Elsewhere => {
                 "and the committed configuration another branch or url; the shared bx.lock \
                  keeps the committed one's"
             }
-            update::Unshared::NotCommitted => {
+            Unshared::NotCommitted => {
                 "and the committed configuration does not follow it; the shared bx.lock holds \
                  only what the committed configuration follows. Declare it in a committed \
                  layer, or pin it with `rev`"

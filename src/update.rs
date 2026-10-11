@@ -46,12 +46,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::external::{Check, External, first_followed};
-use crate::config::lock::{self, Lock, Locked};
+use crate::config::lock::{self, Lock, Locked, Unshared};
 use crate::config::update::Interval;
 use crate::fs::Mode;
+use crate::git::checkout::{self, problem};
 use crate::git::{self, Git};
 use crate::paths::{self, Portable};
-use crate::plan::external::{self as checkout, problem};
+use crate::plan::external::finished_clone;
 use crate::state::StateDir;
 use crate::sync;
 
@@ -358,7 +359,7 @@ pub fn look(
     };
     let dest = external.path.render(home);
     let reference = format!("refs/heads/{}", follow.branch);
-    let ours = checkout::finished_clone(ledger, &external.path)
+    let ours = finished_clone(ledger, &external.path)
         && dest.is_dir()
         && checkout::own_checkout(git, &dest).is_ok()
         && matches!(checkout::origin_url(git, &dest), Ok(Some(url)) if url == external.url);
@@ -489,83 +490,22 @@ pub fn proposed(
 /// alone, follows it, and always while `committed` is unknown.
 #[must_use]
 pub fn kept(path: &Portable, externals: &[External], committed: Option<&[External]>) -> bool {
-    followed(path, externals) || committed.is_none_or(|c| followed(path, c))
-}
-
-/// Whether any of `externals` follows a branch at `path`.
-#[must_use]
-pub fn followed(path: &Portable, externals: &[External]) -> bool {
-    externals
-        .iter()
-        .any(|external| external.path == *path && external.follows().is_some())
+    lock::followed(path, externals) || committed.is_none_or(|c| lock::followed(path, c))
 }
 
 /// Whether the committed configuration, where it is known, does not follow
 /// `found`'s path from the url and branch this account's does: a follow that
 /// `local.toml` alone declares, or points elsewhere, whose commit the shared
-/// `bx.lock` does not take.
+/// `bx.lock` does not take ([`lock::unshared_at`]).
 #[must_use]
 pub fn unshared(found: &Found, committed: Option<&[External]>) -> bool {
-    unshared_at(&found.path, &found.url, &found.branch, committed)
-}
-
-/// Why the shared `bx.lock` does not take a follow ([`unshared`]), which
-/// decides the remedy each message names for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unshared {
-    /// The committed configuration follows the path too, from another url or
-    /// branch: only a `rev` locks this one, because declaring it in a
-    /// committed layer would change what every account follows.
-    Elsewhere,
-    /// The committed configuration does not follow the path at all: a
-    /// committed layer that declares the follow, or a `rev`, locks it.
-    NotCommitted,
+    lock::unshared_at(&found.path, &found.url, &found.branch, committed)
 }
 
 /// Why `found`'s follow is [`unshared`], or `None` when it is not.
 #[must_use]
 pub fn why_unshared(found: &Found, committed: Option<&[External]>) -> Option<Unshared> {
-    why_unshared_at(&found.path, &found.url, &found.branch, committed)
-}
-
-/// What `bx update` cannot do for `external`'s follow, which `local.toml`
-/// alone declares or points elsewhere ([`unshared`]): why, which names the
-/// remedy that locks it instead, or `None` for a follow `bx update` does
-/// lock, and for a pin.
-#[must_use]
-pub fn unshared_remedy(external: &External, committed: Option<&[External]>) -> Option<Unshared> {
-    let follow = external.follows()?;
-    why_unshared_at(&external.path, &external.url, &follow.branch, committed)
-}
-
-/// [`why_unshared`], for the follow of `branch` of `url` at `path`.
-fn why_unshared_at(
-    path: &Portable,
-    url: &str,
-    branch: &str,
-    committed: Option<&[External]>,
-) -> Option<Unshared> {
-    if !unshared_at(path, url, branch, committed) {
-        return None;
-    }
-    Some(if committed.is_some_and(|c| followed(path, c)) {
-        Unshared::Elsewhere
-    } else {
-        Unshared::NotCommitted
-    })
-}
-
-/// [`unshared`], for the follow of `branch` of `url` at `path`.
-fn unshared_at(path: &Portable, url: &str, branch: &str, committed: Option<&[External]>) -> bool {
-    committed.is_some_and(|committed| {
-        !committed.iter().any(|external| {
-            external.path == *path
-                && external.url == url
-                && external
-                    .follows()
-                    .is_some_and(|follow| follow.branch == branch)
-        })
-    })
+    lock::why_unshared_at(&found.path, &found.url, &found.branch, committed)
 }
 
 /// The commit message for moving `before` to `after`: what moved, by path,
@@ -1242,6 +1182,7 @@ mod tests {
     use super::*;
     use crate::config::Origin;
     use crate::config::external::{Follow, Pin};
+    use crate::config::lock::unshared_remedy;
     use crate::testing::guarded_home;
 
     const A: &str = "0e810e5afa27acbd074398eefbe28d13005dbc15";

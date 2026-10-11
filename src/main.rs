@@ -57,7 +57,7 @@ enum Command {
         #[arg(long, conflicts_with_all = ["check", "snooze"])]
         yes: bool,
         /// Only look and report: exit 0 when nothing is new, 2 when
-        /// something is, 1 when nothing is but a remote could not be reached;
+        /// something is, 1 when nothing is but an external could not be checked;
         /// locks, commits and applies nothing
         #[arg(long, conflicts_with = "snooze")]
         check: bool,

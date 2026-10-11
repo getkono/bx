@@ -883,7 +883,8 @@ pub fn now() -> Epoch {
 /// at are kept.
 ///
 /// Exits [`crate::report::Exit::Pending`] when there is something to apply.
-/// Otherwise a foreground check that could not reach some remote exits
+/// Otherwise a foreground check that could not check some external — its
+/// remote unreachable, or without the branch it follows — exits
 /// [`crate::report::Exit::Error`], so "could not look" never reads as "up to
 /// date"; a background check exits [`crate::report::Exit::Converged`].
 ///
@@ -986,7 +987,8 @@ fn looked(
             writeln!(out, "No [[external]] follows a branch.").map_err(Error::Output)?;
         }
     }
-    // A person's check that could not ask some remote has not shown nothing
+    // A person's check that could not check some external — its remote
+    // unreachable, or without the branch it follows — has not shown nothing
     // is new, so a script reading its status must not take it as up to date;
     // something new still wins, and the shell's own check stays quiet.
     Ok(if found.iter().any(|found| found.moves_to().is_some()) {

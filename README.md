@@ -75,7 +75,8 @@ There are twelve. You should not need a manual.
 `init`, `apply`, `sync` and `update` take `--yes`, and `init` takes
 `--set NAME=VALUE` for each value it would ask for, so all four run without a
 terminal. `bx update --check` only looks, exiting `2` when something is new,
-and `1` when nothing is but a followed external could not be reached,
+and `1` when nothing is but a followed external could not be checked
+(its remote unreachable, or without the branch it follows),
 and `bx update --snooze` puts the next question off.
 
 `add` and `rm` need the file or directory to act on; without one they refuse

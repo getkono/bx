@@ -36,6 +36,10 @@ use bx::testing::{GuardedHome, guarded_home};
 /// replaces with the local upstream's.
 const PINNED: &str = "e52ee8ca55bcc56a17c828767a3f98f22a68d4eb";
 
+/// The commit the example's `bx.lock` holds for its followed `[[external]]`,
+/// which the copy replaces with the local upstream's.
+const LOCKED: &str = "6661b4b68173784ba31ef10ce4b5cb1c9ecfdcac";
+
 /// The system directories the machine's `PATH` holds after the stubs: where
 /// `git`, `zsh` and `bash` are.
 const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -98,14 +102,30 @@ impl Machine {
     fn new(values: &str) -> Self {
         let home = guarded_home();
         let upstream = tempfile::tempdir().expect("a tempdir for the upstream");
-        let rev = make_upstream(upstream.path());
+        let rev = make_upstream(
+            upstream.path(),
+            "zsh-autosuggestions",
+            "zsh-autosuggestions.zsh",
+            "typeset -g EXAMPLE_PLUGIN_LOADED=1\n",
+        );
+        let locked = make_upstream(
+            upstream.path(),
+            "zsh-completions",
+            "src/_example",
+            "#compdef example\n",
+        );
 
         let repo = home.child(".config/bx");
         copy_tree(&example(), &repo);
-        let externals = repo.join("modules/externals.toml");
-        let text = std::fs::read_to_string(&externals).expect("modules/externals.toml");
-        assert!(text.contains(PINNED), "the example pins {PINNED}");
-        std::fs::write(&externals, text.replace(PINNED, &rev)).expect("the rewritten rev");
+        for (file, from, to) in [
+            ("modules/externals.toml", PINNED, &rev),
+            ("bx.lock", LOCKED, &locked),
+        ] {
+            let path = repo.join(file);
+            let text = std::fs::read_to_string(&path).expect(file);
+            assert!(text.contains(from), "the example's {file} holds {from}");
+            std::fs::write(&path, text.replace(from, to)).expect("the rewritten rev");
+        }
 
         let key = age::x25519::Identity::generate();
         let identity = home.write(
@@ -257,16 +277,13 @@ impl Run {
     }
 }
 
-/// An upstream repository for the example's external, at `root`'s
-/// `zsh-autosuggestions`, with one commit; returns the commit's id.
-fn make_upstream(root: &Path) -> String {
-    let dir = root.join("zsh-autosuggestions");
-    std::fs::create_dir_all(&dir).expect("the upstream");
-    std::fs::write(
-        dir.join("zsh-autosuggestions.zsh"),
-        "typeset -g EXAMPLE_PLUGIN_LOADED=1\n",
-    )
-    .expect("the plugin file");
+/// An upstream repository for one of the example's externals, at `root`'s
+/// `name`, with one commit holding `file`; returns the commit's id.
+fn make_upstream(root: &Path, name: &str, file: &str, body: &str) -> String {
+    let dir = root.join(name);
+    let file = dir.join(file);
+    std::fs::create_dir_all(file.parent().expect("a parent")).expect("the upstream");
+    std::fs::write(file, body).expect("the upstream's file");
     let git = |args: &[&str]| {
         let output = Command::new("git")
             .env_clear()
@@ -478,9 +495,13 @@ fn the_example_lands_every_kind_of_target_it_declares() {
         std::fs::read_to_string(home.join(".config/git/identity")).expect("the identity"),
         "[user]\n\tname = Example Person\n\temail = person@example.invalid\n"
     );
-    // The external, checked out.
+    // The pinned external, checked out, and the followed one at its lock.
     assert!(
         home.join(".local/share/zsh/zsh-autosuggestions/zsh-autosuggestions.zsh")
+            .is_file()
+    );
+    assert!(
+        home.join(".local/share/zsh/zsh-completions/src/_example")
             .is_file()
     );
     // The account's own startup files, carried through around bx's region.

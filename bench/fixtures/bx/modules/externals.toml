@@ -1,9 +1,13 @@
 # A git repository bx keeps checked out at one pinned commit. It moves only
 # when `rev` changes.
-#
-# To follow a branch instead, write `branch = "master"` in place of `rev`:
-# `bx update` then locks its newest commit in bx.lock, beside bx.toml, and an
-# interactive zsh or bash asks, once each `[update] interval` (7d unless
+[[external]]
+path = "~/.local/share/zsh/zsh-autosuggestions"
+url  = "https://github.com/zsh-users/zsh-autosuggestions"
+rev  = "e52ee8ca55bcc56a17c828767a3f98f22a68d4eb" # v0.7.1
+
+# A git repository that follows a branch: `branch` in place of `rev`.
+# `bx update` locks the branch's newest commit in bx.lock, beside bx.toml, and
+# an interactive zsh or bash asks, once each `[update] interval` (7d unless
 # bx.toml sets one), whether to look for more. A link puts the checkout's
 # children where a tool looks for them:
 #
@@ -12,6 +16,6 @@
 #   to      = "~/.claude/skills/*"
 #   require = "SKILL.md"
 [[external]]
-path = "~/.local/share/zsh/zsh-autosuggestions"
-url  = "https://github.com/zsh-users/zsh-autosuggestions"
-rev  = "e52ee8ca55bcc56a17c828767a3f98f22a68d4eb" # v0.7.1
+path   = "~/.local/share/zsh/zsh-completions"
+url    = "https://github.com/zsh-users/zsh-completions"
+branch = "master"

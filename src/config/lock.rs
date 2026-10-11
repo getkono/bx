@@ -45,7 +45,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+use toml_edit::{ArrayOfTables, Document, DocumentMut, Item, Table, value};
 
 use super::external::{self, External};
 use super::{Ctx, Error};
@@ -124,26 +124,18 @@ impl Lock {
     /// external would be refused for, a `rev` that is not a full commit id,
     /// and a path written twice.
     pub fn parse(text: &str, file: &Path, home: &Path) -> Result<Self, Error> {
-        let doc = text
-            .parse::<DocumentMut>()
-            .map_err(|source| Error::Syntax {
-                file: file.to_path_buf(),
-                source: Box::new(source),
-            })?;
+        // `Document`, not `DocumentMut`: only a parsed document keeps the
+        // spans every error below names its line from.
+        let doc = Document::parse(text).map_err(|source| Error::Syntax {
+            file: file.to_path_buf(),
+            source: Box::new(source),
+        })?;
+        let root = doc.as_table();
         let mut entries = BTreeMap::new();
-        for (name, item) in doc.as_table() {
-            let origin = || {
-                doc.as_table()
-                    .key(name)
-                    .and_then(toml_edit::Key::span)
-                    .map_or_else(
-                        || super::Origin::unknown(file),
-                        |s| super::Origin::at(file, text, &s),
-                    )
-            };
+        for (name, item) in root {
             let Some(tables) = item.as_array_of_tables().filter(|_| name == "external") else {
                 return Err(Error::UnknownSection {
-                    origin: origin(),
+                    origin: super::section_origin(root, name, file, text),
                     section: name.to_string(),
                 });
             };
@@ -478,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn each_lock_error_names_the_file_and_no_line_yet() {
+    fn each_lock_error_names_the_file_and_its_line() {
         let entry = |extra: &str| {
             format!(
                 "[[external]]\npath = \"~/a\"\nurl = \"https://h/o/a\"\nbranch = \"main\"\n\
@@ -492,9 +484,8 @@ mod tests {
             err.starts_with("/repo/bx.lock: TOML parse error at line 1, column 12"),
             "{err}"
         );
-        // Every other error names the file and line 0, "position unknown":
-        // the lock is parsed into a `DocumentMut`, which keeps no spans
-        // (#220). Each case carries the line it should name instead.
+        // Every other error names the file and the line of the section, key
+        // or entry it is about.
         for (text, line) in [
             ("[locks]\n".to_string(), 1),
             ("\nexternal = 1\n".to_string(), 2),
@@ -509,7 +500,7 @@ mod tests {
         ] {
             let err = parse(&text).unwrap_err();
             assert!(
-                err.starts_with("/repo/bx.lock:0: "),
+                err.starts_with(&format!("/repo/bx.lock:{line}: ")),
                 "{text:?}, whose error belongs at line {line}: {err}"
             );
         }

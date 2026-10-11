@@ -6,9 +6,11 @@
 //! external's plan and apply ([`crate::plan::external`]), `bx update`'s look at
 //! a followed branch ([`crate::update`]) and a link into an external's
 //! checkout (`plan::links`) all ask them, so they live here, beside
-//! [`Git`], rather than in any one of them.
+//! [`Git`], rather than in any one of them. Whether a directory is the top of
+//! a checkout of its own ([`toplevel_is_self`]) is also asked of the config
+//! repo, by `bx sync` and by `bx update`'s `bx.lock` commit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::git::{self, Git};
 
@@ -30,6 +32,36 @@ pub(crate) fn problem(error: &git::Error) -> String {
     }
 }
 
+/// Why a directory is not the top of a git checkout of its own.
+#[derive(Debug)]
+pub(crate) enum NotSelf {
+    /// `git` could not say where the top is: it could not be started, failed
+    /// (no repository at all), or ran out of time.
+    Unread(git::Error),
+    /// The directory lies inside the repository whose top this is.
+    Inside(PathBuf),
+}
+
+/// Whether `dir` is the top of a git working tree of its own, rather than no
+/// repository at all or a directory inside some other one. Each caller maps
+/// the refusal to its own error.
+///
+/// # Errors
+///
+/// Why it is not.
+pub(crate) fn toplevel_is_self(git: &Git, dir: &Path) -> Result<(), NotSelf> {
+    let top = PathBuf::from(
+        git.query(dir, &["rev-parse", "--show-toplevel"])
+            .map_err(NotSelf::Unread)?,
+    );
+    // Git names the top with symlinks resolved, so `dir` is too.
+    if std::fs::canonicalize(dir).is_ok_and(|dir| dir == top) {
+        Ok(())
+    } else {
+        Err(NotSelf::Inside(top))
+    }
+}
+
 /// Refuse a directory that is not the top of a git checkout of its own, so no
 /// question is ever answered by a repository around it.
 ///
@@ -37,17 +69,15 @@ pub(crate) fn problem(error: &git::Error) -> String {
 ///
 /// The note for a row.
 pub(crate) fn own_checkout(git: &Git, dest: &Path) -> Result<(), String> {
-    let top = git
-        .query(dest, &["rev-parse", "--show-toplevel"])
-        .map_err(|error| format!("is not a git checkout bx can read: {}", problem(&error)))?;
-    let same = std::fs::canonicalize(dest).is_ok_and(|dest| dest == Path::new(&top));
-    if same {
-        Ok(())
-    } else {
-        Err(format!(
-            "is not a git checkout of its own (git answers from {top}); bx left it as it is"
-        ))
-    }
+    toplevel_is_self(git, dest).map_err(|refusal| match refusal {
+        NotSelf::Unread(error) => {
+            format!("is not a git checkout bx can read: {}", problem(&error))
+        }
+        NotSelf::Inside(top) => format!(
+            "is not a git checkout of its own (git answers from {}); bx left it as it is",
+            top.display()
+        ),
+    })
 }
 
 /// The commit checked out in `dest`.

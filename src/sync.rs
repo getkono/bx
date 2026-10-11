@@ -52,6 +52,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::env::Env;
+use crate::git::checkout::{self, NotSelf};
 use crate::git::{self, Git};
 use crate::paths;
 use crate::plan::{self, Report};
@@ -412,28 +413,20 @@ fn refuse_state_in_repo(repo: &Path, state: &Path) -> Result<(), Error> {
 /// all, or a directory inside some other repository, whose history `sync`
 /// must not pull into or push from. A `git` that cannot be started at all is
 /// [`git::Error::Spawn`], not a missing repository: `git init` would not help.
-pub(crate) fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
-    let top = match git.query(repo, &["rev-parse", "--show-toplevel"]) {
-        Ok(top) => top,
-        Err(error @ git::Error::Spawn { .. }) => return Err(error.into()),
-        Err(git::Error::Failed { .. } | git::Error::TimedOut { .. }) => {
-            return Err(Error::NotARepo {
+fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
+    checkout::toplevel_is_self(git, repo).map_err(|refusal| match refusal {
+        NotSelf::Unread(error @ git::Error::Spawn { .. }) => error.into(),
+        NotSelf::Unread(git::Error::Failed { .. } | git::Error::TimedOut { .. }) => {
+            Error::NotARepo {
                 repo: repo.to_path_buf(),
                 toplevel: None,
-            });
+            }
         }
-    };
-    let top = PathBuf::from(top);
-    // Git names the top with symlinks resolved, so the repo is too.
-    let same = std::fs::canonicalize(repo).is_ok_and(|repo| repo == top);
-    if same {
-        Ok(())
-    } else {
-        Err(Error::NotARepo {
+        NotSelf::Inside(top) => Error::NotARepo {
             repo: repo.to_path_buf(),
             toplevel: Some(top),
-        })
-    }
+        },
+    })
 }
 
 /// The upstream `branch` is configured with.

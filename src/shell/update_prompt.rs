@@ -632,6 +632,66 @@ mod tests {
         }
     }
 
+    /// Which of `stamps`, each the whole of an `ask-due` in a state directory
+    /// of its own, `shell`'s hook asks from, in one run of `shell`; `None`
+    /// when `shell` is not installed.
+    fn asks_from(shell: Shell, stamps: &[String]) -> Option<Vec<bool>> {
+        crate::shell::testing::installed(match shell {
+            Shell::Zsh => "zsh",
+            Shell::Bash => "bash",
+        })?;
+        let rig = Rig::new(shell);
+        let mut script = String::new();
+        for (i, text) in stamps.iter().enumerate() {
+            let root = rig.home.path().join(format!("s{i}"));
+            let state = crate::state::StateDir::resolve_in(rig.home.path(), Some(root.as_os_str()));
+            std::fs::create_dir_all(state.update()).expect("update/");
+            std::fs::write(crate::update::Stamps::of(&state).ask_due(), text).expect("a stamp");
+            script.push_str(&format!(
+                "XDG_STATE_HOME='{}'\nBX_UPDATE_ASKED=\nprintf '@\\n'\n__bx_update_due </dev/null\n",
+                root.display()
+            ));
+        }
+        let (printed, _) = rig.run(&script, "", &[]);
+        let asked: Vec<bool> = printed
+            .split("@\n")
+            .skip(1)
+            .map(|run| run.contains("check now whether"))
+            .collect();
+        assert_eq!(asked.len(), stamps.len(), "{shell:?}: {printed}");
+        Some(asked)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(12))]
+
+        /// `bx doctor` says a stamp holds no time exactly when the hook would
+        /// not ask from it. Every time drawn is long past, so a stamp holding
+        /// one is due, and the hook asks from it.
+        #[test]
+        fn the_hook_and_doctor_agree_on_which_stamps_hold_a_time(
+            stamps in proptest::collection::vec(
+                "\n?[ \t]{0,2}[+-]?[0-9]{0,9}[ \t\rx.]{0,2}(\n|\n[0-9x]{0,3}\n)?",
+                1..24,
+            ),
+        ) {
+            let dir = tempfile::tempdir().expect("a directory");
+            let doctor: Vec<bool> = stamps
+                .iter()
+                .map(|text| {
+                    let path = dir.path().join("ask-due");
+                    std::fs::write(&path, text).expect("a stamp");
+                    crate::update::Stamps::read(&path).is_some()
+                })
+                .collect();
+            for shell in SHELLS {
+                if let Some(hook) = asks_from(shell, &stamps) {
+                    proptest::prop_assert_eq!(&hook, &doctor, "{:?}: {:?}", shell, stamps);
+                }
+            }
+        }
+    }
+
     /// What bash prints of `PROMPT_COMMAND` after sourcing the hook behind
     /// `before`: its attributes, then each element on its own line.
     fn prompt_command(before: &str) -> String {

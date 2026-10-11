@@ -806,9 +806,34 @@ impl Stamps {
     }
 
     /// The epoch in `path`, or `None` when it is absent or holds none.
+    ///
+    /// A stamp holds a time exactly when the prompt hook
+    /// ([`crate::shell::update_prompt`]) would read one from it: a first line
+    /// ended by a newline that, less the spaces and tabs around it, is one or
+    /// more ASCII digits. That is what the hook's `read -r` and its `<->` and
+    /// `*[!0-9]*` tests accept, so `bx doctor` names a stamp as holding no time
+    /// exactly when no shell asks from it — `+12`, `12\r` and a line with no
+    /// newline included. A number past `u64` holds none here either, though a
+    /// shell's arithmetic would wrap it; bx never writes one. The file is read
+    /// as bytes, because the hook never looks past the first line: what
+    /// follows it, valid UTF-8 or not, changes nothing.
     #[must_use]
     pub fn read(path: &Path) -> Option<Epoch> {
-        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+        let bytes = std::fs::read(path).ok()?;
+        let end = bytes.iter().position(|&byte| byte == b'\n')?;
+        let blank = |byte: &u8| matches!(byte, b' ' | b'\t');
+        let line = &bytes[..end];
+        let start = line.iter().position(|byte| !blank(byte)).unwrap_or(end);
+        let stop = line
+            .iter()
+            .rposition(|byte| !blank(byte))
+            .map_or(start, |last| last + 1);
+        let digits = &line[start..stop];
+        // `parse` alone would also take a leading `+`.
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(digits).ok()?.parse().ok()
     }
 
     /// Write `text` to `path` whole.
@@ -1629,6 +1654,29 @@ mod tests {
             None,
             "unreadable is never due"
         );
+        // What the prompt hook reads a time from, and what it does not.
+        // What follows the first line is never read, valid UTF-8 or not.
+        for (text, epoch) in [
+            (&b" 12\t\n"[..], Some(12)),
+            (b"012\nlater\n", Some(12)),
+            (b"12\n\xff", Some(12)),
+            (b"\xff\n", None),
+            (b"+12\n", None),
+            (b"-12\n", None),
+            (b"12\r\n", None),
+            (b"12", None),
+            (b" \t\n", None),
+            (b"\n12\n", None),
+            (b"18446744073709551616\n", None),
+        ] {
+            std::fs::write(stamps.ask_due(), text).unwrap();
+            assert_eq!(
+                Stamps::read(&stamps.ask_due()),
+                epoch,
+                "{:?}",
+                text.escape_ascii().to_string()
+            );
+        }
 
         // Only "already gone" is quietly fine when a stamp is removed.
         std::fs::create_dir(stamps.available()).unwrap();

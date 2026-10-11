@@ -143,15 +143,11 @@ path, `bx rm` when a conflict left something as it was, and
   own config directory, one `source` line in `.zshrc`.
 - `bx` never points a tool at a `bx`-owned directory, and never sets an
   environment variable that moves a tool's config, data, or cache outside a root
-  you declared. It sets only variables it knows how to judge, and judges each
-  value for what it is — a location, a list of locations, an anchor, a program,
-  a command line, a tool's options, a search list, a socket or a setting: declare your scratch mount as a root
-  and your toolchain caches may live there; declare nothing and no location,
-  list of locations or anchor is allowed at all. The other kinds say what a
-  tool runs, where it looks and what it connects to rather than where its files
-  live, so they move nothing and need no root — and none of them, root or no
-  root, may point inside a directory `bx` owns. It will write only a variable
-  in bx's emit table, which grows with the generators that need it.
+  you declared: declare your scratch mount as a root and your toolchain caches
+  may live there; declare nothing and nothing moves. Values that only say what
+  a tool runs, where it looks or what it connects to need no root, but none
+  may point inside a directory `bx` owns. The full rule is the module
+  documentation of [`src/env_guard.rs`](src/env_guard.rs).
 - Uninstalling is a supported operation, not an afterthought.
 
 ### Idempotent and reversible

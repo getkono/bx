@@ -1,5 +1,10 @@
 //! The one rule that keeps bx from breaking the tools it manages.
 //!
+//! This is the full statement of invariant 2 in `CLAUDE.md` — *native
+//! locations unless the configuration declares otherwise*. `CLAUDE.md` and
+//! `README.md` summarise it and point here, so a change to the rule is made
+//! here, beside the code that enforces it, and nowhere else.
+//!
 //! bx *may* write an environment variable that is a tool's own documented
 //! configuration interface, but only a variable in bx's emit table, which grows
 //! with the generators that need it — `SCCACHE_CACHE_SIZE` and `RUSTC_WRAPPER`
@@ -32,7 +37,7 @@
 //! **A fragment may set only a variable bx knows how to judge.** [`EMITTABLE`](table::EMITTABLE)
 //! is the table of every name bx may generate, and it says what each one holds
 //! — a [`Kind`]: a location, a list of locations, an anchor, a program, a
-//! search list, a socket, or a setting.
+//! command line, a tool's options, a search list, a socket, or a setting.
 //! The value is judged for what the name holds. Every name the table does not
 //! list is refused as [`Reason::NotEmittable`], whatever its value.
 //!
@@ -45,13 +50,21 @@
 //! generates, so the table grows with the generators and with nothing else.
 //! [`check`] is the verdict. Declare no root — `RootSet::strict`, which is
 //! what the test-only `scan` uses — and no location, no list of locations and no anchor
-//! may be set at all. A program, a search list and a socket say what a tool
-//! runs, where it looks and what it connects to rather than where its files
-//! live, so they move nothing and need no root — but no more than any other
-//! kind may they **point inside** a directory bx owns
-//! ([`Reason::BxOwnedDirectory`], [`Reason::InsideConfigRepo`]), which
-//! `refuses_unanchored` asks of every path-shaped value whatever its kind. A
-//! setting names no path at all, and is held to no path check.
+//! may be set at all. A program, a command line, a tool's options, a search
+//! list and a socket say what a tool runs, how it runs it, where it looks and
+//! what it connects to rather than where its files live, so they move nothing
+//! and need no root — but no more than any other kind may they **point
+//! inside** a directory bx owns ([`Reason::BxOwnedDirectory`],
+//! [`Reason::InsideConfigRepo`]), which `refuses_unanchored` asks of every
+//! path-shaped value whatever its kind. A command line's or options' absolute
+//! and `~` words are judged for that, and none may name a relocating variable;
+//! a relative word is admitted, because it resolves against a directory bx
+//! does not choose and so cannot be judged lexically. A setting names no path
+//! at all, and is held to no path check.
+//!
+//! Containment is decided **lexically**, never by touching the filesystem,
+//! because invariant 3 forbids a verdict that depends on what happens to
+//! exist.
 //!
 //! The **containing** check is the one that does not generalise, and
 //! deliberately. The criterion is **whether the tool clears what it is given**:
@@ -63,9 +76,10 @@
 //! directories and is approved, because nothing empties a `PATH` entry.
 //!
 //! So the check is asked of a location and of a list of locations, and of
-//! nothing else — not of a program, a search list or a socket, none of which
-//! its tool clears, and not of an anchor, which [`Kind::Anchor`] exempts
-//! because bx has found no tool that reads one at all.
+//! nothing else — not of a program, a command line, a tool's options, a
+//! search list or a socket, none of which its tool clears, and not of an
+//! anchor, which [`Kind::Anchor`] exempts because bx has found no tool that
+//! reads one at all.
 //! `a_location_may_not_contain_bxs_own_directories` asserts both halves,
 //! allowing an `EDITOR`, a `PATH` and an `SSH_AUTH_SOCK` that contain bx's
 //! directories on the same lines as it refuses a `CARGO_HOME` that does.

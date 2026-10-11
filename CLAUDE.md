@@ -32,44 +32,14 @@ wrong even if it passes CI.
    in delimited managed regions, or in files bx owns because the user said so.
 2. **Native locations unless the configuration declares otherwise.** Never point
    a tool at a bx-owned directory. Never move a tool's config, data, or cache
-   outside a root the configuration declares. `env_guard` enforces this, and
-   every generated environment fragment must pass through it: a fragment may set
-   only variables bx knows how to judge, and each value is judged for what it is
-   — a location, a list of locations, an anchor, a program, a command line, a
-   tool's options, a search list, a socket or a setting. Generated shell content that is **not** an environment
-   fragment must carry no environment assignment at all; that replacement rule
-   is what keeps the guard's reach total. The shell-init snippet is the one
-   file under it: fixed text that sets no environment variable outside bx's own
-   `BX_` namespace, and gets every other variable by sourcing a guarded
-   environment fragment, and `env_guard`'s
-   `the_init_snippet_is_not_an_environment_fragment` holds its bytes to the
-   rule. The zsh update prompt is the second: it assigns only its locals,
-   `BX_` names and zsh's `precmd_functions` hook array, and
-   `the_update_prompt_is_not_an_environment_fragment` holds its bytes to that.
-   The bash update prompt is the third: it assigns only its locals, `BX_`
-   names and `PROMPT_COMMAND`, which it only appends to and only when it is
-   neither exported nor read-only. A later line of the user's can still
-   export it, so the appended entry names no function: it expands an
-   unexported `BX_` variable, and is nothing in a child that inherits it.
-   `the_bash_update_prompt_is_not_an_environment_fragment` holds its bytes to
-   that. Nothing holds a *fourth* such file to it, so the change that generates one
-   carries the proof of its own bytes with it. Cached tool activation
-   output is the other admitted non-fragment file, and the one exception to
-   the no-assignment rule: it is searched by name for every relocating
-   variable, and each such assignment is judged by `env_guard`, so a tool's
-   own variables that relocate nothing pass and an output with any refused
-   assignment is not written. Declare no root and nothing
-   moves: no location, no list of locations and no anchor is permitted at all.
-   A program, a command line, a tool's options, a search list and a socket say
-   what a tool runs, how it runs it, where it looks and what it connects to
-   rather than where its files live, so they move nothing and need no root —
-   but no more than any other kind may they point inside a directory bx owns.
-   A command line's or options' absolute and `~` words are judged for that,
-   and none may name a relocating variable; a relative word is admitted,
-   because it resolves against a directory bx does not choose and so cannot
-   be judged lexically. Containment is decided lexically, never by
-   touching the filesystem, because invariant 3 forbids a verdict that depends
-   on what happens to exist.
+   outside a root the configuration declares. Declare no root and nothing
+   moves. `env_guard` enforces this: every generated environment fragment
+   passes through it, generated shell content that is not a fragment carries
+   no environment assignment beyond the exceptions it lists, and a change that
+   generates a new such file carries the proof of its own bytes with it. The
+   full statement — the kinds of value and how each is judged, the admitted
+   non-fragment files and their exceptions, and why containment is lexical —
+   is the module documentation of `src/env_guard.rs`, and is kept only there.
 3. **Idempotent.** `apply` twice must produce an empty second `plan`, and
    generated files must be byte-identical between runs: no timestamps, no
    nondeterministic iteration order.

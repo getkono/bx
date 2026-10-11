@@ -320,8 +320,9 @@ fn the_kinds_that_move_nothing_need_no_root() {
     // search list is where it looks, a socket is what it connects to, and
     // a setting is not a path at all: none of them moves a tool's config,
     // data or cache, which is what invariant 2 is about, so none needs a
-    // root. `CLAUDE.md`, `AGENTS.md` and `README.md` are written to say
-    // exactly that, and this is what holds them to it.
+    // root. The module documentation, and the summaries of it in
+    // `CLAUDE.md` and `README.md`, are written to say exactly that, and this
+    // is what holds them to it.
     for (name, value) in [
         ("PATH", "/etc/evil:/usr/bin"),
         ("INFOPATH", "/etc/evil"),

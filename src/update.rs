@@ -691,7 +691,7 @@ pub fn write_and_commit(git: &Git, repo: &Path, lock: &Lock, message: &str) -> R
         crate::fs::write_atomically(&path, bytes, Mode::DEFAULT_FILE).map_err(Error::Write)
     };
     write(lock.render().as_bytes())?;
-    if sync::own_repository(git, repo).is_err() {
+    if checkout::toplevel_is_self(git, repo).is_err() {
         return Ok(false);
     }
     let committed = git

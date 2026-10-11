@@ -106,7 +106,7 @@ fn guard_fragment_after(content: &str, roots: &RootSet, before: usize) -> Option
 
 /// [`guard_fragment`] for an `environment.d` fragment, where every line is
 /// exported although none says `export`.
-fn guard_environment_d(content: &str, roots: &RootSet) -> Option<String> {
+pub(in crate::plan) fn guard_environment_d(content: &str, roots: &RootSet) -> Option<String> {
     violations(&env_guard::scan_exported(content, roots), 0)
 }
 

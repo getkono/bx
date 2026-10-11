@@ -31,9 +31,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use self::dir::decide_dir;
-#[cfg(test)]
-pub(super) use self::guard::guard_fragment;
 use self::guard::guard_generated;
+#[cfg(test)]
+pub(super) use self::guard::{guard_environment_d, guard_fragment};
 use self::link::decide_link;
 use self::parent::{Write, created_dirs, locked_parent, parent_note};
 pub(super) use self::undeclared::decide_undeclared;

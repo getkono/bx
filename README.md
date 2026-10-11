@@ -29,7 +29,7 @@ nothing else changes. (`fd` ships `fdfind` on Debian for the same reason.)
 To upgrade, run `bx self-upgrade`: it runs this same installer over the
 installed binary. Each release pins the installer's checksum, so if the
 installer has changed since your release, `bx self-upgrade` refuses and sends
-you here; reinstall with the line above.
+you here; reinstall with the line above. `bx self-update` is the same command.
 
 ## Getting started
 

@@ -49,7 +49,7 @@ BX="${BX_BIN:-$(dirname "$BENCH_DIR")/target/release/bx}"
 	echo "       or run \`mise run bench\`, which does." >&2
 	exit 1
 }
-for tool in $SHELLS; do
+for tool in $SHELLS git; do
 	command -v "$tool" >/dev/null 2>&1 || {
 		echo "error: ${tool} is required." >&2
 		exit 1
@@ -88,11 +88,37 @@ for rc in .zshrc .bashrc; do
 done
 
 # The bx home's config repo is the example configuration, with this account's
-# answers. The external and the secret are switched off: one would clone over
-# the network and the other needs a key, and neither is on the shell's startup
-# path.
+# answers. The pinned external and the secret are switched off: one would clone
+# over the network and the other needs a key, and neither is on the shell's
+# startup path.
 mkdir -p "${WORK}/bx/.config" "${WORK}/bx/.local/state/bx"
 cp -R "${BENCH_DIR}/fixtures/bx" "${WORK}/bx/.config/bx"
+
+# The followed external stays on, because following a branch is what puts the
+# update-prompt hook in the generated interactive files, and that hook is on
+# the startup path. It clones from a local upstream instead of the network:
+# the home's ~/.gitconfig redirects the declared url there, as the acceptance
+# suite does, and the copy's bx.lock holds that upstream's commit.
+UPSTREAM="${WORK}/upstream/zsh-completions"
+mkdir -p "${UPSTREAM}/src"
+echo '#compdef example' >"${UPSTREAM}/src/_example"
+upstream() { # upstream <args>: git in the local upstream, with nothing inherited
+	env -i PATH="$SEARCH" HOME="${WORK}/upstream" GIT_CONFIG_NOSYSTEM=1 \
+		GIT_AUTHOR_NAME=bench GIT_AUTHOR_EMAIL=bench@example.invalid \
+		GIT_COMMITTER_NAME=bench GIT_COMMITTER_EMAIL=bench@example.invalid \
+		git -C "$UPSTREAM" "$@"
+}
+upstream init --quiet -b master
+upstream add --all
+upstream commit --quiet -m 'the completions'
+LOCK="${WORK}/bx/.config/bx/bx.lock"
+sed "s/^rev = \".*\"\$/rev = \"$(upstream rev-parse HEAD)\"/" \
+	"${BENCH_DIR}/fixtures/bx/bx.lock" >"$LOCK"
+cat >"${WORK}/bx/.gitconfig" <<GIT
+[url "file://${WORK}/upstream/"]
+	insteadOf = https://github.com/zsh-users/
+GIT
+
 cat >"${WORK}/bx/.local/state/bx/local.toml" <<'TOML'
 [values]
 git_name = "Bench"
@@ -118,6 +144,15 @@ bx() { # bx <args>: the real binary, in the bx home, with nothing inherited
 bx apply --yes
 # Converged, so what is measured is exactly what bx leaves in place.
 bx plan
+
+# The hook is measured only if bx generated it: each shell's interactive file
+# must register it, or the number below says nothing about it.
+for hook in 'precmd_functions+=(__bx_update)' "PROMPT_COMMAND+=('\${BX_UPDATE_HOOK-}')"; do
+	grep -qsF "$hook" "${WORK}/bx/.local/share/bx/"* || {
+		echo "error: bx generated no update-prompt hook (${hook}) to measure." >&2
+		exit 1
+	}
+done
 
 startup() { # startup <shell> <fixture>: the command that starts it, as one line
 	case "$1" in

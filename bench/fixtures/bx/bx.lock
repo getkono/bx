@@ -1,0 +1,10 @@
+# Written by `bx update`: the commit each [[external]] that follows a branch
+# is kept at. Commit it with the configuration. To follow a different branch,
+# change the [[external]] declaration and run `bx update`; to hold a commit,
+# pin the declaration with `rev` instead.
+
+[[external]]
+path = "~/.local/share/zsh/zsh-completions"
+url = "https://github.com/zsh-users/zsh-completions"
+branch = "master"
+rev = "6661b4b68173784ba31ef10ce4b5cb1c9ecfdcac"

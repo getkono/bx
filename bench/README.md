@@ -89,8 +89,9 @@ in place of the published one.
 
 `fixtures/bx` is a complete config repo, shaped like a real dotfiles
 repository ported to bx, with nothing in it that names an account, a machine,
-a mount or a key: `bx.toml` and `modules/*.toml` declare it, and `home/` holds
-the file bodies. `tests/acceptance.rs` applies it with the real binary and
+a mount or a key: `bx.toml` and `modules/*.toml` declare it, `bx.lock` holds
+the commit its followed external is locked to, and `home/` holds the file
+bodies. `tests/acceptance.rs` applies it with the real binary and
 holds it to the invariants end to end, and walks it for anything
 account-specific.
 

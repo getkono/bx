@@ -14,11 +14,13 @@
 //! * the environment is cleared, and `PATH` is the bench's stub tools ahead of
 //!   the system directories, so the four activations the example declares run
 //!   the stubs and nothing the developer installed;
-//! * the external's url is redirected, through `url.<base>.insteadOf` in the
-//!   home's own `~/.gitconfig`, to a repository the test makes in a tempdir —
-//!   the same seam `bx`'s own external tests use, since the configuration
-//!   refuses a local url outright. The repository's commit cannot be the
-//!   published one the example pins, so the copy's `rev` is rewritten to it;
+//! * the two externals' urls — one pinned to a `rev`, one following a branch —
+//!   are redirected, through `url.<base>.insteadOf` in the home's own
+//!   `~/.gitconfig`, to repositories the test makes in a tempdir — the same
+//!   seam `bx`'s own external tests use, since the configuration refuses a
+//!   local url outright. Those repositories' commits cannot be the published
+//!   ones the example names, so the copy's pinned `rev` and the commit its
+//!   `bx.lock` holds for the followed external are each rewritten to them;
 //! * the secret is encrypted, in the copy, to an age identity generated for the
 //!   run, which `local.toml` names. The example ships no ciphertext, because a
 //!   committed one is either decryptable by a committed key or by nobody.
@@ -83,10 +85,10 @@ fn example() -> PathBuf {
 }
 
 /// One throwaway machine: a guarded home holding the example as its config
-/// repo, and the upstream its external clones from.
+/// repo, and the upstreams its pinned and followed externals clone from.
 struct Machine {
     home: GuardedHome,
-    /// Holds the upstream repository for as long as the machine lives.
+    /// Holds the upstream repositories for as long as the machine lives.
     _upstream: tempfile::TempDir,
     /// The bench's stub tools, copied and made executable.
     stubs: tempfile::TempDir,

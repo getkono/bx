@@ -22,8 +22,11 @@ Everything below is measured for zsh and for bash alike.
 **`overhead`** — `baseline` vs the same rc file after `bx apply`: bx's region
 in `~/.zshrc` or `~/.bashrc`, the interactive file that region sources, and
 for zsh the `~/.zshenv` fragment, with the example's four activations cached
-into the interactive file. What bx's generated files cost. **Gated** at
-`BX_BUDGET_MS` (default 5), for each shell.
+into the interactive file and the hook that asks about a followed external's
+updates defined and registered in it. What bx's generated files cost.
+**Gated** at `BX_BUDGET_MS` (default 5), for each shell. The bench refuses to
+measure when either interactive file lacks the hook, so the number always
+includes it.
 
 **`spawns`** — invariant 6 says the startup path spawns no process, and the
 bench holds it twice. Read: the lines of those files, comments aside, that hold
@@ -71,9 +74,16 @@ arbitrary.
 - **Medians.** Each fixture's time is the median of its runs, so a start the
   scheduler happened to delay does not move the number the gate reads.
 
-The example's external and secret are switched off in the bench's
+The example's pinned external and its secret are switched off in the bench's
 `local.toml`: one would clone over the network and the other needs a key, and
 neither is on the startup path. `tests/acceptance.rs` applies both.
+
+The example's followed external stays on, because following a branch is what
+generates the update-prompt hook, and the hook is on the startup path. It
+never reaches the network: `run.sh` makes a one-commit upstream in the scratch
+directory, the bx home's `~/.gitconfig` redirects the declared url to it with
+`url.<base>.insteadOf`, and the copy's `bx.lock` holds that upstream's commit
+in place of the published one.
 
 ## The example configuration
 

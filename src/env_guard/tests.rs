@@ -2014,46 +2014,109 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
 /// round's other new mechanism — so it is fixed the same way, with a test
 /// that fails when it is removed.
 ///
-/// **What it does not do:** it does not know string literals, so a `//` or
-/// a `/*` inside one truncates the line. That direction is safe here — it
-/// can only hide a caller that a string literal also spells, which no call
-/// is — and stating it is the point, since the alternative is a claim
-/// wider than the code.
+/// It skips string literals — escaped, raw, byte and spanning lines — and
+/// char literals, keeping their text as code, so a `//` or `/*` inside one
+/// is not a comment. Issue #235: an earlier version did not, and the `/*`
+/// in a string spelling `config.d/*.conf` opened a block comment that never
+/// closed, so the rest of `config/target.rs` went unscanned and a site
+/// naming the guard there was never read. A `/*` carries over lines, so not
+/// knowing strings was never a safe direction.
+///
+/// **What it does not do:** it does not nest block comments, as Rust does,
+/// so `/* a /* b */ c */` leaves ` c */` as code. That direction is safe
+/// here: it can only expose text, which reports a caller rather than hiding
+/// one.
 fn code_only(text: &str) -> Vec<(usize, String)> {
+    /// What the scan is inside of, carried from one line to the next.
+    #[derive(Clone, Copy)]
+    enum Lex {
+        Code,
+        Block,
+        Str,
+        /// A raw string, closed by `"` and this many `#`.
+        Raw(usize),
+    }
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = Vec::new();
-    let mut in_block = false;
+    let mut state = Lex::Code;
     for (idx, raw) in text.lines().enumerate() {
+        let chars: Vec<char> = raw.chars().collect();
+        let at = |i: usize| chars.get(i).copied();
         let mut code = String::new();
-        let mut rest = raw;
-        while !rest.is_empty() {
-            if in_block {
-                match rest.find("*/") {
-                    Some(at) => {
-                        rest = &rest[at + 2..];
-                        in_block = false;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            match state {
+                Lex::Block => {
+                    if c == '*' && at(i + 1) == Some('/') {
+                        state = Lex::Code;
+                        i += 2;
+                    } else {
+                        i += 1;
                     }
-                    None => break,
                 }
-            } else {
-                let block = rest.find("/*");
-                let line = rest.find("//");
-                match (block, line) {
-                    (Some(b), Some(l)) if l < b => {
-                        code.push_str(&rest[..l]);
+                Lex::Str => {
+                    code.push(c);
+                    if c == '\\' {
+                        code.extend(at(i + 1));
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        state = Lex::Code;
+                    }
+                    i += 1;
+                }
+                Lex::Raw(hashes) => {
+                    code.push(c);
+                    i += 1;
+                    if c == '"' && (i..i + hashes).all(|j| at(j) == Some('#')) {
+                        code.extend(&chars[i..i + hashes]);
+                        i += hashes;
+                        state = Lex::Code;
+                    }
+                }
+                Lex::Code => {
+                    let next = at(i + 1);
+                    if c == '/' && next == Some('/') {
                         break;
                     }
-                    (Some(b), _) => {
-                        code.push_str(&rest[..b]);
-                        rest = &rest[b + 2..];
-                        in_block = true;
+                    if c == '/' && next == Some('*') {
+                        state = Lex::Block;
+                        i += 2;
+                        continue;
                     }
-                    (None, Some(l)) => {
-                        code.push_str(&rest[..l]);
-                        break;
-                    }
-                    (None, None) => {
-                        code.push_str(rest);
-                        break;
+                    code.push(c);
+                    i += 1;
+                    if c == '"' {
+                        state = Lex::Str;
+                    } else if c == 'r' && (i < 2 || !ident(chars[i - 2]) || chars[i - 2] == 'b') {
+                        // `r"…"`, `r#"…"#` and `br…`: a raw string only
+                        // where the `r` starts a token, not ends a name.
+                        let hashes = chars[i..].iter().take_while(|&&h| h == '#').count();
+                        let starts_token =
+                            i < 2 || chars[i - 2] != 'b' || i < 3 || !ident(chars[i - 3]);
+                        if starts_token && at(i + hashes) == Some('"') {
+                            code.extend(&chars[i..=i + hashes]);
+                            i += hashes + 1;
+                            state = Lex::Raw(hashes);
+                        }
+                    } else if c == '\'' {
+                        // `'\''`, `'\n'` and `'\u{…}'` run to the next
+                        // quote past their escape; `'x'` is three
+                        // characters; anything else is a lifetime or a
+                        // label, which has no closing quote.
+                        let end = if next == Some('\\') {
+                            (i + 2..chars.len()).find(|&j| chars[j] == '\'')
+                        } else if at(i + 1) == Some('\'') {
+                            Some(i + 1)
+                        } else {
+                            None
+                        };
+                        if let Some(end) = end {
+                            code.extend(&chars[i..=end]);
+                            i = end + 1;
+                        }
                     }
                 }
             }
@@ -2088,6 +2151,45 @@ fn comments_are_stripped_however_they_are_written() {
         stripped("/* env_guard\n*/ env_guard::scan(\"\");"),
         vec!["", "env_guard::scan(\"\");"]
     );
+    // Issue #235: a `/*` or `//` inside a string or char literal opens no
+    // comment, so the code after it — on its own line or the next — is
+    // still read. Escaped quotes, raw and multi-line strings, and a quote
+    // as a char do not end or open a string early; a lifetime is not a
+    // char.
+    assert_eq!(
+        stripped("let a = \"a/*b\";\nenv_guard::scan(\"\");"),
+        vec!["let a = \"a/*b\";", "env_guard::scan(\"\");"]
+    );
+    assert_eq!(
+        stripped("f(\"//\", env_guard::x); // note"),
+        vec!["f(\"//\", env_guard::x);"]
+    );
+    assert_eq!(
+        stripped("let a = \"\\\"/*\"; b // c"),
+        vec!["let a = \"\\\"/*\"; b"]
+    );
+    assert_eq!(
+        stripped("let a = r#\"\"/*\"#; b // c"),
+        vec!["let a = r#\"\"/*\"#; b"]
+    );
+    assert_eq!(
+        stripped("let a = br\"/*\"; b // c"),
+        vec!["let a = br\"/*\"; b"]
+    );
+    assert_eq!(
+        stripped("let a = \"one\n/* two\n\"; b // c"),
+        vec!["let a = \"one", "/* two", "\"; b"]
+    );
+    assert_eq!(
+        stripped("let q = '\"'; let e = '\\''; b // c"),
+        vec!["let q = '\"'; let e = '\\''; b"]
+    );
+    assert_eq!(
+        stripped("fn f<'a>(x: &'a str) -> char { 'x' } // c"),
+        vec!["fn f<'a>(x: &'a str) -> char { 'x' }"]
+    );
+    // A name ending in `r` before a string is not a raw string's prefix.
+    assert_eq!(stripped("bar(\"/*\"); b // c"), vec!["bar(\"/*\"); b"]);
 }
 
 /// Whether `code` names this module in a position a Rust path can use.
@@ -2186,7 +2288,7 @@ fn every_site_that_reaches_the_guard_is_known() {
     // into a further file is a new caller, as it was when sites were
     // matched by file. "This module" is the `env_guard` module wherever
     // its files are — `env_guard.rs` and everything beneath `env_guard/`.
-    const KNOWN: [&str; 14] = [
+    const KNOWN: [&str; 15] = [
         // `bx add`'s advisory scan.
         "use crate::env_guard::{self, Reason, RootSet};",
         "env_guard::scan_with(text, roots)",
@@ -2210,6 +2312,11 @@ fn every_site_that_reaches_the_guard_is_known() {
         "if name.starts_with(|c: char| c.is_ascii_digit()) || !env_guard::is_relocating(&name) {",
         "if name.starts_with(|c: char| c.is_ascii_digit()) || !env_guard::is_relocating(&name) {",
         "Use::Assigns(value) => match env_guard::check(&name, &value, roots) {",
+        // A `config::target` test hands the strict root set to
+        // `activation::plan`, which judges through the `check` above; it
+        // names the type and judges nothing itself. Unread until issue
+        // #235, when a `/*` in a string above it hid it from this scan.
+        "&crate::env_guard::RootSet::strict(),",
     ];
     let live = "A generated body reaches bytes through the plan's judgement of it, and a \
                     new route has to be read before it is trusted: check that it passes every \

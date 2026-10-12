@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/getkono/bx/security/advisories/new
+    about: Report privately. Never paste a secret, key, or identity into a public issue.

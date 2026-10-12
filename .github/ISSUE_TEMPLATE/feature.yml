@@ -1,0 +1,39 @@
+name: Feature request
+description: Ask for something bx does not do yet, including a new architecture, distribution, or shell.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        bx is Linux-only by design; requests for macOS or Windows will be closed.
+
+        If an [existing issue](https://github.com/getkono/bx/issues) already asks for this, add a 👍 to it instead of opening another. Reactions are how demand is weighed.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - Linux architecture or distribution
+        - Shell
+        - Tool or external integration
+        - Command or behavior
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what stops you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Optional. How you would like bx to handle it.
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+      description: Optional. What you do instead today.

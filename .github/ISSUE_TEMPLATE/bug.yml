@@ -1,0 +1,41 @@
+name: Bug report
+description: bx did something wrong, or did not do what it said it would.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search [existing issues](https://github.com/getkono/bx/issues) first. Redact home paths, hostnames, and anything secret from what you paste.
+  - type: textarea
+    id: version
+    attributes:
+      label: bx --version
+      description: Paste the full output.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and architecture
+      placeholder: Fedora 44, x86_64
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell and version
+      placeholder: zsh 5.9
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The commands you ran, what happened, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: bx plan output or debug log
+      description: Optional. Rerun with `BX_LOG=bx=debug` for a debug log.
+      render: text

@@ -308,6 +308,14 @@ asked, and `bx update` and `bx update --check` work there as anywhere. If a
 line after bx's region exports `PROMPT_COMMAND`, a child bash inherits bx's
 entry, which does nothing there.
 
+## Feedback
+
+Report a bug or request a feature, including a new architecture, distribution,
+or shell, through [the issue forms](https://github.com/getkono/bx/issues/new/choose).
+Report a security vulnerability
+[privately](https://github.com/getkono/bx/security/advisories/new), never in a
+public issue.
+
 ## License
 
 MIT

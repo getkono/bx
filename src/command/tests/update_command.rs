@@ -1270,12 +1270,15 @@ fn a_stamp_that_cannot_be_removed_says_removing() {
     let error = stamps
         .set(0, Some(None), None, None)
         .expect_err("a directory is not removed");
+    // `unlink(2)` of a directory is `EISDIR` on Linux and `EPERM` on macOS.
+    let refused = std::io::Error::from_raw_os_error(if cfg!(target_os = "linux") {
+        rustix::io::Errno::ISDIR.raw_os_error()
+    } else {
+        rustix::io::Errno::PERM.raw_os_error()
+    });
     assert_eq!(
         error.to_string(),
-        format!(
-            "removing {}: Is a directory (os error 21)",
-            stamps.ask_due().display()
-        )
+        format!("removing {}: {refused}", stamps.ask_due().display())
     );
 }
 

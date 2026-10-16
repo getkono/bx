@@ -250,10 +250,20 @@ pub fn observe(dest: &Path) -> Result<Observed, Error> {
         None
     };
 
+    // A link's own mode is never set and never consulted. Linux makes every
+    // link `0777`; macOS masks a new link's mode with the umask, so the same
+    // link would read differently from one shell to the next. Every link is
+    // seen at [`Mode::LINK`], the mode its record holds.
+    let mode = if kind == Kind::Symlink {
+        Mode::LINK
+    } else {
+        mode_of(&meta)
+    };
+
     Ok(Observed {
         path: dest.to_path_buf(),
         kind,
-        mode: Some(mode_of(&meta)),
+        mode: Some(mode),
         bytes,
         link,
         parent,

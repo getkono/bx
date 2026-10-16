@@ -907,10 +907,12 @@ mod tests {
 
         std::fs::remove_file(dir.lock()).expect("unlink the link");
         std::os::unix::fs::symlink(home.child("elsewhere"), dir.lock()).expect("dangling");
+        // `0777` on Linux; the umask-masked mode on macOS.
+        let made = lmode_of(&dir.lock());
         let err = SharedLock::probe(&dir).expect_err("a dangling link is not a lock file");
         assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
         assert!(!home.child("elsewhere").exists());
-        assert_eq!(lmode_of(&dir.lock()), 0o777);
+        assert_eq!(lmode_of(&dir.lock()), made);
     }
 
     #[test]

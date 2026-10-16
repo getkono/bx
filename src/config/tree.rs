@@ -444,14 +444,15 @@ mod tests {
             ("files/x/b", "b"),
             ("files/x/a/x", "ax"),
             ("files/x/a.b", "ab"),
-            ("files/x/A", "A"),
+            // `Z`, not `A`: a case-insensitive filesystem holds `A` and `a/` as one name.
+            ("files/x/Z", "Z"),
         ]);
 
         let layer = load(&repo).expect("loads");
         assert_eq!(
             paths(&layer),
             [
-                "~/.config/x/A",
+                "~/.config/x/Z",
                 "~/.config/x/a.b",
                 "~/.config/x/a/x",
                 "~/.config/x/b",
@@ -461,7 +462,7 @@ mod tests {
         );
         assert!(layer.config.trees.is_empty());
         let first = &layer.config.targets[0];
-        assert_eq!(first.body, Body::File(PathBuf::from("files/x/A")));
+        assert_eq!(first.body, Body::File(PathBuf::from("files/x/Z")));
         assert_eq!(first.origin.line, 1);
         assert_eq!(first.attach, Attach::Own);
         assert_eq!(first.format, Format::Opaque);

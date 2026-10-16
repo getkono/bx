@@ -62,7 +62,7 @@ impl Platform {
     /// every placement are the same on every runner; what macOS places is
     /// tested through [`place_on`] with [`Platform::Macos`], and end to end
     /// by the acceptance suite, which runs the real binary.
-    pub const HERE: Self = if cfg!(target_os = "macos") && !cfg!(test) {
+    pub const HERE: Self = if cfg!(all(target_os = "macos", not(test))) {
         Self::Macos
     } else {
         Self::Linux
@@ -656,8 +656,10 @@ mod tests {
                 "~/.zprofile"
             ]
         );
-        // What Linux writes is written alike.
+        // What Linux writes is written alike, and the `zshenv` fragment
+        // inherits nothing on either: it is the first file zsh reads.
         assert_eq!(macos[..3], linux[..]);
+        assert!(linux[0].2.is_empty(), "{:?}", linux[0].2);
         // The `zprofile` fragment holds the same `[path]` lines and no
         // variable, and inherits the `zshenv` fragment's.
         let zshenv_path = linux[0].1.split_once("# [path]\n").expect("a path block").1;
@@ -763,6 +765,31 @@ mod tests {
                 .collect();
             assert_eq!(ready, ["~/.zshenv", "~/.zprofile"]);
         }
+    }
+
+    #[test]
+    fn on_macos_a_held_back_zshenv_variable_leaves_a_zprofile_with_no_path_entries_alone() {
+        let text = "[[value]]\nname = \"root\"\nkind = \"string\"\n\n\
+                    [[env]]\nname = \"CARGO_HOME\"\nvalue = \"{{root}}/cargo\"\nkind = \"environment\"\n\n\
+                    [[env]]\nname = \"PAGER\"\nvalue = \"less\"\nkind = \"login\"\n";
+        let config = parse_str(text, Path::new("/repo/bx.toml"), Path::new(HOME)).expect("parses");
+        let values = ResolvedValues::resolve(
+            config.values.clone(),
+            &config.value_assignments,
+            Path::new(HOME),
+        )
+        .expect("values");
+        let placed = place_envs(&config, &values, Platform::Macos).expect("places");
+        let zprofile = placed
+            .iter()
+            .find(|resolution| match resolution {
+                Resolution::Ready(target) => target.path.to_string() == Place::Zprofile.fragment(),
+                Resolution::Blocked(entry) => entry.key == Place::Zprofile.fragment(),
+            })
+            .expect("the zprofile fragment");
+        // Nothing is repeated in it, so nothing of the `zshenv` fragment's
+        // holds it back.
+        assert!(matches!(zprofile, Resolution::Ready(_)), "{zprofile:?}");
     }
 
     #[test]

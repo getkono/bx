@@ -669,6 +669,29 @@ mod tests {
         assert_eq!(render(&zsh), render(&zsh));
     }
 
+    #[test]
+    fn the_inherited_render_is_the_earlier_fragment_s_variables_alone() {
+        let decide = when::tools(&|_| unreachable!("nothing is gated"));
+        let own = vec![Var::always("PAGER", "less")];
+        let none = Fragment {
+            syntax: Syntax::Zsh,
+            vars: own.clone(),
+            path: Vec::new(),
+            inherited: Vec::new(),
+        };
+        assert_eq!(none.inherited_render(&decide), "");
+        let after = Fragment {
+            inherited: vec![Var::always("CARGO_HOME", "~/.cargo")],
+            ..none
+        };
+        // What the earlier fragment wrote, under its header, and none of
+        // this fragment's own lines.
+        assert_eq!(
+            after.inherited_render(&decide),
+            format!("{HEADER}export CARGO_HOME=$HOME/.cargo\n")
+        );
+    }
+
     fn gated(name: &str, value: &str, when: &str) -> Var {
         Var {
             name: name.to_string(),

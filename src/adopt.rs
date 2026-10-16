@@ -183,6 +183,9 @@ pub struct Context {
     /// the user's.
     git: crate::git::Git,
     trees: Vec<TreeDecl>,
+    /// Whether a directory looks names up without regard to case:
+    /// [`crate::fs::case_insensitive`], which tests replace.
+    folds: fn(&Path) -> Option<bool>,
 }
 
 /// A `tree = "…"` entry some layer declares, as `add` and `rm` need it.
@@ -260,6 +263,7 @@ impl Context {
             roots,
             git: crate::git::Git::new(env),
             trees,
+            folds: crate::fs::case_insensitive,
         })
     }
 
@@ -358,6 +362,38 @@ impl Context {
             );
         }
         paths
+    }
+
+    /// Why `target` is refused as a path the configuration already declares
+    /// under another case, when it is one.
+    ///
+    /// [`Context::declared`] compares bytes, so `~/.Config/app/x` beside a
+    /// declared `~/.config/app/x` reads as undeclared. Where the directory the
+    /// two part in folds case they are one file, and a second declaration
+    /// would record a second prior for it and fail every later load (see
+    /// `refuse_shared_files` in [`resolve`]). The volume is asked as that
+    /// check asks it, and one it cannot judge is taken to fold.
+    fn declared_by_case(&self, target: &Portable) -> Option<String> {
+        let lowered = target.as_str().to_lowercase();
+        self.declared_paths()
+            .into_iter()
+            .filter(|path| path != target && path.as_str().to_lowercase() == lowered)
+            .find_map(|path| {
+                let parting =
+                    resolve::parting_dir(&path.render(&self.home), &target.render(&self.home));
+                let judged = match (self.folds)(&parting) {
+                    Some(false) => return None,
+                    Some(true) => "on this volume, which does not tell names apart by case",
+                    None => {
+                        "unless this volume tells names apart by case, which bx could not \
+                         determine"
+                    }
+                };
+                Some(format!(
+                    "is the same file as `{path}`, which the configuration already declares, \
+                     {judged}; add or remove it by that name"
+                ))
+            })
     }
 }
 
@@ -813,6 +849,9 @@ fn decide_file(
              adding it again"
         ))),
         Declared::No => {
+            if let Some(note) = ctx.declared_by_case(target) {
+                return Ok(refused(note));
+            }
             let rel = target
                 .as_str()
                 .strip_prefix("~/")
@@ -1945,6 +1984,46 @@ mod tests {
             "{rows:?}"
         );
         assert_eq!(layer(&home), off);
+    }
+
+    #[test]
+    fn a_path_declared_under_another_case_is_refused_where_the_volume_folds_case() {
+        let declared = inline("~/.config/app/x", "x\\n");
+        let home = repo(&declared);
+        plant(&home, ".Config/app/x", b"x\n", 0o644);
+        let plan_with = |folds: fn(&Path) -> Option<bool>| {
+            let ctx = Context {
+                folds,
+                ..context(&home)
+            };
+            plan_add(&ctx, &ledger(&home), &target(&home, ".Config/app/x")).expect("plan_add")
+        };
+
+        for (folds, judged) in [
+            (
+                (|_| Some(true)) as fn(&Path) -> Option<bool>,
+                "does not tell names apart",
+            ),
+            (|_| None, "could not determine"),
+        ] {
+            let rows = plan_with(folds);
+            assert!(
+                matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                    if note.contains("same file as `~/.config/app/x`") && note.contains(judged)),
+                "{rows:?}"
+            );
+        }
+        let rows = plan_with(|_| Some(false));
+        assert_eq!(adopted(&rows), ["~/.Config/app/x"], "{rows:?}");
+
+        // The volume itself is asked by default, and the refusal agrees with it.
+        let rows = add_rel(&home, ".Config/app/x");
+        let folds = crate::fs::case_insensitive(home.path()) != Some(false);
+        assert_eq!(adopted(&rows).is_empty(), folds, "{rows:?}");
+        if folds {
+            assert_eq!(layer(&home), declared, "not declared a second time");
+            assert!(ledger(&home).is_empty());
+        }
     }
 
     #[test]

@@ -242,7 +242,7 @@ fn refuse_shared_files(
 
 /// The directory in which two paths first name different entries: where a
 /// lookup decides whether they are one file.
-fn parting_dir(one: &Path, other: &Path) -> std::path::PathBuf {
+pub(crate) fn parting_dir(one: &Path, other: &Path) -> std::path::PathBuf {
     one.components()
         .zip(other.components())
         .take_while(|(a, b)| a == b)

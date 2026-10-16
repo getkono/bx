@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        bx is Linux-only by design; requests for macOS or Windows will be closed.
+        bx supports Linux and macOS 13+, on x86_64 and aarch64. Requests for Windows will be closed.
 
         If an [existing issue](https://github.com/getkono/bx/issues) already asks for this, add a 👍 to it instead of opening another. Reactions are how demand is weighed.
   - type: dropdown
@@ -13,7 +13,7 @@ body:
     attributes:
       label: Kind
       options:
-        - Linux architecture or distribution
+        - Platform, architecture or distribution
         - Shell
         - Tool or external integration
         - Command or behavior

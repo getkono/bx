@@ -9,7 +9,8 @@ Releases are automated. Land Conventional Commits on `master` and
 3. When the release job reports that it cut a release, the same workflow run's
    `build` job cross-compiles `x86_64-unknown-linux-musl` and
    `aarch64-unknown-linux-musl`, packaging each tarball with its `.sha256`, and
-   the `upload-assets` job attaches them all to the Release.
+   the `upload-assets` job attaches them all to the Release. bx supports macOS
+   too, but no macOS binary is built or released yet.
 
 `install.sh` refuses to install without verifying the checksum, so the `.sha256`
 assets are required. If `build` or `upload-assets` fails, the Release exists but

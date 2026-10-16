@@ -2016,6 +2016,16 @@ mod tests {
         let rows = plan_with(|_| Some(false));
         assert_eq!(adopted(&rows), ["~/.Config/app/x"], "{rows:?}");
 
+        // Only a case-only difference is refused: an unrelated path on a
+        // folding volume is still adopted.
+        plant(&home, ".other", b"o\n", 0o644);
+        let ctx = Context {
+            folds: |_| Some(true),
+            ..context(&home)
+        };
+        let rows = plan_add(&ctx, &ledger(&home), &target(&home, ".other")).expect("plan_add");
+        assert_eq!(adopted(&rows), ["~/.other"], "{rows:?}");
+
         // The volume itself is asked by default, and the refusal agrees with it.
         let rows = add_rel(&home, ".Config/app/x");
         let folds = crate::fs::case_insensitive(home.path()) != Some(false);

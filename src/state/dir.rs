@@ -387,7 +387,8 @@ fn blame_ancestor(path: &Path, source: &std::io::Error) -> Option<Error> {
 /// The rename is `RENAME_NOREPLACE`, so an existing quarantine is never
 /// destroyed — not by an earlier bx's leftovers, and not by a race; a name
 /// taken since the listing is skipped for the next. A filesystem that does not
-/// support the flag (`EINVAL`) falls back to checking for the name first and
+/// support the flag — `EINVAL` on Linux, `ENOTSUP` on macOS: see
+/// [`noreplace_unsupported`] — falls back to checking for the name first and
 /// renaming second, which the lock makes sound against every other bx.
 ///
 /// The lock must be the one of the directory holding `path` — see
@@ -416,11 +417,12 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
         match rename_noreplace(path, &candidate) {
             Ok(()) => return Ok(candidate),
             Err(Errno::EXIST) => {}
-            Err(Errno::INVAL) if std::fs::symlink_metadata(&candidate).is_err() => {
-                std::fs::rename(path, &candidate)?;
-                return Ok(candidate);
+            Err(errno) if noreplace_unsupported(errno) => {
+                if std::fs::symlink_metadata(&candidate).is_err() {
+                    std::fs::rename(path, &candidate)?;
+                    return Ok(candidate);
+                }
             }
-            Err(Errno::INVAL) => {}
             Err(source) => return Err(source.into()),
         }
         n = n
@@ -429,45 +431,61 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
     }
 }
 
-/// `renameat2(from, to, RENAME_NOREPLACE)`.
+/// Whether `errno`, from [`rename_noreplace`], says the filesystem does not
+/// support an exclusive rename rather than that the rename failed.
+///
+/// Linux's `renameat2` answers `EINVAL` for a filesystem without
+/// `RENAME_NOREPLACE`; macOS's `renameatx_np` answers `ENOTSUP` for one without
+/// `RENAME_EXCL`, and `EOPNOTSUPP` is the same condition under its other name.
+/// The two are one value on Linux and distinct on macOS, so they are looked up
+/// rather than matched as patterns, and not chained with `||`, whose last
+/// operand Linux could not tell from its second.
+fn noreplace_unsupported(errno: Errno) -> bool {
+    [Errno::INVAL, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&errno)
+}
+
+/// `renameat2(from, to, RENAME_NOREPLACE)`, which is `renameatx_np(…,
+/// RENAME_EXCL)` on macOS.
 ///
 /// One call site, so a test can make it answer as a filesystem without the flag
 /// does — see [`noreplace_seam`] — and reach [`move_aside`]'s check-then-rename
 /// fallback, which no filesystem a test can create would exercise.
 fn rename_noreplace(from: &Path, to: &Path) -> rustix::io::Result<()> {
     #[cfg(test)]
-    if noreplace_seam::unsupported(to) {
-        return Err(Errno::INVAL);
+    if let Some(errno) = noreplace_seam::answer(to) {
+        return Err(errno);
     }
     rustix::fs::renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)
 }
 
-/// A test-only, per-thread switch that makes [`rename_noreplace`] report
-/// `EINVAL`, as a filesystem that does not support `RENAME_NOREPLACE` does.
+/// A test-only, per-thread switch that makes [`rename_noreplace`] fail with
+/// the errno a test chooses: `EINVAL` or `ENOTSUP`, as a filesystem that does
+/// not support `RENAME_NOREPLACE` does, or any other, as a rename that failed.
 #[cfg(test)]
 pub(crate) mod noreplace_seam {
+    use rustix::io::Errno;
     use std::cell::RefCell;
     use std::path::Path;
 
-    /// Called with each rename's destination; `true` reports `EINVAL`.
-    type Seam = Box<dyn FnMut(&Path) -> bool>;
+    /// Called with each rename's destination; `Some` is the errno to report.
+    type Seam = Box<dyn FnMut(&Path) -> Option<Errno>>;
 
     thread_local! {
         static SEAM: RefCell<Option<Seam>> = const { RefCell::new(None) };
     }
 
-    /// Whether the seam installed on this thread says `RENAME_NOREPLACE` is
-    /// unsupported for `to`. With none installed, it is supported.
-    pub(super) fn unsupported(to: &Path) -> bool {
-        SEAM.with(|slot| match slot.borrow_mut().as_mut() {
-            Some(seam) => seam(to),
-            None => false,
-        })
+    /// The errno the seam installed on this thread reports for a rename to
+    /// `to`. With none installed, or a `None` from it, the rename is real.
+    pub(super) fn answer(to: &Path) -> Option<Errno> {
+        SEAM.with(|slot| slot.borrow_mut().as_mut().and_then(|seam| seam(to)))
     }
 
     /// Run `f` with `seam` installed on this thread, removing it afterwards
     /// even if `f` panics.
-    pub(crate) fn with<T>(seam: impl FnMut(&Path) -> bool + 'static, f: impl FnOnce() -> T) -> T {
+    pub(crate) fn with<T>(
+        seam: impl FnMut(&Path) -> Option<Errno> + 'static,
+        f: impl FnOnce() -> T,
+    ) -> T {
         struct Remove;
         impl Drop for Remove {
             fn drop(&mut self) {
@@ -1113,6 +1131,18 @@ mod tests {
     }
 
     #[test]
+    fn each_platform_s_answer_for_an_unsupported_exclusive_rename_takes_the_fallback() {
+        // Linux's `EINVAL`, and macOS's `ENOTSUP` under both of its names.
+        for unsupported in [Errno::INVAL, Errno::NOTSUP, Errno::OPNOTSUPP] {
+            assert!(noreplace_unsupported(unsupported), "{unsupported:?}");
+        }
+        // A rename that failed is reported, never retried as a plain rename.
+        for failed in [Errno::EXIST, Errno::ACCESS, Errno::IO, Errno::NOENT] {
+            assert!(!noreplace_unsupported(failed), "{failed:?}");
+        }
+    }
+
+    #[test]
     fn without_rename_noreplace_the_fallback_skips_a_taken_name_and_replaces_no_quarantine() {
         // Coverage review, round 5: the check-then-rename fallback for a
         // filesystem that rejects `RENAME_NOREPLACE` with `EINVAL` never ran,
@@ -1138,7 +1168,7 @@ mod tests {
                 if candidate == taken.as_path() && !taken.exists() {
                     std::fs::write(&taken, b"taken after the listing").expect("race");
                 }
-                true
+                Some(Errno::INVAL)
             },
             || move_aside(&path, &lock),
         )
@@ -1161,6 +1191,44 @@ mod tests {
         assert_eq!(
             move_aside(&path, &lock).expect("moved aside"),
             StateDir::quarantine_nth(&path, 4),
+        );
+    }
+
+    #[test]
+    fn macos_s_unsupported_answer_takes_the_fallback_too() {
+        // macOS's `renameatx_np` answers `ENOTSUP`, not `EINVAL`, for a
+        // filesystem without `RENAME_EXCL`; the fallback must take it as well.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        let path = dir.path().join("v.mpk");
+        std::fs::write(&path, b"damaged").expect("seed");
+
+        let aside = noreplace_seam::with(|_| Some(Errno::NOTSUP), || move_aside(&path, &lock))
+            .expect("moved aside through the fallback");
+
+        assert_eq!(aside, StateDir::quarantine(&path));
+        assert_eq!(std::fs::read(&aside).expect("moved"), b"damaged");
+        assert!(std::fs::symlink_metadata(&path).is_err(), "the file moved");
+    }
+
+    #[test]
+    fn an_exclusive_rename_that_failed_is_reported_and_never_retried_plainly() {
+        // Mutation testing: with the fallback's guard forced true, a rename
+        // that failed for any reason was retried as a plain rename, which
+        // succeeded here and hid the failure.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
+        let path = dir.path().join("v.mpk");
+        std::fs::write(&path, b"damaged").expect("seed");
+
+        let err = noreplace_seam::with(|_| Some(Errno::IO), || move_aside(&path, &lock))
+            .expect_err("the failed rename is the answer");
+
+        assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
+        assert_eq!(std::fs::read(&path).expect("kept"), b"damaged");
+        assert!(
+            std::fs::symlink_metadata(StateDir::quarantine(&path)).is_err(),
+            "nothing was renamed",
         );
     }
 

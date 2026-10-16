@@ -1072,10 +1072,11 @@ fn every_review_falsifier_relocates_in_a_real_shell_and_is_refused() {
             vec![],
             "{content:?}"
         );
-        // Only a machine `WITHOUT_SHELLS` excuses runs on fewer than all
-        // of them, and some of these relocate in one shell alone.
+        // Only a machine `WITHOUT_SHELLS` excuses, or macOS, where no bash
+        // is held, runs on fewer than bash and zsh both, and some of these
+        // relocate in one shell alone.
         assert!(
-            escaped.contains(&true) || shells.found.len() < SHELLS.len(),
+            escaped.contains(&true) || shells.found.len() < 2,
             "{content:?} relocated nothing in any shell"
         );
     }

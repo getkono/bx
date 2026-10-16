@@ -105,7 +105,9 @@ pub struct Resolved {
 /// Resolve a merged configuration.
 ///
 /// `home` is threaded in rather than read from the environment, so the whole
-/// resolution is a pure function of the layer bytes plus this argument.
+/// resolution is a pure function of the layer bytes plus this argument — but
+/// for two ready targets whose keys differ only by case, where the volume is
+/// asked whether it tells them apart (see [`crate::fs::case_insensitive`]).
 ///
 /// # Errors
 ///
@@ -121,7 +123,9 @@ pub struct Resolved {
 /// a reference to a value no layer declares, or a committed `default` it
 /// cannot hold; for a `[[source]]` path referencing a value no layer declares,
 /// or made unwritable by a committed `default`; for two enabled plugins that
-/// claim the terminal slot; for two ready targets that name one file; and for
+/// claim the terminal slot; for two ready targets that name one file, by one
+/// key or by two that differ only by case on a volume that does not tell them
+/// apart; and for
 /// an external whose checkout overlaps another external's or a ready target's
 /// path.
 ///
@@ -154,7 +158,7 @@ pub fn resolve(
         .collect::<Result<Vec<_>, Error>>()?;
     targets.extend(place(merged, &values)?);
 
-    refuse_shared_files(&targets)?;
+    refuse_shared_files(&targets, home, crate::fs::case_insensitive)?;
     refuse_overlapping_externals(&merged.externals, &targets)?;
 
     Ok(Resolved {
@@ -174,7 +178,18 @@ pub fn resolve(
 /// `Portable` is the key the ledger and the journal are written against: two
 /// targets for one file would give `rm` two priors to restore and `apply` two
 /// writers, so the second `plan` would never be empty.
-fn refuse_shared_files(targets: &[Resolution<Target>]) -> Result<(), Error> {
+///
+/// Two keys that differ only by case are one file too where the directory they
+/// part in looks names up without regard to case, as a default APFS volume
+/// does. That is asked of the volume through `folds` — never assumed from the
+/// OS — and only for such a pair, so a configuration without one touches no
+/// filesystem here. A volume `folds` cannot judge is taken to fold: refusing
+/// costs an edit to the configuration, and two priors for one file cost `rm`.
+fn refuse_shared_files(
+    targets: &[Resolution<Target>],
+    home: &Path,
+    folds: impl Fn(&Path) -> Option<bool>,
+) -> Result<(), Error> {
     let ready: Vec<&Target> = targets
         .iter()
         .filter_map(|resolution| match resolution {
@@ -197,7 +212,42 @@ fn refuse_shared_files(targets: &[Resolution<Target>]) -> Result<(), Error> {
             });
         }
     }
+
+    for (index, later) in ready.iter().enumerate() {
+        for earlier in &ready[..index] {
+            if earlier.path.as_str().to_lowercase() != later.path.as_str().to_lowercase() {
+                continue;
+            }
+            let parting = parting_dir(&earlier.path.render(home), &later.path.render(home));
+            let judged = match folds(&parting) {
+                Some(false) => continue,
+                Some(true) => "on this volume, which does not tell names apart by case",
+                None => {
+                    "unless this volume tells names apart by case, which bx could not \
+                     determine"
+                }
+            };
+            return Err(Error::BadValue {
+                origin: later.origin.clone(),
+                message: format!(
+                    "target `{}` is the same file as `{}`, the target at {}, {judged}; \
+                     one file has one target",
+                    later.path, earlier.path, earlier.origin
+                ),
+            });
+        }
+    }
     Ok(())
+}
+
+/// The directory in which two paths first name different entries: where a
+/// lookup decides whether they are one file.
+fn parting_dir(one: &Path, other: &Path) -> std::path::PathBuf {
+    one.components()
+        .zip(other.components())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a)
+        .collect()
 }
 
 /// Refuse an external whose checkout overlaps another external's or a ready
@@ -2585,6 +2635,123 @@ mod tests {
         assert!(
             message.contains("same file as the target at bx.toml:"),
             "{message}"
+        );
+    }
+
+    /// Two ready targets, at `bx.toml:2` and `local.toml:1`, whose keys
+    /// differ only by the case of `App`.
+    fn targets_differing_by_case() -> Vec<Resolution<Target>> {
+        let global = layer(
+            "bx.toml",
+            LayerKind::Global,
+            "\n[[target]]\npath = \"~/.config/App/settings.json\"\ncontent = \"GLOBAL\"\n",
+        )
+        .unwrap();
+        let local = layer(
+            "local.toml",
+            LayerKind::Local,
+            "[[target]]\npath = \"~/.config/app/settings.json\"\ncontent = \"LOCAL\"\n",
+        )
+        .unwrap();
+        global
+            .config
+            .targets
+            .into_iter()
+            .chain(local.config.targets)
+            .map(Resolution::Ready)
+            .collect()
+    }
+
+    #[test]
+    fn targets_differing_only_by_case_are_refused_where_the_volume_folds_case() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let message = refuse_shared_files(&targets_differing_by_case(), &home(), |dir| {
+            asked.borrow_mut().push(dir.to_path_buf());
+            Some(true)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(message.contains("local.toml:1"), "{message}");
+        assert!(message.contains("the target at bx.toml:2"), "{message}");
+        assert!(
+            message.contains("`~/.config/App/settings.json`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("does not tell names apart by case"),
+            "{message}"
+        );
+        assert_eq!(
+            *asked.borrow(),
+            [home().join(".config")],
+            "the volume is asked about the directory the two names part in"
+        );
+    }
+
+    #[test]
+    fn targets_differing_only_by_case_stand_where_the_volume_tells_them_apart() {
+        refuse_shared_files(&targets_differing_by_case(), &home(), |_| Some(false))
+            .expect("two files on a case-sensitive volume");
+    }
+
+    #[test]
+    fn targets_differing_only_by_case_are_refused_where_the_volume_cannot_be_judged() {
+        let message = refuse_shared_files(&targets_differing_by_case(), &home(), |_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("could not determine"), "{message}");
+        assert!(message.contains("the target at bx.toml:2"), "{message}");
+    }
+
+    #[test]
+    fn targets_that_differ_by_more_than_case_never_ask_the_volume() {
+        let mut targets = targets_differing_by_case();
+        targets.truncate(1);
+        targets.extend(resolved_targets(
+            "[[target]]\npath = \"~/.config/app/other.json\"\ncontent = \"x\"\n",
+        ));
+        refuse_shared_files(&targets, &home(), |dir| {
+            panic!("asked about {}", dir.display())
+        })
+        .expect("different files");
+    }
+
+    #[test]
+    fn the_real_volume_decides_whether_case_differing_targets_are_one_file() {
+        let home = crate::testing::guarded_home();
+        home.write(".config/App/settings.json", "{}");
+        let folds = home.child(".config/app/settings.json").exists();
+
+        let outcome = refuse_shared_files(
+            &targets_differing_by_case(),
+            home.path(),
+            crate::fs::case_insensitive,
+        );
+
+        assert_eq!(outcome.is_err(), folds, "{outcome:?}");
+    }
+
+    /// The targets of one global layer, each ready.
+    fn resolved_targets(text: &str) -> Vec<Resolution<Target>> {
+        layer("bx.toml", LayerKind::Global, text)
+            .unwrap()
+            .config
+            .targets
+            .into_iter()
+            .map(Resolution::Ready)
+            .collect()
+    }
+
+    #[test]
+    fn the_directory_two_paths_part_in_is_their_common_prefix() {
+        assert_eq!(
+            parting_dir(Path::new("/h/.config/App/x"), Path::new("/h/.config/app/x")),
+            Path::new("/h/.config")
+        );
+        assert_eq!(
+            parting_dir(Path::new("/h/A"), Path::new("/h/a")),
+            Path::new("/h")
         );
     }
 

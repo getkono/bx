@@ -17,8 +17,14 @@ fn bun_reads_a_backslash_as_a_separator_and_the_guard_refuses_it() {
         return;
     };
     let scratch = tempfile::tempdir().expect("a scratch directory");
-    let root = scratch.path().join("r");
-    let home = scratch.path().join("h");
+    // Canonical, as bun prints it: macOS's temp directory is under the `/var`
+    // symlink.
+    let base = scratch
+        .path()
+        .canonicalize()
+        .expect("the scratch directory");
+    let root = base.join("r");
+    let home = base.join("h");
     let state = home.join(".local/state/bx");
     std::fs::create_dir_all(root.join("a")).expect("the root");
     std::fs::create_dir_all(&state).expect("a stand-in state directory");

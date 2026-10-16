@@ -133,7 +133,7 @@ pub fn guarded_home() -> GuardedHome {
 pub struct GuardedHome {
     /// Held for its `Drop`, which removes the directory.
     _dir: TempDir,
-    /// `dir`'s canonical path.
+    /// The tempdir's canonical path.
     path: PathBuf,
 }
 

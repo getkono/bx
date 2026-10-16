@@ -160,22 +160,29 @@ struct Shell {
     report: &'static str,
 }
 
-const SHELLS: &[Shell] = &[
-    Shell {
-        program: "bash",
-        flags: &["--norc", "--noprofile"],
-        report: "__bx_report() { local __bx_n; for __bx_n in $(compgen -v); do \
-                     printf '%s=%s\\0' \"$__bx_n\" \"${!__bx_n}\"; done; }; trap __bx_report EXIT",
-    },
-    Shell {
-        program: "zsh",
-        flags: &["-f"],
-        report: "__bx_report() { local __bx_n; for __bx_n in ${(k)parameters}; do \
-                     [[ ${parameters[$__bx_n]} == (scalar|array)* ]] && \
-                     printf '%s=%s\\0' \"$__bx_n\" \"${(j.:.)${(P)__bx_n}}\"; done; }; \
-                     trap __bx_report EXIT",
-    },
-];
+#[cfg(target_os = "linux")]
+const BASH: Shell = Shell {
+    program: "bash",
+    flags: &["--norc", "--noprofile"],
+    report: "__bx_report() { local __bx_n; for __bx_n in $(compgen -v); do \
+                 printf '%s=%s\\0' \"$__bx_n\" \"${!__bx_n}\"; done; }; trap __bx_report EXIT",
+};
+
+const ZSH: Shell = Shell {
+    program: "zsh",
+    flags: &["-f"],
+    report: "__bx_report() { local __bx_n; for __bx_n in ${(k)parameters}; do \
+                 [[ ${parameters[$__bx_n]} == (scalar|array)* ]] && \
+                 printf '%s=%s\\0' \"$__bx_n\" \"${(j.:.)${(P)__bx_n}}\"; done; }; \
+                 trap __bx_report EXIT",
+};
+
+/// macOS's bash is 3.2, which bx's generated bash does not support yet, so
+/// the guard is held to bash on Linux only.
+#[cfg(target_os = "linux")]
+const SHELLS: &[Shell] = &[BASH, ZSH];
+#[cfg(not(target_os = "linux"))]
+const SHELLS: &[Shell] = &[ZSH];
 
 /// The variable that excuses a machine from supplying the programs these
 /// checks are held against.

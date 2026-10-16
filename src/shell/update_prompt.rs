@@ -269,6 +269,16 @@ mod tests {
             )
             .expect("a recording bx");
             crate::fs::set_mode(&bx, crate::fs::Mode::from_bits(0o755)).expect("executable");
+            // Run once here and its record dropped: macOS checks a newly
+            // written executable before its first run, for long enough that a
+            // detached first call could outlast the script's own pause. Not on
+            // Linux, which has no such check, and where executing a file just
+            // written can meet `ETXTBSY` from another test thread's fork.
+            if cfg!(target_os = "macos") {
+                let warmed = Command::new(&bx).status().expect("the recording bx runs");
+                assert!(warmed.success(), "the recording bx: {warmed}");
+                std::fs::remove_file(home.path().join("calls")).expect("the warm-up's record");
+            }
             std::fs::create_dir_all(Self::dir_in(home.path())).expect("update/");
             Self { home, shell }
         }
@@ -348,7 +358,12 @@ mod tests {
         }
     }
 
+    /// The shells every hook test runs in. macOS's bash is 3.2, which the
+    /// bash hook does not support yet; it is held to bash on Linux only.
+    #[cfg(target_os = "linux")]
     const SHELLS: [Shell; 2] = [Shell::Zsh, Shell::Bash];
+    #[cfg(not(target_os = "linux"))]
+    const SHELLS: [Shell; 1] = [Shell::Zsh];
 
     #[test]
     fn nothing_due_is_silent_and_starts_nothing() {
@@ -694,6 +709,7 @@ mod tests {
 
     /// What bash prints of `PROMPT_COMMAND` after sourcing the hook behind
     /// `before`: its attributes, then each element on its own line.
+    #[cfg(target_os = "linux")]
     fn prompt_command(before: &str) -> String {
         let rig = Rig::new(Shell::Bash);
         rig.run_after(
@@ -705,6 +721,8 @@ mod tests {
         .0
     }
 
+    // macOS's bash is 3.2, which the bash hook does not support yet.
+    #[cfg(target_os = "linux")]
     #[test]
     fn bash_appends_to_an_unexported_prompt_command_once() {
         if crate::shell::testing::installed("bash").is_none() {
@@ -733,6 +751,8 @@ mod tests {
         );
     }
 
+    // macOS's bash is 3.2, which the bash hook does not support yet.
+    #[cfg(target_os = "linux")]
     #[test]
     fn bash_leaves_an_exported_or_read_only_prompt_command_alone() {
         if crate::shell::testing::installed("bash").is_none() {
@@ -761,6 +781,8 @@ mod tests {
         assert_eq!(printed, "[7]\n");
     }
 
+    // macOS's bash is 3.2, which the bash hook does not support yet.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_later_export_carries_an_entry_a_child_bash_runs_without_error() {
         if crate::shell::testing::installed("bash").is_none() {

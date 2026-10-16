@@ -53,6 +53,7 @@ use crate::journal::{Session, SessionKind};
 use crate::paths::{self, Portable};
 use crate::recover::{self, Interrupted};
 use crate::report::{Action, Exit};
+use crate::shell::placement::Platform;
 use crate::shell::{Shell, activation};
 use crate::state::{
     self, ExclusiveLock, Fingerprints, LedgerView, Mechanism, SharedLock, StateDir,
@@ -554,19 +555,7 @@ fn undeclared_rows(
                 .map(|external| external.path.as_str()),
         )
         .collect();
-    // A startup file's region sources its fragment, and stays while the
-    // fragment is planned — a vacated one included, which is left sourced and
-    // empty — so it is declared by the fragment whether or not this run
-    // decides it.
-    let sourcing = config::env::Place::ALL
-        .into_iter()
-        .filter_map(|place| Some((place.fragment(), place.startup_file()?)))
-        .chain([(crate::shell::bash::FILE, crate::shell::bash::STARTUP_FILE)]);
-    for (fragment, startup) in sourcing {
-        if declared.contains(fragment) {
-            declared.insert(startup);
-        }
-    }
+    declare_sourcing(&mut declared, Platform::HERE);
     let origin = Origin::unknown(&inputs.state.ledger());
     // A link's own directory is the user's, not bx's: only what lies beneath
     // one whose children this run cannot list is held.
@@ -584,6 +573,28 @@ fn undeclared_rows(
         })
         .map(|(_, entry)| decide::decide_undeclared(entry, &origin, &inputs.home))
         .collect()
+}
+
+/// Declare, for each generated file `declared` names, the startup files whose
+/// regions source it on `platform`.
+///
+/// A startup file's region sources its fragment, and stays while the
+/// fragment is planned — a vacated one included, which is left sourced and
+/// empty — so it is declared by the fragment whether or not this run decides
+/// it. On [`Platform::Macos`] bash's file is sourced from
+/// [`crate::shell::bash::PROFILE`] too, so that region is declared with it.
+fn declare_sourcing(declared: &mut BTreeSet<&str>, platform: Platform) {
+    let profile = (platform == Platform::Macos).then_some(crate::shell::bash::PROFILE);
+    let sourcing = config::env::Place::ALL
+        .into_iter()
+        .filter_map(|place| Some((place.fragment(), place.startup_file()?)))
+        .chain([(crate::shell::bash::FILE, crate::shell::bash::STARTUP_FILE)])
+        .chain(profile.map(|profile| (crate::shell::bash::FILE, profile)));
+    for (fragment, startup) in sourcing {
+        if declared.contains(fragment) {
+            declared.insert(startup);
+        }
+    }
 }
 
 /// `target` as `plan` renders it: zsh's and bash's interactive files with
@@ -1844,6 +1855,32 @@ pub(crate) mod tests {
         assert!(!without.contains("alias s="), "{without}");
         let with = written(stub_tool(&home));
         assert!(with.contains("alias s='stub'\n"), "{with}");
+    }
+
+    #[test]
+    fn on_macos_a_planned_bash_file_declares_the_bash_profile_region_too() {
+        use crate::shell::bash::{FILE, PROFILE, STARTUP_FILE};
+        let declared = |platform| {
+            // bash's file planned and nothing else: as it is once nothing
+            // places it and only the vacated file is left.
+            let mut declared = BTreeSet::from([FILE]);
+            declare_sourcing(&mut declared, platform);
+            declared
+        };
+        assert_eq!(
+            declared(Platform::Macos),
+            BTreeSet::from([FILE, STARTUP_FILE, PROFILE])
+        );
+        assert_eq!(
+            declared(Platform::Linux),
+            BTreeSet::from([FILE, STARTUP_FILE])
+        );
+        // Nothing planned declares no startup file on either platform.
+        for platform in [Platform::Linux, Platform::Macos] {
+            let mut none = BTreeSet::new();
+            declare_sourcing(&mut none, platform);
+            assert!(none.is_empty(), "{platform:?}");
+        }
     }
 
     #[test]

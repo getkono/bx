@@ -2,13 +2,13 @@
 name = "bx"
 version = "0.1.2"
 edition = "2024"
-description = "An idempotent, additive Linux developer-environment manager."
+description = "An idempotent, additive developer-environment manager for Linux and macOS."
 authors = ["Justin Chung"]
 license = "MIT"
 repository = "https://github.com/getkono/bx"
 homepage = "https://github.com/getkono/bx"
 readme = "README.md"
-keywords = ["dotfiles", "cli", "configuration", "linux", "developer-tools"]
+keywords = ["dotfiles", "cli", "linux", "macos", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 # bx is distributed only as a prebuilt static binary via install.sh (see
 # RELEASING.md); it is not published to crates.io. The metadata above is kept

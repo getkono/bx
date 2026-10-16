@@ -1,4 +1,5 @@
-# cross-rs — bx ships only statically linked Linux binaries.
+# cross-rs — bx's statically linked Linux release binaries. bx also supports
+# macOS, but no macOS release binary is built yet, here or elsewhere.
 #
 # musl (not gnu) for both targets: the binary must run on a barebones box with
 # no toolchain and no assumption about the host's glibc version, because

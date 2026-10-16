@@ -7,7 +7,7 @@
 # static-binary build that install.sh downloads from.
 [workspace]
 # bx is NOT published to crates.io. Its only install channel is install.sh
-# pulling a static musl binary from GitHub Releases, because the tool's job is
+# pulling a prebuilt binary from GitHub Releases, because the tool's job is
 # to bootstrap a machine that has no Rust toolchain on it. With publishing off,
 # release-plz must detect versions from git tags rather than the registry, which
 # is what `git_only` does (it is mutually exclusive with `publish = true`).

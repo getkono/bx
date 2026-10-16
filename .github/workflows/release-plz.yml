@@ -5,9 +5,10 @@ name: Release-plz
 # and a `v{version}` tag. Cutting a release fans out to the build job below,
 # which attaches the static binaries install.sh downloads.
 #
-# bx is NOT published to crates.io — install.sh pulling a static musl binary is
+# bx is NOT published to crates.io — install.sh pulling a prebuilt binary is
 # the only channel, because bootstrapping a machine with no toolchain on it is
-# what bx is for. See release-plz.toml and RELEASING.md.
+# what bx is for. bx supports Linux and macOS, but this workflow builds only the
+# Linux binaries so far. See release-plz.toml and RELEASING.md.
 on:
   push:
     branches:

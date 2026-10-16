@@ -1402,12 +1402,7 @@ mod tests {
         // load, Session::open and recovery forever, and a link to /dev/zero
         // read without end.
         fn fifo(path: &Path) {
-            rustix::fs::mkfifoat(
-                rustix::fs::CWD,
-                path,
-                rustix::fs::Mode::from_raw_mode(0o600),
-            )
-            .expect("mkfifo");
+            crate::testing::mkfifo(path);
         }
         fn device_link(path: &Path) {
             std::os::unix::fs::symlink("/dev/zero", path).expect("link to /dev/zero");

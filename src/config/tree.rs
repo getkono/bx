@@ -544,14 +544,7 @@ mod tests {
     fn a_fifo_in_the_tree_is_a_load_error_naming_it() {
         let repo = repo(&[("bx.toml", TREE), ("files/x/f", "")]);
         let fifo = repo.path().join("files/x/pipe");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .expect("a fifo");
+        crate::testing::mkfifo(&fifo);
 
         let message = load(&repo).expect_err("refused").to_string();
         assert!(message.contains(&fifo.display().to_string()), "{message}");

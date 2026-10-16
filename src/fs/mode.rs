@@ -233,7 +233,9 @@ impl fmt::Display for Mode {
 
 impl From<Mode> for RawMode {
     fn from(mode: Mode) -> Self {
-        Self::from_bits_truncate(mode.bits())
+        // `mode_t` is `u32` on Linux and `u16` on macOS; every bit `Mode`
+        // keeps is below `0o10000`, so the cast loses nothing on either.
+        Self::from_bits_truncate(mode.bits() as rustix::fs::RawMode)
     }
 }
 
@@ -578,7 +580,7 @@ mod tests {
         for bits in [0o4755, 0o2755, 0o1777, 0o7777] {
             assert_eq!(
                 RawMode::from(Mode::from_bits(bits)).bits(),
-                bits,
+                bits as rustix::fs::RawMode,
                 "{bits:04o}",
             );
         }

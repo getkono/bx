@@ -857,14 +857,7 @@ mod tests {
         seed(&home.child("f"), b"x", Mode::DEFAULT_FILE);
         std::fs::create_dir(home.child("real")).expect("mkdir");
         std::os::unix::fs::symlink("real", home.child("link")).expect("symlink");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            home.child("fifo"),
-            rustix::fs::FileType::Fifo,
-            Mode::PRIVATE_FILE.into(),
-            0,
-        )
-        .expect("mkfifo");
+        crate::testing::mkfifo(&home.child("fifo"));
 
         for (rel, expected) in [
             ("f", "a file, where the target declares a directory"),

@@ -195,23 +195,16 @@ pub fn read(dir: &StateDir, reference: &RestoreRef) -> Result<Vec<u8>, Error> {
 /// `None` means *rewrite it*: a blob that cannot be stat'ed is not a blob whose
 /// content has been established.
 ///
-/// The name is opened `O_PATH | O_NOFOLLOW` and the descriptor is checked, so
-/// what is measured is the entry in `restore/` and never what a symlink there
-/// names: a decoy link to a same-length file elsewhere used to satisfy the
-/// check with none of the user's bytes behind it. It must be a regular file
-/// with exactly one link. `O_PATH` reads nothing and cannot block on a FIFO.
+/// The name is `lstat`ed, so what is measured is the entry in `restore/` and
+/// never what a symlink there names: a decoy link to a same-length file
+/// elsewhere used to satisfy the check with none of the user's bytes behind
+/// it. It must be a regular file with exactly one link. `lstat` opens nothing,
+/// so it needs no read permission and cannot block on a FIFO.
 /// The rewrite goes through [`write_atomically`]: its rename replaces a second
 /// hard link, and it refuses a symlink outright, so a link is never written
 /// through.
 fn blob_len(path: &Path) -> Option<u64> {
-    // `union`, not `|`, for the reason `read` gives.
-    let fd = rustix::fs::open(
-        path,
-        OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC),
-        RawMode::empty(),
-    )
-    .ok()?;
-    let stat = rustix::fs::fstat(&fd).ok()?;
+    let stat = rustix::fs::lstat(path).ok()?;
     let own = FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_nlink == 1;
     own.then(|| u64::try_from(stat.st_size).ok()).flatten()
 }

@@ -220,6 +220,24 @@ fn skip_unconstructible_to(
     }
 }
 
+/// Put a FIFO at `path`, mode `0600`.
+///
+/// Runs `mkfifo(1)`: rustix offers `mknodat` and `mkfifoat` on Linux only,
+/// and calling `libc` directly would take the `unsafe` this crate forbids.
+///
+/// # Panics
+///
+/// If `mkfifo` cannot be run or does not make the FIFO. A test whose fixture
+/// did not materialise is not a test that passed.
+pub fn mkfifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .args(["-m", "600"])
+        .arg(path)
+        .status()
+        .unwrap_or_else(|e| panic!("running mkfifo for {}: {e}", path.display()));
+    assert!(status.success(), "mkfifo {}: {status}", path.display());
+}
+
 impl std::fmt::Debug for GuardedHome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardedHome")

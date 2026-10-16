@@ -964,14 +964,7 @@ mod tests {
         std::fs::create_dir(&dir).expect("mkdir");
         std::fs::write(dir.join("inside"), b"theirs").expect("an entry of their own");
         let fifo = home.child("p");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            Mode::PRIVATE_FILE.into(),
-            0,
-        )
-        .expect("mkfifo");
+        crate::testing::mkfifo(&fifo);
 
         for (dest, kind) in [(&dir, Kind::Dir), (&fifo, Kind::Other)] {
             let err = stage_now(dest, Mode::DEFAULT_FILE).expect_err("not a file bx can write");

@@ -145,6 +145,43 @@ mod tests {
     }
 
     #[test]
+    fn a_swapped_name_that_is_the_same_file_means_case_does_not_matter() {
+        let home = crate::testing::guarded_home();
+        home.write("dir/a", "x");
+        let dir = home.child("dir");
+        // Where case matters, a hard link under the swapped name is the one
+        // file under both names, which is all a volume that folds case shows.
+        if std::fs::symlink_metadata(dir.join("A")).is_err() {
+            std::fs::hard_link(dir.join("a"), dir.join("A")).unwrap();
+        }
+
+        assert_eq!(judge_by_an_entry(&dir), Some(true));
+        assert_eq!(case_insensitive(&dir), Some(true));
+    }
+
+    #[test]
+    fn an_entry_whose_swapped_name_cannot_be_looked_up_is_not_judged_by() {
+        let home = crate::testing::guarded_home();
+        // 254 bytes, and 762 once swapped: past a 255-byte name limit, so
+        // where the volume counts bytes the lookup fails with something other
+        // than "not found". A volume that folds case and limits the name some
+        // other way finds the file again under the swapped name.
+        let name = "ΐ".repeat(127);
+        assert!(swap_case(&name).len() > 255);
+        home.write(format!("dir/{name}"), "x");
+        let dir = home.child("dir");
+
+        let expected = match std::fs::symlink_metadata(dir.join(swap_case(&name))) {
+            Ok(_) => Some(true),
+            Err(e) => {
+                assert_ne!(e.kind(), std::io::ErrorKind::NotFound);
+                None
+            }
+        };
+        assert_eq!(judge_by_an_entry(&dir), expected);
+    }
+
+    #[test]
     fn a_directory_with_nothing_to_judge_by_defers_to_its_parent() {
         let home = crate::testing::guarded_home();
         home.write("only_.../1", "x");

@@ -346,8 +346,16 @@ pub struct Fragment {
     pub vars: Vec<Var>,
     /// The `[path]` entries, written after every variable in zsh's words.
     /// Only the `zshenv` fragment holds any, and only those that reach zsh;
-    /// see [`super::path`].
+    /// see [`super::path`] — and on macOS the `zprofile` fragment too, which
+    /// writes them again after `path_helper` has reordered `PATH`
+    /// ([`crate::shell::placement::Platform`]).
     pub path: Vec<PathEntry>,
+    /// The variables a file the shell reads before this one has already
+    /// exported, which this fragment's lines may refer to but never writes:
+    /// the `zshenv` fragment's, for the `zprofile` fragment that repeats the
+    /// `[path]` entries on macOS. Not part of the bytes; the guard judges the
+    /// fragment as if they came first ([`Fragment::inherited_render`]).
+    pub inherited: Vec<Var>,
 }
 
 /// The line every fragment opens with. Fixed, so the fragment's bytes are a
@@ -392,6 +400,25 @@ impl Fragment {
         }
         out.push_str(&path::render(&self.path, Shell::Zsh));
         out
+    }
+
+    /// The bytes of the fragment the [`Fragment::inherited`] variables come
+    /// from, as far as they go — what the shell has read before this one —
+    /// or an empty string when there are none. What the guard reads ahead of
+    /// this fragment's own bytes, so a `[path]` entry that refers to one of
+    /// them is judged against the value it expands to.
+    #[must_use]
+    pub fn inherited_render(&self, decide: &dyn Decide) -> String {
+        if self.inherited.is_empty() {
+            return String::new();
+        }
+        Self {
+            syntax: self.syntax,
+            vars: self.inherited.clone(),
+            path: Vec::new(),
+            inherited: Vec::new(),
+        }
+        .render(decide)
     }
 }
 
@@ -615,6 +642,7 @@ mod tests {
             syntax: Syntax::Zsh,
             vars: vars.clone(),
             path: Vec::new(),
+            inherited: Vec::new(),
         };
         let render = |fragment: &Fragment| {
             fragment.render(&when::tools(&|_| unreachable!("nothing is gated")))
@@ -634,6 +662,7 @@ mod tests {
             syntax: Syntax::EnvironmentD,
             vars,
             path: Vec::new(),
+            inherited: Vec::new(),
         };
         assert!(render(&env_d).contains("\nCARGO_HOME=$HOME/.cargo\n"));
         assert!(!render(&env_d).contains("export"));
@@ -663,6 +692,7 @@ mod tests {
                 gated("VISUAL", "hx", "has:hx"),
             ],
             path: Vec::new(),
+            inherited: Vec::new(),
         };
         let asked = std::cell::RefCell::new(Vec::new());
         let present = |tool: &str| {
@@ -708,6 +738,7 @@ mod tests {
                 },
             ],
             path: Vec::new(),
+            inherited: Vec::new(),
         };
         let machine = |host: &str| when::Machine {
             os: "linux".to_string(),

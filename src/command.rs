@@ -83,6 +83,7 @@ fn doctor_with(
             path,
             unit_dir: &unit_dir,
             systemd,
+            bash: &doctor::bash::Version,
         },
     );
     out.write_all(doctor::render(&report, &env.home).as_bytes())

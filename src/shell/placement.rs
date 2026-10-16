@@ -25,8 +25,52 @@ use super::keybindings::Keybindings;
 use super::plugin::PluginDecl;
 use super::source::SourceDecl;
 
-/// Every target the shell declarations of `merged` place: zsh's
-/// ([`place_envs`]), then bash's ([`super::bash::place`]).
+/// The platform whose login shells the placement answers for: what each
+/// reads at login, and in what order, is the one thing about the shells that
+/// differs between them.
+///
+/// On macOS a login shell runs `path_helper` from `/etc/zprofile` (zsh) or
+/// `/etc/profile` (bash) after `~/.zshenv` and before `~/.zprofile` or
+/// `~/.bash_profile`, and it rebuilds `PATH` with the system's directories
+/// first, so every directory `~/.zshenv` prepended lands behind `/usr/bin`.
+/// Terminal and iTerm start a login shell for every window, so a login bash
+/// reads `~/.bash_profile` and not `~/.bashrc`. On macOS, then:
+///
+/// - the `zprofile` fragment repeats the `[path]` entries that reach zsh,
+///   after its own variables, so a login zsh puts them back where they were
+///   declared; each added entry is taken out before it is put back, so the
+///   second pass moves it rather than repeating it;
+/// - bash's file gets a second region, in [`super::bash::PROFILE`], which
+///   sources it unless `~/.bash_profile` already had `~/.bashrc` source it
+///   ([`super::bash::profile_line`]).
+///
+/// Linux reads none of these differently, so on Linux the placement is what
+/// it always was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// Linux.
+    Linux,
+    /// macOS, where a login shell runs `path_helper` and Terminal starts
+    /// login shells.
+    Macos,
+}
+
+impl Platform {
+    /// The platform this binary was built for, and so runs on.
+    ///
+    /// The library's own tests pin it to Linux, so the bytes they expect of
+    /// every placement are the same on every runner; what macOS places is
+    /// tested through [`place_on`] with [`Platform::Macos`], and end to end
+    /// by the acceptance suite, which runs the real binary.
+    pub const HERE: Self = if cfg!(target_os = "macos") && !cfg!(test) {
+        Self::Macos
+    } else {
+        Self::Linux
+    };
+}
+
+/// Every target the shell declarations of `merged` place on this platform:
+/// [`place_on`] for [`Platform::HERE`].
 ///
 /// What a caller of [`crate::config::resolve::resolve`] hands it, so the
 /// placed targets are refused for sharing a file or overlapping an external
@@ -34,10 +78,24 @@ use super::source::SourceDecl;
 ///
 /// # Errors
 ///
-/// Whatever [`place_envs`] or [`super::bash::place`] returns.
+/// Whatever [`place_on`] returns.
 pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
-    let mut placed = place_envs(merged, values)?;
-    placed.extend(super::bash::place(merged, values)?);
+    place_on(merged, values, Platform::HERE)
+}
+
+/// Every target the shell declarations of `merged` place on `platform`:
+/// zsh's ([`place_envs`]), then bash's ([`super::bash::place`]).
+///
+/// # Errors
+///
+/// Whatever [`place_envs`] or [`super::bash::place`] returns.
+pub fn place_on(
+    merged: &Config,
+    values: &ResolvedValues,
+    platform: Platform,
+) -> Result<Vec<Resolution<Target>>, Error> {
+    let mut placed = place_envs(merged, values, platform)?;
+    placed.extend(super::bash::place(merged, values, platform)?);
     Ok(placed)
 }
 
@@ -57,7 +115,11 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
 /// The `[path]` entries land in the `zshenv` fragment, after its variables,
 /// which is emitted when either is declared. Nothing in an entry is
 /// substituted, so an entry never holds a fragment back; a variable the
-/// fragment holds back holds its entries back with it.
+/// fragment holds back holds its entries back with it. On
+/// [`Platform::Macos`] they land in the `zprofile` fragment too, after its
+/// variables, which places it and its region on their own; that fragment
+/// inherits the `zshenv` fragment's variables, so an entry that refers to one
+/// is judged against it.
 ///
 /// The enabled `[[plugin]]` entries land in the `zshrc` fragment, which is
 /// the interactive shell file and is rendered through the phase assembly
@@ -114,6 +176,7 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
 pub(crate) fn place_envs(
     merged: &Config,
     values: &ResolvedValues,
+    platform: Platform,
 ) -> Result<Vec<Resolution<Target>>, Error> {
     // Only what reaches zsh: a declaration kept to bash is bash's file's.
     let path: Vec<PathEntry> = merged
@@ -169,18 +232,40 @@ pub(crate) fn place_envs(
     let bodies = super::function::resolve(functions, values)?;
     let sourced = super::source::resolve(sources, values)?;
 
-    let mut placed = Vec::new();
-    for place in Place::ALL {
-        let here: Vec<&(&EnvDecl, Resolution<Var>)> = resolved
+    let lands_in = |place: Place| {
+        resolved
             .iter()
             // A variable that lands in `environment.d` carries no `shells`
             // (the load refuses one), so this keeps only the other shell's
             // variables out of zsh's files.
-            .filter(|(decl, _)| {
+            .filter(move |(decl, _)| {
                 decl.kind.places().contains(&place) && decl.shells.includes(Shell::Zsh)
             })
-            .collect();
-        let entries = if place == Place::Zshenv { path } else { &[] };
+    };
+    // What the `zshenv` fragment exports: what a login zsh has read by the
+    // time it reads the `zprofile` fragment, whose repeated `[path]` entries
+    // may refer to it.
+    let exported: Vec<Var> = lands_in(Place::Zshenv)
+        .filter_map(|(_, resolution)| match resolution {
+            Resolution::Ready(var) => Some(var.clone()),
+            Resolution::Blocked(_) => None,
+        })
+        .collect();
+
+    let mut placed = Vec::new();
+    for place in Place::ALL {
+        let here: Vec<&(&EnvDecl, Resolution<Var>)> = lands_in(place).collect();
+        let repeats_path = place == Place::Zprofile && platform == Platform::Macos;
+        let entries = if place == Place::Zshenv || repeats_path {
+            path
+        } else {
+            &[]
+        };
+        let inherited = if repeats_path && !path.is_empty() {
+            exported.clone()
+        } else {
+            Vec::new()
+        };
         let (interactive, declared, defined, optional) = if place == Place::Zshrc {
             (plugins, aliases, functions, sources)
         } else {
@@ -239,7 +324,7 @@ pub(crate) fn place_envs(
                     Resolution::Blocked(_) => None,
                 })
                 .collect();
-            let generator = match fragment_gen(place, vars, entries.to_vec()) {
+            let generator = match fragment_gen(place, vars, entries.to_vec(), inherited) {
                 Gen::Interactive(file) => Gen::Interactive(Box::new(
                     file.with_plugins(interactive)?
                         .with_history(history.clone())
@@ -275,14 +360,16 @@ pub(crate) fn place_envs(
     Ok(placed)
 }
 
-/// What produces the fragment at `place`, holding `vars` and then `entries`:
-/// an environment fragment, or at the interactive place the file the phase
-/// assembly renders, with the fragment in its `env` phase and no plugin yet.
-fn fragment_gen(place: Place, vars: Vec<Var>, entries: Vec<PathEntry>) -> Gen {
+/// What produces the fragment at `place`, holding `vars` and then `entries`
+/// and read after `inherited`: an environment fragment, or at the
+/// interactive place the file the phase assembly renders, with the fragment
+/// in its `env` phase and no plugin yet.
+fn fragment_gen(place: Place, vars: Vec<Var>, entries: Vec<PathEntry>, inherited: Vec<Var>) -> Gen {
     let fragment = Fragment {
         syntax: place.syntax(),
         vars,
         path: entries,
+        inherited,
     };
     match place {
         Place::Zshrc => Gen::Interactive(Box::new(Interactive::new(fragment))),
@@ -343,7 +430,7 @@ pub fn vacated_fragments(
                 Resolution::Ready(fragment_target(
                     place,
                     path,
-                    fragment_gen(place, Vec::new(), Vec::new()),
+                    fragment_gen(place, Vec::new(), Vec::new(), Vec::new()),
                     &origin,
                 ))
             })
@@ -481,5 +568,137 @@ pub(crate) fn held_together(
         let names = values.in_declaration_order(unset);
         let hint = values::init_hint(&spelled(&names));
         (BlockReason::UnsetValue { names }, hint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::parse_str;
+    use crate::config::when::tools;
+
+    const HOME: &str = "/var/home/example";
+
+    /// What `text` places for zsh on `platform`: each ready target's path,
+    /// its bytes on a machine with every tool, and its fragment's inherited
+    /// variables' names.
+    fn zsh_on(text: &str, platform: Platform) -> Vec<(String, String, Vec<String>)> {
+        let config = parse_str(text, Path::new("/repo/bx.toml"), Path::new(HOME)).expect("parses");
+        let values = ResolvedValues::resolve(
+            config.values.clone(),
+            &config.value_assignments,
+            Path::new(HOME),
+        )
+        .expect("values");
+        place_envs(&config, &values, platform)
+            .expect("places")
+            .into_iter()
+            .map(|resolution| match resolution {
+                Resolution::Ready(target) => {
+                    let Body::Generated(generator) = &target.body else {
+                        panic!("generated: {target:?}");
+                    };
+                    let inherited = match generator {
+                        Gen::Env(fragment) => {
+                            fragment.inherited.iter().map(|v| v.name.clone()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    (
+                        target.path.to_string(),
+                        generator.render(&tools(&|_| true)),
+                        inherited,
+                    )
+                }
+                Resolution::Blocked(entry) => panic!("held back: {entry:?}"),
+            })
+            .collect()
+    }
+
+    const PATHS: &str = "[[env]]\nname = \"LANG\"\nvalue = \"C.UTF-8\"\nkind = \"environment\"\n\n\
+                         [path]\nprepend = [\"~/bin\"]\nappend = [\"/opt/tool/bin\"]\n";
+
+    #[test]
+    fn on_macos_the_zprofile_fragment_puts_the_path_entries_back_after_path_helper() {
+        let linux = zsh_on(PATHS, Platform::Linux);
+        let paths: Vec<&str> = linux.iter().map(|(p, ..)| p.as_str()).collect();
+        let shared = [
+            Place::Zshenv.fragment(),
+            "~/.zshenv",
+            Place::EnvironmentD.fragment(),
+        ];
+        assert_eq!(paths, shared);
+
+        let macos = zsh_on(PATHS, Platform::Macos);
+        let paths: Vec<&str> = macos.iter().map(|(p, ..)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                shared[0],
+                shared[1],
+                shared[2],
+                Place::Zprofile.fragment(),
+                "~/.zprofile"
+            ]
+        );
+        // What Linux writes is written alike.
+        assert_eq!(macos[..3], linux[..]);
+        // The `zprofile` fragment holds the same `[path]` lines and no
+        // variable, and inherits the `zshenv` fragment's.
+        let zshenv_path = linux[0].1.split_once("# [path]\n").expect("a path block").1;
+        let (head, zprofile_path) = macos[3].1.split_once("# [path]\n").expect("a path block");
+        assert_eq!(zprofile_path, zshenv_path);
+        assert!(!head.contains("export "), "{head}");
+        assert_eq!(macos[3].2, ["LANG"]);
+        assert_eq!(
+            macos[4].1,
+            format!("[[ -r {0} ]] && source {0}\n", Place::Zprofile.fragment())
+        );
+    }
+
+    #[test]
+    fn on_macos_a_login_variable_comes_before_the_repeated_path_entries() {
+        let login =
+            format!("{PATHS}\n[[env]]\nname = \"PAGER\"\nvalue = \"less\"\nkind = \"login\"\n");
+        let macos = zsh_on(&login, Platform::Macos);
+        let zprofile = &macos
+            .iter()
+            .find(|(p, ..)| p == Place::Zprofile.fragment())
+            .expect("the zprofile fragment")
+            .1;
+        let pager = zprofile
+            .find("export PAGER=less")
+            .expect("the login variable");
+        let path = zprofile.find("# [path]").expect("the path block");
+        assert!(pager < path, "{zprofile}");
+        // Without a `[path]` entry nothing is repeated, and nothing is
+        // inherited for it.
+        let alone = zsh_on(
+            "[[env]]\nname = \"PAGER\"\nvalue = \"less\"\nkind = \"login\"\n",
+            Platform::Macos,
+        );
+        assert_eq!(
+            alone,
+            zsh_on(
+                "[[env]]\nname = \"PAGER\"\nvalue = \"less\"\nkind = \"login\"\n",
+                Platform::Linux,
+            )
+        );
+        assert!(
+            alone
+                .iter()
+                .all(|(_, body, inherited)| !body.contains("PATH") && inherited.is_empty())
+        );
+    }
+
+    #[test]
+    fn an_entry_kept_to_bash_is_not_repeated_for_zsh() {
+        let bash_only = "[path]\nprepend = [{ dir = \"~/bin\", shells = [\"bash\"] }]\n";
+        assert!(zsh_on(bash_only, Platform::Macos).is_empty());
+    }
+
+    #[test]
+    fn the_platform_here_is_linux_in_the_library_s_tests() {
+        assert_eq!(Platform::HERE, Platform::Linux);
     }
 }

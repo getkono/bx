@@ -730,6 +730,7 @@ fn the_path_lines_bx_writes_are_approved_and_give_zsh_the_declared_order() {
             entry("${CARGO_HOME}/bin", Position::Prepend, false),
             entry("~/.cargo/bin", Position::Remove, false),
         ],
+        inherited: Vec::new(),
     }
     .render(&crate::config::when::tools(&|_| {
         unreachable!("nothing is gated on a tool")
@@ -824,6 +825,7 @@ fn bash_s_path_lines_are_approved_and_give_bash_the_declared_order_once_even_aft
         syntax: Syntax::Zsh,
         vars: vec![Var::always("CARGO_HOME", cargo.display().to_string())],
         path: entries,
+        inherited: Vec::new(),
     }
     .render(&crate::config::when::tools(&|_| {
         unreachable!("nothing is gated on a tool")
@@ -878,6 +880,7 @@ fn a_path_block_ending_on_a_missing_gated_directory_is_approved_and_survives_err
             syntax: Syntax::Zsh,
             vars: vec![],
             path,
+            inherited: Vec::new(),
         }
         .render(&crate::config::when::tools(&|_| {
             unreachable!("nothing is gated on a tool")

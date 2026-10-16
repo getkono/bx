@@ -1793,6 +1793,34 @@ fn the_region_line_is_not_an_environment_fragment() {
 }
 
 #[test]
+fn the_bash_profile_region_line_is_not_an_environment_fragment() {
+    // The region bx attaches to `~/.bash_profile` on macOS is held to what
+    // the zsh regions are, of the bytes its generator emits: it tests bash's
+    // file and a function, and sources the file. It assigns nothing.
+    use crate::paths::Portable;
+    use crate::shell::bash::{FILE, LOADED, profile_line};
+    let file = Portable::parse_in(FILE, Path::new(HOME)).expect("a portable path");
+    let line = profile_line(&file);
+    let region = format!("# >>> bx >>>\n{line}# <<< bx <<<\n");
+    assert_eq!(region.lines().count(), 3, "{region:?}");
+    assert_eq!(assignments_in(&region), Vec::<&str>::new(), "{region:?}");
+    for text in region.lines() {
+        assert!(
+            !matches!(statement(text), Statement::Assign { .. }),
+            "{text:?}"
+        );
+    }
+    // It names the file it sources, and the function it asks about.
+    assert_eq!(
+        line,
+        format!(
+            "[[ -r {0} ]] && ! declare -F {LOADED} >/dev/null && source {0}\n",
+            file.as_str()
+        )
+    );
+}
+
+#[test]
 fn the_init_snippet_is_not_an_environment_fragment() {
     // Invariant 2 sends bx's generated environment fragments through the
     // guard, and requires of generated shell content that is *not* one of
@@ -2288,13 +2316,16 @@ fn every_site_that_reaches_the_guard_is_known() {
     // into a further file is a new caller, as it was when sites were
     // matched by file. "This module" is the `env_guard` module wherever
     // its files are — `env_guard.rs` and everything beneath `env_guard/`.
-    const KNOWN: [&str; 15] = [
+    const KNOWN: [&str; 16] = [
         // `bx add`'s advisory scan.
         "use crate::env_guard::{self, Reason, RootSet};",
         "env_guard::scan_with(text, roots)",
-        // The plan's fragment judgements.
+        // The plan's fragment judgements. The `zprofile` fragment on macOS
+        // is judged read after the variables it inherits, and only its own
+        // lines' violations are kept.
         "use crate::env_guard::{self, RootSet};",
         "violations(&env_guard::scan_with(content, roots), before)",
+        "let mut found = env_guard::scan_with(&format!(\"{inherited}{content}\"), roots);",
         "violations(&env_guard::scan_exported(content, roots), 0)",
         "fn violations(found: &[env_guard::Violation], before: usize) -> Option<String> {",
         // The interactive file's history path, judged beside its `env`

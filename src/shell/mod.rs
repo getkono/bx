@@ -135,6 +135,7 @@ impl Gen {
         match self {
             Self::Env(fragment) => fragment.render(decide),
             Self::Source(fragment) => crate::config::env::source_line(fragment),
+            Self::Profile(file) => bash::profile_line(file),
             Self::Interactive(file) => file.render(decide),
             Self::Bash(file) => file.render(decide),
             Self::Inputrc(keybindings) => bash::render_inputrc(keybindings),
@@ -151,7 +152,7 @@ impl Gen {
         match self {
             Self::Interactive(file) => file.note(),
             Self::Bash(file) => file.note(),
-            Self::Env(_) | Self::Source(_) | Self::Inputrc(_) => None,
+            Self::Env(_) | Self::Source(_) | Self::Profile(_) | Self::Inputrc(_) => None,
         }
     }
 }

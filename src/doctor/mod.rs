@@ -13,7 +13,9 @@
 //!
 //! Doctor takes no exclusive lock and writes nothing under the state directory
 //! or the home, so it runs beside an `apply` that holds the lock. It starts no
-//! process but the one read-only `systemctl --user show` [`systemd`] builds.
+//! process but the one read-only `systemctl --user show` [`systemd`] builds,
+//! and `bash --version` when bash's generated file asks about updates
+//! ([`bash`]).
 //!
 //! The checks, in order:
 //!
@@ -39,7 +41,11 @@
 //!     holds no time.
 //! 11. [`stray_local`] — a `local.toml` inside the config repo, which bx
 //!     never loads, with the move to the state directory that makes it count.
+//! 12. [`bash`] — bash's generated file asks about followed externals'
+//!     updates, and the `bash` on `PATH` is older than 4.4, which leaves the
+//!     question out.
 
+pub mod bash;
 pub mod externals;
 pub mod modes;
 pub mod orphans;
@@ -86,6 +92,8 @@ pub struct Probes<'a> {
     pub unit_dir: &'a Path,
     /// The question put to the user's systemd.
     pub systemd: &'a dyn systemd::Query,
+    /// The question put to the `bash` on `path`.
+    pub bash: &'a dyn bash::Query,
 }
 
 /// Run every check against `inputs`, in the order the module lists them.
@@ -123,6 +131,7 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
         inputs.state(),
     ));
     findings.extend(stray_local::check(inputs.repo(), inputs.state(), home));
+    findings.extend(bash::check(inputs.targets(), probes.path, probes.bash));
     Report { findings }
 }
 
@@ -233,6 +242,7 @@ content = \"a\\n\"
                 path: OsStr::new(""),
                 unit_dir: &unit_dir,
                 systemd,
+                bash: &bash::Version,
             },
         );
         (render(&report, home.path()), exit(&report))
@@ -350,6 +360,7 @@ install = \"sudo dnf install bx-no-such-tool\"
                 path,
                 unit_dir: &unit_dir,
                 systemd,
+                bash: &bash::Version,
             },
         );
         (render(&report, home.path()), exit(&report))

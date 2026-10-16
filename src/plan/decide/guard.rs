@@ -46,7 +46,9 @@ pub(super) fn guard_generated(
 ) -> Option<String> {
     match generator {
         Gen::Env(fragment) => match fragment.syntax {
-            Syntax::Zsh => guard_fragment(content, roots),
+            Syntax::Zsh => {
+                guard_fragment_inheriting(&fragment.inherited_render(decide), content, roots)
+            }
             Syntax::EnvironmentD => guard_environment_d(content, roots),
         },
         Gen::Interactive(file) => {
@@ -68,7 +70,7 @@ pub(super) fn guard_generated(
                 guard_history_file("bash", file.history().bash_file.as_ref(), roots),
             ])
         }
-        Gen::Source(_) | Gen::Inputrc(_) => None,
+        Gen::Source(_) | Gen::Profile(_) | Gen::Inputrc(_) => None,
     }
 }
 
@@ -97,6 +99,21 @@ fn guard_history_file(shell: &str, file: Option<&Portable>, roots: &RootSet) -> 
 /// wrote is not bx's output to judge.
 pub(in crate::plan) fn guard_fragment(content: &str, roots: &RootSet) -> Option<String> {
     guard_fragment_after(content, roots, 0)
+}
+
+/// [`guard_fragment`] for a fragment a shell reads after `inherited`, the
+/// fragment its references may expand from: the two are judged as one, so a
+/// reference resolves to what the earlier file gave it, and only what this
+/// fragment's own lines do is reported, each under its own line number. A
+/// violation in `inherited` is that fragment's to report, when it is judged.
+fn guard_fragment_inheriting(inherited: &str, content: &str, roots: &RootSet) -> Option<String> {
+    let skipped = inherited.lines().count();
+    let mut found = env_guard::scan_with(&format!("{inherited}{content}"), roots);
+    found.retain(|v| v.line > skipped);
+    for v in &mut found {
+        v.line -= skipped;
+    }
+    violations(&found, 0)
 }
 
 /// [`guard_fragment`] for a fragment that is one part of a file, preceded in
@@ -145,6 +162,28 @@ mod tests {
             guard_fragment("export EDITOR=nvim\n", &RootSet::strict()),
             None
         );
+    }
+
+    #[test]
+    fn a_fragment_read_after_another_is_judged_with_what_that_one_exported() {
+        let home = guarded_home();
+        let roots = RootSet::new(home.path(), &[PathBuf::from("~")]);
+        let content = "# own\nexport PATH=${CARGO_HOME}/bin:${PATH}\n";
+        // Alone, the reference resolves to nothing the guard can judge.
+        let alone = guard_fragment_inheriting("", content, &roots).expect("unresolved");
+        assert!(alone.starts_with("line 2: PATH "), "{alone}");
+        // Read after the fragment that exports it, it is judged against that.
+        let inherited = "# inherited\nexport CARGO_HOME=${HOME}/.cargo\n";
+        assert_eq!(guard_fragment_inheriting(inherited, content, &roots), None);
+        // What the earlier fragment does wrong is its own to report, and a
+        // line of this one keeps its own number.
+        let worse = format!("{inherited}RUSTUP_HOME=/elsewhere\n");
+        assert_eq!(guard_fragment_inheriting(&worse, content, &roots), None);
+        let own =
+            guard_fragment_inheriting(inherited, &format!("{content}RUSTUP_HOME=/b\n"), &roots)
+                .expect("its own violation");
+        assert!(own.starts_with("line 3: RUSTUP_HOME "), "{own}");
+        assert!(!own.contains("PATH"), "{own}");
     }
 
     mod env_placement {

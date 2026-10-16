@@ -668,9 +668,10 @@ const READABLE_FRAGMENTS: &[&str] = &[
          [[ -d /var/mnt/scratch/example ]] && export PATH=/var/mnt/scratch/example/bin:$PATH\n\
          [[ -d /var/mnt/scratch/example/none ]] && export PATH=/b:$PATH\n\
          path=(${path:#/a})\n",
-    // bash's removal, which both shells read alike.
+    // bash's removal, which both shells read alike, its `/` spelled as
+    // bash 3.2 reads it too.
     "export PATH=/a:/b:/a:/a:$PATH\n\
-         PATH=:${PATH//:/::}:; PATH=${PATH//\":/a:\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}\n\
+         PATH=:${PATH//:/::}:; PATH=${PATH//\":\"\\/\"a:\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}\n\
          export PATH=/a:$PATH\n",
     "export XDG_STATE_HOME=~/.local/state/bx\n",
     "export npm_config_cache=/etc/evil\nexport TMPDIR=/tmp\n",

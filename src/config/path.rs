@@ -65,7 +65,10 @@
 //! out of `PATH` wherever it already is, so a nested shell that reads the
 //! file again — a zsh, or a bash started from one, whose `PATH` the zsh
 //! already extended — moves the entry rather than repeating it. The
-//! `environment.d` fragment gets no `PATH` entry from here.
+//! `environment.d` fragment gets no `PATH` entry from here. On macOS, where a
+//! login shell's `path_helper` puts the system's directories back in front
+//! after `~/.zshenv`, the `zprofile` fragment gets zsh's lines again
+//! ([`crate::shell::placement::Platform`]).
 
 use std::path::Path;
 
@@ -371,7 +374,9 @@ fn spelled(text: &str) -> Result<String, String> {
 ///   colons; drops every `:DIR:`, which with no colon shared between two
 ///   entries takes out every copy, adjacent ones included; then collapses the
 ///   doubled colons and strips the two it added. `DIR` is double-quoted, so
-///   the `/` in it does not end the pattern and nothing in it is a glob.
+///   nothing in it is a glob, and each `/` in it is written [`BASH_SLASH`],
+///   outside the quotes and escaped, so it does not end the pattern: bash
+///   3.2, macOS's, ends it at a `/` even inside double quotes.
 ///
 /// Both leave every other entry as and where it was, and neither runs a
 /// command.
@@ -395,7 +400,10 @@ pub fn render(entries: &[PathEntry], shell: Shell) -> String {
     };
     let removal = |out: &mut String, dir: &str| {
         out.push_str(open);
-        out.push_str(dir);
+        match shell {
+            Shell::Zsh => out.push_str(dir),
+            Shell::Bash => out.push_str(&dir.replace('/', BASH_SLASH)),
+        }
         out.push_str(close);
         out.push('\n');
     };
@@ -453,15 +461,27 @@ pub(crate) const ZSH_REMOVAL: (&str, &str) = ("path=(${path:#", "})");
 /// assignments to `PATH` on one line: every `:` doubled and one more at each
 /// end, so each entry stands between colons of its own; every `:WORD:` dropped,
 /// which with no colon shared takes out every copy; the doubled colons
-/// collapsed; the two added stripped. The word is double-quoted, so a `/` in
-/// it does not end the pattern and no character in it is a glob, and a
-/// reference in it expands as it would bare. Nothing but `PATH` is assigned,
+/// collapsed; the two added stripped. The word is double-quoted, so no
+/// character in it is a glob, and a reference in it expands as it would bare;
+/// each `/` in it is [`BASH_SLASH`], so it does not end the pattern in any
+/// bash. Nothing but `PATH` is assigned,
 /// and what it holds after is what it held before less every entry that is
 /// `WORD`, so the guard judges the line exactly as it judges zsh's.
 pub(crate) const BASH_REMOVAL: (&str, &str) = (
     "PATH=:${PATH//:/::}:; PATH=${PATH//\":",
     ":\"/}; PATH=${PATH//::/:}; PATH=${PATH#:}; PATH=${PATH%:}",
 );
+
+/// How each `/` of the word in bash's removal line is written: the double
+/// quotes around the word closed, an escaped `/`, and the quotes opened again.
+///
+/// bash 3.2, the one macOS ships, ends the pattern of `${PATH//PATTERN/}` at
+/// the first `/` it holds even inside double quotes, so a quoted `/` would
+/// split the word into a shorter pattern and a replacement, and take some
+/// other text out of `PATH`. An escaped one outside the quotes is one `/` to
+/// every bash. The guard reads exactly this spelling, and no other `/`, in
+/// that word.
+pub(crate) const BASH_SLASH: &str = "\"\\/\"";
 
 #[cfg(test)]
 mod tests {
@@ -702,10 +722,13 @@ mod tests {
 
         // bash gets the same lines but for each removal, in its own words.
         let bash = render(&entries, Shell::Bash);
+        // Each `/` of the word spelled so bash 3.2 does not end the pattern
+        // at it.
         let removal = |dir: &str| {
             format!(
-                "PATH=:${{PATH//:/::}}:; PATH=${{PATH//\":{dir}:\"/}}; PATH=${{PATH//::/:}}; \
-                 PATH=${{PATH#:}}; PATH=${{PATH%:}}"
+                "PATH=:${{PATH//:/::}}:; PATH=${{PATH//\":{}:\"/}}; PATH=${{PATH//::/:}}; \
+                 PATH=${{PATH#:}}; PATH=${{PATH%:}}",
+                dir.replace('/', "\"\\/\"")
             )
         };
         let mut expected = zsh;

@@ -167,7 +167,8 @@ fn path_edit(line: &str) -> Option<String> {
                 .and_then(|rest| rest.strip_suffix(BASH_REMOVAL.1))
         });
     if let Some(dir) = removed {
-        return Some(format!("path-out {dir}"));
+        // bash's word spells each `/` so bash 3.2 reads it as one.
+        return Some(format!("path-out {}", dir.replace("\"\\/\"", "/")));
     }
     let list = line.strip_prefix("export PATH=")?;
     let dir = list

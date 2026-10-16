@@ -290,20 +290,25 @@ const CAP_FSETID: u32 = 4;
 /// caller then refuses, which changes nothing; the other guess strips a bit.
 /// The whole judgement is [`cap_fsetid_in`], which takes the text, so the only
 /// part no test reaches is the `read_to_string` itself.
-#[cfg(target_os = "linux")]
-fn has_cap_fsetid() -> bool {
-    cap_fsetid_in(std::fs::read_to_string("/proc/self/status").ok().as_deref())
-}
-
-/// What stands in for `CAP_FSETID` on macOS: an effective uid of 0.
 ///
-/// XNU has no capabilities and no `/proc`. Its `chmod` keeps `S_ISGID` for
-/// the superuser and otherwise only for a member of the directory's group, so
-/// the superuser is the whole of the privileged path, and the group path is
+/// What stands in for `CAP_FSETID` on macOS is an effective uid of 0. XNU has
+/// no capabilities and no `/proc`. Its `chmod` keeps `S_ISGID` for the
+/// superuser and otherwise only for a member of the directory's group, so the
+/// superuser is the whole of the privileged path, and the group path is
 /// [`in_group`], as on Linux.
-#[cfg(not(target_os = "linux"))]
+///
+/// One function with an arm per platform, not one function per platform:
+/// mutation testing runs on Linux, where a function compiled only for macOS
+/// is never built, so every mutant of its body would survive.
 fn has_cap_fsetid() -> bool {
-    rustix::process::geteuid().is_root()
+    #[cfg(target_os = "linux")]
+    {
+        cap_fsetid_in(std::fs::read_to_string("/proc/self/status").ok().as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        rustix::process::geteuid().is_root()
+    }
 }
 
 /// Whether `CAP_FSETID` is set in the `CapEff` mask of `status`, the text of
@@ -337,26 +342,31 @@ fn cap_eff(status: &str) -> Option<u64> {
 /// anything else is what would let an unmapped id through the comparisons
 /// [`keeps_setgid`] makes. The reads are one line each; the judgement is
 /// [`overflow_in`], which takes the text.
-#[cfg(target_os = "linux")]
-fn overflow_ids() -> Overflow {
-    let read = |name: &str| std::fs::read_to_string(name).ok();
-    Overflow {
-        uid: overflow_in(read("/proc/sys/kernel/overflowuid").as_deref()),
-        gid: overflow_in(read("/proc/sys/kernel/overflowgid").as_deref()),
-    }
-}
-
+///
 /// macOS has no user namespaces, so no id is unmapped and none reads as an
 /// overflow id. `(uid_t)-1` and `(gid_t)-1` stand in for one: they are
 /// `KAUTH_UID_NONE` and `KAUTH_GID_NONE`, and `chown` reads `-1` as "leave it
 /// unchanged", so no file can be given either. The directory service does name
 /// `nogroup` with gid `-1`; were a file ever to `stat` as it, the preflight
 /// would refuse it, which is the safe direction.
-#[cfg(not(target_os = "linux"))]
-const fn overflow_ids() -> Overflow {
-    Overflow {
-        uid: u32::MAX,
-        gid: u32::MAX,
+///
+/// One function with an arm per platform, for the reason [`has_cap_fsetid`]
+/// gives.
+fn overflow_ids() -> Overflow {
+    #[cfg(target_os = "linux")]
+    {
+        let read = |name: &str| std::fs::read_to_string(name).ok();
+        Overflow {
+            uid: overflow_in(read("/proc/sys/kernel/overflowuid").as_deref()),
+            gid: overflow_in(read("/proc/sys/kernel/overflowgid").as_deref()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Overflow {
+            uid: u32::MAX,
+            gid: u32::MAX,
+        }
     }
 }
 

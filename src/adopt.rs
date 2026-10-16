@@ -694,7 +694,12 @@ fn secret(target: &Portable) -> Option<String> {
 }
 
 /// [`secret`], for a path relative to the home.
+///
+/// Compared without regard to case on every OS: on a volume that folds case,
+/// `~/.SSH/id_ed25519` is the key `~/.ssh/id_ed25519` names, and refusing it
+/// where case matters costs nothing a person would want copied.
 fn secret_rel(rel: &str) -> Option<String> {
+    let rel = &rel.to_lowercase();
     let name = rel.rsplit('/').next().unwrap_or(rel);
     let listed = [
         ".netrc",
@@ -709,16 +714,19 @@ fn secret_rel(rel: &str) -> Option<String> {
         ".docker/config.json",
         ".kube/config",
         ".config/sops/age/keys.txt",
+        "Library/Application Support/sops/age/keys.txt",
     ]
-    .contains(&rel);
+    .iter()
+    .any(|path| path.to_lowercase() == *rel);
     let under = [
         ".gnupg/",
         ".password-store/",
         ".local/share/keyrings/",
         ".config/age/",
+        "Library/Keychains/",
     ]
     .iter()
-    .any(|dir| rel.starts_with(dir));
+    .any(|dir| rel.starts_with(&dir.to_lowercase()));
     let ssh_key = rel.starts_with(".ssh/")
         && name.starts_with("id_")
         && !std::path::Path::new(name)
@@ -1772,6 +1780,7 @@ mod tests {
             ".password-store/site.gpg",
             ".local/share/keyrings/login.keyring",
             ".config/age/keys.txt",
+            "Library/Keychains/login.keychain-db",
         ] {
             plant(&home, rel, b"SECRET\n", 0o600);
             let rows = add_rel(&home, rel);
@@ -1782,6 +1791,34 @@ mod tests {
             assert!(!body(&home, rel).exists(), "{rel}");
         }
         assert_eq!(layer(&home), MINE);
+    }
+
+    #[test]
+    fn the_credential_list_is_matched_without_regard_to_case() {
+        for rel in [
+            ".SSH/id_ed25519",
+            ".ssh/ID_ED25519",
+            ".NETRC",
+            ".Config/GH/hosts.yml",
+            ".GnuPG/pubring.kbx",
+            "Library/Keychains/login.keychain-db",
+            "library/keychains/login.keychain-db",
+            "Library/Application Support/sops/age/keys.txt",
+            "LIBRARY/APPLICATION SUPPORT/SOPS/AGE/KEYS.TXT",
+        ] {
+            assert!(secret_rel(rel).is_some(), "{rel}");
+        }
+        for rel in [
+            ".SSH/id_ed25519.PUB",
+            ".SSH/config",
+            "Library/Application Support/sops/age/other.txt",
+            "Library/Preferences/x.plist",
+        ] {
+            assert!(secret_rel(rel).is_none(), "{rel}");
+        }
+        assert!(credential_dir(
+            &Portable::try_from("~/Library/Keychains".to_string()).unwrap()
+        ));
     }
 
     #[test]

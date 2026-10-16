@@ -119,7 +119,8 @@ pub fn place_on(
 /// [`Platform::Macos`] they land in the `zprofile` fragment too, after its
 /// variables, which places it and its region on their own; that fragment
 /// inherits the `zshenv` fragment's variables, so an entry that refers to one
-/// is judged against it.
+/// is judged against it, and a variable that holds the `zshenv` fragment back
+/// holds the `zprofile` fragment back with it, for the same reason.
 ///
 /// The enabled `[[plugin]]` entries land in the `zshrc` fragment, which is
 /// the interactive shell file and is rendered through the phase assembly
@@ -251,6 +252,14 @@ pub(crate) fn place_envs(
             Resolution::Blocked(_) => None,
         })
         .collect();
+    // What holds the `zshenv` fragment back: it holds back the `[path]`
+    // entries with it, wherever they are repeated.
+    let zshenv_held: Vec<&BlockedEntry> = lands_in(Place::Zshenv)
+        .filter_map(|(_, resolution)| match resolution {
+            Resolution::Blocked(entry) => Some(entry),
+            Resolution::Ready(_) => None,
+        })
+        .collect();
 
     let mut placed = Vec::new();
     for place in Place::ALL {
@@ -309,13 +318,19 @@ pub(crate) fn place_envs(
             })
         };
         let fragment = portable(place.fragment())?;
-        let held: Vec<&BlockedEntry> = here
+        let mut held: Vec<&BlockedEntry> = here
             .iter()
             .filter_map(|(_, resolution)| match resolution {
                 Resolution::Blocked(entry) => Some(entry),
                 Resolution::Ready(_) => None,
             })
             .collect();
+        // The repeated entries are held back with the `zshenv` fragment, so a
+        // login zsh never reads them in `~/.zprofile` alone, and an entry that
+        // refers to a held-back variable is never judged without it.
+        if repeats_path && !entries.is_empty() {
+            held.extend(zshenv_held.iter().copied());
+        }
         placed.push(if held.is_empty() {
             let vars = here
                 .iter()
@@ -689,6 +704,65 @@ mod tests {
                 .iter()
                 .all(|(_, body, inherited)| !body.contains("PATH") && inherited.is_empty())
         );
+    }
+
+    #[test]
+    fn on_macos_a_held_back_zshenv_variable_holds_the_repeated_path_entries_back() {
+        let unset = |entry: &str| {
+            format!(
+                "[[value]]\nname = \"root\"\nkind = \"string\"\n\n\
+                 [[env]]\nname = \"CARGO_HOME\"\nvalue = \"{{{{root}}}}/cargo\"\nkind = \"environment\"\n\n\
+                 [path]\nprepend = [\"{entry}\"]\n"
+            )
+        };
+        for entry in ["${CARGO_HOME}/bin", "~/bin"] {
+            let text = unset(entry);
+            let config =
+                parse_str(&text, Path::new("/repo/bx.toml"), Path::new(HOME)).expect("parses");
+            let values = ResolvedValues::resolve(
+                config.values.clone(),
+                &config.value_assignments,
+                Path::new(HOME),
+            )
+            .expect("values");
+            let placed = place_envs(&config, &values, Platform::Macos).expect("places");
+            let held: Vec<&BlockedEntry> = placed
+                .iter()
+                .filter_map(|resolution| match resolution {
+                    Resolution::Blocked(entry) => Some(entry),
+                    Resolution::Ready(_) => None,
+                })
+                .collect();
+            let keys: Vec<&str> = held.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(
+                keys,
+                [
+                    Place::Zshenv.fragment(),
+                    Place::EnvironmentD.fragment(),
+                    Place::Zprofile.fragment()
+                ],
+                "{entry}"
+            );
+            for entry in held {
+                assert_eq!(
+                    entry.reason,
+                    BlockReason::UnsetValue {
+                        names: vec!["root".to_string()]
+                    }
+                );
+                assert_eq!(entry.hint, values::init_hint(&["root"]));
+            }
+            // Nothing reaches `~/.zprofile` but the region, which sources
+            // the fragment only once one is there to read.
+            let ready: Vec<String> = placed
+                .iter()
+                .filter_map(|resolution| match resolution {
+                    Resolution::Ready(target) => Some(target.path.to_string()),
+                    Resolution::Blocked(_) => None,
+                })
+                .collect();
+            assert_eq!(ready, ["~/.zshenv", "~/.zprofile"]);
+        }
     }
 
     #[test]

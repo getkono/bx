@@ -1569,6 +1569,27 @@ pub(crate) mod tests {
         .expect("the stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("executable");
+        // Another test thread that forks while the stub is open for writing
+        // holds that descriptor until its child calls `exec`, and running the
+        // stub inside that window fails with `ETXTBSY`. The window closes on
+        // its own, so the stub is run once here, retrying only that error,
+        // and the record of that run dropped, before any code under test runs
+        // it.
+        let mut warmed = false;
+        for _ in 0..200 {
+            match std::process::Command::new(&stub).output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("the stub would not run: {e}"),
+                Ok(_) => {
+                    warmed = true;
+                    break;
+                }
+            }
+        }
+        assert!(warmed, "the stub stayed busy");
+        std::fs::remove_file(home.child("runs")).expect("the warm-up's record");
         activation::System::new(bin.into_os_string(), activation::TIMEOUT)
     }
 

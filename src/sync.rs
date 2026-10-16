@@ -583,6 +583,10 @@ pub(crate) mod tests {
     }
 
     /// Run `git args` in `dir` with the test identity, and return its output.
+    ///
+    /// Automatic maintenance is off: after a commit, git starts it detached,
+    /// and it can still hold `objects/maintenance.lock` when a test snapshots
+    /// the tree the commit was made in.
     pub(crate) fn run(home: &Path, dir: &Path, args: &[&str]) -> String {
         let mut all = vec![
             "-c",
@@ -591,6 +595,10 @@ pub(crate) mod tests {
             "user.email=test@example.invalid",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
         ];
         all.extend_from_slice(args);
         git(home)

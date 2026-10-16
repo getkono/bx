@@ -1,6 +1,6 @@
 # bx
 
-> Project Status: Alpha. Linux only.
+> Project Status: Alpha. Linux and macOS 13+, on x86_64 and aarch64.
 
 `bx` is a single-binary developer-environment manager. One `bx init` and
 one `bx apply` replace setting up mise, sccache, uv, git, ssh, gh, starship and
@@ -19,7 +19,8 @@ curl -fsSL https://raw.githubusercontent.com/getkono/bx/master/install.sh | sh
 
 A single static binary, no runtime dependencies — it installs onto a barebones
 box with no toolchain, which is the point: `bx` is what you run *before* you
-have anything else.
+have anything else. Releases ship Linux binaries today; the installer does not
+yet fetch a macOS one.
 
 It also installs as **`userbox`**. Two-letter names are a scarce namespace with
 no registry, so the long name is the one that is guaranteed to keep working:
@@ -209,7 +210,8 @@ path, `bx rm` when a conflict left something as it was, and
   no answer, a damaged state file, an interrupted or running session, a
   directory wider than a private file in it, a declared optional source that is
   not readable, a unit file systemd has not reloaded, enabled or loaded, or that
-  has failed, a declared reference that is not on disk, a temporary file an
+  has failed (on Linux; launchd is the macOS counterpart, and its check is not
+  there yet), a declared reference that is not on disk, a temporary file an
   interrupted write left behind, an external that follows a branch
   `bx.lock` holds no commit for, a `bx.lock` entry nothing follows any more,
   an update stamp that holds no time, and a `local.toml` inside the config

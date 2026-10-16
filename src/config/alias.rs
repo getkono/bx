@@ -8,7 +8,7 @@ use std::path::Path;
 
 use toml_edit::{Item, Table};
 
-use super::when::When;
+use super::when::{self, When};
 use super::{Ctx, Error, Origin};
 
 /// One declared alias, from either table.
@@ -91,10 +91,7 @@ pub fn parse_alias(table: &Table, file: &Path, text: &str) -> Result<AliasDecl, 
     if let Some(problem) = unwritable(&command) {
         return Err(ctx.bad(table, "command", format!("alias `{name}`: {problem}")));
     }
-    let when = match ctx.str_at(table, "when")? {
-        None => None,
-        Some(raw) => Some(When::parse(raw).map_err(|problem| ctx.bad(table, "when", problem))?),
-    };
+    let when = when::at(&ctx, table)?;
 
     Ok(AliasDecl {
         name,

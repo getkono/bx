@@ -8,6 +8,7 @@
 
 use super::{Assembly, Phase, SETTLE, Shell, held};
 use crate::config::target::Interactive;
+use crate::config::when::Decide;
 
 impl Interactive {
     /// The note the file's plan row carries: every function held back from
@@ -15,8 +16,8 @@ impl Interactive {
     /// the declarations that do not reach zsh, or `None` when there is none
     /// of them.
     ///
-    /// Decided by the values alone, never by `present`, so the note is the
-    /// same whichever tools this machine has.
+    /// Decided by the values alone, never by `decide`, so the note is the
+    /// same whichever tools and facts this machine has.
     #[must_use]
     pub fn note(&self) -> Option<String> {
         let notes: Vec<String> = [
@@ -35,11 +36,12 @@ impl Interactive {
     /// The fragment is contributed only when it holds a variable, so a file
     /// with plugins alone has no `env` phase, a history declaring nothing zsh
     /// reads adds no `options` phase, a file whose every alias is gated on a
-    /// missing tool has no `aliases` phase, and a file whose every function is
-    /// held back has no `functions` phase, and a file binding no key has no
+    /// condition bx decides does not hold has no `aliases` phase, and a file
+    /// whose every function is held back has no `functions` phase, and a file
+    /// binding no key has no
     /// `keybindings` phase. The bytes are a function of the variables, the
     /// plugins, the history, the aliases, the functions, the keybindings, the
-    /// sources, the activations the plan attached and `present`'s answers
+    /// sources, the activations the plan attached and `decide`'s answers
     /// alone: never of whether a plugin's or a source's file exists.
     ///
     /// A file holding a plugin, a source line or an activation closes with
@@ -50,13 +52,13 @@ impl Interactive {
     /// would stop a shell running under `ERR_EXIT` before its prompt — and
     /// show every other shell a failed status at its first prompt.
     #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+    pub fn render(&self, decide: &dyn Decide) -> String {
         let mut assembly = Assembly::new();
         let env = self.env();
         let contributed = if env.vars.is_empty() {
             Ok(())
         } else {
-            assembly.contribute(Phase::Env, crate::config::env::SECTION, env.render(present))
+            assembly.contribute(Phase::Env, crate::config::env::SECTION, env.render(decide))
         }
         .and_then(|()| super::plugin::contribute(&mut assembly, self.plugins()))
         .and_then(|()| {
@@ -69,9 +71,9 @@ impl Interactive {
         // Only the terminal slot refuses a contribution, and `with_plugins`
         // admitted at most one claimant.
         contributed.expect("an `Interactive` holds at most one terminal claimant");
-        super::alias::contribute(&mut assembly, self.aliases(), present);
+        super::alias::contribute(&mut assembly, self.aliases(), decide);
         // The held-back functions are the note's to name, not the bytes'.
-        super::function::contribute(&mut assembly, self.functions(), present);
+        super::function::contribute(&mut assembly, self.functions(), decide);
         super::update_prompt::contribute(&mut assembly, self.update_prompt(), Shell::Zsh);
         super::keybindings::contribute(&mut assembly, self.keybindings());
         // An activation lands only in `activations` or `completions`, neither
@@ -81,7 +83,7 @@ impl Interactive {
         let activated = !self.activations().is_empty();
         // Last, so each source follows its phase's own declarations; the
         // held-back ones are the note's to name.
-        let sourced = super::source::contribute(&mut assembly, self.sources(), Shell::Zsh, present);
+        let sourced = super::source::contribute(&mut assembly, self.sources(), Shell::Zsh, decide);
         let mut out = assembly.render();
         if !self.plugins().is_empty() || sourced || activated {
             out.push_str(SETTLE);

@@ -186,10 +186,7 @@ pub fn parse_function(table: &Table, file: &Path, text: &str) -> Result<Function
         None => None,
         Some(raw) => Some(Hook::parse(raw).map_err(|problem| ctx.bad(table, "hook", problem))?),
     };
-    let when = match ctx.str_at(table, "when")? {
-        None => None,
-        Some(raw) => Some(When::parse(raw).map_err(|problem| ctx.bad(table, "when", problem))?),
-    };
+    let when = when::at(&ctx, table)?;
     if when.is_some() && hook.is_none() {
         return Err(ctx.bad(
             table,

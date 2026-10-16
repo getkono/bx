@@ -67,7 +67,7 @@ use toml_edit::Table;
 
 use super::path::{self, PathEntry};
 use super::shells::{Shell, Shells};
-use super::when::{self, Gate, When};
+use super::when::{self, Decide, Gate, When};
 use super::{Ctx, Error, Origin};
 use crate::lexical::is_variable_name;
 use crate::paths::Portable;
@@ -194,24 +194,22 @@ pub fn parse_env(table: &Table, file: &Path, text: &str) -> Result<EnvDecl, Erro
         )
     })?;
 
-    let when = match ctx.str_at(table, "when")? {
-        None => None,
-        Some(raw) => {
-            let when = When::parse(raw).map_err(|problem| ctx.bad(table, "when", problem))?;
-            if when.is_runtime() && kind.places().contains(&Place::EnvironmentD) {
-                return Err(ctx.bad(
-                    table,
-                    "when",
-                    format!(
-                        "`{name}`: `when = {raw:?}` is a test the shell runs, and a variable of \
-                         `kind = {raw_kind:?}` lands in `environment.d`, which runs none; gate it \
-                         on `has:TOOL`, or give it `kind = \"login\"` or `\"interactive\"`"
-                    ),
-                ));
-            }
-            Some(when)
-        }
-    };
+    let when = when::at(&ctx, table)?;
+    if let Some(runtime) = when.as_ref().and_then(When::runtime)
+        && kind.places().contains(&Place::EnvironmentD)
+    {
+        let raw = runtime.to_string();
+        return Err(ctx.bad(
+            table,
+            "when",
+            format!(
+                "`{name}`: `when` holds {raw:?}, a test the shell runs, and a variable of \
+                 `kind = {raw_kind:?}` lands in `environment.d`, which runs none; gate it only \
+                 on conditions bx decides — `has:`, `os:`, `arch:`, `host:`, `user:` or \
+                 `distro:` — or give it `kind = \"login\"` or `\"interactive\"`"
+            ),
+        ));
+    }
 
     let shells = ctx.shells_at(table, &format!("`{name}`"))?;
     if kind.places().contains(&Place::EnvironmentD) && table.get(Shells::KEY).is_some() {
@@ -364,14 +362,15 @@ impl Fragment {
     /// shell expands one only at the start of a word, and bare when every
     /// character is one a bare word holds, double-quoted otherwise.
     ///
-    /// A gated variable is decided through [`When::gate`]: `present` answers
-    /// whether a `has:TOOL` tool is usable, so the line is written plainly or
-    /// left out, and a runtime condition writes the line alone inside a block
-    /// its test guards — never inlined beside the assignment, so the guard
-    /// reads the assignment as the statement it is. The bytes are a function
-    /// of the variables and `present`'s answers alone.
+    /// A gated variable is decided through [`When::gate`]: `decide` answers
+    /// whether a `has:TOOL` tool is usable and what the machine's facts are,
+    /// so the line is written plainly or left out, and a runtime condition
+    /// writes the line alone inside a block its test guards — never inlined
+    /// beside the assignment, so the guard reads the assignment as the
+    /// statement it is. The bytes are a function of the variables and
+    /// `decide`'s answers alone.
     #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+    pub fn render(&self, decide: &dyn Decide) -> String {
         let export = match self.syntax {
             Syntax::Zsh => "export ",
             Syntax::EnvironmentD => "",
@@ -379,7 +378,7 @@ impl Fragment {
         let mut out = String::from(HEADER);
         for var in &self.vars {
             let line = format!("{export}{}", assignment(var));
-            match var.when.as_ref().map(|when| when.gate(present)) {
+            match var.when.as_ref().map(|when| when.gate(decide)) {
                 None | Some(Gate::Always) => out.push_str(&line),
                 Some(Gate::Never) => {}
                 Some(Gate::Test(test)) => {
@@ -617,7 +616,9 @@ mod tests {
             vars: vars.clone(),
             path: Vec::new(),
         };
-        let render = |fragment: &Fragment| fragment.render(&|_| unreachable!("nothing is gated"));
+        let render = |fragment: &Fragment| {
+            fragment.render(&when::tools(&|_| unreachable!("nothing is gated")))
+        };
         assert_eq!(
             render(&zsh),
             format!(
@@ -669,7 +670,7 @@ mod tests {
             tool == "sccache"
         };
         assert_eq!(
-            zsh.render(&present),
+            zsh.render(&when::tools(&present)),
             format!(
                 "{HEADER}export LANG=C.UTF-8\n\
                  if [[ -o interactive ]]; then\n  export EDITOR=nvim\nfi\n\
@@ -683,9 +684,66 @@ mod tests {
         );
         // Each tool is asked about once per render, and only a `has:` asks.
         assert_eq!(*asked.borrow(), ["sccache", "hx"]);
-        let rendered = zsh.render(&present);
+        let rendered = zsh.render(&when::tools(&present));
         assert!(!rendered.contains("command -v"), "{rendered}");
-        assert_eq!(rendered, zsh.render(&present), "byte-identical");
+        assert_eq!(
+            rendered,
+            zsh.render(&when::tools(&present)),
+            "byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_variable_gated_on_the_machine_is_written_or_left_out_by_its_facts() {
+        let fragment = |syntax| Fragment {
+            syntax,
+            vars: vec![
+                gated("A", "1", "os:linux"),
+                gated("B", "2", "os:macos"),
+                gated("C", "3", "host:box"),
+                Var {
+                    name: "D".to_string(),
+                    value: "4".to_string(),
+                    when: Some(When::parse_all(&["user:me", "ssh"]).expect("all of")),
+                },
+            ],
+            path: Vec::new(),
+        };
+        let machine = |host: &str| when::Machine {
+            os: "linux".to_string(),
+            host: Some(host.to_string()),
+            user: Some("me".to_string()),
+            ..when::Machine::default()
+        };
+        let render = |fragment: &Fragment, machine: &when::Machine| {
+            fragment.render(&when::Facts {
+                machine,
+                present: &|_| unreachable!(),
+            })
+        };
+        let zsh = fragment(Syntax::Zsh);
+        let here = machine("BOX");
+        assert_eq!(
+            render(&zsh, &here),
+            format!(
+                "{HEADER}export A=1\nexport C=3\n\
+                 if [[ -n ${{SSH_CONNECTION-}} ]]; then\n  export D=4\nfi\n"
+            )
+        );
+        assert_eq!(render(&zsh, &here), render(&zsh, &here), "byte-identical");
+        // A renamed host takes its line out, and nothing else.
+        assert_eq!(
+            render(&zsh, &machine("other")),
+            format!(
+                "{HEADER}export A=1\n\
+                 if [[ -n ${{SSH_CONNECTION-}} ]]; then\n  export D=4\nfi\n"
+            )
+        );
+        let env_d = Fragment {
+            vars: zsh.vars[..3].to_vec(),
+            ..fragment(Syntax::EnvironmentD)
+        };
+        assert_eq!(render(&env_d, &here), format!("{HEADER}A=1\nC=3\n"));
     }
 
     #[test]
@@ -700,10 +758,24 @@ mod tests {
         assert_eq!(envs[0].when, Some(When::Ssh));
         assert_eq!(envs[1].when, Some(When::Has("sccache".to_string())));
 
+        let envs = parse(
+            "[[env]]\nname = \"X\"\nvalue = \"x\"\nkind = \"login\"\n\
+             when = [\"os:macos\", \"arch:aarch64\"]\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            envs[0].when,
+            Some(When::All(vec![When::Os("macos"), When::Arch("aarch64")]))
+        );
+
         for (when, needle) in [
             ("\"tty\"", "`when` must be one of"),
             ("\"env:1X\"", "not an environment variable name"),
-            ("true", "a string"),
+            ("true", "a string or an array of strings"),
+            ("[\"ssh\", 1]", "a string or an array of strings"),
+            ("[]", "lists no condition"),
+            ("[\"ssh\", \"login\"]", "at most one"),
+            ("[\"os:windows\"]", "`os:` names one of"),
         ] {
             let body =
                 format!("[[env]]\nname = \"X\"\nvalue = \"x\"\nkind = \"login\"\nwhen = {when}\n");
@@ -716,18 +788,33 @@ mod tests {
     fn a_runtime_when_on_a_variable_environment_d_holds_fails_the_load() {
         for kind in ["environment", "gui"] {
             for when in [
-                "interactive",
-                "login",
-                "ssh",
-                "env:TMUX",
-                "env:TERM_PROGRAM=WezTerm",
+                "\"interactive\"",
+                "\"login\"",
+                "\"ssh\"",
+                "\"env:TMUX\"",
+                "\"env:TERM_PROGRAM=WezTerm\"",
+                "[\"os:linux\", \"ssh\"]",
             ] {
                 let body = format!(
-                    "[[env]]\nname = \"X\"\nvalue = \"x\"\nkind = \"{kind}\"\nwhen = \"{when}\"\n"
+                    "[[env]]\nname = \"X\"\nvalue = \"x\"\nkind = \"{kind}\"\nwhen = {when}\n"
                 );
                 let err = parse(&body).expect_err(&body);
                 assert!(err.contains("`environment.d`"), "{body}: {err}");
-                assert!(err.contains("has:TOOL"), "{body}: {err}");
+                assert!(err.contains("`has:`, `os:`"), "{body}: {err}");
+            }
+            // What bx decides is allowed there: it renders no test.
+            for when in [
+                "\"os:linux\"",
+                "\"arch:x86_64\"",
+                "\"host:box\"",
+                "\"user:me\"",
+                "\"distro:fedora\"",
+                "[\"os:linux\", \"has:sccache\"]",
+            ] {
+                let body = format!(
+                    "[[env]]\nname = \"X\"\nvalue = \"x\"\nkind = \"{kind}\"\nwhen = {when}\n"
+                );
+                parse(&body).expect(&body);
             }
         }
         for kind in ["login", "interactive"] {

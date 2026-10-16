@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn locate_in_env_reads_the_process_path() {
-        // Linux-only tool: `sh` is on the path of any machine that can run bx.
+        // `sh` is on the path of any machine that can run bx.
         assert!(locate_in_env("sh").is_usable());
         assert_eq!(
             locate_in_env("bx-a-tool-that-is-definitely-not-installed"),

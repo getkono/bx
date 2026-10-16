@@ -1,4 +1,5 @@
-//! `bx` — an idempotent, additive Linux developer-environment manager.
+//! `bx` — an idempotent, additive developer-environment manager for Linux and
+//! macOS.
 //!
 //! The crate is organised around two invariants that the rest of the tool is
 //! built on top of, and that are enforced here rather than by convention:

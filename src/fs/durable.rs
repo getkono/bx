@@ -102,7 +102,26 @@ impl Dir {
 
     /// `fsync` the directory, so the entries changed inside it survive a power
     /// loss.
+    ///
+    /// On macOS a plain `fsync` hands the data to the drive and stops there:
+    /// only `F_FULLFSYNC` flushes the drive's own cache, which is what
+    /// `File::sync_all` already asks for on a file. A filesystem that does not
+    /// support it for a directory says so, and gets the plain `fsync`, which
+    /// is still everything that filesystem offers; any other failure is the
+    /// answer.
     pub(crate) fn sync(&self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        match rustix::fs::fcntl_fullfsync(&self.fd) {
+            Ok(()) => {}
+            Err(
+                rustix::io::Errno::NOTSUP
+                | rustix::io::Errno::OPNOTSUPP
+                | rustix::io::Errno::INVAL
+                | rustix::io::Errno::NOTTY,
+            ) => rustix::fs::fsync(&self.fd).map_err(io::Error::from)?,
+            Err(other) => return Err(other.into()),
+        }
+        #[cfg(not(target_os = "macos"))]
         rustix::fs::fsync(&self.fd).map_err(io::Error::from)?;
         #[cfg(test)]
         probe::note(Event::SyncDir(self.path.clone()));

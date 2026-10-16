@@ -42,6 +42,7 @@ use super::{Change, Diff, Error, region};
 use crate::config::resolve::Resolution;
 use crate::config::secrets::Secrets;
 use crate::config::target::{Attach, Body, Direction, Format, Target};
+use crate::config::when::Facts;
 use crate::env_guard::RootSet;
 use crate::fs::{self, Desired, Kind, Mode, Observed};
 use crate::journal::{Content, Ownership, Request};
@@ -540,7 +541,8 @@ enum Wanted {
 /// Not a pure read of the repo, in `plan` as in `apply`: a secret body is
 /// decrypted here with the account's identity, never prompting, and a
 /// generated body's `has:TOOL` conditions are decided by looking each tool up
-/// along the `PATH` [`Inputs`](super::Inputs) took.
+/// along the `PATH` [`Inputs`](super::Inputs) took, and its conditions on the
+/// machine's facts against the facts it read.
 fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
     if let Some(note) = unsupported(target) {
         return Ok(Wanted::Blocked(note.to_string()));
@@ -565,11 +567,16 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
             }
         }
         // A `has:TOOL` condition is decided here, by looking the tool up on
-        // this machine, so the generated shell carries no `command -v`.
+        // this machine, so the generated shell carries no `command -v`, and
+        // so is every condition on the machine's facts `Inputs` read.
         Body::Generated(generator) => {
             let present = |tool: &str| ctx.host.locate(tool).is_usable();
-            let content = generator.render(&present);
-            if let Some(note) = guard_generated(generator, &content, ctx.roots, &present) {
+            let facts = Facts {
+                machine: ctx.host.machine(),
+                present: &present,
+            };
+            let content = generator.render(&facts);
+            if let Some(note) = guard_generated(generator, &content, ctx.roots, &facts) {
                 return Ok(Wanted::Blocked(note));
             }
             content.into_bytes()

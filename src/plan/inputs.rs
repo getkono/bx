@@ -10,6 +10,7 @@ use crate::config::lock::Lock;
 use crate::config::merge;
 use crate::config::resolve::{self, Resolution, Resolved};
 use crate::config::target::Target;
+use crate::config::when::Machine;
 use crate::config::{Layer, LayerKind};
 use crate::env::Env;
 use crate::env_guard::RootSet;
@@ -39,7 +40,9 @@ pub struct Inputs {
     pub(super) git: Git,
     /// Every enabled `[[activation]]`, in the merged configuration's order.
     pub(super) activations: Vec<activation::ActivationDecl>,
-    /// The machine an activation's tool is looked up and run on.
+    /// The machine an activation's tool and a `has:TOOL` condition's tool
+    /// are looked up on, and whose facts every other condition bx decides is
+    /// decided against.
     pub(super) host: activation::System,
     /// `bx.lock`: the commit each followed external is kept at.
     pub(super) lock: Lock,
@@ -89,7 +92,9 @@ impl Inputs {
             progress: env.stderr_tty,
             git: Git::new(env).unattended(),
             activations: merged.activations,
-            host: activation::System::from_env(),
+            // The machine's facts are read here, once, so every condition
+            // on them in this run is decided against the same answers.
+            host: activation::System::from_env().with_machine(Machine::read(env.user.clone())),
             lock,
             committed_externals,
         })
@@ -125,7 +130,8 @@ impl Inputs {
         self
     }
 
-    /// The same inputs, running activations on `host`.
+    /// The same inputs, running activations on `host` and deciding every
+    /// condition against its tools and facts.
     #[cfg(test)]
     pub(crate) fn with_host(mut self, host: activation::System) -> Self {
         self.host = host;

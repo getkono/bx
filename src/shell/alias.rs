@@ -68,7 +68,7 @@
 //! holds them to that.
 
 use super::{Assembly, Phase, quote};
-use crate::config::when::{self, Gate};
+use crate::config::when::{self, Decide, Gate};
 
 /// A declared alias, as [`crate::config::alias`] parses it, named here
 /// too, where every renderer already looks for it.
@@ -84,22 +84,23 @@ impl AliasDecl {
     /// What the alias contributes to the file: its line, the line inside a
     /// guarded block, or nothing.
     ///
-    /// `present` answers whether a `has:TOOL` tool is usable on this machine,
-    /// asked while `plan` and `apply` render, never by the generated shell.
+    /// `decide` answers whether a `has:TOOL` tool is usable on this machine
+    /// and what its facts are, asked while `plan` and `apply` render, never
+    /// by the generated shell.
     #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
-        self.render_gated(self.when.as_ref().map(|when| when.gate(present)))
+    pub fn render(&self, decide: &dyn Decide) -> String {
+        self.render_gated(self.when.as_ref().map(|when| when.gate(decide)))
     }
 
-    /// [`AliasDecl::render`] for bash: the same line, a `has:TOOL` decided
-    /// the same way, and a runtime condition asked in bash's words
+    /// [`AliasDecl::render`] for bash: the same line, what bx decides
+    /// decided the same way, and a runtime condition asked in bash's words
     /// ([`crate::config::when::When::test_bash`]).
     #[must_use]
-    pub fn render_bash(&self, present: &dyn Fn(&str) -> bool) -> String {
+    pub fn render_bash(&self, decide: &dyn Decide) -> String {
         self.render_gated(
             self.when
                 .as_ref()
-                .map(|when| super::bash::gate(when, present)),
+                .map(|when| super::bash::gate(when, decide)),
         )
     }
 
@@ -119,10 +120,11 @@ impl AliasDecl {
 /// Add every enabled alias to `assembly`'s `aliases` phase, in declaration
 /// order.
 ///
-/// An alias gated on a missing tool contributes nothing at all.
-pub fn contribute(assembly: &mut Assembly, aliases: &[AliasDecl], present: &dyn Fn(&str) -> bool) {
+/// An alias gated on a missing tool, or on a fact this machine does not
+/// have, contributes nothing at all.
+pub fn contribute(assembly: &mut Assembly, aliases: &[AliasDecl], decide: &dyn Decide) {
     for alias in aliases.iter().filter(|a| a.enabled) {
-        let body = alias.render(present);
+        let body = alias.render(decide);
         if !body.is_empty() {
             // The aliases phase is not the terminal slot, so it never refuses.
             let _ = assembly.contribute(Phase::Aliases, alias.name.clone(), body);
@@ -133,7 +135,7 @@ pub fn contribute(assembly: &mut Assembly, aliases: &[AliasDecl], present: &dyn 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::when::When;
+    use crate::config::when::{When, tools};
     use crate::config::{Origin, parse_str};
     use crate::shell::testing::{installed, run};
     use std::path::{Path, PathBuf};
@@ -358,30 +360,42 @@ mod tests {
     #[test]
     fn a_gate_decides_whether_and_how_the_alias_is_written() {
         let has = alias("cat", "bat", Some(When::Has("bat".to_string())));
-        assert_eq!(has.render(&|tool| tool == "bat"), "alias cat='bat'\n");
-        assert_eq!(has.render(&|_| false), "");
+        assert_eq!(
+            has.render(&tools(&|tool| tool == "bat")),
+            "alias cat='bat'\n"
+        );
+        assert_eq!(has.render(&tools(&|_| false)), "");
         let ssh = alias("x", "y", Some(When::Ssh));
         assert_eq!(
-            ssh.render(&|_| unreachable!("a runtime test asks for no tool")),
+            ssh.render(&tools(&|_| unreachable!("a runtime test asks for no tool"))),
             "if [[ -n ${SSH_CONNECTION-} ]]; then\n  alias x='y'\nfi\n"
         );
-        assert_eq!(alias("x", "y", None).render(&|_| false), "alias x='y'\n");
+        assert_eq!(
+            alias("x", "y", None).render(&tools(&|_| false)),
+            "alias x='y'\n"
+        );
     }
 
     #[test]
     fn bash_gets_the_same_line_gated_in_its_own_words() {
         let has = alias("cat", "bat", Some(When::Has("bat".to_string())));
-        assert_eq!(has.render_bash(&|tool| tool == "bat"), "alias cat='bat'\n");
-        assert_eq!(has.render_bash(&|_| false), "");
+        assert_eq!(
+            has.render_bash(&tools(&|tool| tool == "bat")),
+            "alias cat='bat'\n"
+        );
+        assert_eq!(has.render_bash(&tools(&|_| false)), "");
         let interactive = alias("x", "y", Some(When::Interactive));
         assert_eq!(
-            interactive.render_bash(&|_| unreachable!("a runtime test asks for no tool")),
+            interactive.render_bash(&tools(&|_| unreachable!("a runtime test asks for no tool"))),
             "if [[ $- == *i* ]]; then\n  alias x='y'\nfi\n"
         );
         let ssh = alias("x", "y", Some(When::Ssh));
-        assert_eq!(ssh.render_bash(&|_| false), ssh.render(&|_| false));
         assert_eq!(
-            alias("x", "y", None).render_bash(&|_| false),
+            ssh.render_bash(&tools(&|_| false)),
+            ssh.render(&tools(&|_| false))
+        );
+        assert_eq!(
+            alias("x", "y", None).render_bash(&tools(&|_| false)),
             "alias x='y'\n"
         );
     }
@@ -398,7 +412,7 @@ mod tests {
             alias("ls", "eza", Some(When::Has("eza".to_string()))),
         ];
         let mut assembly = Assembly::new();
-        contribute(&mut assembly, &aliases, &|tool| tool == "eza");
+        contribute(&mut assembly, &aliases, &tools(&|tool| tool == "eza"));
         let rendered = assembly.render();
         assert!(rendered.contains("alias ll='ls -la'\n"), "{rendered}");
         assert!(rendered.contains("alias ls='eza'\n"), "{rendered}");
@@ -408,7 +422,7 @@ mod tests {
 
         // Every alias gated off: the phase is not even headed.
         let mut none = Assembly::new();
-        contribute(&mut none, &aliases[1..2], &|_| false);
+        contribute(&mut none, &aliases[1..2], &tools(&|_| false));
         assert!(none.is_empty());
     }
 
@@ -424,7 +438,7 @@ mod tests {
         ];
         let render = || {
             let mut assembly = Assembly::new();
-            contribute(&mut assembly, &aliases, &|_| true);
+            contribute(&mut assembly, &aliases, &tools(&|_| true));
             assembly.render()
         };
         let first = render();
@@ -527,7 +541,7 @@ mod tests {
         aliases.push(alias("g", "export X=1", Some(When::Interactive)));
         aliases.push(alias("h", "Y=2", Some(When::EnvSet("HOME".to_string()))));
         let mut assembly = Assembly::new();
-        contribute(&mut assembly, &aliases, &|_| true);
+        contribute(&mut assembly, &aliases, &tools(&|_| true));
         // Every parameter zsh does not maintain itself, with its value. The
         // loop variable is local to the function, so it is in both dumps.
         let dump = "__bx_dump() { local n; for n in ${(ok)parameters}; do \

@@ -907,10 +907,36 @@ mod tests {
                 true,
                 "if shopt -q login_shell && [[ -n ${Y+x} ]]; then\n  export X=1\nfi\n",
             ),
+            // An array whose runtime test is the login test needs it once,
+            // and the bx-decided condition beside it only drops the line.
+            (
+                Some(When::parse_all(&["os:linux", "login"]).expect("parses")),
+                true,
+                "if shopt -q login_shell; then\n  export X=1\nfi\n",
+            ),
+            (
+                Some(When::parse_all(&["os:macos", "login"]).expect("parses")),
+                true,
+                "",
+            ),
+            (
+                Some(When::parse_all(&["os:linux", "ssh"]).expect("parses")),
+                true,
+                "if shopt -q login_shell && [[ -n ${SSH_CONNECTION-} ]]; then\n  \
+                 export X=1\nfi\n",
+            ),
         ];
+        let machine = when::Machine {
+            os: "linux".to_string(),
+            ..when::Machine::default()
+        };
+        let decide = when::Facts {
+            machine: &machine,
+            present: &|tool| tool == "t",
+        };
         for (when, login, expected) in cases {
             let var = var(when, login);
-            assert_eq!(var.render(&tools(&|tool| tool == "t")), expected, "{var:?}");
+            assert_eq!(var.render(&decide), expected, "{var:?}");
             // Every opener it writes is one the guard reads.
             for line in expected.lines().filter(|l| l.starts_with("if ")) {
                 assert!(when::is_opener(line), "{line}");

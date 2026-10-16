@@ -150,6 +150,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Assembly, Shell, quote};
 use crate::config::target::Activated;
+use crate::config::when::Machine;
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
 use crate::report::Action;
@@ -284,13 +285,17 @@ pub trait Host {
     fn path(&self) -> &OsStr;
 }
 
-/// The machine bx is running on, searched along one `PATH`.
+/// The machine bx is running on, searched along one `PATH`, with the facts
+/// a `when` condition on it is decided against.
 #[derive(Debug, Clone)]
 pub struct System {
     /// The search path `command[0]` is looked up along.
     path: OsString,
     /// How long one run may take.
     timeout: Duration,
+    /// The facts `os:`, `arch:`, `host:`, `user:` and `distro:` are decided
+    /// against: none known until [`System::with_machine`] supplies them.
+    machine: Machine,
 }
 
 impl System {
@@ -307,7 +312,22 @@ impl System {
         Self {
             path: path.into(),
             timeout,
+            machine: Machine::default(),
         }
+    }
+
+    /// The same machine, its facts being `machine`: what
+    /// `plan::Inputs::load` reads once, and a test supplies its own.
+    #[must_use]
+    pub fn with_machine(mut self, machine: Machine) -> Self {
+        self.machine = machine;
+        self
+    }
+
+    /// The facts a `when` condition on this machine is decided against.
+    #[must_use]
+    pub const fn machine(&self) -> &Machine {
+        &self.machine
     }
 }
 

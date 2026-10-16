@@ -11,7 +11,7 @@ use toml_edit::Table;
 use super::plugin::unsourceable;
 use super::shells::{Phase, Shells};
 use super::values;
-use super::when::When;
+use super::when::{self, When};
 use super::{Ctx, Error, Origin};
 
 /// One `[[source]]` entry, as written: its path not yet substituted.
@@ -131,10 +131,7 @@ pub fn parse_source(table: &Table, file: &Path, text: &str) -> Result<SourceDecl
         None => DEFAULT_PHASE,
         Some(raw) => parse_phase(raw).map_err(|problem| ctx.bad(table, "phase", problem))?,
     };
-    let when = match ctx.str_at(table, "when")? {
-        None => None,
-        Some(raw) => Some(When::parse(raw).map_err(|problem| ctx.bad(table, "when", problem))?),
-    };
+    let when = when::at(&ctx, table)?;
 
     let shells = ctx.shells_at(table, &format!("source `{name}`"))?;
 

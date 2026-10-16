@@ -1,8 +1,8 @@
 //! The closed set of conditions a declaration may be gated on.
 //!
-//! A declared line — an environment variable today, an alias or a function
-//! later — may say **when** it applies with one `when = "…"` string. The set is
-//! closed and fixed: six spellings, each of which renders to a plain shell test
+//! A declared line — an environment variable, an alias, a source or a
+//! function's hook — may say **when** it applies with a `when = "…"` string.
+//! The set is closed and fixed: each spelling renders to a plain shell test
 //! that spawns nothing, or is decided by bx itself and vanishes from the
 //! generated shell entirely.
 //!
@@ -14,12 +14,24 @@
 //! | `env:NAME`         | `NAME` is set, to anything, empty included  | `[[ -n ${NAME+x} ]]`                |
 //! | `env:NAME=VALUE`   | `NAME` is set to exactly `VALUE`            | `[[ ${NAME-} == "VALUE" ]]`         |
 //! | `has:TOOL`         | `TOOL` is installed and executable          | nothing: decided at `plan`/`apply`  |
+//! | `os:OS`            | the running OS is `linux` or `macos`        | nothing: decided at `plan`/`apply`  |
+//! | `arch:ARCH`        | the CPU is `x86_64` or `aarch64`            | nothing: decided at `plan`/`apply`  |
+//! | `host:NAME`        | the short hostname is `NAME`, in any case   | nothing: decided at `plan`/`apply`  |
+//! | `user:NAME`        | the account is `NAME` (`$USER`, `$LOGNAME`) | nothing: decided at `plan`/`apply`  |
+//! | `distro:ID`        | os-release's `ID` or `ID_LIKE` names `ID`   | nothing: decided at `plan`/`apply`  |
 //!
 //! `has:TOOL` is never a runtime `command -v`: bx looks the tool up once, when
 //! `plan` or `apply` renders the fragment, through [`crate::detect`], and the
 //! gated line is written unconditionally when the tool is usable and left out
 //! when it is not. Installing the tool later makes the next `plan` show the
 //! line arriving.
+//!
+//! The machine's facts — `os:`, `arch:`, `host:`, `user:` and `distro:` — are
+//! decided the same way, against the [`Machine`] `plan::Inputs::load` reads
+//! once: the OS and architecture bx was built for, the kernel's node name cut
+//! at its first `.`, `$USER` (or `$LOGNAME`), and `/etc/os-release` (or
+//! `/usr/lib/os-release`), which is read on Linux only. A fact that changes —
+//! a renamed host — makes the next `plan` show the line arriving or leaving.
 //!
 //! Every other spelling is a runtime test, and a runtime-gated line is always
 //! written as a **guarded block** — an `if TEST; then` line, the assignment on
@@ -29,15 +41,37 @@
 //! so a relocating export hidden behind a condition is still refused.
 //!
 //! `environment.d` cannot run a test, so a variable that lands there may be
-//! gated only on `has:TOOL`; any other `when` is refused when the config loads.
+//! gated only on conditions bx decides; a runtime test is refused when the
+//! config loads.
 //!
-//! One condition per declaration: there is no `and`, `or` or `not`.
+//! An array is **all of** its conditions: `when = ["os:macos",
+//! "arch:aarch64"]` holds only where both do. Within one array the conditions
+//! bx decides fold first, so any that does not hold leaves the line out, and
+//! **at most one** runtime test may remain — two are refused when the config
+//! loads — so a guarded block keeps the single opener the guard already
+//! reads. There is no `or` and no `not`.
 
+use std::fmt;
+
+use toml_edit::Table;
+
+use super::{Ctx, Error};
 use crate::lexical::is_variable_name;
 
 /// Every spelling, as an error message lists them.
-const SPELLINGS: &str = "\"interactive\", \"login\", \"ssh\", \"env:NAME\", \"env:NAME=VALUE\" \
-                         or \"has:TOOL\"";
+const SPELLINGS: &str = "\"interactive\", \"login\", \"ssh\", \"env:NAME\", \"env:NAME=VALUE\", \
+                         \"has:TOOL\", \"os:OS\", \"arch:ARCH\", \"host:NAME\", \"user:NAME\" \
+                         or \"distro:ID\"";
+
+/// Every OS `os:` may name, as [`std::env::consts::OS`] spells it.
+pub const OSES: [&str; 2] = ["linux", "macos"];
+
+/// Every architecture `arch:` may name, as [`std::env::consts::ARCH`] spells
+/// it.
+pub const ARCHES: [&str; 2] = ["x86_64", "aarch64"];
+
+/// The key a declaration's condition is written under.
+const KEY: &str = "when";
 
 /// A condition a declaration is gated on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -60,6 +94,179 @@ pub enum When {
     /// The named tool is installed: a bare name looked up on `PATH`, or an
     /// absolute path. Decided by bx, never by the shell.
     Has(String),
+    /// The running OS is this one of [`OSES`]. Decided by bx.
+    Os(&'static str),
+    /// The CPU architecture is this one of [`ARCHES`]. Decided by bx.
+    Arch(&'static str),
+    /// The short hostname is this, compared ASCII case-insensitively.
+    /// Decided by bx.
+    Host(String),
+    /// The account is this one. Decided by bx.
+    User(String),
+    /// os-release's `ID` is this, or its `ID_LIKE` lists it. Decided by bx.
+    Distro(String),
+    /// Every one of these holds: what a `when` array spells.
+    ///
+    /// Built only by [`When::parse_all`], so it holds two or more
+    /// conditions, none of them an `All`, and at most one runtime test.
+    All(Vec<When>),
+}
+
+/// The facts about the machine a `when` condition bx decides is decided
+/// against, read once by `plan::Inputs::load` ([`Machine::read`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Machine {
+    /// The OS, as [`std::env::consts::OS`] spells it.
+    pub os: String,
+    /// The CPU architecture, as [`std::env::consts::ARCH`] spells it.
+    pub arch: String,
+    /// The kernel's node name, cut at its first `.`; `None` when it could
+    /// not be read.
+    pub host: Option<String>,
+    /// The account's name, from `$USER`, else `$LOGNAME`.
+    pub user: Option<String>,
+    /// What os-release says the distribution is; `None` off Linux, or when
+    /// it could not be read.
+    pub distro: Option<Distro>,
+}
+
+/// What os-release says the distribution is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Distro {
+    /// `ID`.
+    pub id: String,
+    /// `ID_LIKE`, split on whitespace.
+    pub id_like: Vec<String>,
+}
+
+/// A machine nothing is known about: every fact is unknown, so no condition
+/// on one holds.
+#[cfg(test)]
+static UNKNOWN: Machine = Machine {
+    os: String::new(),
+    arch: String::new(),
+    host: None,
+    user: None,
+    distro: None,
+};
+
+impl Machine {
+    /// This machine: the OS and architecture bx was built for, the kernel's
+    /// node name, `user` (the `$USER` or `$LOGNAME` the caller read), and,
+    /// on Linux, os-release.
+    #[must_use]
+    pub fn read(user: Option<String>) -> Self {
+        let os = std::env::consts::OS;
+        let distro = if os == "linux" {
+            ["/etc/os-release", "/usr/lib/os-release"]
+                .iter()
+                .find_map(|path| std::fs::read_to_string(path).ok())
+                .and_then(|text| Distro::parse(&text))
+        } else {
+            None
+        };
+        let uname = rustix::system::uname();
+        Self {
+            os: os.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            host: uname.nodename().to_str().ok().and_then(short_host),
+            user: user.filter(|user| !user.is_empty()),
+            distro,
+        }
+    }
+}
+
+/// `nodename` cut at its first `.`, or `None` when nothing is left.
+fn short_host(nodename: &str) -> Option<String> {
+    let short = nodename.split('.').next().unwrap_or_default();
+    (!short.is_empty()).then(|| short.to_string())
+}
+
+impl Distro {
+    /// Read `ID` and `ID_LIKE` from an os-release file's text, or `None`
+    /// when it names no `ID`.
+    ///
+    /// Each line is `KEY=VALUE`, the value bare or quoted, as
+    /// `os-release(5)` writes it; a line that is not is skipped.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut id = None;
+        let mut id_like = Vec::new();
+        for line in text.lines() {
+            let Some((key, value)) = line.trim().split_once('=') else {
+                continue;
+            };
+            let value = unquote(value);
+            match key {
+                "ID" => id = Some(value),
+                "ID_LIKE" => id_like = value.split_whitespace().map(str::to_string).collect(),
+                _ => {}
+            }
+        }
+        id.filter(|id| !id.is_empty())
+            .map(|id| Self { id, id_like })
+    }
+}
+
+/// An os-release value without its quotes and the backslashes that escape
+/// a character inside them.
+fn unquote(value: &str) -> String {
+    let quoted = ['"', '\''].into_iter().find_map(|quote| {
+        value
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+    });
+    let Some(inner) = quoted else {
+        return value.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// What bx decides a condition against: whether a tool is usable here, and
+/// the [`Machine`]'s facts.
+pub trait Decide {
+    /// Whether `tool`, as a `has:` condition names it, is usable here.
+    fn has(&self, tool: &str) -> bool;
+
+    /// The facts about this machine.
+    fn machine(&self) -> &Machine;
+}
+
+/// A [`Decide`] answering a tool's presence through `present` and every
+/// other fact from `machine`.
+pub struct Facts<'a> {
+    /// The facts about this machine.
+    pub machine: &'a Machine,
+    /// Whether a tool is usable here.
+    pub present: &'a dyn Fn(&str) -> bool,
+}
+
+impl Decide for Facts<'_> {
+    fn has(&self, tool: &str) -> bool {
+        (self.present)(tool)
+    }
+
+    fn machine(&self) -> &Machine {
+        self.machine
+    }
+}
+
+/// Facts for a test that asks only about tools: `present` answers them, on a
+/// machine nothing is known about, so no condition on a fact holds.
+#[cfg(test)]
+pub fn tools<'a>(present: &'a dyn Fn(&str) -> bool) -> Facts<'a> {
+    Facts {
+        machine: &UNKNOWN,
+        present,
+    }
 }
 
 /// What a condition comes to once bx has decided everything it can.
@@ -78,8 +285,8 @@ impl When {
     ///
     /// # Errors
     ///
-    /// Why `raw` is not one of the six spellings, or why its operand is not
-    /// one the rendered test can hold.
+    /// Why `raw` is not one of the spellings, or why its operand is not one
+    /// the rendered test can hold or bx can decide.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let unknown = || format!("`when` must be one of {SPELLINGS}, got {raw:?}");
         match raw {
@@ -116,27 +323,140 @@ impl When {
                 None => Ok(Self::Has(tool.to_string())),
             };
         }
+        if let Some(os) = raw.strip_prefix("os:") {
+            return one_of(&OSES, os)
+                .map(Self::Os)
+                .ok_or_else(|| format!("`when = {raw:?}`: `os:` names one of {}", listed(&OSES)));
+        }
+        if let Some(arch) = raw.strip_prefix("arch:") {
+            if arch == "arm64" {
+                return Err(format!(
+                    "`when = {raw:?}`: bx names this architecture as the kernel does; write \
+                     `arch:aarch64`"
+                ));
+            }
+            return one_of(&ARCHES, arch).map(Self::Arch).ok_or_else(|| {
+                format!("`when = {raw:?}`: `arch:` names one of {}", listed(&ARCHES))
+            });
+        }
+        for (prefix, problem, build) in [
+            (
+                "host:",
+                unhostable as fn(&str) -> Option<&'static str>,
+                Self::Host as fn(String) -> Self,
+            ),
+            ("user:", unaccountable, Self::User),
+            ("distro:", undistributable, Self::Distro),
+        ] {
+            if let Some(operand) = raw.strip_prefix(prefix) {
+                return match problem(operand) {
+                    Some(problem) => Err(format!("`when = {raw:?}`: {problem}; got {operand:?}")),
+                    None => Ok(build(operand.to_string())),
+                };
+            }
+        }
         Err(unknown())
     }
 
+    /// Read a `when` array a config author wrote: all of its conditions.
+    ///
+    /// One condition is that condition, as a string would be.
+    ///
+    /// # Errors
+    ///
+    /// Why a member does not parse, why the array is empty, or that it holds
+    /// more than one runtime test.
+    pub fn parse_all<S: AsRef<str>>(raws: &[S]) -> Result<Self, String> {
+        let mut all = raws
+            .iter()
+            .map(|raw| Self::parse(raw.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if all.len() <= 1 {
+            return all.pop().ok_or_else(|| {
+                "`when = []` lists no condition; remove `when`, or name at least one".to_string()
+            });
+        }
+        let runtime: Vec<String> = all
+            .iter()
+            .filter(|when| when.is_runtime())
+            .map(|when| format!("{:?}", when.to_string()))
+            .collect();
+        if runtime.len() > 1 {
+            return Err(format!(
+                "`when` lists {} tests the shell runs ({}), and a list may hold at most one, \
+                 beside any number of conditions bx decides",
+                runtime.len(),
+                runtime.join(", ")
+            ));
+        }
+        Ok(Self::All(all))
+    }
+
     /// Whether the condition is a test the shell runs, rather than one bx
-    /// decides while it plans.
+    /// decides while it plans; for an array, whether it holds one.
     #[must_use]
-    pub const fn is_runtime(&self) -> bool {
-        !matches!(self, Self::Has(_))
+    pub fn is_runtime(&self) -> bool {
+        self.runtime().is_some()
+    }
+
+    /// The one runtime test this condition holds: itself, for a runtime
+    /// condition; an array's runtime member, if it has one; and `None` for a
+    /// condition bx decides.
+    #[must_use]
+    pub fn runtime(&self) -> Option<&Self> {
+        match self {
+            Self::Interactive
+            | Self::Login
+            | Self::Ssh
+            | Self::EnvSet(_)
+            | Self::EnvEquals { .. } => Some(self),
+            Self::All(all) => all.iter().find_map(Self::runtime),
+            Self::Has(_)
+            | Self::Os(_)
+            | Self::Arch(_)
+            | Self::Host(_)
+            | Self::User(_)
+            | Self::Distro(_) => None,
+        }
+    }
+
+    /// Whether every condition bx decides holds against `decide`; a runtime
+    /// test is the shell's to decide, and counts as holding here.
+    fn holds(&self, decide: &dyn Decide) -> bool {
+        let machine = || decide.machine();
+        match self {
+            Self::Has(tool) => decide.has(tool),
+            Self::Os(os) => machine().os == *os,
+            Self::Arch(arch) => machine().arch == *arch,
+            Self::Host(name) => machine()
+                .host
+                .as_deref()
+                .is_some_and(|host| host.eq_ignore_ascii_case(name)),
+            Self::User(name) => machine().user.as_deref() == Some(name.as_str()),
+            Self::Distro(id) => machine()
+                .distro
+                .as_ref()
+                .is_some_and(|distro| distro.id == *id || distro.id_like.contains(id)),
+            Self::All(all) => all.iter().all(|when| when.holds(decide)),
+            Self::Interactive
+            | Self::Login
+            | Self::Ssh
+            | Self::EnvSet(_)
+            | Self::EnvEquals { .. } => true,
+        }
     }
 
     /// The shell test a runtime condition renders to, or `None` for one bx
-    /// decides itself.
+    /// decides itself. An array renders its runtime member's.
     #[must_use]
     pub fn test(&self) -> Option<String> {
-        Some(match self {
+        Some(match self.runtime()? {
             Self::Interactive => "[[ -o interactive ]]".to_string(),
             Self::Login => "[[ -o login ]]".to_string(),
             Self::Ssh => "[[ -n ${SSH_CONNECTION-} ]]".to_string(),
             Self::EnvSet(name) => format!("[[ -n ${{{name}+x}} ]]"),
             Self::EnvEquals { name, value } => format!("[[ ${{{name}-}} == \"{value}\" ]]"),
-            Self::Has(_) => return None,
+            _ => return None,
         })
     }
 
@@ -148,42 +468,153 @@ impl When {
     /// answers them: `$-` holds `i` in an interactive shell, and
     /// `login_shell` is the read-only option bash sets for a login shell.
     /// Every other test is the one [`When::test`] writes, which bash reads
-    /// alike.
+    /// alike. An array renders its runtime member's.
     #[must_use]
     pub fn test_bash(&self) -> Option<String> {
-        match self {
+        match self.runtime()? {
             Self::Interactive => Some("[[ $- == *i* ]]".to_string()),
             Self::Login => Some("shopt -q login_shell".to_string()),
             other => other.test(),
         }
     }
 
-    /// Decide what bx can: a tool's presence through `present`, asked once
-    /// per call, and nothing about the shell, which is left as a test.
+    /// Decide what bx can — a tool's presence and the machine's facts,
+    /// through `decide`, each asked at most once per call — and nothing
+    /// about the shell, which is left as a test.
     #[must_use]
-    pub fn gate(&self, present: &dyn Fn(&str) -> bool) -> Gate {
-        self.gate_with(present, Self::test)
+    pub fn gate(&self, decide: &dyn Decide) -> Gate {
+        self.gate_with(decide, Self::test)
     }
 
-    /// Decide a tool's presence through `present`, and render any other
-    /// condition through `test`: [`When::test`] for zsh, and
+    /// Decide what bx can through `decide`, and render the runtime test that
+    /// remains through `test`: [`When::test`] for zsh, and
     /// [`When::test_bash`] for bash ([`crate::shell::bash::gate`]).
-    pub(crate) fn gate_with(
-        &self,
-        present: &dyn Fn(&str) -> bool,
-        test: fn(&Self) -> Option<String>,
-    ) -> Gate {
-        match self {
-            Self::Has(tool) => {
-                if present(tool) {
-                    Gate::Always
-                } else {
-                    Gate::Never
-                }
-            }
-            runtime => Gate::Test(test(runtime).unwrap_or_default()),
+    ///
+    /// Any condition bx decides that does not hold leaves the line out,
+    /// whatever the shell would say.
+    pub(crate) fn gate_with(&self, decide: &dyn Decide, test: fn(&Self) -> Option<String>) -> Gate {
+        if !self.holds(decide) {
+            return Gate::Never;
+        }
+        match self.runtime() {
+            Some(runtime) => Gate::Test(test(runtime).unwrap_or_default()),
+            None => Gate::Always,
         }
     }
+}
+
+/// The spelling a config author writes: the string for one condition, and
+/// a TOML array of them for [`When::All`].
+impl fmt::Display for When {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Interactive => f.write_str("interactive"),
+            Self::Login => f.write_str("login"),
+            Self::Ssh => f.write_str("ssh"),
+            Self::EnvSet(name) => write!(f, "env:{name}"),
+            Self::EnvEquals { name, value } => write!(f, "env:{name}={value}"),
+            Self::Has(tool) => write!(f, "has:{tool}"),
+            Self::Os(os) => write!(f, "os:{os}"),
+            Self::Arch(arch) => write!(f, "arch:{arch}"),
+            Self::Host(name) => write!(f, "host:{name}"),
+            Self::User(name) => write!(f, "user:{name}"),
+            Self::Distro(id) => write!(f, "distro:{id}"),
+            Self::All(all) => {
+                let spelled: Vec<String> = all
+                    .iter()
+                    .map(|when| format!("{:?}", when.to_string()))
+                    .collect();
+                write!(f, "[{}]", spelled.join(", "))
+            }
+        }
+    }
+}
+
+/// Read the `when` key of a declaration's `table`: one condition as a
+/// string, all of several as an array of strings, or `None` when it is
+/// absent.
+///
+/// # Errors
+///
+/// [`Error::WrongType`] for a value that is neither, and
+/// [`Error::BadValue`] naming why a condition, or the array, is refused.
+pub(crate) fn at(ctx: &Ctx<'_>, table: &Table) -> Result<Option<When>, Error> {
+    let Some(item) = table.get(KEY) else {
+        return Ok(None);
+    };
+    let wrong_type = |found: &'static str| Error::WrongType {
+        origin: ctx.key_origin(table, KEY),
+        key: KEY.to_string(),
+        expected: "a string or an array of strings",
+        found,
+    };
+    let parsed = if let Some(raw) = item.as_str() {
+        When::parse(raw)
+    } else {
+        let array = item
+            .as_array()
+            .ok_or_else(|| wrong_type(item.type_name()))?;
+        let raws = array
+            .iter()
+            .map(|value| value.as_str().ok_or_else(|| wrong_type(value.type_name())))
+            .collect::<Result<Vec<_>, _>>()?;
+        When::parse_all(&raws)
+    };
+    parsed
+        .map(Some)
+        .map_err(|problem| ctx.bad(table, KEY, problem))
+}
+
+/// The member of `closed` that is `operand`, if one is.
+fn one_of(closed: &[&'static str], operand: &str) -> Option<&'static str> {
+    closed.iter().copied().find(|member| *member == operand)
+}
+
+/// `closed`, quoted and joined for a message.
+fn listed(closed: &[&str]) -> String {
+    closed
+        .iter()
+        .map(|member| format!("`{member}`"))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+/// Why `name` is not a short hostname `host:` can compare against, or
+/// `None` when it is.
+fn unhostable(name: &str) -> Option<&'static str> {
+    let fine = !name.is_empty()
+        && !name.starts_with('-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    (!fine).then_some(
+        "`host:` names a short hostname, the part before the first `.`: ASCII letters, digits \
+         and `-`, not starting with `-`",
+    )
+}
+
+/// Why `name` is not an account name `user:` can compare against, or `None`
+/// when it is.
+fn unaccountable(name: &str) -> Option<&'static str> {
+    let fine = !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    (!fine).then_some(
+        "`user:` names an account: ASCII letters, digits, `.`, `_` and `-`, not starting with \
+         `-`",
+    )
+}
+
+/// Why `id` is not an os-release `ID` `distro:` can compare against, or
+/// `None` when it is.
+fn undistributable(id: &str) -> Option<&'static str> {
+    let fine = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c));
+    (!fine).then_some(
+        "`distro:` names an os-release `ID`: lowercase ASCII letters, digits, `.`, `_` and `-`",
+    )
 }
 
 /// The line that opens a block guarded by `test`.
@@ -344,21 +775,253 @@ mod tests {
             if let Some(test) = test {
                 assert!(is_opener(&opener(test)), "{raw}");
                 assert_eq!(
-                    parsed.gate(&|_| unreachable!()),
+                    parsed.gate(&tools(&|_| unreachable!())),
                     Gate::Test(test.to_string())
                 );
             }
         }
     }
 
+    /// A machine that is `linux` on `x86_64`, host `box`, account `me`, a
+    /// Fedora that is like Red Hat.
+    fn fedora() -> Machine {
+        Machine {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            host: Some("box".to_string()),
+            user: Some("me".to_string()),
+            distro: Some(Distro {
+                id: "fedora".to_string(),
+                id_like: vec!["rhel".to_string(), "centos".to_string()],
+            }),
+        }
+    }
+
+    fn on(machine: &Machine, when: &When) -> Gate {
+        when.gate(&Facts {
+            machine,
+            present: &|tool| tool == "sccache",
+        })
+    }
+
     #[test]
-    fn an_unrecognised_spelling_is_refused_listing_all_six() {
+    fn every_machine_fact_parses_renders_nothing_and_spells_itself_back() {
+        for (raw, when) in [
+            ("os:linux", When::Os("linux")),
+            ("os:macos", When::Os("macos")),
+            ("arch:x86_64", When::Arch("x86_64")),
+            ("arch:aarch64", When::Arch("aarch64")),
+            ("host:Box-1", When::Host("Box-1".to_string())),
+            ("user:j.doe_2", When::User("j.doe_2".to_string())),
+            (
+                "distro:opensuse-tumbleweed",
+                When::Distro("opensuse-tumbleweed".to_string()),
+            ),
+        ] {
+            let parsed = When::parse(raw).expect(raw);
+            assert_eq!(parsed, when, "{raw}");
+            assert!(!parsed.is_runtime(), "{raw}");
+            assert_eq!(parsed.test(), None, "{raw}");
+            assert_eq!(parsed.test_bash(), None, "{raw}");
+            assert_eq!(parsed.to_string(), raw);
+        }
+    }
+
+    #[test]
+    fn a_machine_fact_is_decided_against_the_facts_and_nothing_else() {
+        let here = fedora();
+        for (raw, gate) in [
+            ("os:linux", Gate::Always),
+            ("os:macos", Gate::Never),
+            ("arch:x86_64", Gate::Always),
+            ("arch:aarch64", Gate::Never),
+            ("host:box", Gate::Always),
+            ("host:BOX", Gate::Always),
+            ("host:box2", Gate::Never),
+            ("user:me", Gate::Always),
+            ("user:Me", Gate::Never),
+            ("distro:fedora", Gate::Always),
+            ("distro:rhel", Gate::Always),
+            ("distro:centos", Gate::Always),
+            ("distro:debian", Gate::Never),
+        ] {
+            let when = When::parse(raw).expect(raw);
+            assert_eq!(on(&here, &when), gate, "{raw}");
+            assert_eq!(
+                crate::shell::bash::gate(
+                    &when,
+                    &Facts {
+                        machine: &here,
+                        present: &|_| false
+                    }
+                ),
+                gate,
+                "{raw}"
+            );
+        }
+        // A fact that could not be read holds for no condition on it.
+        for raw in [
+            "os:linux",
+            "arch:x86_64",
+            "host:box",
+            "user:me",
+            "distro:fedora",
+        ] {
+            let when = When::parse(raw).expect(raw);
+            assert_eq!(on(&Machine::default(), &when), Gate::Never, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_bad_machine_operand_is_refused_naming_why() {
+        for (raw, needle) in [
+            ("os:", "`os:` names one of `linux` or `macos`"),
+            ("os:windows", "`os:` names one of `linux` or `macos`"),
+            ("os:Linux", "`os:` names one of"),
+            ("os:darwin", "`os:` names one of"),
+            ("arch:", "`arch:` names one of `x86_64` or `aarch64`"),
+            ("arch:i686", "`arch:` names one of"),
+            ("arch:arm64", "write `arch:aarch64`"),
+            ("host:", "short hostname"),
+            ("host:box.example.com", "short hostname"),
+            ("host:-box", "short hostname"),
+            ("host:b_x", "short hostname"),
+            ("user:", "`user:` names an account"),
+            ("user:-u", "`user:` names an account"),
+            ("user:a b", "`user:` names an account"),
+            ("user:$(id)", "`user:` names an account"),
+            ("distro:", "os-release `ID`"),
+            ("distro:Fedora", "os-release `ID`"),
+            ("distro:arch linux", "os-release `ID`"),
+        ] {
+            let err = When::parse(raw).expect_err(raw);
+            assert!(err.contains(needle), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_array_is_all_of_its_conditions_with_at_most_one_test() {
+        let here = fedora();
+        let all = |raws: &[&str]| When::parse_all(raws).expect("parses");
+
+        // One condition is that condition.
+        assert_eq!(all(&["ssh"]), When::Ssh);
+
+        let both = all(&["os:linux", "arch:x86_64"]);
+        assert_eq!(
+            both,
+            When::All(vec![When::Os("linux"), When::Arch("x86_64")])
+        );
+        assert!(!both.is_runtime());
+        assert_eq!(on(&here, &both), Gate::Always);
+        assert_eq!(on(&here, &all(&["os:linux", "arch:aarch64"])), Gate::Never);
+        assert_eq!(on(&here, &all(&["has:sccache", "host:box"])), Gate::Always);
+        assert_eq!(on(&here, &all(&["has:missing", "host:box"])), Gate::Never);
+
+        // The one runtime test is what remains once the rest holds.
+        let tested = all(&["os:linux", "interactive", "user:me"]);
+        assert!(tested.is_runtime());
+        assert_eq!(tested.runtime(), Some(&When::Interactive));
+        assert_eq!(tested.test().as_deref(), Some("[[ -o interactive ]]"));
+        assert_eq!(tested.test_bash().as_deref(), Some("[[ $- == *i* ]]"));
+        assert_eq!(
+            on(&here, &tested),
+            Gate::Test("[[ -o interactive ]]".to_string())
+        );
+        assert_eq!(
+            crate::shell::bash::gate(
+                &tested,
+                &Facts {
+                    machine: &here,
+                    present: &|_| false
+                }
+            ),
+            Gate::Test("[[ $- == *i* ]]".to_string())
+        );
+        // ... and a decided condition that does not hold drops the line
+        // whatever the shell would say.
+        assert_eq!(on(&here, &all(&["os:macos", "ssh"])), Gate::Never);
+        assert_eq!(
+            all(&["os:macos", "env:X=a b"]).to_string(),
+            "[\"os:macos\", \"env:X=a b\"]"
+        );
+
+        for (raws, needle) in [
+            (&[][..], "lists no condition"),
+            (
+                &["ssh", "login"][..],
+                "lists 2 tests the shell runs (\"ssh\", \"login\")",
+            ),
+            (&["os:linux", "env:A", "env:B=c"][..], "at most one"),
+            (&["os:linux", "tty"][..], "`when` must be one of"),
+            (&["os:beos"][..], "`os:` names one of"),
+        ] {
+            let err = When::parse_all(raws).expect_err(needle);
+            assert!(err.contains(needle), "{raws:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn os_release_is_read_as_os_release_5_writes_it() {
+        let text = "NAME=\"Fedora Linux\"\n# a comment\nID=fedora\n\
+                    ID_LIKE=\"rhel  centos\"\nVERSION_ID=40\nnot a pair\n";
+        assert_eq!(
+            Distro::parse(text),
+            Some(Distro {
+                id: "fedora".to_string(),
+                id_like: vec!["rhel".to_string(), "centos".to_string()],
+            })
+        );
+        assert_eq!(
+            Distro::parse("ID='debian'\n"),
+            Some(Distro {
+                id: "debian".to_string(),
+                id_like: Vec::new(),
+            })
+        );
+        assert_eq!(
+            Distro::parse("ID=\"a\\\"b\"\n").map(|d| d.id),
+            Some("a\"b".to_string())
+        );
+        assert_eq!(Distro::parse("ID=\n"), None);
+        assert_eq!(Distro::parse("NAME=x\n"), None);
+        assert_eq!(unquote("\"unterminated"), "\"unterminated");
+    }
+
+    #[test]
+    fn the_short_host_is_the_node_name_before_its_first_dot() {
+        assert_eq!(short_host("box.example.com").as_deref(), Some("box"));
+        assert_eq!(short_host("box").as_deref(), Some("box"));
+        assert_eq!(short_host(".hidden"), None);
+        assert_eq!(short_host(""), None);
+    }
+
+    #[test]
+    fn this_machine_is_read_as_it_is() {
+        let here = Machine::read(Some("me".to_string()));
+        assert_eq!(here.os, std::env::consts::OS);
+        assert_eq!(here.arch, std::env::consts::ARCH);
+        assert_eq!(here.user.as_deref(), Some("me"));
+        assert!(here.host.as_deref().is_none_or(|host| !host.contains('.')));
+        assert_eq!(Machine::read(Some(String::new())).user, None);
+        assert_eq!(Machine::read(None).user, None);
+        let os_release = ["/etc/os-release", "/usr/lib/os-release"]
+            .iter()
+            .find_map(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| Distro::parse(&text));
+        let distro = if here.os == "linux" { os_release } else { None };
+        assert_eq!(here.distro, distro);
+    }
+
+    #[test]
+    fn an_unrecognised_spelling_is_refused_listing_them_all() {
         for raw in [
             "",
             "Interactive",
             "tty",
             "has",
             "env",
+            "os",
             "interactive && login",
             "not:ssh",
         ] {
@@ -398,14 +1061,17 @@ mod tests {
     #[test]
     fn tool_presence_is_decided_by_the_caller_and_never_rendered() {
         let has = When::Has("sccache".to_string());
-        assert_eq!(has.gate(&|tool| tool == "sccache"), Gate::Always);
-        assert_eq!(has.gate(&|_| false), Gate::Never);
+        assert_eq!(has.gate(&tools(&|tool| tool == "sccache")), Gate::Always);
+        assert_eq!(has.gate(&tools(&|_| false)), Gate::Never);
         assert_eq!(has.test(), None);
         assert_eq!(
-            crate::shell::bash::gate(&has, &|tool| tool == "sccache"),
+            crate::shell::bash::gate(&has, &tools(&|tool| tool == "sccache")),
             Gate::Always
         );
-        assert_eq!(crate::shell::bash::gate(&has, &|_| false), Gate::Never);
+        assert_eq!(
+            crate::shell::bash::gate(&has, &tools(&|_| false)),
+            Gate::Never
+        );
         assert_eq!(has.test_bash(), None);
     }
 
@@ -418,7 +1084,7 @@ mod tests {
             assert_eq!(when.test_bash().as_deref(), Some(test), "{when:?}");
             assert_ne!(when.test(), when.test_bash(), "{when:?}");
             assert_eq!(
-                crate::shell::bash::gate(&when, &|_| unreachable!()),
+                crate::shell::bash::gate(&when, &tools(&|_| unreachable!())),
                 Gate::Test(test.to_string())
             );
         }

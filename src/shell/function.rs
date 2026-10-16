@@ -121,7 +121,7 @@ use crate::config::Error;
 use crate::config::function::unwritable;
 use crate::config::resolution::{BlockReason, BlockedEntry, Resolution};
 use crate::config::values::{self, ResolvedValues, Unresolved};
-use crate::config::when::{self, Gate};
+use crate::config::when::{self, Decide, Gate};
 
 /// A declared function, the hook points it may register on, and a function
 /// ready to write, as [`crate::config::function`] declares them, named here
@@ -179,16 +179,16 @@ impl Function {
 
     /// What the function contributes to the file: its definition, then its
     /// registration — plain, inside a guarded block, or left out when `when`
-    /// is `has:TOOL` and the tool is missing.
+    /// names a condition bx decides that does not hold.
     ///
-    /// `present` answers whether a `has:TOOL` tool is usable on this machine,
-    /// asked while `plan` and `apply` render, never by the generated shell.
-    /// The definition never asks it.
+    /// `decide` answers whether a `has:TOOL` tool is usable on this machine
+    /// and what its facts are, asked while `plan` and `apply` render, never
+    /// by the generated shell. The definition never asks it.
     #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+    pub fn render(&self, decide: &dyn Decide) -> String {
         let mut out = self.definition();
         if let Some(line) = self.registration() {
-            match self.when.as_ref().map(|when| when.gate(present)) {
+            match self.when.as_ref().map(|when| when.gate(decide)) {
                 None | Some(Gate::Always) => out.push_str(&line),
                 Some(Gate::Never) => {}
                 Some(Gate::Test(test)) => {
@@ -325,7 +325,7 @@ fn resolve_one(
 pub fn contribute<'a>(
     assembly: &mut Assembly,
     functions: &'a [Resolution<Function>],
-    present: &dyn Fn(&str) -> bool,
+    decide: &dyn Decide,
 ) -> Vec<&'a BlockedEntry> {
     let mut held = Vec::new();
     for function in functions {
@@ -336,7 +336,7 @@ pub fn contribute<'a>(
                 let _ = assembly.contribute(
                     Phase::Functions,
                     function.name.clone(),
-                    function.render(present),
+                    function.render(decide),
                 );
             }
             Resolution::Blocked(entry) => held.push(entry),
@@ -362,7 +362,7 @@ pub fn note(held: &[&BlockedEntry]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::shells::Shells;
-    use crate::config::when::When;
+    use crate::config::when::{When, tools};
     use crate::config::{Origin, parse_str};
     use crate::shell::testing::{installed, run};
     use std::path::{Path, PathBuf};
@@ -397,7 +397,7 @@ mod tests {
 
     fn render_all(functions: &[Resolution<Function>], present: &dyn Fn(&str) -> bool) -> String {
         let mut assembly = Assembly::new();
-        contribute(&mut assembly, functions, present);
+        contribute(&mut assembly, functions, &tools(present));
         assembly.render()
     }
 
@@ -624,7 +624,7 @@ mod tests {
         assert!(!rendered.contains("precmd"), "{rendered}");
 
         let mut assembly = Assembly::new();
-        let held = contribute(&mut assembly, &functions, &|_| true);
+        let held = contribute(&mut assembly, &functions, &tools(&|_| true));
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].key, "needs_b");
         assert_eq!(
@@ -732,7 +732,7 @@ mod tests {
                             (( ${chpwd_functions[(Ie)__bx_hook_venv]} )) || \
                             chpwd_functions+=(__bx_hook_venv)\n";
         assert_eq!(
-            hooked.render(&|_| false),
+            hooked.render(&tools(&|_| false)),
             format!("{definition}{registration}")
         );
 
@@ -741,17 +741,17 @@ mod tests {
             ..hooked.clone()
         };
         assert_eq!(
-            has.render(&|tool| tool == "direnv"),
+            has.render(&tools(&|tool| tool == "direnv")),
             format!("{definition}{registration}")
         );
-        assert_eq!(has.render(&|_| false), definition);
+        assert_eq!(has.render(&tools(&|_| false)), definition);
 
         let ssh = Function {
             when: Some(When::Ssh),
             ..hooked
         };
         assert_eq!(
-            ssh.render(&|_| unreachable!("a runtime test asks for no tool")),
+            ssh.render(&tools(&|_| unreachable!("a runtime test asks for no tool"))),
             format!("{definition}if [[ -n ${{SSH_CONNECTION-}} ]]; then\n  {registration}fi\n")
         );
 

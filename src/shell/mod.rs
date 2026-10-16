@@ -126,16 +126,17 @@ use crate::config::target::Gen;
 impl Gen {
     /// The body this generator produces.
     ///
-    /// `present` answers whether a tool a `when = "has:TOOL"` names is usable
-    /// on this machine: the one input besides the target itself, asked while
-    /// `plan` and `apply` decide, never by the generated shell.
+    /// `decide` answers whether a tool a `when = "has:TOOL"` names is usable
+    /// on this machine, and what the machine's facts are: the one input
+    /// besides the target itself, asked while `plan` and `apply` decide,
+    /// never by the generated shell.
     #[must_use]
-    pub fn render(&self, present: &dyn Fn(&str) -> bool) -> String {
+    pub fn render(&self, decide: &dyn crate::config::when::Decide) -> String {
         match self {
-            Self::Env(fragment) => fragment.render(present),
+            Self::Env(fragment) => fragment.render(decide),
             Self::Source(fragment) => crate::config::env::source_line(fragment),
-            Self::Interactive(file) => file.render(present),
-            Self::Bash(file) => file.render(present),
+            Self::Interactive(file) => file.render(decide),
+            Self::Bash(file) => file.render(decide),
             Self::Inputrc(keybindings) => bash::render_inputrc(keybindings),
         }
     }

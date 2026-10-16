@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use super::join;
 use crate::config::env::Syntax;
 use crate::config::target::Gen;
+use crate::config::when::Decide;
 use crate::env_guard::{self, RootSet};
 use crate::paths::Portable;
 
@@ -17,7 +18,7 @@ use crate::paths::Portable;
 /// hold its bytes to carrying no assignment instead.
 ///
 /// The interactive file is judged by its `env` phase alone, rendered with the
-/// same `present` as the file, since that phase is its one environment
+/// same `decide` as the file, since that phase is its one environment
 /// fragment; every other phase holds plugin and alias lines that set nothing,
 /// and function definitions whose registrations assign only zsh's hook
 /// arrays, the update prompt's unexported `BX_` names and, in bash's file, an
@@ -41,7 +42,7 @@ pub(super) fn guard_generated(
     generator: &Gen,
     content: &str,
     roots: &RootSet,
-    present: &dyn Fn(&str) -> bool,
+    decide: &dyn Decide,
 ) -> Option<String> {
     match generator {
         Gen::Env(fragment) => match fragment.syntax {
@@ -49,7 +50,7 @@ pub(super) fn guard_generated(
             Syntax::EnvironmentD => guard_environment_d(content, roots),
         },
         Gen::Interactive(file) => {
-            let env = file.env().render(present);
+            let env = file.env().render(decide);
             let before = content
                 .find(&env)
                 .map_or(0, |at| content[..at].matches('\n').count());
@@ -61,7 +62,7 @@ pub(super) fn guard_generated(
         // The fragment is the file's first bytes, so its lines are numbered
         // as the file's own.
         Gen::Bash(file) => {
-            let env = file.env(present);
+            let env = file.env(decide);
             join([
                 guard_fragment(&env, roots),
                 guard_history_file("bash", file.history().bash_file.as_ref(), roots),

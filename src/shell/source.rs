@@ -84,7 +84,7 @@ use crate::config::Error;
 use crate::config::plugin::unsourceable;
 use crate::config::resolution::{BlockReason, BlockedEntry, Resolution};
 use crate::config::values::{self, ResolvedValues, Unresolved};
-use crate::config::when::{self, Gate, When};
+use crate::config::when::{self, Decide, Gate, When};
 
 /// A declared optional source, and one ready to write, as
 /// [`crate::config::source`] declares them, named here too, where every
@@ -99,18 +99,19 @@ impl Source {
     }
 
     /// What the source contributes to `shell`'s file: its line, the line
-    /// inside a guarded block, or nothing when `when` is `has:TOOL` and the
-    /// tool is missing. A runtime condition is asked in that shell's words
-    /// ([`When::test_bash`] for bash).
+    /// inside a guarded block, or nothing when `when` names a condition bx
+    /// decides that does not hold. A runtime condition is asked in that
+    /// shell's words ([`When::test_bash`] for bash).
     ///
-    /// `present` answers whether a `has:TOOL` tool is usable on this machine,
-    /// asked while `plan` and `apply` render, never by the generated shell.
+    /// `decide` answers whether a `has:TOOL` tool is usable on this machine
+    /// and what its facts are, asked while `plan` and `apply` render, never
+    /// by the generated shell.
     #[must_use]
-    pub fn render_in(&self, shell: Shell, present: &dyn Fn(&str) -> bool) -> String {
+    pub fn render_in(&self, shell: Shell, decide: &dyn Decide) -> String {
         let line = self.line();
         let gate = |when: &When| match shell {
-            Shell::Zsh => when.gate(present),
-            Shell::Bash => super::bash::gate(when, present),
+            Shell::Zsh => when.gate(decide),
+            Shell::Bash => super::bash::gate(when, decide),
         };
         match self.when.as_ref().map(gate) {
             None | Some(Gate::Always) => line,
@@ -216,17 +217,17 @@ fn resolve_one(decl: &SourceDecl, values: &ResolvedValues) -> Result<Resolution<
 /// order, and say whether any line was written.
 ///
 /// A held-back source contributes nothing; nor does one gated on a missing
-/// tool.
+/// tool, or on a fact this machine does not have.
 pub fn contribute(
     assembly: &mut Assembly,
     sources: &[Resolution<Source>],
     shell: Shell,
-    present: &dyn Fn(&str) -> bool,
+    decide: &dyn Decide,
 ) -> bool {
     let mut wrote = false;
     for source in sources {
         if let Resolution::Ready(source) = source {
-            let body = source.render_in(shell, present);
+            let body = source.render_in(shell, decide);
             if !body.is_empty() {
                 // No source loads in the terminal slot, so this never refuses.
                 let _ = assembly.contribute(source.phase, source.name.clone(), body);
@@ -278,6 +279,7 @@ mod tests {
     use super::*;
     use crate::config::shells::{Phase, Shells};
     use crate::config::source::{DEFAULT_PHASE, PHASES, parse_phase};
+    use crate::config::when::tools;
     use crate::config::{Origin, parse_str};
     use crate::shell::testing::{installed, run};
 
@@ -317,7 +319,7 @@ mod tests {
 
     fn render_all(sources: &[Resolution<Source>], present: &dyn Fn(&str) -> bool) -> String {
         let mut assembly = Assembly::new();
-        contribute(&mut assembly, sources, Shell::Zsh, present);
+        contribute(&mut assembly, sources, Shell::Zsh, &tools(present));
         assembly.render()
     }
 
@@ -587,12 +589,22 @@ mod tests {
             Resolution::Ready(source("bat", "~/bat", Phase::Aliases, Some("has:bat"))),
         ];
         let mut assembly = Assembly::new();
-        assert!(contribute(&mut assembly, &sources, Shell::Zsh, &|_| false));
+        assert!(contribute(
+            &mut assembly,
+            &sources,
+            Shell::Zsh,
+            &tools(&|_| false)
+        ));
         let rendered = assembly.render();
         // bash reads the same lines, and asks a runtime condition in its own
         // words.
         let mut bash = Assembly::new();
-        assert!(contribute(&mut bash, &sources, Shell::Bash, &|_| false));
+        assert!(contribute(
+            &mut bash,
+            &sources,
+            Shell::Bash,
+            &tools(&|_| false)
+        ));
         assert_eq!(bash.render(), rendered);
         let login = [Resolution::Ready(source(
             "l",
@@ -601,7 +613,7 @@ mod tests {
             Some("login"),
         ))];
         let mut bash = Assembly::new();
-        contribute(&mut bash, &login, Shell::Bash, &|_| false);
+        contribute(&mut bash, &login, Shell::Bash, &tools(&|_| false));
         assert!(
             bash.render()
                 .ends_with("if shopt -q login_shell; then\n  [[ -r ~/l ]] && source ~/l\nfi\n"),
@@ -633,7 +645,12 @@ mod tests {
             Some("has:bat"),
         ))];
         let mut empty = Assembly::new();
-        assert!(!contribute(&mut empty, &gated, Shell::Zsh, &|_| false));
+        assert!(!contribute(
+            &mut empty,
+            &gated,
+            Shell::Zsh,
+            &tools(&|_| false)
+        ));
         assert!(empty.is_empty());
     }
 

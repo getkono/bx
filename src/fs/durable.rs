@@ -300,6 +300,8 @@ mod tests {
         assert!(!file.exists());
     }
 
+    // `/proc` is Linux's.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_call_records_no_success() {
         let dir = tempfile::tempdir().expect("tempdir");

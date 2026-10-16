@@ -770,6 +770,8 @@ mod tests {
             assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
         }
 
+        // macOS's bash is 3.2, which bx's generated bash does not support yet.
+        #[cfg(target_os = "linux")]
         #[test]
         fn bash_gets_its_file_a_fixed_region_and_an_inputrc_twice_alike_and_rm_restores_them() {
             const SHARED: &str = "[aliases]\nll = \"ls -la\"\n\

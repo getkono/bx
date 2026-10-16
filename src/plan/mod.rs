@@ -2166,14 +2166,7 @@ pub(crate) mod tests {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).expect("the FIFO's directory");
         }
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_bits_truncate(0o600),
-            0,
-        )
-        .expect("mkfifo");
+        crate::testing::mkfifo(path);
     }
 
     /// The text of the error `run` in `mode` stops with, run on a thread so a

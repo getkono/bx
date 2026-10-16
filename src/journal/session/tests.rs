@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt as _;
 
@@ -629,6 +630,8 @@ fn a_request_whose_destination_is_not_where_its_target_renders_is_refused() {
     );
 }
 
+// `/dev/full` is Linux's.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_failed_append_poisons_the_session() {
     let home = guarded_home();
@@ -675,6 +678,8 @@ fn a_failed_append_poisons_the_session() {
     ));
 }
 
+// `/dev/full` is Linux's.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_failed_removal_intent_append_poisons_the_session_and_unlinks_nothing() {
     // r3 coverage C7. The write path's failed append is pinned above; the

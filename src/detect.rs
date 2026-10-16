@@ -368,6 +368,8 @@ mod tests {
         assert_eq!(locate("", path_of(&[&dir])), Presence::Missing);
     }
 
+    // APFS refuses a file name that is not UTF-8.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_non_utf8_tool_name_is_accepted() {
         use std::os::unix::ffi::OsStrExt;

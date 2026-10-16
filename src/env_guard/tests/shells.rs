@@ -17,8 +17,14 @@ fn bun_reads_a_backslash_as_a_separator_and_the_guard_refuses_it() {
         return;
     };
     let scratch = tempfile::tempdir().expect("a scratch directory");
-    let root = scratch.path().join("r");
-    let home = scratch.path().join("h");
+    // Canonical, as bun prints it: macOS's temp directory is under the `/var`
+    // symlink.
+    let base = scratch
+        .path()
+        .canonicalize()
+        .expect("the scratch directory");
+    let root = base.join("r");
+    let home = base.join("h");
     let state = home.join(".local/state/bx");
     std::fs::create_dir_all(root.join("a")).expect("the root");
     std::fs::create_dir_all(&state).expect("a stand-in state directory");
@@ -160,22 +166,29 @@ struct Shell {
     report: &'static str,
 }
 
-const SHELLS: &[Shell] = &[
-    Shell {
-        program: "bash",
-        flags: &["--norc", "--noprofile"],
-        report: "__bx_report() { local __bx_n; for __bx_n in $(compgen -v); do \
-                     printf '%s=%s\\0' \"$__bx_n\" \"${!__bx_n}\"; done; }; trap __bx_report EXIT",
-    },
-    Shell {
-        program: "zsh",
-        flags: &["-f"],
-        report: "__bx_report() { local __bx_n; for __bx_n in ${(k)parameters}; do \
-                     [[ ${parameters[$__bx_n]} == (scalar|array)* ]] && \
-                     printf '%s=%s\\0' \"$__bx_n\" \"${(j.:.)${(P)__bx_n}}\"; done; }; \
-                     trap __bx_report EXIT",
-    },
-];
+#[cfg(target_os = "linux")]
+const BASH: Shell = Shell {
+    program: "bash",
+    flags: &["--norc", "--noprofile"],
+    report: "__bx_report() { local __bx_n; for __bx_n in $(compgen -v); do \
+                 printf '%s=%s\\0' \"$__bx_n\" \"${!__bx_n}\"; done; }; trap __bx_report EXIT",
+};
+
+const ZSH: Shell = Shell {
+    program: "zsh",
+    flags: &["-f"],
+    report: "__bx_report() { local __bx_n; for __bx_n in ${(k)parameters}; do \
+                 [[ ${parameters[$__bx_n]} == (scalar|array)* ]] && \
+                 printf '%s=%s\\0' \"$__bx_n\" \"${(j.:.)${(P)__bx_n}}\"; done; }; \
+                 trap __bx_report EXIT",
+};
+
+/// macOS's bash is 3.2, which bx's generated bash does not support yet, so
+/// the guard is held to bash on Linux only.
+#[cfg(target_os = "linux")]
+const SHELLS: &[Shell] = &[BASH, ZSH];
+#[cfg(not(target_os = "linux"))]
+const SHELLS: &[Shell] = &[ZSH];
 
 /// The variable that excuses a machine from supplying the programs these
 /// checks are held against.
@@ -1071,10 +1084,11 @@ fn every_review_falsifier_relocates_in_a_real_shell_and_is_refused() {
             vec![],
             "{content:?}"
         );
-        // Only a machine `WITHOUT_SHELLS` excuses runs on fewer than all
-        // of them, and some of these relocate in one shell alone.
+        // Only a machine `WITHOUT_SHELLS` excuses, or macOS, where no bash
+        // is held, runs on fewer than bash and zsh both, and some of these
+        // relocate in one shell alone.
         assert!(
-            escaped.contains(&true) || shells.found.len() < SHELLS.len(),
+            escaped.contains(&true) || shells.found.len() < 2,
             "{content:?} relocated nothing in any shell"
         );
     }

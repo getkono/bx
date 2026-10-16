@@ -10,7 +10,26 @@
 //! |---------------------------------------|------------------------------------------------|----------------------|
 //! | [`FILE`], `~/.local/share/bx/bashrc.bash` | the variables, `[path]`, activations, sources, aliases, functions, `[history]` and `[shell-options]` | a file bx owns whole |
 //! | [`STARTUP_FILE`], `~/.bashrc`         | the one line that sources [`FILE`]              | a fixed region       |
+//! | [`PROFILE`], `~/.bash_profile`, macOS only | the one line that sources [`FILE`] unless `~/.bashrc` did ([`profile_line`]) | a fixed region |
 //! | [`INPUTRC`], `~/.inputrc`             | `[keybindings]`, in readline's syntax           | a file bx owns whole |
+//!
+//! On macOS Terminal starts a login shell for every window, and a login bash
+//! reads `~/.bash_profile` and not `~/.bashrc`, so there [`FILE`] is sourced
+//! from both ([`super::placement::Platform`]). It then defines [`LOADED`], a
+//! function that does nothing, which `~/.bash_profile`'s line asks about, so
+//! a `~/.bash_profile` that sources `~/.bashrc` first does not source the file
+//! twice; sourcing `~/.bashrc` again by hand still does. The file's `PATH`
+//! lines run after `/etc/profile`'s `path_helper`, so a login bash keeps the
+//! declared entries where they were declared.
+//!
+//! # bash 3.2
+//!
+//! macOS's `/bin/bash` is 3.2, and the file parses and runs there: each `/`
+//! of a `[path]` removal is spelled as 3.2 reads it
+//! ([`crate::config::path::render`]). The one thing 3.2 leaves out is the
+//! update prompt's registration, which needs 4.4
+//! ([`super::update_prompt::BASH_SINCE`]); `bx doctor` names it
+//! ([`crate::doctor::bash`]).
 //!
 //! # The interactive file
 //!

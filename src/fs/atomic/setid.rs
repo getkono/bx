@@ -109,7 +109,8 @@ fn refuse_unless_setgid_survives(
 /// costs a setgid bit that no second `chmod` by the same process can put back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeepsSetgid {
-    /// This process holds `CAP_FSETID` in its effective set.
+    /// This process holds `CAP_FSETID` in its effective set — on macOS, which
+    /// has no capabilities, it runs as the superuser. See [`has_cap_fsetid`].
     Capability,
     /// The directory's group is this process's effective group or one of its
     /// supplementary groups, and it is a group the kernel resolved into this
@@ -121,6 +122,11 @@ enum KeepsSetgid {
 /// `stat`s as owner `uid` and group `gid` — [`keeps_setgid`] against this
 /// process's own capabilities, effective gid, supplementary groups and this
 /// namespace's overflow ids.
+///
+/// On macOS `getgroups` reports at most 16 supplementary groups, while the
+/// kernel asks the membership resolver, which knows them all. A group beyond
+/// the sixteenth is therefore not confirmed and the preflight refuses: the
+/// refusal costs a plan line, the other guess a bit.
 fn process_keeps_setgid(uid: u32, gid: u32) -> Option<KeepsSetgid> {
     // The test build can force either answer on this thread, because the
     // `None` one needs a user namespace most hosts do not offer.
@@ -270,21 +276,34 @@ const fn inode_capability(
 struct InodeCapability;
 
 /// `CAP_FSETID`, capability 4 in `linux/capability.h`.
+#[cfg(any(target_os = "linux", test))]
 const CAP_FSETID: u32 = 4;
 
 /// Whether this process holds `CAP_FSETID` in its effective capability set.
 ///
 /// Read from `/proc/self/status`, which is the whole interface: bx forbids
 /// `unsafe`, so `capget(2)` is not reachable without a dependency that adds
-/// one, and bx is Linux-only, so `/proc` is the native answer rather than a
-/// portability compromise.
+/// one, and `/proc` is Linux's native answer rather than a portability
+/// compromise.
 ///
 /// A set that cannot be read or parsed confirms nothing and is `false`. The
 /// caller then refuses, which changes nothing; the other guess strips a bit.
 /// The whole judgement is [`cap_fsetid_in`], which takes the text, so the only
 /// part no test reaches is the `read_to_string` itself.
+#[cfg(target_os = "linux")]
 fn has_cap_fsetid() -> bool {
     cap_fsetid_in(std::fs::read_to_string("/proc/self/status").ok().as_deref())
+}
+
+/// What stands in for `CAP_FSETID` on macOS: an effective uid of 0.
+///
+/// XNU has no capabilities and no `/proc`. Its `chmod` keeps `S_ISGID` for
+/// the superuser and otherwise only for a member of the directory's group, so
+/// the superuser is the whole of the privileged path, and the group path is
+/// [`in_group`], as on Linux.
+#[cfg(not(target_os = "linux"))]
+fn has_cap_fsetid() -> bool {
+    rustix::process::geteuid().is_root()
 }
 
 /// Whether `CAP_FSETID` is set in the `CapEff` mask of `status`, the text of
@@ -292,6 +311,7 @@ fn has_cap_fsetid() -> bool {
 ///
 /// `None` — the file could not be read — and text with no usable `CapEff` line
 /// both confirm nothing, and so are `false`.
+#[cfg(any(target_os = "linux", test))]
 fn cap_fsetid_in(status: Option<&str>) -> bool {
     status
         .and_then(cap_eff)
@@ -301,6 +321,7 @@ fn cap_fsetid_in(status: Option<&str>) -> bool {
 /// The effective capability mask on a `/proc/<pid>/status` `CapEff:` line.
 ///
 /// `None` when the line is absent or is not the hex mask the kernel writes.
+#[cfg(any(target_os = "linux", test))]
 fn cap_eff(status: &str) -> Option<u64> {
     status
         .lines()
@@ -316,6 +337,7 @@ fn cap_eff(status: &str) -> Option<u64> {
 /// anything else is what would let an unmapped id through the comparisons
 /// [`keeps_setgid`] makes. The reads are one line each; the judgement is
 /// [`overflow_in`], which takes the text.
+#[cfg(target_os = "linux")]
 fn overflow_ids() -> Overflow {
     let read = |name: &str| std::fs::read_to_string(name).ok();
     Overflow {
@@ -324,8 +346,23 @@ fn overflow_ids() -> Overflow {
     }
 }
 
+/// macOS has no user namespaces, so no id is unmapped and none reads as an
+/// overflow id. `(uid_t)-1` and `(gid_t)-1` stand in for one: they are
+/// `KAUTH_UID_NONE` and `KAUTH_GID_NONE`, and `chown` reads `-1` as "leave it
+/// unchanged", so no file can be given either. The directory service does name
+/// `nogroup` with gid `-1`; were a file ever to `stat` as it, the preflight
+/// would refuse it, which is the safe direction.
+#[cfg(not(target_os = "linux"))]
+const fn overflow_ids() -> Overflow {
+    Overflow {
+        uid: u32::MAX,
+        gid: u32::MAX,
+    }
+}
+
 /// The overflow id in `text`, or the kernel's `DEFAULT_OVERFLOWUID` /
 /// `DEFAULT_OVERFLOWGID` — both `65534` — when there is none to read.
+#[cfg(any(target_os = "linux", test))]
 fn overflow_in(text: Option<&str>) -> u32 {
     /// The kernel's `DEFAULT_OVERFLOWUID` and `DEFAULT_OVERFLOWGID`.
     const DEFAULT: u32 = 65534;
@@ -1232,6 +1269,7 @@ mod tests {
 
         // And what this host actually reports, read rather than assumed.
         let overflow = overflow_ids();
+        #[cfg(target_os = "linux")]
         for (name, got) in [
             ("/proc/sys/kernel/overflowuid", overflow.uid),
             ("/proc/sys/kernel/overflowgid", overflow.gid),
@@ -1241,6 +1279,47 @@ mod tests {
                 Err(_) => assert_eq!(got, 65534, "{name}"),
             }
         }
+        // No namespace, so nothing is unmapped: the stand-in is an id no
+        // file `stat`s as.
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            overflow,
+            Overflow {
+                uid: u32::MAX,
+                gid: u32::MAX
+            },
+        );
+    }
+
+    /// On macOS the superuser stands in for `CAP_FSETID`, and nothing else
+    /// does: this process's answer is its effective uid.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn on_macos_the_superuser_is_the_privileged_path_and_groups_decide_the_rest() {
+        assert_eq!(
+            has_cap_fsetid(),
+            rustix::process::geteuid().is_root(),
+            "the capability stand-in is euid 0",
+        );
+        let overflow = overflow_ids();
+        // Not root, not in group 4242: refused. Root: kept whatever the group.
+        assert_eq!(
+            keeps_setgid(501, 4242, false, 20, &[20, 12], overflow),
+            None
+        );
+        assert_eq!(
+            keeps_setgid(501, 4242, true, 20, &[20, 12], overflow),
+            Some(KeepsSetgid::Capability),
+        );
+        assert_eq!(
+            keeps_setgid(501, 12, false, 20, &[20, 12], overflow),
+            Some(KeepsSetgid::Group),
+        );
+        // `nobody` (-2) is an ordinary id here, not an unmapped one.
+        assert_eq!(
+            keeps_setgid(u32::MAX - 1, u32::MAX - 1, true, 20, &[], overflow),
+            Some(KeepsSetgid::Capability),
+        );
     }
 
     #[test]

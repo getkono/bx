@@ -942,6 +942,7 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt as _;
 
+    #[cfg(target_os = "linux")]
     use rustix::io::Errno;
 
     use crate::fs::atomic::test_support::{
@@ -1420,6 +1421,7 @@ mod tests {
 
     /// A POSIX ACL in the kernel's `system.posix_acl_access` encoding: version
     /// 2, then `(tag, perm, id)` per entry, little-endian, sorted by tag.
+    #[cfg(target_os = "linux")]
     fn posix_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
         let mut encoded = 2_u32.to_le_bytes().to_vec();
         for (tag, perm, id) in entries {
@@ -1430,6 +1432,8 @@ mod tests {
         encoded
     }
 
+    // `user.*` and `system.posix_acl_access` xattrs are Linux's.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_replaced_file_keeps_neither_its_xattrs_nor_its_acl() {
         // A documented exclusion from "restores exactly", pinned so that

@@ -160,8 +160,16 @@ pub(crate) fn say_out_loud(line: &str) {
     let _ = err.flush();
 }
 
-/// A state directory, not yet created, whose files' paths fit Linux's
-/// `PATH_MAX` and whose set-aside names do not.
+/// `PATH_MAX`, which counts the terminating NUL: 4096 on Linux, 1024 on
+/// macOS.
+pub(crate) const PATH_MAX: usize = if cfg!(target_os = "linux") {
+    4096
+} else {
+    1024
+};
+
+/// A state directory, not yet created, whose files' paths fit [`PATH_MAX`]
+/// and whose set-aside names do not.
 ///
 /// Every [`crate::state::move_aside`] of its journal or ledger then fails
 /// with ENAMETOOLONG, whoever the process runs as — "a name too long for a
@@ -169,9 +177,7 @@ pub(crate) fn say_out_loud(line: &str) {
 /// written and locked. `fingerprints.mpk` is the one state file out of
 /// reach.
 pub(crate) fn state_beyond_set_aside_names(home: &crate::testing::GuardedHome) -> StateDir {
-    /// `PATH_MAX`, which counts the terminating NUL.
-    const PATH_MAX: usize = 4096;
-    const ROOT: usize = 4080;
+    const ROOT: usize = PATH_MAX - 16;
     let mut root = home.path().as_os_str().to_os_string();
     assert!(root.len() < ROOT - 256, "a home short enough to extend");
     while ROOT - root.len() > 256 {

@@ -1339,9 +1339,11 @@ mod tests {
     }
 
     /// The home a journal-read child finds its state directory under.
+    #[cfg(target_os = "linux")]
     const READ_CHILD_HOME: &str = "BX_JOURNAL_READ_HOME";
 
     /// Which read a journal-read child makes: `load`, `open` or `recover`.
+    #[cfg(target_os = "linux")]
     const READ_CHILD_CALL: &str = "BX_JOURNAL_READ_CALL";
 
     /// The reading half of
@@ -1350,6 +1352,7 @@ mod tests {
     /// Run in a child so a read that never returns can be killed, and with its
     /// address space capped, so a read of `/dev/zero` aborts on its first
     /// gigabyte instead of taking the host's memory with it.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "spawned by a_journal_that_is_not_a_regular_file_is_refused_without_being_read"]
     fn journal_read_child() {
@@ -1395,6 +1398,9 @@ mod tests {
         assert!(message.contains("only from a regular file"), "{message}");
     }
 
+    // macOS refuses `RLIMIT_AS`, which bounds the child's read of
+    // `/dev/zero`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_journal_that_is_not_a_regular_file_is_refused_without_being_read() {
         // P42R1-D5 (journal part). The journal was read whole with a blocking

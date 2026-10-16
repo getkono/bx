@@ -676,17 +676,23 @@ mod tests {
     /// the last instead, so the depth costs nothing.
     #[test]
     fn a_state_directory_near_path_max_is_walked_to_the_root() {
+        // 16 bytes short of `PATH_MAX`: 4096 on Linux, 1024 on macOS.
+        const NEAR: usize = if cfg!(target_os = "linux") {
+            4080
+        } else {
+            1008
+        };
         let home = guarded_home();
         let (repo, _) = repo_and_state(&home);
         std::fs::create_dir_all(&repo).expect("the repo");
         let deep = |base: PathBuf| {
             let mut path = base.into_os_string();
-            while 4080 - path.len() > 256 {
+            while NEAR - path.len() > 256 {
                 path.push(format!("/{}", "d".repeat(200)));
             }
-            path.push(format!("/{}", "b".repeat(4080 - path.len() - 1)));
+            path.push(format!("/{}", "b".repeat(NEAR - path.len() - 1)));
             let path = PathBuf::from(path);
-            assert_eq!(path.as_os_str().len(), 4080);
+            assert_eq!(path.as_os_str().len(), NEAR);
             std::fs::create_dir_all(&path).expect("the deep directory");
             path
         };

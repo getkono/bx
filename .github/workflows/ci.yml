@@ -93,6 +93,43 @@ jobs:
       - name: Test
         run: mise run test
 
+  check-macos:
+    name: Format, Lint & Test (macOS)
+    runs-on: macos-latest
+    # The same three tasks as `check`, on macOS. Coverage and mutation testing
+    # stay on Linux: they measure the suite, not the platform, and running them
+    # twice would double the slowest jobs for no new evidence.
+    #
+    # format-check, lint and test call only cargo, so nothing from mise's tool
+    # table is installed: `mise run` would otherwise build convco and
+    # cargo-mutants from source first.
+    env:
+      MISE_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+        with:
+          install: false
+      # The differential tests need real zsh, bun and uv, for the reasons
+      # written out in `check`. zsh ships with macOS, so there is no apt step,
+      # and the user-namespace provisions are Linux's alone: the tests that
+      # need them are Linux-only. bash is held to Linux only (macOS's is 3.2).
+      # The uv pin and its exact-release-tag ref are the ones `check` uses.
+      - uses: oven-sh/setup-bun@v2
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.11.30"
+      - name: Check formatting
+        run: mise run format-check
+      - name: Clippy
+        run: mise run lint
+      - name: Test
+        run: mise run test
+
   shell:
     name: Shell scripts
     runs-on: ubuntu-latest

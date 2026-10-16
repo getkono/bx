@@ -2218,14 +2218,7 @@ mod tests {
 
     /// Put a FIFO at `path`.
     fn mkfifo(path: &Path) {
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_bits_truncate(0o600),
-            0,
-        )
-        .expect("mkfifo");
+        crate::testing::mkfifo(path);
     }
 
     #[test]

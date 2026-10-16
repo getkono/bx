@@ -942,6 +942,8 @@ mod tests {
         );
     }
 
+    // macOS's bash is 3.2, which bx's generated bash does not support yet.
+    #[cfg(target_os = "linux")]
     #[test]
     fn bash_defines_the_aliases_and_changes_only_its_history_variables() {
         let Some(bash) = installed("bash") else {
@@ -995,6 +997,8 @@ mod tests {
         assert_ne!(after, before);
     }
 
+    // macOS's bash is 3.2, which bx's generated bash does not support yet.
+    #[cfg(target_os = "linux")]
     #[test]
     fn readline_reads_the_inputrc_as_the_declared_bindings() {
         let Some(bash) = installed("bash") else {

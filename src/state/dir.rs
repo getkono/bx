@@ -1075,6 +1075,8 @@ mod tests {
         );
     }
 
+    // `/proc` is Linux's.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_shared_directory_that_refuses_to_be_narrowed_is_reported_naming_it() {
         // r3 round 2b (P7R4-COV3): `tighten`'s `chmod` failing was never
@@ -1549,6 +1551,8 @@ mod tests {
         );
     }
 
+    // Sized to Linux's 4096-byte `PATH_MAX`; macOS's is 1024.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_linked_local_toml_whose_real_path_cannot_be_resolved_is_an_error_naming_it() {
         // r3 round 2b (P7R4-COV2): resolving a linked `local.toml` to find the

@@ -571,14 +571,7 @@ install = \"sudo dnf install bx-no-such-tool\"
         let home = guarded_home();
         let state = crate::state::StateDir::resolve(home.path());
         std::fs::create_dir_all(state.root()).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            state.journal(),
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
+        crate::testing::mkfifo(&state.journal());
 
         let (out, code) = doctor_of(&home, "", OsStr::new(""), &Every::unreachable());
 

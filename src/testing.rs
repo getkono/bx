@@ -108,13 +108,22 @@ fn check_is_a_throwaway_home(candidate: &Path, real_home: Option<&Path>) {
 /// Aborts, rather than skipping, if the tempdir cannot be created, if it is not
 /// under the system temp directory, or if it and the real `$HOME` contain each
 /// other. A silent pass is the one outcome a safety guard may not produce.
+///
+/// The home handed out is the tempdir's canonical path. macOS puts the
+/// system temp directory under `/var`, a symlink to `/private/var`, and a
+/// path the code under test resolves must compare equal to the home it was
+/// given.
 #[must_use]
 pub fn guarded_home() -> GuardedHome {
     let real_home = std::env::var_os("HOME").map(PathBuf::from);
     let dir = TempDir::new().expect("a tempdir for the guarded home");
     check_is_a_throwaway_home(dir.path(), real_home.as_deref());
+    let path = dir
+        .path()
+        .canonicalize()
+        .expect("the guarded home's canonical path");
 
-    GuardedHome { dir }
+    GuardedHome { _dir: dir, path }
 }
 
 /// A throwaway home directory, removed when the guard drops.
@@ -122,20 +131,23 @@ pub fn guarded_home() -> GuardedHome {
 /// Created by [`guarded_home`]. Holds no lock and mutates nothing global, so it
 /// nests freely.
 pub struct GuardedHome {
-    dir: TempDir,
+    /// Held for its `Drop`, which removes the directory.
+    _dir: TempDir,
+    /// The tempdir's canonical path.
+    path: PathBuf,
 }
 
 impl GuardedHome {
     /// The home directory to hand to the code under test.
     #[must_use]
     pub fn path(&self) -> &Path {
-        self.dir.path()
+        &self.path
     }
 
     /// A path under the guarded home. Creates nothing.
     #[must_use]
     pub fn child(&self, rel: impl AsRef<Path>) -> PathBuf {
-        self.dir.path().join(rel)
+        self.path.join(rel)
     }
 
     /// Write `contents` to a path under the guarded home, creating its parents.
@@ -220,10 +232,28 @@ fn skip_unconstructible_to(
     }
 }
 
+/// Put a FIFO at `path`, mode `0600`.
+///
+/// Runs `mkfifo(1)`: rustix offers `mknodat` and `mkfifoat` on Linux only,
+/// and calling `libc` directly would take the `unsafe` this crate forbids.
+///
+/// # Panics
+///
+/// If `mkfifo` cannot be run or does not make the FIFO. A test whose fixture
+/// did not materialise is not a test that passed.
+pub fn mkfifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .args(["-m", "600"])
+        .arg(path)
+        .status()
+        .unwrap_or_else(|e| panic!("running mkfifo for {}: {e}", path.display()));
+    assert!(status.success(), "mkfifo {}: {status}", path.display());
+}
+
 impl std::fmt::Debug for GuardedHome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardedHome")
-            .field("path", &self.dir.path())
+            .field("path", &self.path)
             .finish_non_exhaustive()
     }
 }

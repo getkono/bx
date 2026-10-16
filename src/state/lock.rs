@@ -487,7 +487,11 @@ fn open_lock_file(dir: &StateDir, path: &Path) -> Result<(OwnedFd, rustix::fs::S
     // depth rather than a condition an unprivileged test can stage; see
     // `check_owner`'s own tests for the judgement it makes.
     super::dir::check_owner(path, stat.st_uid)?;
-    let found = Mode::from_bits(stat.st_mode);
+    #[allow(
+        clippy::useless_conversion,
+        reason = "`st_mode` is `u32` on Linux but `u16` on macOS"
+    )]
+    let found = Mode::from_bits(u32::from(stat.st_mode));
     if found != Mode::PRIVATE_FILE {
         tracing::warn!(
             path = %path.display(),
@@ -903,10 +907,12 @@ mod tests {
 
         std::fs::remove_file(dir.lock()).expect("unlink the link");
         std::os::unix::fs::symlink(home.child("elsewhere"), dir.lock()).expect("dangling");
+        // `0777` on Linux; the umask-masked mode on macOS.
+        let made = lmode_of(&dir.lock());
         let err = SharedLock::probe(&dir).expect_err("a dangling link is not a lock file");
         assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
         assert!(!home.child("elsewhere").exists());
-        assert_eq!(lmode_of(&dir.lock()), 0o777);
+        assert_eq!(lmode_of(&dir.lock()), made);
     }
 
     #[test]
@@ -949,14 +955,7 @@ mod tests {
         let home = guarded_home();
         let dir = StateDir::resolve(home.path());
         std::fs::create_dir_all(dir.root()).expect("the state directory");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            dir.lock(),
-            FileType::Fifo,
-            RawMode::from_bits_truncate(0o600),
-            0,
-        )
-        .expect("mkfifo");
+        crate::testing::mkfifo(&dir.lock());
 
         // Probed on a thread, so an open that waits for a writer to open the
         // FIFO fails this test instead of hanging the suite until it is
@@ -1076,6 +1075,9 @@ mod tests {
         drop(lock);
     }
 
+    // `O_PATH` is Linux's; macOS has no descriptor that names a file and
+    // cannot lock it.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_lock_refused_for_anything_but_contention_is_an_error_naming_the_file() {
         // r3 round 1 (C2): a `flock` failure other than `EWOULDBLOCK` was
@@ -1473,14 +1475,7 @@ mod tests {
         );
 
         std::fs::remove_file(dir.lock()).expect("unlink the link");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            dir.lock(),
-            FileType::Fifo,
-            RawMode::from_bits_truncate(0o600),
-            0,
-        )
-        .expect("mkfifo");
+        crate::testing::mkfifo(&dir.lock());
         let err = ExclusiveLock::acquire(&dir).expect_err("a fifo is not a lock file");
         assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
     }
@@ -1594,7 +1589,7 @@ mod tests {
         let Ok(mask) = std::env::var("BX_TEST_UMASK") else {
             return;
         };
-        let mask = u32::from_str_radix(&mask, 8).expect("an octal umask");
+        let mask = rustix::fs::RawMode::from_str_radix(&mask, 8).expect("an octal umask");
         let dir = match (
             std::env::var_os("BX_TEST_UMASK_DIR"),
             std::env::var_os("BX_TEST_UMASK_HOME"),
@@ -1705,14 +1700,7 @@ mod tests {
         // headline promise is that acquisition never blocks.
         let home = guarded_home();
         let path = home.child("lock");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &path,
-            FileType::Fifo,
-            RawMode::from_bits_truncate(0o600),
-            0,
-        )
-        .expect("fifo");
+        crate::testing::mkfifo(&path);
 
         // In a thread with a deadline: the failure is a hang, and a test that
         // hangs reports nothing. The thread is abandoned if it does.

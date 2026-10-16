@@ -323,7 +323,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use crate::fs::atomic::test_support::{desired, mode_of_path, outcome_for, seed};
+    use crate::fs::atomic::test_support::{desired, outcome_for, seed};
     use crate::fs::atomic::{Error, ParentState, compare, observe, set_mode};
     use crate::report::Action;
     use crate::testing::guarded_home;
@@ -413,14 +413,7 @@ mod tests {
     fn a_device_node_where_a_file_is_declared_is_a_conflict() {
         let home = guarded_home();
         let path = home.child("f");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &path,
-            rustix::fs::FileType::Fifo,
-            Mode::PRIVATE_FILE.into(),
-            0,
-        )
-        .expect("mkfifo");
+        crate::testing::mkfifo(&path);
         let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
         assert_eq!(outcome.drift, Drift::Conflict);
         assert_eq!(outcome.note.as_deref(), Some("not a regular file"));
@@ -518,7 +511,10 @@ mod tests {
 
         // The asymmetry, stated as an assertion: the *destination* is still
         // stat'd without following, so a link there is a link.
-        assert_eq!(mode_of_path(&home.child(".ssh")).bits(), 0o777);
+        assert_eq!(
+            observe(&home.child(".ssh")).expect("observe").kind,
+            Kind::Symlink
+        );
     }
 
     #[test]

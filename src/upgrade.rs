@@ -692,6 +692,10 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(served.installed(), None);
     }
 
+    // This test, and each one below gated on Linux, needs the installer to
+    // fetch a release, and it serves Linux only: it refuses any other OS
+    // before it fetches.
+    #[cfg(target_os = "linux")]
     #[test]
     fn check_reports_a_newer_release_as_pending_and_installs_nothing() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -709,6 +713,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(served.installed(), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn check_at_the_latest_release_is_converged() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -717,6 +722,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(out, "bx v0.2.0 is the latest release.\n");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn check_from_a_build_newer_than_any_release_is_converged() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -725,6 +731,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(out, "bx v0.3.0 is newer than the latest release, v0.2.0.\n");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_older_bx_is_replaced_by_the_latest_release_as_a_fresh_install_would() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -747,6 +754,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_latest_release_is_left_alone_unless_forced() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -772,6 +780,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_build_newer_than_any_release_is_not_downgraded_unless_forced() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -809,6 +818,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         child.wait_with_output().unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_latest_release_is_found_with_no_home_at_all() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -849,6 +859,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(std::fs::read_dir(served.dir.path()).unwrap().count(), 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_version_checked_is_the_version_installed() {
         // The install is handed the tag `--latest` found, not left to look
@@ -914,6 +925,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert!(matches!(err, Error::NoShell), "{err:?}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_latest_release_nobody_can_find_is_an_error() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -928,6 +940,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_latest_tag_that_is_not_a_version_is_an_error() {
         let served = Served::new(INSTALL_SH, "nightly");
@@ -935,6 +948,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert!(matches!(result, Err(Error::Version(t)) if t == "nightly"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_install_reports_what_the_installer_said() {
         let served = Served::new(INSTALL_SH, "v0.2.0");

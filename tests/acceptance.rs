@@ -335,6 +335,19 @@ fn executable_stubs() -> tempfile::TempDir {
         let path = entry.expect("a stub").path();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("an executable stub");
+        // macOS checks a newly written executable before its first run, and
+        // with the whole suite starting fresh copies at once the check can
+        // outlast an activation's time limit. Each stub only prints, so it is
+        // run once here, its output and status discarded, to take that cost
+        // outside any limit.
+        if cfg!(target_os = "macos") {
+            std::process::Command::new(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("a stub runs");
+        }
     }
     stubs
 }

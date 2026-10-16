@@ -387,7 +387,8 @@ fn blame_ancestor(path: &Path, source: &std::io::Error) -> Option<Error> {
 /// The rename is `RENAME_NOREPLACE`, so an existing quarantine is never
 /// destroyed — not by an earlier bx's leftovers, and not by a race; a name
 /// taken since the listing is skipped for the next. A filesystem that does not
-/// support the flag (`EINVAL`) falls back to checking for the name first and
+/// support the flag — `EINVAL` on Linux, `ENOTSUP` on macOS: see
+/// [`noreplace_unsupported`] — falls back to checking for the name first and
 /// renaming second, which the lock makes sound against every other bx.
 ///
 /// The lock must be the one of the directory holding `path` — see
@@ -416,11 +417,12 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
         match rename_noreplace(path, &candidate) {
             Ok(()) => return Ok(candidate),
             Err(Errno::EXIST) => {}
-            Err(Errno::INVAL) if std::fs::symlink_metadata(&candidate).is_err() => {
-                std::fs::rename(path, &candidate)?;
-                return Ok(candidate);
+            Err(errno) if noreplace_unsupported(errno) => {
+                if std::fs::symlink_metadata(&candidate).is_err() {
+                    std::fs::rename(path, &candidate)?;
+                    return Ok(candidate);
+                }
             }
-            Err(Errno::INVAL) => {}
             Err(source) => return Err(source.into()),
         }
         n = n
@@ -429,7 +431,20 @@ pub(crate) fn move_aside(path: &Path, lock: &ExclusiveLock) -> std::io::Result<P
     }
 }
 
-/// `renameat2(from, to, RENAME_NOREPLACE)`.
+/// Whether `errno`, from [`rename_noreplace`], says the filesystem does not
+/// support an exclusive rename rather than that the rename failed.
+///
+/// Linux's `renameat2` answers `EINVAL` for a filesystem without
+/// `RENAME_NOREPLACE`; macOS's `renameatx_np` answers `ENOTSUP` for one without
+/// `RENAME_EXCL`, and `EOPNOTSUPP` is the same condition under its other name.
+/// The two are one value on Linux and distinct on macOS, so they are compared
+/// rather than matched as patterns.
+fn noreplace_unsupported(errno: Errno) -> bool {
+    errno == Errno::INVAL || errno == Errno::NOTSUP || errno == Errno::OPNOTSUPP
+}
+
+/// `renameat2(from, to, RENAME_NOREPLACE)`, which is `renameatx_np(…,
+/// RENAME_EXCL)` on macOS.
 ///
 /// One call site, so a test can make it answer as a filesystem without the flag
 /// does — see [`noreplace_seam`] — and reach [`move_aside`]'s check-then-rename
@@ -1110,6 +1125,18 @@ mod tests {
             StateDir::quarantine_nth(Path::new("/s/bx/ledger.mpk"), 12),
             PathBuf::from("/s/bx/ledger.mpk.corrupt.12"),
         );
+    }
+
+    #[test]
+    fn each_platform_s_answer_for_an_unsupported_exclusive_rename_takes_the_fallback() {
+        // Linux's `EINVAL`, and macOS's `ENOTSUP` under both of its names.
+        for unsupported in [Errno::INVAL, Errno::NOTSUP, Errno::OPNOTSUPP] {
+            assert!(noreplace_unsupported(unsupported), "{unsupported:?}");
+        }
+        // A rename that failed is reported, never retried as a plain rename.
+        for failed in [Errno::EXIST, Errno::ACCESS, Errno::IO, Errno::NOENT] {
+            assert!(!noreplace_unsupported(failed), "{failed:?}");
+        }
     }
 
     #[test]

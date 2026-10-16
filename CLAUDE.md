@@ -1,8 +1,11 @@
 # bx
 
-An idempotent, additive Linux developer-environment manager. A command-line
-application written in Rust (edition 2024). **Linux only** — do not add macOS or
-Windows code paths, targets, or documentation.
+An idempotent, additive developer-environment manager for Linux and macOS. A
+command-line application written in Rust (edition 2024). **Linux and macOS 13+,
+on x86_64 and aarch64.** On macOS bx keeps the same XDG directories for its own
+files (`~/.config/bx`, `~/.local/state/bx`, `~/.local/share/bx`), never a
+`~/Library` layout. **No Windows** — do not add Windows code paths, targets, or
+documentation.
 
 ## Layout
 

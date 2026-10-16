@@ -276,8 +276,8 @@ const CAP_FSETID: u32 = 4;
 ///
 /// Read from `/proc/self/status`, which is the whole interface: bx forbids
 /// `unsafe`, so `capget(2)` is not reachable without a dependency that adds
-/// one, and bx is Linux-only, so `/proc` is the native answer rather than a
-/// portability compromise.
+/// one, and `/proc` is Linux's native answer. A host without it, such as
+/// macOS, has no set to read, which the next paragraph's rule covers.
 ///
 /// A set that cannot be read or parsed confirms nothing and is `false`. The
 /// caller then refuses, which changes nothing; the other guess strips a bit.

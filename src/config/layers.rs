@@ -251,7 +251,8 @@ fn open_step(
     #[cfg(not(target_os = "linux"))]
     const STEP: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY);
 
-    match rustix::fs::openat(dir, name, STEP | OFlags::CLOEXEC, Mode::empty()) {
+    // `union`, not `|`, for the reason `state::restore::read` gives.
+    match rustix::fs::openat(dir, name, STEP.union(OFlags::CLOEXEC), Mode::empty()) {
         Ok(handle) => Ok(Some(handle)),
         Err(Errno::NOENT | Errno::NOTDIR) => Ok(None),
         Err(source) => Err(Error::Io {

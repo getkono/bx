@@ -1853,7 +1853,7 @@ pub(crate) mod tests {
         home.write(".bashrc", "mine\n");
         seed(
             home.path(),
-            "[[env]]\nname = \"ON_BOX\"\nvalue = \"1\"\nkind = \"interactive\"\n\
+            "[[env]]\nname = \"EDITOR\"\nvalue = \"nvim\"\nkind = \"interactive\"\n\
              when = \"host:box\"\n\
              [[alias]]\nname = \"mac\"\ncommand = \"m\"\nwhen = [\"os:macos\", \"arch:aarch64\"]\n\
              [[alias]]\nname = \"lin\"\ncommand = \"l\"\nwhen = [\"os:linux\", \"ssh\"]\n\
@@ -1886,7 +1886,7 @@ pub(crate) mod tests {
         assert_eq!(exit(&apply(&boxed), Mode::Apply), Exit::Converged);
         let [zsh, bash] = files();
         for file in [&zsh, &bash] {
-            assert!(file.contains("export ON_BOX=1\n"), "{file}");
+            assert!(file.contains("export EDITOR=nvim\n"), "{file}");
             assert!(!file.contains("alias mac="), "{file}");
             assert!(
                 file.contains("if [[ -n ${SSH_CONNECTION-} ]]; then\n  alias lin='l'\nfi\n"),
@@ -1894,7 +1894,7 @@ pub(crate) mod tests {
             );
             assert!(file.contains("~/.boxed.sh"), "{file}");
         }
-        assert!(zsh.contains("precmd_functions+=(hi)\n"), "{zsh}");
+        assert!(zsh.contains("precmd_functions+=(__bx_hook_hi)\n"), "{zsh}");
 
         // Idempotent: a second plan is empty and the bytes do not move.
         let again = plan(&boxed);
@@ -1928,12 +1928,12 @@ pub(crate) mod tests {
         apply(&renamed);
         let [zsh_after, bash_after] = files();
         for file in [&zsh_after, &bash_after] {
-            assert!(!file.contains("ON_BOX"), "{file}");
+            assert!(!file.contains("EDITOR"), "{file}");
             assert!(!file.contains("~/.boxed.sh"), "{file}");
             assert!(file.contains("alias lin='l'\n"), "{file}");
         }
         assert!(
-            zsh_after.contains("precmd_functions+=(hi)\n"),
+            zsh_after.contains("precmd_functions+=(__bx_hook_hi)\n"),
             "{zsh_after}"
         );
     }

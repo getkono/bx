@@ -1005,9 +1005,12 @@ mod tests {
         assert!(here.host.as_deref().is_none_or(|host| !host.contains('.')));
         assert_eq!(Machine::read(Some(String::new())).user, None);
         assert_eq!(Machine::read(None).user, None);
-        if here.os != "linux" {
-            assert_eq!(here.distro, None);
-        }
+        let os_release = ["/etc/os-release", "/usr/lib/os-release"]
+            .iter()
+            .find_map(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| Distro::parse(&text));
+        let distro = if here.os == "linux" { os_release } else { None };
+        assert_eq!(here.distro, distro);
     }
 
     #[test]

@@ -718,7 +718,9 @@ fn the_path_lines_bx_writes_are_approved_and_give_zsh_the_declared_order() {
             entry("~/.cargo/bin", Position::Remove, false),
         ],
     }
-    .render(&|_| unreachable!("nothing is gated on a tool"));
+    .render(&crate::config::when::tools(&|_| {
+        unreachable!("nothing is gated on a tool")
+    }));
     assert_eq!(scan_with(&fragment, &shells.rooted()), vec![]);
 
     // An inherited PATH holding the stale install and a declared entry
@@ -810,7 +812,9 @@ fn bash_s_path_lines_are_approved_and_give_bash_the_declared_order_once_even_aft
         vars: vec![Var::always("CARGO_HOME", cargo.display().to_string())],
         path: entries,
     }
-    .render(&|_| unreachable!("nothing is gated on a tool"));
+    .render(&crate::config::when::tools(&|_| {
+        unreachable!("nothing is gated on a tool")
+    }));
     let inherited = format!("export PATH={h}/.cargo/bin:/usr/bin:{h}/bin\n");
     let from_zsh = variables_after(
         zsh,
@@ -862,7 +866,9 @@ fn a_path_block_ending_on_a_missing_gated_directory_is_approved_and_survives_err
             vars: vec![],
             path,
         }
-        .render(&|_| unreachable!("nothing is gated on a tool"));
+        .render(&crate::config::when::tools(&|_| {
+            unreachable!("nothing is gated on a tool")
+        }));
         assert_eq!(scan_with(&fragment, &shells.rooted()), vec![]);
         let file = home.join("fragment.zsh");
         std::fs::write(&file, &fragment).expect("the fragment is written");

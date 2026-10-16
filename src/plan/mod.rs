@@ -17,8 +17,10 @@
 //! [`crate::env::Env::from_process`], and
 //! the `PATH` a declared activation's tool and a generated file's `has:TOOL`
 //! condition are looked up along, which [`Inputs::load`] takes once through
-//! [`activation::System::from_env`]; every other function takes what it needs
-//! as an argument. The processes the path spawns — a declared activation's
+//! [`activation::System::from_env`], with the machine's facts a condition on
+//! them is decided against, which it reads once through
+//! [`crate::config::when::Machine::read`]; every other function takes what it
+//! needs as an argument. The processes the path spawns — a declared activation's
 //! command, and `git` for a declared external — inherit the rest of the
 //! process environment, which bx itself never reads.
 
@@ -725,6 +727,7 @@ pub(crate) mod tests {
     use std::process::{Command, Output};
 
     use super::*;
+    use crate::config::when::{Distro, Machine};
     use crate::env::Env;
     use crate::fs::{self, Mode as FileMode};
     use crate::journal;
@@ -744,6 +747,7 @@ pub(crate) mod tests {
             stdout_tty: false,
             stdin_tty: false,
             stderr_tty: false,
+            user: None,
         }
     }
 
@@ -1840,6 +1844,98 @@ pub(crate) mod tests {
         assert!(!without.contains("alias s="), "{without}");
         let with = written(stub_tool(&home));
         assert!(with.contains("alias s='stub'\n"), "{with}");
+    }
+
+    #[test]
+    fn a_condition_on_the_machine_is_decided_by_the_facts_the_inputs_carry() {
+        let home = guarded_home();
+        home.write(".zshrc", "user\n");
+        home.write(".bashrc", "mine\n");
+        seed(
+            home.path(),
+            "[[env]]\nname = \"ON_BOX\"\nvalue = \"1\"\nkind = \"interactive\"\n\
+             when = \"host:box\"\n\
+             [[alias]]\nname = \"mac\"\ncommand = \"m\"\nwhen = [\"os:macos\", \"arch:aarch64\"]\n\
+             [[alias]]\nname = \"lin\"\ncommand = \"l\"\nwhen = [\"os:linux\", \"ssh\"]\n\
+             [[source]]\nname = \"boxed\"\npath = \"~/.boxed.sh\"\nwhen = \"host:box\"\n\
+             [[function]]\nname = \"hi\"\nbody = \"print hi\"\nhook = \"precmd\"\n\
+             when = [\"user:me\", \"distro:rhel\"]\nshells = [\"zsh\"]\n",
+        );
+        // The machine's facts are whatever the host the inputs carry says,
+        // never this process's own.
+        let on = |host: &str| {
+            let machine = Machine {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                host: Some(host.to_string()),
+                user: Some("me".to_string()),
+                distro: Some(Distro {
+                    id: "fedora".to_string(),
+                    id_like: vec!["rhel".to_string()],
+                }),
+            };
+            load(home.path())
+                .with_host(activation::System::new("", activation::TIMEOUT).with_machine(machine))
+        };
+        let files = || {
+            [INTERACTIVE, ".local/share/bx/bashrc.bash"]
+                .map(|rel| std::fs::read_to_string(home.child(rel)).expect("a generated file"))
+        };
+
+        let boxed = on("BOX");
+        assert_eq!(exit(&apply(&boxed), Mode::Apply), Exit::Converged);
+        let [zsh, bash] = files();
+        for file in [&zsh, &bash] {
+            assert!(file.contains("export ON_BOX=1\n"), "{file}");
+            assert!(!file.contains("alias mac="), "{file}");
+            assert!(
+                file.contains("if [[ -n ${SSH_CONNECTION-} ]]; then\n  alias lin='l'\nfi\n"),
+                "{file}"
+            );
+            assert!(file.contains("~/.boxed.sh"), "{file}");
+        }
+        assert!(zsh.contains("precmd_functions+=(hi)\n"), "{zsh}");
+
+        // Idempotent: a second plan is empty and the bytes do not move.
+        let again = plan(&boxed);
+        assert!(
+            again.actions().iter().all(|a| *a == Action::Unchanged),
+            "{:?}",
+            again.actions()
+        );
+        apply(&boxed);
+        assert_eq!(files(), [zsh.clone(), bash.clone()]);
+
+        // A renamed host takes its lines out of both files, and nothing else.
+        let renamed = on("other");
+        let moved = plan(&renamed);
+        let mut changed: Vec<(&str, Action)> = moved
+            .changes
+            .iter()
+            .filter(|change| change.action != Action::Unchanged)
+            .map(|change| (change.target.as_str(), change.action))
+            .collect();
+        changed.sort_unstable();
+        assert_eq!(
+            changed,
+            [
+                (crate::shell::bash::FILE, Action::Modify),
+                ("~/.local/share/bx/zshrc.zsh", Action::Modify),
+            ],
+            "{:?}",
+            moved.actions()
+        );
+        apply(&renamed);
+        let [zsh_after, bash_after] = files();
+        for file in [&zsh_after, &bash_after] {
+            assert!(!file.contains("ON_BOX"), "{file}");
+            assert!(!file.contains("~/.boxed.sh"), "{file}");
+            assert!(file.contains("alias lin='l'\n"), "{file}");
+        }
+        assert!(
+            zsh_after.contains("precmd_functions+=(hi)\n"),
+            "{zsh_after}"
+        );
     }
 
     #[test]

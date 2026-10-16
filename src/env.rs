@@ -1,10 +1,12 @@
 //! Everything bx takes from the process it runs in.
 //!
 //! [`Env::from_process`] reads the process environment and its terminals on
-//! the path every command takes; the one other read on that path is the
+//! the path every command takes; the other reads on that path are the
 //! `PATH` that `plan::Inputs::load` takes through
 //! `activation::System::from_env`, for a declared activation's tool and a
-//! `has:TOOL` condition. Every other function is handed the [`Env`] it read,
+//! `has:TOOL` condition, and the machine's facts it takes through
+//! `config::when::Machine::read`, for the conditions on them. Every other
+//! function is handed the [`Env`] it read,
 //! so a test supplies its own instead of touching the process.
 
 use std::ffi::{OsStr, OsString};
@@ -46,6 +48,9 @@ pub struct Env {
     pub stdin_tty: bool,
     /// Whether standard error is a terminal, so progress can be drawn.
     pub stderr_tty: bool,
+    /// The account's name: `$USER`, else `$LOGNAME`, whichever is set and
+    /// not empty first, for a `when = "user:NAME"` condition.
+    pub user: Option<String>,
 }
 
 impl Env {
@@ -65,8 +70,16 @@ impl Env {
             stdout_tty: std::io::stdout().is_terminal(),
             stdin_tty: std::io::stdin().is_terminal(),
             stderr_tty: std::io::stderr().is_terminal(),
+            user: account(std::env::var("USER").ok(), std::env::var("LOGNAME").ok()),
         })
     }
+}
+
+/// The account's name: `user`, else `logname`, whichever is not empty
+/// first.
+fn account(user: Option<String>, logname: Option<String>) -> Option<String> {
+    user.filter(|name| !name.is_empty())
+        .or_else(|| logname.filter(|name| !name.is_empty()))
 }
 
 /// `home`, refused when it has a `..` component.
@@ -126,6 +139,16 @@ mod tests {
         assert!(!no_color(Some(OsStr::new(""))));
         assert!(no_color(Some(OsStr::new("1"))));
         assert!(no_color(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn the_account_is_user_else_logname_and_never_empty() {
+        let some = |name: &str| Some(name.to_string());
+        assert_eq!(account(some("u"), some("l")), some("u"));
+        assert_eq!(account(None, some("l")), some("l"));
+        assert_eq!(account(some(""), some("l")), some("l"));
+        assert_eq!(account(some(""), some("")), None);
+        assert_eq!(account(None, None), None);
     }
 
     #[test]

@@ -227,7 +227,7 @@ fn inside_on_disk(dir: &Path, repo: &Path) -> Result<bool, Error> {
     }
 }
 
-/// An `O_PATH` handle on `name`, resolved against `dir`, or `None` where
+/// A handle on the directory `name`, resolved against `dir`, or `None` where
 /// nothing is there to hold ([`identity`]'s `NotFound` and `NotADirectory`).
 /// `spelled` names the step in an error.
 ///
@@ -242,7 +242,17 @@ fn open_step(
     use rustix::fs::{Mode, OFlags};
     use rustix::io::Errno;
 
-    match rustix::fs::openat(dir, name, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) {
+    // `O_PATH` needs no read permission on the directory, only search
+    // permission on the way to it, so an ancestor at mode `0711` is still
+    // walked. macOS has no `O_PATH`; a read-only directory open there needs
+    // read permission, and an unreadable ancestor is reported as an error.
+    #[cfg(target_os = "linux")]
+    const STEP: OFlags = OFlags::PATH;
+    #[cfg(not(target_os = "linux"))]
+    const STEP: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY);
+
+    // `union`, not `|`, for the reason `state::restore::read` gives.
+    match rustix::fs::openat(dir, name, STEP.union(OFlags::CLOEXEC), Mode::empty()) {
         Ok(handle) => Ok(Some(handle)),
         Err(Errno::NOENT | Errno::NOTDIR) => Ok(None),
         Err(source) => Err(Error::Io {
@@ -311,22 +321,19 @@ fn deepest_existing(dir: &Path) -> Result<PathBuf, Error> {
 /// # Errors
 ///
 /// [`Error::Io`] naming `path` for anything but a clean answer.
-fn identity(path: &Path) -> Result<Option<(u64, u64)>, Error> {
-    use std::os::unix::fs::MetadataExt;
+///
+/// It is read with the same `stat` the walk in [`inside_on_disk`] reads with,
+/// so both sides of each comparison carry the platform's own field types:
+/// `st_dev` is `u64` on Linux and `i32` on macOS.
+fn identity(path: &Path) -> Result<Option<(rustix::fs::Dev, u64)>, Error> {
+    use rustix::io::Errno;
 
-    match std::fs::metadata(path) {
-        Ok(meta) => Ok(Some((meta.dev(), meta.ino()))),
-        Err(source)
-            if matches!(
-                source.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
-        }
+    match rustix::fs::stat(path) {
+        Ok(stat) => Ok(Some((stat.st_dev, stat.st_ino))),
+        Err(Errno::NOENT | Errno::NOTDIR) => Ok(None),
         Err(source) => Err(Error::Io {
             path: path.to_path_buf(),
-            source,
+            source: source.into(),
         }),
     }
 }
@@ -670,17 +677,23 @@ mod tests {
     /// the last instead, so the depth costs nothing.
     #[test]
     fn a_state_directory_near_path_max_is_walked_to_the_root() {
+        // 16 bytes short of `PATH_MAX`: 4096 on Linux, 1024 on macOS.
+        const NEAR: usize = if cfg!(target_os = "linux") {
+            4080
+        } else {
+            1008
+        };
         let home = guarded_home();
         let (repo, _) = repo_and_state(&home);
         std::fs::create_dir_all(&repo).expect("the repo");
         let deep = |base: PathBuf| {
             let mut path = base.into_os_string();
-            while 4080 - path.len() > 256 {
+            while NEAR - path.len() > 256 {
                 path.push(format!("/{}", "d".repeat(200)));
             }
-            path.push(format!("/{}", "b".repeat(4080 - path.len() - 1)));
+            path.push(format!("/{}", "b".repeat(NEAR - path.len() - 1)));
             let path = PathBuf::from(path);
-            assert_eq!(path.as_os_str().len(), 4080);
+            assert_eq!(path.as_os_str().len(), NEAR);
             std::fs::create_dir_all(&path).expect("the deep directory");
             path
         };

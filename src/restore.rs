@@ -2485,12 +2485,16 @@ mod tests {
     }
 
     /// The variable the foreign-prior child finds its directory in.
+    #[cfg(target_os = "linux")]
     const FOREIGN_PRIOR_CHILD_DIR: &str = "BX_TEST_RESTORE_FOREIGN_PRIOR_DIR";
 
     /// What the foreign-prior child prints first, so a child that never
     /// started is told apart from one that ran and failed.
+    #[cfg(target_os = "linux")]
     const FOREIGN_PRIOR_CHILD_RAN: &str = "bx-restore-foreign-prior-child-ran";
 
+    // `unshare` user namespaces are Linux's.
+    #[cfg(target_os = "linux")]
     #[test]
     fn rm_restores_a_prior_mode_without_owner_read_at_that_mode() {
         // Integration of #8 @746fdc0. restore_one passes the recorded prior
@@ -2556,6 +2560,7 @@ mod tests {
     /// module is private to it. Skips, with a message on stderr, wherever the
     /// scenario cannot be constructed; fails only when the child ran and
     /// failed.
+    #[cfg(target_os = "linux")]
     fn run_unprivileged_in_a_foreign_setgid_directory(
         name: &str,
         child_env: &str,

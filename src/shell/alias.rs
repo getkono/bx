@@ -465,7 +465,8 @@ mod tests {
                 String::from_utf8_lossy(&expected)
             );
         }
-        if let Some(bash) = installed("bash") {
+        // macOS's bash is 3.2, which has no `BASH_ALIASES`.
+        if let Some(bash) = installed("bash").filter(|_| cfg!(target_os = "linux")) {
             let got = run(
                 &bash,
                 &["--norc", "--noprofile"],

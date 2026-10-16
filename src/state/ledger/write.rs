@@ -665,8 +665,6 @@ mod tests {
 
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    use rustix::fs::{FileType, Mode as RawMode};
-
     use crate::state::ledger::fixtures::*;
     use crate::state::{Fingerprint, Fingerprints, Health};
     use crate::testing::guarded_home;
@@ -1352,14 +1350,7 @@ mod tests {
                     std::os::unix::fs::symlink(home.child("elsewhere"), &blob).expect("symlink");
                 }
                 "directory" => std::fs::create_dir(&blob).expect("directory"),
-                _ => rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    &blob,
-                    FileType::Fifo,
-                    RawMode::from_bits_truncate(0o600),
-                    0,
-                )
-                .expect("fifo"),
+                _ => crate::testing::mkfifo(&blob),
             }
 
             // In a thread with a deadline: without the fix the FIFO case does

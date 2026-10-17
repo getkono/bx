@@ -69,6 +69,7 @@ use toml_edit::{ArrayOfTables, Document, DocumentMut, Item, Table, value};
 use crate::config::resolve::{Resolution, Resolved};
 use crate::config::target::{Attach, Body, Direction, Format};
 use crate::config::values::ResolvedValues;
+use crate::config::when::{Facts, Machine};
 use crate::config::{self, Layer, Origin, layers, merge, resolve};
 use crate::env::Env;
 use crate::env_guard::{self, Reason, RootSet};
@@ -77,6 +78,7 @@ use crate::journal;
 use crate::paths::{self, Portable};
 use crate::recover;
 use crate::restore::{self, Restored};
+use crate::shell::activation::{self, Host as _};
 use crate::state::{
     ContentHash, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, PriorBytes, StateDir,
 };
@@ -183,6 +185,9 @@ pub struct Context {
     /// the user's.
     git: crate::git::Git,
     trees: Vec<TreeDecl>,
+    /// Every `[[target]]` the layer `add` writes declares and a `when` keeps
+    /// off this machine, as written: [`kept_elsewhere`].
+    elsewhere: Vec<crate::config::target::Target>,
     /// Whether a directory looks names up without regard to case:
     /// [`crate::fs::case_insensitive`], which tests replace.
     folds: fn(&Path) -> Option<bool>,
@@ -233,9 +238,43 @@ fn trees_of(layers: &[Layer], values: &ResolvedValues) -> Result<Vec<TreeDecl>, 
     Ok(found)
 }
 
+/// Every `[[target]]` the layer at `file` declares that [`layers::gate`] left
+/// out of it on this machine, read back from the layer's own parse.
+///
+/// Gating keeps only each one's key ([`Config::gated`]), and `add` needs its
+/// body and mode to tell whether adopting the file would change anything.
+///
+/// [`Config::gated`]: crate::config::Config::gated
+fn kept_elsewhere(
+    layers: &[Layer],
+    file: &Path,
+    home: &Path,
+) -> Result<Vec<crate::config::target::Target>, Error> {
+    let Some(layer) = layers.iter().find(|layer| layer.file == file) else {
+        return Ok(Vec::new());
+    };
+    let gated: BTreeSet<&str> = layer
+        .config
+        .gated
+        .iter()
+        .filter(|(section, _)| *section == merge::Section::Target)
+        .map(|(_, key)| key.as_str())
+        .collect();
+    if gated.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (text, _) = open_layer(&layer.file)?;
+    Ok(config::parse_str(&text, &layer.file, home)?
+        .targets
+        .into_iter()
+        .filter(|target| gated.contains(target.path.as_str()))
+        .collect())
+}
+
 impl Context {
     /// Locate the config repo and the state directory and load the layer set,
-    /// exactly as `plan` does.
+    /// exactly as `plan` does: on this machine, so what a `when` keeps off it
+    /// is not declared here ([`layers::load_gated`]).
     ///
     /// # Errors
     ///
@@ -247,13 +286,20 @@ impl Context {
         let home = env.home.clone();
         let repo = paths::config_root_in(&home, env.xdg_config_home.as_deref());
         let state = StateDir::resolve_in(&home, env.xdg_state_home.as_deref());
-        let layers = layers::load_layer_set(&repo, state.root(), &home)?;
+        let host = activation::System::from_env().with_machine(Machine::read(env.user.clone()));
+        let present = |tool: &str| host.locate(tool).is_usable();
+        let facts = Facts {
+            machine: host.machine(),
+            present: &present,
+        };
+        let layers = layers::load_gated(&repo, state.root(), &home, &facts)?.layers;
         let merged = merge::merge(&layers, &home)?;
         let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let roots = RootSet::from_values(&resolved.values)
             .owning(&[state.root().to_path_buf()])
             .with_config_repos(std::slice::from_ref(&repo));
         let trees = trees_of(&layers, &resolved.values)?;
+        let elsewhere = kept_elsewhere(&layers, &repo.join(GLOBAL_LAYER), &home)?;
         Ok(Self {
             home,
             repo,
@@ -263,8 +309,22 @@ impl Context {
             roots,
             git: crate::git::Git::new(env),
             trees,
+            elsewhere,
             folds: crate::fs::case_insensitive,
         })
+    }
+
+    /// The `[[target]]` the layer `add` writes declares for `target` and a
+    /// `when` keeps off this machine, when there is one.
+    ///
+    /// [`Context::declared`] reads the layer set on this machine, so such a
+    /// target is undeclared to it. One layer may not declare a path twice,
+    /// gated or not, so `add` must not declare it in that layer again.
+    fn kept_elsewhere(&self, target: &Portable) -> Option<&crate::config::target::Target> {
+        let values = &self.resolved.values;
+        self.elsewhere
+            .iter()
+            .find(|kept| resolved_path(kept.path.as_str(), values).is_some_and(|p| p == *target))
     }
 
     /// The account's home.
@@ -849,6 +909,9 @@ fn decide_file(
              adding it again"
         ))),
         Declared::No => {
+            if let Some(kept) = ctx.kept_elsewhere(target) {
+                return Ok(kept_elsewhere_adoption(ctx, kept, target, &bytes, mode));
+            }
             if let Some(note) = ctx.declared_by_case(target) {
                 return Ok(refused(note));
             }
@@ -901,6 +964,52 @@ fn decide_file(
             })
         }
     }
+}
+
+/// What adopting a file means when `bx.toml` already declares its path, kept
+/// off this machine by a `when` ([`Context::kept_elsewhere`]).
+///
+/// Nothing is declared a second time, since one layer may not declare a path
+/// twice. Where that declaration's body — the repo copy it names, or its
+/// inline content — already holds these bytes, and it declares this mode,
+/// there is nothing to do; otherwise the file is refused naming the
+/// declaration to change.
+fn kept_elsewhere_adoption(
+    ctx: &Context,
+    kept: &crate::config::target::Target,
+    target: &Portable,
+    bytes: &[u8],
+    mode: Mode,
+) -> Adoption {
+    let refused = |note: String| Adoption::Refused {
+        target: target.clone(),
+        note,
+    };
+    let same_bytes = match &kept.body {
+        Body::File(rel) => std::fs::read(ctx.repo.join(rel)).is_ok_and(|held| held == bytes),
+        Body::Inline(content) => content.as_bytes() == bytes,
+        // As for a declaration that holds here: these bodies are not bytes
+        // the file could be compared against.
+        Body::Generated(_) | Body::Dir | Body::Secret(_) | Body::Symlink(_) => {
+            return refused(format!(
+                "is already declared at {}, kept off this machine by its `when`, with a body \
+                 bx add does not adopt into; one layer declares a path once, so change that \
+                 declaration rather than adding it again",
+                kept.origin
+            ));
+        }
+    };
+    if same_bytes && Mode::resolve(kept.mode, Kind::File) == mode {
+        return Adoption::Unchanged {
+            target: target.clone(),
+        };
+    }
+    refused(format!(
+        "is already declared at {}, kept off this machine by its `when`, and differs \
+             from what it declares; one layer declares a path once, so change that \
+             declaration rather than adding it again",
+        kept.origin
+    ))
 }
 
 /// Each line of `bytes` that assigns a tool's location outside every declared
@@ -2029,6 +2138,111 @@ mod tests {
             "{rows:?}"
         );
         assert_eq!(layer(&home), off);
+    }
+
+    #[test]
+    fn a_target_gated_off_this_machine_is_undeclared_to_add() {
+        // No machine bx runs on is named this, so the condition never holds.
+        // In a module, since `add` declares in `bx.toml` and one layer may not
+        // declare a path twice, gated or not.
+        let gated = format!(
+            "{}when = \"host:no-such-bx-host\"\n",
+            inline("~/.gated", "x\\n")
+        );
+        let home = repo("");
+        home.write(".config/bx/modules/elsewhere.toml", &gated);
+        plant(&home, ".gated", b"mine\n", 0o644);
+
+        let rows = add_rel(&home, ".gated");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Adopt { .. }]),
+            "adopted as undeclared, neither refused nor owned: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_target_bx_toml_keeps_off_this_machine_is_not_declared_there_twice() {
+        let gated = "[[target]]\npath = \"~/.gated\"\nfile = \"files/.gated\"\n\
+                     when = \"host:no-such-bx-host\"\n";
+        let home = repo(gated);
+        home.write(".config/bx/files/.gated", "held\n");
+
+        plant(&home, ".gated", b"held\n", 0o644);
+        assert_eq!(
+            add_rel(&home, ".gated"),
+            [Adoption::Unchanged {
+                target: target(&home, ".gated")
+            }],
+        );
+        assert_eq!(layer(&home), gated);
+
+        // Matching bytes under another mode differ from the declaration too.
+        for (bytes, mode) in [(b"mine\n", 0o644), (b"held\n", 0o600)] {
+            plant(&home, ".gated", bytes, mode);
+            let rows = add_rel(&home, ".gated");
+            assert!(
+                matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                    if note.contains("kept off this machine") && note.contains("differs")),
+                "{rows:?}"
+            );
+            assert_eq!(layer(&home), gated);
+        }
+
+        // An inline body is compared as the declared path's is.
+        let gated = format!(
+            "{}when = \"host:no-such-bx-host\"\n",
+            inline("~/.gated", "held\\n")
+        );
+        let home = repo(&gated);
+        plant(&home, ".gated", b"held\n", 0o644);
+        assert_eq!(
+            add_rel(&home, ".gated"),
+            [Adoption::Unchanged {
+                target: target(&home, ".gated")
+            }],
+        );
+        plant(&home, ".gated", b"mine\n", 0o644);
+        let rows = add_rel(&home, ".gated");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                if note.contains("kept off this machine") && note.contains("differs")),
+            "{rows:?}"
+        );
+        assert_eq!(layer(&home), gated);
+
+        // A body that holds no bytes to compare is refused as such.
+        let gated = "[[target]]\npath = \"~/.gated\"\nsymlink = \"~/elsewhere\"\n\
+                     when = \"host:no-such-bx-host\"\n";
+        let home = repo(gated);
+        plant(&home, ".gated", b"held\n", 0o644);
+        let rows = add_rel(&home, ".gated");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                if note.contains("kept off this machine") && note.contains("does not adopt into")),
+            "{rows:?}"
+        );
+        assert_eq!(layer(&home), gated);
+    }
+
+    #[test]
+    fn modules_gating_a_terminal_plugin_each_to_their_own_os_load_for_add() {
+        let home = repo("");
+        for os in ["linux", "macos"] {
+            home.write(
+                format!(".config/bx/modules/{os}.toml"),
+                &format!(
+                    "when = \"os:{os}\"\n[[plugin]]\nname = \"{os}\"\n\
+                     source = \"~/{os}.zsh\"\nterminal = true\n"
+                ),
+            );
+        }
+        plant(&home, ".free", b"x\n", 0o644);
+
+        let rows = add_rel(&home, ".free");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Adopt { .. }]),
+            "{rows:?}"
+        );
     }
 
     #[test]

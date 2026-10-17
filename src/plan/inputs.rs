@@ -88,23 +88,21 @@ impl Inputs {
             machine: host.machine(),
             present: &present,
         };
-        let loaded = layers::load_layer_set(&repo, state.root(), &home)?;
+        // What a `when` keeps off this machine is left out before anything
+        // merges, so it neither replaces nor collides with what stays.
+        let layers::Gated { layers, elsewhere } =
+            layers::load_gated(&repo, state.root(), &home, &facts)?;
         // What every machine sharing the config repo declares: the layers
-        // `bx.lock` is committed beside, without this account's own.
-        let committed: Vec<Layer> = loaded
+        // `bx.lock` is committed beside, without this account's own. What a
+        // `when` keeps to other machines (`elsewhere`) is never merged: two
+        // such declarations may only clash where both hold, which no machine
+        // reaches, so it is taken as declared beside what this machine
+        // merges, and a follow gated to another machine keeps its commit.
+        let committed: Vec<Layer> = layers
             .iter()
             .filter(|layer| layer.kind == LayerKind::Global)
             .cloned()
             .collect();
-        // What a `when` keeps to other machines is never merged: two such
-        // declarations may only clash where both hold, which no machine
-        // reaches, so it is taken as declared beside what this machine
-        // merges, and a follow gated to another machine keeps its commit.
-        let elsewhere = layers::gated_externals(&committed, &facts);
-        // What a `when` keeps off this machine is left out before anything
-        // merges, so it neither replaces nor collides with what stays.
-        let committed = layers::gate(committed, &facts);
-        let layers = layers::gate(loaded, &facts);
         let merged = merge::merge(&layers, &home)?;
         let committed_externals = merge::merge(&committed, &home).ok().map(|config| {
             let mut externals = config.externals;

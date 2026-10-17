@@ -46,11 +46,13 @@ use toml_edit::DocumentMut;
 
 use crate::adopt::{self, Adoption};
 use crate::config::values::{self, AnswerError, ResolvedValues, ValueDecl, local};
+use crate::config::when::{Facts, Machine};
 use crate::config::{self, Layer, LayerKind, layers, merge};
 use crate::env::Env;
 use crate::fs::{self, Mode};
 use crate::paths::{self, Portable};
 use crate::recover;
+use crate::shell::activation::{self, Host as _};
 use crate::state::{self, ExclusiveLock, StateDir};
 
 /// The `bx.toml` a new config repo starts with.
@@ -270,7 +272,10 @@ pub fn answer(
     let repo = paths::config_root_in(home, env.xdg_config_home.as_deref());
     let state = StateDir::resolve_in(home, env.xdg_state_home.as_deref());
     refuse_non_directory(&repo)?;
-    let mut answers = Answers::load(&repo, &state, home)?;
+    // The machine's facts are read once, as `plan` reads them, so a `when`
+    // is decided here as it is there.
+    let host = activation::System::from_env().with_machine(Machine::read(env.user.clone()));
+    let mut answers = Answers::load(&repo, &state, home, host)?;
 
     answers.set_all(sets)?;
     answers.ask_unset(interactive, ask)?;
@@ -395,17 +400,30 @@ struct Answers {
     doc: DocumentMut,
     /// The file's text when `init` read it; `None` when there was none.
     original: Option<String>,
+    /// The machine every `when` is decided against, as `plan` decides it.
+    host: activation::System,
     /// Every answer set on `doc`, in the order it was set, so [`Self::save`]
     /// can set them again on the file as it stands when the lock is held.
     given: Vec<(String, String)>,
 }
 
 impl Answers {
-    /// Load the layer set as `plan` does. With no config repo there is nothing
-    /// declared, so no committed layer.
-    fn load(repo: &Path, state: &StateDir, home: &Path) -> Result<Self, Error> {
-        let globals = match layers::load_layer_set(repo, state.root(), home) {
+    /// Load the layer set as `plan` does, on `host`. With no config repo there
+    /// is nothing declared, so no committed layer.
+    fn load(
+        repo: &Path,
+        state: &StateDir,
+        home: &Path,
+        host: activation::System,
+    ) -> Result<Self, Error> {
+        let present = |tool: &str| host.locate(tool).is_usable();
+        let facts = Facts {
+            machine: host.machine(),
+            present: &present,
+        };
+        let globals = match layers::load_gated(repo, state.root(), home, &facts) {
             Ok(set) => set
+                .layers
                 .into_iter()
                 .filter(|layer| layer.kind == LayerKind::Global)
                 .collect(),
@@ -421,6 +439,7 @@ impl Answers {
             path,
             doc,
             original,
+            host,
             given: Vec::new(),
         })
     }
@@ -443,8 +462,13 @@ impl Answers {
             kind: LayerKind::Local,
             config: config::parse_str(&self.doc.to_string(), &self.path, &self.home)?,
         };
+        let present = |tool: &str| self.host.locate(tool).is_usable();
+        let facts = Facts {
+            machine: self.host.machine(),
+            present: &present,
+        };
         let mut set = self.globals.clone();
-        set.push(local);
+        set.extend(layers::gate(vec![local], &facts));
         let merged = merge::merge(&set, &self.home)?;
         Ok(ResolvedValues::resolve(
             merged.values,
@@ -706,6 +730,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn modules_gating_a_terminal_plugin_each_to_their_own_os_load_for_init() {
+        let home = guarded_home();
+        seed(
+            home.path(),
+            "[[value]]\nname = \"note\"\nkind = \"string\"\n",
+        );
+        for os in ["linux", "macos"] {
+            home.write(
+                format!(".config/bx/modules/{os}.toml"),
+                &format!(
+                    "when = \"os:{os}\"\n[[plugin]]\nname = \"{os}\"\n\
+                     source = \"~/{os}.zsh\"\nterminal = true\n"
+                ),
+            );
+        }
+        // A plugin `local.toml` gates off this machine joins neither.
+        home.write(
+            ".local/state/bx/local.toml",
+            "[[plugin]]\nname = \"mine\"\nsource = \"~/mine.zsh\"\nterminal = true\n\
+             when = \"host:no-such-bx-host\"\n",
+        );
+
+        let prepared = prepare(
+            &env(home.path()),
+            &["note=hi".to_string()],
+            false,
+            &mut Silent,
+        )
+        .expect("init loads on every machine");
+        assert!(prepared.saved.is_some(), "the answer is written");
+        assert!(
+            std::fs::read_to_string(local(&home))
+                .expect("local.toml")
+                .contains("note = \"hi\""),
+        );
+    }
+
+    #[test]
     fn a_missing_repo_is_created_with_the_fixed_header_and_an_existing_one_is_left_alone() {
         let home = guarded_home();
         let prepared = prepare(&env(home.path()), &[], false, &mut Silent).expect("init");
@@ -934,8 +996,13 @@ pub(crate) mod tests {
         let home = guarded_home();
         seed(home.path(), VALUES);
         let state = StateDir::resolve(home.path());
-        let mut answers =
-            Answers::load(&home.child(".config/bx"), &state, home.path()).expect("load");
+        let mut answers = Answers::load(
+            &home.child(".config/bx"),
+            &state,
+            home.path(),
+            activation::System::from_env(),
+        )
+        .expect("load");
         answers.give("root", "~/s");
         home.write(".local/state/bx/local.toml", "[values]\nroot = \"~/s\"\n");
         std::fs::set_permissions(local(&home), std::fs::Permissions::from_mode(0o644))
@@ -1191,16 +1258,20 @@ pub(crate) mod tests {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         home.write(".local/state/bx/local.toml", "[values\n");
-        let error = Answers::load(&home.child("absent"), &state, home.path())
-            .err()
-            .expect("unparseable");
+        let load = || {
+            Answers::load(
+                &home.child("absent"),
+                &state,
+                home.path(),
+                activation::System::from_env(),
+            )
+        };
+        let error = load().err().expect("unparseable");
         assert!(matches!(error, Error::Local { .. }), "{error:?}");
 
         std::fs::remove_file(local(&home)).expect("rm");
         std::fs::create_dir(local(&home)).expect("a directory where the file goes");
-        let error = Answers::load(&home.child("absent"), &state, home.path())
-            .err()
-            .expect("unreadable");
+        let error = load().err().expect("unreadable");
         assert!(matches!(error, Error::ReadLocal { .. }), "{error:?}");
     }
 

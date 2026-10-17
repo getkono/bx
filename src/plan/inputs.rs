@@ -398,7 +398,15 @@ mod tests {
         let terminal = |name: &str| {
             format!("[[plugin]]\nname = \"{name}\"\nsource = \"~/{name}.zsh\"\nterminal = true\n")
         };
-        seed(home.path(), &follow("~/shared", "shared"));
+        // A follow outside any module whose own `when` holds on macOS only.
+        seed(
+            home.path(),
+            &format!(
+                "{}{}when = \"os:macos\"\n",
+                follow("~/shared", "shared"),
+                follow("~/mac-entry", "mac-entry")
+            ),
+        );
         // One terminal plugin per OS module, which clash only where both
         // hold, and a macOS override of `bx.toml`'s follow.
         home.write(
@@ -450,6 +458,9 @@ mod tests {
         assert!(kept(&at("~/mac-only"), &[], Some(committed)));
         assert_eq!(why(&linux, "~/mac-only", "mac-only"), None);
         assert_eq!(why(&linux, "~/shared", "shared"), None);
+        // So does a follow whose own `when` excludes it outside a module.
+        assert!(kept(&at("~/mac-entry"), &[], Some(committed)));
+        assert_eq!(why(&linux, "~/mac-entry", "mac-entry"), None);
         // What only this account's `local.toml` follows stays out of the
         // shared lock, and a path nothing commits is pruned from it.
         assert_eq!(why(&linux, "~/mine", "mine"), Some(Unshared::NotCommitted));
@@ -458,6 +469,7 @@ mod tests {
         let macos = on("macos");
         assert_eq!(why(&macos, "~/shared", "mac-shared"), None);
         assert_eq!(why(&macos, "~/mac-only", "mac-only"), None);
+        assert_eq!(why(&macos, "~/mac-entry", "mac-entry"), None);
         assert_eq!(why(&macos, "~/mine", "mine"), Some(Unshared::NotCommitted));
     }
 }

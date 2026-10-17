@@ -49,7 +49,8 @@
 //! fragment would hold ([`LaunchAgent`]). The declaration is the same on
 //! both; only the file differs, and what this module says of `environment.d`
 //! holds of the LaunchAgent too. `apply` writes it and loads nothing, so it
-//! takes effect at the next login. Every shell startup file is the user's, so bx never
+//! takes effect at the next login, and `bx doctor` says when launchd has not
+//! loaded it ([`crate::doctor::launchd`]). Every shell startup file is the user's, so bx never
 //! writes a declaration into one: it attaches a **fixed three-line region**
 //! whose one line sources a fragment bx owns whole, beneath
 //! [`FRAGMENT_DIR`]. The region's bytes are the same for every declaration and

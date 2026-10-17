@@ -977,6 +977,18 @@ fn doctor_looks_at_the_applied_example_and_changes_nothing() {
     );
     assert_same(&before, &machine.everything(), "doctor wrote something");
 
+    // On macOS the LaunchAgent is asked about: `apply` loads nothing, so
+    // launchd has not loaded it, or has no GUI domain to say so in.
+    let agent = "~/Library/LaunchAgents/dev.bx.environment.plist";
+    let asked = doctor.stdout().lines().any(|line| {
+        line.starts_with(&format!("  ! {agent}  ("))
+            && line.contains(" is written but launchd has not loaded it")
+            || line.starts_with(&format!(
+                "  ! launchd is unreachable, so {agent} went unchecked"
+            ))
+    });
+    assert_eq!(asked, cfg!(target_os = "macos"), "{}", doctor.stdout());
+
     // The example follows a branch, so bash's file asks about updates, which
     // a bash older than 4.4 — macOS's 3.2 — leaves out, and doctor says so.
     let version = machine

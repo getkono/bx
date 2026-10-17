@@ -14,7 +14,8 @@
 //! Doctor takes no exclusive lock and writes nothing under the state directory
 //! or the home, so it runs beside an `apply` that holds the lock. It starts no
 //! process but the one read-only `systemctl --user show` [`systemd`] builds,
-//! and `bash --version` when bash's generated file asks about updates
+//! the one read-only `launchctl print` [`launchd`] builds on macOS, and
+//! `bash --version` when bash's generated file asks about updates
 //! ([`bash`]).
 //!
 //! The checks, in order:
@@ -31,7 +32,8 @@
 //! 5. [`modes`] — a directory whose mode is wider than a file declared in it.
 //! 6. [`sources`] — a declared optional source whose file is not readable.
 //! 7. [`systemd`] — a declared unit file systemd has not reloaded, that is not
-//!    enabled, that it could not load, or that has failed.
+//!    enabled, that it could not load, or that has failed; and on macOS
+//!    [`launchd`] — bx's LaunchAgent, written and not loaded by launchd.
 //! 8. [`references`] — a path a written target declares in `references` that
 //!    is not on disk.
 //! 9. [`orphans`] — a `.bx-` temporary file an interrupted write left beside
@@ -47,6 +49,7 @@
 
 pub mod bash;
 pub mod externals;
+pub mod launchd;
 pub mod modes;
 pub mod orphans;
 pub mod references;
@@ -92,6 +95,8 @@ pub struct Probes<'a> {
     pub unit_dir: &'a Path,
     /// The question put to the user's systemd.
     pub systemd: &'a dyn systemd::Query,
+    /// The question put to launchd about bx's LaunchAgent.
+    pub launchd: &'a dyn launchd::Query,
     /// The question put to the `bash` on `path`.
     pub bash: &'a dyn bash::Query,
 }
@@ -111,6 +116,10 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
     findings.extend(modes::check(inputs.targets(), home));
     findings.extend(sources::check(inputs.targets(), home, &sources::readable));
     findings.extend(systemd::check(&units, probes.systemd));
+    findings.extend(launchd::check(
+        launchd::agent(inputs.targets(), home).as_ref(),
+        probes.launchd,
+    ));
     findings.extend(references::check(
         inputs.targets(),
         &state.ledger,
@@ -245,10 +254,21 @@ content = \"a\\n\"
                 path: OsStr::new(""),
                 unit_dir: &unit_dir,
                 systemd,
+                launchd: &Unasked,
                 bash: &bash::Version,
             },
         );
         (render(&report, home.path()), exit(&report))
+    }
+
+    /// A launchd no test here may ask: what they declare is placed for
+    /// Linux, which has no LaunchAgent.
+    struct Unasked;
+
+    impl launchd::Query for Unasked {
+        fn loaded(&self, label: &str) -> Result<bool, launchd::Unreachable> {
+            panic!("launchd was asked about {label}")
+        }
     }
 
     #[test]
@@ -364,6 +384,7 @@ install = \"sudo dnf install bx-no-such-tool\"
                 path,
                 unit_dir: &unit_dir,
                 systemd,
+                launchd: &Unasked,
                 bash: &bash::Version,
             },
         );

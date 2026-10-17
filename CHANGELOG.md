@@ -9,6 +9,34 @@ Conventional Commit messages.
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/getkono/bx/compare/v0.1.2...v0.1.3) - 2026-10-17
+
+### Added
+
+- *(config)* judge a target's substituted path against the platform anchors ([#271](https://github.com/getkono/bx/pull/271))
+- release and install macOS binaries ([#270](https://github.com/getkono/bx/pull/270))
+- *(doctor)* report a login shell other than the asserted one ([#269](https://github.com/getkono/bx/pull/269))
+- *(env)* deliver environment and gui variables through launchd on macOS ([#268](https://github.com/getkono/bx/pull/268))
+- *(config)* refuse targets under platform-anchored directories without an os gate ([#266](https://github.com/getkono/bx/pull/266))
+- *(config)* accept when on targets, paths, plugins, activation, externals, tools and modules ([#262](https://github.com/getkono/bx/pull/262))
+- *(config)* gate declarations on machine facts ([#256](https://github.com/getkono/bx/pull/256))
+
+### Fixed
+
+- *(config)* decide when gates in bx add and bx init as plan does ([#267](https://github.com/getkono/bx/pull/267))
+- handle case-insensitive filesystems ([#259](https://github.com/getkono/bx/pull/259))
+- *(shell)* correct login-shell startup on macOS ([#260](https://github.com/getkono/bx/pull/260))
+- *(fs)* durable and set-id semantics on macOS ([#258](https://github.com/getkono/bx/pull/258))
+- build and test on macOS ([#253](https://github.com/getkono/bx/pull/253))
+
+### Other
+
+- run the bash 3.2 and PATH_MAX tests on macOS ([#264](https://github.com/getkono/bx/pull/264))
+- *(bench)* measure shell startup on macOS ([#261](https://github.com/getkono/bx/pull/261))
+- support macOS alongside Linux ([#257](https://github.com/getkono/bx/pull/257))
+- run format-check, lint and test on macOS ([#255](https://github.com/getkono/bx/pull/255))
+- add issue forms for bug reports and feature requests ([#237](https://github.com/getkono/bx/pull/237))
+
 ### Changed
 
 - *(install)* `install.sh` changed to install the new macOS binaries, so

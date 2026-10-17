@@ -63,10 +63,18 @@ command -v python3 >/dev/null 2>&1 || {
 	echo "error: python3 is required to read hyperfine's JSON." >&2
 	exit 1
 }
-[ -r /proc/self/stat ] || {
-	echo "error: /proc/self/stat is required to count the processes a start spawns." >&2
+# How a traced start's processes are counted: Linux reads the shell's own
+# /proc/$$/stat, and macOS, which has no /proc, watches the shell's forks
+# through kqueue. Both are explained where the trace runs.
+if [ -r /proc/self/stat ]; then
+	COUNT_BY=proc
+elif python3 -c 'import select; select.KQ_NOTE_FORK' 2>/dev/null; then
+	COUNT_BY=kqueue
+else
+	echo "error: counting the processes a start spawns needs /proc/self/stat (Linux)" >&2
+	echo "       or kqueue's NOTE_FORK (macOS)." >&2
 	exit 1
-}
+fi
 
 mkdir -p "$RESULTS"
 
@@ -207,8 +215,7 @@ done
 for rc in .zshrc .bashrc; do
 	grep '^eval ' "${WORK}/legacy/${rc}" >"${TRACE}/legacy/${rc}"
 done
-# shellcheck disable=SC2016 # expanded by the traced shell, not this one.
-SELF='wait; read -r stat </proc/$$/stat; echo "$stat"'
+WATCH="" # a command the traced shell runs under, set only while counting forks
 traced() { # traced <shell> <fixture> [command]: start it with only its traced lines
 	case "$1" in
 	zsh) set -- "$2" "${3:-exit}" zsh -d -i ;;
@@ -216,28 +223,80 @@ traced() { # traced <shell> <fixture> [command]: start it with only its traced l
 	esac
 	fixture="$1" command="$2"
 	shift 2
-	env -i HOME="${WORK}/${fixture}" ZDOTDIR="${TRACE}/${fixture}" PATH="$SEARCH" \
+	# shellcheck disable=SC2086 # WATCH is a command line; the scratch paths hold no whitespace.
+	$WATCH env -i HOME="${WORK}/${fixture}" ZDOTDIR="${TRACE}/${fixture}" PATH="$SEARCH" \
 		"$@" -c "$command" 2>/dev/null
 }
 
-# Spawns: a shell that started a process and waited for it carries that
-# child's page faults in its own /proc/$$/stat (cminflt, the 11th field), and
-# no process runs without faulting a page in. So the traced shell reads that
-# field itself, with builtins, once its startup files and a `wait` are done: 0
-# exactly when they started nothing, and nothing else on the machine moves it.
+# Spawns, on Linux: a shell that started a process and waited for it carries
+# that child's page faults in its own /proc/$$/stat (cminflt, the 11th field),
+# and no process runs without faulting a page in. So the traced shell reads
+# that field itself, with builtins, once its startup files and a `wait` are
+# done: 0 exactly when they started nothing, and nothing else on the machine
+# moves it.
+# shellcheck disable=SC2016 # expanded by the traced shell, not this one.
+SELF='wait; read -r stat </proc/$$/stat; echo "$stat"'
+# Spawns, on macOS: no /proc, and a shell's builtins expose no child page
+# faults (bash's `times` rounds a fork's cost to 0 ms). So the traced shell is
+# watched from outside instead: forks.py forks, registers a kqueue NOTE_FORK
+# filter on its child while the child waits, and only then lets it exec the
+# shell, so no fork from the first line of a startup file on is missed. Every
+# process a shell starts, a command or a subshell, begins as a fork of the
+# shell, and `env` execs it without forking. It prints the forks it saw: 0
+# exactly when the startup files started nothing. Repeated forks between two
+# reads coalesce into one event, so a non-zero count is a lower bound.
+cat >"${WORK}/forks.py" <<'PY'
+import os, select, sys
+
+go_r, go_w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(go_w)
+    os.read(go_r, 1)
+    os.execvp(sys.argv[1], sys.argv[1:])
+os.close(go_r)
+kq = select.kqueue()
+watch = select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                      select.KQ_NOTE_FORK | select.KQ_NOTE_EXIT)
+kq.control([watch], 0)
+os.close(go_w)
+forks, done = 0, False
+while not done:
+    for event in kq.control(None, 8):
+        forks += bool(event.fflags & select.KQ_NOTE_FORK)
+        done = done or bool(event.fflags & select.KQ_NOTE_EXIT)
+os.waitpid(pid, 0)
+print(forks)
+PY
+spawned() { # spawned <shell> <fixture>: what its traced start spawned, 0 for nothing
+	case "$COUNT_BY" in
+	proc) traced "$1" "$2" "$SELF" | awk '{ print $11 }' ;;
+	kqueue)
+		WATCH="python3 ${WORK}/forks.py"
+		traced "$1" "$2" wait | tail -n 1
+		WATCH=""
+		;;
+	esac
+}
+unit() { # unit: what spawned counts
+	case "$COUNT_BY" in
+	proc) echo "page faults" ;;
+	kqueue) echo "forks" ;;
+	esac
+}
 for sh in $SHELLS; do
-	legacy="$(traced "$sh" legacy "$SELF" | awk '{ print $11 }')"
+	legacy="$(spawned "$sh" legacy)"
 	[ "${legacy:-0}" -gt 0 ] || {
 		echo "error: the ${sh} trace saw no process start from the hand-written ${sh}rc." >&2
 		exit 1
 	}
-	faults="$(traced "$sh" bx "$SELF" | awk '{ print $11 }')"
-	[ -n "$faults" ] || {
+	spawns="$(spawned "$sh" bx)"
+	[ -n "$spawns" ] || {
 		echo "error: the ${sh} trace of bx's startup files read nothing back." >&2
 		exit 1
 	}
-	[ "$faults" -eq 0 ] || {
-		echo "FAIL: bx's ${sh} startup files started a process (${faults} page faults)." >&2
+	[ "$spawns" -eq 0 ] || {
+		echo "FAIL: bx's ${sh} startup files started a process (${spawns} $(unit))." >&2
 		exit 1
 	}
 done
@@ -245,8 +304,9 @@ done
 # Reads: the startup path parses no configuration. Every file under the bx
 # home's configuration and state directories, bx's own config repo and state
 # among them, has its access time set into the past; a read moves it to now
-# under the relatime and strictatime mounts. A read made first proves this
-# filesystem records reads at all.
+# under Linux's relatime and strictatime mounts and macOS's default APFS ones,
+# and BSD find and touch take the same flags as GNU's here. A read made first
+# proves this filesystem records reads at all.
 WITNESS="${WORK}/bx/.config ${WORK}/bx/.local/state"
 unread() { # unread: set every witness's access time into the past
 	# shellcheck disable=SC2086 # the scratch paths hold no whitespace.
@@ -316,8 +376,15 @@ def medians(name, shell):
     # results are in the order the commands were given. The median, not the
     # mean: a start the scheduler delayed moves the mean by its whole delay
     # and the median not at all, and the gate is about bx, not about the
-    # machine's other load.
-    return {label: r["median"] * 1000 for label, r in zip(labels[name], data)}
+    # machine's other load. hyperfine 1 puts it at the top of each result,
+    # hyperfine 2 under its summary's wall-clock time.
+    return {label: median(r) * 1000 for label, r in zip(labels[name], data)}
+
+
+def median(result):
+    if "summary" in result:
+        return result["summary"]["time_wall_clock"]["median"]
+    return result["median"]
 
 
 over_budget = []

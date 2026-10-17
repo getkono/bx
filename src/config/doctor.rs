@@ -146,4 +146,17 @@ mod tests {
         let err = parse("[doctor]\nlogin-shell = 1\n").unwrap_err();
         assert!(err.contains("a string"), "{err}");
     }
+
+    #[test]
+    fn a_doctor_that_is_not_a_table_is_a_load_error() {
+        let err = crate::config::parse_str(
+            "doctor = 1\n",
+            Path::new("/repo/bx.toml"),
+            Path::new("/home/u"),
+        )
+        .expect_err("doctor = 1")
+        .to_string();
+        assert!(err.contains("a table `[doctor]`"), "{err}");
+        assert!(err.starts_with("/repo/bx.toml:1:"), "{err}");
+    }
 }

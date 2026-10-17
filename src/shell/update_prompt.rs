@@ -57,8 +57,10 @@
 //! - **The status kept.** `__bx_update` returns the status it was called
 //!   with, so a prompt that shows the last command's status shows the same
 //!   one it would without bx.
-//! - **bash 4.4 or later.** Reading `PROMPT_COMMAND`'s attributes needs
-//!   `${PROMPT_COMMAND@a}`; an older bash is not asked.
+//! - **bash 4.4 or later** ([`BASH_SINCE`]). Reading `PROMPT_COMMAND`'s
+//!   attributes needs `${PROMPT_COMMAND@a}`; an older bash — macOS's
+//!   `/bin/bash` is 3.2 — parses the file, registers nothing and is not
+//!   asked, and `bx doctor` names the hook it left out.
 //!
 //! # Invariant 6
 //!
@@ -87,6 +89,12 @@ use super::{Assembly, Phase, Shell};
 
 /// The owner the hook is contributed under.
 pub const SECTION: &str = "bx update";
+
+/// The oldest bash, as `(major, minor)`, that [`BASH`] registers on: reading
+/// `PROMPT_COMMAND`'s attributes needs `${PROMPT_COMMAND@a}`. An older bash —
+/// macOS's `/bin/bash` is 3.2 — sources the file without the hook, and
+/// `bx doctor` says so ([`crate::doctor::bash`]).
+pub const BASH_SINCE: (u32, u32) = (4, 4);
 
 /// The hook, as the `functions` phase holds it.
 pub const ZSH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, at most
@@ -358,8 +366,9 @@ mod tests {
         }
     }
 
-    /// The shells every hook test runs in. macOS's bash is 3.2, which the
-    /// bash hook does not support yet; it is held to bash on Linux only.
+    /// The shells every hook test runs in. The bash hook is registered on
+    /// bash 4.4 or later only, and macOS's bash is 3.2, so it is held to bash
+    /// on Linux only.
     #[cfg(target_os = "linux")]
     const SHELLS: [Shell; 2] = [Shell::Zsh, Shell::Bash];
     #[cfg(not(target_os = "linux"))]
@@ -721,7 +730,9 @@ mod tests {
         .0
     }
 
-    // macOS's bash is 3.2, which the bash hook does not support yet.
+    // The hook is registered on bash 4.4 or later only, and macOS's bash is
+    // 3.2: `a_bash_older_than_4_4_registers_nothing_and_says_nothing` holds
+    // it there.
     #[cfg(target_os = "linux")]
     #[test]
     fn bash_appends_to_an_unexported_prompt_command_once() {
@@ -751,7 +762,9 @@ mod tests {
         );
     }
 
-    // macOS's bash is 3.2, which the bash hook does not support yet.
+    // The hook is registered on bash 4.4 or later only, and macOS's bash is
+    // 3.2: `a_bash_older_than_4_4_registers_nothing_and_says_nothing` holds
+    // it there.
     #[cfg(target_os = "linux")]
     #[test]
     fn bash_leaves_an_exported_or_read_only_prompt_command_alone() {
@@ -781,7 +794,9 @@ mod tests {
         assert_eq!(printed, "[7]\n");
     }
 
-    // macOS's bash is 3.2, which the bash hook does not support yet.
+    // The hook is registered on bash 4.4 or later only, and macOS's bash is
+    // 3.2: `a_bash_older_than_4_4_registers_nothing_and_says_nothing` holds
+    // it there.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_later_export_carries_an_entry_a_child_bash_runs_without_error() {
@@ -801,6 +816,37 @@ mod tests {
             &[],
         );
         assert_eq!(printed, "[7]\n[0]\n");
+    }
+
+    #[test]
+    fn a_bash_older_than_4_4_registers_nothing_and_says_nothing() {
+        if crate::shell::testing::installed("bash").is_none() {
+            return;
+        }
+        // Whichever bash this is: 4.4 or later registers the entry, and an
+        // older one — macOS's 3.2 — parses the whole hook, registers nothing
+        // and prints nothing, so a shell sourcing bx's file there starts
+        // cleanly without the question.
+        let rig = Rig::new(Shell::Bash);
+        let (printed, calls) = rig.run(
+            "printf '%s|%s\\n' \"$(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] ))\" \
+             \"${PROMPT_COMMAND-}\"",
+            "",
+            &[],
+        );
+        let (version, registered) = printed
+            .trim_end()
+            .split_once('|')
+            .unwrap_or_else(|| panic!("{printed:?}"));
+        let version: u32 = version.parse().expect("bash's version");
+        let since = BASH_SINCE.0 * 100 + BASH_SINCE.1;
+        let expected = if version >= since {
+            "${BX_UPDATE_HOOK-}"
+        } else {
+            ""
+        };
+        assert_eq!(registered, expected, "bash {version}: {printed:?}");
+        assert_eq!(calls, "");
     }
 
     #[test]

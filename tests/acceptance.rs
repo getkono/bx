@@ -59,21 +59,39 @@ const ANSWERS: &str =
 /// The account's own `~/.zshrc` before bx: a line bx must carry through.
 const ZSHRC: &str = "# my own zshrc\nautoload -Uz compinit && compinit -i\n";
 
-/// The account's own `~/.bashrc` before bx.
-const BASHRC: &str = "# my own bashrc\nshopt -s globstar\n";
+/// The account's own `~/.bashrc` before bx. An option every bash has, back
+/// to macOS's 3.2: an unknown one is an error on stderr at every start.
+const BASHRC: &str = "# my own bashrc\nshopt -s histappend\n";
 
 /// Every path in the home a `bx rm` releases the example's targets from:
-/// together, everything the example declares.
-const MANAGED: [&str; 8] = [
-    ".bashrc",
-    ".config",
-    ".hushlogin",
-    ".inputrc",
-    ".local",
-    ".ssh",
-    ".zshenv",
-    ".zshrc",
-];
+/// together, everything the example declares. On macOS that is also where a
+/// login shell is put right after `path_helper` and where a login bash is
+/// pointed at bx's file.
+const MANAGED: &[&str] = if cfg!(target_os = "macos") {
+    &[
+        ".bash_profile",
+        ".bashrc",
+        ".config",
+        ".hushlogin",
+        ".inputrc",
+        ".local",
+        ".ssh",
+        ".zprofile",
+        ".zshenv",
+        ".zshrc",
+    ]
+} else {
+    &[
+        ".bashrc",
+        ".config",
+        ".hushlogin",
+        ".inputrc",
+        ".local",
+        ".ssh",
+        ".zshenv",
+        ".zshrc",
+    ]
+};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -792,13 +810,28 @@ fn zsh_and_bash_start_cleanly_with_what_bx_generated() {
     let machine = Machine::answered();
     machine.apply();
 
-    for shell in ["zsh", "bash"] {
-        let output = interactive(&machine, shell, "exit");
+    // Interactive, and a login shell as Terminal starts one on macOS — where
+    // `bash` is 3.2 — each reading every file bx wrote for it.
+    for (shell, flags) in [
+        ("zsh", &["-i"][..]),
+        ("bash", &["-i"]),
+        ("zsh", &["-l", "-i"]),
+        ("bash", &["-l", "-i"]),
+    ] {
+        let output = machine
+            .command(shell)
+            .args(flags)
+            .args(["-c", "exit"])
+            .env("TERM", "dumb")
+            .output()
+            .expect("the shell runs");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{shell}: {output:?}");
+        assert!(output.status.success(), "{shell} {flags:?}: {output:?}");
         assert!(
-            !stderr.contains("not found") && !stderr.contains("error"),
-            "{shell} complained starting up:\n{stderr}"
+            ["not found", "error", "invalid", "bad substitution"]
+                .iter()
+                .all(|complaint| !stderr.contains(complaint)),
+            "{shell} {flags:?} complained starting up:\n{stderr}"
         );
     }
 
@@ -819,6 +852,48 @@ fn zsh_and_bash_start_cleanly_with_what_bx_generated() {
          && ! type pane_title >/dev/null 2>&1",
     );
     assert!(bash.status.success(), "bash: {bash:?}");
+}
+
+#[test]
+fn a_login_shell_keeps_the_declared_prepends_ahead_of_the_system_s_directories() {
+    // On macOS a login shell runs `path_helper` — zsh from `/etc/zprofile`,
+    // after `~/.zshenv`; bash from `/etc/profile` — which rebuilds `PATH`
+    // with `/usr/bin` ahead of everything `~/.zshenv` prepended. The example
+    // prepends `~/bin` while it exists. On Linux a login bash reads no file
+    // bx writes, so only zsh is asked there.
+    let machine = Machine::answered();
+    let bin = machine.home.child("bin");
+    std::fs::create_dir_all(&bin).expect("~/bin");
+    machine.apply();
+    let bin = bin.display().to_string();
+
+    let shells: &[&str] = if cfg!(target_os = "macos") {
+        &["zsh", "bash"]
+    } else {
+        &["zsh"]
+    };
+    for shell in shells {
+        let output = machine
+            .command(shell)
+            .args(["-l", "-c", "printf '%s\\n' \"$PATH\""])
+            .output()
+            .expect("the shell runs");
+        assert!(output.status.success(), "{shell}: {output:?}");
+        let path = String::from_utf8_lossy(&output.stdout);
+        let entries: Vec<&str> = path.trim_end().split(':').collect();
+        let at = |dir: &str| entries.iter().position(|entry| *entry == dir);
+        let declared = at(&bin).unwrap_or_else(|| panic!("{shell}: no {bin} in {path}"));
+        let system = at("/usr/bin").unwrap_or_else(|| panic!("{shell}: no /usr/bin in {path}"));
+        assert!(
+            declared < system,
+            "{shell}: {bin} behind /usr/bin in {path}"
+        );
+        assert_eq!(
+            entries.iter().filter(|entry| **entry == bin).count(),
+            1,
+            "{shell}: {bin} more than once in {path}"
+        );
+    }
 }
 
 #[test]
@@ -869,6 +944,28 @@ fn doctor_looks_at_the_applied_example_and_changes_nothing() {
         doctor.stderr()
     );
     assert_same(&before, &machine.everything(), "doctor wrote something");
+
+    // The example follows a branch, so bash's file asks about updates, which
+    // a bash older than 4.4 — macOS's 3.2 — leaves out, and doctor says so.
+    let version = machine
+        .command("bash")
+        .args([
+            "-c",
+            "echo $(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] ))",
+        ])
+        .output()
+        .expect("bash runs");
+    let version: u32 = String::from_utf8_lossy(&version.stdout)
+        .trim()
+        .parse()
+        .expect("bash's version");
+    assert_eq!(
+        doctor.stdout().contains("~/.local/share/bx/bashrc.bash")
+            && doctor.stdout().contains(", older than 4.4,"),
+        version < 404,
+        "bash {version}:\n{}",
+        doctor.stdout()
+    );
 }
 
 #[test]

@@ -214,8 +214,9 @@ path, `bx rm` when a conflict left something as it was, and
   there yet), a declared reference that is not on disk, a temporary file an
   interrupted write left behind, an external that follows a branch
   `bx.lock` holds no commit for, a `bx.lock` entry nothing follows any more,
-  an update stamp that holds no time, and a `local.toml` inside the config
-  repo, which bx never loads. It has no notion of a cache's size limit or of
+  an update stamp that holds no time, a `local.toml` inside the config
+  repo, which bx never loads, and a `bash` on `PATH` older than 4.4 — macOS's
+  is 3.2 — that leaves out bash's question about updates. It has no notion of a cache's size limit or of
   an integration gone stale, and reports neither.
 
 ### Fast enough to forget
@@ -306,7 +307,8 @@ asked. bx cannot tell a metered or mobile connection from any other, which is
 why the default is to ask first. bash asks through `PROMPT_COMMAND`, which bx
 only appends to, keeping the status your prompt shows; a bash whose
 `PROMPT_COMMAND` is exported or read-only, or a bash older than 4.4, is not
-asked, and `bx update` and `bx update --check` work there as anywhere. If a
+asked — `bx doctor` names the second — and `bx update` and
+`bx update --check` work there as anywhere. If a
 line after bx's region exports `PROMPT_COMMAND`, a child bash inherits bx's
 entry, which does nothing there.
 

@@ -10,7 +10,26 @@
 //! |---------------------------------------|------------------------------------------------|----------------------|
 //! | [`FILE`], `~/.local/share/bx/bashrc.bash` | the variables, `[path]`, activations, sources, aliases, functions, `[history]` and `[shell-options]` | a file bx owns whole |
 //! | [`STARTUP_FILE`], `~/.bashrc`         | the one line that sources [`FILE`]              | a fixed region       |
+//! | [`PROFILE`], `~/.bash_profile`, macOS only | the one line that sources [`FILE`] unless `~/.bashrc` did ([`profile_line`]) | a fixed region |
 //! | [`INPUTRC`], `~/.inputrc`             | `[keybindings]`, in readline's syntax           | a file bx owns whole |
+//!
+//! On macOS Terminal starts a login shell for every window, and a login bash
+//! reads `~/.bash_profile` and not `~/.bashrc`, so there [`FILE`] is sourced
+//! from both ([`super::placement::Platform`]). It then defines [`LOADED`], a
+//! function that does nothing, which `~/.bash_profile`'s line asks about, so
+//! a `~/.bash_profile` that sources `~/.bashrc` first does not source the file
+//! twice; sourcing `~/.bashrc` again by hand still does. The file's `PATH`
+//! lines run after `/etc/profile`'s `path_helper`, so a login bash keeps the
+//! declared entries where they were declared.
+//!
+//! # bash 3.2
+//!
+//! macOS's `/bin/bash` is 3.2, and the file parses and runs there: each `/`
+//! of a `[path]` removal is spelled as 3.2 reads it
+//! ([`crate::config::path::render`]). The one thing 3.2 leaves out is the
+//! update prompt's registration, which needs 4.4
+//! ([`super::update_prompt::BASH_SINCE`]); `bx doctor` names it
+//! ([`crate::doctor::bash`]).
 //!
 //! # The interactive file
 //!
@@ -111,7 +130,7 @@
 use std::path::Path;
 
 use super::keybindings::Keybindings;
-use super::placement::{held_together, resolve_env};
+use super::placement::{Platform, held_together, resolve_env};
 use super::source::SourceDecl;
 use super::{Assembly, Phase, SETTLE, Shell, activation, held};
 use crate::config::env::{EnvDecl, EnvKind, assignment};
@@ -131,6 +150,37 @@ pub const FILE: &str = "~/.local/share/bx/bashrc.bash";
 
 /// The user's startup file whose region sources [`FILE`].
 pub const STARTUP_FILE: &str = "~/.bashrc";
+
+/// The login bash's startup file whose region sources [`FILE`] on macOS,
+/// where Terminal starts a login shell for every window and bash then reads
+/// this file and not [`STARTUP_FILE`].
+pub const PROFILE: &str = "~/.bash_profile";
+
+/// The function [`FILE`] defines when [`PROFILE`] sources it too: what
+/// [`profile_line`] asks about, so a `~/.bash_profile` that sources
+/// `~/.bashrc` first does not source the file a second time.
+pub const LOADED: &str = "__bx_bashrc_loaded";
+
+/// The line [`PROFILE`]'s region carries: source `file` when it is readable
+/// and no earlier line defined [`LOADED`] by sourcing it.
+///
+/// `declare -F` is a builtin, so the test starts no process. Sets nothing and
+/// reads no variable, so, as [`crate::config::env::source_line`]'s, it is
+/// generated shell content that is not an environment fragment and carries
+/// no assignment at all.
+#[must_use]
+pub fn profile_line(file: &Portable) -> String {
+    let path = file.as_str();
+    format!("[[ -r {path} ]] && ! declare -F {LOADED} >/dev/null && source {path}\n")
+}
+
+/// The definition [`FILE`] holds when [`PROFILE`] sources it too: a function
+/// that does nothing, so defining it assigns nothing.
+fn loaded() -> String {
+    format!(
+        "# Defined so ~/.bash_profile's region does not source this file again.\n{LOADED}() {{ :; }}\n"
+    )
+}
 
 /// Readline's own file, which bx owns whole once a key is bound.
 pub const INPUTRC: &str = "~/.inputrc";
@@ -262,6 +312,9 @@ impl Bash {
         }
         super::function::contribute(&mut assembly, self.functions(), decide);
         super::update_prompt::contribute(&mut assembly, self.update_prompt(), Shell::Bash);
+        if self.profile() {
+            let _ = assembly.contribute(Phase::Functions, PROFILE, loaded());
+        }
         let _ = assembly.contribute(
             Phase::Options,
             history::SECTION,
@@ -292,20 +345,27 @@ pub fn render_inputrc(keybindings: &Keybindings) -> String {
     )
 }
 
-/// The targets bash's files make: [`FILE`] and its region in
-/// [`STARTUP_FILE`] when anything places the file, and [`INPUTRC`] when a key
-/// is bound. Each is attributed to the declaration that placed it.
+/// The targets bash's files make on `platform`: [`FILE`] and its region in
+/// [`STARTUP_FILE`] when anything places the file — and on
+/// [`Platform::Macos`] a second region, in [`PROFILE`] — and [`INPUTRC`]
+/// when a key is bound. Each is attributed to the declaration that placed
+/// it.
 ///
 /// The file is held back, whole, when a variable it holds waits on a value,
-/// as zsh's interactive file is; its region is still placed. A function or a
-/// source that waits on one is held back alone and named in the file's row.
+/// as zsh's interactive file is; its regions are still placed. A function or
+/// a source that waits on one is held back alone and named in the file's row.
 ///
 /// # Errors
 ///
 /// [`Error::BadValue`] when the home cannot hold the files' paths, and for a
 /// variable, a function body or a source path whose value is a repo defect,
 /// as [`crate::config::resolve::resolve`] lists.
-pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<Target>>, Error> {
+pub fn place(
+    merged: &Config,
+    values: &ResolvedValues,
+    platform: Platform,
+) -> Result<Vec<Resolution<Target>>, Error> {
+    let profile = platform == Platform::Macos;
     let home = values.home();
     // zsh's load order: `~/.zshenv`'s variables, then `~/.zprofile`'s, then
     // the interactive file's.
@@ -417,7 +477,8 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
                 .with_functions(functions)
                 .with_sources(sources)
                 .with_omitted(super::omitted(Shell::Bash, merged))
-                .with_update_prompt(followed.is_some());
+                .with_update_prompt(followed.is_some())
+                .with_profile(profile);
             Resolution::Ready(target(
                 file.clone(),
                 Gen::Bash(Box::new(bash)),
@@ -435,10 +496,18 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
         });
         placed.push(Resolution::Ready(target(
             region,
-            Gen::Source(file),
+            Gen::Source(file.clone()),
             Attach::Region { comment: '#' },
             &origin,
         )));
+        if profile {
+            placed.push(Resolution::Ready(target(
+                portable(PROFILE, home, &origin)?,
+                Gen::Profile(file),
+                Attach::Region { comment: '#' },
+                &origin,
+            )));
+        }
     }
     let keybindings = &merged.keybindings;
     if let Some(origin) = keybindings
@@ -537,14 +606,20 @@ mod tests {
         parse_str(text, Path::new("/repo/bx.toml"), Path::new(HOME)).expect("parses")
     }
 
-    /// What `config` places, its values resolved against [`HOME`].
+    /// What `config` places on Linux, its values resolved against [`HOME`].
     fn placed_by(config: &Config) -> Result<Vec<Resolution<Target>>, Error> {
+        placed_on(config, Platform::Linux)
+    }
+
+    /// What `config` places on `platform`, its values resolved against
+    /// [`HOME`].
+    fn placed_on(config: &Config, platform: Platform) -> Result<Vec<Resolution<Target>>, Error> {
         let values = ResolvedValues::resolve(
             config.values.clone(),
             &config.value_assignments,
             Path::new(HOME),
         )?;
-        place(config, &values)
+        place(config, &values, platform)
     }
 
     fn bash_of(config: &Config) -> Bash {
@@ -749,6 +824,85 @@ mod tests {
             "{}",
             with[0].2
         );
+    }
+
+    #[test]
+    fn on_macos_bash_profile_sources_the_file_too_and_linux_is_unchanged() {
+        let config = load("[aliases]\nll = \"ls\"\n");
+        let linux = described(&placed_by(&config).expect("places"));
+        let macos = described(&placed_on(&config, Platform::Macos).expect("places"));
+        assert!(
+            linux
+                .iter()
+                .all(|(path, _, body)| path != PROFILE && !body.contains(LOADED)),
+            "{linux:?}"
+        );
+        assert_eq!(macos.len(), 3, "{macos:?}");
+        // The file defines the function the profile's region asks about, and
+        // is otherwise the file Linux gets.
+        assert_eq!(macos[0].0, FILE);
+        assert_eq!(
+            macos[0].2,
+            format!(
+                "{}\n# bx phase: functions\n# Defined so ~/.bash_profile's region does not \
+                 source this file again.\n{LOADED}() {{ :; }}\n",
+                linux[0].2
+            )
+        );
+        assert_eq!(macos[1], linux[1], "the ~/.bashrc region");
+        assert_eq!(
+            macos[2],
+            (
+                PROFILE.to_string(),
+                Attach::Region { comment: '#' },
+                format!("[[ -r {FILE} ]] && ! declare -F {LOADED} >/dev/null && source {FILE}\n"),
+            )
+        );
+    }
+
+    #[test]
+    fn a_login_bash_sources_the_file_once_whether_or_not_bash_profile_sources_bashrc() {
+        let Some(bash) = installed("bash") else {
+            return;
+        };
+        let config = load("[aliases]\nll = \"ls\"\n");
+        let placed = placed_on(&config, Platform::Macos).expect("places");
+        let bytes: Vec<String> = described(&placed).into_iter().map(|(_, _, b)| b).collect();
+        let (file, bashrc, profile) = (&bytes[0], &bytes[1], &bytes[2]);
+        let home = tempfile::tempdir().expect("a home");
+        let at = |raw: &str| home.path().join(raw.trim_start_matches("~/"));
+        std::fs::create_dir_all(at(FILE).parent().expect("a parent")).expect("the directory");
+        // The file as bx writes it, counting each time it is sourced.
+        std::fs::write(at(FILE), format!("{file}loads=$((loads+1))\n")).expect("the file");
+        let loads = |script: &str| -> String {
+            let path = home.path().join("script");
+            std::fs::write(&path, format!("{script}echo \"${{loads-0}}\"\n")).expect("script");
+            let output = std::process::Command::new(&bash)
+                .args(["--norc", "--noprofile"])
+                .arg(&path)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("PATH", "/nonexistent")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("bash runs");
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            String::from_utf8(output.stdout).expect("utf-8")
+        };
+        // `~/.bash_profile` with bx's region alone.
+        assert_eq!(loads(profile), "1\n");
+        // `~/.bash_profile` sourcing `~/.bashrc` ahead of bx's region.
+        assert_eq!(loads(&format!("{bashrc}{profile}")), "1\n");
+        // `~/.bashrc` sourced by hand again still reloads the file.
+        assert_eq!(loads(&format!("{bashrc}{profile}{bashrc}")), "2\n");
+        // Without the function the guard is not there: twice.
+        std::fs::write(
+            at(FILE),
+            format!("{}loads=$((loads+1))\n", file.replace(LOADED, "other")),
+        )
+        .expect("the file");
+        assert_eq!(loads(&format!("{bashrc}{profile}")), "2\n");
     }
 
     #[test]
@@ -980,8 +1134,6 @@ mod tests {
         );
     }
 
-    // macOS's bash is 3.2, which bx's generated bash does not support yet.
-    #[cfg(target_os = "linux")]
     #[test]
     fn bash_defines_the_aliases_and_changes_only_its_history_variables() {
         let Some(bash) = installed("bash") else {
@@ -989,14 +1141,16 @@ mod tests {
         };
         let rendered = bash_of(&load(SOURCE)).render(&tools(&|_| true));
         let flags = ["--norc", "--noprofile"];
-        let probe = "printf '%s|' \"${BASH_ALIASES[ll]}\" \"${BASH_ALIASES[sudo]}\" \
-                     \"${BASH_ALIASES[cat]}\" \"$HISTSIZE\" \"$HISTCONTROL\"; \
+        // `alias NAME` rather than bash 4's `BASH_ALIASES`, so the probe runs
+        // in macOS's bash 3.2 too.
+        let probe = "alias ll sudo cat; printf '%s|' \"$HISTSIZE\" \"$HISTCONTROL\"; \
                      shopt -p checkwinsize histappend\n";
         let got =
             String::from_utf8(run(&bash, &flags, &format!("{rendered}{probe}"))).expect("utf-8");
         assert_eq!(
             got,
-            "ls -la|sudo |bat --paging=never|10000|ignorespace:erasedups|\
+            "alias ll='ls -la'\nalias sudo='sudo '\nalias cat='bat --paging=never'\n\
+             10000|ignorespace:erasedups|\
              shopt -s checkwinsize\nshopt -s histappend\n"
         );
 
@@ -1035,7 +1189,9 @@ mod tests {
         assert_ne!(after, before);
     }
 
-    // macOS's bash is 3.2, which bx's generated bash does not support yet.
+    // macOS's bash 3.2 exits 1 at `bind -f` in this script with no terminal,
+    // so the probe reads readline's bindings on Linux only. The file is
+    // readline's syntax, not bash's.
     #[cfg(target_os = "linux")]
     #[test]
     fn readline_reads_the_inputrc_as_the_declared_bindings() {

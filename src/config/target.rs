@@ -301,6 +301,12 @@ pub enum Gen {
     /// Sets nothing, so it is not an environment fragment and is not judged as
     /// one; `env_guard`'s tests hold its bytes to carrying no assignment.
     Source(Portable),
+    /// The one line of `~/.bash_profile`'s fixed region on macOS, sourcing
+    /// bash's generated file when it is readable and `~/.bashrc` has not
+    /// already sourced it ([`crate::shell::bash::profile_line`]). Sets
+    /// nothing either, and is not judged as a fragment; `env_guard`'s tests
+    /// hold its bytes to carrying no assignment.
+    Profile(Portable),
     /// The interactive shell file, assembled phase by phase. Only its `env`
     /// phase is an environment fragment, and only that phase is judged as
     /// one; see [`Interactive`]. Boxed, because it carries every interactive
@@ -597,6 +603,9 @@ pub struct Bash {
     /// Whether an external follows a branch, so the file asks about its
     /// updates ([`crate::shell::update_prompt`]).
     update_prompt: bool,
+    /// Whether `~/.bash_profile` sources the file too, so the file defines
+    /// the function that region asks about ([`crate::shell::bash::LOADED`]).
+    profile: bool,
 }
 
 impl Bash {
@@ -669,6 +678,19 @@ impl Bash {
     #[must_use]
     pub const fn update_prompt(&self) -> bool {
         self.update_prompt
+    }
+
+    /// The file, sourced from `~/.bash_profile` too when `profile`.
+    #[must_use]
+    pub const fn with_profile(mut self, profile: bool) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Whether `~/.bash_profile` sources the file too.
+    #[must_use]
+    pub const fn profile(&self) -> bool {
+        self.profile
     }
 
     /// The variables, in the order the `env` phase holds them.
@@ -2699,6 +2721,7 @@ mod tests {
                 syntax: Syntax::Zsh,
                 vars,
                 path: Vec::new(),
+                inherited: Vec::new(),
             }
         }
 

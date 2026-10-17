@@ -736,6 +736,7 @@ mod tests {
                 syntax: Syntax::Zsh,
                 vars: vec![Var::always("EDITOR", "x")],
                 path: Vec::new(),
+                inherited: Vec::new(),
             }))))
         );
         assert_eq!(zshrc_fragment.format, Format::Opaque);
@@ -968,6 +969,7 @@ mod tests {
                 syntax: Syntax::Zsh,
                 vars: Vec::new(),
                 path: Vec::new(),
+                inherited: Vec::new(),
             }))))
         );
     }
@@ -1000,6 +1002,7 @@ mod tests {
                             syntax: Syntax::Zsh,
                             vars: Vec::new(),
                             path: Vec::new(),
+                            inherited: Vec::new(),
                         }))
                     );
                     assert_eq!(target.origin.file, ledger);

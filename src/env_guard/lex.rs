@@ -6,7 +6,7 @@ use std::path::Path;
 use super::reason::Reason;
 use super::scope::Scope;
 use super::table::{Kind, emittable};
-use crate::config::path::{BASH_REMOVAL, GATE, ZSH_REMOVAL};
+use crate::config::path::{BASH_REMOVAL, BASH_SLASH, GATE, ZSH_REMOVAL};
 use crate::lexical::is_variable_name;
 
 /// How long an expansion may grow before it is refused.
@@ -103,11 +103,17 @@ pub(super) fn statement(line: &str) -> Statement<'_> {
         {
             // In bash's shape a `:` follows the word, which zsh would read
             // as the start of a modifier on an unbraced reference ending it.
-            let modified = close == BASH_REMOVAL.1
+            let bash = close == BASH_REMOVAL.1;
+            let modified = bash
                 && word.rfind('$').is_some_and(|at| {
                     !word[at + 1..].starts_with('{') && !word[at..].contains('/')
                 });
-            return exact_word(word)
+            let read = if bash {
+                slashed_word(word)
+            } else {
+                exact_word(word)
+            };
+            return read
                 .filter(|_| !modified)
                 .map_or(Statement::Refused, |word| Statement::Removal { word });
         }
@@ -147,6 +153,35 @@ fn exact_word(text: &str) -> Option<Word<'_>> {
         Ok((word, "")) if !word.tilde => Some(word),
         _ => None,
     }
+}
+
+/// The word of bash's removal line: [`exact_word`]'s word with every `/`
+/// spelled [`BASH_SLASH`] and no `/` anywhere else, read as the word it
+/// spells. `text` stays as written, for a message to quote back.
+///
+/// Each piece between two slashes is read as a bare word holding no `/` and
+/// no `~`, and each slash is the one `/` inside its spelling, so the parts
+/// are the spelled word's parts.
+fn slashed_word(text: &str) -> Option<Word<'_>> {
+    if text.chars().any(is_unprintable) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut pieces = text.split(BASH_SLASH);
+    let first = pieces.next().unwrap_or_default();
+    let in_piece = |c: char| c.is_ascii_alphanumeric() || "_.,:@%+-".contains(c);
+    parts.extend(self::parts(first, in_piece).ok()?);
+    let slash_at = BASH_SLASH.find('/').unwrap_or_default();
+    let slash = &BASH_SLASH[slash_at..=slash_at];
+    for piece in pieces {
+        parts.push(Part::Text(slash));
+        parts.extend(self::parts(piece, in_piece).ok()?);
+    }
+    Some(Word {
+        text,
+        tilde: false,
+        parts,
+    })
 }
 
 /// `statement` as a fragment of this syntax reads it: a gated assignment and a
@@ -474,13 +509,20 @@ mod tests {
         // bash's shape follows the word with a `:`, which zsh would read as a
         // modifier on an unbraced reference ending it; a braced one ends at
         // its `}`, so nothing follows it to misread.
-        let bash = |word: &str| format!("{}{word}{}", BASH_REMOVAL.0, BASH_REMOVAL.1);
+        let bash = |word: &str| {
+            format!(
+                "{}{}{}",
+                BASH_REMOVAL.0,
+                word.replace('/', BASH_SLASH),
+                BASH_REMOVAL.1
+            )
+        };
         for removed in ["${CARGO_HOME}", "/opt/${TOOL}"] {
             let line = bash(removed);
             let Statement::Removal { word } = statement(&line) else {
                 panic!("bash's removal of a braced reference is read: {line:?}");
             };
-            assert_eq!(word.text, removed);
+            assert_eq!(word.text, removed.replace('/', BASH_SLASH));
         }
         // The same words unbraced are the ones refused.
         for refused in ["$CARGO_HOME", "/opt/$TOOL"] {
@@ -508,7 +550,14 @@ mod tests {
             panic!("a removal is read");
         };
         assert_eq!(word.text, "${CARGO_HOME}/bin");
-        let bash = |word: &str| format!("{}{word}{}", BASH_REMOVAL.0, BASH_REMOVAL.1);
+        let bash = |word: &str| {
+            format!(
+                "{}{}{}",
+                BASH_REMOVAL.0,
+                word.replace('/', BASH_SLASH),
+                BASH_REMOVAL.1
+            )
+        };
         for (line, removed) in [
             (bash("${CARGO_HOME}/bin"), "${CARGO_HOME}/bin"),
             (format!("  {}", bash("$HOME/bin")), "$HOME/bin"),
@@ -517,7 +566,7 @@ mod tests {
             let Statement::Removal { word } = statement(&line) else {
                 panic!("bash's removal is read: {line:?}");
             };
-            assert_eq!(word.text, removed);
+            assert_eq!(word.text, removed.replace('/', BASH_SLASH));
         }
         // bash's shape, near missed: the word, each assignment, or what
         // follows the line.
@@ -535,7 +584,11 @@ mod tests {
             bash("/x").replace("PATH=${PATH#:}; ", ""),
             bash("/x").replace("${PATH%:}", "${PATH%%:*}"),
             bash("/x").replace(":; PATH=${PATH//\":", ":; FPATH=${PATH//\":"),
-            bash("/x").replace("\":/x:\"", ":/x:"),
+            bash("/x").replace("\":\"\\/\"x:\"", ":\\/x:"),
+            // A `/` left inside the quotes, which bash 3.2 reads as the end
+            // of the pattern.
+            format!("{}/x{}", BASH_REMOVAL.0, BASH_REMOVAL.1),
+            format!("{}${{HOME}}/x{}", BASH_REMOVAL.0, BASH_REMOVAL.1),
         ];
         for line in &bash_near_misses {
             let (found, scope) = pass(line, &rooted(), false);
@@ -662,7 +715,14 @@ mod tests {
         // bash's removal is judged exactly as zsh's: its value as one string
         // is unknown after it, its word must resolve, and a later entry is
         // judged.
-        let bash = |word: &str| format!("{}{word}{}", BASH_REMOVAL.0, BASH_REMOVAL.1);
+        let bash = |word: &str| {
+            format!(
+                "{}{}{}",
+                BASH_REMOVAL.0,
+                word.replace('/', BASH_SLASH),
+                BASH_REMOVAL.1
+            )
+        };
         for (content, expected) in [
             (
                 format!(

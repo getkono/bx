@@ -1748,17 +1748,17 @@ mod tests {
                 ),
                 "{rel}",
             );
-            // The configuration it wrote loads, on every OS.
-            context(&home);
-            if os == here {
-                assert_eq!(
-                    add_rel(&home, rel),
-                    [Adoption::Unchanged {
-                        target: target(&home, rel)
-                    }],
-                    "{rel}",
-                );
-            }
+            // The configuration it wrote loads, and a second add changes
+            // nothing, on every OS.
+            let once = layer(&home);
+            assert_eq!(
+                add_rel(&home, rel),
+                [Adoption::Unchanged {
+                    target: target(&home, rel)
+                }],
+                "{rel}",
+            );
+            assert_eq!(layer(&home), once, "{rel}");
         }
     }
 

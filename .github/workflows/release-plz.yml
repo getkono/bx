@@ -7,8 +7,8 @@ name: Release-plz
 #
 # bx is NOT published to crates.io — install.sh pulling a prebuilt binary is
 # the only channel, because bootstrapping a machine with no toolchain on it is
-# what bx is for. bx supports Linux and macOS, but this workflow builds only the
-# Linux binaries so far. See release-plz.toml and RELEASING.md.
+# what bx is for. It builds the Linux and macOS binaries, each for x86_64 and
+# aarch64. See release-plz.toml and RELEASING.md.
 on:
   push:
     branches:
@@ -87,33 +87,45 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: release-plz-release
     if: ${{ needs.release-plz-release.outputs.releases_created == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        # cross cannot build for Darwin, so the macOS targets build natively on
+        # a macOS runner: the Apple Silicon runner's toolchain links both
+        # architectures. No notarization: a binary curl downloads is not
+        # quarantined, and the arm64 linker ad-hoc signs what it links.
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       # rust-toolchain.toml pins the channel, so the action's `targets` input
-      # would add the musl std to the unused `stable` toolchain. Add it here,
-      # inside the checkout, so it lands in the pinned toolchain cross builds
-      # with.
+      # would add the target's std to the unused `stable` toolchain. Add it
+      # here, inside the checkout, so it lands in the pinned toolchain the build
+      # uses.
       - name: Add the target to the pinned toolchain
         run: rustup target add ${{ matrix.target }}
-      # Key the cache by target: both musl targets run on the same runner and
-      # rust-cache's default key omits the target, so without this the aarch64
-      # job would restore the x86_64 job's host-compiled build scripts.
+      # Key the cache by target: each pair of targets runs on the same runner
+      # and rust-cache's default key omits the target, so without this the
+      # aarch64 job would restore the x86_64 job's host-compiled build scripts.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
       - name: Install cross
+        if: ${{ runner.os == 'Linux' }}
         uses: taiki-e/install-action@cross
-      - name: Build
+      - name: Build (Linux)
+        if: ${{ runner.os == 'Linux' }}
         run: |
           # The cross container has no git, so export the commit hash and its
           # date here and forward them via Cross.toml. Assign and export
@@ -124,6 +136,10 @@ jobs:
           BX_BUILD_COMMIT_DATE="$(git log -1 --format=%cI)"
           export BX_BUILD_COMMIT_DATE
           cross build --release --locked --target ${{ matrix.target }}
+      # The runner has git, so build.rs reads the commit itself.
+      - name: Build (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package and checksum
         run: |
           set -euo pipefail
@@ -132,8 +148,13 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           # install.sh refuses to install without verifying, so the checksum is a
           # required asset, not an optional nicety. Written in `sha256sum -c`
-          # format so the installer can hand it straight to the tool.
-          sha256sum "bx-${{ matrix.target }}.tar.gz" > "bx-${{ matrix.target }}.tar.gz.sha256"
+          # format so the installer can hand it straight to the tool; macOS has
+          # no sha256sum, and `shasum -a 256` writes the same format.
+          if [ "$RUNNER_OS" = macOS ]; then
+            shasum -a 256 "bx-${{ matrix.target }}.tar.gz" > "bx-${{ matrix.target }}.tar.gz.sha256"
+          else
+            sha256sum "bx-${{ matrix.target }}.tar.gz" > "bx-${{ matrix.target }}.tar.gz.sha256"
+          fi
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

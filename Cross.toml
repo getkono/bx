@@ -1,5 +1,6 @@
-# cross-rs — bx's statically linked Linux release binaries. bx also supports
-# macOS, but no macOS release binary is built yet, here or elsewhere.
+# cross-rs — bx's statically linked Linux release binaries. The macOS release
+# binaries are not built here: cross cannot build for Darwin, so the release
+# workflow builds them natively on a macOS runner.
 #
 # musl (not gnu) for both targets: the binary must run on a barebones box with
 # no toolchain and no assumption about the host's glibc version, because

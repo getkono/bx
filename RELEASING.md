@@ -7,10 +7,17 @@ Releases are automated. Land Conventional Commits on `master` and
    in `Cargo.toml` and writes `CHANGELOG.md` from the commit messages.
 2. Merging that PR cuts a **GitHub Release** and a `v{version}` tag.
 3. When the release job reports that it cut a release, the same workflow run's
-   `build` job cross-compiles `x86_64-unknown-linux-musl` and
-   `aarch64-unknown-linux-musl`, packaging each tarball with its `.sha256`, and
-   the `upload-assets` job attaches them all to the Release. bx supports macOS
-   too, but no macOS binary is built or released yet.
+   `build` job builds four targets, packaging each tarball with its `.sha256`,
+   and the `upload-assets` job attaches them all to the Release:
+   - `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`,
+     cross-compiled with `cross` on a Linux runner;
+   - `x86_64-apple-darwin` and `aarch64-apple-darwin`, built with `cargo` on a
+     macOS runner, because `cross` cannot build for Darwin, and summed there
+     with `shasum -a 256`. They are not notarized: a binary `curl` downloads
+     is not quarantined, and the arm64 linker ad-hoc signs what it links.
+
+   `install.sh` picks `bx-${ARCH}-unknown-linux-musl.tar.gz` on Linux and
+   `bx-${ARCH}-apple-darwin.tar.gz` on macOS.
 
 `install.sh` refuses to install without verifying the checksum, so the `.sha256`
 assets are required. If `build` or `upload-assets` fails, the Release exists but

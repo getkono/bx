@@ -10,13 +10,13 @@ use crate::config::lock::Lock;
 use crate::config::merge;
 use crate::config::resolve::{self, Resolution, Resolved};
 use crate::config::target::Target;
-use crate::config::when::Machine;
+use crate::config::when::{Facts, Machine};
 use crate::config::{Layer, LayerKind};
 use crate::env::Env;
 use crate::env_guard::RootSet;
 use crate::git::Git;
 use crate::paths;
-use crate::shell::activation;
+use crate::shell::activation::{self, Host as _};
 use crate::state::StateDir;
 
 /// What a run decides against, loaded once.
@@ -62,10 +62,32 @@ impl Inputs {
     /// [`Error::RepoMissing`] when there is no config repo, and
     /// [`Error::Config`] for anything else the configuration refuses.
     pub fn load(env: &Env) -> Result<Self, Error> {
+        // The machine's facts are read here, once, so every condition on
+        // them in this run is decided against the same answers.
+        let host = activation::System::from_env().with_machine(Machine::read(env.user.clone()));
+        Self::load_on(env, host)
+    }
+
+    /// [`Inputs::load`], on `host`: the machine every condition bx decides —
+    /// a declaration's or a module's `when` as the layers load, and a
+    /// generated line's as `plan` renders it — is decided against, and an
+    /// activation's tool runs on.
+    ///
+    /// # Errors
+    ///
+    /// As [`Inputs::load`].
+    pub fn load_on(env: &Env, host: activation::System) -> Result<Self, Error> {
         let home = env.home.clone();
         let repo = paths::config_root_in(&home, env.xdg_config_home.as_deref());
         let state = StateDir::resolve_in(&home, env.xdg_state_home.as_deref());
-        let layers = layers::load_layer_set(&repo, state.root(), &home)?;
+        let present = |tool: &str| host.locate(tool).is_usable();
+        let facts = Facts {
+            machine: host.machine(),
+            present: &present,
+        };
+        // What a `when` keeps off this machine is left out before anything
+        // merges, so it neither replaces nor collides with what stays.
+        let layers = layers::gate(layers::load_layer_set(&repo, state.root(), &home)?, &facts);
         let merged = merge::merge(&layers, &home)?;
         // What every machine sharing the config repo declares: the layers
         // `bx.lock` is committed beside, without this account's own.
@@ -92,9 +114,7 @@ impl Inputs {
             progress: env.stderr_tty,
             git: Git::new(env).unattended(),
             activations: merged.activations,
-            // The machine's facts are read here, once, so every condition
-            // on them in this run is decided against the same answers.
-            host: activation::System::from_env().with_machine(Machine::read(env.user.clone())),
+            host,
             lock,
             committed_externals,
         })

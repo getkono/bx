@@ -76,7 +76,9 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use super::{Error, Layer, LayerKind, load_layer};
+use super::toggle::Section;
+use super::when::Decide;
+use super::{Config, Error, Layer, LayerKind, Origin, load_layer};
 use crate::paths::{self, LOCAL_FILE, local_layer_path};
 
 /// Every layer file, in merge order: the repo's globals, then the local layer.
@@ -353,6 +355,7 @@ fn identity(path: &Path) -> Result<Option<(rustix::fs::Dev, u64)>, Error> {
 /// Whatever [`layer_paths`] and [`super::load_layer`] return.
 pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<Layer>, Error> {
     let local = local_layer_path(state_dir);
+    let modules = repo.join(super::MODULES_DIR);
 
     layer_paths(repo, state_dir)?
         .iter()
@@ -361,9 +364,148 @@ pub fn load_layer_set(repo: &Path, state_dir: &Path, home: &Path) -> Result<Vec<
             if *path == local {
                 layer.kind = LayerKind::Local;
             }
+            if let Some(gate) = layer
+                .config
+                .when
+                .as_ref()
+                .filter(|_| !path.starts_with(&modules))
+            {
+                return Err(Error::BadValue {
+                    origin: gate.origin.clone(),
+                    message: "a top-level `when` gates a module, so only a file in `modules/` \
+                              may carry one; `bx.toml` and `local.toml` apply on every \
+                              machine, so move what it gates into a module, or gate each \
+                              declaration with its own `when`"
+                        .to_string(),
+                });
+            }
             Ok(layer)
         })
         .collect()
+}
+
+/// Leave out of each layer what its `when` keeps off this machine, before the
+/// layers are merged.
+///
+/// A module whose own top-level `when` does not hold on the machine `decide`
+/// describes contributes nothing: every declaration and table in it is
+/// dropped, as though the file were not there. Otherwise each `[[target]]`,
+/// `[path]` entry, `[[plugin]]`, `[[activation]]`, `[[external]]` and
+/// `[[tool]]` whose own `when` does not hold is dropped from its layer.
+///
+/// A dropped declaration is not declared on this machine, so it replaces no
+/// earlier layer's entry with the same key, claims no terminal slot, and
+/// writes nothing; a file it wrote here before is reported as no longer
+/// declared, exactly as an `enabled = false` one is. Its key is recorded in
+/// [`Config::gated`](super::Config::gated), so a later layer's toggle naming
+/// it flips nothing rather than being refused as naming nothing: on another
+/// machine it names an entry.
+///
+/// Each condition is decided once per layer, and only conditions bx decides
+/// reach here; the parser refused every other.
+#[must_use]
+pub fn gate(mut layers: Vec<Layer>, decide: &dyn Decide) -> Vec<Layer> {
+    for layer in &mut layers {
+        gate_layer(&mut layer.config, decide);
+    }
+    layers
+}
+
+/// [`gate`], for one layer's configuration.
+fn gate_layer(config: &mut Config, decide: &dyn Decide) {
+    if config
+        .when
+        .as_ref()
+        .is_some_and(|gate| gate.excludes(decide))
+    {
+        let gated = declared_keys(config);
+        *config = Config {
+            gated,
+            ..Config::default()
+        };
+        return;
+    }
+    let excluded: Vec<Origin> = config
+        .gates
+        .iter()
+        .filter(|gate| gate.excludes(decide))
+        .map(|gate| gate.origin.clone())
+        .collect();
+    if excluded.is_empty() {
+        return;
+    }
+    let out = |origin: &Origin| excluded.contains(origin);
+    let mut gated = Vec::new();
+    let mut keep = |section: Section, key: &str, origin: &Origin| {
+        let kept = !out(origin);
+        if !kept {
+            gated.push((section, key.to_string()));
+        }
+        kept
+    };
+    config
+        .targets
+        .retain(|t| keep(Section::Target, t.path.as_str(), &t.origin));
+    config
+        .externals
+        .retain(|e| keep(Section::External, e.path.as_str(), &e.origin));
+    config
+        .plugins
+        .retain(|p| keep(Section::Plugin, &p.name, &p.origin));
+    config
+        .activations
+        .retain(|a| keep(Section::Activation, &a.name, &a.origin));
+    config
+        .tools
+        .retain(|t| keep(Section::Tool, &t.name, &t.origin));
+    // A `[path]` entry has no toggle to name it, so its key is not recorded.
+    config.path.retain(|entry| !out(&entry.origin));
+    config.gated.extend(gated);
+}
+
+/// The natural key of every declaration in `config` a toggle could name.
+fn declared_keys(config: &Config) -> Vec<(Section, String)> {
+    let mut keys = Vec::new();
+    let mut add = |section: Section, names: &mut dyn Iterator<Item = &str>| {
+        keys.extend(names.map(|name| (section, name.to_string())));
+    };
+    add(
+        Section::Target,
+        &mut config.targets.iter().map(|t| t.path.as_str()),
+    );
+    add(
+        Section::External,
+        &mut config.externals.iter().map(|e| e.path.as_str()),
+    );
+    add(
+        Section::Env,
+        &mut config.envs.iter().map(|e| e.name.as_str()),
+    );
+    add(
+        Section::Alias,
+        &mut config.aliases.iter().map(|a| a.name.as_str()),
+    );
+    add(
+        Section::Function,
+        &mut config.functions.iter().map(|f| f.name.as_str()),
+    );
+    add(
+        Section::Plugin,
+        &mut config.plugins.iter().map(|p| p.name.as_str()),
+    );
+    add(
+        Section::Source,
+        &mut config.sources.iter().map(|s| s.name.as_str()),
+    );
+    add(
+        Section::Activation,
+        &mut config.activations.iter().map(|a| a.name.as_str()),
+    );
+    add(
+        Section::Tool,
+        &mut config.tools.iter().map(|t| t.name.as_str()),
+    );
+    keys
 }
 
 /// A `local.toml` sitting inside the config repo, if there is one.

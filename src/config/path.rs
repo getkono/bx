@@ -16,7 +16,8 @@
 //!
 //! Each list holds directories, one per string. An entry is a string, or an
 //! inline table `{ dir = "…", if_exists = true, enabled = false,
-//! shells = ["zsh"] }` when it needs a flag or a restriction:
+//! shells = ["zsh"], when = "os:macos" }` when it needs a flag or a
+//! restriction:
 //!
 //! - `prepend` — put ahead of the inherited `PATH`, the first entry first.
 //! - `append` — put after it, the first entry first.
@@ -30,6 +31,13 @@
 //! - `shells` — the shells the entry is kept to, as every other declaration
 //!   takes it ([`crate::shell::Shells`]); without it the entry reaches zsh and
 //!   bash alike.
+//! - `when` — keep the entry to the machines where a condition bx decides
+//!   holds: `has:TOOL`, `os:OS`, `arch:ARCH`, `host:NAME`, `user:NAME` or
+//!   `distro:ID`, or an array that is all of several ([`super::when`]). It is
+//!   decided as `plan` loads the configuration, so the generated line carries
+//!   no test, and a test only the shell could run is refused. Where it does
+//!   not hold the entry is not declared on this machine, and replaces no
+//!   earlier layer's entry for the directory ([`super::layers::gate`]).
 //!
 //! # What an entry may say
 //!
@@ -75,6 +83,7 @@ use std::path::Path;
 use toml_edit::{InlineTable, Table, Value};
 
 use super::shells::{Shell, Shells};
+use super::when::{self, Condition};
 use super::{Ctx, Error, Origin};
 use crate::lexical::is_variable_name;
 
@@ -90,7 +99,7 @@ const LISTS: [(&str, Position); 3] = [
 ];
 
 /// Every key an entry's inline table may carry.
-const ENTRY_KEYS: [&str; 4] = ["dir", "if_exists", "enabled", Shells::KEY];
+const ENTRY_KEYS: [&str; 5] = ["dir", "if_exists", "enabled", Shells::KEY, when::KEY];
 
 /// Which list an entry is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -135,9 +144,16 @@ pub struct PathEntry {
 /// in an entry, [`Error::WrongType`] for a list or an entry of the wrong type,
 /// [`Error::MissingKey`] for an inline entry with no `dir`, and
 /// [`Error::BadValue`] for a directory [`shell_spelling`] refuses, an
-/// `if_exists` on a `remove` entry, or a `shells` that names no shell or one
-/// bx does not generate for.
-pub fn parse_path(table: &Table, file: &Path, text: &str) -> Result<Vec<PathEntry>, Error> {
+/// `if_exists` on a `remove` entry, a `shells` that names no shell or one
+/// bx does not generate for, or a `when` that is not a condition bx decides.
+///
+/// Every entry's `when` is pushed onto `gates`, found again by its origin.
+pub fn parse_path(
+    table: &Table,
+    file: &Path,
+    text: &str,
+    gates: &mut Vec<Condition>,
+) -> Result<Vec<PathEntry>, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);
     ctx.reject_unknown_keys(table, &LISTS.map(|(key, _)| key))?;
 
@@ -154,6 +170,17 @@ pub fn parse_path(table: &Table, file: &Path, text: &str) -> Result<Vec<PathEntr
                 || ctx.key_origin(table, key),
                 |s| Origin::at(file, text, &s),
             );
+            if let Some(gate) = value
+                .as_inline_table()
+                .and_then(|entry| entry.get(when::KEY))
+            {
+                let when = when::decided(Some(gate), gate.type_name())
+                    .map_err(|refusal| refusal.at(origin.clone()))?;
+                gates.push(Condition {
+                    origin: origin.clone(),
+                    when,
+                });
+            }
             entries.push(parse_entry(value, key, position, origin)?);
         }
     }
@@ -662,8 +689,16 @@ mod tests {
             ("[path]\nprepend = \"/x\"\n", "an array of directories"),
             ("[path]\nprepend = [1]\n", "a directory, or an inline table"),
             (
+                "[path]\nprepend = [{ dir = \"/x\", unless = true }]\n",
+                "unknown key `prepend.unless`",
+            ),
+            (
                 "[path]\nprepend = [{ dir = \"/x\", when = true }]\n",
-                "unknown key `prepend.when`",
+                "`when` must be a string or an array of strings, found boolean",
+            ),
+            (
+                "[path]\nprepend = [{ dir = \"/x\", when = \"login\" }]\n",
+                "is a test the shell runs",
             ),
             ("[path]\nprepend = [{ if_exists = true }]\n", "`dir`"),
             (

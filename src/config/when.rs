@@ -53,7 +53,7 @@
 
 use std::fmt;
 
-use toml_edit::Table;
+use toml_edit::{Table, Value};
 
 use super::{Ctx, Error};
 use crate::lexical::is_variable_name;
@@ -71,7 +71,7 @@ pub const OSES: [&str; 2] = ["linux", "macos"];
 pub const ARCHES: [&str; 2] = ["x86_64", "aarch64"];
 
 /// The key a declaration's condition is written under.
-const KEY: &str = "when";
+pub(crate) const KEY: &str = "when";
 
 /// A condition a declaration is gated on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -542,27 +542,126 @@ pub(crate) fn at(ctx: &Ctx<'_>, table: &Table) -> Result<Option<When>, Error> {
     let Some(item) = table.get(KEY) else {
         return Ok(None);
     };
-    let wrong_type = |found: &'static str| Error::WrongType {
-        origin: ctx.key_origin(table, KEY),
-        key: KEY.to_string(),
-        expected: "a string or an array of strings",
-        found,
+    read(item.as_value(), item.type_name())
+        .map(Some)
+        .map_err(|refusal| refusal.at(ctx.key_origin(table, KEY)))
+}
+
+/// Read the `when` key of a declaration bx decides as a whole — a
+/// `[[target]]`, a `[path]` entry, a `[[plugin]]`, an `[[activation]]`, an
+/// `[[external]]` or a `[[tool]]` — or `None` when it is absent.
+///
+/// Such a declaration is kept or left out when bx plans, so a test the shell
+/// would run has nothing to guard and is refused.
+///
+/// # Errors
+///
+/// Whatever [`at`] refuses, and [`Error::BadValue`] for a condition, or an
+/// array holding one, that only the shell can decide.
+pub(crate) fn decided_at(ctx: &Ctx<'_>, table: &Table) -> Result<Option<When>, Error> {
+    let Some(when) = at(ctx, table)? else {
+        return Ok(None);
     };
-    let parsed = if let Some(raw) = item.as_str() {
-        When::parse(raw)
-    } else {
-        let array = item
-            .as_array()
-            .ok_or_else(|| wrong_type(item.type_name()))?;
-        let raws = array
-            .iter()
-            .map(|value| value.as_str().ok_or_else(|| wrong_type(value.type_name())))
-            .collect::<Result<Vec<_>, _>>()?;
-        When::parse_all(&raws)
-    };
-    parsed
+    only_decided(when)
         .map(Some)
         .map_err(|problem| ctx.bad(table, KEY, problem))
+}
+
+/// [`decided_at`] for a value that is not a table's key: a `[path]` entry's
+/// inline table, or a module's top-level `when`. `None` reads as absent;
+/// `type_name` names the item for a message when it is not a value.
+///
+/// # Errors
+///
+/// The [`Refusal`] to place at the key's origin.
+pub(crate) fn decided(value: Option<&Value>, type_name: &'static str) -> Result<When, Refusal> {
+    only_decided(read(value, type_name)?).map_err(Refusal::Bad)
+}
+
+/// `when`, unless it holds a test the shell runs.
+fn only_decided(when: When) -> Result<When, String> {
+    match when.runtime() {
+        None => Ok(when),
+        Some(runtime) => Err(format!(
+            "`when = {:?}` is a test the shell runs, and this is kept or left out when bx \
+             plans, before any shell starts; gate it on a condition bx decides: {DECIDED}",
+            runtime.to_string()
+        )),
+    }
+}
+
+/// Every spelling bx decides, as an error message lists them.
+const DECIDED: &str = "\"has:TOOL\", \"os:OS\", \"arch:ARCH\", \"host:NAME\", \"user:NAME\" or \
+                       \"distro:ID\"";
+
+/// Why a `when` value was refused, before it has an origin to be placed at.
+#[derive(Debug)]
+pub(crate) enum Refusal {
+    /// It is not a string or an array of strings; this is what it is.
+    WrongType(&'static str),
+    /// It is, and this is why its conditions are refused.
+    Bad(String),
+}
+
+impl Refusal {
+    /// The error, placed at `origin`.
+    pub(crate) fn at(self, origin: super::Origin) -> Error {
+        match self {
+            Self::WrongType(found) => Error::WrongType {
+                origin,
+                key: KEY.to_string(),
+                expected: "a string or an array of strings",
+                found,
+            },
+            Self::Bad(message) => Error::BadValue { origin, message },
+        }
+    }
+}
+
+/// Read one `when` value: a string, or an array of strings. `None` is an
+/// item that is not a value at all, which `type_name` names.
+fn read(value: Option<&Value>, type_name: &'static str) -> Result<When, Refusal> {
+    let value = value.ok_or(Refusal::WrongType(type_name))?;
+    if let Some(raw) = value.as_str() {
+        return When::parse(raw).map_err(Refusal::Bad);
+    }
+    let array = value
+        .as_array()
+        .ok_or_else(|| Refusal::WrongType(value.type_name()))?;
+    let raws = array
+        .iter()
+        .map(|member| {
+            member
+                .as_str()
+                .ok_or_else(|| Refusal::WrongType(member.type_name()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    When::parse_all(&raws).map_err(Refusal::Bad)
+}
+
+/// A condition bx decides, beside the declaration it gates.
+///
+/// Held by the layer it was written in rather than by the declaration, and
+/// found again by the declaration's [`Origin`](super::Origin): every
+/// declaration records where its entry was written, and no two entries in one
+/// layer were written in one place. A tree's files all carry the tree's
+/// origin, so the tree's gate reaches every one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Condition {
+    /// Where the gated entry was written; for a module's own `when`, where
+    /// the key was.
+    pub origin: super::Origin,
+    /// The condition, which holds no test the shell runs.
+    pub when: When,
+}
+
+impl Condition {
+    /// Whether the condition leaves its declaration out on the machine
+    /// `decide` describes.
+    #[must_use]
+    pub fn excludes(&self, decide: &dyn Decide) -> bool {
+        self.when.gate(decide) == Gate::Never
+    }
 }
 
 /// The member of `closed` that is `operand`, if one is.

@@ -125,8 +125,8 @@ pub(crate) const SECTION: &str = "[[external]]";
 const LINK_SECTION: &str = "[[external.link]]";
 
 /// Every key an `[[external]]` entry may carry.
-const KEYS: [&str; 8] = [
-    "path", "url", "rev", "branch", "check", "interval", "link", "enabled",
+const KEYS: [&str; 9] = [
+    "path", "url", "rev", "branch", "check", "interval", "link", "enabled", "when",
 ];
 
 /// Every key an `[[external.link]]` may carry.

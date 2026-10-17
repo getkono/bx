@@ -39,8 +39,8 @@ pub struct ActivationDecl {
 pub(crate) const SECTION: &str = "[[activation]]";
 
 /// Every key an `[[activation]]` entry may carry.
-const KEYS: [&str; 7] = [
-    "name", "command", "zsh", "bash", "shells", "phase", "enabled",
+const KEYS: [&str; 8] = [
+    "name", "command", "zsh", "bash", "shells", "phase", "enabled", "when",
 ];
 
 /// The characters a word may hold and still be written bare.

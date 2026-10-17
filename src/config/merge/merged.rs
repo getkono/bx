@@ -191,12 +191,18 @@ impl Keyed for PathEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Merged<T, K = String> {
     pub(super) entries: Vec<(K, T)>,
+    /// Every key an earlier layer declared only behind a `when` that does not
+    /// hold on this machine ([`crate::config::layers::gate`]). A toggle naming
+    /// one, and nothing held, flips nothing: on another machine it names an
+    /// entry, so it is no misspelling.
+    pub(super) gated: Vec<K>,
 }
 
 impl<T, K> Default for Merged<T, K> {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
+            gated: Vec::new(),
         }
     }
 }
@@ -222,11 +228,20 @@ impl<T: Keyed> Merged<T> {
     /// [`Error::BadValue`] when no earlier layer introduced the key. A silent
     /// no-op here is how an account ends up with a file it explicitly refused.
     pub fn toggle(&mut self, toggle: &Toggle) -> Result<(), Error> {
-        let index = self
-            .position(&toggle.key)
-            .ok_or_else(|| unknown_toggle(toggle, ""))?;
-        self.entries[index].1.set_enabled(toggle.enabled);
+        match self.position(&toggle.key) {
+            Some(index) => self.entries[index].1.set_enabled(toggle.enabled),
+            None if self.gated.contains(&toggle.key) => {}
+            None => return Err(unknown_toggle(toggle, "")),
+        }
         Ok(())
+    }
+}
+
+impl<T, K> Merged<T, K> {
+    /// Remember `key` as declared only behind a gate that does not hold on
+    /// this machine, so a later toggle naming it flips nothing.
+    pub fn gated_out(&mut self, key: K) {
+        self.gated.push(key);
     }
 }
 

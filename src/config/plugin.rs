@@ -71,7 +71,7 @@ pub fn check_terminal(plugins: &[PluginDecl]) -> Result<(), Error> {
 pub(crate) const SECTION: &str = "[[plugin]]";
 
 /// Every key a `[[plugin]]` entry may carry.
-const KEYS: [&str; 4] = ["name", "source", "terminal", "enabled"];
+const KEYS: [&str; 5] = ["name", "source", "terminal", "enabled", "when"];
 
 /// Parse one `[[plugin]]` entry.
 ///

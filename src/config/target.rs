@@ -29,7 +29,22 @@
 //! requires   = ["starship"]                     # default []; reported, never a gate
 //! references = ["~/.gitconfig.local"]           # default []
 //! enabled    = true                             # default true
+//! when       = "os:macos"                       # optional; a condition bx decides
 //! ```
+//!
+//! # `when` keeps a target to some machines
+//!
+//! `when` is one condition bx decides, or an array that is all of several:
+//! `has:TOOL`, `os:OS`, `arch:ARCH`, `host:NAME`, `user:NAME` or `distro:ID`
+//! (see [`super::when`]). A target is kept or left out as `plan` loads the
+//! configuration, so a test only the shell could run — `interactive`,
+//! `login`, `ssh`, `env:…` — has nothing to guard and is refused when the
+//! config loads. Where the condition does not hold the target is not declared
+//! on this machine: it replaces no earlier layer's target for the same file,
+//! and a later toggle naming it flips nothing. A file it wrote on this machine
+//! before is reported as no longer declared, exactly as with
+//! `enabled = false`, and `bx rm` puts the prior bytes back. A tree's `when`
+//! gates every file it expands to. See [`super::layers::gate`].
 //!
 //! # Why the discriminant keys are flat
 //!
@@ -85,7 +100,7 @@ use crate::paths::Portable;
 pub(crate) const SECTION: &str = "[[target]]";
 
 /// Every key a `[[target]]` entry may carry.
-const KEYS: [&str; 19] = [
+const KEYS: [&str; 20] = [
     "path",
     "file",
     "content",
@@ -105,6 +120,7 @@ const KEYS: [&str; 19] = [
     "requires",
     "references",
     "enabled",
+    "when",
 ];
 
 /// The keys that declare a body. Exactly one, except for an `include` target.

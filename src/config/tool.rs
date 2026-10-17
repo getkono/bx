@@ -35,7 +35,7 @@ use super::{Ctx, Error, Origin};
 pub(crate) const SECTION: &str = "[[tool]]";
 
 /// Every key a `[[tool]]` entry may carry.
-const KEYS: [&str; 3] = ["name", "install", "enabled"];
+const KEYS: [&str; 4] = ["name", "install", "enabled", "when"];
 
 /// One `[[tool]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]

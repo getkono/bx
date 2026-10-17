@@ -149,6 +149,17 @@ pub struct Config {
     /// Empty from the parser. [`merge::merge`] fills it instead of failing the
     /// load, and [`resolve::resolve`] blocks every target for such a file.
     pub(crate) conflicts: Vec<merge::Conflict>,
+    /// The layer's own top-level `when`: the condition every declaration in
+    /// it is gated on. Only a module may carry one; see [`layers::gate`].
+    pub when: Option<when::Condition>,
+    /// The `when` of each `[[target]]`, `[path]` entry, `[[plugin]]`,
+    /// `[[activation]]`, `[[external]]` and `[[tool]]` that carries one, found
+    /// again by the entry's origin. See [`layers::gate`].
+    pub gates: Vec<when::Condition>,
+    /// The natural key of every entry [`layers::gate`] left out of this
+    /// layer because its condition does not hold here, so a later toggle
+    /// naming it flips nothing rather than naming nothing.
+    pub gated: Vec<(toggle::Section, String)>,
 }
 
 /// One layer file and what it says.
@@ -401,13 +412,16 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     // entry an earlier layer introduced.
                     match toggle::toggle_of(table, toggle::Section::Target, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
-                        None => match target::parse_entry(table, file, text, home)? {
-                            target::Entry::Target(target) => config.targets.push(target),
-                            target::Entry::Tree(mut tree) => {
-                                tree.at = config.targets.len();
-                                config.trees.push(tree);
+                        None => {
+                            match target::parse_entry(table, file, text, home)? {
+                                target::Entry::Target(target) => config.targets.push(target),
+                                target::Entry::Tree(mut tree) => {
+                                    tree.at = config.targets.len();
+                                    config.trees.push(tree);
+                                }
                             }
-                        },
+                            gate_of(table, target::SECTION, file, text, &mut config)?;
+                        }
                     }
                 }
             }
@@ -426,9 +440,12 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                                 .to_string();
                             config.toggles.push(toggle);
                         }
-                        None => config
-                            .externals
-                            .push(external::parse_external(table, file, text, home)?),
+                        None => {
+                            config
+                                .externals
+                                .push(external::parse_external(table, file, text, home)?);
+                            gate_of(table, external::SECTION, file, text, &mut config)?;
+                        }
                     }
                 }
             }
@@ -475,7 +492,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     expected: "a table `[path]`",
                     found: item.type_name(),
                 })?;
-                config.path = path::parse_path(table, file, text)?;
+                config.path = path::parse_path(table, file, text, &mut config.gates)?;
             }
             "history" => {
                 let table = item.as_table().ok_or_else(|| Error::WrongType {
@@ -546,9 +563,12 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                 for table in entries(root, name, item, file, text)? {
                     match toggle::toggle_of(table, toggle::Section::Plugin, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
-                        None => config
-                            .plugins
-                            .push(plugin::parse_plugin(table, file, text)?),
+                        None => {
+                            config
+                                .plugins
+                                .push(plugin::parse_plugin(table, file, text)?);
+                            gate_of(table, plugin::SECTION, file, text, &mut config)?;
+                        }
                     }
                 }
             }
@@ -566,9 +586,12 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                 for table in entries(root, name, item, file, text)? {
                     match toggle::toggle_of(table, toggle::Section::Activation, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
-                        None => config
-                            .activations
-                            .push(activation::parse_activation(table, file, text)?),
+                        None => {
+                            config
+                                .activations
+                                .push(activation::parse_activation(table, file, text)?);
+                            gate_of(table, activation::SECTION, file, text, &mut config)?;
+                        }
                     }
                 }
             }
@@ -576,9 +599,18 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                 for table in entries(root, name, item, file, text)? {
                     match toggle::toggle_of(table, toggle::Section::Tool, file, text)? {
                         Some(toggle) => config.toggles.push(toggle),
-                        None => config.tools.push(tool::parse_tool(table, file, text)?),
+                        None => {
+                            config.tools.push(tool::parse_tool(table, file, text)?);
+                            gate_of(table, tool::SECTION, file, text, &mut config)?;
+                        }
                     }
                 }
+            }
+            when::KEY => {
+                let origin = section_origin(root, name, file, text);
+                let when = when::decided(item.as_value(), item.type_name())
+                    .map_err(|refusal| refusal.at(origin.clone()))?;
+                config.when = Some(when::Condition { origin, when });
             }
             unknown => {
                 return Err(Error::UnknownSection {
@@ -691,8 +723,63 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .chain(toggles_in(&config, toggle::Section::Tool))
             .collect(),
     )?;
+    refuse_gated_values(&config)?;
 
     Ok(config)
+}
+
+/// Record the bx-decided `when` of the entry `table` heads, if it has one,
+/// in `config.gates`, found again by the entry's origin.
+///
+/// # Errors
+///
+/// Whatever [`when::decided_at`] refuses.
+fn gate_of(
+    table: &Table,
+    section: &'static str,
+    file: &Path,
+    text: &str,
+    config: &mut Config,
+) -> Result<(), Error> {
+    let ctx = Ctx::new(table, file, text, section);
+    if let Some(when) = when::decided_at(&ctx, table)? {
+        config.gates.push(when::Condition {
+            origin: ctx.origin().clone(),
+            when,
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a `[[value]]` in a layer its own `when` gates.
+///
+/// A value is referred to by name from every layer, so one that existed on
+/// some machines only would turn every `{{name}}` elsewhere into a reference
+/// to nothing there.
+///
+/// # Errors
+///
+/// [`Error::BadValue`] at the first declaration or toggle of a value.
+fn refuse_gated_values(config: &Config) -> Result<(), Error> {
+    if config.when.is_none() {
+        return Ok(());
+    }
+    let first = config
+        .values
+        .iter()
+        .map(|value| &value.origin)
+        .chain(toggles_in(config, toggle::Section::Value).map(|(_, origin)| origin))
+        .next();
+    match first {
+        None => Ok(()),
+        Some(origin) => Err(Error::BadValue {
+            origin: origin.clone(),
+            message: "a module gated by its own `when` may not declare a `[[value]]`: a value \
+                      is referred to by name from every layer, so declare it in `bx.toml` or \
+                      in a module with no `when`"
+                .to_string(),
+        }),
+    }
 }
 
 /// The toggles in `config` that belong to one section, as `check_unique` wants

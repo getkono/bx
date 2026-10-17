@@ -11,8 +11,9 @@
 #
 # This is the only install channel. bx is what you run *before* you have a
 # toolchain, so this script assumes nothing beyond a POSIX shell, curl or wget,
-# and tar. The binary it fetches is statically linked against musl, so there is
-# no glibc version floor and no shared library to find.
+# and tar. On Linux the binary it fetches is statically linked against musl, so
+# there is no glibc version floor and no shared library to find; on macOS it
+# links only the system libraries every macOS ships.
 #
 # Environment:
 #   BX_VERSION      version to install, e.g. v1.2.3 (default: the latest release)
@@ -43,14 +44,18 @@ esac
 
 # --- preflight ----------------------------------------------------------------
 
-[ "$(uname -s)" = "Linux" ] || die "bx is Linux-only; this is $(uname -s)."
+case "$(uname -s)" in
+Linux) OS="unknown-linux-musl" ;;
+Darwin) OS="apple-darwin" ;;
+*) die "unsupported OS: $(uname -s). bx ships Linux and macOS binaries." ;;
+esac
 
 case "$(uname -m)" in
 x86_64 | amd64) ARCH="x86_64" ;;
 aarch64 | arm64) ARCH="aarch64" ;;
 *) die "unsupported architecture: $(uname -m). bx ships x86_64 and aarch64 binaries." ;;
 esac
-TARGET="${ARCH}-unknown-linux-musl"
+TARGET="${ARCH}-${OS}"
 
 if command -v curl >/dev/null 2>&1; then
 	fetch() { curl -fsSL "$1" -o "$2"; }

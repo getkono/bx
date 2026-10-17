@@ -54,7 +54,7 @@ pub const INSTALL_DOCS_URL: &str = "https://github.com/getkono/bx#install";
 /// A literal rather than a build-time digest so that changing the installer is
 /// a deliberate act: a test hashes the file and fails until this is updated.
 pub const INSTALLER_SHA256: &str =
-    "8e5153b2f52eba1ecfee6b5f920662be084af4bbb398abdf2dc269f79d5824ca";
+    "0bb1ddb2f9fbf4848a4c5b82311f8b52306a53495e5ed3d7679d62434d540bb4";
 
 /// Why an upgrade, or the check, did not complete.
 #[derive(Debug, thiserror::Error)]
@@ -444,6 +444,17 @@ mod tests {
     /// The installer in this tree: the bytes master serves once it lands.
     const INSTALL_SH: &[u8] = include_bytes!("../install.sh");
 
+    /// The release target `install.sh` picks on this machine, as the release
+    /// job names its assets: `bx-TARGET.tar.gz`.
+    fn release_target() -> String {
+        let os = if cfg!(target_os = "macos") {
+            "apple-darwin"
+        } else {
+            "unknown-linux-musl"
+        };
+        format!("{}-{os}", std::env::consts::ARCH)
+    }
+
     /// A stand-in for `curl` and `wget` that serves fixture files from `root`
     /// by URL and records each request, so the real `install.sh` runs end to
     /// end without the network.
@@ -539,7 +550,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
                 format!("#!/bin/sh\necho {tag}\n"),
             )
             .unwrap();
-            let asset = format!("bx-{}-unknown-linux-musl.tar.gz", std::env::consts::ARCH);
+            let asset = format!("bx-{}.tar.gz", release_target());
             let status = Command::new("tar")
                 .arg("-czf")
                 .arg(assets.join(&asset))
@@ -562,7 +573,8 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
             install_stub(self.bin.path(), name, self.root.path());
         }
 
-        /// The stub first, then the system's `sh`, `tar` and `sha256sum`.
+        /// The stub first, then the system's `sh`, `tar`, and `sha256sum` or
+        /// `shasum`.
         fn path_var(&self) -> OsString {
             let system = std::env::var_os("PATH").unwrap_or_default();
             std::env::join_paths(
@@ -692,10 +704,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(served.installed(), None);
     }
 
-    // This test, and each one below gated on Linux, needs the installer to
-    // fetch a release, and it serves Linux only: it refuses any other OS
-    // before it fetches.
-    #[cfg(target_os = "linux")]
     #[test]
     fn check_reports_a_newer_release_as_pending_and_installs_nothing() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -713,7 +721,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(served.installed(), None);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn check_at_the_latest_release_is_converged() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -722,7 +729,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(out, "bx v0.2.0 is the latest release.\n");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn check_from_a_build_newer_than_any_release_is_converged() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -731,7 +737,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(out, "bx v0.3.0 is newer than the latest release, v0.2.0.\n");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn an_older_bx_is_replaced_by_the_latest_release_as_a_fresh_install_would() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -754,7 +759,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn the_latest_release_is_left_alone_unless_forced() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -780,7 +784,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_build_newer_than_any_release_is_not_downgraded_unless_forced() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -818,7 +821,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         child.wait_with_output().unwrap()
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn the_latest_release_is_found_with_no_home_at_all() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -859,7 +861,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert_eq!(std::fs::read_dir(served.dir.path()).unwrap().count(), 0);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn the_version_checked_is_the_version_installed() {
         // The install is handed the tag `--latest` found, not left to look
@@ -925,7 +926,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert!(matches!(err, Error::NoShell), "{err:?}");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_latest_release_nobody_can_find_is_an_error() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
@@ -940,7 +940,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_latest_tag_that_is_not_a_version_is_an_error() {
         let served = Served::new(INSTALL_SH, "nightly");
@@ -948,7 +947,6 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         assert!(matches!(result, Err(Error::Version(t)) if t == "nightly"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_install_reports_what_the_installer_said() {
         let served = Served::new(INSTALL_SH, "v0.2.0");

@@ -9,6 +9,14 @@ Conventional Commit messages.
 
 ## [Unreleased]
 
+### Changed
+
+- *(install)* `install.sh` changed to install the new macOS binaries, so
+  `bx self-upgrade` from a v0.1.x release refuses the new installer and points
+  at the README. Reinstall once with
+  `curl -fsSL https://raw.githubusercontent.com/getkono/bx/master/install.sh | sh`;
+  self-upgrade works again from the release that ships this change.
+
 ## [0.1.2](https://github.com/getkono/bx/compare/v0.1.1...v0.1.2) - 2026-10-12
 
 ### Added

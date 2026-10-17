@@ -12,7 +12,9 @@ use crate::paths::Portable;
 
 /// Judge a generated body against Invariant 2, as what it is.
 ///
-/// An environment fragment goes through the guard in its own syntax. The line
+/// An environment fragment goes through the guard in its own syntax, and the
+/// LaunchAgent on macOS through its `environment.d` fragment
+/// ([`guard_launch_agent`]). The line
 /// a region sources a fragment with sets nothing, so it is not a fragment:
 /// the guard's grammar would refuse it as unreadable, and `env_guard`'s tests
 /// hold its bytes to carrying no assignment instead.
@@ -51,6 +53,9 @@ pub(super) fn guard_generated(
             }
             Syntax::EnvironmentD => guard_environment_d(content, roots),
         },
+        // The property list is not the fragment's syntax: its fragment is
+        // rendered as `environment.d` would hold it, and judged as that.
+        Gen::LaunchAgent(agent) => guard_launch_agent(&agent.env.render(decide), roots),
         Gen::Interactive(file) => {
             let env = file.env().render(decide);
             let before = content
@@ -128,6 +133,35 @@ pub(in crate::plan) fn guard_environment_d(content: &str, roots: &RootSet) -> Op
     violations(&env_guard::scan_exported(content, roots), 0)
 }
 
+/// [`guard_environment_d`] for the `environment.d` fragment a LaunchAgent
+/// holds on macOS, `env`, and one more refusal: a value that does not expand
+/// to a literal. `environment.d` expands a reference itself, and launchd
+/// expands none, so a value the guard cannot expand would reach every
+/// program as the reference's own text.
+///
+/// The note names each variable, not a line: the lines are the fragment's,
+/// and the property list written has others.
+pub(in crate::plan) fn guard_launch_agent(env: &str, roots: &RootSet) -> Option<String> {
+    let found = env_guard::scan_exported(env, roots);
+    let refused = found.iter().map(|v| {
+        let name = if v.name.is_empty() { &v.value } else { &v.name };
+        Some(format!("{name} {}", v.reason))
+    });
+    let unexpanded = env_guard::expand_exported(env, roots)
+        .into_iter()
+        .filter(|expanded| !found.iter().any(|v| v.name == expanded.name))
+        .map(|expanded| {
+            expanded.value.err().map(|reason| {
+                format!(
+                    "{} {reason}, and launchd expands nothing, so it would be set to the \
+                     reference's text",
+                    expanded.name
+                )
+            })
+        });
+    join(refused.chain(unexpanded))
+}
+
 /// One note naming each violation as `line N: NAME <reason>`, each line moved
 /// down by the `before` lines the scanned content is preceded by in its file.
 fn violations(found: &[env_guard::Violation], before: usize) -> Option<String> {
@@ -184,6 +218,69 @@ mod tests {
                 .expect("its own violation");
         assert!(own.starts_with("line 3: RUSTUP_HOME "), "{own}");
         assert!(!own.contains("PATH"), "{own}");
+    }
+
+    #[test]
+    fn the_launch_agent_guard_refuses_a_relocation_and_a_value_launchd_cannot_expand() {
+        let home = guarded_home();
+        let roots = RootSet::new(home.path(), &[]);
+        // What `environment.d` admits, the LaunchAgent admits.
+        assert_eq!(
+            guard_launch_agent("EDITOR=nvim\n", &roots),
+            guard_environment_d("EDITOR=nvim\n", &roots)
+        );
+        assert_eq!(guard_launch_agent("EDITOR=nvim\n", &roots), None);
+        // A relocation with no root is refused by name, not by a line of a
+        // file the property list does not have.
+        let note = guard_launch_agent("EDITOR=nvim\nCARGO_HOME=/elsewhere\n", &roots)
+            .expect("a relocation");
+        assert!(note.starts_with("CARGO_HOME "), "{note}");
+        assert!(!note.contains("line "), "{note}");
+        // A name the emit table does not list is refused, as in any fragment.
+        let unlisted = guard_launch_agent("CARGO_X=1\n", &roots).expect("not emittable");
+        assert!(unlisted.starts_with("CARGO_X "), "{unlisted}");
+        // A line the grammar does not read is named by its text.
+        let unreadable = guard_launch_agent("eval x\n", &roots).expect("unreadable");
+        assert!(unreadable.starts_with("eval x "), "{unreadable}");
+        // A search list extending what it inherited is admitted where a
+        // reader expands it, and refused where launchd would be handed the
+        // reference's text.
+        let extends = "PATH=${PATH}:/opt/tool/bin\n";
+        assert_eq!(guard_environment_d(extends, &roots), None);
+        let refused = guard_launch_agent(extends, &roots).expect("unexpandable");
+        assert!(refused.starts_with("PATH "), "{refused}");
+        assert!(refused.contains("launchd expands nothing"), "{refused}");
+        // A reference to an earlier line expands, so it is admitted.
+        let earlier = "EDITOR=nvim\nVISUAL=${EDITOR}\n";
+        assert_eq!(guard_launch_agent(earlier, &roots), None);
+        // A refused value is named once, for the guard's reason.
+        let unknown = guard_launch_agent("EDITOR=${NOPE}\n", &roots).expect("unresolved");
+        assert_eq!(unknown.matches("EDITOR").count(), 1, "{unknown}");
+    }
+
+    #[test]
+    fn a_launch_agent_is_judged_through_its_fragment() {
+        use crate::config::env::{Fragment, LaunchAgent, Var};
+        let home = guarded_home();
+        let roots = RootSet::new(home.path(), &[]);
+        let decide = crate::config::when::tools(&|_| true);
+        let agent = |name: &str, value: &str| {
+            Gen::LaunchAgent(LaunchAgent {
+                env: Fragment {
+                    syntax: Syntax::EnvironmentD,
+                    vars: vec![Var::always(name, value)],
+                    path: Vec::new(),
+                    inherited: Vec::new(),
+                },
+                home: home.path().to_path_buf(),
+            })
+        };
+        let judge = |generator: &Gen| {
+            guard_generated(generator, &generator.render(&decide), &roots, &decide)
+        };
+        assert_eq!(judge(&agent("EDITOR", "~/bin/nvim")), None);
+        let note = judge(&agent("XDG_DATA_HOME", "~/elsewhere")).expect("a relocation");
+        assert!(note.starts_with("XDG_DATA_HOME "), "{note}");
     }
 
     mod env_placement {

@@ -134,6 +134,7 @@ impl Gen {
     pub fn render(&self, decide: &dyn crate::config::when::Decide) -> String {
         match self {
             Self::Env(fragment) => fragment.render(decide),
+            Self::LaunchAgent(agent) => agent.render(decide),
             Self::Source(fragment) => crate::config::env::source_line(fragment),
             Self::Profile(file) => bash::profile_line(file),
             Self::Interactive(file) => file.render(decide),
@@ -152,7 +153,11 @@ impl Gen {
         match self {
             Self::Interactive(file) => file.note(),
             Self::Bash(file) => file.note(),
-            Self::Env(_) | Self::Source(_) | Self::Profile(_) | Self::Inputrc(_) => None,
+            Self::Env(_)
+            | Self::LaunchAgent(_)
+            | Self::Source(_)
+            | Self::Profile(_)
+            | Self::Inputrc(_) => None,
         }
     }
 }

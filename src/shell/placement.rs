@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::config::env::{self, EnvDecl, Fragment, Place, Syntax, Var};
+use crate::config::env::{self, EnvDecl, Fragment, LaunchAgent, Place, Syntax, Var};
 use crate::config::external::first_followed;
 use crate::config::history::History;
 use crate::config::path::PathEntry;
@@ -317,7 +317,7 @@ pub(crate) fn place_envs(
                 message: format!("`{raw}` cannot be placed under this home: {source}"),
             })
         };
-        let fragment = portable(place.fragment())?;
+        let fragment = portable(fragment_path(place, platform))?;
         let mut held: Vec<&BlockedEntry> = here
             .iter()
             .filter_map(|(_, resolution)| match resolution {
@@ -340,6 +340,12 @@ pub(crate) fn place_envs(
                 })
                 .collect();
             let generator = match fragment_gen(place, vars, entries.to_vec(), inherited) {
+                Gen::Env(env) if place == Place::EnvironmentD && platform == Platform::Macos => {
+                    Gen::LaunchAgent(LaunchAgent {
+                        env,
+                        home: values.home().to_path_buf(),
+                    })
+                }
                 Gen::Interactive(file) => Gen::Interactive(Box::new(
                     file.with_plugins(interactive)?
                         .with_history(history.clone())
@@ -392,11 +398,22 @@ fn fragment_gen(place: Place, vars: Vec<Var>, entries: Vec<PathEntry>, inherited
     }
 }
 
-/// The fragment bx owns whole at `place`, produced by `generator`.
+/// The fragment bx owns whole at `place` on `platform`: [`Place::fragment`],
+/// but for `environment.d` on macOS, which has none, the LaunchAgent that
+/// takes its place.
+fn fragment_path(place: Place, platform: Platform) -> &'static str {
+    match (place, platform) {
+        (Place::EnvironmentD, Platform::Macos) => env::LAUNCH_AGENT,
+        _ => place.fragment(),
+    }
+}
+
+/// The fragment bx owns whole at `place`, produced by `generator`. A
+/// LaunchAgent is a property list, not a `conf.d` fragment, so it is opaque.
 fn fragment_target(place: Place, path: Portable, generator: Gen, origin: &Origin) -> Target {
-    let format = match place.syntax() {
-        Syntax::EnvironmentD => Format::EnvD,
-        Syntax::Zsh => Format::Opaque,
+    let format = match (place.syntax(), &generator) {
+        (_, Gen::LaunchAgent(_)) | (Syntax::Zsh, _) => Format::Opaque,
+        (Syntax::EnvironmentD, _) => Format::EnvD,
     };
     placed_target(path, generator, Attach::Own, format, origin)
 }
@@ -433,21 +450,28 @@ pub fn vacated_fragments(
         line: 0,
     };
     let bash = super::bash::vacated(placed, &generated, home, &origin);
+    // Every fragment either platform places, so one bx wrote on the other —
+    // or before the LaunchAgent took `environment.d`'s place on macOS — is
+    // vacated too.
     Place::ALL
         .into_iter()
-        .filter_map(|place| {
-            let path = Portable::parse_in(place.fragment(), home).ok()?;
+        .map(|place| (place, Platform::Linux))
+        .chain([(Place::EnvironmentD, Platform::Macos)])
+        .filter_map(|(place, platform)| {
+            let path = Portable::parse_in(fragment_path(place, platform), home).ok()?;
             let named = placed.iter().any(|resolution| match resolution {
                 Resolution::Ready(target) => target.path == path,
                 Resolution::Blocked(entry) => entry.key == path.to_string(),
             });
             (!named && recorded(&path)).then(|| {
-                Resolution::Ready(fragment_target(
-                    place,
-                    path,
-                    fragment_gen(place, Vec::new(), Vec::new(), Vec::new()),
-                    &origin,
-                ))
+                let generator = match fragment_gen(place, Vec::new(), Vec::new(), Vec::new()) {
+                    Gen::Env(env) if platform == Platform::Macos => Gen::LaunchAgent(LaunchAgent {
+                        env,
+                        home: home.to_path_buf(),
+                    }),
+                    other => other,
+                };
+                Resolution::Ready(fragment_target(place, path, generator, &origin))
             })
         })
         .chain(bash)
@@ -651,14 +675,22 @@ mod tests {
             [
                 shared[0],
                 shared[1],
-                shared[2],
+                env::LAUNCH_AGENT,
                 Place::Zprofile.fragment(),
                 "~/.zprofile"
             ]
         );
-        // What Linux writes is written alike, and the `zshenv` fragment
-        // inherits nothing on either: it is the first file zsh reads.
-        assert_eq!(macos[..3], linux[..]);
+        // What Linux writes to zsh is written alike, and the `zshenv`
+        // fragment inherits nothing on either: it is the first file zsh
+        // reads. `environment.d` is a LaunchAgent on macOS.
+        assert_eq!(macos[..2], linux[..2]);
+        assert!(
+            macos[2]
+                .1
+                .contains("<string>LANG</string>\n\t\t<string>C.UTF-8</string>\n"),
+            "{}",
+            macos[2].1
+        );
         assert!(linux[0].2.is_empty(), "{:?}", linux[0].2);
         // The `zprofile` fragment holds the same `[path]` lines and no
         // variable, and inherits the `zshenv` fragment's.
@@ -740,7 +772,7 @@ mod tests {
                 keys,
                 [
                     Place::Zshenv.fragment(),
-                    Place::EnvironmentD.fragment(),
+                    env::LAUNCH_AGENT,
                     Place::Zprofile.fragment()
                 ],
                 "{entry}"
@@ -796,6 +828,112 @@ mod tests {
     fn an_entry_kept_to_bash_is_not_repeated_for_zsh() {
         let bash_only = "[path]\nprepend = [{ dir = \"~/bin\", shells = [\"bash\"] }]\n";
         assert!(zsh_on(bash_only, Platform::Macos).is_empty());
+    }
+
+    /// Every ready target `text` places for zsh on `platform`.
+    fn targets_on(text: &str, platform: Platform) -> Vec<Target> {
+        let config = parse_str(text, Path::new("/repo/bx.toml"), Path::new(HOME)).expect("parses");
+        let values = ResolvedValues::resolve(
+            config.values.clone(),
+            &config.value_assignments,
+            Path::new(HOME),
+        )
+        .expect("values");
+        place_envs(&config, &values, platform)
+            .expect("places")
+            .into_iter()
+            .map(|resolution| match resolution {
+                Resolution::Ready(target) => target,
+                Resolution::Blocked(entry) => panic!("held back: {entry:?}"),
+            })
+            .collect()
+    }
+
+    const SESSION: &str = "[[env]]\nname = \"GTK_IM_MODULE\"\nvalue = \"ibus\"\nkind = \"gui\"\n\n\
+                           [[env]]\nname = \"EDITOR\"\nvalue = \"~/bin/nvim\"\nkind = \"environment\"\n";
+
+    #[test]
+    fn on_macos_environment_and_gui_variables_land_in_a_launch_agent() {
+        let linux = targets_on(SESSION, Platform::Linux);
+        let macos = targets_on(SESSION, Platform::Macos);
+        let paths = |targets: &[Target]| -> Vec<String> {
+            targets.iter().map(|t| t.path.to_string()).collect()
+        };
+        assert_eq!(
+            paths(&linux),
+            [Place::Zshenv.fragment(), "~/.zshenv", env::ENVIRONMENT_D]
+        );
+        assert_eq!(
+            paths(&macos),
+            [Place::Zshenv.fragment(), "~/.zshenv", env::LAUNCH_AGENT]
+        );
+        // The zsh files are the same on both; only the session's file is not.
+        assert_eq!(macos[..2], linux[..2]);
+        assert_eq!(linux[2].format, Format::EnvD);
+        let agent = &macos[2];
+        assert_eq!(agent.format, Format::Opaque);
+        assert_eq!(agent.attach, Attach::Own);
+        let Body::Generated(Gen::LaunchAgent(launch)) = &agent.body else {
+            panic!("a LaunchAgent: {agent:?}");
+        };
+        assert_eq!(launch.home, Path::new(HOME));
+        // It holds what `environment.d` holds, in that syntax, for the guard.
+        let Body::Generated(Gen::Env(env_d)) = &linux[2].body else {
+            panic!("an environment.d fragment: {:?}", linux[2]);
+        };
+        assert_eq!(&launch.env, env_d);
+        let body = launch.render(&tools(&|_| true));
+        assert!(
+            body.contains(
+                "\t\t<string>/bin/launchctl</string>\n\t\t<string>setenv</string>\n\
+                 \t\t<string>EDITOR</string>\n\t\t<string>/var/home/example/bin/nvim</string>\n\
+                 \t\t<string>GTK_IM_MODULE</string>\n\t\t<string>ibus</string>\n\t</array>\n"
+            ),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_launch_agent_bx_wrote_is_vacated_on_either_platform() {
+        let home = Path::new(HOME);
+        let ledger = Path::new("/var/home/example/.local/state/bx/ledger");
+        let vacated = vacated_fragments(
+            &[],
+            |p| p.as_str() == env::LAUNCH_AGENT,
+            |_, _| false,
+            home,
+            ledger,
+        );
+        assert_eq!(vacated.len(), 1, "{vacated:?}");
+        let Resolution::Ready(target) = &vacated[0] else {
+            panic!("ready: {vacated:?}");
+        };
+        assert_eq!(target.path.to_string(), env::LAUNCH_AGENT);
+        assert_eq!(target.format, Format::Opaque);
+        let Body::Generated(generator @ Gen::LaunchAgent(_)) = &target.body else {
+            panic!("a LaunchAgent: {target:?}");
+        };
+        let body = generator.render(&tools(&|_| true));
+        assert!(
+            body.contains("<array>\n\t\t<string>/usr/bin/true</string>\n\t</array>"),
+            "{body}"
+        );
+        // Placed, it is left to the placement; and `environment.d` is
+        // vacated with the Linux fragment's empty bytes as before.
+        let placed = targets_on(SESSION, Platform::Macos)
+            .into_iter()
+            .map(Resolution::Ready)
+            .collect::<Vec<_>>();
+        let recorded = |p: &Portable| [env::LAUNCH_AGENT, env::ENVIRONMENT_D].contains(&p.as_str());
+        let vacated = vacated_fragments(&placed, recorded, |_, _| false, home, ledger);
+        let paths: Vec<String> = vacated
+            .iter()
+            .map(|r| match r {
+                Resolution::Ready(t) => t.path.to_string(),
+                Resolution::Blocked(e) => e.key.clone(),
+            })
+            .collect();
+        assert_eq!(paths, [env::ENVIRONMENT_D]);
     }
 
     #[test]

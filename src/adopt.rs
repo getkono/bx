@@ -69,6 +69,7 @@ use toml_edit::{ArrayOfTables, Document, DocumentMut, Item, Table, value};
 use crate::config::resolve::{Resolution, Resolved};
 use crate::config::target::{Attach, Body, Direction, Format};
 use crate::config::values::ResolvedValues;
+use crate::config::when::{Facts, Machine};
 use crate::config::{self, Layer, Origin, layers, merge, resolve};
 use crate::env::Env;
 use crate::env_guard::{self, Reason, RootSet};
@@ -77,6 +78,7 @@ use crate::journal;
 use crate::paths::{self, Portable};
 use crate::recover;
 use crate::restore::{self, Restored};
+use crate::shell::activation::{self, Host as _};
 use crate::state::{
     ContentHash, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, PriorBytes, StateDir,
 };
@@ -235,7 +237,8 @@ fn trees_of(layers: &[Layer], values: &ResolvedValues) -> Result<Vec<TreeDecl>, 
 
 impl Context {
     /// Locate the config repo and the state directory and load the layer set,
-    /// exactly as `plan` does.
+    /// exactly as `plan` does: on this machine, so what a `when` keeps off it
+    /// is not declared here ([`layers::load_gated`]).
     ///
     /// # Errors
     ///
@@ -247,7 +250,13 @@ impl Context {
         let home = env.home.clone();
         let repo = paths::config_root_in(&home, env.xdg_config_home.as_deref());
         let state = StateDir::resolve_in(&home, env.xdg_state_home.as_deref());
-        let layers = layers::load_layer_set(&repo, state.root(), &home)?;
+        let host = activation::System::from_env().with_machine(Machine::read(env.user.clone()));
+        let present = |tool: &str| host.locate(tool).is_usable();
+        let facts = Facts {
+            machine: host.machine(),
+            present: &present,
+        };
+        let layers = layers::load_gated(&repo, state.root(), &home, &facts)?.layers;
         let merged = merge::merge(&layers, &home)?;
         let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let roots = RootSet::from_values(&resolved.values)
@@ -1984,6 +1993,47 @@ mod tests {
             "{rows:?}"
         );
         assert_eq!(layer(&home), off);
+    }
+
+    #[test]
+    fn a_target_gated_off_this_machine_is_undeclared_to_add() {
+        // No machine bx runs on is named this, so the condition never holds.
+        // In a module, since `add` declares in `bx.toml` and one layer may not
+        // declare a path twice, gated or not.
+        let gated = format!(
+            "{}when = \"host:no-such-bx-host\"\n",
+            inline("~/.gated", "x\\n")
+        );
+        let home = repo("");
+        home.write(".config/bx/modules/elsewhere.toml", &gated);
+        plant(&home, ".gated", b"mine\n", 0o644);
+
+        let rows = add_rel(&home, ".gated");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Adopt { .. }]),
+            "adopted as undeclared, neither refused nor owned: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn modules_gating_a_terminal_plugin_each_to_their_own_os_load_for_add() {
+        let home = repo("");
+        for os in ["linux", "macos"] {
+            home.write(
+                format!(".config/bx/modules/{os}.toml"),
+                &format!(
+                    "when = \"os:{os}\"\n[[plugin]]\nname = \"{os}\"\n\
+                     source = \"~/{os}.zsh\"\nterminal = true\n"
+                ),
+            );
+        }
+        plant(&home, ".free", b"x\n", 0o644);
+
+        let rows = add_rel(&home, ".free");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Adopt { .. }]),
+            "{rows:?}"
+        );
     }
 
     #[test]

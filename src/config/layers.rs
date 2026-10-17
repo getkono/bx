@@ -81,6 +81,46 @@ use super::when::{Decide, Gate};
 use super::{Config, Error, Layer, LayerKind, Origin, load_layer};
 use crate::paths::{self, LOCAL_FILE, local_layer_path};
 
+/// The layer set as it stands on one machine: what [`load_gated`] returns.
+#[derive(Debug)]
+pub struct Gated {
+    /// Every layer, in merge order, with what a `when` keeps off the machine
+    /// left out ([`gate`]). What the layers merge from.
+    pub layers: Vec<Layer>,
+    /// Every `[[external]]` the committed layers keep to other machines
+    /// ([`gated_externals`]), read before the gate dropped them.
+    pub elsewhere: Vec<super::external::External>,
+}
+
+/// [`load_layer_set`], then [`gate`] on the machine `decide` describes.
+///
+/// Every command that merges the layer set loads it through here — `plan`,
+/// `bx add` and `bx init` — so a declaration gated off this machine is
+/// undeclared to all of them alike, and two that clash only where no machine
+/// meets both refuse none of them.
+///
+/// # Errors
+///
+/// As [`load_layer_set`].
+pub fn load_gated(
+    repo: &Path,
+    state_dir: &Path,
+    home: &Path,
+    decide: &dyn Decide,
+) -> Result<Gated, Error> {
+    let loaded = load_layer_set(repo, state_dir, home)?;
+    let committed: Vec<Layer> = loaded
+        .iter()
+        .filter(|layer| layer.kind == LayerKind::Global)
+        .cloned()
+        .collect();
+    let elsewhere = gated_externals(&committed, decide);
+    Ok(Gated {
+        layers: gate(loaded, decide),
+        elsewhere,
+    })
+}
+
 /// Every layer file, in merge order: the repo's globals, then the local layer.
 ///
 /// A missing `local.toml` is ordinary and yields a shorter list, not an error:

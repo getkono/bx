@@ -46,9 +46,11 @@ pub struct Inputs {
     pub(super) host: activation::System,
     /// `bx.lock`: the commit each followed external is kept at.
     pub(super) lock: Lock,
-    /// Every enabled external the committed layers declare without this
-    /// account's `local.toml`, on any machine — no `when` is decided for
-    /// it — or `None` when they cannot be merged alone.
+    /// Every external the committed layers declare without this account's
+    /// `local.toml`, on any machine: those enabled where they merge on this
+    /// one, then every one a `when` keeps to other machines, as declared
+    /// ([`layers::gated_externals`]). `None` when the committed layers
+    /// cannot be merged alone on this machine.
     pub(super) committed_externals: Option<Vec<External>>,
 }
 
@@ -88,21 +90,27 @@ impl Inputs {
         };
         let loaded = layers::load_layer_set(&repo, state.root(), &home)?;
         // What every machine sharing the config repo declares: the layers
-        // `bx.lock` is committed beside, without this account's own, and
-        // with nothing a `when` keeps to other machines left out, so a
-        // follow gated to another machine keeps its commit in the lock.
+        // `bx.lock` is committed beside, without this account's own.
         let committed: Vec<Layer> = loaded
             .iter()
             .filter(|layer| layer.kind == LayerKind::Global)
             .cloned()
             .collect();
+        // What a `when` keeps to other machines is never merged: two such
+        // declarations may only clash where both hold, which no machine
+        // reaches, so it is taken as declared beside what this machine
+        // merges, and a follow gated to another machine keeps its commit.
+        let elsewhere = layers::gated_externals(&committed, &facts);
         // What a `when` keeps off this machine is left out before anything
         // merges, so it neither replaces nor collides with what stays.
+        let committed = layers::gate(committed, &facts);
         let layers = layers::gate(loaded, &facts);
         let merged = merge::merge(&layers, &home)?;
-        let committed_externals = merge::merge(&committed, &home)
-            .ok()
-            .map(|config| config.externals);
+        let committed_externals = merge::merge(&committed, &home).ok().map(|config| {
+            let mut externals = config.externals;
+            externals.extend(elsewhere);
+            externals
+        });
         let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let lock = Lock::read(&repo, &home)?;
         let roots = RootSet::from_values(&resolved.values)
@@ -130,9 +138,10 @@ impl Inputs {
         &self.lock
     }
 
-    /// Every enabled external the committed layers declare on their own,
-    /// without this account's `local.toml`: what the shared `bx.lock` is
-    /// kept for. `None` when those layers cannot be merged without it.
+    /// Every external the committed layers declare on their own, without
+    /// this account's `local.toml`, on this machine or another: what the
+    /// shared `bx.lock` is kept for. `None` when those layers cannot be
+    /// merged without it.
     #[must_use]
     pub fn committed_externals(&self) -> Option<&[External]> {
         self.committed_externals.as_deref()
@@ -372,5 +381,83 @@ mod tests {
             std::fs::read_to_string(home.child(".gitconfig.local")).expect("untouched"),
             "mine\n"
         );
+    }
+
+    #[test]
+    fn the_shared_lock_keeps_what_any_machine_follows_and_nothing_only_this_account_does() {
+        use crate::config::lock::{Unshared, why_unshared_at};
+        use crate::paths::Portable;
+        use crate::update::kept;
+
+        let home = guarded_home();
+        let follow = |path: &str, url: &str| {
+            format!(
+                "[[external]]\npath = \"{path}\"\nurl = \"https://h/o/{url}\"\nbranch = \"main\"\n"
+            )
+        };
+        let terminal = |name: &str| {
+            format!("[[plugin]]\nname = \"{name}\"\nsource = \"~/{name}.zsh\"\nterminal = true\n")
+        };
+        seed(home.path(), &follow("~/shared", "shared"));
+        // One terminal plugin per OS module, which clash only where both
+        // hold, and a macOS override of `bx.toml`'s follow.
+        home.write(
+            ".config/bx/modules/macos.toml",
+            &format!(
+                "when = \"os:macos\"\n{}{}{}",
+                terminal("mac"),
+                follow("~/shared", "mac-shared"),
+                follow("~/mac-only", "mac-only")
+            ),
+        );
+        home.write(
+            ".config/bx/modules/linux.toml",
+            &format!("when = \"os:linux\"\n{}", terminal("tux")),
+        );
+        home.write(".local/state/bx/local.toml", &follow("~/mine", "mine"));
+        let on = |os: &str| {
+            let machine = Machine {
+                os: os.to_string(),
+                arch: "aarch64".to_string(),
+                host: None,
+                user: None,
+                distro: None,
+            };
+            Inputs::load_on(
+                &env(home.path()),
+                activation::System::new("", activation::TIMEOUT).with_machine(machine),
+            )
+            .expect("the inputs load")
+        };
+        let at = |raw: &str| Portable::parse_in(raw, home.path()).expect("a portable path");
+        let why = |inputs: &Inputs, path: &str, url: &str| {
+            let committed = inputs
+                .committed_externals()
+                .expect("the committed layers merge on every machine");
+            why_unshared_at(
+                &at(path),
+                &format!("https://h/o/{url}"),
+                "main",
+                Some(committed),
+            )
+        };
+
+        let linux = on("linux");
+        let committed = linux.committed_externals().expect("known");
+        // A follow gated to macOS keeps its commit when `bx update` runs on
+        // Linux, and `bx.toml`'s follow, which the macOS module overrides
+        // only where it holds, is locked here.
+        assert!(kept(&at("~/mac-only"), &[], Some(committed)));
+        assert_eq!(why(&linux, "~/mac-only", "mac-only"), None);
+        assert_eq!(why(&linux, "~/shared", "shared"), None);
+        // What only this account's `local.toml` follows stays out of the
+        // shared lock, and a path nothing commits is pruned from it.
+        assert_eq!(why(&linux, "~/mine", "mine"), Some(Unshared::NotCommitted));
+        assert!(!kept(&at("~/mine"), &[], Some(committed)));
+
+        let macos = on("macos");
+        assert_eq!(why(&macos, "~/shared", "mac-shared"), None);
+        assert_eq!(why(&macos, "~/mac-only", "mac-only"), None);
+        assert_eq!(why(&macos, "~/mine", "mine"), Some(Unshared::NotCommitted));
     }
 }

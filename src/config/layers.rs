@@ -471,6 +471,37 @@ fn gate_layer(config: &mut Config, decide: &dyn Decide) {
     config.gated.extend(gated);
 }
 
+/// Every `[[external]]` in `layers` that [`gate`] leaves out on the machine
+/// `decide` describes: each one a module's own `when` drops with the module,
+/// and each one whose own `when` does not hold. These are what other machines
+/// sharing the layers declare and this one does not.
+///
+/// Each is taken as declared, whatever its `enabled` and whatever a toggle
+/// in another layer says about it, and without being merged with anything:
+/// two of them may claim the same path, or sit beside declarations they
+/// would clash with, because no machine meets them all at once.
+#[must_use]
+pub fn gated_externals(layers: &[Layer], decide: &dyn Decide) -> Vec<super::external::External> {
+    layers
+        .iter()
+        .flat_map(|layer| {
+            let config = &layer.config;
+            let whole = config
+                .when
+                .as_ref()
+                .is_some_and(|gate| gate.excludes(decide));
+            config.externals.iter().filter(move |external| {
+                whole
+                    || config
+                        .gates
+                        .iter()
+                        .any(|gate| gate.origin == external.origin && gate.excludes(decide))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// The natural key of every declaration in `config` a toggle could name.
 fn declared_keys(config: &Config) -> Vec<(Section, String)> {
     let mut keys = Vec::new();

@@ -66,7 +66,7 @@ const BASHRC: &str = "# my own bashrc\nshopt -s histappend\n";
 /// Every path in the home a `bx rm` releases the example's targets from:
 /// together, everything the example declares. On macOS that is also where a
 /// login shell is put right after `path_helper` and where a login bash is
-/// pointed at bx's file.
+/// pointed at bx's file, and the LaunchAgent the session's variables land in.
 const MANAGED: &[&str] = if cfg!(target_os = "macos") {
     &[
         ".bash_profile",
@@ -79,6 +79,7 @@ const MANAGED: &[&str] = if cfg!(target_os = "macos") {
         ".zprofile",
         ".zshenv",
         ".zshrc",
+        "Library",
     ]
 } else {
     &[
@@ -544,6 +545,37 @@ fn the_example_lands_every_kind_of_target_it_declares() {
     let bashrc = std::fs::read_to_string(home.join(".bashrc")).expect("~/.bashrc");
     assert!(bashrc.starts_with(BASHRC), "{bashrc}");
     assert!(bashrc.contains("# >>> bx >>>\n"), "{bashrc}");
+    // The session's variables: `environment.d` on Linux, and on macOS the
+    // LaunchAgent in its place, which launchd can read.
+    let env_d = home.join(".config/environment.d/50-bx.conf");
+    let agent = home.join("Library/LaunchAgents/dev.bx.environment.plist");
+    if cfg!(target_os = "macos") {
+        assert!(!env_d.exists(), "{}", env_d.display());
+        let plist = std::fs::read_to_string(&agent).expect("the LaunchAgent");
+        for (name, value) in [("EDITOR", "nvim"), ("GTK_IM_MODULE", "ibus")] {
+            assert!(
+                plist.contains(&format!(
+                    "\t\t<string>{name}</string>\n\t\t<string>{value}</string>\n"
+                )),
+                "{plist}"
+            );
+        }
+        let lint = machine
+            .command("/usr/bin/plutil")
+            .arg("-lint")
+            .arg(&agent)
+            .output()
+            .expect("plutil runs");
+        assert!(
+            lint.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lint.stdout)
+        );
+    } else {
+        assert!(!agent.exists(), "{}", agent.display());
+        let fragment = std::fs::read_to_string(&env_d).expect("the environment.d fragment");
+        assert!(fragment.contains("GTK_IM_MODULE=ibus\n"), "{fragment}");
+    }
 }
 
 #[test]

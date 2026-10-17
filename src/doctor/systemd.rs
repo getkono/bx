@@ -325,7 +325,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::plan::tests::inputs;
+    // The units these tests declare are kept to Linux, as every unit must be.
+    use crate::plan::tests::inputs_on_linux as inputs;
     use crate::testing::guarded_home;
 
     const DIR: &str = "/var/home/example/.config/systemd/user";
@@ -419,10 +420,12 @@ mod tests {
 [[target]]
 path = \"~/.config/systemd/user/on-disk.service\"
 content = \"[Service]\\n\"
+when = \"os:linux\"
 
 [[target]]
 path = \"~/.config/systemd/user/not-yet.timer\"
 content = \"[Timer]\\n\"
+when = \"os:linux\"
 
 [[target]]
 path = \"~/.config/systemd/on-disk.service\"
@@ -431,6 +434,7 @@ content = \"[Service]\\n\"
 [[target]]
 path = \"~/.config/systemd/user/app@.service\"
 content = \"[Service]\\n\"
+when = \"os:linux\"
 
 [[value]]
 name = \"slice\"
@@ -439,6 +443,7 @@ kind = \"string\"
 [[target]]
 path = \"~/.config/systemd/user/{{slice}}.slice\"
 content = \"[Slice]\\n\"
+when = \"os:linux\"
 ";
         for rel in [
             ".config/systemd/user/on-disk.service",
@@ -474,7 +479,8 @@ content = \"[Slice]\\n\"
             .expect("a link");
         let inputs = inputs(
             &home,
-            "[[target]]\npath = \"~/.config/systemd/user/link.service\"\ncontent = \"x\"\n",
+            "[[target]]\npath = \"~/.config/systemd/user/link.service\"\ncontent = \"x\"\n\
+             when = \"os:linux\"\n",
         );
 
         assert_eq!(units(inputs.targets(), home.path(), &dir).len(), 1);

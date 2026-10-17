@@ -175,7 +175,8 @@ mod tests {
 
     use super::systemd::{Query, State, Unreachable};
     use super::*;
-    use crate::plan::tests::inputs;
+    // The units these tests declare are kept to Linux, as every unit must be.
+    use crate::plan::tests::inputs_on_linux as inputs;
     use crate::testing::guarded_home;
 
     /// A systemd that answers every unit with one state, and counts questions.
@@ -223,10 +224,12 @@ mod tests {
 [[target]]
 path = \"~/.config/systemd/user/a.service\"
 content = \"[Service]\\n\"
+when = \"os:linux\"
 
 [[target]]
 path = \"~/.config/systemd/user/b.timer\"
 content = \"[Timer]\\n\"
+when = \"os:linux\"
 
 [[target]]
 path = \"~/.a\"
@@ -275,7 +278,7 @@ content = \"a\\n\"
             first,
             "  ! ~/.config/systemd/user/a.service  (~/.config/bx/bx.toml:1) is written but not \
              enabled; `systemctl --user enable a.service` enables it\n  ! \
-             ~/.config/systemd/user/b.timer  (~/.config/bx/bx.toml:5) is written but not \
+             ~/.config/systemd/user/b.timer  (~/.config/bx/bx.toml:6) is written but not \
              enabled; `systemctl --user enable b.timer` enables it\nDoctor: 2 finding(s).\n"
         );
         assert_eq!(code, Exit::Pending);
@@ -325,6 +328,7 @@ content = \"a\\n\"
 [[target]]
 path = \"~/.config/systemd/user/a.service\"
 content = \"[Service]\\n\"
+when = \"os:linux\"
 
 [[source]]
 name = \"keychain\"
@@ -422,18 +426,18 @@ install = \"sudo dnf install bx-no-such-tool\"
 
         assert_eq!(
             first,
-            "  ! tool bx-no-such-tool  (~/.config/bx/bx.toml:19) is not on PATH; `sudo dnf \
+            "  ! tool bx-no-such-tool  (~/.config/bx/bx.toml:20) is not on PATH; `sudo dnf \
              install bx-no-such-tool` installs it\n\
-             \x20 ! value email  (~/.config/bx/bx.toml:14) is required and has no answer; run \
+             \x20 ! value email  (~/.config/bx/bx.toml:15) is required and has no answer; run \
              `bx init` to set email\n\
              \x20 ! ~/.local/state/bx/fingerprints.mpk is damaged: it is not valid MessagePack; \
              it is a cache, and the next `bx apply` sets it aside and rebuilds it\n\
              \x20 ! ~/.local/state/bx/journal.mpk records an interrupted apply session of 1 \
              write(s) that stopped before it finished; the next `bx apply` rolls it back; `bx \
              plan` shows what it would do\n\
-             \x20 ! ~/.ssh/config  (~/.config/bx/bx.toml:9) ~/.ssh is 0755, wider than the 0600 \
+             \x20 ! ~/.ssh/config  (~/.config/bx/bx.toml:10) ~/.ssh is 0755, wider than the 0600 \
              this file declares; `chmod 0711 ~/.ssh` narrows it\n\
-             \x20 ! source keychain  (~/.config/bx/bx.toml:5) ~/.keychain/host-sh is not \
+             \x20 ! source keychain  (~/.config/bx/bx.toml:6) ~/.keychain/host-sh is not \
              readable, so the shell skips the line that sources it\n\
              \x20 ! ~/.config/systemd/user/a.service  (~/.config/bx/bx.toml:1) is written but \
              not enabled; `systemctl --user enable a.service` enables it\n\
@@ -619,7 +623,7 @@ install = \"sudo dnf install bx-no-such-tool\"
         let layer = "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"[include]\\n\"\n\
                      references = [\"~/.gitconfig.local\"]\n\
                      [[target]]\npath = \"~/.config/systemd/user/a.service\"\n\
-                     content = \"[Service]\\n\"\n";
+                     content = \"[Service]\\n\"\nwhen = \"os:linux\"\n";
         let (before, code) = doctor_of(&home, layer, OsStr::new(""), &Every::unit(disabled()));
         assert_eq!(before, "Doctor: 0 finding(s).\n", "nothing applied yet");
         assert_eq!(code, Exit::Converged);

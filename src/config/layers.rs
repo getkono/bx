@@ -1626,5 +1626,54 @@ mod tests {
                 std::fs::write(&file, "").expect("emptied");
             }
         }
+
+        #[test]
+        fn a_trees_when_reaches_every_file_it_expands_to() {
+            let home = guarded_home();
+            let repo = home.child(".config/bx");
+            let state = home.child(".local/state/bx");
+            for file in ["a", "sub/b"] {
+                home.write(format!(".config/bx/files/mac/{file}"), "m\n");
+                home.write(format!(".config/bx/files/all/{file}"), "x\n");
+            }
+            home.write(
+                ".config/bx/bx.toml",
+                "[[target]]\npath = \"~/.mac\"\ntree = \"files/mac\"\nwhen = \"os:macos\"\n\
+                 [[target]]\npath = \"~/.all\"\ntree = \"files/all\"\n",
+            );
+            let paths = |machine: &Machine| -> (Vec<String>, Vec<(Section, String)>) {
+                let facts = Facts {
+                    machine,
+                    present: &|_| false,
+                };
+                let layers = super::super::load_layer_set(&repo, &state, home.path())
+                    .expect("the trees expand");
+                let gated = gate(layers, &facts);
+                let keys = gated[0].config.gated.clone();
+                let merged = merge(&gated, home.path()).expect("merges");
+                let targets = merged
+                    .targets
+                    .iter()
+                    .map(|t| t.path.as_str().to_string())
+                    .collect();
+                (targets, keys)
+            };
+
+            let (targets, gated) = paths(&linux());
+            assert_eq!(targets, ["~/.all/a", "~/.all/sub/b"]);
+            assert_eq!(
+                gated,
+                [
+                    (Section::Target, "~/.mac/a".to_string()),
+                    (Section::Target, "~/.mac/sub/b".to_string()),
+                ]
+            );
+            let (targets, gated) = paths(&macos());
+            assert_eq!(
+                targets,
+                ["~/.mac/a", "~/.mac/sub/b", "~/.all/a", "~/.all/sub/b"]
+            );
+            assert!(gated.is_empty());
+        }
     }
 }

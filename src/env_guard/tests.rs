@@ -2316,7 +2316,7 @@ fn every_site_that_reaches_the_guard_is_known() {
     // into a further file is a new caller, as it was when sites were
     // matched by file. "This module" is the `env_guard` module wherever
     // its files are — `env_guard.rs` and everything beneath `env_guard/`.
-    const KNOWN: [&str; 16] = [
+    const KNOWN: [&str; 20] = [
         // `bx add`'s advisory scan.
         "use crate::env_guard::{self, Reason, RootSet};",
         "env_guard::scan_with(text, roots)",
@@ -2327,6 +2327,14 @@ fn every_site_that_reaches_the_guard_is_known() {
         "violations(&env_guard::scan_with(content, roots), before)",
         "let mut found = env_guard::scan_with(&format!(\"{inherited}{content}\"), roots);",
         "violations(&env_guard::scan_exported(content, roots), 0)",
+        // The LaunchAgent on macOS: its `environment.d` fragment judged by
+        // `scan_exported`, and every value it holds expanded, refused where
+        // it does not expand; the property list renders the values the
+        // same walk expanded, against a root set built for its home alone.
+        "let found = env_guard::scan_exported(env, roots);",
+        "let unexpanded = env_guard::expand_exported(env, roots)",
+        "let roots = crate::env_guard::RootSet::new(&self.home, &[]);",
+        "crate::env_guard::expand_exported(&self.env.render(decide), &roots)",
         "fn violations(found: &[env_guard::Violation], before: usize) -> Option<String> {",
         // The interactive file's history path, judged beside its `env`
         // phase, which still goes through `scan_with` above.

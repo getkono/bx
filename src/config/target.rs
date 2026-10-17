@@ -318,6 +318,11 @@ pub enum Gen {
     /// An environment fragment: the variables one place holds. The plan judges
     /// it against the declared roots before it is written.
     Env(super::env::Fragment),
+    /// The LaunchAgent `environment.d` is on macOS, holding the variables
+    /// that place holds ([`super::env::LaunchAgent`]). The plan judges its
+    /// fragment as it judges `environment.d`'s, and refuses a value launchd
+    /// would be handed unexpanded.
+    LaunchAgent(super::env::LaunchAgent),
     /// The one line of a fixed region, sourcing a fragment when it is readable.
     /// Sets nothing, so it is not an environment fragment and is not judged as
     /// one; `env_guard`'s tests hold its bytes to carrying no assignment.

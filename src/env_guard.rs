@@ -144,6 +144,24 @@
 //! non-fragment file to the rule, so the generator that adds one carries the
 //! proof of its own bytes with it.
 //!
+//! **The LaunchAgent** is an environment fragment written in another syntax,
+//! and judged as one. On macOS, which has no `environment.d`, the
+//! `environment` and `gui` variables land in
+//! `~/Library/LaunchAgents/dev.bx.environment.plist`, which launchd runs at
+//! login to set them for every program the session starts. Its variables are
+//! rendered as the `environment.d` fragment they are on Linux and judged by
+//! [`scan_exported`], every one of them exactly as that fragment's would be.
+//! The property list then hands launchd the values the same walk expanded
+//! ([`expand_exported`]) — every `~`, `$HOME` and reference to a variable
+//! named earlier written as what it stands for — because `launchctl setenv`
+//! expands nothing. So it adds one refusal of its own: a value that does not
+//! expand, such as `PATH=${PATH}:…`, which `environment.d` would extend from
+//! what it inherited, is refused there, since launchd would set the
+//! reference's own text. Nothing else in the file is a statement: its one
+//! program is `/bin/launchctl setenv` with those names and values, or
+//! `/usr/bin/true` when there are none, and no shell reads it.
+//! `crate::config::env`'s tests hold its bytes to that.
+//!
 //! **Reasons, and the one assertion.** Everything this module can be given —
 //! any name, any value, any fragment, well formed or not — comes back as a
 //! [`Verdict`], and every rejection as a [`Reason`]. The guard never panics on
@@ -407,6 +425,32 @@ pub fn scan_exported(content: &str, roots: &RootSet) -> Vec<Violation> {
     pass(content, roots, true).0
 }
 
+/// One assignment of an exported fragment, and the value it expands to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expanded {
+    /// The variable assigned.
+    pub name: String,
+    /// What a reader of the fragment gives it — every `~`, `$HOME` and
+    /// reference to a name assigned earlier expanded — or why that cannot be
+    /// known.
+    pub value: Result<String, Reason>,
+}
+
+/// Every assignment of the exported fragment `content`, in order, each with
+/// the value [`scan_exported`] judged it by: what a reader that expands
+/// nothing — launchd, reading the LaunchAgent
+/// [`crate::config::env::LaunchAgent`] renders — is handed already expanded,
+/// so it is given exactly what was judged.
+///
+/// `roots` supplies the home `~` and `$HOME` expand against, and nothing else
+/// here; the verdict is [`scan_exported`]'s to give. A value that does not
+/// resolve — a reference to a name nothing earlier assigned, or to the
+/// inherited value of the name itself — carries the reason it does not.
+#[must_use]
+pub fn expand_exported(content: &str, roots: &RootSet) -> Vec<Expanded> {
+    walk(content, roots, true).2
+}
+
 /// Find every forbidden assignment in a block of shell bx is about to write.
 ///
 /// Equivalent to [`scan_with`] against `RootSet::strict`: with no root
@@ -427,8 +471,20 @@ pub fn scan(content: &str) -> Vec<Violation> {
 /// `every_exported` judges every assignment as exported, whether or not its
 /// line says so — the reading of an `environment.d` fragment.
 fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>, Scope) {
+    let (found, scope, _) = walk(content, roots, every_exported);
+    (found, scope)
+}
+
+/// [`pass`], and every plain assignment the walk read with the value it
+/// expanded to, for [`expand_exported`].
+fn walk(
+    content: &str,
+    roots: &RootSet,
+    every_exported: bool,
+) -> (Vec<Violation>, Scope, Vec<Expanded>) {
     let mut scope = Scope::default();
     let mut found = Vec::new();
+    let mut expanded = Vec::new();
     // The open guarded block: the line that opened it, and every name
     // assigned inside it.
     let mut block: Option<(usize, Vec<String>)> = None;
@@ -464,6 +520,10 @@ fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>
                 if let Some(reason) = judged.reason {
                     found.push(violation(name, value, reason));
                 }
+                expanded.push(Expanded {
+                    name: name.to_string(),
+                    value: judged.resolved.clone(),
+                });
                 scope.learn(name, judged);
                 if let Some((_, assigned)) = block.as_mut() {
                     assigned.push(name.to_string());
@@ -511,7 +571,7 @@ fn pass(content: &str, roots: &RootSet, every_exported: bool) -> (Vec<Violation>
         });
         scope.forget_everything();
     }
-    (found, scope)
+    (found, scope, expanded)
 }
 
 /// What [`evaluate`] found: the verdict, and what the value expands to.

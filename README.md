@@ -210,8 +210,8 @@ path, `bx rm` when a conflict left something as it was, and
   no answer, a damaged state file, an interrupted or running session, a
   directory wider than a private file in it, a declared optional source that is
   not readable, a unit file systemd has not reloaded, enabled or loaded, or that
-  has failed (on Linux; launchd is the macOS counterpart, and its check is not
-  there yet), a declared reference that is not on disk, a temporary file an
+  has failed (on Linux), bx's LaunchAgent written but not yet loaded by
+  launchd (on macOS), a declared reference that is not on disk, a temporary file an
   interrupted write left behind, an external that follows a branch
   `bx.lock` holds no commit for, a `bx.lock` entry nothing follows any more,
   an update stamp that holds no time, a `local.toml` inside the config
@@ -270,6 +270,13 @@ or its module's. Without it the configuration is refused as it loads, on
 every OS, so you learn on the machine you wrote it on. `~/library/` in
 any other case is `~/Library/` on macOS, so it needs an `os:` too. `bx add`
 writes the `when` itself.
+
+An `[[env]]` variable of `kind = "environment"` or `"gui"`, which reaches
+the programs your graphical session starts, needs no `when`: bx writes it to
+`~/.config/environment.d/50-bx.conf` on Linux, and on macOS to a LaunchAgent,
+`~/Library/LaunchAgents/dev.bx.environment.plist`, that runs
+`launchctl setenv` at login. `apply` loads nothing, so it takes effect at the
+next login; `bx doctor` says until then that launchd has not loaded it.
 
 ## Externals
 

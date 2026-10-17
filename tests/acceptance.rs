@@ -66,7 +66,7 @@ const BASHRC: &str = "# my own bashrc\nshopt -s histappend\n";
 /// Every path in the home a `bx rm` releases the example's targets from:
 /// together, everything the example declares. On macOS that is also where a
 /// login shell is put right after `path_helper` and where a login bash is
-/// pointed at bx's file.
+/// pointed at bx's file, and the LaunchAgent the session's variables land in.
 const MANAGED: &[&str] = if cfg!(target_os = "macos") {
     &[
         ".bash_profile",
@@ -79,6 +79,7 @@ const MANAGED: &[&str] = if cfg!(target_os = "macos") {
         ".zprofile",
         ".zshenv",
         ".zshrc",
+        "Library",
     ]
 } else {
     &[
@@ -544,6 +545,37 @@ fn the_example_lands_every_kind_of_target_it_declares() {
     let bashrc = std::fs::read_to_string(home.join(".bashrc")).expect("~/.bashrc");
     assert!(bashrc.starts_with(BASHRC), "{bashrc}");
     assert!(bashrc.contains("# >>> bx >>>\n"), "{bashrc}");
+    // The session's variables: `environment.d` on Linux, and on macOS the
+    // LaunchAgent in its place, which launchd can read.
+    let env_d = home.join(".config/environment.d/50-bx.conf");
+    let agent = home.join("Library/LaunchAgents/dev.bx.environment.plist");
+    if cfg!(target_os = "macos") {
+        assert!(!env_d.exists(), "{}", env_d.display());
+        let plist = std::fs::read_to_string(&agent).expect("the LaunchAgent");
+        for (name, value) in [("EDITOR", "nvim"), ("GTK_IM_MODULE", "ibus")] {
+            assert!(
+                plist.contains(&format!(
+                    "\t\t<string>{name}</string>\n\t\t<string>{value}</string>\n"
+                )),
+                "{plist}"
+            );
+        }
+        let lint = machine
+            .command("/usr/bin/plutil")
+            .arg("-lint")
+            .arg(&agent)
+            .output()
+            .expect("plutil runs");
+        assert!(
+            lint.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lint.stdout)
+        );
+    } else {
+        assert!(!agent.exists(), "{}", agent.display());
+        let fragment = std::fs::read_to_string(&env_d).expect("the environment.d fragment");
+        assert!(fragment.contains("GTK_IM_MODULE=ibus\n"), "{fragment}");
+    }
 }
 
 #[test]
@@ -945,6 +977,26 @@ fn doctor_looks_at_the_applied_example_and_changes_nothing() {
     );
     assert_same(&before, &machine.everything(), "doctor wrote something");
 
+    // On macOS the LaunchAgent is asked about: `apply` loads nothing, so
+    // launchd has not loaded it, or has no GUI domain to say so in. The label
+    // is the account's, not the tempdir home's: where bx's own agent is
+    // already loaded for this account, doctor rightly finds nothing to say.
+    let agent = "~/Library/LaunchAgents/dev.bx.environment.plist";
+    let loaded = cfg!(target_os = "macos") && account_has_loaded("dev.bx.environment");
+    let asked = doctor.stdout().lines().any(|line| {
+        line.starts_with(&format!("  ! {agent}  ("))
+            && line.contains(" is written but launchd has not loaded it")
+            || line.starts_with(&format!(
+                "  ! launchd is unreachable, so {agent} went unchecked"
+            ))
+    });
+    assert_eq!(
+        asked,
+        cfg!(target_os = "macos") && !loaded,
+        "loaded for this account: {loaded}\n{}",
+        doctor.stdout()
+    );
+
     // The example follows a branch, so bash's file asks about updates, which
     // a bash older than 4.4 — macOS's 3.2 — leaves out, and doctor says so.
     let version = machine
@@ -966,6 +1018,23 @@ fn doctor_looks_at_the_applied_example_and_changes_nothing() {
         "bash {version}:\n{}",
         doctor.stdout()
     );
+}
+
+/// Whether launchd has loaded `label` in this account's GUI domain — the same
+/// `launchctl print` doctor asks, put from outside it, so a machine whose own
+/// bx agent is loaded expects no finding rather than failing.
+fn account_has_loaded(label: &str) -> bool {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("id runs");
+    let uid = String::from_utf8_lossy(&uid.stdout);
+    std::process::Command::new("/bin/launchctl")
+        .args(["print", &format!("gui/{}/{label}", uid.trim())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[test]

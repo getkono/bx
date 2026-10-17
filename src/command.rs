@@ -83,6 +83,7 @@ fn doctor_with(
             path,
             unit_dir: &unit_dir,
             systemd,
+            launchd: &doctor::launchd::Launchctl::default(),
             bash: &doctor::bash::Version,
         },
     );

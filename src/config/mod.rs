@@ -1784,6 +1784,27 @@ mod tests {
         module("when = \"os:macos\"\n", "", "~/Library").expect("kept to macOS by its module");
         // The anchor is a directory, not a prefix of a name.
         module("", "", "~/Libraryx").expect("not under ~/Library");
+        // `~/library` is `~/Library` on macOS's case-folding volume and a
+        // directory of its own elsewhere, so it is refused only ungated.
+        for (top, own) in [("", ""), ("", "when = \"host:box\"\n")] {
+            let error = module(top, own, "~/library/Fonts/a.ttf").expect_err("refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("is `~/Library` on macos, whose volumes"),
+                "{own:?}: {error}"
+            );
+        }
+        for (top, own) in [
+            ("", "when = \"os:macos\"\n"),
+            ("", "when = \"os:linux\"\n"),
+            ("when = [\"host:box\", \"os:linux\"]\n", ""),
+        ] {
+            module(top, own, "~/LIBRARY/a").unwrap_or_else(|e| panic!("{top:?} {own:?}: {e}"));
+        }
+        // Linux's filesystems tell names apart by case, so its anchors do not
+        // fold.
+        module("", "", "~/.config/Systemd/user/a.service").expect("not a user unit");
         module("", "", "~/.config/systemd/a.service").expect("not a user unit");
 
         // A tree rooted under an anchor is judged as written.

@@ -1476,16 +1476,69 @@ pub(crate) fn refuse_file_at_home_or_above(
     Ok(())
 }
 
-/// The directories only one OS reads, each beside that OS as `os:` spells it.
+/// A directory only one OS reads.
+#[derive(Debug)]
+struct PlatformAnchor {
+    /// The directory, as a [`Portable`] spells it.
+    dir: &'static str,
+    /// The OS that reads it, as `os:` spells it.
+    os: &'static str,
+    /// Whether that OS's own volumes look names up without regard to case,
+    /// so a path spelling the directory in another case lands in it there.
+    folds_case: bool,
+}
+
+/// The directories only one OS reads.
 ///
 /// The systemd user manager reads unit files and `environment.d` on Linux
 /// alone, and `~/Library` is macOS's: a file there on the other OS is
-/// written for nothing to read.
-pub(crate) const PLATFORM_ANCHORS: [(&str, &str); 3] = [
-    ("~/.config/systemd/user", "linux"),
-    ("~/.config/environment.d", "linux"),
-    ("~/Library", "macos"),
+/// written for nothing to read. macOS's default volume folds case, so
+/// `~/library` is `~/Library` there; Linux's filesystems do not, and no other
+/// OS reads the systemd directories, so only `~/Library` folds.
+const PLATFORM_ANCHORS: [PlatformAnchor; 3] = [
+    PlatformAnchor {
+        dir: "~/.config/systemd/user",
+        os: "linux",
+        folds_case: false,
+    },
+    PlatformAnchor {
+        dir: "~/.config/environment.d",
+        os: "linux",
+        folds_case: false,
+    },
+    PlatformAnchor {
+        dir: "~/Library",
+        os: "macos",
+        folds_case: true,
+    },
 ];
+
+/// Where `path` lies under one of [`PLATFORM_ANCHORS`]: the anchor, and
+/// whether `path` spells it exactly (`true`) or only in another case, on an
+/// anchor that folds it (`false`).
+fn platform_anchor(path: &Portable) -> Option<(&'static PlatformAnchor, bool)> {
+    PLATFORM_ANCHORS.iter().find_map(|anchor| {
+        if crate::lexical::is_within(path.as_str(), anchor.dir) {
+            Some((anchor, true))
+        } else if anchor.folds_case
+            && crate::lexical::is_within_folding_case(path.as_str(), anchor.dir)
+        {
+            Some((anchor, false))
+        } else {
+            None
+        }
+    })
+}
+
+/// The OS a target at `path`, written on a machine running `here`, must be
+/// kept to so [`refuse_ungated_platform`] accepts it: the anchor's OS for a
+/// path that spells its anchor exactly, and `here` for one that spells it in
+/// another case — on the anchor's own OS that is the anchor, and on any other
+/// it is a different directory, read there. `None` when `path` lies under no
+/// anchor and needs no gate.
+pub(crate) fn platform_gate(path: &Portable, here: &'static str) -> Option<&'static str> {
+    platform_anchor(path).map(|(anchor, exact)| if exact { anchor.os } else { here })
+}
 
 /// Refuse a target at `path` that lies under one of [`PLATFORM_ANCHORS`]
 /// unless one of `gates` — its own `when`, its module's — names that
@@ -1495,25 +1548,37 @@ pub(crate) const PLATFORM_ANCHORS: [(&str, &str); 3] = [
 /// for one OS is refused on every OS: its author learns on the machine they
 /// wrote it on, not on the other one. Containment is lexical
 /// ([`crate::lexical::is_within`]), like the environment guard's, so a path
-/// reaching an anchor through a symlink is not seen. The message is returned
-/// for the caller to attach the entry's origin.
+/// reaching an anchor through a symlink is not seen. A path that spells an
+/// anchor which folds case in another case (`~/library/…`) is that anchor on
+/// its OS and a different directory elsewhere, so any `os:` gate keeps it:
+/// what is refused is a gate that decides nothing, under which it would land
+/// in the anchor ungated. The message is returned for the caller to attach the
+/// entry's origin.
 pub(crate) fn refuse_ungated_platform(
     path: &Portable,
     gates: &[&super::when::When],
 ) -> Result<(), String> {
-    let Some((anchor, os)) = PLATFORM_ANCHORS
-        .iter()
-        .find(|(anchor, _)| crate::lexical::is_within(path.as_str(), anchor))
-    else {
+    let Some((anchor, exact)) = platform_anchor(path) else {
         return Ok(());
     };
-    if gates.iter().any(|when| when.names_os(os)) {
+    let PlatformAnchor { dir, os, .. } = anchor;
+    if exact {
+        if gates.iter().any(|when| when.names_os(os)) {
+            return Ok(());
+        }
+        return Err(format!(
+            "`{path}` lies under `{dir}`, which only {os} reads, so it must be kept to {os}: \
+             add `when = \"os:{os}\"` to the target, or move it to a module whose own `when` \
+             says so"
+        ));
+    }
+    if gates.iter().any(|when| when.names_an_os()) {
         return Ok(());
     }
     Err(format!(
-        "`{path}` lies under `{anchor}`, which only {os} reads, so it must be kept to {os}: \
-         add `when = \"os:{os}\"` to the target, or move it to a module whose own `when` \
-         says so"
+        "`{path}` is `{dir}` on {os}, whose volumes do not tell names apart by case, and only \
+         {os} reads that, so it must be kept to an OS: add `when = \"os:{os}\"` to the target, \
+         or the `os:` it is meant for, or move it to a module whose own `when` says so"
     ))
 }
 

@@ -30,6 +30,18 @@ pub(crate) fn is_within(path: &str, root: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+/// [`is_within`], with the letters of `root` matched without regard to ASCII
+/// case: `~/library/x` is within `~/Library` here, as it is on a volume that
+/// does not tell names apart by case.
+pub(crate) fn is_within_folding_case(path: &str, root: &str) -> bool {
+    path.get(..root.len()).is_some_and(|head| {
+        head.eq_ignore_ascii_case(root) && {
+            let rest = &path[root.len()..];
+            rest.is_empty() || rest.starts_with('/')
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,5 +54,17 @@ mod tests {
         assert!(!is_within("~/Libraryx/y", "~/Library"));
         assert!(!is_within("~", "~/Library"));
         assert!(!is_within("~/.config/systemd", "~/.config/systemd/user"));
+        assert!(!is_within("~/library/x", "~/Library"));
+    }
+
+    #[test]
+    fn folding_case_a_path_is_within_its_root_in_any_case_and_nothing_else() {
+        assert!(is_within_folding_case("~/Library", "~/Library"));
+        assert!(is_within_folding_case("~/library", "~/Library"));
+        assert!(is_within_folding_case("~/LIBRARY/Fonts/a.ttf", "~/Library"));
+        assert!(!is_within_folding_case("~/libraryx", "~/Library"));
+        assert!(!is_within_folding_case("~/Libr", "~/Library"));
+        assert!(!is_within_folding_case("~/Librar\u{e9}", "~/Library"));
+        assert!(!is_within_folding_case("~/Documents", "~/Library"));
     }
 }

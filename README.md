@@ -267,7 +267,9 @@ A target under a directory only one OS reads must be kept to that OS:
 `~/.config/systemd/user/` and `~/.config/environment.d/` need
 `os:linux`, and `~/Library/` needs `os:macos`, in the target's own `when`
 or its module's. Without it the configuration is refused as it loads, on
-every OS, so you learn on the machine you wrote it on.
+every OS, so you learn on the machine you wrote it on. `~/library/` in
+any other case is `~/Library/` on macOS, so it needs an `os:` too. `bx add`
+writes the `when` itself.
 
 ## Externals
 

@@ -450,6 +450,17 @@ impl When {
         }
     }
 
+    /// Whether this condition, or one of the conditions an array spells, is
+    /// `os:` for any OS: [`Self::names_os`] without the OS.
+    #[must_use]
+    pub(crate) fn names_an_os(&self) -> bool {
+        match self {
+            Self::Os(_) => true,
+            Self::All(all) => all.iter().any(Self::names_an_os),
+            _ => false,
+        }
+    }
+
     /// Whether every condition bx decides holds against `decide`; a runtime
     /// test is the shell's to decide, and counts as holding here.
     fn holds(&self, decide: &dyn Decide) -> bool {
@@ -1097,6 +1108,9 @@ mod tests {
         assert!(!when(&["os:linux"]).names_os("macos"));
         assert!(when(&["host:box", "os:macos"]).names_os("macos"));
         assert!(!when(&["host:box", "distro:fedora"]).names_os("linux"));
+        assert!(when(&["os:linux"]).names_an_os());
+        assert!(when(&["host:box", "os:macos"]).names_an_os());
+        assert!(!when(&["host:box", "distro:fedora"]).names_an_os());
     }
 
     #[test]

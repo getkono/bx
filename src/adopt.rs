@@ -970,9 +970,10 @@ fn decide_file(
 /// off this machine by a `when` ([`Context::kept_elsewhere`]).
 ///
 /// Nothing is declared a second time, since one layer may not declare a path
-/// twice. Where the repo copy that declaration names already holds these
-/// bytes and this mode, there is nothing to do; otherwise the file is refused
-/// naming the declaration to change.
+/// twice. Where that declaration's body — the repo copy it names, or its
+/// inline content — already holds these bytes, and it declares this mode,
+/// there is nothing to do; otherwise the file is refused naming the
+/// declaration to change.
 fn kept_elsewhere_adoption(
     ctx: &Context,
     kept: &crate::config::target::Target,
@@ -980,24 +981,35 @@ fn kept_elsewhere_adoption(
     bytes: &[u8],
     mode: Mode,
 ) -> Adoption {
-    let same = match &kept.body {
+    let refused = |note: String| Adoption::Refused {
+        target: target.clone(),
+        note,
+    };
+    let same_bytes = match &kept.body {
         Body::File(rel) => std::fs::read(ctx.repo.join(rel)).is_ok_and(|held| held == bytes),
-        _ => false,
-    } && Mode::resolve(kept.mode, Kind::File) == mode;
-    if same {
+        Body::Inline(content) => content.as_bytes() == bytes,
+        // As for a declaration that holds here: these bodies are not bytes
+        // the file could be compared against.
+        Body::Generated(_) | Body::Dir | Body::Secret(_) | Body::Symlink(_) => {
+            return refused(format!(
+                "is already declared at {}, kept off this machine by its `when`, with a body \
+                 bx add does not adopt into; one layer declares a path once, so change that \
+                 declaration rather than adding it again",
+                kept.origin
+            ));
+        }
+    };
+    if same_bytes && Mode::resolve(kept.mode, Kind::File) == mode {
         return Adoption::Unchanged {
             target: target.clone(),
         };
     }
-    Adoption::Refused {
-        target: target.clone(),
-        note: format!(
-            "is already declared at {}, kept off this machine by its `when`, and differs \
+    refused(format!(
+        "is already declared at {}, kept off this machine by its `when`, and differs \
              from what it declares; one layer declares a path once, so change that \
              declaration rather than adding it again",
-            kept.origin
-        ),
-    }
+        kept.origin
+    ))
 }
 
 /// Each line of `bytes` that assigns a tool's location outside every declared
@@ -2164,11 +2176,49 @@ mod tests {
         );
         assert_eq!(layer(&home), gated);
 
+        // Matching bytes under another mode differ from the declaration too.
+        for (bytes, mode) in [(b"mine\n", 0o644), (b"held\n", 0o600)] {
+            plant(&home, ".gated", bytes, mode);
+            let rows = add_rel(&home, ".gated");
+            assert!(
+                matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                    if note.contains("kept off this machine") && note.contains("differs")),
+                "{rows:?}"
+            );
+            assert_eq!(layer(&home), gated);
+        }
+
+        // An inline body is compared as the declared path's is.
+        let gated = format!(
+            "{}when = \"host:no-such-bx-host\"\n",
+            inline("~/.gated", "held\\n")
+        );
+        let home = repo(&gated);
+        plant(&home, ".gated", b"held\n", 0o644);
+        assert_eq!(
+            add_rel(&home, ".gated"),
+            [Adoption::Unchanged {
+                target: target(&home, ".gated")
+            }],
+        );
         plant(&home, ".gated", b"mine\n", 0o644);
         let rows = add_rel(&home, ".gated");
         assert!(
             matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
-                if note.contains("kept off this machine")),
+                if note.contains("kept off this machine") && note.contains("differs")),
+            "{rows:?}"
+        );
+        assert_eq!(layer(&home), gated);
+
+        // A body that holds no bytes to compare is refused as such.
+        let gated = "[[target]]\npath = \"~/.gated\"\nsymlink = \"~/elsewhere\"\n\
+                     when = \"host:no-such-bx-host\"\n";
+        let home = repo(gated);
+        plant(&home, ".gated", b"held\n", 0o644);
+        let rows = add_rel(&home, ".gated");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                if note.contains("kept off this machine") && note.contains("does not adopt into")),
             "{rows:?}"
         );
         assert_eq!(layer(&home), gated);

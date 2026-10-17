@@ -358,6 +358,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         // ever per layer; a merged configuration holds none.
         when: None,
         gates: Vec::new(),
+        path_gates: Vec::new(),
         gated: Vec::new(),
     })
 }

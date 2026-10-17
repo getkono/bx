@@ -1785,10 +1785,6 @@ mod tests {
                 "name = \"a\"\ncommand = [\"a\"]\ncache = false\n",
                 "unknown key `cache`",
             ),
-            (
-                "name = \"a\"\ncommand = [\"a\"]\nwhen = \"ssh\"\n",
-                "unknown key `when`",
-            ),
         ] {
             let err = parse(&format!("[[activation]]\n{body}")).expect_err(body);
             assert!(err.contains(needle), "{body}: {err}");

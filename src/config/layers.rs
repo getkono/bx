@@ -77,7 +77,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::toggle::Section;
-use super::when::Decide;
+use super::when::{Decide, Gate};
 use super::{Config, Error, Layer, LayerKind, Origin, load_layer};
 use crate::paths::{self, LOCAL_FILE, local_layer_path};
 
@@ -431,6 +431,16 @@ fn gate_layer(config: &mut Config, decide: &dyn Decide) {
         .filter(|gate| gate.excludes(decide))
         .map(|gate| gate.origin.clone())
         .collect();
+    let dirs: Vec<&str> = config
+        .path_gates
+        .iter()
+        .filter(|(_, when)| when.gate(decide) == Gate::Never)
+        .map(|(dir, _)| dir.as_str())
+        .collect();
+    // A `[path]` entry has no toggle to name it, so its key is not recorded.
+    config
+        .path
+        .retain(|entry| !dirs.contains(&entry.shell.as_str()));
     if excluded.is_empty() {
         return;
     }
@@ -458,8 +468,6 @@ fn gate_layer(config: &mut Config, decide: &dyn Decide) {
     config
         .tools
         .retain(|t| keep(Section::Tool, &t.name, &t.origin));
-    // A `[path]` entry has no toggle to name it, so its key is not recorded.
-    config.path.retain(|entry| !out(&entry.origin));
     config.gated.extend(gated);
 }
 
@@ -1257,5 +1265,335 @@ mod tests {
             super::super::layer_files(&repo),
             Err(Error::RepoMissing(ref p)) if *p == repo
         ));
+    }
+
+    /// What `when` keeps off a machine, decided before the merge.
+    mod gated {
+        use super::super::gate;
+        use crate::config::merge::merge;
+        use crate::config::toggle::Section;
+        use crate::config::when::{Facts, Machine};
+        use crate::config::{Config, Error, Layer, LayerKind, parse_str};
+        use crate::testing::guarded_home;
+        use std::path::{Path, PathBuf};
+
+        fn home() -> PathBuf {
+            PathBuf::from("/var/home/example")
+        }
+
+        fn layer(file: &str, kind: LayerKind, text: &str) -> Layer {
+            Layer {
+                file: PathBuf::from(file),
+                kind,
+                config: parse_str(text, Path::new(file), &home())
+                    .unwrap_or_else(|e| panic!("{file}: {e}")),
+            }
+        }
+
+        fn module(name: &str, text: &str) -> Layer {
+            layer(&format!("modules/{name}"), LayerKind::Global, text)
+        }
+
+        /// A Linux machine called `box`, on which only `rg` is installed.
+        fn linux() -> Machine {
+            Machine {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                host: Some("box".to_string()),
+                user: Some("me".to_string()),
+                distro: None,
+            }
+        }
+
+        fn macos() -> Machine {
+            Machine {
+                os: "macos".to_string(),
+                arch: "aarch64".to_string(),
+                ..linux()
+            }
+        }
+
+        /// The layers, gated on `machine`, then merged.
+        fn merged_on(machine: &Machine, layers: Vec<Layer>) -> Result<Config, Error> {
+            let facts = Facts {
+                machine,
+                present: &|tool| tool == "rg",
+            };
+            merge(&gate(layers, &facts), &home())
+        }
+
+        fn target(path: &str, body: &str, when: &str) -> String {
+            format!("[[target]]\npath = \"{path}\"\ncontent = \"{body}\"\n{when}")
+        }
+
+        fn bodies(config: &Config) -> Vec<(String, String)> {
+            config
+                .targets
+                .iter()
+                .map(|t| (t.path.as_str().to_string(), format!("{:?}", t.body)))
+                .collect()
+        }
+
+        #[test]
+        fn every_gated_declaration_is_kept_only_where_its_condition_holds() {
+            let text = format!(
+                "{}{}[path]\nprepend = [\"/always\", {{ dir = \"/mac\", when = \"os:macos\" }}]\n\
+                 [[plugin]]\nname = \"p\"\nsource = \"~/p.zsh\"\nwhen = \"has:fd\"\n\
+                 [[activation]]\nname = \"a\"\ncommand = [\"a\"]\nwhen = [\"os:linux\", \"host:box\"]\n\
+                 [[external]]\npath = \"~/x\"\nurl = \"https://example.com/x.git\"\n\
+                 rev = \"0123456789012345678901234567890123456789\"\nwhen = \"user:me\"\n\
+                 [[tool]]\nname = \"t\"\nwhen = \"arch:aarch64\"\n",
+                target("~/.mac", "m", "when = \"os:macos\"\n"),
+                target("~/.rg", "r", "when = \"has:rg\"\n"),
+            );
+            let names = |config: &Config| {
+                (
+                    config
+                        .targets
+                        .iter()
+                        .map(|t| t.path.as_str().to_string())
+                        .collect::<Vec<_>>(),
+                    config
+                        .path
+                        .iter()
+                        .map(|p| p.dir.clone())
+                        .collect::<Vec<_>>(),
+                    config.plugins.len(),
+                    config.activations.len(),
+                    config.externals.len(),
+                    config.tools.len(),
+                )
+            };
+
+            let on_linux = merged_on(&linux(), vec![layer("bx.toml", LayerKind::Global, &text)])
+                .expect("merges");
+            assert_eq!(
+                names(&on_linux),
+                (
+                    vec!["~/.rg".to_string()],
+                    vec!["/always".to_string()],
+                    0,
+                    1,
+                    1,
+                    0
+                )
+            );
+            let on_mac = merged_on(&macos(), vec![layer("bx.toml", LayerKind::Global, &text)])
+                .expect("merges");
+            assert_eq!(
+                names(&on_mac),
+                (
+                    vec!["~/.mac".to_string(), "~/.rg".to_string()],
+                    vec!["/always".to_string(), "/mac".to_string()],
+                    0,
+                    0,
+                    1,
+                    1
+                )
+            );
+
+            // Every key a gate left out is recorded, and nothing else.
+            let facts = Facts {
+                machine: &linux(),
+                present: &|_| false,
+            };
+            let gated = gate(vec![layer("bx.toml", LayerKind::Global, &text)], &facts);
+            assert_eq!(
+                gated[0].config.gated,
+                [
+                    (Section::Target, "~/.mac".to_string()),
+                    (Section::Target, "~/.rg".to_string()),
+                    (Section::Plugin, "p".to_string()),
+                    (Section::Tool, "t".to_string()),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_gated_module_contributes_nothing_where_its_condition_does_not_hold() {
+            let mac = module(
+                "macos.toml",
+                &format!(
+                    "when = [\"os:macos\", \"has:rg\"]\n{}\
+                     [[env]]\nname = \"BROWSER\"\nvalue = \"open\"\nkind = \"interactive\"\n\
+                     [[alias]]\nname = \"o\"\ncommand = \"open\"\n\
+                     [history]\nsize = 10\n",
+                    target("~/.mac", "m", ""),
+                ),
+            );
+            let on_linux = merged_on(&linux(), vec![mac.clone()]).expect("merges");
+            assert!(on_linux.targets.is_empty());
+            assert!(on_linux.envs.is_empty());
+            assert!(on_linux.aliases.is_empty());
+            assert_eq!(on_linux.history, Config::default().history);
+
+            let on_mac = merged_on(&macos(), vec![mac]).expect("merges");
+            assert_eq!(on_mac.targets.len(), 1);
+            assert_eq!(on_mac.envs.len(), 1);
+            assert_eq!(on_mac.aliases.len(), 1);
+            assert_ne!(on_mac.history, Config::default().history);
+        }
+
+        #[test]
+        fn a_gated_entry_overrides_an_earlier_one_only_where_it_holds() {
+            let layers = || {
+                vec![
+                    layer("bx.toml", LayerKind::Global, &target("~/.x", "shared", "")),
+                    module(
+                        "macos.toml",
+                        &target("~/.x", "mac", "when = \"os:macos\"\n"),
+                    ),
+                    module("zz.toml", &target("~/.x", "linux", "when = \"os:linux\"\n")),
+                ]
+            };
+            let body = |machine: &Machine| bodies(&merged_on(machine, layers()).expect("merges"));
+            assert_eq!(
+                body(&linux()),
+                [("~/.x".to_string(), "Inline(\"linux\")".to_string())]
+            );
+            assert_eq!(
+                body(&macos()),
+                [("~/.x".to_string(), "Inline(\"mac\")".to_string())]
+            );
+        }
+
+        #[test]
+        fn a_toggle_naming_only_a_gated_entry_flips_nothing() {
+            let layers = |toggle: &str| {
+                vec![
+                    module(
+                        "macos.toml",
+                        &format!(
+                            "when = \"os:macos\"\n{}\
+                             [[tool]]\nname = \"brew\"\n",
+                            target("~/.mac", "m", "")
+                        ),
+                    ),
+                    layer(
+                        "bx.toml",
+                        LayerKind::Global,
+                        &format!(
+                            "{}[[plugin]]\nname = \"p\"\nsource = \"~/p.zsh\"\nwhen = \"os:macos\"\n",
+                            target("~/.gated", "g", "when = \"os:macos\"\n")
+                        ),
+                    ),
+                    layer("local.toml", LayerKind::Local, toggle),
+                ]
+            };
+            for toggle in [
+                "[[target]]\npath = \"~/.mac\"\nenabled = false\n",
+                "[[target]]\npath = \"~/.gated\"\nenabled = true\n",
+                "[[tool]]\nname = \"brew\"\nenabled = false\n",
+                "[[plugin]]\nname = \"p\"\nenabled = true\n",
+            ] {
+                let on_linux =
+                    merged_on(&linux(), layers(toggle)).unwrap_or_else(|e| panic!("{toggle}: {e}"));
+                assert!(on_linux.targets.is_empty(), "{toggle}");
+                assert!(on_linux.tools.is_empty(), "{toggle}");
+                assert!(on_linux.plugins.is_empty(), "{toggle}");
+                merged_on(&macos(), layers(toggle)).unwrap_or_else(|e| panic!("{toggle}: {e}"));
+            }
+            // A toggle naming nothing on any machine is still refused.
+            let message = merged_on(
+                &linux(),
+                layers("[[target]]\npath = \"~/.typo\"\nenabled = false\n"),
+            )
+            .expect_err("a typo")
+            .to_string();
+            assert!(
+                message.contains("which no earlier layer declares"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn two_gated_terminal_plugins_never_meet() {
+            let terminal = |name: &str, os: &str| {
+                module(
+                    &format!("{os}.toml"),
+                    &format!(
+                        "when = \"os:{os}\"\n[[plugin]]\nname = \"{name}\"\n\
+                         source = \"~/{name}.zsh\"\nterminal = true\n"
+                    ),
+                )
+            };
+            let layers = || vec![terminal("a", "linux"), terminal("b", "macos")];
+            for machine in [linux(), macos()] {
+                let config = merged_on(&machine, layers()).expect("one claimant per machine");
+                assert_eq!(config.plugins.len(), 1, "{machine:?}");
+            }
+        }
+
+        #[test]
+        fn a_runtime_condition_or_a_gated_value_is_refused_at_load() {
+            for (text, needle) in [
+                (
+                    target("~/.x", "x", "when = \"interactive\"\n"),
+                    "`when = \"interactive\"` is a test the shell runs",
+                ),
+                (
+                    "[[tool]]\nname = \"t\"\nwhen = [\"os:linux\", \"login\"]\n".to_string(),
+                    "`when = \"login\"` is a test the shell runs",
+                ),
+                (
+                    "[[external]]\npath = \"~/x\"\nurl = \"https://example.com/x.git\"\n\
+                     rev = \"0123456789012345678901234567890123456789\"\nwhen = \"ssh\"\n"
+                        .to_string(),
+                    "is a test the shell runs",
+                ),
+                (
+                    "when = \"env:TMUX\"\n".to_string(),
+                    "`when = \"env:TMUX\"` is a test the shell runs",
+                ),
+                (
+                    "when = 1\n".to_string(),
+                    "`when` must be a string or an array of strings",
+                ),
+                (
+                    "[when]\n".to_string(),
+                    "`when` must be a string or an array of strings",
+                ),
+                (
+                    "when = \"os:linux\"\n[[value]]\nname = \"v\"\nkind = \"string\"\n".to_string(),
+                    "may not declare a `[[value]]`",
+                ),
+                (
+                    "when = \"os:linux\"\n[[value]]\nname = \"v\"\nenabled = false\n".to_string(),
+                    "may not declare a `[[value]]`",
+                ),
+            ] {
+                let message = parse_str(&text, Path::new("modules/m.toml"), &home())
+                    .expect_err(&text)
+                    .to_string();
+                assert!(message.contains(needle), "{text}: {message}");
+            }
+        }
+
+        #[test]
+        fn only_a_module_may_carry_a_top_level_when() {
+            let home = guarded_home();
+            let repo = home.child(".config/bx");
+            let state = home.child(".local/state/bx");
+            home.write(".config/bx/modules/mac.toml", "when = \"os:macos\"\n");
+            let layers =
+                super::super::load_layer_set(&repo, &state, home.path()).expect("a module may");
+            assert!(layers[0].config.when.is_some());
+
+            for rel in [".config/bx/bx.toml", ".local/state/bx/local.toml"] {
+                let file = home.write(rel, "\nwhen = \"os:macos\"\n");
+                let message = super::super::load_layer_set(&repo, &state, home.path())
+                    .expect_err(rel)
+                    .to_string();
+                assert!(
+                    message.starts_with(&format!("{}:2:", file.display())),
+                    "{rel}: {message}"
+                );
+                assert!(
+                    message.contains("only a file in `modules/`"),
+                    "{rel}: {message}"
+                );
+                std::fs::write(&file, "").expect("emptied");
+            }
+        }
     }
 }

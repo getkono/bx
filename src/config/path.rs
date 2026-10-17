@@ -83,7 +83,7 @@ use std::path::Path;
 use toml_edit::{InlineTable, Table, Value};
 
 use super::shells::{Shell, Shells};
-use super::when::{self, Condition};
+use super::when::{self, When};
 use super::{Ctx, Error, Origin};
 use crate::lexical::is_variable_name;
 
@@ -147,12 +147,14 @@ pub struct PathEntry {
 /// `if_exists` on a `remove` entry, a `shells` that names no shell or one
 /// bx does not generate for, or a `when` that is not a condition bx decides.
 ///
-/// Every entry's `when` is pushed onto `gates`, found again by its origin.
+/// Every entry's `when` is pushed onto `gates` beside the entry's natural
+/// key, [`PathEntry::shell`]: several entries may share a line, and so an
+/// origin, but no two in one layer share a key.
 pub fn parse_path(
     table: &Table,
     file: &Path,
     text: &str,
-    gates: &mut Vec<Condition>,
+    gates: &mut Vec<(String, When)>,
 ) -> Result<Vec<PathEntry>, Error> {
     let ctx = Ctx::new(table, file, text, SECTION);
     ctx.reject_unknown_keys(table, &LISTS.map(|(key, _)| key))?;
@@ -170,18 +172,19 @@ pub fn parse_path(
                 || ctx.key_origin(table, key),
                 |s| Origin::at(file, text, &s),
             );
-            if let Some(gate) = value
+            let gate = value
                 .as_inline_table()
                 .and_then(|entry| entry.get(when::KEY))
-            {
-                let when = when::decided(Some(gate), gate.type_name())
-                    .map_err(|refusal| refusal.at(origin.clone()))?;
-                gates.push(Condition {
-                    origin: origin.clone(),
-                    when,
-                });
+                .map(|gate| {
+                    when::decided(Some(gate), gate.type_name())
+                        .map_err(|refusal| refusal.at(origin.clone()))
+                })
+                .transpose()?;
+            let entry = parse_entry(value, key, position, origin)?;
+            if let Some(when) = gate {
+                gates.push((entry.shell.clone(), when));
             }
-            entries.push(parse_entry(value, key, position, origin)?);
+            entries.push(entry);
         }
     }
     Ok(entries)

@@ -242,6 +242,27 @@ Your config repo lives wherever you want it; `bx init` proposes
 Everything specific to you or to one machine — answers, the write record, caches,
 and the key that decrypts your secrets — stays outside the repo, on the machine.
 
+**Some machines only.** A `[[target]]`, `[path]` entry, `[[plugin]]`,
+`[[activation]]`, `[[external]]` or `[[tool]]` may say `when` it applies, and
+a file in `modules/` may say it once, at the top, for everything in it:
+
+```toml
+# modules/macos.toml
+when = "os:macos"                 # or ["os:macos", "arch:aarch64"]: all of them
+
+[[target]]
+path = "~/.hammerspoon/init.lua"
+file = "files/hammerspoon.lua"
+```
+
+`when` names what bx decides as it plans: `os:linux`/`os:macos`,
+`arch:x86_64`/`arch:aarch64`, `host:NAME`, `user:NAME`, `distro:ID` and
+`has:TOOL`. Where it does not hold, the declaration is not declared on that
+machine: it overrides nothing an earlier file said, and a file it wrote there
+before is reported for `bx rm`, as with `enabled = false`. A test only a
+shell can answer (`interactive`, `login`, `ssh`, `env:…`) is refused there,
+and so is a top-level `when` in `bx.toml` or `local.toml`.
+
 ## Externals
 
 A git repository you want on every machine — a zsh plugin, a theme, a

@@ -152,10 +152,14 @@ pub struct Config {
     /// The layer's own top-level `when`: the condition every declaration in
     /// it is gated on. Only a module may carry one; see [`layers::gate`].
     pub when: Option<when::Condition>,
-    /// The `when` of each `[[target]]`, `[path]` entry, `[[plugin]]`,
-    /// `[[activation]]`, `[[external]]` and `[[tool]]` that carries one, found
-    /// again by the entry's origin. See [`layers::gate`].
+    /// The `when` of each `[[target]]`, `[[plugin]]`, `[[activation]]`,
+    /// `[[external]]` and `[[tool]]` that carries one, found again by the
+    /// entry's origin, which is its own header's line. See [`layers::gate`].
     pub gates: Vec<when::Condition>,
+    /// The `when` of each `[path]` entry that carries one, beside the entry's
+    /// natural key, [`path::PathEntry::shell`]: entries share a line, so no
+    /// origin tells them apart.
+    pub path_gates: Vec<(String, when::When)>,
     /// The natural key of every entry [`layers::gate`] left out of this
     /// layer because its condition does not hold here, so a later toggle
     /// naming it flips nothing rather than naming nothing.
@@ -492,7 +496,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     expected: "a table `[path]`",
                     found: item.type_name(),
                 })?;
-                config.path = path::parse_path(table, file, text, &mut config.gates)?;
+                config.path = path::parse_path(table, file, text, &mut config.path_gates)?;
             }
             "history" => {
                 let table = item.as_table().ok_or_else(|| Error::WrongType {

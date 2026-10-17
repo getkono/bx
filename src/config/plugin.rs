@@ -3,6 +3,14 @@
 //! with must keep.
 //!
 //! The line itself is [`crate::shell::plugin`]'s.
+//!
+//! An entry may carry `when`, one condition bx decides or an array that is
+//! all of several (`has:TOOL`, `os:OS`, `arch:ARCH`, `host:NAME`,
+//! `user:NAME`, `distro:ID`; see [`super::when`]). Where it does not hold
+//! the plugin is not declared on this machine, so it is not sourced and
+//! claims no terminal slot: `modules/macos.toml` and `modules/linux.toml`
+//! may each name their own terminal plugin. A test only the shell could run
+//! is refused when the config loads ([`super::layers::gate`]).
 
 use std::path::Path;
 

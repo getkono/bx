@@ -47,7 +47,8 @@ pub struct Inputs {
     /// `bx.lock`: the commit each followed external is kept at.
     pub(super) lock: Lock,
     /// Every enabled external the committed layers declare without this
-    /// account's `local.toml`, or `None` when they cannot be merged alone.
+    /// account's `local.toml`, on any machine — no `when` is decided for
+    /// it — or `None` when they cannot be merged alone.
     pub(super) committed_externals: Option<Vec<External>>,
 }
 
@@ -85,17 +86,20 @@ impl Inputs {
             machine: host.machine(),
             present: &present,
         };
-        // What a `when` keeps off this machine is left out before anything
-        // merges, so it neither replaces nor collides with what stays.
-        let layers = layers::gate(layers::load_layer_set(&repo, state.root(), &home)?, &facts);
-        let merged = merge::merge(&layers, &home)?;
+        let loaded = layers::load_layer_set(&repo, state.root(), &home)?;
         // What every machine sharing the config repo declares: the layers
-        // `bx.lock` is committed beside, without this account's own.
-        let committed: Vec<Layer> = layers
+        // `bx.lock` is committed beside, without this account's own, and
+        // with nothing a `when` keeps to other machines left out, so a
+        // follow gated to another machine keeps its commit in the lock.
+        let committed: Vec<Layer> = loaded
             .iter()
             .filter(|layer| layer.kind == LayerKind::Global)
             .cloned()
             .collect();
+        // What a `when` keeps off this machine is left out before anything
+        // merges, so it neither replaces nor collides with what stays.
+        let layers = layers::gate(loaded, &facts);
+        let merged = merge::merge(&layers, &home)?;
         let committed_externals = merge::merge(&committed, &home)
             .ok()
             .map(|config| config.externals);
@@ -263,5 +267,110 @@ mod tests {
         let note = decide::guard_fragment(&fragment, &inputs.roots).expect("refused");
         let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();
         assert!(note.contains(&inside), "{note}");
+    }
+
+    #[test]
+    fn a_gated_target_and_module_come_and_go_with_the_machine_the_inputs_carry() {
+        use crate::config::when::Distro;
+        use crate::paths::Portable;
+        use crate::plan::tests::{apply, inline, plan};
+        use crate::report::Action;
+
+        let home = guarded_home();
+        home.write(".gitconfig.local", "mine\n");
+        seed(
+            home.path(),
+            &format!(
+                "{}when = [\"host:box\", \"distro:rhel\"]\n",
+                inline("~/.boxed", "b\\n")
+            ),
+        );
+        home.write(
+            ".config/bx/modules/macos.toml",
+            &format!("when = \"os:macos\"\n{}", inline("~/.mac", "m\\n")),
+        );
+        let on = |os: &str, host: &str| {
+            let machine = Machine {
+                os: os.to_string(),
+                arch: "aarch64".to_string(),
+                host: Some(host.to_string()),
+                user: None,
+                distro: Some(Distro {
+                    id: "fedora".to_string(),
+                    id_like: vec!["rhel".to_string()],
+                }),
+            };
+            Inputs::load_on(
+                &env(home.path()),
+                activation::System::new("", activation::TIMEOUT).with_machine(machine),
+            )
+            .expect("the inputs load")
+        };
+        let declared = |inputs: &Inputs| -> Vec<String> {
+            inputs
+                .declared_targets()
+                .map(|(target, _)| target.path.as_str().to_string())
+                .collect()
+        };
+        let rows = |inputs: &Inputs| -> Vec<(String, Action)> {
+            let mut rows: Vec<_> = plan(inputs)
+                .changes
+                .iter()
+                .filter(|change| ["~/.boxed", "~/.mac"].contains(&change.target.as_str()))
+                .map(|change| (change.target.to_string(), change.action))
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        // Neither condition holds: nothing is declared, and nothing planned.
+        let neither = on("linux", "other");
+        assert!(declared(&neither).is_empty());
+        assert!(rows(&neither).is_empty());
+
+        // Both hold: both arrive, and a second plan is empty.
+        let both = on("macos", "BOX");
+        assert_eq!(declared(&both), ["~/.boxed", "~/.mac"]);
+        apply(&both);
+        assert_eq!(
+            std::fs::read_to_string(home.child(".mac")).expect("written"),
+            "m\n"
+        );
+        assert!(
+            plan(&both)
+                .actions()
+                .iter()
+                .all(|action| *action == Action::Unchanged),
+            "{:?}",
+            plan(&both).actions()
+        );
+        let written = std::fs::read(home.child(".boxed")).expect("written");
+        apply(&both);
+        assert_eq!(std::fs::read(home.child(".boxed")).expect("kept"), written);
+
+        // Off macOS the module's target is no longer declared, exactly as an
+        // `enabled = false` one is, and nothing is written for it.
+        let linux = on("linux", "box");
+        assert_eq!(declared(&linux), ["~/.boxed"]);
+        assert_eq!(
+            rows(&linux),
+            [
+                ("~/.boxed".to_string(), Action::Unchanged),
+                ("~/.mac".to_string(), Action::Undeclared),
+            ]
+        );
+        assert!(!apply(&linux).executed);
+        assert!(home.child(".mac").exists());
+
+        // `bx rm` then puts back what was there before: nothing.
+        let state = StateDir::resolve(home.path());
+        let mac = Portable::parse_in("~/.mac", home.path()).expect("a portable path");
+        crate::restore::restore(&state, home.path(), &[mac]).expect("rm");
+        assert!(!home.child(".mac").exists());
+        assert_eq!(rows(&linux), [("~/.boxed".to_string(), Action::Unchanged)]);
+        assert_eq!(
+            std::fs::read_to_string(home.child(".gitconfig.local")).expect("untouched"),
+            "mine\n"
+        );
     }
 }

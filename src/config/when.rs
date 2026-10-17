@@ -50,6 +50,21 @@
 //! **at most one** runtime test may remain — two are refused when the config
 //! loads — so a guarded block keeps the single opener the guard already
 //! reads. There is no `or` and no `not`.
+//!
+//! # Gating a whole declaration, or a whole module
+//!
+//! A `[[target]]`, a `[path]` entry, a `[[plugin]]`, an `[[activation]]`, an
+//! `[[external]]` and a `[[tool]]` take `when` too, and so does a file in
+//! `modules/`, as a top-level key that gates everything in it — say
+//! `modules/macos.toml` opening with `when = "os:macos"`. These are not
+//! lines in a generated file but whole declarations, kept or left out as
+//! `plan` loads the configuration ([`super::layers::gate`]), so only the
+//! conditions bx decides may gate them; a runtime test there, and a
+//! top-level `when` in `bx.toml` or `local.toml`, which apply on every
+//! machine, are refused when the config loads. Where the condition does not
+//! hold the declaration is not declared on this machine: it replaces no
+//! earlier layer's entry, and a later toggle naming it flips nothing. A gated
+//! module may not declare a `[[value]]`, which every layer refers to by name.
 
 use std::fmt;
 
@@ -1058,6 +1073,56 @@ mod tests {
             let err = When::parse_all(raws).expect_err(needle);
             assert!(err.contains(needle), "{raws:?}: {err}");
         }
+    }
+
+    #[test]
+    fn a_whole_declaration_takes_only_conditions_bx_decides() {
+        let value = |raw: &str| raw.parse::<Value>().expect("a TOML value");
+        let decided_of = |raw: &str| decided(Some(&value(raw)), "value");
+
+        assert_eq!(
+            decided_of("\"os:macos\"").expect("decided"),
+            When::Os("macos")
+        );
+        let both = decided_of("[\"has:sccache\", \"host:box\"]").expect("decided");
+        let here = fedora();
+        let box_with = |present: &dyn Fn(&str) -> bool| {
+            Condition {
+                origin: super::super::Origin::unknown(std::path::Path::new("m.toml")),
+                when: both.clone(),
+            }
+            .excludes(&Facts {
+                machine: &here,
+                present,
+            })
+        };
+        assert!(!box_with(&|tool| tool == "sccache"));
+        assert!(box_with(&|_| false));
+
+        for (raw, needle) in [
+            ("\"ssh\"", "`when = \"ssh\"` is a test the shell runs"),
+            (
+                "[\"os:linux\", \"env:TMUX\"]",
+                "`when = \"env:TMUX\"` is a test the shell runs",
+            ),
+            ("\"interactive\"", DECIDED),
+            ("\"os:beos\"", "`os:` names one of"),
+        ] {
+            match decided_of(raw) {
+                Err(Refusal::Bad(message)) => assert!(message.contains(needle), "{raw}: {message}"),
+                other => panic!("{raw}: {other:?}"),
+            }
+        }
+        for (raw, found) in [("true", "boolean"), ("[1]", "integer")] {
+            match decided_of(raw) {
+                Err(Refusal::WrongType(name)) => assert_eq!(name, found, "{raw}"),
+                other => panic!("{raw}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            decided(None, "table"),
+            Err(Refusal::WrongType("table"))
+        ));
     }
 
     #[test]

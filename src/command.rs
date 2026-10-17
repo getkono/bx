@@ -515,6 +515,15 @@ fn update_with(
                  bx update locks on top of it as it stands."
             ),
         )?,
+        Err(sync::Error::UpstreamGone {
+            branch, upstream, ..
+        }) => say(
+            out,
+            &format!(
+                "The config repo's {branch} tracks {upstream}, which does not exist, so there is \
+                 nothing to pull; bx update locks on top of it as it stands."
+            ),
+        )?,
         Err(sync::Error::NotARepo { .. }) => say(
             out,
             "The config repo is not a git repository, so there is nothing to pull or commit; \

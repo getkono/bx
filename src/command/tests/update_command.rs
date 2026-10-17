@@ -733,6 +733,30 @@ fn a_config_repo_with_no_upstream_is_locked_as_it_stands() {
 }
 
 #[test]
+fn a_config_repo_whose_upstream_is_gone_is_locked_as_it_stands() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let repo = cloned(&home, &layer());
+    run(
+        home.path(),
+        &repo,
+        &["config", "branch.master.merge", "refs/heads/gone"],
+    );
+    let mut out = Vec::new();
+    let exit = update(&home, true, &mut out).expect("update");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert!(
+        text(&out).starts_with("The config repo's master tracks origin/gone, which does not"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        run(home.path(), &repo, &["log", "-1", "--format=%s"]),
+        "chore(bx): update bx.lock"
+    );
+}
+
+#[test]
 fn a_branch_diverged_only_by_unpushed_lock_commits_catches_up_and_locks_again() {
     let home = guarded_home();
     upstream(&home, &["skills/a/SKILL.md"]);

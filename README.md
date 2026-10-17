@@ -275,7 +275,9 @@ A target under a directory only one OS reads must be kept to that OS:
 or its module's. Without it the configuration is refused as it loads, on
 every OS, so you learn on the machine you wrote it on. `~/library/` in
 any other case is `~/Library/` on macOS, so it needs an `os:` too. `bx add`
-writes the `when` itself.
+writes the `when` itself. A path that gets there only through a `{{name}}`
+is judged once the value is answered: a committed `default` that leads
+there is refused, and an answer in `local.toml` holds that target back.
 
 An `[[env]]` variable of `kind = "environment"` or `"gui"`, which reaches
 the programs your graphical session starts, needs no `when`: bx writes it to

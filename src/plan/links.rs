@@ -358,6 +358,7 @@ fn link_target(external: &External, link: &Link, child: &str, home: &Path) -> Op
         references: Vec::new(),
         enabled: true,
         origin: link.origin.clone(),
+        gates: Vec::new(),
     })
 }
 

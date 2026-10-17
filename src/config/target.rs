@@ -49,7 +49,10 @@
 //! A target under a directory only one OS reads — `~/.config/systemd/user`
 //! and `~/.config/environment.d` on Linux, `~/Library` on macOS — must be
 //! kept to that OS by its own `when` or its module's, or the layer is refused
-//! as it loads, on every OS. See [`refuse_ungated_platform`].
+//! as it loads, on every OS. See [`refuse_ungated_platform`]. A path that
+//! reaches such a directory only once a `{{name}}` in it is answered is judged
+//! again after substitution, by the same gates: a committed `default` leading
+//! there fails the load, and an account's answer blocks the target.
 //!
 //! # Why the discriminant keys are flat
 //!
@@ -168,6 +171,15 @@ pub struct Target {
     pub enabled: bool,
     /// Where the entry was written.
     pub origin: Origin,
+    /// The conditions that keep it to this machine: its own `when` and its
+    /// module's, which [`refuse_ungated_platform`] reads again once a
+    /// `{{name}}` in its path is answered.
+    ///
+    /// Empty as parsed, where both stay on the layer for [`super::layers::gate`]
+    /// to decide; [`super::merge::merge`] carries them here, after every gate is
+    /// decided, so a target that reaches resolution holds only conditions that
+    /// held. Empty on a target bx makes itself.
+    pub gates: Vec<super::when::When>,
 }
 
 /// What a target's content is.
@@ -1027,6 +1039,7 @@ pub fn parse_entry(table: &Table, file: &Path, text: &str, home: &Path) -> Resul
         references,
         enabled: ctx.bool_at(table, "enabled")?.unwrap_or(true),
         origin: ctx.origin().clone(),
+        gates: Vec::new(),
     }))
 }
 

@@ -1060,6 +1060,7 @@ mod tests {
                 file: PathBuf::from("/repo/bx.toml"),
                 line: 3,
             },
+            gates: Vec::new(),
         }
     }
 

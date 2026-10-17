@@ -479,12 +479,17 @@ mod tests {
                 String::from_utf8_lossy(&expected)
             );
         }
-        // macOS's bash is 3.2, which has no `BASH_ALIASES`.
-        if let Some(bash) = installed("bash").filter(|_| cfg!(target_os = "linux")) {
+        if let Some(bash) = installed("bash") {
+            // `alias NAME` rather than bash 4's `BASH_ALIASES`, so the probe
+            // runs in macOS's bash 3.2 too. bash prints the body single-quoted
+            // for its own input, so evaluating that recovers its bytes.
             let got = run(
                 &bash,
                 &["--norc", "--noprofile"],
-                &script("printf '%s\\0' \"${BASH_ALIASES[NAME]}\""),
+                &script(
+                    "__bx_a=$(alias NAME); eval \"__bx_a=${__bx_a#alias NAME=}\"; \
+                     printf '%s\\0' \"$__bx_a\"",
+                ),
             );
             assert_eq!(
                 String::from_utf8_lossy(&got),

@@ -114,10 +114,11 @@ jobs:
       - uses: jdx/mise-action@v2
         with:
           install: false
-      # The differential tests need real zsh, bun and uv, for the reasons
-      # written out in `check`. zsh ships with macOS, so there is no apt step,
-      # and the user-namespace provisions are Linux's alone: the tests that
-      # need them are Linux-only. bash is held to Linux only (macOS's is 3.2).
+      # The differential tests need real bash, zsh, bun and uv, for the reasons
+      # written out in `check`. bash and zsh ship with macOS, so there is no
+      # apt step, and the user-namespace provisions are Linux's alone: the
+      # tests that need them are Linux-only. The bash on PATH may be macOS's
+      # 3.2 or a later one, and the tests hold either to what bx supports.
       # The uv pin and its exact-release-tag ref are the ones `check` uses.
       - uses: oven-sh/setup-bun@v2
       - uses: astral-sh/setup-uv@v10.2.0

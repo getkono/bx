@@ -185,6 +185,9 @@ pub struct Context {
     /// the user's.
     git: crate::git::Git,
     trees: Vec<TreeDecl>,
+    /// Every `[[target]]` the layer `add` writes declares and a `when` keeps
+    /// off this machine, as written: [`kept_elsewhere`].
+    elsewhere: Vec<crate::config::target::Target>,
     /// Whether a directory looks names up without regard to case:
     /// [`crate::fs::case_insensitive`], which tests replace.
     folds: fn(&Path) -> Option<bool>,
@@ -235,6 +238,39 @@ fn trees_of(layers: &[Layer], values: &ResolvedValues) -> Result<Vec<TreeDecl>, 
     Ok(found)
 }
 
+/// Every `[[target]]` the layer at `file` declares that [`layers::gate`] left
+/// out of it on this machine, read back from the layer's own parse.
+///
+/// Gating keeps only each one's key ([`Config::gated`]), and `add` needs its
+/// body and mode to tell whether adopting the file would change anything.
+///
+/// [`Config::gated`]: crate::config::Config::gated
+fn kept_elsewhere(
+    layers: &[Layer],
+    file: &Path,
+    home: &Path,
+) -> Result<Vec<crate::config::target::Target>, Error> {
+    let Some(layer) = layers.iter().find(|layer| layer.file == file) else {
+        return Ok(Vec::new());
+    };
+    let gated: BTreeSet<&str> = layer
+        .config
+        .gated
+        .iter()
+        .filter(|(section, _)| *section == merge::Section::Target)
+        .map(|(_, key)| key.as_str())
+        .collect();
+    if gated.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (text, _) = open_layer(&layer.file)?;
+    Ok(config::parse_str(&text, &layer.file, home)?
+        .targets
+        .into_iter()
+        .filter(|target| gated.contains(target.path.as_str()))
+        .collect())
+}
+
 impl Context {
     /// Locate the config repo and the state directory and load the layer set,
     /// exactly as `plan` does: on this machine, so what a `when` keeps off it
@@ -263,6 +299,7 @@ impl Context {
             .owning(&[state.root().to_path_buf()])
             .with_config_repos(std::slice::from_ref(&repo));
         let trees = trees_of(&layers, &resolved.values)?;
+        let elsewhere = kept_elsewhere(&layers, &repo.join(GLOBAL_LAYER), &home)?;
         Ok(Self {
             home,
             repo,
@@ -272,8 +309,22 @@ impl Context {
             roots,
             git: crate::git::Git::new(env),
             trees,
+            elsewhere,
             folds: crate::fs::case_insensitive,
         })
+    }
+
+    /// The `[[target]]` the layer `add` writes declares for `target` and a
+    /// `when` keeps off this machine, when there is one.
+    ///
+    /// [`Context::declared`] reads the layer set on this machine, so such a
+    /// target is undeclared to it. One layer may not declare a path twice,
+    /// gated or not, so `add` must not declare it in that layer again.
+    fn kept_elsewhere(&self, target: &Portable) -> Option<&crate::config::target::Target> {
+        let values = &self.resolved.values;
+        self.elsewhere
+            .iter()
+            .find(|kept| resolved_path(kept.path.as_str(), values).is_some_and(|p| p == *target))
     }
 
     /// The account's home.
@@ -858,6 +909,9 @@ fn decide_file(
              adding it again"
         ))),
         Declared::No => {
+            if let Some(kept) = ctx.kept_elsewhere(target) {
+                return Ok(kept_elsewhere_adoption(ctx, kept, target, &bytes, mode));
+            }
             if let Some(note) = ctx.declared_by_case(target) {
                 return Ok(refused(note));
             }
@@ -909,6 +963,40 @@ fn decide_file(
                 warnings,
             })
         }
+    }
+}
+
+/// What adopting a file means when `bx.toml` already declares its path, kept
+/// off this machine by a `when` ([`Context::kept_elsewhere`]).
+///
+/// Nothing is declared a second time, since one layer may not declare a path
+/// twice. Where the repo copy that declaration names already holds these
+/// bytes and this mode, there is nothing to do; otherwise the file is refused
+/// naming the declaration to change.
+fn kept_elsewhere_adoption(
+    ctx: &Context,
+    kept: &crate::config::target::Target,
+    target: &Portable,
+    bytes: &[u8],
+    mode: Mode,
+) -> Adoption {
+    let same = match &kept.body {
+        Body::File(rel) => std::fs::read(ctx.repo.join(rel)).is_ok_and(|held| held == bytes),
+        _ => false,
+    } && Mode::resolve(kept.mode, Kind::File) == mode;
+    if same {
+        return Adoption::Unchanged {
+            target: target.clone(),
+        };
+    }
+    Adoption::Refused {
+        target: target.clone(),
+        note: format!(
+            "is already declared at {}, kept off this machine by its `when`, and differs \
+             from what it declares; one layer declares a path once, so change that \
+             declaration rather than adding it again",
+            kept.origin
+        ),
     }
 }
 
@@ -2058,6 +2146,32 @@ mod tests {
             matches!(rows.as_slice(), [Adoption::Adopt { .. }]),
             "adopted as undeclared, neither refused nor owned: {rows:?}"
         );
+    }
+
+    #[test]
+    fn a_target_bx_toml_keeps_off_this_machine_is_not_declared_there_twice() {
+        let gated = "[[target]]\npath = \"~/.gated\"\nfile = \"files/.gated\"\n\
+                     when = \"host:no-such-bx-host\"\n";
+        let home = repo(gated);
+        home.write(".config/bx/files/.gated", "held\n");
+
+        plant(&home, ".gated", b"held\n", 0o644);
+        assert_eq!(
+            add_rel(&home, ".gated"),
+            [Adoption::Unchanged {
+                target: target(&home, ".gated")
+            }],
+        );
+        assert_eq!(layer(&home), gated);
+
+        plant(&home, ".gated", b"mine\n", 0o644);
+        let rows = add_rel(&home, ".gated");
+        assert!(
+            matches!(rows.as_slice(), [Adoption::Refused { note, .. }]
+                if note.contains("kept off this machine")),
+            "{rows:?}"
+        );
+        assert_eq!(layer(&home), gated);
     }
 
     #[test]

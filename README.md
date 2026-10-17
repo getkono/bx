@@ -216,7 +216,11 @@ path, `bx rm` when a conflict left something as it was, and
   `bx.lock` holds no commit for, a `bx.lock` entry nothing follows any more,
   an update stamp that holds no time, a `local.toml` inside the config
   repo, which bx never loads, and a `bash` on `PATH` older than 4.4 — macOS's
-  is 3.2 — that leaves out bash's question about updates. It has no notion of a cache's size limit or of
+  is 3.2 — that leaves out bash's question about updates. With
+  `[doctor] login-shell = "zsh"` (or `"bash"`), usually in `local.toml`, it
+  also reports an account whose login shell is another, quoting the `chsh`
+  that changes it, never running it, and a session whose `$SHELL` still names
+  the old one. It has no notion of a cache's size limit or of
   an integration gone stale, and reports neither.
 
 ### Fast enough to forget

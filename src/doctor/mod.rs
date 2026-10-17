@@ -14,9 +14,11 @@
 //! Doctor takes no exclusive lock and writes nothing under the state directory
 //! or the home, so it runs beside an `apply` that holds the lock. It starts no
 //! process but the one read-only `systemctl --user show` [`systemd`] builds,
-//! the one read-only `launchctl print` [`launchd`] builds on macOS, and
+//! the one read-only `launchctl print` [`launchd`] builds on macOS,
 //! `bash --version` when bash's generated file asks about updates
-//! ([`bash`]).
+//! ([`bash`]), and, when `[doctor] login-shell` asserts a shell, the one
+//! read-only account lookup [`login_shell`] builds: `getent passwd` on Linux,
+//! `dscacheutil` on macOS.
 //!
 //! The checks, in order:
 //!
@@ -46,10 +48,15 @@
 //! 12. [`bash`] — bash's generated file asks about followed externals'
 //!     updates, and the `bash` on `PATH` is older than 4.4, which leaves the
 //!     question out.
+//! 13. [`login_shell`] — the account's login shell is not the one
+//!     `[doctor] login-shell` asserts, with the `chsh` that changes it quoted,
+//!     never run; it could not be read; or it is, and this session's `$SHELL`
+//!     is still another.
 
 pub mod bash;
 pub mod externals;
 pub mod launchd;
+pub mod login_shell;
 pub mod modes;
 pub mod orphans;
 pub mod references;
@@ -99,6 +106,8 @@ pub struct Probes<'a> {
     pub launchd: &'a dyn launchd::Query,
     /// The question put to the `bash` on `path`.
     pub bash: &'a dyn bash::Query,
+    /// The question put to the account database about the login shell.
+    pub login_shell: &'a dyn login_shell::Query,
 }
 
 /// Run every check against `inputs`, in the order the module lists them.
@@ -141,6 +150,10 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
     ));
     findings.extend(stray_local::check(inputs.repo(), inputs.state(), home));
     findings.extend(bash::check(inputs.targets(), probes.path, probes.bash));
+    findings.extend(login_shell::check(
+        resolved.doctor.login_shell.as_ref(),
+        probes.login_shell,
+    ));
     Report { findings }
 }
 
@@ -256,18 +269,38 @@ content = \"a\\n\"
                 systemd,
                 launchd: &Unasked,
                 bash: &bash::Version,
+                login_shell: &Unasked,
             },
         );
         (render(&report, home.path()), exit(&report))
     }
 
     /// A launchd no test here may ask: what they declare is placed for
-    /// Linux, which has no LaunchAgent.
+    /// Linux, which has no LaunchAgent. And an account database no test may
+    /// ask that asserts no login shell.
     struct Unasked;
 
     impl launchd::Query for Unasked {
         fn loaded(&self, label: &str) -> Result<bool, launchd::Unreachable> {
             panic!("launchd was asked about {label}")
+        }
+    }
+
+    impl login_shell::Query for Unasked {
+        fn account(&self) -> Result<String, login_shell::Unreadable> {
+            panic!("the login shell was asked with none asserted")
+        }
+
+        fn session(&self) -> Option<String> {
+            panic!("$SHELL was asked with no login shell asserted")
+        }
+    }
+
+    /// An account that logs in to `account`, in a session started with it.
+    fn logs_in_to(account: &str) -> login_shell::Fixed {
+        login_shell::Fixed {
+            account: Ok(account.to_string()),
+            session: Some(account.to_string()),
         }
     }
 
@@ -367,14 +400,29 @@ required = true
 [[tool]]
 name = \"bx-no-such-tool\"
 install = \"sudo dnf install bx-no-such-tool\"
+
+[doctor]
+login-shell = \"zsh\"
 ";
 
-    /// Run doctor over `layer` in `home`, looking for tools along `path`.
+    /// Run doctor over `layer` in `home`, looking for tools along `path`, on
+    /// an account that logs in to bash.
     fn doctor_of(
         home: &crate::testing::GuardedHome,
         layer: &str,
         path: &OsStr,
         systemd: &dyn Query,
+    ) -> (String, Exit) {
+        doctor_as(home, layer, path, systemd, &logs_in_to("/bin/bash"))
+    }
+
+    /// [`doctor_of`], asking `login_shell` about the account's login shell.
+    fn doctor_as(
+        home: &crate::testing::GuardedHome,
+        layer: &str,
+        path: &OsStr,
+        systemd: &dyn Query,
+        login_shell: &dyn login_shell::Query,
     ) -> (String, Exit) {
         let inputs = inputs(home, layer);
         let unit_dir = paths::systemd_user_dir_in(home.path(), None);
@@ -386,6 +434,7 @@ install = \"sudo dnf install bx-no-such-tool\"
                 systemd,
                 launchd: &Unasked,
                 bash: &bash::Version,
+                login_shell,
             },
         );
         (render(&report, home.path()), exit(&report))
@@ -468,7 +517,9 @@ install = \"sudo dnf install bx-no-such-tool\"
              \x20 ! ~/.config/bx/local.toml is inside the config repo, so bx never loads it \
              and could publish it; move what it holds into ~/.local/state/bx/local.toml, the \
              local layer bx loads\n\
-             Doctor: 9 finding(s).\n"
+             \x20 ! login shell  (~/.config/bx/bx.toml:25) is /bin/bash, not the asserted zsh; \
+             `chsh -s \"$(command -v zsh)\"` changes it\n\
+             Doctor: 10 finding(s).\n"
         );
         assert_eq!(code, Exit::Pending);
         assert_eq!(first, second, "two runs print the same bytes");
@@ -515,11 +566,12 @@ install = \"sudo dnf install bx-no-such-tool\"
             ..disabled()
         };
 
-        let (out, code) = doctor_of(
+        let (out, code) = doctor_as(
             &home,
             EVERY_CHECK,
             home.child("bin").as_os_str(),
             &Every::unit(enabled),
+            &logs_in_to("/usr/bin/zsh"),
         );
 
         assert_eq!(out, "Doctor: 0 finding(s).\n");

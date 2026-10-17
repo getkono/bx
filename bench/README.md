@@ -33,20 +33,27 @@ bench holds it twice. Read: the lines of those files, comments aside, that hold
 a command substitution, which covers branches this home never takes; it counts
 the hand-written rc files' four as well, so a pattern that finds nothing is
 known to work. Traced: the shell runs bx's lines alone — the regions, cut out
-of the rc files, in the bx home — and once they are done and it has waited,
-reads its own `/proc/$$/stat` with builtins. A shell carries the page faults
-of every child it waited for in that file's `cminflt`, and no process runs
-without faulting, so the field is 0 exactly when bx's files started nothing,
-whatever else the machine is doing. The hand-written rc files' activation
-lines, traced the same way, must read above 0. **Gated**: any is a failure.
+of the rc files, in the bx home — and the processes it started are counted,
+each way 0 exactly when bx's files started nothing, whatever else the machine
+is doing. On Linux, once they are done and it has waited, the shell reads its
+own `/proc/$$/stat` with builtins: a shell carries the page faults of every
+child it waited for in that file's `cminflt`, and no process runs without
+faulting. On macOS, which has no `/proc` and whose shells' builtins expose no
+child page faults, a small Python tracer starts the shell and counts its forks
+through a kqueue `NOTE_FORK` filter it registers before the shell's first
+line runs; every command and subshell a shell starts begins as a fork. The
+hand-written rc files' activation lines, traced the same way, must read
+above 0. **Gated**: any is a failure.
 
 **`reads`** — invariant 6 says the startup path parses no configuration file.
 Every file under the bx home's `~/.config` and `~/.local/state` — bx's config
 repo, its `local.toml` and state, and the tool configs it delivered — has its
 access time set into the past, and each shell's traced start must leave all
-of them unread. A read the harness makes first proves the filesystem records
-reads; on a `noatime` mount the bench refuses to run (set `TMPDIR`
-elsewhere). **Gated**: any read is a failure.
+of them unread. Linux's `relatime` and macOS's default APFS mounts both record
+such a read, and BSD `find -newerat` and `touch -a -t` behave as GNU's do. A
+read the harness makes first proves the filesystem records reads; on a
+`noatime` mount the bench refuses to run (set `TMPDIR` elsewhere). **Gated**:
+any read is a failure.
 
 **`net`** — a hand-written rc file that activates the same four tools with
 `eval "$(tool init zsh)"` or `bash`, against bx's. **Reported, never gated**:

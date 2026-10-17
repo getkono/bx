@@ -22,6 +22,7 @@
 
 pub mod activation;
 pub mod alias;
+pub mod doctor;
 pub mod env;
 pub mod external;
 pub mod function;
@@ -133,6 +134,8 @@ pub struct Config {
     pub keybindings: keybindings::Keybindings,
     /// `[update]`: a table, merged key by key. See [`update`].
     pub update: update::Update,
+    /// `[doctor]`: a table, merged key by key. See [`doctor`].
+    pub doctor: doctor::Doctor,
     /// List entries that restate only their natural key and `enabled`.
     ///
     /// A **toggle**: it flips the flag on an entry an earlier layer introduced
@@ -527,6 +530,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     found: item.type_name(),
                 })?;
                 config.update = update::parse_update(table, file, text)?;
+            }
+            "doctor" => {
+                let table = item.as_table().ok_or_else(|| Error::WrongType {
+                    origin: section_origin(root, name, file, text),
+                    key: name.to_string(),
+                    expected: "a table `[doctor]`",
+                    found: item.type_name(),
+                })?;
+                config.doctor = doctor::parse_doctor(table, file, text)?;
             }
             "keybindings" => {
                 let table = item.as_table().ok_or_else(|| Error::WrongType {

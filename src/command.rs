@@ -85,6 +85,7 @@ fn doctor_with(
             systemd,
             launchd: &doctor::launchd::Launchctl::default(),
             bash: &doctor::bash::Version,
+            login_shell: &doctor::login_shell::Account::default(),
         },
     );
     out.write_all(doctor::render(&report, &env.home).as_bytes())

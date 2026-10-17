@@ -208,6 +208,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut shell_options = ShellOptions::default();
     let mut keybindings = Keybindings::default();
     let mut update = super::update::Update::default();
+    let mut doctor = super::doctor::Doctor::default();
 
     // Values first, across every layer. A value never depends on a target, and
     // a target's key depends on the values — the final ones, because the file a
@@ -235,6 +236,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         shell_options.absorb(&layer.config.shell_options);
         keybindings.absorb(&layer.config.keybindings);
         update.absorb(&layer.config.update);
+        doctor.absorb(&layer.config.doctor);
 
         values.absorb(layer.config.values.iter().cloned());
         envs.absorb(layer.config.envs.iter().cloned());
@@ -348,6 +350,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         shell_options,
         keybindings,
         update,
+        doctor,
         // Consumed above; a merged configuration has no toggles left to apply.
         toggles: Vec::new(),
         conflicts: clashes

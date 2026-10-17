@@ -1300,7 +1300,7 @@ mod tests {
 
     /// What `when` keeps off a machine, decided before the merge.
     mod gated {
-        use super::super::gate;
+        use super::super::{gate, gated_externals};
         use crate::config::merge::merge;
         use crate::config::toggle::Section;
         use crate::config::when::{Facts, Machine};
@@ -1674,6 +1674,48 @@ mod tests {
                 ["~/.mac/a", "~/.mac/sub/b", "~/.all/a", "~/.all/sub/b"]
             );
             assert!(gated.is_empty());
+        }
+
+        #[test]
+        fn gated_externals_are_exactly_what_this_machine_leaves_out() {
+            let external = |path: &str, when: &str| {
+                format!(
+                    "[[external]]\npath = \"{path}\"\nurl = \"https://example.com/x.git\"\n\
+                     rev = \"0123456789012345678901234567890123456789\"\n{when}"
+                )
+            };
+            // Beside an entry its own `when` excludes sit one whose `when`
+            // holds and one with none: neither is left out, though the layer
+            // holds a gate that excludes and a gate on each one's origin.
+            let layers = vec![
+                layer(
+                    "bx.toml",
+                    LayerKind::Global,
+                    &format!(
+                        "{}{}{}",
+                        external("~/mac", "when = \"os:macos\"\n"),
+                        external("~/linux", "when = \"os:linux\"\n"),
+                        external("~/always", ""),
+                    ),
+                ),
+                module(
+                    "macos.toml",
+                    &format!("when = \"os:macos\"\n{}", external("~/module", "")),
+                ),
+            ];
+            let paths = |machine: &Machine| {
+                let facts = Facts {
+                    machine,
+                    present: &|_| false,
+                };
+                gated_externals(&layers, &facts)
+                    .iter()
+                    .map(|e| e.path.as_str().to_string())
+                    .collect::<Vec<_>>()
+            };
+
+            assert_eq!(paths(&linux()), ["~/mac", "~/module"]);
+            assert_eq!(paths(&macos()), ["~/linux"]);
         }
     }
 }

@@ -46,6 +46,11 @@
 //! `enabled = false`, and `bx rm` puts the prior bytes back. A tree's `when`
 //! gates every file it expands to. See [`super::layers::gate`].
 //!
+//! A target under a directory only one OS reads — `~/.config/systemd/user`
+//! and `~/.config/environment.d` on Linux, `~/Library` on macOS — must be
+//! kept to that OS by its own `when` or its module's, or the layer is refused
+//! as it loads, on every OS. See [`refuse_ungated_platform`].
+//!
 //! # Why the discriminant keys are flat
 //!
 //! `attach = "region"` with a sibling `comment = "#"`, not
@@ -1469,6 +1474,47 @@ pub(crate) fn refuse_file_at_home_or_above(
         ));
     }
     Ok(())
+}
+
+/// The directories only one OS reads, each beside that OS as `os:` spells it.
+///
+/// The systemd user manager reads unit files and `environment.d` on Linux
+/// alone, and `~/Library` is macOS's: a file there on the other OS is
+/// written for nothing to read.
+pub(crate) const PLATFORM_ANCHORS: [(&str, &str); 3] = [
+    ("~/.config/systemd/user", "linux"),
+    ("~/.config/environment.d", "linux"),
+    ("~/Library", "macos"),
+];
+
+/// Refuse a target at `path` that lies under one of [`PLATFORM_ANCHORS`]
+/// unless one of `gates` — its own `when`, its module's — names that
+/// anchor's OS.
+///
+/// Judged as the layer loads, before any gate is decided, so a target meant
+/// for one OS is refused on every OS: its author learns on the machine they
+/// wrote it on, not on the other one. Containment is lexical
+/// ([`crate::lexical::is_within`]), like the environment guard's, so a path
+/// reaching an anchor through a symlink is not seen. The message is returned
+/// for the caller to attach the entry's origin.
+pub(crate) fn refuse_ungated_platform(
+    path: &Portable,
+    gates: &[&super::when::When],
+) -> Result<(), String> {
+    let Some((anchor, os)) = PLATFORM_ANCHORS
+        .iter()
+        .find(|(anchor, _)| crate::lexical::is_within(path.as_str(), anchor))
+    else {
+        return Ok(());
+    };
+    if gates.iter().any(|when| when.names_os(os)) {
+        return Ok(());
+    }
+    Err(format!(
+        "`{path}` lies under `{anchor}`, which only {os} reads, so it must be kept to {os}: \
+         add `when = \"os:{os}\"` to the target, or move it to a module whose own `when` \
+         says so"
+    ))
 }
 
 /// A tree's root: a directory in the config repo, confined to it as a `file`

@@ -374,6 +374,9 @@ pub fn load_layer(path: &Path, repo: &Path, home: &Path) -> Result<Layer, Error>
     })?;
     let mut config = parse_str(&text, path, home)?;
     tree::expand(&mut config, repo, home)?;
+    // Again over the files the trees expanded to: a tree rooted above an
+    // anchor, at `~/.config` say, reaches into it only through its files.
+    refuse_ungated_platform_targets(&config)?;
 
     Ok(Layer {
         file: path.to_path_buf(),
@@ -728,6 +731,7 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .collect(),
     )?;
     refuse_gated_values(&config)?;
+    refuse_ungated_platform_targets(&config)?;
 
     Ok(config)
 }
@@ -784,6 +788,34 @@ fn refuse_gated_values(config: &Config) -> Result<(), Error> {
                 .to_string(),
         }),
     }
+}
+
+/// Refuse every target and tree in `config` that lies under a directory only
+/// one OS reads without being kept to that OS, by its own `when` or its
+/// layer's. See [`target::refuse_ungated_platform`].
+///
+/// # Errors
+///
+/// [`Error::BadValue`] at the first such entry.
+fn refuse_ungated_platform_targets(config: &Config) -> Result<(), Error> {
+    let entries = config
+        .targets
+        .iter()
+        .map(|target| (&target.path, &target.origin))
+        .chain(config.trees.iter().map(|tree| (&tree.path, &tree.origin)));
+    for (path, origin) in entries {
+        let gates: Vec<&when::When> = config
+            .when
+            .iter()
+            .chain(config.gates.iter().filter(|gate| gate.origin == *origin))
+            .map(|gate| &gate.when)
+            .collect();
+        target::refuse_ungated_platform(path, &gates).map_err(|message| Error::BadValue {
+            origin: origin.clone(),
+            message,
+        })?;
+    }
+    Ok(())
 }
 
 /// The toggles in `config` that belong to one section, as `check_unique` wants
@@ -1703,6 +1735,95 @@ mod tests {
         let error = load_layer(&missing, dir.path(), home()).expect_err("should be an error");
         assert!(matches!(error, Error::Io { .. }));
         assert!(error.to_string().contains("bx.toml"));
+    }
+
+    #[test]
+    fn a_target_under_a_platform_directory_loads_only_when_kept_to_its_os() {
+        let module = |top: &str, own: &str, path: &str| {
+            parse_str(
+                &format!("{top}[[target]]\npath = \"{path}\"\ncontent = \"x\"\n{own}"),
+                Path::new("modules/m.toml"),
+                home(),
+            )
+        };
+        for path in [
+            "~/.config/systemd/user/a.service",
+            "~/.config/environment.d/60-a.conf",
+            "~/.config/systemd/user/{{slice}}.slice",
+        ] {
+            for (top, own) in [
+                ("", ""),
+                ("", "when = \"os:macos\"\n"),
+                ("when = \"os:macos\"\n", ""),
+                ("", "when = [\"has:systemctl\", \"host:box\"]\n"),
+            ] {
+                let error = module(top, own, path).expect_err("refused");
+                assert!(
+                    error.to_string().contains("which only linux reads"),
+                    "{path} {top:?} {own:?}: {error}"
+                );
+            }
+            for (top, own) in [
+                ("", "when = \"os:linux\"\n"),
+                ("", "when = [\"has:systemctl\", \"os:linux\"]\n"),
+                ("when = \"os:linux\"\n", ""),
+                (
+                    "when = [\"os:linux\", \"host:box\"]\n",
+                    "when = \"has:x\"\n",
+                ),
+            ] {
+                module(top, own, path).unwrap_or_else(|e| panic!("{path} {top:?} {own:?}: {e}"));
+            }
+        }
+        let error = module("", "when = \"os:linux\"\n", "~/Library/Preferences/a.plist")
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains("which only macos reads"),
+            "{error}"
+        );
+        module("when = \"os:macos\"\n", "", "~/Library").expect("kept to macOS by its module");
+        // The anchor is a directory, not a prefix of a name.
+        module("", "", "~/Libraryx").expect("not under ~/Library");
+        module("", "", "~/.config/systemd/a.service").expect("not a user unit");
+
+        // A tree rooted under an anchor is judged as written.
+        let error = parse_str(
+            "[[target]]\npath = \"~/Library/Fonts\"\ntree = \"files/fonts\"\n",
+            Path::new("bx.toml"),
+            home(),
+        )
+        .expect_err("refused");
+        assert!(
+            error.to_string().contains("which only macos reads"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_tree_reaching_a_platform_directory_is_judged_by_the_files_it_expands_to() {
+        let tree = "[[target]]\npath = \"~/.config\"\ntree = \"files/config\"\n";
+        let dir = repo(&[
+            ("bx.toml", tree),
+            ("files/config/git/config", "x"),
+            ("files/config/systemd/user/a.service", "x"),
+        ]);
+        let error =
+            load_layer(&dir.path().join("bx.toml"), dir.path(), home()).expect_err("refused");
+        assert!(
+            error
+                .to_string()
+                .contains("`~/.config/systemd/user/a.service` lies under"),
+            "{error}"
+        );
+
+        std::fs::write(
+            dir.path().join("bx.toml"),
+            format!("{tree}when = \"os:linux\"\n"),
+        )
+        .expect("write");
+        let layer =
+            load_layer(&dir.path().join("bx.toml"), dir.path(), home()).expect("kept to Linux");
+        assert_eq!(layer.config.targets.len(), 2);
     }
 
     // --- parsing ----------------------------------------------------------

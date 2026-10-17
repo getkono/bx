@@ -435,6 +435,21 @@ impl When {
         }
     }
 
+    /// Whether this condition, or one of the conditions an array spells, is
+    /// `os:OS` for exactly `os`.
+    ///
+    /// A claim about what was written, not about what holds: it is how a
+    /// declaration under a directory only one OS reads shows it is kept to
+    /// that OS ([`super::target::refuse_ungated_platform`]).
+    #[must_use]
+    pub(crate) fn names_os(&self, os: &str) -> bool {
+        match self {
+            Self::Os(named) => *named == os,
+            Self::All(all) => all.iter().any(|when| when.names_os(os)),
+            _ => false,
+        }
+    }
+
     /// Whether every condition bx decides holds against `decide`; a runtime
     /// test is the shell's to decide, and counts as holding here.
     fn holds(&self, decide: &dyn Decide) -> bool {
@@ -1073,6 +1088,15 @@ mod tests {
             let err = When::parse_all(raws).expect_err(needle);
             assert!(err.contains(needle), "{raws:?}: {err}");
         }
+    }
+
+    #[test]
+    fn a_condition_names_an_os_alone_or_among_others() {
+        let when = |raws: &[&str]| When::parse_all(raws).expect("a condition");
+        assert!(when(&["os:linux"]).names_os("linux"));
+        assert!(!when(&["os:linux"]).names_os("macos"));
+        assert!(when(&["host:box", "os:macos"]).names_os("macos"));
+        assert!(!when(&["host:box", "distro:fedora"]).names_os("linux"));
     }
 
     #[test]

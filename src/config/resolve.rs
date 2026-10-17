@@ -100,6 +100,8 @@ pub struct Resolved {
     pub tools: Vec<super::tool::ToolDecl>,
     /// The merged `[update]` table: nothing in it is substituted.
     pub update: super::update::Update,
+    /// The merged `[doctor]` table: nothing in it is substituted.
+    pub doctor: super::doctor::Doctor,
 }
 
 /// Resolve a merged configuration.
@@ -168,6 +170,7 @@ pub fn resolve(
         secrets: merged.secrets.clone(),
         tools: merged.tools.clone(),
         update: merged.update.clone(),
+        doctor: merged.doctor.clone(),
     })
 }
 

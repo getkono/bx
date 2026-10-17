@@ -978,8 +978,11 @@ fn doctor_looks_at_the_applied_example_and_changes_nothing() {
     assert_same(&before, &machine.everything(), "doctor wrote something");
 
     // On macOS the LaunchAgent is asked about: `apply` loads nothing, so
-    // launchd has not loaded it, or has no GUI domain to say so in.
+    // launchd has not loaded it, or has no GUI domain to say so in. The label
+    // is the account's, not the tempdir home's: where bx's own agent is
+    // already loaded for this account, doctor rightly finds nothing to say.
     let agent = "~/Library/LaunchAgents/dev.bx.environment.plist";
+    let loaded = cfg!(target_os = "macos") && account_has_loaded("dev.bx.environment");
     let asked = doctor.stdout().lines().any(|line| {
         line.starts_with(&format!("  ! {agent}  ("))
             && line.contains(" is written but launchd has not loaded it")
@@ -987,7 +990,12 @@ fn doctor_looks_at_the_applied_example_and_changes_nothing() {
                 "  ! launchd is unreachable, so {agent} went unchecked"
             ))
     });
-    assert_eq!(asked, cfg!(target_os = "macos"), "{}", doctor.stdout());
+    assert_eq!(
+        asked,
+        cfg!(target_os = "macos") && !loaded,
+        "loaded for this account: {loaded}\n{}",
+        doctor.stdout()
+    );
 
     // The example follows a branch, so bash's file asks about updates, which
     // a bash older than 4.4 — macOS's 3.2 — leaves out, and doctor says so.
@@ -1010,6 +1018,23 @@ fn doctor_looks_at_the_applied_example_and_changes_nothing() {
         "bash {version}:\n{}",
         doctor.stdout()
     );
+}
+
+/// Whether launchd has loaded `label` in this account's GUI domain — the same
+/// `launchctl print` doctor asks, put from outside it, so a machine whose own
+/// bx agent is loaded expects no finding rather than failing.
+fn account_has_loaded(label: &str) -> bool {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("id runs");
+    let uid = String::from_utf8_lossy(&uid.stdout);
+    std::process::Command::new("/bin/launchctl")
+        .args(["print", &format!("gui/{}/{label}", uid.trim())])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[test]

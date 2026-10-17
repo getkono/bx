@@ -588,6 +588,7 @@ fn target(path: Portable, generator: Gen, attach: Attach, origin: &Origin) -> Ta
         references: Vec::new(),
         enabled: true,
         origin: origin.clone(),
+        gates: Vec::new(),
     }
 }
 

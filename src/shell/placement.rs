@@ -498,6 +498,7 @@ fn placed_target(
         references: Vec::new(),
         enabled: true,
         origin: origin.clone(),
+        gates: Vec::new(),
     }
 }
 

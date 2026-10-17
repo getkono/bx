@@ -258,6 +258,7 @@ fn expand_one(tree: &Tree, repo: &Path, home: &Path) -> Result<Vec<Target>, Erro
                 references: Vec::new(),
                 enabled: tree.enabled,
                 origin: tree.origin.clone(),
+                gates: Vec::new(),
             })
         })
         .collect()

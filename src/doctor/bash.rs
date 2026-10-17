@@ -140,6 +140,7 @@ mod tests {
                 file: "/repo/bx.toml".into(),
                 line: 3,
             },
+            gates: Vec::new(),
         })
     }
 

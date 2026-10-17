@@ -9,6 +9,7 @@ use super::requirement::check_requirement;
 use crate::config::Error;
 use crate::config::target::{Attach, Body, Format, KeyPath, Target};
 use crate::config::values::ResolvedValues;
+use crate::config::when::When;
 use crate::paths::Portable;
 
 /// Why [`substituted`] could not rebuild a target.
@@ -163,6 +164,12 @@ pub(super) fn substituted(target: &Target, values: &ResolvedValues) -> Result<Ta
     let path = portable(target.path.as_str())?;
     crate::config::target::refuse_file_at_home_or_above(path.as_str(), &path, &body, values.home())
         .map_err(|message| field(target.path.as_str(), message))?;
+    // And the load's platform refusal, which saw `{{lib}}/x.plist` and could
+    // not tell that an answer of `~/Library` puts it under a directory only
+    // macOS reads. The gates are the ones the load judged it by.
+    let gates: Vec<&When> = target.gates.iter().collect();
+    crate::config::target::refuse_ungated_platform(&path, &gates)
+        .map_err(|message| field(target.path.as_str(), message))?;
 
     Ok(Target {
         path,
@@ -187,6 +194,7 @@ pub(super) fn substituted(target: &Target, values: &ResolvedValues) -> Result<Ta
             .collect::<Result<Vec<_>, Broken>>()?,
         enabled: target.enabled,
         origin: target.origin.clone(),
+        gates: target.gates.clone(),
     })
 }
 
@@ -225,6 +233,128 @@ mod tests {
         .unwrap();
 
         assert_eq!(ready(&resolved, 0).path.as_str(), "~/.config/bx/dark.toml");
+    }
+
+    /// A string value `sub`, and a target whose path reaches a platform
+    /// anchor only through it, with `when` after the target's own keys.
+    fn anchored(path: &str, default: &str, when: &str) -> String {
+        format!(
+            "[[value]]\nname = \"sub\"\nkind = \"string\"\n{default}\
+             [[target]]\npath = \"{path}\"\ncontent = \"x\"\n{when}"
+        )
+    }
+
+    #[test]
+    fn an_answer_that_moves_a_target_under_a_platform_anchor_blocks_it_unless_gated() {
+        for (path, answer, os) in [
+            ("~/.config/{{sub}}/a.service", "systemd/user", "linux"),
+            ("~/.config/{{sub}}/a.conf", "environment.d", "linux"),
+            ("~/{{sub}}/LaunchAgents/a.plist", "Library", "macos"),
+        ] {
+            let local = format!("[values]\nsub = \"{answer}\"\n");
+            let ungated = resolved(&anchored(path, "", ""), Some(&local))
+                .expect("an account's answer blocks its target, not the load");
+            let entry = blocked(&ungated, 0);
+            assert_eq!(
+                entry.reason,
+                BlockReason::InvalidValue {
+                    names: vec!["sub".to_string()]
+                },
+                "{path}"
+            );
+            assert!(
+                entry.hint.contains(&format!("only {os} reads")),
+                "{path}: {}",
+                entry.hint
+            );
+            assert!(entry.hint.contains("local.toml:2"), "{}", entry.hint);
+
+            let gated = format!("when = \"os:{os}\"\n");
+            let kept = resolved(&anchored(path, "", &gated), Some(&local)).unwrap();
+            assert_eq!(
+                ready(&kept, 0).gates,
+                vec![crate::config::when::When::Os(os)],
+                "{path}: the gate the load judged it by reaches resolution"
+            );
+
+            let other = if os == "linux" { "macos" } else { "linux" };
+            let wrong = format!("when = \"os:{other}\"\n");
+            let misgated = resolved(&anchored(path, "", &wrong), Some(&local)).unwrap();
+            let entry = blocked(&misgated, 0);
+            assert!(
+                entry.hint.contains(&format!("only {os} reads")),
+                "{}",
+                entry.hint
+            );
+        }
+
+        // An answer that leads nowhere near an anchor resolves ungated.
+        let elsewhere = resolved(
+            &anchored("~/.config/{{sub}}/a.service", "", ""),
+            Some("[values]\nsub = \"systemd/system\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            ready(&elsewhere, 0).path.as_str(),
+            "~/.config/systemd/system/a.service"
+        );
+    }
+
+    #[test]
+    fn a_committed_default_that_leads_under_a_platform_anchor_fails_the_load() {
+        let default = "default = \"systemd/user\"\n";
+        let message = resolved(&anchored("~/.config/{{sub}}/a.service", default, ""), None)
+            .expect_err("a committed default under an anchor is a repo defect");
+        assert!(message.starts_with("bx.toml:5: "), "{message}");
+        assert!(message.contains("only linux reads"), "{message}");
+
+        let gated = "when = [\"arch:x86_64\", \"os:linux\"]\n";
+        let kept = resolved(
+            &anchored("~/.config/{{sub}}/a.service", default, gated),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ready(&kept, 0).path.as_str(),
+            "~/.config/systemd/user/a.service"
+        );
+    }
+
+    #[test]
+    fn a_module_s_own_when_keeps_a_substituted_target_under_a_platform_anchor() {
+        use super::super::tests::{home, layer};
+        use crate::config::LayerKind;
+
+        let target = "[[target]]\npath = \"~/{{sub}}/LaunchAgents/a.plist\"\ncontent = \"x\"\n";
+        let resolve = |module: &str| {
+            let layers = [
+                layer("bx.toml", LayerKind::Global, &anchored("~/.x", "", "")),
+                layer("modules/mac.toml", LayerKind::Global, module),
+                layer(
+                    "local.toml",
+                    LayerKind::Local,
+                    "[values]\nsub = \"Library\"\n",
+                ),
+            ]
+            .map(Result::unwrap);
+            let merged = crate::config::merge::merge(&layers, &home()).unwrap();
+            super::super::resolve(&merged, &home(), crate::shell::placement::place).unwrap()
+        };
+
+        let kept = resolve(&format!("when = \"os:macos\"\n{target}"));
+        assert_eq!(
+            ready(&kept, 1).path.as_str(),
+            "~/Library/LaunchAgents/a.plist"
+        );
+        assert_eq!(
+            ready(&kept, 1).gates,
+            [crate::config::when::When::Os("macos")]
+        );
+        assert!(ready(&kept, 0).gates.is_empty(), "bx.toml carries no gate");
+
+        let ungated = resolve(target);
+        let entry = blocked(&ungated, 1);
+        assert!(entry.hint.contains("only macos reads"), "{}", entry.hint);
     }
 
     #[test]

@@ -318,8 +318,11 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         folded.push(layer);
     }
 
+    let mut targets = targets.into_enabled();
+    carry_gates(&mut targets, layers);
+
     Ok(Config {
-        targets: targets.into_enabled(),
+        targets,
         // A tree is expanded as its layer is loaded, into the targets above;
         // what the merge folds has none left.
         trees: Vec::new(),
@@ -358,12 +361,50 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
             .map(|clash| clash.into_conflict(&resolved))
             .collect(),
         // A gate is decided before the merge, by `layers::gate`, and only
-        // ever per layer; a merged configuration holds none.
+        // ever per layer; a merged configuration holds none. What a target's
+        // gates still say about it travels on the target: see `carry_gates`.
         when: None,
         gates: Vec::new(),
         path_gates: Vec::new(),
         gated: Vec::new(),
     })
+}
+
+/// Give each of `targets` the conditions it was declared under: its own
+/// `when` and its module's, found in the layer that declared it.
+///
+/// By then [`super::layers::gate`] has decided every one of them and dropped
+/// the targets whose conditions do not hold, so what is carried is only ever a
+/// condition that held. [`super::resolve`] reads it again once a `{{name}}` in
+/// the path is answered: the load judged the path as written, and an answer
+/// can move it under a directory only one OS reads
+/// ([`super::target::refuse_ungated_platform`]).
+///
+/// The layer is found by the target's origin, which names one file and the
+/// line of its header, and a tree's files carry the tree's own.
+fn carry_gates(targets: &mut [Target], layers: &[Layer]) {
+    for target in targets {
+        let declared = |config: &&Config| {
+            config
+                .targets
+                .iter()
+                .any(|declared| declared.origin == target.origin)
+        };
+        let Some(config) = layers.iter().map(|layer| &layer.config).find(declared) else {
+            continue;
+        };
+        target.gates = config
+            .when
+            .iter()
+            .chain(
+                config
+                    .gates
+                    .iter()
+                    .filter(|gate| gate.origin == target.origin),
+            )
+            .map(|gate| gate.when.clone())
+            .collect();
+    }
 }
 
 /// Refuse a `[values]` table in a committed layer.

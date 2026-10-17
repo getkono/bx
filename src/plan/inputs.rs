@@ -10,13 +10,13 @@ use crate::config::lock::Lock;
 use crate::config::merge;
 use crate::config::resolve::{self, Resolution, Resolved};
 use crate::config::target::Target;
-use crate::config::when::Machine;
+use crate::config::when::{Facts, Machine};
 use crate::config::{Layer, LayerKind};
 use crate::env::Env;
 use crate::env_guard::RootSet;
 use crate::git::Git;
 use crate::paths;
-use crate::shell::activation;
+use crate::shell::activation::{self, Host as _};
 use crate::state::StateDir;
 
 /// What a run decides against, loaded once.
@@ -46,8 +46,11 @@ pub struct Inputs {
     pub(super) host: activation::System,
     /// `bx.lock`: the commit each followed external is kept at.
     pub(super) lock: Lock,
-    /// Every enabled external the committed layers declare without this
-    /// account's `local.toml`, or `None` when they cannot be merged alone.
+    /// Every external the committed layers declare without this account's
+    /// `local.toml`, on any machine: those enabled where they merge on this
+    /// one, then every one a `when` keeps to other machines, as declared
+    /// ([`layers::gated_externals`]). `None` when the committed layers
+    /// cannot be merged alone on this machine.
     pub(super) committed_externals: Option<Vec<External>>,
 }
 
@@ -62,21 +65,52 @@ impl Inputs {
     /// [`Error::RepoMissing`] when there is no config repo, and
     /// [`Error::Config`] for anything else the configuration refuses.
     pub fn load(env: &Env) -> Result<Self, Error> {
+        // The machine's facts are read here, once, so every condition on
+        // them in this run is decided against the same answers.
+        let host = activation::System::from_env().with_machine(Machine::read(env.user.clone()));
+        Self::load_on(env, host)
+    }
+
+    /// [`Inputs::load`], on `host`: the machine every condition bx decides —
+    /// a declaration's or a module's `when` as the layers load, and a
+    /// generated line's as `plan` renders it — is decided against, and an
+    /// activation's tool runs on.
+    ///
+    /// # Errors
+    ///
+    /// As [`Inputs::load`].
+    pub fn load_on(env: &Env, host: activation::System) -> Result<Self, Error> {
         let home = env.home.clone();
         let repo = paths::config_root_in(&home, env.xdg_config_home.as_deref());
         let state = StateDir::resolve_in(&home, env.xdg_state_home.as_deref());
-        let layers = layers::load_layer_set(&repo, state.root(), &home)?;
-        let merged = merge::merge(&layers, &home)?;
+        let present = |tool: &str| host.locate(tool).is_usable();
+        let facts = Facts {
+            machine: host.machine(),
+            present: &present,
+        };
+        let loaded = layers::load_layer_set(&repo, state.root(), &home)?;
         // What every machine sharing the config repo declares: the layers
         // `bx.lock` is committed beside, without this account's own.
-        let committed: Vec<Layer> = layers
+        let committed: Vec<Layer> = loaded
             .iter()
             .filter(|layer| layer.kind == LayerKind::Global)
             .cloned()
             .collect();
-        let committed_externals = merge::merge(&committed, &home)
-            .ok()
-            .map(|config| config.externals);
+        // What a `when` keeps to other machines is never merged: two such
+        // declarations may only clash where both hold, which no machine
+        // reaches, so it is taken as declared beside what this machine
+        // merges, and a follow gated to another machine keeps its commit.
+        let elsewhere = layers::gated_externals(&committed, &facts);
+        // What a `when` keeps off this machine is left out before anything
+        // merges, so it neither replaces nor collides with what stays.
+        let committed = layers::gate(committed, &facts);
+        let layers = layers::gate(loaded, &facts);
+        let merged = merge::merge(&layers, &home)?;
+        let committed_externals = merge::merge(&committed, &home).ok().map(|config| {
+            let mut externals = config.externals;
+            externals.extend(elsewhere);
+            externals
+        });
         let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let lock = Lock::read(&repo, &home)?;
         let roots = RootSet::from_values(&resolved.values)
@@ -92,9 +126,7 @@ impl Inputs {
             progress: env.stderr_tty,
             git: Git::new(env).unattended(),
             activations: merged.activations,
-            // The machine's facts are read here, once, so every condition
-            // on them in this run is decided against the same answers.
-            host: activation::System::from_env().with_machine(Machine::read(env.user.clone())),
+            host,
             lock,
             committed_externals,
         })
@@ -106,9 +138,10 @@ impl Inputs {
         &self.lock
     }
 
-    /// Every enabled external the committed layers declare on their own,
-    /// without this account's `local.toml`: what the shared `bx.lock` is
-    /// kept for. `None` when those layers cannot be merged without it.
+    /// Every external the committed layers declare on their own, without
+    /// this account's `local.toml`, on this machine or another: what the
+    /// shared `bx.lock` is kept for. `None` when those layers cannot be
+    /// merged without it.
     #[must_use]
     pub fn committed_externals(&self) -> Option<&[External]> {
         self.committed_externals.as_deref()
@@ -243,5 +276,200 @@ mod tests {
         let note = decide::guard_fragment(&fragment, &inputs.roots).expect("refused");
         let inside = crate::env_guard::Reason::InsideConfigRepo.to_string();
         assert!(note.contains(&inside), "{note}");
+    }
+
+    #[test]
+    fn a_gated_target_and_module_come_and_go_with_the_machine_the_inputs_carry() {
+        use crate::config::when::Distro;
+        use crate::paths::Portable;
+        use crate::plan::tests::{apply, inline, plan};
+        use crate::report::Action;
+
+        let home = guarded_home();
+        home.write(".gitconfig.local", "mine\n");
+        seed(
+            home.path(),
+            &format!(
+                "{}when = [\"host:box\", \"distro:rhel\"]\n",
+                inline("~/.boxed", "b\\n")
+            ),
+        );
+        home.write(
+            ".config/bx/modules/macos.toml",
+            &format!("when = \"os:macos\"\n{}", inline("~/.mac", "m\\n")),
+        );
+        let on = |os: &str, host: &str| {
+            let machine = Machine {
+                os: os.to_string(),
+                arch: "aarch64".to_string(),
+                host: Some(host.to_string()),
+                user: None,
+                distro: Some(Distro {
+                    id: "fedora".to_string(),
+                    id_like: vec!["rhel".to_string()],
+                }),
+            };
+            Inputs::load_on(
+                &env(home.path()),
+                activation::System::new("", activation::TIMEOUT).with_machine(machine),
+            )
+            .expect("the inputs load")
+        };
+        let declared = |inputs: &Inputs| -> Vec<String> {
+            inputs
+                .declared_targets()
+                .map(|(target, _)| target.path.as_str().to_string())
+                .collect()
+        };
+        let rows = |inputs: &Inputs| -> Vec<(String, Action)> {
+            let mut rows: Vec<_> = plan(inputs)
+                .changes
+                .iter()
+                .filter(|change| ["~/.boxed", "~/.mac"].contains(&change.target.as_str()))
+                .map(|change| (change.target.to_string(), change.action))
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        // Neither condition holds: nothing is declared, and nothing planned.
+        let neither = on("linux", "other");
+        assert!(declared(&neither).is_empty());
+        assert!(rows(&neither).is_empty());
+
+        // Both hold: both arrive, and a second plan is empty.
+        let both = on("macos", "BOX");
+        assert_eq!(declared(&both), ["~/.boxed", "~/.mac"]);
+        apply(&both);
+        assert_eq!(
+            std::fs::read_to_string(home.child(".mac")).expect("written"),
+            "m\n"
+        );
+        assert!(
+            plan(&both)
+                .actions()
+                .iter()
+                .all(|action| *action == Action::Unchanged),
+            "{:?}",
+            plan(&both).actions()
+        );
+        let written = std::fs::read(home.child(".boxed")).expect("written");
+        apply(&both);
+        assert_eq!(std::fs::read(home.child(".boxed")).expect("kept"), written);
+
+        // Off macOS the module's target is no longer declared, exactly as an
+        // `enabled = false` one is, and nothing is written for it.
+        let linux = on("linux", "box");
+        assert_eq!(declared(&linux), ["~/.boxed"]);
+        assert_eq!(
+            rows(&linux),
+            [
+                ("~/.boxed".to_string(), Action::Unchanged),
+                ("~/.mac".to_string(), Action::Undeclared),
+            ]
+        );
+        assert!(!apply(&linux).executed);
+        assert!(home.child(".mac").exists());
+
+        // `bx rm` then puts back what was there before: nothing.
+        let state = StateDir::resolve(home.path());
+        let mac = Portable::parse_in("~/.mac", home.path()).expect("a portable path");
+        crate::restore::restore(&state, home.path(), &[mac]).expect("rm");
+        assert!(!home.child(".mac").exists());
+        assert_eq!(rows(&linux), [("~/.boxed".to_string(), Action::Unchanged)]);
+        assert_eq!(
+            std::fs::read_to_string(home.child(".gitconfig.local")).expect("untouched"),
+            "mine\n"
+        );
+    }
+
+    #[test]
+    fn the_shared_lock_keeps_what_any_machine_follows_and_nothing_only_this_account_does() {
+        use crate::config::lock::{Unshared, why_unshared_at};
+        use crate::paths::Portable;
+        use crate::update::kept;
+
+        let home = guarded_home();
+        let follow = |path: &str, url: &str| {
+            format!(
+                "[[external]]\npath = \"{path}\"\nurl = \"https://h/o/{url}\"\nbranch = \"main\"\n"
+            )
+        };
+        let terminal = |name: &str| {
+            format!("[[plugin]]\nname = \"{name}\"\nsource = \"~/{name}.zsh\"\nterminal = true\n")
+        };
+        // A follow outside any module whose own `when` holds on macOS only.
+        seed(
+            home.path(),
+            &format!(
+                "{}{}when = \"os:macos\"\n",
+                follow("~/shared", "shared"),
+                follow("~/mac-entry", "mac-entry")
+            ),
+        );
+        // One terminal plugin per OS module, which clash only where both
+        // hold, and a macOS override of `bx.toml`'s follow.
+        home.write(
+            ".config/bx/modules/macos.toml",
+            &format!(
+                "when = \"os:macos\"\n{}{}{}",
+                terminal("mac"),
+                follow("~/shared", "mac-shared"),
+                follow("~/mac-only", "mac-only")
+            ),
+        );
+        home.write(
+            ".config/bx/modules/linux.toml",
+            &format!("when = \"os:linux\"\n{}", terminal("tux")),
+        );
+        home.write(".local/state/bx/local.toml", &follow("~/mine", "mine"));
+        let on = |os: &str| {
+            let machine = Machine {
+                os: os.to_string(),
+                arch: "aarch64".to_string(),
+                host: None,
+                user: None,
+                distro: None,
+            };
+            Inputs::load_on(
+                &env(home.path()),
+                activation::System::new("", activation::TIMEOUT).with_machine(machine),
+            )
+            .expect("the inputs load")
+        };
+        let at = |raw: &str| Portable::parse_in(raw, home.path()).expect("a portable path");
+        let why = |inputs: &Inputs, path: &str, url: &str| {
+            let committed = inputs
+                .committed_externals()
+                .expect("the committed layers merge on every machine");
+            why_unshared_at(
+                &at(path),
+                &format!("https://h/o/{url}"),
+                "main",
+                Some(committed),
+            )
+        };
+
+        let linux = on("linux");
+        let committed = linux.committed_externals().expect("known");
+        // A follow gated to macOS keeps its commit when `bx update` runs on
+        // Linux, and `bx.toml`'s follow, which the macOS module overrides
+        // only where it holds, is locked here.
+        assert!(kept(&at("~/mac-only"), &[], Some(committed)));
+        assert_eq!(why(&linux, "~/mac-only", "mac-only"), None);
+        assert_eq!(why(&linux, "~/shared", "shared"), None);
+        // So does a follow whose own `when` excludes it outside a module.
+        assert!(kept(&at("~/mac-entry"), &[], Some(committed)));
+        assert_eq!(why(&linux, "~/mac-entry", "mac-entry"), None);
+        // What only this account's `local.toml` follows stays out of the
+        // shared lock, and a path nothing commits is pruned from it.
+        assert_eq!(why(&linux, "~/mine", "mine"), Some(Unshared::NotCommitted));
+        assert!(!kept(&at("~/mine"), &[], Some(committed)));
+
+        let macos = on("macos");
+        assert_eq!(why(&macos, "~/shared", "mac-shared"), None);
+        assert_eq!(why(&macos, "~/mac-only", "mac-only"), None);
+        assert_eq!(why(&macos, "~/mac-entry", "mac-entry"), None);
+        assert_eq!(why(&macos, "~/mine", "mine"), Some(Unshared::NotCommitted));
     }
 }

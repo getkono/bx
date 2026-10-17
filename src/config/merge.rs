@@ -247,6 +247,25 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         tools.absorb(layer.config.tools.iter().cloned());
         externals.absorb(layer.config.externals.iter().cloned());
 
+        // A key the layer declared only behind a gate that does not hold on
+        // this machine: a later toggle naming it flips nothing.
+        for (section, key) in &layer.config.gated {
+            let key = key.clone();
+            match section {
+                Section::Value => values.gated_out(key),
+                Section::Env => envs.gated_out(key),
+                Section::Alias => aliases.gated_out(key),
+                Section::Function => functions.gated_out(key),
+                Section::Plugin => plugins.gated_out(key),
+                Section::Source => sources.gated_out(key),
+                Section::Activation => activations.gated_out(key),
+                Section::Tool => tools.gated_out(key),
+                Section::External => externals.gated_out(key),
+                // Keyed by the file it names, once the values are resolved.
+                Section::Target => {}
+            }
+        }
+
         for toggle in &layer.config.toggles {
             // Exhaustive over `Section`, so a keyed list added later is a
             // compile error here rather than a panic in a library call.
@@ -335,6 +354,12 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
             .into_iter()
             .map(|clash| clash.into_conflict(&resolved))
             .collect(),
+        // A gate is decided before the merge, by `layers::gate`, and only
+        // ever per layer; a merged configuration holds none.
+        when: None,
+        gates: Vec::new(),
+        path_gates: Vec::new(),
+        gated: Vec::new(),
     })
 }
 

@@ -164,10 +164,6 @@ mod tests {
                 "name = \"a\"\nsource = \"~/a.zsh\"\nterminal = \"yes\"\n",
                 "a boolean",
             ),
-            (
-                "name = \"a\"\nsource = \"~/a.zsh\"\nwhen = \"ssh\"\n",
-                "unknown key `when`",
-            ),
         ] {
             let err = parse(&format!("[[plugin]]\n{body}")).expect_err(body);
             assert!(err.contains(needle), "{body}: {err}");

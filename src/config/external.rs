@@ -13,6 +13,7 @@
 //! check   = "ask"                                              # followed only: ask | auto
 //! interval = "1d"                                              # with `check = "auto"` only
 //! enabled = true                                               # default true
+//! when    = "os:macos"                                         # optional; see below
 //!
 //! [[external.link]]                                            # any number
 //! from    = "skills/*"            # every child directory of `skills/` in the checkout
@@ -22,6 +23,17 @@
 //!
 //! This module is the configuration half: what an entry may say, and what it
 //! is refused for saying. It reads nothing from disk and runs no `git`.
+//!
+//! `when` is one condition bx decides, or an array that is all of several
+//! (`has:TOOL`, `os:OS`, `arch:ARCH`, `host:NAME`, `user:NAME`,
+//! `distro:ID`; see [`super::when`]). Where it does not hold the external is
+//! not declared on this machine: it is not checked out, its links are not
+//! made, and a checkout bx made here before is reported for `bx rm`, as an
+//! `enabled = false` one is. `bx.lock` is shared by every machine, so a
+//! committed follow keeps its commit there even when `bx update` runs on a
+//! machine its `when` leaves it off. A test
+//! only the shell could run is refused when the config loads
+//! ([`super::layers::gate`]).
 //!
 //! # Pinned or followed
 //!
@@ -125,8 +137,8 @@ pub(crate) const SECTION: &str = "[[external]]";
 const LINK_SECTION: &str = "[[external.link]]";
 
 /// Every key an `[[external]]` entry may carry.
-const KEYS: [&str; 8] = [
-    "path", "url", "rev", "branch", "check", "interval", "link", "enabled",
+const KEYS: [&str; 9] = [
+    "path", "url", "rev", "branch", "check", "interval", "link", "enabled", "when",
 ];
 
 /// Every key an `[[external.link]]` may carry.

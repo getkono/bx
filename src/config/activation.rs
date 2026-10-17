@@ -3,6 +3,13 @@
 //! Running a tool's command, caching what it printed, and judging that output
 //! are [`crate::shell::activation`]'s; this is the parser, and the rule a
 //! command must keep to be looked up and run at all.
+//!
+//! An entry may carry `when`, one condition bx decides or an array that is
+//! all of several (`has:TOOL`, `os:OS`, `arch:ARCH`, `host:NAME`,
+//! `user:NAME`, `distro:ID`; see [`super::when`]). Where it does not hold
+//! the activation is not declared on this machine: its tool is never run and
+//! nothing of it lands in a generated file. A test only the shell could run
+//! is refused when the config loads ([`super::layers::gate`]).
 
 use std::path::Path;
 
@@ -39,8 +46,8 @@ pub struct ActivationDecl {
 pub(crate) const SECTION: &str = "[[activation]]";
 
 /// Every key an `[[activation]]` entry may carry.
-const KEYS: [&str; 7] = [
-    "name", "command", "zsh", "bash", "shells", "phase", "enabled",
+const KEYS: [&str; 8] = [
+    "name", "command", "zsh", "bash", "shells", "phase", "enabled", "when",
 ];
 
 /// The characters a word may hold and still be written bare.

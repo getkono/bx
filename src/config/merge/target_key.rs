@@ -170,6 +170,12 @@ impl Merged<Target, TargetKey> {
         // What this layer has said so far, statement by statement.
         let mut said: Vec<Said> = Vec::new();
 
+        for (section, spelling) in &layer.config.gated {
+            if *section == Section::Target {
+                self.gated_out(TargetKey::of(spelling, values));
+            }
+        }
+
         for target in &layer.config.targets {
             let spelling = target.path.as_str();
             let key = TargetKey::of(spelling, values);
@@ -212,6 +218,11 @@ impl Merged<Target, TargetKey> {
                 Section::Target => {
                     let key = TargetKey::of(&toggle.key, values);
                     if self.position(&key).is_none() {
+                        // A file declared only behind a gate that does not
+                        // hold here: the toggle names it on another machine.
+                        if self.gated.contains(&key) {
+                            continue;
+                        }
                         return Err(unknown_toggle(toggle, &self.as_written_note()));
                     }
                     let fragile = !anchored(&toggle.key, earlier, layer, values);

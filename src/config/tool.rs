@@ -6,7 +6,15 @@
 //! name    = "rg"                               # required; the natural key
 //! install = "sudo dnf install ripgrep"         # optional; printed, never run
 //! enabled = true                               # default true
+//! when    = "os:linux"                         # optional; a condition bx decides
 //! ```
+//!
+//! `when` is one condition bx decides, or an array that is all of several
+//! (`has:TOOL`, `os:OS`, `arch:ARCH`, `host:NAME`, `user:NAME`,
+//! `distro:ID`; see [`super::when`]). Where it does not hold the tool is not
+//! declared on this machine, so `bx doctor` does not look for it. A test only
+//! the shell could run is refused when the config loads
+//! ([`super::layers::gate`]).
 //!
 //! `name` is the program's file name, the word a shell looks up on `PATH`, and
 //! it is the only thing `bx doctor` checks: a tool is present when an
@@ -35,7 +43,7 @@ use super::{Ctx, Error, Origin};
 pub(crate) const SECTION: &str = "[[tool]]";
 
 /// Every key a `[[tool]]` entry may carry.
-const KEYS: [&str; 3] = ["name", "install", "enabled"];
+const KEYS: [&str; 4] = ["name", "install", "enabled", "when"];
 
 /// One `[[tool]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]

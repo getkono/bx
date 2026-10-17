@@ -780,6 +780,21 @@ pub(crate) mod tests {
         load(home.path())
     }
 
+    /// [`inputs`], decided as if this machine ran Linux: what a layer kept
+    /// to Linux, a systemd unit say, declares whatever OS runs the test.
+    pub(crate) fn inputs_on_linux(home: &GuardedHome, layer: &str) -> Inputs {
+        seed(home.path(), layer);
+        let machine = Machine {
+            os: "linux".to_string(),
+            ..Machine::read(None)
+        };
+        Inputs::load_on(
+            &env(home.path()),
+            activation::System::from_env().with_machine(machine),
+        )
+        .expect("the inputs load")
+    }
+
     /// One inline target, as TOML. `content` is spelled as a TOML basic string.
     pub(crate) fn inline(path: &str, content: &str) -> String {
         format!("[[target]]\npath = \"{path}\"\ncontent = \"{content}\"\n")

@@ -1090,6 +1090,11 @@ fn write_layer(path: &Path, text: &str, mode: Mode, home: &Path) -> Result<(), E
 /// touched: a re-serialised document would move a comment that stands alone
 /// in the file to after the new tables. Each new table follows one blank line,
 /// which is exactly what [`undeclare`] takes away with it.
+///
+/// A file under a directory only one OS reads is declared with the
+/// `when = "os:…"` the loader demands of it
+/// ([`config::target::platform_gate`]), so adopting it never writes a table
+/// the configuration would refuse.
 fn declare(ctx: &Context, rows: &[Adoption]) -> Result<(), Error> {
     let mut tables = ArrayOfTables::new();
     for row in rows {
@@ -1104,6 +1109,10 @@ fn declare(ctx: &Context, rows: &[Adoption]) -> Result<(), Error> {
         table.insert("file", value(body.to_string_lossy().as_ref()));
         if *mode != Mode::DEFAULT_FILE {
             table.insert("mode", value(mode.to_string()));
+        }
+        // A file under a directory only one OS reads loads only kept to it.
+        if let Some(os) = config::target::platform_gate(target, std::env::consts::OS) {
+            table.insert("when", value(format!("os:{os}")));
         }
         table.decor_mut().set_prefix("\n");
         tables.push(table);
@@ -1724,6 +1733,42 @@ mod tests {
             std::fs::read(StateDir::resolve(home.path()).ledger()).expect("ledger"),
             ledger_once,
         );
+    }
+
+    #[test]
+    fn a_file_under_a_directory_only_one_os_reads_is_declared_kept_to_that_os() {
+        let here = std::env::consts::OS;
+        for (rel, os) in [
+            (".config/systemd/user/a.service", "linux"),
+            (".config/environment.d/60-a.conf", "linux"),
+            ("Library/Preferences/a.plist", "macos"),
+            // `~/Library` on macOS's case-folding volume, a directory of its
+            // own elsewhere: kept to the OS it was adopted on.
+            ("library/b.plist", here),
+        ] {
+            let home = repo("");
+            plant(&home, rel, b"x\n", 0o644);
+            let rows = add_rel(&home, rel);
+            assert_eq!(adopted(&rows), [format!("~/{rel}")], "{rows:?}");
+            assert_eq!(
+                layer(&home),
+                format!(
+                    "[[target]]\npath = \"~/{rel}\"\nfile = \"files/{rel}\"\nwhen = \"os:{os}\"\n"
+                ),
+                "{rel}",
+            );
+            // The configuration it wrote loads, and a second add changes
+            // nothing, on every OS.
+            let once = layer(&home);
+            assert_eq!(
+                add_rel(&home, rel),
+                [Adoption::Unchanged {
+                    target: target(&home, rel)
+                }],
+                "{rel}",
+            );
+            assert_eq!(layer(&home), once, "{rel}");
+        }
     }
 
     #[test]

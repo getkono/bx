@@ -2266,7 +2266,8 @@ mod tests {
         std::fs::write(
             xdg.join("bx/bx.toml"),
             "[[target]]\npath = \"~/xdg/systemd/user/a.service\"\ncontent = \"x\"\n\n\
-             [[target]]\npath = \"~/.config/systemd/user/b.service\"\ncontent = \"x\"\n",
+             [[target]]\npath = \"~/.config/systemd/user/b.service\"\ncontent = \"x\"\n\
+             when = \"os:linux\"\n",
         )
         .expect("bx.toml");
         home.write("xdg/systemd/user/a.service", "x");
@@ -2290,7 +2291,10 @@ mod tests {
         let home = guarded_home();
         seed(
             home.path(),
-            &inline("~/.config/systemd/user/a.service", "x"),
+            &format!(
+                "{}when = \"os:linux\"\n",
+                inline("~/.config/systemd/user/a.service", "x")
+            ),
         );
 
         let mut out = Vec::new();

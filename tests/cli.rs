@@ -1075,7 +1075,6 @@ fn the_short_and_long_version_flags_print_the_same_build_details() {
 /// release asset at all: a `bx self-upgrade` that tried to install would fail
 /// rather than replace the binary under test. Returns the `PATH` and the file
 /// each request is appended to.
-#[cfg(target_os = "linux")]
 fn served(home: &Path, latest: &str) -> (std::ffi::OsString, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1143,7 +1142,6 @@ fn served(home: &Path, latest: &str) -> (std::ffi::OsString, std::path::PathBuf)
 }
 
 /// `bx self-upgrade ARGS` with `path` as its `PATH`.
-#[cfg(target_os = "linux")]
 fn self_upgrade(home: &Path, path: &std::ffi::OsStr, args: &[&str]) -> Output {
     Command::cargo_bin("bx")
         .expect("the bx binary")
@@ -1156,7 +1154,6 @@ fn self_upgrade(home: &Path, path: &std::ffi::OsStr, args: &[&str]) -> Output {
 }
 
 /// The `bx` a published release installs: a script that names its tag.
-#[cfg(target_os = "linux")]
 fn release_bx(tag: &str) -> String {
     format!("#!/bin/sh\necho {tag}\n")
 }
@@ -1165,7 +1162,6 @@ fn release_bx(tag: &str) -> String {
 /// uploads: the tarball holding [`release_bx`], and its `.sha256`. With
 /// `tampered`, the checksum is of other bytes, as when the tarball was
 /// altered after it was summed.
-#[cfg(target_os = "linux")]
 fn publish(home: &Path, tag: &str, tampered: bool) {
     use bx::hash::ContentHash;
 
@@ -1174,7 +1170,14 @@ fn publish(home: &Path, tag: &str, tampered: bool) {
     std::fs::create_dir_all(&assets).expect("the release assets");
     std::fs::create_dir_all(&staging).expect("the staging directory");
     std::fs::write(staging.join("bx"), release_bx(tag)).expect("the released bx");
-    let asset = format!("bx-{}-unknown-linux-musl.tar.gz", std::env::consts::ARCH);
+    // The target install.sh picks on this machine, as the release job names
+    // its assets.
+    let os = if cfg!(target_os = "macos") {
+        "apple-darwin"
+    } else {
+        "unknown-linux-musl"
+    };
+    let asset = format!("bx-{}-{os}.tar.gz", std::env::consts::ARCH);
     let status = std::process::Command::new("tar")
         .arg("-czf")
         .arg(assets.join(&asset))
@@ -1200,7 +1203,6 @@ fn publish(home: &Path, tag: &str, tampered: bool) {
 /// A copy of the binary under test in `home/install`, so the directory
 /// `bx self-upgrade` replaces itself in is a tempdir rather than the build's
 /// own `target` directory. Returns the copy and its bytes.
-#[cfg(target_os = "linux")]
 fn installed_copy(home: &Path) -> (std::path::PathBuf, Vec<u8>) {
     let dir = home.join("install");
     std::fs::create_dir_all(&dir).expect("the install directory");
@@ -1213,7 +1215,6 @@ fn installed_copy(home: &Path) -> (std::path::PathBuf, Vec<u8>) {
 /// `EXE self-upgrade` with `path` as its `PATH`, retrying only while the
 /// freshly written copy is still held open by another test thread's fork, as
 /// [`served`] waits out its stub.
-#[cfg(target_os = "linux")]
 fn self_upgrade_copy(exe: &Path, home: &Path, path: &std::ffi::OsStr) -> Output {
     for _ in 0..200 {
         match std::process::Command::new(exe)
@@ -1232,9 +1233,6 @@ fn self_upgrade_copy(exe: &Path, home: &Path, path: &std::ffi::OsStr) -> Output 
     panic!("the copy of bx stayed busy");
 }
 
-// The self-upgrade tests run the installer, which serves Linux only: it
-// refuses any other OS before it fetches.
-#[cfg(target_os = "linux")]
 #[test]
 fn self_upgrade_check_exits_two_when_a_newer_release_exists_and_installs_nothing() {
     let home = guarded_home();
@@ -1254,7 +1252,6 @@ fn self_upgrade_check_exits_two_when_a_newer_release_exists_and_installs_nothing
     assert!(!requests.contains("/download/"), "{requests}");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn self_upgrade_at_the_latest_release_exits_zero_and_installs_nothing() {
     let home = guarded_home();
@@ -1277,7 +1274,6 @@ fn self_upgrade_at_the_latest_release_exits_zero_and_installs_nothing() {
     assert!(!requests.contains("/download/"), "{requests}");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
     let home = guarded_home();
@@ -1313,7 +1309,6 @@ fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn self_upgrade_refuses_a_release_whose_checksum_does_not_match() {
     let home = guarded_home();
@@ -1380,7 +1375,6 @@ fn self_update_is_a_visible_alias_of_self_upgrade() {
     assert!(words.contains("[alias: self-update]"), "{}", stdout(&help));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn self_update_check_reports_exactly_as_self_upgrade_check() {
     for (tag, code) in [("v999.0.0".to_owned(), 2), (format!("v{}", bx::VERSION), 0)] {

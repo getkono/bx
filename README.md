@@ -17,10 +17,12 @@ moves another tool's config, data or cache anywhere you did not declare. Remove
 curl -fsSL https://raw.githubusercontent.com/getkono/bx/master/install.sh | sh
 ```
 
-A single static binary, no runtime dependencies — it installs onto a barebones
-box with no toolchain, which is the point: `bx` is what you run *before* you
-have anything else. Releases ship Linux binaries today; the installer does not
-yet fetch a macOS one.
+A single binary with no runtime dependencies — it installs onto a barebones box
+with no toolchain, which is the point: `bx` is what you run *before* you have
+anything else. Releases ship Linux and macOS binaries for x86_64 and aarch64,
+and the installer picks the one for the machine it runs on. On Linux the binary
+is statically linked against musl; on macOS it links only the system libraries
+every macOS ships.
 
 It also installs as **`userbox`**. Two-letter names are a scarce namespace with
 no registry, so the long name is the one that is guaranteed to keep working:

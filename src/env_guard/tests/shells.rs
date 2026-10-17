@@ -166,7 +166,6 @@ struct Shell {
     report: &'static str,
 }
 
-#[cfg(target_os = "linux")]
 const BASH: Shell = Shell {
     program: "bash",
     flags: &["--norc", "--noprofile"],
@@ -183,12 +182,7 @@ const ZSH: Shell = Shell {
                  trap __bx_report EXIT",
 };
 
-/// macOS's bash is 3.2, which bx's generated bash does not support yet, so
-/// the guard is held to bash on Linux only.
-#[cfg(target_os = "linux")]
 const SHELLS: &[Shell] = &[BASH, ZSH];
-#[cfg(not(target_os = "linux"))]
-const SHELLS: &[Shell] = &[ZSH];
 
 /// The variable that excuses a machine from supplying the programs these
 /// checks are held against.
@@ -1088,9 +1082,8 @@ fn every_review_falsifier_relocates_in_a_real_shell_and_is_refused() {
             vec![],
             "{content:?}"
         );
-        // Only a machine `WITHOUT_SHELLS` excuses, or macOS, where no bash
-        // is held, runs on fewer than bash and zsh both, and some of these
-        // relocate in one shell alone.
+        // Only a machine `WITHOUT_SHELLS` excuses runs on fewer than bash and
+        // zsh both, and some of these relocate in one shell alone.
         assert!(
             escaped.contains(&true) || shells.found.len() < 2,
             "{content:?} relocated nothing in any shell"

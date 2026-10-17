@@ -158,8 +158,14 @@ fn decision_4_apply_without_yes_and_no_terminal_exits_one_having_shown_the_plan(
     assert!(!home.child(".a").exists(), "written without confirmation");
 }
 
-// Sized to Linux's 4096-byte `PATH_MAX`; macOS's is 1024.
-#[cfg(target_os = "linux")]
+/// `PATH_MAX`, which counts the terminating NUL: 4096 on Linux, 1024 on
+/// macOS.
+const PATH_MAX: usize = if cfg!(target_os = "linux") {
+    4096
+} else {
+    1024
+};
+
 #[test]
 fn apply_over_a_damaged_ledger_it_cannot_move_aside_exits_one_and_writes_nothing() {
     // `state::Error::CannotQuarantine`, from the state directory's r3 round:
@@ -167,9 +173,9 @@ fn apply_over_a_damaged_ledger_it_cannot_move_aside_exits_one_and_writes_nothing
     // aside, so apply must stop with an error before anything is written.
     let home = guarded_home();
     seed(home.path(), A_TARGET);
-    // A state directory 4080 bytes long: `ledger.mpk` still fits in
-    // `PATH_MAX`, and every name it could be moved aside to does not.
-    const ROOT: usize = 4080;
+    // A state directory 16 bytes short of `PATH_MAX`: `ledger.mpk` still fits
+    // in it, and every name it could be moved aside to does not.
+    const ROOT: usize = PATH_MAX - 16;
     let mut xdg_state = home.path().join("s").into_os_string();
     let xdg_len = ROOT - "/bx".len();
     while xdg_len - xdg_state.len() > 256 {

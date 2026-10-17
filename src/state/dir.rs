@@ -1619,8 +1619,6 @@ mod tests {
         );
     }
 
-    // Sized to Linux's 4096-byte `PATH_MAX`; macOS's is 1024.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_linked_local_toml_whose_real_path_cannot_be_resolved_is_an_error_naming_it() {
         // r3 round 2b (P7R4-COV2): resolving a linked `local.toml` to find the
@@ -1629,9 +1627,14 @@ mod tests {
         // examined but not resolved.
         //
         // The over-long real path is staged as a *chain* of links: each one
-        // names four 200-byte components under the link before it, so no
-        // symlink target grows past ~810 bytes and no path handed to a syscall
-        // is long either. A filesystem that caps one symlink target well below
+        // sits in the deepest directory so far and names four 200-byte
+        // components below it, so no symlink target grows past ~810 bytes and
+        // no path handed to a syscall is long either. Each link sits *in* the
+        // tree rather than beside it so that what follows a link in a walk is
+        // only the few short names after it: macOS refuses a walk in which a
+        // link's target and the rest of the path reach its 1024-byte
+        // `PATH_MAX` together, and a link beside the tree is followed by
+        // every component below it. A filesystem that caps one symlink target well below
         // `PATH_MAX` — XFS caps it at 1024 bytes — stages this as readily as
         // any other. The chain grows until `canonicalize` of the cursor itself
         // is the failure under test, so the length that is enough is measured
@@ -1665,13 +1668,29 @@ mod tests {
             // holds to 10, so failing to get there by then is a surprise worth
             // reporting, not a skip.
             assert!(links < 10, "no real path over PATH_MAX after {links} links");
-            let mut next = cursor.clone();
+            // Each component is made relative to the one before it, so that
+            // making it walks no link with long names after it either.
+            let mut at = rustix::fs::open(
+                home.child(&cursor),
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                rustix::fs::Mode::empty(),
+            )
+            .expect("the deepest directory so far");
+            let mut below = PathBuf::new();
             for _ in 0..PER_LINK {
-                next.push(&part);
-                std::fs::create_dir(home.child(&next)).expect("one component deeper");
+                rustix::fs::mkdirat(&at, part.as_str(), rustix::fs::Mode::from_raw_mode(0o777))
+                    .expect("one component deeper");
+                at = rustix::fs::openat(
+                    &at,
+                    part.as_str(),
+                    rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                    rustix::fs::Mode::empty(),
+                )
+                .expect("the component just made");
+                below.push(&part);
             }
-            let link = PathBuf::from(format!("s{links}"));
-            std::os::unix::fs::symlink(&next, home.child(&link)).expect("a short link to it");
+            let link = cursor.join(format!("s{links}"));
+            std::os::unix::fs::symlink(&below, home.child(&link)).expect("a short link to it");
             cursor = link;
             links += 1;
         }

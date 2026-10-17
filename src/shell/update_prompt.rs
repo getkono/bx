@@ -366,17 +366,21 @@ mod tests {
         }
     }
 
-    /// The shells every hook test runs in. The bash hook is registered on
-    /// bash 4.4 or later only, and macOS's bash is 3.2, so it is held to bash
-    /// on Linux only.
-    #[cfg(target_os = "linux")]
-    const SHELLS: [Shell; 2] = [Shell::Zsh, Shell::Bash];
-    #[cfg(not(target_os = "linux"))]
-    const SHELLS: [Shell; 1] = [Shell::Zsh];
+    /// The shells every hook test runs in: zsh, and bash where it is one the
+    /// hook registers on. An older bash never runs the hook, so what it does
+    /// when called is nothing a person meets — `printf '%(%s)T'`, which takes
+    /// the time without a process, is bash 4.2's.
+    fn shells() -> Vec<Shell> {
+        let mut shells = vec![Shell::Zsh];
+        if bash_registers() {
+            shells.push(Shell::Bash);
+        }
+        shells
+    }
 
     #[test]
     fn nothing_due_is_silent_and_starts_nothing() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             assert_eq!(
                 rig.run("__bx_update_due", "", &[]),
@@ -401,7 +405,7 @@ mod tests {
 
     #[test]
     fn what_a_check_found_is_offered_and_yes_runs_bx_update() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             rig.stamp(
                 "available",
@@ -428,7 +432,7 @@ mod tests {
 
     #[test]
     fn a_due_check_starts_one_quiet_background_check_and_asks_nothing() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             rig.stamp("check-due", "1\n");
             rig.stamp("ask-due", "1\n");
@@ -452,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_due_question_asks_whether_to_check_and_only_once() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             rig.stamp("ask-due", "1\n");
             let (printed, calls) = rig.run("__bx_update_due\n__bx_update_due", "y", &[]);
@@ -467,7 +471,7 @@ mod tests {
 
     #[test]
     fn a_due_question_answered_no_snoozes() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             rig.stamp("ask-due", "1\n");
             let (printed, calls) = rig.run("__bx_update_due", "n", &[]);
@@ -484,7 +488,7 @@ mod tests {
 
     #[test]
     fn a_hook_with_no_bx_on_path_is_silent() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             std::fs::remove_file(rig.home.path().join("bin/bx")).expect("no bx");
             rig.stamp("available", "~/a: x\n");
@@ -509,7 +513,7 @@ mod tests {
         // More input than a pipe holds: a hook that asks nothing never reads
         // it, so the write always meets a closed pipe once the shell exits.
         let input = "y\n".repeat(1 << 20);
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             assert_eq!(
                 rig.run("__bx_update_due", &input, &[]),
@@ -572,7 +576,7 @@ mod tests {
 
     #[test]
     fn a_dumb_terminal_is_never_asked() {
-        for shell in SHELLS {
+        for shell in shells() {
             let Some(at_a_terminal) = calls_at_a_terminal(shell, "xterm") else {
                 return;
             };
@@ -590,7 +594,7 @@ mod tests {
 
     #[test]
     fn an_agent_ci_or_an_opt_out_is_never_asked() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             rig.stamp("available", "~/a: x\n");
             rig.stamp("check-due", "1\n");
@@ -613,7 +617,7 @@ mod tests {
 
     #[test]
     fn a_shell_without_a_terminal_is_never_asked() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             rig.stamp("available", "~/a: x\n");
             assert_eq!(
@@ -626,7 +630,7 @@ mod tests {
 
     #[test]
     fn the_hook_reads_the_stamps_where_bx_writes_them_for_every_xdg_state_home() {
-        for shell in SHELLS {
+        for shell in shells() {
             let rig = Rig::new(shell);
             let elsewhere = rig.home.path().join("elsewhere");
             let absolute = elsewhere.to_str().expect("a UTF-8 tempdir");
@@ -708,7 +712,7 @@ mod tests {
                     crate::update::Stamps::read(&path).is_some()
                 })
                 .collect();
-            for shell in SHELLS {
+            for shell in shells() {
                 if let Some(hook) = asks_from(shell, &stamps) {
                     proptest::prop_assert_eq!(&hook, &doctor, "{:?}: {:?}", shell, stamps);
                 }
@@ -716,9 +720,33 @@ mod tests {
         }
     }
 
+    /// Whether the installed bash is one [`BASH`] registers on: 4.4 or later.
+    /// An older one — macOS's `/bin/bash` is 3.2 — registers nothing, which
+    /// `a_bash_older_than_4_4_registers_nothing_and_says_nothing` holds it
+    /// to, so the tests of what a registration does have nothing to read
+    /// there.
+    fn bash_registers() -> bool {
+        static REGISTERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *REGISTERS.get_or_init(|| {
+            let Some(bash) = crate::shell::testing::installed("bash") else {
+                return false;
+            };
+            let output = Command::new(bash)
+                .args(["--norc", "--noprofile", "-c"])
+                .arg("printf '%s %s' \"${BASH_VERSINFO[0]}\" \"${BASH_VERSINFO[1]}\"")
+                .output()
+                .expect("bash runs");
+            let printed = String::from_utf8_lossy(&output.stdout);
+            let version: Vec<u32> = printed
+                .split(' ')
+                .map(|part| part.parse().unwrap_or_else(|_| panic!("{printed:?}")))
+                .collect();
+            (version[0], version[1]) >= BASH_SINCE
+        })
+    }
+
     /// What bash prints of `PROMPT_COMMAND` after sourcing the hook behind
     /// `before`: its attributes, then each element on its own line.
-    #[cfg(target_os = "linux")]
     fn prompt_command(before: &str) -> String {
         let rig = Rig::new(Shell::Bash);
         rig.run_after(
@@ -730,13 +758,9 @@ mod tests {
         .0
     }
 
-    // The hook is registered on bash 4.4 or later only, and macOS's bash is
-    // 3.2: `a_bash_older_than_4_4_registers_nothing_and_says_nothing` holds
-    // it there.
-    #[cfg(target_os = "linux")]
     #[test]
     fn bash_appends_to_an_unexported_prompt_command_once() {
-        if crate::shell::testing::installed("bash").is_none() {
+        if !bash_registers() {
             return;
         }
         assert_eq!(prompt_command(""), "[]\n[${BX_UPDATE_HOOK-}]\n", "unset");
@@ -762,13 +786,9 @@ mod tests {
         );
     }
 
-    // The hook is registered on bash 4.4 or later only, and macOS's bash is
-    // 3.2: `a_bash_older_than_4_4_registers_nothing_and_says_nothing` holds
-    // it there.
-    #[cfg(target_os = "linux")]
     #[test]
     fn bash_leaves_an_exported_or_read_only_prompt_command_alone() {
-        if crate::shell::testing::installed("bash").is_none() {
+        if !bash_registers() {
             return;
         }
         assert_eq!(
@@ -794,13 +814,9 @@ mod tests {
         assert_eq!(printed, "[7]\n");
     }
 
-    // The hook is registered on bash 4.4 or later only, and macOS's bash is
-    // 3.2: `a_bash_older_than_4_4_registers_nothing_and_says_nothing` holds
-    // it there.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_later_export_carries_an_entry_a_child_bash_runs_without_error() {
-        if crate::shell::testing::installed("bash").is_none() {
+        if !bash_registers() {
             return;
         }
         // A line of ~/.bashrc after bx's region exports PROMPT_COMMAND. In

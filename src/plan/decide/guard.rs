@@ -809,8 +809,6 @@ mod tests {
             assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
         }
 
-        // macOS's bash is 3.2, which bx's generated bash does not support yet.
-        #[cfg(target_os = "linux")]
         #[test]
         fn bash_gets_its_file_a_fixed_region_and_an_inputrc_twice_alike_and_rm_restores_them() {
             const SHARED: &str = "[aliases]\nll = \"ls -la\"\n\
@@ -857,13 +855,18 @@ mod tests {
             // bash reads the region, and through it the file.
             if let Some(bash) = crate::shell::testing::installed("bash") {
                 // The region names the file under `~`, so run under this home.
+                // `alias ll` rather than bash 4's `BASH_ALIASES`, so the probe
+                // runs in macOS's bash 3.2 too.
                 let script = format!(
                     "HOME={}\nPS1=x\nsource ~/.bashrc\n\
-                     printf '%s|' \"${{BASH_ALIASES[ll]}}\" \"$HISTSIZE\"\n",
+                     alias ll\nprintf '%s|' \"$HISTSIZE\"\n",
                     home.path().display()
                 );
                 let out = crate::shell::testing::run(&bash, &["--norc", "--noprofile"], &script);
-                assert_eq!(String::from_utf8(out).expect("utf-8"), "ls -la|500|");
+                assert_eq!(
+                    String::from_utf8(out).expect("utf-8"),
+                    "alias ll='ls -la'\n500|"
+                );
             }
 
             // Idempotent: an empty second plan, and nothing rewritten.

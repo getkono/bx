@@ -1189,10 +1189,6 @@ mod tests {
         assert_ne!(after, before);
     }
 
-    // macOS's bash 3.2 exits 1 at `bind -f` in this script with no terminal,
-    // so the probe reads readline's bindings on Linux only. The file is
-    // readline's syntax, not bash's.
-    #[cfg(target_os = "linux")]
     #[test]
     fn readline_reads_the_inputrc_as_the_declared_bindings() {
         let Some(bash) = installed("bash") else {
@@ -1205,8 +1201,20 @@ mod tests {
             "bind -f {}\nbind -q beginning-of-line\nbind -q backward-word\n",
             inputrc.display()
         );
-        let got = String::from_utf8(run(&bash, &["--norc", "--noprofile", "-i"], &script))
-            .expect("utf-8");
+        // A `-c` string rather than `run`'s script file: an interactive bash
+        // 3.2 — macOS's — reading a script file with no terminal has readline
+        // refuse `bind -f`, and one running a `-c` string does not.
+        let output = std::process::Command::new(&bash)
+            .args(["--norc", "--noprofile", "-i", "-c", &script])
+            .current_dir(scratch.path())
+            .env_clear()
+            .env("HOME", scratch.path())
+            .env("PATH", "/nonexistent")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("an installed bash runs");
+        assert!(output.status.success(), "{script}: {output:?}");
+        let got = String::from_utf8(output.stdout).expect("utf-8");
         // Readline spells an escape-prefixed sequence `\M-` where
         // `convert-meta` is on and `\e` where it is off. The inputrc includes
         // the system's, which decides that setting (Fedora's turns it off,

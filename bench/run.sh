@@ -32,12 +32,20 @@
 #                 which `mise run bench` builds first)
 #   BX_BUDGET_MS  overhead budget in milliseconds (default: 5)
 #   BX_BENCH_RUNS minimum hyperfine runs per fixture (default: 50)
+#   BX_BENCH_ROUNDS interleaved rounds the overhead is measured in, each
+#                 starting either fixture twice (default: BX_BENCH_RUNS / 2,
+#                 rounded up)
 
 set -eu
 
 BUDGET_MS="${BX_BUDGET_MS:-5}"
 RUNS="${BX_BENCH_RUNS:-50}"
+ROUNDS="${BX_BENCH_ROUNDS:-$(((RUNS + 1) / 2))}"
 SHELLS="zsh bash"
+[ "$ROUNDS" -ge 1 ] 2>/dev/null || {
+	echo "error: BX_BENCH_ROUNDS must be a whole number of at least 1." >&2
+	exit 1
+}
 
 cd "$(dirname "$0")"
 BENCH_DIR="$(pwd)"
@@ -75,8 +83,16 @@ else
 	echo "       or kqueue's NOTE_FORK (macOS)." >&2
 	exit 1
 fi
+# Said once, so a log shows which way the spawns below were counted; CI's
+# macOS bench job requires the kqueue line.
+case "$COUNT_BY" in
+proc) echo "Counting the processes a start spawns through /proc/\$\$/stat." ;;
+kqueue) echo "Counting the processes a start spawns through kqueue NOTE_FORK." ;;
+esac
 
 mkdir -p "$RESULTS"
+# Only this run's measurements, so the uploaded results are the ones read.
+rm -f "${RESULTS}"/*.json
 
 # Hermetic: a scratch home per fixture so nothing in the developer's own home is
 # read, and the stub tools ahead of the system's programs on PATH.
@@ -334,51 +350,89 @@ for sh in $SHELLS; do
 	}
 done
 
-run() { # run <name> <shell> <fixture>...
+prime() { # prime <shell> <fixture>...: start each once, so compinit's dump exists
+	sh="$1"
+	shift
+	for f in "$@"; do
+		# shellcheck disable=SC2046
+		env -i HOME="${WORK}/${f}" PATH="$SEARCH" $(startup "$sh" "$f") >/dev/null 2>&1 || true
+	done
+}
+run() { # run <name> <shell> <warmup> <count> <fixture>...: one hyperfine, in that order
 	name="$1"
 	sh="$2"
-	shift 2
+	warmup="$3"
+	count="$4" # hyperfine's run count, e.g. `--runs 5`
+	shift 4
 	cmds=""
 	for f in "$@"; do
 		# `env` rather than a `VAR=… cmd` prefix: --shell=none execs the
 		# command directly, so there is no shell to interpret an assignment.
 		cmds="${cmds} -n ${f} 'env -i HOME=${WORK}/${f} PATH=${SEARCH} $(startup "$sh" "$f")'"
 	done
-	# Prime each fixture once so compinit's dump exists before timing.
-	for f in "$@"; do
-		# shellcheck disable=SC2046
-		env -i HOME="${WORK}/${f}" PATH="$SEARCH" $(startup "$sh" "$f") >/dev/null 2>&1 || true
-	done
-	eval "hyperfine --warmup 5 --min-runs ${RUNS} --shell=none \
+	eval "hyperfine --warmup ${warmup} ${count} --shell=none \
 		--export-json '${RESULTS}/${name}-${sh}.json' ${cmds}" >/dev/null
 }
 
+# The overhead is a difference of two fixtures, and hyperfine times each
+# fixture's runs as one block, so whatever the machine is doing while one block
+# runs and not the other lands in the difference: a shared CI runner moves the
+# same start by more than the budget from one start to the next, and a macOS
+# runner holds a slow spell for a fraction of a second, shorter than any block
+# of runs. So the overhead is measured in rounds of four single starts, each
+# fixture twice, mirrored (baseline bx bx baseline, then bx baseline baseline
+# bx the round after), and the gate reads the median of the rounds'
+# differences: a drift that is steady across a round's four starts cancels out
+# of it, every fixture holds every position equally often, and a round a spell
+# broke into is outvoted. The rounds are primed, so none needs a warmup.
 for sh in $SHELLS; do
+	prime "$sh" baseline legacy bx
 	echo "Measuring bx's generated ${sh} startup files (budget ${BUDGET_MS} ms)..."
-	run overhead "$sh" baseline bx
+	round=1
+	while [ "$round" -le "$ROUNDS" ]; do
+		case "$((round % 2))" in
+		1) run "overhead-${round}" "$sh" 0 "--runs 1" baseline bx bx baseline ;;
+		0) run "overhead-${round}" "$sh" 0 "--runs 1" bx baseline baseline bx ;;
+		esac
+		round=$((round + 1))
+	done
 	echo "Measuring net effect vs a hand-written ${sh}rc..."
-	run net "$sh" legacy bx
+	run net "$sh" 5 "--min-runs ${RUNS}" legacy bx
 done
 
 # shellcheck disable=SC2086 # one argument per shell.
-python3 - "$RESULTS" "$BUDGET_MS" $SHELLS <<'PY'
-import json, sys
+python3 - "$RESULTS" "$BUDGET_MS" "$ROUNDS" $SHELLS <<'PY'
+import json, statistics, sys
 
-results, budget, shells = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
+results, budget = sys.argv[1], float(sys.argv[2])
+rounds, shells = int(sys.argv[3]), sys.argv[4:]
 
-labels = {"overhead": ["baseline", "bx"], "net": ["legacy", "bx"]}
+
+def order(name):
+    # The order run.sh gave the fixtures in: odd rounds are baseline bx bx
+    # baseline, even rounds their mirror.
+    if name == "net":
+        return ["legacy", "bx"]
+    if int(name.split("-")[1]) % 2:
+        return ["baseline", "bx", "bx", "baseline"]
+    return ["bx", "baseline", "baseline", "bx"]
 
 
 def medians(name, shell):
     with open(f"{results}/{name}-{shell}.json") as fh:
         data = json.load(fh)["results"]
-    # The -n labels are not echoed back in the JSON, so pair by position: the
-    # results are in the order the commands were given. The median, not the
-    # mean: a start the scheduler delayed moves the mean by its whole delay
-    # and the median not at all, and the gate is about bx, not about the
-    # machine's other load. hyperfine 1 puts it at the top of each result,
-    # hyperfine 2 under its summary's wall-clock time.
-    return {label: median(r) * 1000 for label, r in zip(labels[name], data)}
+    # hyperfine 1 does not echo the -n labels back in the JSON, so pair by
+    # position: the results are in the order the commands were given. The
+    # median, not the mean: a start the scheduler delayed moves the mean by
+    # its whole delay and the median not at all, and the gate is about bx, not
+    # about the machine's other load. hyperfine 1 puts it at the top of each
+    # result, hyperfine 2 under its summary's wall-clock time. A fixture a
+    # round starts twice reads as the mean of its two starts, which is what
+    # cancels a steady drift across the round.
+    each = {}
+    for label, r in zip(order(name), data):
+        each.setdefault(label, []).append(median(r) * 1000)
+    return {label: statistics.mean(times) for label, times in each.items()}
 
 
 def median(result):
@@ -389,18 +443,20 @@ def median(result):
 
 over_budget = []
 for shell in shells:
-    over = medians("overhead", shell)
+    each = [medians(f"overhead-{r}", shell) for r in range(1, rounds + 1)]
     net = medians("net", shell)
-    overhead = over["bx"] - over["baseline"]
+    baseline = statistics.median(m["baseline"] for m in each)
+    with_bx = statistics.median(m["bx"] for m in each)
+    overhead = statistics.median(m["bx"] - m["baseline"] for m in each)
     saved = net["legacy"] - net["bx"]
     if overhead > budget:
         over_budget.append((shell, overhead))
 
     print()
     print(f"  {shell}")
-    print(f"  baseline   {over['baseline']:7.2f} ms")
-    print(f"  + bx       {over['bx']:7.2f} ms   after `bx apply` of the example")
-    print(f"  overhead   {overhead:7.2f} ms   (budget {budget:.2f} ms)")
+    print(f"  baseline   {baseline:7.2f} ms")
+    print(f"  + bx       {with_bx:7.2f} ms   after `bx apply` of the example")
+    print(f"  overhead   {overhead:7.2f} ms   (budget {budget:.2f} ms; median of {rounds} rounds)")
     print(f"  spawns     {0:7d}      processes bx's startup files started")
     print(f"  reads      {0:7d}      configuration files they read")
     print()

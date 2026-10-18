@@ -197,9 +197,12 @@ pub(crate) mod testing {
 
     /// The installed shell `program`, or `None` on a machine excused from
     /// supplying it. A runner may not excuse itself, as `env_guard`'s
-    /// differential checks rule.
+    /// differential checks rule. A version-manager shim is resolved to the
+    /// real shell first, and fails the check when it cannot be.
     pub(crate) fn installed(program: &str) -> Option<PathBuf> {
-        if let crate::detect::Presence::Present { path } = crate::detect::locate_in_env(program) {
+        if let Some(path) =
+            crate::detect::locate_real_in_env(program).unwrap_or_else(|shim| panic!("{shim}"))
+        {
             return Some(path);
         }
         let excused = std::env::var_os("BX_TEST_WITHOUT_SHELLS").is_some();

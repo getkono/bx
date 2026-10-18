@@ -139,6 +139,105 @@ pub fn locate_in_env(tool: impl AsRef<OsStr>) -> Presence {
     locate(tool, std::env::var_os("PATH").unwrap_or_default())
 }
 
+/// The real executable `tool` on the process's `PATH` runs, for the tests
+/// that run it with a cleared environment: `Ok(None)` when nothing is found.
+#[cfg(test)]
+pub(crate) fn locate_real_in_env(tool: &str) -> Result<Option<PathBuf>, String> {
+    locate_real(tool, std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// The real executable `tool` resolves to on `path_var`, seen through any
+/// version-manager shim in the way.
+///
+/// A shim — mise's or asdf's, an entry in a directory named `shims` — finds
+/// its tool from the caller's environment and working directory. A test that
+/// clears the environment before running it gets a shim that exits 1 having
+/// printed nothing, and fails for a reason unrelated to bx. So a shim is
+/// resolved here, while the developer's environment is still intact: first
+/// by asking its manager (`mise which`, `asdf which`), then by the next
+/// entry on `path_var` that is not a shim. When neither answers, the error
+/// names the shim and the fix rather than letting the test run it.
+///
+/// Test-only: the module's no-spawn rule is for bx itself, and asking the
+/// manager is a process.
+#[cfg(test)]
+fn locate_real(tool: &str, path_var: impl AsRef<OsStr>) -> Result<Option<PathBuf>, String> {
+    let path_var = path_var.as_ref();
+    let Presence::Present { path: found } = locate(tool, path_var) else {
+        return Ok(None);
+    };
+    if !in_shims(&found) {
+        return Ok(Some(found));
+    }
+    let real = |candidate: &Path| {
+        !in_shims(candidate) && matches!(classify(candidate), Presence::Present { .. })
+    };
+    for manager in managers_of(&found, path_var) {
+        if let Some(path) = manager_which(&manager, tool).filter(|path| real(path)) {
+            return Ok(Some(path));
+        }
+    }
+    let beyond = std::env::split_paths(path_var)
+        .filter(|dir| !dir.as_os_str().is_empty() && !is_shims(dir))
+        .map(|dir| dir.join(tool))
+        .find(|candidate| real(candidate));
+    beyond.map(Some).ok_or_else(|| {
+        format!(
+            "{tool} resolves to the version-manager shim {}, which cannot find its tool once \
+             the test clears the environment, and neither `mise which {tool}` nor \
+             `asdf which {tool}` named the real executable — activate {tool} where the tests \
+             run (e.g. `mise use --global {tool}`), or put a real {tool} on PATH",
+            found.display()
+        )
+    })
+}
+
+/// Whether `path` is an entry in a version manager's shim directory.
+#[cfg(test)]
+fn in_shims(path: &Path) -> bool {
+    path.parent().is_some_and(is_shims)
+}
+
+#[cfg(test)]
+fn is_shims(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| name == "shims")
+}
+
+/// The version managers that may own `shim`: the program a mise shim links
+/// to, then `mise` and `asdf` wherever `path_var` finds them.
+#[cfg(test)]
+fn managers_of(shim: &Path, path_var: &OsStr) -> Vec<PathBuf> {
+    let mut managers = Vec::new();
+    if let Ok(target) = std::fs::canonicalize(shim)
+        && target
+            .file_name()
+            .is_some_and(|name| name == "mise" || name == "asdf")
+    {
+        managers.push(target);
+    }
+    for name in ["mise", "asdf"] {
+        if let Presence::Present { path } = locate(name, path_var)
+            && !managers.contains(&path)
+        {
+            managers.push(path);
+        }
+    }
+    managers
+}
+
+/// What `manager which tool` names, run in the inherited environment.
+#[cfg(test)]
+fn manager_which(manager: &Path, tool: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new(manager)
+        .args(["which", tool])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let printed = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(printed.trim());
+    (output.status.success() && path.is_absolute()).then_some(path)
+}
+
 /// Classify one concrete candidate path.
 fn classify(candidate: &Path) -> Presence {
     // `metadata` follows symlinks, which is what we want both ways round: a
@@ -431,6 +530,103 @@ mod tests {
             Some(found)
         );
         assert_eq!(Presence::Missing.path(), None);
+    }
+
+    /// A `shims` directory holding `tool` as a link to a stand-in `mise`
+    /// that answers `which` with `answer`, or fails when there is none.
+    fn shimmed(tool: &str, answer: Option<&Path>) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let mise = dir.path().join("mise");
+        let script = match answer {
+            Some(path) => format!(
+                "#!/bin/sh\n[ \"$1 $2\" = 'which {tool}' ] && echo '{}'\n",
+                path.display()
+            ),
+            None => "#!/bin/sh\nexit 1\n".to_string(),
+        };
+        fs::write(&mise, script).unwrap();
+        fs::set_permissions(&mise, fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread that forks while the stand-in is open for
+        // writing holds that descriptor until its child calls `exec`, and
+        // running the stand-in inside that window fails with `ETXTBSY`, which
+        // `manager_which` would read as no answer. The window closes on its
+        // own, so the stand-in is run once here, retrying only that error,
+        // before `locate_real` runs it.
+        let mut warmed = false;
+        for _ in 0..200 {
+            match std::process::Command::new(&mise)
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("the stand-in mise would not run: {e}"),
+                Ok(_) => {
+                    warmed = true;
+                    break;
+                }
+            }
+        }
+        assert!(warmed, "the stand-in mise stayed busy");
+        let shims = dir.path().join("shims");
+        fs::create_dir(&shims).unwrap();
+        let shim = shims.join(tool);
+        std::os::unix::fs::symlink(&mise, &shim).unwrap();
+        (dir, shim)
+    }
+
+    #[test]
+    fn a_program_that_is_no_shim_is_its_own_real_executable() {
+        let dir = TempDir::new().unwrap();
+        let exe = bin(&dir, "bun", 0o755);
+        assert_eq!(locate_real("bun", path_of(&[&dir])), Ok(Some(exe)));
+        assert_eq!(locate_real("uv", path_of(&[&dir])), Ok(None));
+    }
+
+    #[test]
+    fn a_shim_resolves_to_what_its_manager_names() {
+        let real_dir = TempDir::new().unwrap();
+        let real = bin(&real_dir, "bun", 0o755);
+        let (_dir, shim) = shimmed("bun", Some(&real));
+        let shims = shim.parent().unwrap();
+        assert_eq!(locate_real("bun", shims), Ok(Some(real)));
+    }
+
+    #[test]
+    fn a_shim_its_manager_cannot_name_falls_back_to_a_real_one_on_the_path() {
+        let real_dir = TempDir::new().unwrap();
+        let real = bin(&real_dir, "bun", 0o755);
+        // The manager names another shim, which is no answer.
+        let (_dir, shim) = shimmed("bun", None);
+        let (_other, other_shim) = shimmed("bun", None);
+        let (_naming, naming_a_shim) = shimmed("bun", Some(&other_shim));
+        for shim in [&shim, &naming_a_shim] {
+            let path_var = std::env::join_paths([
+                shim.parent().unwrap(),
+                other_shim.parent().unwrap(),
+                real_dir.path(),
+            ])
+            .unwrap();
+            assert_eq!(locate_real("bun", path_var), Ok(Some(real.clone())));
+        }
+    }
+
+    #[test]
+    fn a_shim_nothing_resolves_fails_naming_the_shim() {
+        let (_dir, shim) = shimmed("bun", None);
+        let message = locate_real("bun", shim.parent().unwrap()).unwrap_err();
+        assert!(message.contains(&shim.display().to_string()), "{message}");
+        assert!(message.contains("mise use --global bun"), "{message}");
+    }
+
+    #[test]
+    fn locate_real_in_env_reads_the_process_path() {
+        assert!(locate_real_in_env("sh").unwrap().is_some());
+        assert_eq!(
+            locate_real_in_env("bx-a-tool-that-is-definitely-not-installed"),
+            Ok(None)
+        );
     }
 
     #[test]

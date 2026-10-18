@@ -32,14 +32,15 @@
 #                 which `mise run bench` builds first)
 #   BX_BUDGET_MS  overhead budget in milliseconds (default: 5)
 #   BX_BENCH_RUNS minimum hyperfine runs per fixture (default: 50)
-#   BX_BENCH_ROUNDS interleaved rounds the overhead's runs are split into
-#                 (default: 10)
+#   BX_BENCH_ROUNDS interleaved rounds the overhead is measured in, each
+#                 starting either fixture twice (default: BX_BENCH_RUNS / 2,
+#                 rounded up)
 
 set -eu
 
 BUDGET_MS="${BX_BUDGET_MS:-5}"
 RUNS="${BX_BENCH_RUNS:-50}"
-ROUNDS="${BX_BENCH_ROUNDS:-10}"
+ROUNDS="${BX_BENCH_ROUNDS:-$(((RUNS + 1) / 2))}"
 SHELLS="zsh bash"
 [ "$ROUNDS" -ge 1 ] 2>/dev/null || {
 	echo "error: BX_BENCH_ROUNDS must be a whole number of at least 1." >&2
@@ -376,23 +377,22 @@ run() { # run <name> <shell> <warmup> <count> <fixture>...: one hyperfine, in th
 # The overhead is a difference of two fixtures, and hyperfine times each
 # fixture's runs as one block, so whatever the machine is doing while one block
 # runs and not the other lands in the difference: a shared CI runner moves the
-# same start by more than the budget from one second to the next. So its runs
-# are split into rounds, each timing both fixtures back to back, in the
-# opposite order to the round before, and the gate reads the median of the
-# rounds' differences: drift slower than a round cancels out of each, and a
-# round it hit is outvoted. A round runs an exact count, at least 5 a fixture:
-# hyperfine's --min-runs would keep each block going for seconds, as long as
-# the drift it is there to cancel.
-PER_ROUND=$(((RUNS + ROUNDS - 1) / ROUNDS))
-[ "$PER_ROUND" -ge 5 ] || PER_ROUND=5
+# same start by more than the budget from one start to the next, and a macOS
+# runner holds a slow spell for a fraction of a second, shorter than any block
+# of runs. So the overhead is measured in rounds of four single starts, each
+# fixture twice, mirrored (baseline bx bx baseline, then bx baseline baseline
+# bx the round after), and the gate reads the median of the rounds'
+# differences: a drift that is steady across a round's four starts cancels out
+# of it, every fixture holds every position equally often, and a round a spell
+# broke into is outvoted. The rounds are primed, so none needs a warmup.
 for sh in $SHELLS; do
 	prime "$sh" baseline legacy bx
 	echo "Measuring bx's generated ${sh} startup files (budget ${BUDGET_MS} ms)..."
 	round=1
 	while [ "$round" -le "$ROUNDS" ]; do
 		case "$((round % 2))" in
-		1) run "overhead-${round}" "$sh" 2 "--runs ${PER_ROUND}" baseline bx ;;
-		0) run "overhead-${round}" "$sh" 2 "--runs ${PER_ROUND}" bx baseline ;;
+		1) run "overhead-${round}" "$sh" 0 "--runs 1" baseline bx bx baseline ;;
+		0) run "overhead-${round}" "$sh" 0 "--runs 1" bx baseline baseline bx ;;
 		esac
 		round=$((round + 1))
 	done
@@ -409,23 +409,30 @@ rounds, shells = int(sys.argv[3]), sys.argv[4:]
 
 
 def order(name):
-    # The order run.sh gave the fixtures in: odd rounds start with the
-    # baseline, even rounds with bx.
+    # The order run.sh gave the fixtures in: odd rounds are baseline bx bx
+    # baseline, even rounds their mirror.
     if name == "net":
         return ["legacy", "bx"]
-    return ["baseline", "bx"] if int(name.split("-")[1]) % 2 else ["bx", "baseline"]
+    if int(name.split("-")[1]) % 2:
+        return ["baseline", "bx", "bx", "baseline"]
+    return ["bx", "baseline", "baseline", "bx"]
 
 
 def medians(name, shell):
     with open(f"{results}/{name}-{shell}.json") as fh:
         data = json.load(fh)["results"]
-    # The -n labels are not echoed back in the JSON, so pair by position: the
-    # results are in the order the commands were given. The median, not the
-    # mean: a start the scheduler delayed moves the mean by its whole delay
-    # and the median not at all, and the gate is about bx, not about the
-    # machine's other load. hyperfine 1 puts it at the top of each result,
-    # hyperfine 2 under its summary's wall-clock time.
-    return {label: median(r) * 1000 for label, r in zip(order(name), data)}
+    # hyperfine 1 does not echo the -n labels back in the JSON, so pair by
+    # position: the results are in the order the commands were given. The
+    # median, not the mean: a start the scheduler delayed moves the mean by
+    # its whole delay and the median not at all, and the gate is about bx, not
+    # about the machine's other load. hyperfine 1 puts it at the top of each
+    # result, hyperfine 2 under its summary's wall-clock time. A fixture a
+    # round starts twice reads as the mean of its two starts, which is what
+    # cancels a steady drift across the round.
+    each = {}
+    for label, r in zip(order(name), data):
+        each.setdefault(label, []).append(median(r) * 1000)
+    return {label: statistics.mean(times) for label, times in each.items()}
 
 
 def median(result):

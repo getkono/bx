@@ -83,15 +83,19 @@ arbitrary.
   parses it; and it is shell zsh and bash both run cleanly, since the example
   activates each tool for both.
 - **Primed.** Each fixture runs once before timing so `compinit`'s dump exists,
-  and hyperfine warms up further before recording.
-- **Medians.** Each fixture's time is the median of its runs, so a start the
-  scheduler happened to delay does not move the number the gate reads.
+  and the `net` measurement warms up further before recording.
+- **Medians.** The gate reads a median of differences, so a start the
+  scheduler happened to delay does not move the number it reads.
 - **Interleaved.** A shared CI runner moves the same start by more than the
-  budget from one second to the next, and hyperfine times each fixture's runs
-  as one block, so a difference of two blocks would carry that drift. The
-  `overhead` runs are split into `BX_BENCH_ROUNDS` rounds (default 10), each
-  timing `baseline` and `bx` back to back, in the opposite order to the round
-  before, and the gate reads the median of the rounds' differences.
+  budget from one start to the next, and a macOS runner holds a slow spell for
+  a fraction of a second, so a difference of two blocks of runs would carry
+  that drift. The `overhead` is measured in `BX_BENCH_ROUNDS` rounds (default
+  half of `BX_BENCH_RUNS`, rounded up) of four single starts, mirrored:
+  `baseline bx bx baseline`, then `bx baseline baseline bx`. A round's
+  difference is the mean of its two `bx` starts less the mean of its two
+  `baseline` starts, so a drift steady across the round cancels, and the gate
+  reads the median of the rounds' differences, so a round a spell broke into
+  is outvoted.
 
 The example's pinned external and its secret are switched off in the bench's
 `local.toml`: one would clone over the network and the other needs a key, and
@@ -130,5 +134,6 @@ stubs/                    stand-ins for starship, zoxide, mise, fzf
 results/                  hyperfine JSON per measurement, round and shell (gitignored)
 ```
 
-`BX_BENCH_RUNS` (default 50) sets the minimum runs per fixture, which the
-`overhead` measurement divides among its rounds, at least 5 a fixture in each.
+`BX_BENCH_RUNS` (default 50) sets the minimum runs per fixture of the `net`
+measurement, and the runs per fixture of the `overhead` measurement, two in
+each of its rounds.

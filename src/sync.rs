@@ -101,6 +101,27 @@ pub enum Error {
         /// The branch checked out there.
         branch: String,
     },
+    /// The branch names an upstream the fetch left no ref for.
+    #[error(
+        "the branch {branch} of the config repo tracks {upstream}, which does not exist: it \
+         was deleted, or never pushed, and bx sync {}. Set another upstream with `git -C {} \
+         branch --set-upstream-to=REMOTE/BRANCH`, or publish {branch} with `git -C {} push \
+         --set-upstream REMOTE {branch}`, and run bx sync again",
+        diverged_changes(*.recovered),
+        .repo.display(),
+        .repo.display()
+    )]
+    UpstreamGone {
+        /// The config repo.
+        repo: PathBuf,
+        /// The branch checked out there.
+        branch: String,
+        /// The upstream it names, as `REMOTE/BRANCH`.
+        upstream: String,
+        /// Tracked copies an interrupted sync left uncommitted, which [`pull`]
+        /// committed before it found the upstream gone.
+        recovered: usize,
+    },
     /// Both the branch and its upstream have commits the other lacks.
     #[error(
         "{branch} and {upstream} have diverged ({ahead} commit(s) only here, {behind} only \
@@ -162,7 +183,8 @@ pub enum Error {
     Output(#[source] std::io::Error),
 }
 
-/// What [`Error::Diverged`] says `sync` changed before it refused: nothing,
+/// What [`Error::Diverged`] and [`Error::UpstreamGone`] say `sync` changed
+/// before it refused: nothing,
 /// or only the commit of the `recovered` copies an interrupted sync carried.
 fn diverged_changes(recovered: usize) -> String {
     if recovered == 0 {
@@ -210,9 +232,10 @@ pub struct Pulled {
 /// outside the config repo; the config repo must be a git repository of its
 /// own, on a branch with an upstream; tracked copies an interrupted sync wrote
 /// and never committed are committed ([`commit_carried`]); the upstream is
-/// fetched; a branch that has diverged from it is refused; a branch with
-/// commits to push is refused when one carries a state file; and a branch
-/// that is behind is fast-forwarded. Nothing but that commit is changed
+/// fetched; an upstream the fetch left no ref for is refused; a branch that
+/// has diverged from it is refused; a branch with commits to push is refused
+/// when one carries a state file; and a branch that is behind is
+/// fast-forwarded. Nothing but that commit is changed
 /// before the fast-forward, which git makes only when the working tree allows
 /// it.
 ///
@@ -220,10 +243,10 @@ pub struct Pulled {
 ///
 /// [`plan::Error::RepoMissing`] when there is no config repo;
 /// [`Error::StateInRepo`], [`Error::NotARepo`], [`Error::Detached`],
-/// [`Error::NoUpstream`], [`Error::Diverged`] and [`Error::WouldPushState`]
-/// as their steps say; [`Error::Unexpected`] when git's ahead/behind count
-/// cannot be read; [`Error::Git`] when git cannot be started or refuses a
-/// step; and whatever [`commit_carried`] returns.
+/// [`Error::NoUpstream`], [`Error::UpstreamGone`], [`Error::Diverged`] and
+/// [`Error::WouldPushState`] as their steps say; [`Error::Unexpected`] when
+/// git's ahead/behind count cannot be read; [`Error::Git`] when git cannot be
+/// started or refuses a step; and whatever [`commit_carried`] returns.
 pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
     let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
     if !repo.is_dir() {
@@ -248,6 +271,15 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
     let recovered = commit_carried(env, git, &repo)?;
 
     git.remote(&repo, &["fetch", "--quiet", &upstream.remote])?;
+    // Asked after the fetch, which may create the ref or prune it.
+    if gone(git, &repo, &branch)? {
+        return Err(Error::UpstreamGone {
+            repo,
+            branch,
+            upstream: upstream.short,
+            recovered,
+        });
+    }
     let (ahead, behind) = counts(git, &repo)?;
     if ahead > 0 && behind > 0 {
         return Err(Error::Diverged {
@@ -453,6 +485,21 @@ fn upstream(git: &Git, repo: &Path, branch: &str) -> Result<Upstream, Error> {
             branch: branch.to_string(),
         }),
     }
+}
+
+/// Whether the upstream `branch` names has no ref here: deleted where it was
+/// pushed and pruned by a fetch, or never pushed at all. Git cannot resolve
+/// `@{upstream}` for such a branch, and says so only as `no such branch`.
+fn gone(git: &Git, repo: &Path, branch: &str) -> Result<bool, Error> {
+    let track = git.query(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(upstream:track,nobracket)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    Ok(track == "gone")
 }
 
 /// Commits only on the branch, and commits only on its upstream.
@@ -736,6 +783,83 @@ pub(crate) mod tests {
             "{error:?}"
         );
         assert!(error.to_string().contains("--set-upstream-to"), "{error}");
+    }
+
+    #[test]
+    fn a_branch_whose_upstream_is_gone_is_refused_and_left_where_it_was() {
+        let home = guarded_home();
+        let repo = cloned(&home, "");
+        run(
+            home.path(),
+            &repo,
+            &["config", "branch.master.merge", "refs/heads/gone"],
+        );
+        let before = rev(home.path(), &repo, "HEAD");
+        let error = pull(&env(home.path()), &git(home.path())).expect_err("upstream gone");
+        assert!(
+            matches!(
+                &error,
+                Error::UpstreamGone { branch, upstream, .. }
+                    if branch == "master" && upstream == "origin/gone"
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("--set-upstream-to"), "{error}");
+        assert!(error.to_string().contains("changed nothing."), "{error}");
+        assert_eq!(rev(home.path(), &repo, "HEAD"), before);
+    }
+
+    #[test]
+    fn an_upstream_deleted_on_the_remote_and_pruned_by_the_fetch_is_gone() {
+        let home = guarded_home();
+        let repo = cloned(&home, "");
+        run(home.path(), &repo, &["checkout", "--quiet", "-b", "topic"]);
+        run(
+            home.path(),
+            &repo,
+            &["push", "--quiet", "-u", "origin", "topic"],
+        );
+        let other = other(&home);
+        run(
+            home.path(),
+            &other,
+            &["push", "--quiet", "origin", "--delete", "topic"],
+        );
+        run(home.path(), &repo, &["config", "fetch.prune", "true"]);
+        let error = pull(&env(home.path()), &git(home.path())).expect_err("pruned");
+        assert!(
+            matches!(
+                &error,
+                Error::UpstreamGone { branch, upstream, .. }
+                    if branch == "topic" && upstream == "origin/topic"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_upstream_another_machine_pushed_is_fetched_before_it_is_judged_gone() {
+        let home = guarded_home();
+        let repo = cloned(&home, "");
+        let other = other(&home);
+        run(home.path(), &other, &["checkout", "--quiet", "-b", "topic"]);
+        std::fs::write(other.join("notes"), "x\n").expect("a note");
+        commit_all(home.path(), &other, "elsewhere");
+        run(home.path(), &other, &["push", "--quiet", "origin", "topic"]);
+        // Tracking a branch this clone has never fetched.
+        run(home.path(), &repo, &["checkout", "--quiet", "-b", "topic"]);
+        run(
+            home.path(),
+            &repo,
+            &["config", "branch.topic.remote", "origin"],
+        );
+        run(
+            home.path(),
+            &repo,
+            &["config", "branch.topic.merge", "refs/heads/topic"],
+        );
+        let pulled = pull(&env(home.path()), &git(home.path())).expect("pulled");
+        assert_eq!(pulled.fast_forwarded, 1);
     }
 
     #[test]

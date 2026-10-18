@@ -546,6 +546,29 @@ mod tests {
         };
         fs::write(&mise, script).unwrap();
         fs::set_permissions(&mise, fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread that forks while the stand-in is open for
+        // writing holds that descriptor until its child calls `exec`, and
+        // running the stand-in inside that window fails with `ETXTBSY`, which
+        // `manager_which` would read as no answer. The window closes on its
+        // own, so the stand-in is run once here, retrying only that error,
+        // before `locate_real` runs it.
+        let mut warmed = false;
+        for _ in 0..200 {
+            match std::process::Command::new(&mise)
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("the stand-in mise would not run: {e}"),
+                Ok(_) => {
+                    warmed = true;
+                    break;
+                }
+            }
+        }
+        assert!(warmed, "the stand-in mise stayed busy");
         let shims = dir.path().join("shims");
         fs::create_dir(&shims).unwrap();
         let shim = shims.join(tool);

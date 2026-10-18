@@ -413,7 +413,11 @@ jobs:
           install_args: aqua:sharkdp/hyperfine
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
+      # The default shell runs without pipefail, so the step would take tee's
+      # status and pass whatever the bench reported. An explicit `shell: bash`
+      # runs with pipefail, so a failing bench fails the step.
       - name: Measure
+        shell: bash
         run: mise run bench | tee bench-result.txt
       - name: Upload benchmark result
         if: always()

@@ -255,15 +255,17 @@ fn a_runner_that_asks_to_be_excused_fails_instead() {
     excuse_honoured(true, true);
 }
 
-/// The installed program `program` resolves to.
+/// The installed program `program` resolves to, seen through any
+/// version-manager shim, which could not find its tool in the cleared
+/// environment the checks run it in; a shim that cannot be resolved fails.
 ///
 /// A program that is not installed fails the check it would have run,
 /// unless [`WITHOUT_SHELLS`] excuses this machine — which, per
 /// [`excuse_honoured`], no runner may be.
 fn installed(program: &str) -> Option<PathBuf> {
-    match crate::detect::locate_in_env(program) {
-        crate::detect::Presence::Present { path } => Some(path),
-        _ => {
+    match crate::detect::locate_real_in_env(program).unwrap_or_else(|shim| panic!("{shim}")) {
+        Some(path) => Some(path),
+        None => {
             assert!(
                 shells_are_excused(),
                 "{program} is not installed, so every check held against it \

@@ -86,6 +86,12 @@ arbitrary.
   and hyperfine warms up further before recording.
 - **Medians.** Each fixture's time is the median of its runs, so a start the
   scheduler happened to delay does not move the number the gate reads.
+- **Interleaved.** A shared CI runner moves the same start by more than the
+  budget from one second to the next, and hyperfine times each fixture's runs
+  as one block, so a difference of two blocks would carry that drift. The
+  `overhead` runs are split into `BX_BENCH_ROUNDS` rounds (default 10), each
+  timing `baseline` and `bx` back to back, in the opposite order to the round
+  before, and the gate reads the median of the rounds' differences.
 
 The example's pinned external and its secret are switched off in the bench's
 `local.toml`: one would clone over the network and the other needs a key, and
@@ -121,7 +127,8 @@ fixtures/baseline/        the account's own zshrc and bashrc, no integrations
 fixtures/bx/              the example configuration, applied into a copy of baseline
 fixtures/legacy/          baseline + eval "$(tool init)" per tool
 stubs/                    stand-ins for starship, zoxide, mise, fzf
-results/                  hyperfine JSON per measurement and shell (gitignored)
+results/                  hyperfine JSON per measurement, round and shell (gitignored)
 ```
 
-`BX_BENCH_RUNS` (default 50) sets the minimum runs per fixture.
+`BX_BENCH_RUNS` (default 50) sets the minimum runs per fixture, which the
+`overhead` measurement divides among its rounds, at least 5 a fixture in each.

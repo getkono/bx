@@ -497,18 +497,20 @@ mod tests {
         let started = Instant::now();
         assert!(bounded(&mut parent, started + Duration::from_millis(300), true).is_none());
         let pid = std::fs::read_to_string(&pid_file).expect("the grandchild's pid");
-        let proc = PathBuf::from("/proc").join(pid.trim());
+        let pid = pid.trim();
+        let grandchild = pid
+            .parse()
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("a process id");
         let gone = (0..100).any(|_| {
-            // A killed process lingers as a zombie until its parent reaps
-            // it; either way it no longer runs.
-            let state = std::fs::read_to_string(proc.join("stat")).unwrap_or_default();
-            let running = !state.is_empty() && !state.contains(") Z ");
+            let running = runs(grandchild);
             if running {
                 std::thread::sleep(Duration::from_millis(20));
             }
             !running
         });
-        assert!(gone, "the grandchild {} still runs", pid.trim());
+        assert!(gone, "the grandchild {pid} still runs");
 
         let home = guarded_home();
         let error = git(home.path())
@@ -519,6 +521,34 @@ mod tests {
                 error.to_string().contains("did not finish in time"),
                 "{error}"
             );
+        }
+    }
+
+    /// Whether `pid` still runs.
+    ///
+    /// `kill(pid, 0)` answers on every platform: `ESRCH` means no such process,
+    /// and anything else, `EPERM` included, means one exists. A killed process
+    /// lingers as a zombie until it is reaped, and an orphan is reaped by
+    /// whatever adopts it; on Linux that may be a subreaper or a container's
+    /// first process that never reaps, so there a process whose `/proc` state
+    /// is `Z` no longer runs either. An unreadable `/proc` confirms nothing, so
+    /// the process is then judged by `kill` alone, never assumed gone.
+    ///
+    /// One function with an arm per platform, as `has_cap_fsetid` is, so the
+    /// whole of it builds wherever the suite does.
+    fn runs(pid: rustix::process::Pid) -> bool {
+        let exists = !matches!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_nonzero()));
+            exists && !stat.is_ok_and(|stat| stat.contains(") Z "))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            exists
         }
     }
 }

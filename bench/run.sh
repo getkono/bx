@@ -75,6 +75,12 @@ else
 	echo "       or kqueue's NOTE_FORK (macOS)." >&2
 	exit 1
 fi
+# Said once, so a log shows which way the spawns below were counted; CI's
+# macOS bench job requires the kqueue line.
+case "$COUNT_BY" in
+proc) echo "Counting the processes a start spawns through /proc/\$\$/stat." ;;
+kqueue) echo "Counting the processes a start spawns through kqueue NOTE_FORK." ;;
+esac
 
 mkdir -p "$RESULTS"
 

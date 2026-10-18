@@ -423,3 +423,48 @@ jobs:
           path: |
             bench-result.txt
             bench/results/
+
+  bench-macos:
+    name: Shell startup budget (macOS)
+    runs-on: macos-latest
+    # The same gate as `bench`, on macOS. Its spawn trace takes the other path
+    # in bench/run.sh: macOS has no /proc, so forks are counted through kqueue,
+    # and a change that starts a process only there, or slows startup only
+    # there, would otherwise merge green. See bench/README.md.
+    #
+    # MISE_AUTO_INSTALL is off for the reason written out in `bench`.
+    env:
+      MISE_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+        with:
+          install_args: aqua:sharkdp/hyperfine
+      # zsh and bash ship with macOS, so there is no install step. The bash
+      # measured is the one the bench's hermetic PATH finds, and it must be the
+      # system's 3.2, the oldest bash bx supports: a newer one on that PATH
+      # would make the number say nothing about the floor.
+      - name: Confirm the system bash is the one measured
+        run: |
+          bash_path="$(env -i PATH=/usr/local/bin:/usr/bin:/bin sh -c 'command -v bash')"
+          "$bash_path" --version | head -n 1
+          test "$bash_path" = /bin/bash
+      # An explicit `shell: bash` runs with pipefail, so a failing bench fails
+      # the step through tee. The kqueue line is required: on macOS the trace
+      # must count forks, never be skipped, and run.sh says which way it
+      # counted.
+      - name: Measure
+        shell: bash
+        run: |
+          mise run bench | tee bench-result.txt
+          grep -qF 'through kqueue NOTE_FORK' bench-result.txt
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: startup-benchmark-macos
+          path: |
+            bench-result.txt
+            bench/results/

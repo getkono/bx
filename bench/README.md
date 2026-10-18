@@ -3,7 +3,13 @@
 `bx` is on every shell start, so "fast enough to forget" is a product
 requirement — and an unmeasured requirement is one that regresses. `mise run
 bench` is the external profile that keeps it honest, and CI fails on a
-regression.
+regression on both platforms bx supports: the `Shell startup budget` job runs
+it on Linux, where spawns are counted through `/proc`, and
+`Shell startup budget (macOS)` runs it on macOS, holding bash to the system's
+`/bin/bash` 3.2, where they are counted through kqueue. `run.sh`
+prints which way it counted, and the macOS job fails unless that line names
+kqueue, so neither job can pass with the trace skipped. Each uploads its
+result as its own artifact, `startup-benchmark` and `startup-benchmark-macos`.
 
 ```
 mise run bench

@@ -818,6 +818,15 @@ impl Stamps {
         available: Option<&[String]>,
     ) -> Result<(), Error> {
         self.state.ensure_update()?;
+        // Made beside every stamp a shell asks from, so its prompt can
+        // register with a redirect and start no process.
+        if let Err(source) = std::fs::create_dir_all(self.waiting()) {
+            return Err(Error::Io {
+                op: "making",
+                path: self.waiting(),
+                source,
+            });
+        }
         for (path, interval) in [(self.ask_due(), ask), (self.check_due(), check)] {
             match interval {
                 Some(Some(interval)) => {
@@ -833,15 +842,6 @@ impl Stamps {
                 self.remove(&self.answered())?;
             }
             Some(lines) => {
-                // Made here, beside the offer it waits on, so a shell's prompt
-                // can register with a redirect and start no process.
-                if let Err(source) = std::fs::create_dir_all(self.waiting()) {
-                    return Err(Error::Io {
-                        op: "making",
-                        path: self.waiting(),
-                        source,
-                    });
-                }
                 let text: String = std::iter::once(format!("gen {}\n", generation(lines)))
                     .chain(lines.iter().map(|line| format!("{line}\n")))
                     .collect();

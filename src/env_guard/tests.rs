@@ -1917,15 +1917,26 @@ fn the_update_prompt_is_not_an_environment_fragment() {
              names, a local, nor zsh's precmd hook array"
         );
     }
-    // Not vacuous: the once-per-shell markers and the registration.
+    // Not vacuous: the once-per-shell markers, the registration, and the
+    // locals the cross-shell wait assigns — the trap's included.
     for name in [
         "BX_UPDATE_ASKED",
         "BX_UPDATE_CHECKING",
         "precmd_functions",
         "answer",
+        "woken",
+        "outcome",
+        "also",
+        "left",
     ] {
         assert!(assigned.contains(&name), "{name}: {assigned:?}");
     }
+    assert_eq!(
+        hook.matches("trap ").count(),
+        2,
+        "one SIGURG trap set and taken down, under localtraps"
+    );
+    assert!(!hook.contains("eval"), "zsh puts the trap back itself");
     // Nothing is exported, and nothing the guard would have to judge.
     assert!(!hook.contains("export"), "the hook exports nothing");
     for (idx, line) in hook.split('\n').enumerate() {
@@ -2022,6 +2033,30 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
         "the hook exports nothing"
     );
     assert!(!hook.contains("declare"), "nor declares a global");
+    // The one `eval` puts back the SIGURG trap the shell had: its text is
+    // what `trap -p URG` printed into the shell's waiting file, read back
+    // past the generation line before the hook's own trap is set.
+    assert_eq!(
+        hook.matches("eval").count(),
+        1,
+        "one eval, putting the trap back"
+    );
+    for piece in [
+        "{ printf '%s\\n' \"$gen\"; trap -p URG; } 2>/dev/null >| \"$dir/waiting/$$\"\n",
+        "    read -r saved\n    read -r -d '' saved\n  } 2>/dev/null < \"$dir/waiting/$$\"\n  \
+         trap 'woken=1' URG\n",
+        "  trap - URG\n  [[ -n $saved ]] && eval \"$saved\"\n",
+    ] {
+        assert!(hook.contains(piece), "{piece}");
+    }
+    assert_eq!(
+        assignments_in(hook)
+            .iter()
+            .filter(|name| **name == "saved")
+            .count(),
+        3,
+        "saved is declared empty, then holds what trap -p printed and nothing else"
+    );
     for (idx, line) in hook.split('\n').enumerate() {
         if let Statement::Assign { name, .. } = statement(line) {
             assert!(

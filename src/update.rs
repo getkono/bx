@@ -27,7 +27,7 @@
 //!
 //! # Stamps
 //!
-//! An interactive shell decides whether to ask about updates by reading three
+//! An interactive shell decides whether to ask about updates by reading the
 //! files in the state directory's `update/` with shell builtins, and starts
 //! no process to do it (Invariant 6):
 //!
@@ -35,12 +35,28 @@
 //! |-------------|-----------------------------------------------------------------------|
 //! | `ask-due`   | when to next ask whether to check, in seconds since the epoch         |
 //! | `check-due` | when to next check without asking, for `check = "auto"` externals     |
-//! | `available` | one line per external a check found new commits for                   |
+//! | `available` | `gen` and the offer's [`generation`], then one line per external a check found new commits for |
+//! | `answered`  | the generation of the offer, or `ask` and the `ask-due` of the question, a shell last had answered |
+//! | `waiting/`  | one file per shell waiting on a prompt, named by its pid               |
 //!
-//! Each is written whole by [`Stamps`] and nothing else. A missing or
-//! unreadable `ask-due` or `check-due` is never due: a machine that has not
-//! run `bx update` or `bx apply` since it began following a branch is not
-//! asked, rather than asked at once.
+//! The first three are written whole by [`Stamps`] and nothing else. A
+//! missing or unreadable `ask-due` or `check-due` is never due: a machine that
+//! has not run `bx update` or `bx apply` since it began following a branch is
+//! not asked, rather than asked at once.
+//!
+//! # Shells asking at once
+//!
+//! Every shell at a prompt sees the same offer, and the first answer settles
+//! it for all of them. The shell answered writes `answered` with a builtin
+//! redirect before it starts `bx update` or `bx update --snooze`, so a shell
+//! opened a moment later is not asked while either still runs, and wakes each
+//! shell in `waiting/` with the `kill` builtin's `SIGURG`, so one already
+//! asking gives way at once rather than at its timeout. Nothing polls and
+//! nothing watches: a waiting shell sleeps in its `read` until a key, the
+//! signal or the timeout. [`Stamps::set`] wakes them too whenever it changes
+//! what is offered or asked, so a `bx update` run by hand withdraws open
+//! prompts, and clears `answered` with `available`, so the same commits are
+//! offered again once the next interval's check finds them still unapplied.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -767,10 +783,27 @@ impl Stamps {
         self.dir.join("last-check")
     }
 
+    /// `answered`: the generation of the offer, or `ask <epoch>` of the
+    /// question, a shell last had answered, so no other shell asks it again.
+    #[must_use]
+    pub fn answered(&self) -> PathBuf {
+        self.dir.join("answered")
+    }
+
+    /// `waiting/`: one file per shell whose prompt is waiting for an answer,
+    /// named by its pid and non-empty while it waits.
+    #[must_use]
+    pub fn waiting(&self) -> PathBuf {
+        self.dir.join("waiting")
+    }
+
     /// Set `ask-due` to `now` plus `ask`, or removed when no external asks
     /// first; `check-due` to `now` plus `check`, or removed when no external
-    /// checks on its own; and `available` to `available`'s lines, or removed
-    /// when there are none. A stamp given as `None` is left as it is.
+    /// checks on its own; and `available` to `available`'s lines under their
+    /// [`generation`], or removed, with `answered`, when there are none. A
+    /// stamp given as `None` is left as it is. Once `available` or `ask-due`
+    /// is written, every shell waiting on a prompt is woken ([`Stamps::wake`])
+    /// to see whether what it asks still stands.
     ///
     /// # Errors
     ///
@@ -795,14 +828,108 @@ impl Stamps {
             }
         }
         match available {
-            Some([]) => self.remove(&self.available())?,
+            Some([]) => {
+                self.remove(&self.available())?;
+                self.remove(&self.answered())?;
+            }
             Some(lines) => {
-                let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+                // Made here, beside the offer it waits on, so a shell's prompt
+                // can register with a redirect and start no process.
+                if let Err(source) = std::fs::create_dir_all(self.waiting()) {
+                    return Err(Error::Io {
+                        op: "making",
+                        path: self.waiting(),
+                        source,
+                    });
+                }
+                let text: String = std::iter::once(format!("gen {}\n", generation(lines)))
+                    .chain(lines.iter().map(|line| format!("{line}\n")))
+                    .collect();
                 self.write(&self.available(), &text)?;
             }
             None => {}
         }
+        if available.is_some() || ask.is_some() {
+            self.wake();
+        }
         Ok(())
+    }
+
+    /// Wake every shell waiting on a prompt with `SIGURG`, so it reads the
+    /// stamps again and gives way when what it asks was answered or
+    /// replaced; and remove the file of every shell that is gone.
+    ///
+    /// Best effort: a shell this cannot reach still gives up at its prompt's
+    /// timeout. A file whose pid is gone — `kill(pid, 0)` says no such
+    /// process — or belongs to another account, which no shell of this one's
+    /// is, is a shell that exited without letting go, and is removed. One
+    /// whose pid a new process of this account took is signalled once more
+    /// before it is removed in its turn, which costs nothing: `SIGURG` is
+    /// ignored by any process that does not ask for it.
+    pub fn wake(&self) {
+        let Ok(entries) = std::fs::read_dir(self.waiting()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .filter(|name| !name.starts_with('0') && name.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|name| name.parse().ok())
+                .and_then(rustix::process::Pid::from_raw)
+            else {
+                continue;
+            };
+            match rustix::process::test_kill_process(pid) {
+                Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                Ok(()) if entry.metadata().is_ok_and(|meta| meta.len() > 0) => {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::URG);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether the prompt hook ([`crate::shell::update_prompt`]) offers what
+    /// `available` holds to a shell that has not yet asked about it, given
+    /// `answered`: the stamps' bytes, either `None` where the file is absent.
+    ///
+    /// It reads them as the hook's `read -r` does: whole lines only, each less
+    /// the spaces and tabs around it. A first line `gen G` is the offer's
+    /// generation, and the lines after it are what is offered; one without it
+    /// is offered as it stands. Something is offered while there is a line to
+    /// offer, unless the first line of `answered`, read the same way, is its
+    /// generation.
+    #[must_use]
+    pub fn offers(available: Option<&[u8]>, answered: Option<&[u8]>) -> bool {
+        let trim = |line: &[u8]| -> Vec<u8> {
+            let blank = |byte: &u8| matches!(byte, b' ' | b'\t');
+            let start = line.iter().position(|b| !blank(b)).unwrap_or(line.len());
+            let stop = line
+                .iter()
+                .rposition(|b| !blank(b))
+                .map_or(start, |l| l + 1);
+            line[start..stop].to_vec()
+        };
+        let mut lines: Vec<Vec<u8>> = available
+            .unwrap_or_default()
+            .split_inclusive(|&byte| byte == b'\n')
+            .filter_map(|line| line.strip_suffix(b"\n"))
+            .map(trim)
+            .collect();
+        let generation = match lines.first() {
+            Some(first) if first.starts_with(b"gen ") => Some(lines.remove(0)[4..].to_vec()),
+            _ => None,
+        };
+        let answered = answered
+            .unwrap_or_default()
+            .split(|&byte| byte == b'\n')
+            .next()
+            .map(trim)
+            .unwrap_or_default();
+        !lines.is_empty() && generation.is_none_or(|generation| generation != answered)
     }
 
     /// The epoch in `path`, or `None` when it is absent or holds none.
@@ -1029,9 +1156,28 @@ fn looked(
     })
 }
 
+/// The generation of an offer of `lines`: sixteen hex digits of their 64-bit
+/// FNV-1a hash, each line ended by a newline.
+///
+/// A line names an external and the commits it moves from and to, so the same
+/// moves always give the same generation, on every machine and in every
+/// version: a check that finds again what a shell already had answered
+/// cannot offer it again under a new name, and the bytes `available` holds
+/// stay the same from one check to the next.
+#[must_use]
+pub fn generation(lines: &[String]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in lines.iter().flat_map(|line| line.bytes().chain(*b"\n")) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 /// What `available` holds after a check that found `found`: each line of
 /// `previous` about an external it did not look at, then one line for each
-/// external it found new commits for.
+/// external it found new commits for. `previous`'s generation line is not
+/// one of them: [`Stamps::set`] writes the new one.
 #[must_use]
 pub fn offered(previous: &str, found: &[Found]) -> Vec<String> {
     // A remote this check could not reach says nothing new about it, so what
@@ -1043,6 +1189,7 @@ pub fn offered(previous: &str, found: &[Found]) -> Vec<String> {
         .collect();
     previous
         .lines()
+        .filter(|line| !line.starts_with("gen "))
         .filter(|line| !looked.iter().any(|prefix| line.starts_with(prefix)))
         .map(str::to_string)
         .chain(
@@ -1577,6 +1724,11 @@ mod tests {
             ]
         );
         assert!(offered("", &[]).is_empty());
+        assert_eq!(
+            offered(&format!("gen 0123456789abcdef\n{previous}"), &looked),
+            offered(previous, &looked),
+            "the generation is not something offered"
+        );
         let offline = [found(
             "~/b",
             Some(A),
@@ -1634,18 +1786,32 @@ mod tests {
         assert_eq!(Stamps::read(&stamps.check_due()), Some(1000 + 86_400));
         assert_eq!(
             std::fs::read_to_string(stamps.available()).unwrap(),
-            "~/a: x\n"
+            "gen 8323ea2e82044071\n~/a: x\n",
+            "the generation first, then what is offered"
         );
+        assert!(stamps.waiting().is_dir(), "made beside the offer");
         let mode = std::fs::metadata(stamps.ask_due()).unwrap();
         assert_eq!(
             std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
             0o600
         );
 
+        std::fs::write(stamps.answered(), "8323ea2e82044071\n").unwrap();
+        stamps
+            .set(1500, None, None, Some(&["~/a: x".to_string()]))
+            .unwrap();
+        assert!(
+            stamps.answered().exists(),
+            "an offer written again keeps its answer"
+        );
         stamps.set(2000, None, Some(None), Some(&[])).unwrap();
         assert_eq!(Stamps::read(&stamps.ask_due()), Some(1000 + 86_400), "left");
         assert!(!stamps.check_due().exists());
         assert!(!stamps.available().exists());
+        assert!(
+            !stamps.answered().exists(),
+            "nothing offered, so nothing answered: the same commits are offered again"
+        );
         stamps.set(2000, None, Some(None), Some(&[])).unwrap();
 
         std::fs::write(stamps.ask_due(), "soon\n").unwrap();
@@ -1687,6 +1853,85 @@ mod tests {
         let now = now();
         assert!(now > 1_700_000_000, "seconds since the epoch: {now}");
         assert!(now < 1_700_000_000 * 4, "{now}");
+    }
+
+    #[test]
+    fn the_same_moves_always_have_the_same_generation() {
+        let lines = |text: &str| -> Vec<String> { text.lines().map(str::to_string).collect() };
+        let one = lines("~/a: 1 new commit(s) on main, 0e810e5afa27 -> 85919cd1ffa7");
+        assert_eq!(generation(&one), generation(&one.clone()));
+        // Pinned, so a change of hash is a change every machine sees.
+        assert_eq!(generation(&[]), "cbf29ce484222325");
+        assert_eq!(generation(&lines("~/a: x")), "8323ea2e82044071");
+        for other in [
+            lines("~/a: 1 new commit(s) on main, 0e810e5afa27 -> 0e810e5afa28"),
+            lines("~/b: 1 new commit(s) on main, 0e810e5afa27 -> 85919cd1ffa7"),
+            lines("~/a: 1 new commit(s) on main,\n0e810e5afa27 -> 85919cd1ffa7"),
+        ] {
+            assert_ne!(generation(&one), generation(&other), "{other:?}");
+        }
+        assert_ne!(
+            generation(&lines("a\nb")),
+            generation(&lines("b\na")),
+            "order is part of it"
+        );
+    }
+
+    #[test]
+    fn an_offer_stands_until_its_generation_is_answered() {
+        let offers = |available: &str, answered: Option<&str>| {
+            Stamps::offers(Some(available.as_bytes()), answered.map(str::as_bytes))
+        };
+        assert!(offers("gen g\n~/a: x\n", None));
+        assert!(offers("gen g\n~/a: x\n", Some("h\n")));
+        assert!(!offers("gen g\n~/a: x\n", Some("g\n")));
+        assert!(
+            !offers("gen g\n~/a: x\n", Some(" g\t")),
+            "read as the hook does"
+        );
+        assert!(!offers("gen g\n", None), "nothing to offer");
+        assert!(!offers("~/a: x", None), "no whole line");
+        assert!(
+            offers("~/a: x\n", Some("~/a: x\n")),
+            "no generation: offered"
+        );
+        assert!(
+            offers("gen  g\n~/a: x\n", Some("g\n")),
+            "its generation is ` g`"
+        );
+        assert!(!Stamps::offers(None, Some(b"g\n")));
+    }
+
+    #[test]
+    fn waking_prunes_shells_that_are_gone_and_signals_the_rest() {
+        let home = guarded_home();
+        let stamps = Stamps::of(&StateDir::resolve(home.path()));
+        std::fs::create_dir_all(stamps.waiting()).unwrap();
+        // A child that has exited and been reaped: its pid names no process.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        gone.wait().unwrap();
+        let gone = stamps.waiting().join(gone.id().to_string());
+        std::fs::write(&gone, "g\n").unwrap();
+        // A process still running, which ignores `SIGURG` as every one does
+        // that does not ask for it.
+        let mut alive = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let waiting = stamps.waiting().join(alive.id().to_string());
+        std::fs::write(&waiting, "g\n").unwrap();
+        let idle = stamps.waiting().join("0");
+        std::fs::write(&idle, "g\n").unwrap();
+        stamps.wake();
+        let survived = alive.try_wait().unwrap();
+        alive.kill().unwrap();
+        alive.wait().unwrap();
+        assert!(!gone.exists(), "a shell that is gone is pruned");
+        assert!(waiting.exists(), "a live one is kept");
+        assert!(idle.exists(), "a name that is no pid is not touched");
+        assert_eq!(survived, None, "SIGURG harms nothing that ignores it");
+        std::fs::remove_dir_all(stamps.waiting()).unwrap();
+        stamps.wake();
     }
 
     #[test]

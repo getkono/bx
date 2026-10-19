@@ -97,36 +97,35 @@ pub const SECTION: &str = "bx update";
 pub const BASH_SINCE: (u32, u32) = (4, 4);
 
 /// The hook, as the `functions` phase holds it.
-pub const ZSH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, at most
-# once per shell. Reads bx's update stamps; starts nothing until one is due.
+pub const ZSH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, once per
+# offer. Reads bx's update stamps; starts nothing until one is due.
 __bx_update() {
   [[ -o interactive && -t 0 && -t 1 && $TERM != dumb ]] || return 0
   __bx_update_due
 }
 __bx_update_due() {
-  [[ -z $BX_UPDATE_ASKED ]] || return 0
   [[ -z ${CI-}${CLAUDECODE-}${CODEX_SANDBOX-}${GEMINI_CLI-}${CURSOR_AGENT-}${BX_NO_UPDATE_PROMPT-} ]] || return 0
   (( ${+commands[bx]} )) || return 0
   local dir=$HOME/.local/state/bx/update
   [[ ${XDG_STATE_HOME-} == /* ]] && dir=$XDG_STATE_HOME/bx/update
-  local now=${(%):-%D{%s}} due line answer
+  local now=${(%):-%D{%s}} due line gen= answered=
   local -a found
+  [[ -r $dir/answered ]] && read -r answered < $dir/answered
   if [[ -s $dir/available ]]; then
     while read -r line
     do
       found+=("$line")
     done < $dir/available
-    typeset -g BX_UPDATE_ASKED=1
+    if [[ ${found[1]-} == 'gen '* ]]; then
+      gen=${found[1]#gen }
+      shift found
+    fi
+  fi
+  if (( ${#found} )) && [[ -z $gen || $gen != "$answered" ]]; then
+    [[ -n $gen && $gen == "${BX_UPDATE_ASKED-}" ]] && return 0
     print -r -- "bx: what this configuration follows has new commits:"
     print -rl -- "  "${^found}
-    print -n -- "bx: update now? [y/N] "
-    read -k 1 -u 0 answer
-    print
-    if [[ $answer == [yY] ]]; then
-      command bx update
-    else
-      command bx update --snooze </dev/null >/dev/null 2>&1 &!
-    fi
+    __bx_update_ask $dir offer "$gen" "bx: update now? [y/N] "
     return 0
   fi
   if [[ -z $BX_UPDATE_CHECKING && -r $dir/check-due ]] && read -r due < $dir/check-due \
@@ -136,16 +135,81 @@ __bx_update_due() {
     return 0
   fi
   if [[ -z $BX_UPDATE_CHECKING && -r $dir/ask-due ]] && read -r due < $dir/ask-due \
-    && [[ $due == <-> ]] && (( due <= now )); then
-    typeset -g BX_UPDATE_ASKED=1
-    print -n -- "bx: check now whether what this configuration follows has new commits? [y/N] "
-    read -k 1 -u 0 answer
-    print
-    if [[ $answer == [yY] ]]; then
-      command bx update
-    else
-      command bx update --snooze </dev/null >/dev/null 2>&1 &!
-    fi
+    && [[ $due == <-> ]] && (( due <= now )) \
+    && [[ "ask $due" != "$answered" && "ask $due" != "${BX_UPDATE_ASKED-}" ]]; then
+    __bx_update_ask $dir ask "ask $due" \
+      "bx: check now whether what this configuration follows has new commits? [y/N] "
+  fi
+  return 0
+}
+# Whether what __bx_update_ask asks about ($2, offer or ask; $3, its
+# generation) stands in the update stamps under $1: 1 while it does, 0 once it
+# was answered, and 2 once a check replaced it with another offer.
+__bx_update_settled() {
+  local line=
+  [[ -r $1/answered ]] && read -r line < $1/answered
+  [[ -n $3 && $line == "$3" ]] && return 0
+  line=
+  if [[ $2 == offer ]]; then
+    [[ -s $1/available ]] || return 0
+    read -r line < $1/available
+    [[ -z $3 || $line == "gen $3" ]] && return 1
+    return 2
+  fi
+  [[ -r $1/ask-due ]] && read -r line < $1/ask-due
+  [[ "ask $line" == "$3" ]] && return 1
+  return 0
+}
+# Asks $4 about $2 ($3, its generation) under the update stamps in $1, for at
+# most BX_UPDATE_PROMPT_TIMEOUT seconds. Waits under waiting/, where whoever
+# answers it wakes this shell with SIGURG, so it gives way at once.
+__bx_update_ask() {
+  setopt localoptions localtraps nullglob
+  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= f p
+  local -i wait=60 start=${(%):-%D{%s}} now left
+  [[ ${BX_UPDATE_PROMPT_TIMEOUT-} == [1-9]* && $BX_UPDATE_PROMPT_TIMEOUT != *[^0-9]* ]] \
+    && wait=$BX_UPDATE_PROMPT_TIMEOUT
+  typeset -g BX_UPDATE_ASKED=$gen
+  print -r -- "$gen" 2>/dev/null >| $dir/waiting/$$
+  trap 'woken=1' URG
+  print -n -- "$4"
+  while [[ -z $outcome ]]
+  do
+    __bx_update_settled $dir $kind "$gen"
+    case $? in
+      0) outcome=answered ;;
+      2) outcome=changed ;;
+      *)
+        now=${(%):-%D{%s}}
+        left=wait-now+start
+        if (( left <= 0 )); then
+          outcome=none
+        else
+          woken=
+          read -k 1 -u 0 -t $left answer && outcome=read
+          [[ -n $outcome$woken ]] || outcome=none
+        fi
+        ;;
+    esac
+  done
+  : 2>/dev/null >| $dir/waiting/$$
+  trap - URG
+  print
+  case $outcome in
+    answered) print -r -- "bx: answered in another shell"; return 0 ;;
+    changed) print -r -- "bx: a check found something else; asking about it at the next prompt"; return 0 ;;
+    none) print -r -- "bx: no answer; asking again at a later shell"; return 0 ;;
+  esac
+  print -r -- "$gen" 2>/dev/null >| $dir/answered
+  for f in $dir/waiting/*
+  do
+    p=${f:t}
+    [[ $p == [1-9]* && $p != *[^0-9]* && $p != $$ && -s $f ]] && kill -URG $p 2>/dev/null
+  done
+  if [[ $answer == [yY] ]]; then
+    command bx update
+  else
+    command bx update --snooze </dev/null >/dev/null 2>&1 &!
   fi
   return 0
 }
@@ -155,8 +219,8 @@ precmd_functions+=(__bx_update)
 /// The hook in bash's words, as the `functions` phase of bash's file holds
 /// it: what [`ZSH`] does, registered on `PROMPT_COMMAND` as the module's
 /// *bash's hook* says.
-pub const BASH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, at most
-# once per shell. Reads bx's update stamps; starts nothing until one is due.
+pub const BASH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, once per
+# offer. Reads bx's update stamps; starts nothing until one is due.
 # Returns the status it was called with, so the prompt shows the same one.
 __bx_update() {
   local last=$?
@@ -166,30 +230,29 @@ __bx_update() {
   return $last
 }
 __bx_update_due() {
-  [[ -z $BX_UPDATE_ASKED ]] || return 0
   [[ -z ${CI-}${CLAUDECODE-}${CODEX_SANDBOX-}${GEMINI_CLI-}${CURSOR_AGENT-}${BX_NO_UPDATE_PROMPT-} ]] || return 0
   type -P bx >/dev/null || return 0
   local dir=$HOME/.local/state/bx/update
   [[ ${XDG_STATE_HOME-} == /* ]] && dir=$XDG_STATE_HOME/bx/update
-  local now due line answer
+  local now due line gen= answered=
   local -a found
   printf -v now '%(%s)T' -1
+  [[ -r $dir/answered ]] && read -r answered < "$dir/answered"
   if [[ -s $dir/available ]]; then
     while read -r line
     do
       found+=("$line")
     done < "$dir/available"
-    BX_UPDATE_ASKED=1
+    if [[ ${found[0]-} == 'gen '* ]]; then
+      gen=${found[0]#gen }
+      found=("${found[@]:1}")
+    fi
+  fi
+  if (( ${#found[@]} )) && [[ -z $gen || $gen != "$answered" ]]; then
+    [[ -n $gen && $gen == "${BX_UPDATE_ASKED-}" ]] && return 0
     printf '%s\n' "bx: what this configuration follows has new commits:"
     printf '  %s\n' "${found[@]}"
-    printf '%s' "bx: update now? [y/N] "
-    read -r -n 1 answer
-    printf '\n'
-    if [[ $answer == [yY] ]]; then
-      command bx update
-    else
-      (command bx update --snooze </dev/null >/dev/null 2>&1 &)
-    fi
+    __bx_update_ask "$dir" offer "$gen" "bx: update now? [y/N] "
     return 0
   fi
   if [[ -z $BX_UPDATE_CHECKING && -r $dir/check-due ]] && read -r due < "$dir/check-due" \
@@ -199,16 +262,91 @@ __bx_update_due() {
     return 0
   fi
   if [[ -z $BX_UPDATE_CHECKING && -r $dir/ask-due ]] && read -r due < "$dir/ask-due" \
-    && [[ -n $due && $due != *[!0-9]* ]] && (( 10#$due <= now )); then
-    BX_UPDATE_ASKED=1
-    printf '%s' "bx: check now whether what this configuration follows has new commits? [y/N] "
-    read -r -n 1 answer
-    printf '\n'
-    if [[ $answer == [yY] ]]; then
-      command bx update
-    else
-      (command bx update --snooze </dev/null >/dev/null 2>&1 &)
-    fi
+    && [[ -n $due && $due != *[!0-9]* ]] && (( 10#$due <= now )) \
+    && [[ "ask $due" != "$answered" && "ask $due" != "${BX_UPDATE_ASKED-}" ]]; then
+    __bx_update_ask "$dir" ask "ask $due" \
+      "bx: check now whether what this configuration follows has new commits? [y/N] "
+  fi
+  return 0
+}
+# Whether what __bx_update_ask asks about ($2, offer or ask; $3, its
+# generation) stands in the update stamps under $1: 1 while it does, 0 once it
+# was answered, and 2 once a check replaced it with another offer.
+__bx_update_settled() {
+  local line=
+  [[ -r $1/answered ]] && read -r line < "$1/answered"
+  [[ -n $3 && $line == "$3" ]] && return 0
+  line=
+  if [[ $2 == offer ]]; then
+    [[ -s $1/available ]] || return 0
+    read -r line < "$1/available"
+    [[ -z $3 || $line == "gen $3" ]] && return 1
+    return 2
+  fi
+  [[ -r $1/ask-due ]] && read -r line < "$1/ask-due"
+  [[ "ask $line" == "$3" ]] && return 1
+  return 0
+}
+# Asks $4 about $2 ($3, its generation) under the update stamps in $1, for at
+# most BX_UPDATE_PROMPT_TIMEOUT seconds. Waits under waiting/, where whoever
+# answers it wakes this shell with SIGURG, so it gives way at once: bash ends
+# a read for a trapped signal only in POSIX mode, so the read runs in it.
+__bx_update_ask() {
+  local -
+  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= saved= posix= f p start now
+  local -i wait=60 left
+  [[ ${BX_UPDATE_PROMPT_TIMEOUT-} == [1-9]* && $BX_UPDATE_PROMPT_TIMEOUT != *[!0-9]* ]] \
+    && wait=$BX_UPDATE_PROMPT_TIMEOUT
+  [[ -o posix ]] && posix=1
+  BX_UPDATE_ASKED=$gen
+  printf -v start '%(%s)T' -1
+  { printf '%s\n' "$gen"; trap -p URG; } 2>/dev/null >| "$dir/waiting/$$"
+  {
+    read -r saved
+    read -r -d '' saved
+  } 2>/dev/null < "$dir/waiting/$$"
+  trap 'woken=1' URG
+  printf '%s' "$4"
+  while [[ -z $outcome ]]
+  do
+    __bx_update_settled "$dir" "$kind" "$gen"
+    case $? in
+      0) outcome=answered ;;
+      2) outcome=changed ;;
+      *)
+        printf -v now '%(%s)T' -1
+        left=wait-now+start
+        if (( left <= 0 )); then
+          outcome=none
+        else
+          woken=
+          set -o posix
+          read -r -n 1 -t $left answer && outcome=read
+          [[ -n $posix ]] || set +o posix
+          [[ -n $outcome$woken ]] || outcome=none
+        fi
+        ;;
+    esac
+  done
+  : 2>/dev/null >| "$dir/waiting/$$"
+  trap - URG
+  [[ -n $saved ]] && eval "$saved"
+  printf '\n'
+  case $outcome in
+    answered) printf '%s\n' "bx: answered in another shell"; return 0 ;;
+    changed) printf '%s\n' "bx: a check found something else; asking about it at the next prompt"; return 0 ;;
+    none) printf '%s\n' "bx: no answer; asking again at a later shell"; return 0 ;;
+  esac
+  printf '%s\n' "$gen" 2>/dev/null >| "$dir/answered"
+  for f in "$dir"/waiting/*
+  do
+    p=${f##*/}
+    [[ $p == [1-9]* && $p != *[!0-9]* && $p != "$$" && -s $f ]] && kill -URG "$p" 2>/dev/null
+  done
+  if [[ $answer == [yY] ]]; then
+    command bx update
+  else
+    (command bx update --snooze </dev/null >/dev/null 2>&1 &)
   fi
   return 0
 }

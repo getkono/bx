@@ -1247,6 +1247,327 @@ fn a_background_check_that_fails_says_why_and_waits_an_hour() {
     );
 }
 
+/// [`layer`], checked on its own once a day.
+fn auto() -> String {
+    layer().replace(
+        "branch = \"master\"\n",
+        "branch = \"master\"\ncheck = \"auto\"\ninterval = \"1d\"\n",
+    )
+}
+
+/// A config repo following [`auto`], locked at the upstream's first commit
+/// and pushed, and a second commit published upstream that nothing locks
+/// yet: the commit.
+fn pushed_and_moved(home: &GuardedHome) -> (std::path::PathBuf, String) {
+    upstream(home, &["skills/a/SKILL.md"]);
+    let repo = cloned(home, &auto());
+    update(home, true, &mut Vec::new()).expect("update");
+    run(home.path(), &repo, &["push", "--quiet"]);
+    (repo, publish(home, &["skills/b/SKILL.md"]))
+}
+
+/// Another machine locks the external at `tip` and pushes it.
+fn locked_elsewhere(home: &GuardedHome, tip: &str) {
+    let other = crate::sync::tests::other(home);
+    let lock = std::fs::read_to_string(other.join("bx.lock")).expect("bx.lock");
+    let from = locked(home).expect("locked here");
+    std::fs::write(other.join("bx.lock"), lock.replace(&from, tip)).expect("bx.lock");
+    commit_all(home.path(), &other, update::SUBJECT);
+    run(home.path(), &other, &["push", "--quiet"]);
+}
+
+/// A background check, and what it wrote to `last-check`.
+fn background(home: &GuardedHome) -> (Exit, String) {
+    let exit = update::check(
+        &env(home.path()),
+        &[],
+        true,
+        &git(home.path()),
+        &mut Vec::new(),
+    )
+    .expect("background");
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    let last = std::fs::read_to_string(stamps.last_check()).expect("last-check");
+    (exit, last)
+}
+
+#[test]
+fn a_background_check_offers_nothing_another_machine_already_locked() {
+    let home = guarded_home();
+    let (repo, second) = pushed_and_moved(&home);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Pending, "{last}");
+    assert!(offers(&stamps), "found here first");
+    assert!(stamps.judged().is_file());
+
+    locked_elsewhere(&home, &second);
+    let head = rev(home.path(), &repo, "HEAD");
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Converged, "{last}");
+    assert!(!stamps.available().exists(), "{last}");
+    assert!(!stamps.judged().exists());
+    assert_eq!(
+        last,
+        format!(
+            "judged against bx.lock as origin/master holds it: another machine updated it, and \
+             `bx sync` brings it in\n~/{AT}: another machine already locked master at {}; \
+             `bx sync` brings it in\n",
+            &second[..12]
+        )
+    );
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head, "the branch stays");
+    assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
+    assert_eq!(
+        locked(&home).as_deref(),
+        Some(rev(home.path(), &home.child(AT), "HEAD").as_str()),
+        "nothing moved here"
+    );
+}
+
+#[test]
+fn a_background_check_judges_what_the_upstream_has_not_locked_against_its_lock() {
+    let home = guarded_home();
+    let (_, second) = pushed_and_moved(&home);
+    locked_elsewhere(&home, &second);
+    let third = publish(&home, &["skills/c/SKILL.md"]);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Pending, "{last}");
+    let offered = std::fs::read_to_string(stamps.available()).expect("offered");
+    assert!(
+        offered.ends_with(&format!(
+            "~/{AT}: 1 new commit(s) on master, {} -> {}\n",
+            &second[..12],
+            &third[..12]
+        )),
+        "from what the upstream locks: {offered}"
+    );
+    assert!(
+        last.starts_with("judged against bx.lock as origin/master holds it"),
+        "{last}"
+    );
+}
+
+#[test]
+fn a_background_check_behind_an_upstream_with_the_same_lock_judges_its_own() {
+    let home = guarded_home();
+    let (repo, _) = pushed_and_moved(&home);
+    let other = crate::sync::tests::other(&home);
+    std::fs::write(other.join("notes"), "x\n").expect("a note");
+    commit_all(home.path(), &other, "elsewhere");
+    run(home.path(), &other, &["push", "--quiet"]);
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Pending, "{last}");
+    assert!(
+        last.starts_with(&format!("~/{AT}: 1 new commit(s)")),
+        "{last}"
+    );
+    assert!(!repo.join("notes").exists(), "fetched, never merged");
+}
+
+#[test]
+fn a_background_check_with_no_upstream_to_judge_falls_back_to_this_machine_s_lock() {
+    for (break_it, why) in [
+        (
+            &["branch", "--quiet", "--unset-upstream"][..],
+            "the config repo's master has no upstream",
+        ),
+        (
+            &["remote", "set-url", "origin", "/nonexistent/remote.git"][..],
+            "origin/master could not be fetched: ",
+        ),
+        (
+            &["config", "branch.master.merge", "refs/heads/gone"][..],
+            "origin/gone, which master tracks, does not exist",
+        ),
+    ] {
+        let home = guarded_home();
+        let (repo, _) = pushed_and_moved(&home);
+        run(home.path(), &repo, break_it);
+        let (exit, last) = background(&home);
+        assert_eq!(exit, Exit::Pending, "{last}");
+        assert!(
+            last.starts_with(&format!("judged against this machine's bx.lock: {why}")),
+            "{last}"
+        );
+        assert!(
+            last.contains(&format!("\n~/{AT}: 1 new commit(s)")),
+            "{last}"
+        );
+    }
+}
+
+#[test]
+fn a_background_check_diverged_from_its_upstream_judges_its_own_lock() {
+    let home = guarded_home();
+    let (repo, _) = pushed_and_moved(&home);
+    std::fs::write(repo.join("mine"), "x\n").expect("a note");
+    commit_all(home.path(), &repo, "mine");
+    let other = crate::sync::tests::other(&home);
+    std::fs::write(other.join("notes"), "x\n").expect("a note");
+    commit_all(home.path(), &other, "elsewhere");
+    run(home.path(), &other, &["push", "--quiet"]);
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Pending, "{last}");
+    assert!(
+        last.starts_with(
+            "judged against this machine's bx.lock: master and origin/master have diverged"
+        ),
+        "{last}"
+    );
+}
+
+#[test]
+fn a_background_check_with_nothing_on_auto_never_fetches_the_config_repo() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let repo = cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    run(home.path(), &repo, &["push", "--quiet"]);
+    let tracked = rev(home.path(), &repo, "origin/master");
+    let other = crate::sync::tests::other(&home);
+    std::fs::write(other.join("notes"), "x\n").expect("a note");
+    commit_all(home.path(), &other, "elsewhere");
+    run(home.path(), &other, &["push", "--quiet"]);
+
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Converged, "{last}");
+    assert!(!last.contains("judged against"), "{last}");
+    assert_eq!(
+        rev(home.path(), &repo, "origin/master"),
+        tracked,
+        "no remote reached"
+    );
+}
+
+#[test]
+fn a_sync_that_brings_in_another_lock_withdraws_the_offer_and_checks_again() {
+    let home = guarded_home();
+    let (_, second) = pushed_and_moved(&home);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    background(&home);
+    assert!(offers(&stamps));
+    let offered = std::fs::read(stamps.available()).expect("offered");
+
+    // The lock here is the one the offer was judged against.
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("apply");
+    assert_eq!(
+        std::fs::read(stamps.available()).expect("still offered"),
+        offered
+    );
+
+    locked_elsewhere(&home, &second);
+    let mut out = Vec::new();
+    sync_with(
+        &env(home.path()),
+        true,
+        &mut out,
+        &git(home.path()),
+        &mut never,
+    )
+    .expect("sync");
+    assert!(!stamps.available().exists(), "{}", text(&out));
+    assert!(!stamps.judged().exists());
+    let due = Stamps::read(&stamps.check_due()).expect("check-due");
+    assert!(due <= update::now(), "due at once: {due}");
+    assert_eq!(rev(home.path(), &home.child(AT), "HEAD"), second);
+
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Converged, "{last}");
+    assert_eq!(last, format!("~/{AT}: up to date with master\n"));
+    assert!(!stamps.available().exists());
+}
+
+#[test]
+fn an_apply_of_another_lock_declined_or_unconfirmed_keeps_the_offer() {
+    let home = guarded_home();
+    let (repo, second) = pushed_and_moved(&home);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    background(&home);
+    let offered = std::fs::read(stamps.available()).expect("offered");
+    let due = std::fs::read(stamps.check_due()).expect("check-due");
+    locked_elsewhere(&home, &second);
+    run(home.path(), &repo, &["pull", "--quiet", "--ff-only"]);
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let kept = |why: &str| {
+        assert_eq!(
+            std::fs::read(stamps.available()).expect("still offered"),
+            offered,
+            "{why}"
+        );
+        assert!(stamps.judged().is_file(), "{why}");
+        assert_eq!(
+            std::fs::read(stamps.check_due()).expect("check-due"),
+            due,
+            "{why}"
+        );
+    };
+
+    let exit = apply_with(&tty, false, &mut Vec::new(), &mut || Ok(false)).expect("declined");
+    assert_ne!(exit, Exit::Converged);
+    kept("declined");
+    let exit =
+        apply_with(&tty, false, &mut Vec::new(), &mut || Err(Error::Canceled)).expect("canceled");
+    assert_eq!(exit, Exit::Canceled);
+    kept("canceled");
+    let unconfirmed = apply_with(&env(home.path()), false, &mut Vec::new(), &mut never);
+    assert!(
+        matches!(unconfirmed, Err(Error::NeedsConfirmation)),
+        "{unconfirmed:?}"
+    );
+    kept("unconfirmed");
+
+    apply_with(&tty, false, &mut Vec::new(), &mut || Ok(true)).expect("approved");
+    assert!(!stamps.available().exists(), "approved: withdrawn");
+    assert!(!stamps.judged().exists());
+}
+
+#[test]
+fn a_check_carries_no_line_judged_against_an_older_lock() {
+    let home = guarded_home();
+    let (repo, second) = pushed_and_moved(&home);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    background(&home);
+    assert!(offers(&stamps));
+    // Another machine's lock, pulled by hand and never applied; then a check
+    // that cannot look at the external again.
+    locked_elsewhere(&home, &second);
+    run(home.path(), &repo, &["pull", "--quiet", "--ff-only"]);
+    std::fs::rename(home.child("upstream"), home.child("elsewhere")).expect("unreachable");
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Converged, "{last}");
+    assert!(last.contains("not checked"), "{last}");
+    assert!(!stamps.available().exists(), "{last}");
+    assert!(!stamps.judged().exists());
+}
+
+#[test]
+fn an_offer_an_older_bx_wrote_without_its_lock_is_left_to_the_next_check() {
+    let home = guarded_home();
+    let (_, second) = pushed_and_moved(&home);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    stamps
+        .write(&stamps.available(), &format!("~/{AT}: y\n"))
+        .expect("an older offer");
+    locked_elsewhere(&home, &second);
+    sync_with(
+        &env(home.path()),
+        true,
+        &mut Vec::new(),
+        &git(home.path()),
+        &mut never,
+    )
+    .expect("sync");
+    assert_eq!(
+        std::fs::read_to_string(stamps.available()).expect("kept"),
+        format!("~/{AT}: y\n")
+    );
+}
+
 #[test]
 fn a_config_repo_git_does_not_manage_gets_its_lock_uncommitted() {
     let home = guarded_home();

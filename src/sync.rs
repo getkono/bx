@@ -462,7 +462,7 @@ fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
 }
 
 /// The upstream `branch` is configured with.
-fn upstream(git: &Git, repo: &Path, branch: &str) -> Result<Upstream, Error> {
+pub(crate) fn upstream(git: &Git, repo: &Path, branch: &str) -> Result<Upstream, Error> {
     let answer = git.query(
         repo,
         &[
@@ -490,7 +490,7 @@ fn upstream(git: &Git, repo: &Path, branch: &str) -> Result<Upstream, Error> {
 /// Whether the upstream `branch` names has no ref here: deleted where it was
 /// pushed and pruned by a fetch, or never pushed at all. Git cannot resolve
 /// `@{upstream}` for such a branch, and says so only as `no such branch`.
-fn gone(git: &Git, repo: &Path, branch: &str) -> Result<bool, Error> {
+pub(crate) fn gone(git: &Git, repo: &Path, branch: &str) -> Result<bool, Error> {
     let track = git.query(
         repo,
         &[
@@ -503,7 +503,7 @@ fn gone(git: &Git, repo: &Path, branch: &str) -> Result<bool, Error> {
 }
 
 /// Commits only on the branch, and commits only on its upstream.
-fn counts(git: &Git, repo: &Path) -> Result<(u64, u64), Error> {
+pub(crate) fn counts(git: &Git, repo: &Path) -> Result<(u64, u64), Error> {
     let args = ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"];
     let answer = git.query(repo, &args)?;
     let unexpected = || Error::Unexpected {

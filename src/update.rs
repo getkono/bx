@@ -1910,6 +1910,9 @@ mod tests {
         // A child that has exited and been reaped: its pid names no process.
         let mut gone = std::process::Command::new("true").spawn().unwrap();
         gone.wait().unwrap();
+        // The same pid written with a leading zero is no name a shell writes.
+        let padded = stamps.waiting().join(format!("0{}", gone.id()));
+        std::fs::write(&padded, "g\n").unwrap();
         let gone = stamps.waiting().join(gone.id().to_string());
         std::fs::write(&gone, "g\n").unwrap();
         // A process still running, which ignores `SIGURG` as every one does
@@ -1929,9 +1932,52 @@ mod tests {
         assert!(!gone.exists(), "a shell that is gone is pruned");
         assert!(waiting.exists(), "a live one is kept");
         assert!(idle.exists(), "a name that is no pid is not touched");
+        assert!(padded.exists(), "a pid with a leading zero is not touched");
         assert_eq!(survived, None, "SIGURG harms nothing that ignores it");
         std::fs::remove_dir_all(stamps.waiting()).unwrap();
         stamps.wake();
+    }
+
+    #[test]
+    fn waking_signals_only_a_shell_that_is_asking() {
+        let home = guarded_home();
+        let stamps = Stamps::of(&StateDir::resolve(home.path()));
+        std::fs::create_dir_all(stamps.waiting()).unwrap();
+        // A process that exits 7 at `SIGURG`, once it says it has the trap.
+        let ready = home.child("ready");
+        let mut asker = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap 'exit 7' URG; : > \"$1\"; while :; do sleep 0.05; done")
+            .arg("sh")
+            .arg(&ready)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "the trap is set");
+        let waiting = stamps.waiting().join(asker.id().to_string());
+        // An empty file is a shell that is not asking now.
+        std::fs::write(&waiting, "").unwrap();
+        stamps.wake();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let idle = asker.try_wait().unwrap();
+        std::fs::write(&waiting, "g\n").unwrap();
+        stamps.wake();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut woken = asker.try_wait().unwrap();
+        while woken.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            woken = asker.try_wait().unwrap();
+        }
+        if woken.is_none() {
+            asker.kill().unwrap();
+            asker.wait().unwrap();
+        }
+        assert_eq!(idle, None, "a shell not asking is not signalled");
+        assert_eq!(woken.and_then(|status| status.code()), Some(7), "woken");
+        assert!(waiting.exists(), "a live shell's file is kept");
     }
 
     #[test]

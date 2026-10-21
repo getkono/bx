@@ -1419,6 +1419,29 @@ fn a_background_check_diverged_from_its_upstream_judges_its_own_lock() {
 }
 
 #[test]
+fn a_background_check_with_nothing_on_auto_never_fetches_the_config_repo() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let repo = cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    run(home.path(), &repo, &["push", "--quiet"]);
+    let tracked = rev(home.path(), &repo, "origin/master");
+    let other = crate::sync::tests::other(&home);
+    std::fs::write(other.join("notes"), "x\n").expect("a note");
+    commit_all(home.path(), &other, "elsewhere");
+    run(home.path(), &other, &["push", "--quiet"]);
+
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Converged, "{last}");
+    assert!(!last.contains("judged against"), "{last}");
+    assert_eq!(
+        rev(home.path(), &repo, "origin/master"),
+        tracked,
+        "no remote reached"
+    );
+}
+
+#[test]
 fn a_sync_that_brings_in_another_lock_withdraws_the_offer_and_checks_again() {
     let home = guarded_home();
     let (_, second) = pushed_and_moved(&home);

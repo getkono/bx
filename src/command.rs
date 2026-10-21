@@ -64,16 +64,18 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
         out,
         &std::env::var_os("PATH").unwrap_or_default(),
         &systemd::Systemctl::default(),
+        &Git::new(env),
     )
 }
 
-/// [`doctor`], looking for declared tools along `path` and asking systemd
-/// through `systemd`.
+/// [`doctor`], looking for declared tools along `path`, asking systemd
+/// through `systemd`, and asking `git` about the config repo.
 fn doctor_with(
     env: &Env,
     out: &mut dyn Write,
     path: &std::ffi::OsStr,
     systemd: &dyn systemd::Query,
+    git: &Git,
 ) -> Result<Exit, Error> {
     let inputs = Inputs::load(env)?;
     let unit_dir = paths::systemd_user_dir_in(&env.home, env.xdg_config_home.as_deref());
@@ -86,6 +88,7 @@ fn doctor_with(
             launchd: &doctor::launchd::Launchctl::default(),
             bash: &doctor::bash::Version,
             login_shell: &doctor::login_shell::Account::default(),
+            git,
         },
     );
     out.write_all(doctor::render(&report, &env.home).as_bytes())
@@ -2431,8 +2434,14 @@ mod tests {
         home.write(".config/systemd/user/b.service", "x");
 
         let mut out = Vec::new();
-        let exit =
-            doctor_with(&env, &mut out, std::ffi::OsStr::new(""), &AllFailed).expect("doctor");
+        let exit = doctor_with(
+            &env,
+            &mut out,
+            std::ffi::OsStr::new(""),
+            &AllFailed,
+            &Git::new(&env),
+        )
+        .expect("doctor");
 
         assert_eq!(exit, Exit::Pending);
         assert_eq!(
@@ -2499,6 +2508,7 @@ mod tests {
         assert!(!rendered(&env(home.path())).contains('\x1b'));
     }
 
+    mod doctor_command;
     mod sync_command;
     mod update_command;
 }

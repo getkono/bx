@@ -18,7 +18,9 @@
 //! `bash --version` when bash's generated file asks about updates
 //! ([`bash`]), and, when `[doctor] login-shell` asserts a shell, the one
 //! read-only account lookup [`login_shell`] builds: `getent passwd` on Linux,
-//! `dscacheutil` on macOS.
+//! `dscacheutil` on macOS; and, when the config repo is a git repository, the
+//! read-only `git` questions [`repo`] asks of it and of the followed
+//! externals' checkouts bx cloned, none of which reaches a remote.
 //!
 //! The checks, in order:
 //!
@@ -52,6 +54,11 @@
 //!     `[doctor] login-shell` asserts, with the `chsh` that changes it quoted,
 //!     never run; it could not be read; or it is, and this session's `$SHELL`
 //!     is still another.
+//! 14. [`repo`] — the config repo has uncommitted changes, commits its
+//!     upstream lacks, is behind or has diverged from it as last fetched, has
+//!     no upstream or a gone one, has a detached `HEAD`, or has a rebase or
+//!     `git am` in progress; and a followed external's checkout holds local
+//!     work.
 
 pub mod bash;
 pub mod externals;
@@ -60,6 +67,7 @@ pub mod login_shell;
 pub mod modes;
 pub mod orphans;
 pub mod references;
+pub mod repo;
 pub mod sources;
 pub mod state;
 pub mod stray_local;
@@ -72,6 +80,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::config::Origin;
+use crate::git::Git;
 use crate::paths;
 use crate::plan::Inputs;
 use crate::report::{Exit, escape};
@@ -108,6 +117,8 @@ pub struct Probes<'a> {
     pub bash: &'a dyn bash::Query,
     /// The question put to the account database about the login shell.
     pub login_shell: &'a dyn login_shell::Query,
+    /// The `git` [`repo`] asks about the config repo and followed checkouts.
+    pub git: &'a Git,
 }
 
 /// Run every check against `inputs`, in the order the module lists them.
@@ -153,6 +164,13 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
     findings.extend(login_shell::check(
         resolved.doctor.login_shell.as_ref(),
         probes.login_shell,
+    ));
+    findings.extend(repo::check(
+        inputs.repo(),
+        &resolved.externals,
+        &state.ledger,
+        home,
+        probes.git,
     ));
     Report { findings }
 }
@@ -270,6 +288,7 @@ content = \"a\\n\"
                 launchd: &Unasked,
                 bash: &bash::Version,
                 login_shell: &Unasked,
+                git: &Git::at_home(home.path()),
             },
         );
         (render(&report, home.path()), exit(&report))
@@ -435,6 +454,7 @@ login-shell = \"zsh\"
                 launchd: &Unasked,
                 bash: &bash::Version,
                 login_shell,
+                git: &Git::at_home(home.path()),
             },
         );
         (render(&report, home.path()), exit(&report))

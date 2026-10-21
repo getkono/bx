@@ -1598,7 +1598,7 @@ fn an_update_whose_pull_cannot_reach_the_remote_answers_the_offer_and_says_why()
     let since = update::now();
     let error = update(&home, true, &mut Vec::new()).expect_err("unreachable");
     assert!(matches!(error, update::Error::Sync(_)), "{error:?}");
-    settled(&stamps, &generation, since, "bx update stopped: ");
+    settled(&stamps, &generation, since, update::STOPPED);
 }
 
 #[test]
@@ -1609,9 +1609,16 @@ fn an_update_that_finishes_withdraws_the_offer() {
     update(&home, true, &mut Vec::new()).expect("update");
     publish(&home, &["skills/b/SKILL.md"]);
     let (stamps, _) = on_offer(&home);
+    // Why an earlier run stopped, which `bx doctor` names until one finishes.
+    std::fs::write(
+        stamps.last_check(),
+        format!("{}the remote was unreachable\n", update::STOPPED),
+    )
+    .expect("last-check");
     update(&home, true, &mut Vec::new()).expect("update");
     assert!(!stamps.available().exists());
     assert!(!stamps.answered().exists());
+    assert!(!stamps.last_check().exists());
     assert!(!offers(&stamps));
 }
 

@@ -1,7 +1,7 @@
 //! Check 10: externals that follow a branch, against `bx.lock` and the update
 //! stamps.
 //!
-//! Three things, read from files and nothing else — no remote is asked, and
+//! Four things, read from files and nothing else — no remote is asked, and
 //! no checkout is looked into:
 //!
 //! * a followed external `bx.lock` holds no commit for, or holds one for
@@ -13,7 +13,15 @@
 //! * an entry in `bx.lock` for a path no `[[external]]` follows any more,
 //!   which the next `bx update` drops;
 //! * an update stamp that holds no time, so an interactive shell never asks
-//!   about updates until `bx update` writes it again.
+//!   about updates until `bx update` writes it again;
+//! * a `last-check` line saying `bx update` stopped — it failed, or the config
+//!   repo refused it — which stands until a `bx update` finishes. What else
+//!   `last-check` holds — what a check found, or that `bx update` was
+//!   declined or canceled — is no finding: doctor has no severity, and a
+//!   finding would leave every machine whose shell checked `Pending`.
+//!
+//! The last two only while an external follows a branch, as nothing asks
+//! about updates otherwise.
 
 use std::path::Path;
 
@@ -23,10 +31,11 @@ use crate::config::external::{External, first_followed};
 use crate::config::lock::{self, Lock, Lookup};
 use crate::plan::external::unlocked_note;
 use crate::state::StateDir;
-use crate::update::{Stamps, kept};
+use crate::update::{STOPPED, Stamps, kept};
 
 /// A finding for every followed external the lock does not hold, then every
-/// lock entry nothing follows, then every unreadable stamp.
+/// lock entry nothing follows, then every unreadable stamp, then every line of
+/// `last-check` that says `bx update` stopped.
 ///
 /// `externals` is this account's merged configuration and `committed` the
 /// committed layers' alone, as [`crate::update::proposed`] takes them: an
@@ -88,6 +97,21 @@ pub fn check(
                         "{} holds no time, so no shell asks about updates; `bx update` or \
                          `bx update --snooze` writes it again",
                         stamp.display()
+                    ),
+                });
+            }
+        }
+        let last = stamps.last_check();
+        let text = std::fs::read(&last).unwrap_or_default();
+        for line in String::from_utf8_lossy(&text).lines() {
+            if line.starts_with(STOPPED) {
+                findings.push(Finding {
+                    subject: "bx update".to_string(),
+                    origin: None,
+                    note: format!(
+                        "{} says `{line}`; `bx update` tries again, and removes it once it \
+                         finishes",
+                        last.display()
                     ),
                 });
             }
@@ -288,5 +312,85 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// A followed external `bx.lock` holds at its branch, so only what
+    /// `last-check` says can be a finding.
+    fn locked_follow(home: &Path) -> ([External; 1], Lock) {
+        let followed = [external(home, "~/a", follow("main"))];
+        let mut lock = Lock::default();
+        lock.set(
+            followed[0].path.clone(),
+            Locked {
+                url: "https://h/o/a".to_string(),
+                branch: "main".to_string(),
+                rev: REV.to_string(),
+            },
+        );
+        (followed, lock)
+    }
+
+    #[test]
+    fn a_last_check_saying_bx_update_stopped_is_a_finding_while_something_follows() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let stamps = Stamps::of(&state);
+        state.ensure_update().unwrap();
+        let stopped = format!("{STOPPED}the config repo has diverged from its upstream");
+        std::fs::write(stamps.last_check(), format!("{stopped}\n")).unwrap();
+        let (followed, lock) = locked_follow(home.path());
+        let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
+        assert_eq!(
+            findings,
+            [Finding {
+                subject: "bx update".to_string(),
+                origin: None,
+                note: format!(
+                    "{} says `{stopped}`; `bx update` tries again, and removes it once it \
+                     finishes",
+                    stamps.last_check().display()
+                ),
+            }]
+        );
+        let report = super::super::Report { findings };
+        assert_eq!(super::super::exit(&report), crate::report::Exit::Pending);
+
+        // Nothing follows a branch: nothing asks about updates, so nothing.
+        let pinned = [external(home.path(), "~/a", Pin::Rev(REV.to_string()))];
+        let findings = check(
+            &pinned,
+            Some(&pinned),
+            &Lock::default(),
+            home.path(),
+            &state,
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_last_check_that_says_nothing_stopped_or_none_at_all_is_no_finding() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let stamps = Stamps::of(&state);
+        let (followed, lock) = locked_follow(home.path());
+        assert!(!stamps.last_check().exists());
+        let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
+        assert!(findings.is_empty(), "{findings:?}");
+
+        state.ensure_update().unwrap();
+        for said in [
+            "~/a: 1 new commit(s) on main, 0e810e5 -> 1f921f6\n",
+            "~/a: up to date with main\n",
+            "the check failed: no config repo\n",
+            "bx update was declined, and locked nothing\n",
+            "bx update was canceled, and locked nothing\n",
+            // Not at the start of its line: not what `settled` writes.
+            " bx update stopped: indented\n",
+            "",
+        ] {
+            std::fs::write(stamps.last_check(), said).unwrap();
+            let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
+            assert!(findings.is_empty(), "{said:?}: {findings:?}");
+        }
     }
 }

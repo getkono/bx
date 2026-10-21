@@ -417,9 +417,9 @@ impl UpdateMode {
 /// configuration says.
 ///
 /// Every way it ends settles what the stamps offer, so no shell asks it again:
-/// run to the end, [`update::finished`] clears the offer; declined, abandoned
-/// at the question, refused or failed, [`update::settled`] answers it and
-/// says why in `last-check`. Only [`update::Error::Busy`] records nothing, as
+/// run to the end, [`update::finished`] clears the offer and `last-check`;
+/// declined, abandoned at the question, refused or failed, [`update::settled`]
+/// answers it and says why in `last-check`. Only [`update::Error::Busy`] records nothing, as
 /// the run holding the stamps settles them.
 ///
 /// Without `yes` it needs a terminal to ask on, and refuses before reaching
@@ -483,7 +483,7 @@ fn update_with(
     };
     let reason = match &why {
         Ok((_, why)) => why.clone(),
-        Err(error) => format!("bx update stopped: {error}"),
+        Err(error) => format!("{}{error}", update::STOPPED),
     };
     let ask = Inputs::load(env).ok().map(|inputs| {
         update::ask_interval(

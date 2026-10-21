@@ -59,8 +59,9 @@
 //! offered again once the next interval's check finds them still unapplied.
 //! A `bx update` that stops short — declined, abandoned at its question,
 //! refused or failed — answers the offer instead ([`settled`]) and says why in
-//! `last-check`; only one turned away because another holds the stamps
-//! records nothing, as that one settles them.
+//! `last-check`, which `bx doctor` names when it failed or was refused, until
+//! a `bx update` that finishes removes it ([`finished`]); only one turned away
+//! because another holds the stamps records nothing, as that one settles them.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -559,6 +560,11 @@ pub fn message(before: &Lock, after: &Lock) -> String {
 
 /// The subject of every commit `bx update` makes.
 pub const SUBJECT: &str = "chore(bx): update bx.lock";
+
+/// What opens the line [`settled`] writes to `last-check` when `bx update`
+/// failed or the config repo refused it, before the error itself; `bx doctor`
+/// names such a line.
+pub const STOPPED: &str = "bx update stopped: ";
 
 /// What [`replay_own_lock_commits`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1249,12 +1255,14 @@ pub(crate) fn snooze_waiting(
     Ok(crate::report::Exit::Converged)
 }
 
-/// After a `bx update` that finished: every stamp starts a new interval, and
-/// nothing is offered until the next check finds something.
+/// After a `bx update` that finished: every stamp starts a new interval,
+/// nothing is offered until the next check finds something, and `last-check`
+/// is removed, so neither what a check found nor why an earlier `bx update`
+/// stopped outlives the update that took it in.
 ///
 /// # Errors
 ///
-/// As [`Stamps::set`].
+/// As [`Stamps::set`], and [`Error::Io`] when `last-check` cannot be removed.
 pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
     let interval = inputs.resolved().update.interval();
     let externals = &inputs.resolved().externals;
@@ -1262,7 +1270,9 @@ pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
         ask_interval(externals, interval),
         check_interval(externals, interval),
     );
-    Stamps::of(inputs.state()).set(now(), Some(ask), Some(auto), Some(&[]))
+    let stamps = Stamps::of(inputs.state());
+    stamps.set(now(), Some(ask), Some(auto), Some(&[]))?;
+    stamps.remove(&stamps.last_check())
 }
 
 /// After a `bx update` that stopped short of [`finished`] — declined,

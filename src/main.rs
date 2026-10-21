@@ -49,11 +49,11 @@ enum Command {
         yes: bool,
     },
     /// Move externals that follow a branch to its new commits: pull, look,
-    /// lock and commit, apply
+    /// lock and commit, apply, push
     Update {
         /// Only these externals, by path; every followed one when none
         paths: Vec<String>,
-        /// Lock, commit and apply without asking for confirmation
+        /// Lock, commit, apply and push without asking for confirmation
         #[arg(long, conflicts_with_all = ["check", "snooze"])]
         yes: bool,
         /// Only look and report: exit 0 when nothing is new, 2 when

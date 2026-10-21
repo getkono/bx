@@ -69,7 +69,7 @@ There are twelve. You should not need a manual.
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
 | `bx sync` | pull, apply, carry this machine's copies of tracked files into the repo and commit them, push — no git knowledge required |
-| `bx update` | move [externals](#externals) that follow a branch to its new commits: pull, look, lock and commit, apply |
+| `bx update` | move [externals](#externals) that follow a branch to its new commits: pull, look, lock and commit, apply, push |
 | `bx secret list` | list declared secrets, and whether each decrypts here |
 | `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
 | `bx shell-init` | the one line for your shell rc — not built yet |
@@ -319,7 +319,11 @@ or move a follow only `local.toml` declares into a committed file.
 **`bx update`** brings the config repo level with its upstream, asks each
 followed branch where it is now, lists the new commits, and shows the plan the
 new lock would make. Once you approve, it writes and commits `bx.lock` *before*
-it moves any checkout, then applies; `bx sync` pushes the commit. If another
+it moves any checkout, then applies and pushes the commit to the branch's
+upstream, never forcing; a push the remote refuses is reported, and the commit
+waits for `bx sync` — or, when the upstream moved in the meantime, for another
+`bx update`, which replays it on top, since `bx sync` refuses the diverged
+branch. If another
 machine pushed first, `bx update` replays this machine's own unpushed lock
 commits on top of theirs; when both changed `bx.lock`, or any other commit is
 local, it changes nothing and says how to reconcile. A new commit

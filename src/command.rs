@@ -421,8 +421,14 @@ impl UpdateMode {
 /// for the lock that would follow — the same rendering and the same one
 /// confirmation `bx apply` has. Once approved, `bx.lock` is written and
 /// committed **before** any checkout moves, and then the plan is applied: the
-/// work that runs is the work shown. Nothing is pushed; `bx sync` pushes. With
-/// nothing new it still pulls and applies, so the machine ends where the
+/// work that runs is the work shown. Once applied, the branch is pushed to
+/// its upstream, never forced, when [`sync::may_push`] allows it, so no other
+/// machine's update diverges from this one's; a refused push is said and
+/// leaves the commit for `bx sync`, or, when the upstream moved, for another
+/// `bx update` to replay on top, as `bx sync` refuses the diverged branch;
+/// a branch with no upstream, one that
+/// is gone, or no repository pushes nothing. With nothing new it still pulls,
+/// applies and pushes what was left unpushed, so the machine ends where the
 /// configuration says.
 ///
 /// Every way it ends settles what the stamps offer, so no shell asks it again:
@@ -562,32 +568,47 @@ fn updating(
         }
         other => other,
     };
-    match pulled {
-        Ok(pulled) if pulled.fast_forwarded > 0 => say(out, &fast_forwarded(&pulled))?,
-        Ok(_) => {}
-        Err(sync::Error::NoUpstream { branch, .. }) => say(
-            out,
-            &format!(
-                "The config repo's {branch} has no upstream, so there is nothing to pull; \
-                 bx update locks on top of it as it stands."
-            ),
-        )?,
+    // Kept to push to once the lock is applied; with no upstream, one that is
+    // gone, or no repository at all, there is nowhere to push.
+    let pulled = match pulled {
+        Ok(pulled) => {
+            if pulled.fast_forwarded > 0 {
+                say(out, &fast_forwarded(&pulled))?;
+            }
+            Some(pulled)
+        }
+        Err(sync::Error::NoUpstream { branch, .. }) => {
+            say(
+                out,
+                &format!(
+                    "The config repo's {branch} has no upstream, so there is nothing to pull; \
+                     bx update locks on top of it as it stands."
+                ),
+            )?;
+            None
+        }
         Err(sync::Error::UpstreamGone {
             branch, upstream, ..
-        }) => say(
-            out,
-            &format!(
-                "The config repo's {branch} tracks {upstream}, which does not exist, so there is \
-                 nothing to pull; bx update locks on top of it as it stands."
-            ),
-        )?,
-        Err(sync::Error::NotARepo { .. }) => say(
-            out,
-            "The config repo is not a git repository, so there is nothing to pull or commit; \
-             bx update writes bx.lock there and commits nothing.",
-        )?,
+        }) => {
+            say(
+                out,
+                &format!(
+                    "The config repo's {branch} tracks {upstream}, which does not exist, so \
+                     there is nothing to pull; bx update locks on top of it as it stands."
+                ),
+            )?;
+            None
+        }
+        Err(sync::Error::NotARepo { .. }) => {
+            say(
+                out,
+                "The config repo is not a git repository, so there is nothing to pull or \
+                 commit; bx update writes bx.lock there and commits nothing.",
+            )?;
+            None
+        }
         Err(other) => return Err(other.into()),
-    }
+    };
 
     let inputs = Inputs::load(env)?;
     let externals = &inputs.resolved().externals;
@@ -647,10 +668,15 @@ fn updating(
     let mut recovering = false;
     let mut declined = false;
     let mut failed: Option<update::Error> = None;
+    // Whether the lock was committed, so there is a commit to push.
+    let made = std::cell::Cell::new(false);
     let lock = |failed: &mut Option<update::Error>| match update::write_and_commit(
         git, &repo, &after, &message,
     ) {
-        Ok(_) => true,
+        Ok(commit) => {
+            made.set(made.get() || commit);
+            true
+        }
         Err(error) => {
             *failed = Some(error);
             false
@@ -747,8 +773,52 @@ fn updating(
             "bx update was declined, and locked nothing",
         ));
     }
+    if let Some(pulled) = &pulled {
+        push_lock(git, pulled, u64::from(made.get()), &report, out)?;
+    }
     update::finished(&inputs)?;
     Ok(Updated::Finished(exit))
+}
+
+/// Publish what `bx update` leaves the config repo's branch ahead by: the
+/// commits [`sync::pull`] found unpushed, and the `committed` lock commit.
+///
+/// The push is [`sync::push`]'s, never forced, and runs only when
+/// [`sync::may_push`] says the apply left nothing undone, as `bx sync`'s does.
+/// A push the remote refuses — it moved since the pull, or cannot be reached
+/// — is said, not raised: the lock is committed and applied here, `bx sync`
+/// pushes it, and a `bx update` replays it first over an upstream that moved.
+fn push_lock(
+    git: &Git,
+    pulled: &sync::Pulled,
+    committed: u64,
+    report: &Report,
+    out: &mut dyn Write,
+) -> Result<(), update::Error> {
+    let ahead = pulled.ahead + committed;
+    if ahead == 0 {
+        return Ok(());
+    }
+    let upstream = &pulled.upstream.short;
+    let said = if !sync::may_push(report) {
+        format!(
+            "Pushed nothing: {ahead} commit(s) wait for an apply that leaves nothing undone; \
+             run `bx sync` to push them."
+        )
+    } else {
+        match sync::push(git, pulled) {
+            Ok(()) => format!("Pushed {ahead} commit(s) to {upstream}."),
+            Err(error) => {
+                tracing::debug!(%error, "the push of the lock commit was refused");
+                format!(
+                    "Pushed nothing: the push to {upstream} was refused ({error}). The lock \
+                     stays committed here, and `bx sync` pushes it; if {upstream} moved, run \
+                     `bx update` first, which replays it on top."
+                )
+            }
+        }
+    };
+    writeln!(out, "{said}").map_err(update::Error::Output)
 }
 
 /// What `last-check` says after a `bx update` abandoned at its question.

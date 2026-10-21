@@ -18,13 +18,17 @@
 //! * a `last-check` line saying `bx update` stopped — it failed, or the config
 //!   repo refused it — which stands until a `bx update` finishes and removes
 //!   `last-check`, or a background check overwrites it with what it found.
-//!   What else
-//!   `last-check` holds — what a check found, or that `bx update` was
-//!   declined or canceled — is no finding: doctor has no severity, and a
-//!   finding would leave every machine whose shell checked `Pending`.
 //!
-//! The last two only while an external follows a branch, as nothing asks
-//! about updates otherwise.
+//! What else `last-check` holds — what a check found, that the check failed,
+//! or that `bx update` was declined or canceled — is a note ([`notes`]), not
+//! a finding: a finding would leave every machine whose shell checked
+//! `Pending`. A failed check is a note too: it is retried within the hour,
+//! which overwrites the line, and a cause that outlasts it — a configuration
+//! that does not load, an unreachable remote — is one `bx doctor` or
+//! `bx update` reports on its own.
+//!
+//! The stamps, the `last-check` findings and the notes only while an external
+//! follows a branch, as nothing asks about updates otherwise.
 
 use std::path::Path;
 
@@ -121,6 +125,26 @@ pub fn check(
         }
     }
     findings
+}
+
+/// A note for every line of `last-check` that [`check`] does not report, in
+/// its order, while an external follows a branch. Blank lines say nothing.
+#[must_use]
+pub fn notes(externals: &[External], state: &StateDir) -> Vec<Finding> {
+    if first_followed(externals).is_none() {
+        return Vec::new();
+    }
+    let last = Stamps::of(state).last_check();
+    let text = std::fs::read(&last).unwrap_or_default();
+    String::from_utf8_lossy(&text)
+        .lines()
+        .filter(|line| !line.starts_with(STOPPED) && !line.trim().is_empty())
+        .map(|line| Finding {
+            subject: "bx update".to_string(),
+            origin: None,
+            note: format!("{} says `{line}`", last.display()),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -355,7 +379,14 @@ mod tests {
                 ),
             }]
         );
-        let report = super::super::Report { findings };
+        assert!(
+            notes(&followed, &state).is_empty(),
+            "a stopped line is no note"
+        );
+        let report = super::super::Report {
+            findings,
+            notes: Vec::new(),
+        };
         assert_eq!(super::super::exit(&report), crate::report::Exit::Pending);
 
         // Nothing follows a branch: nothing asks about updates, so nothing.
@@ -371,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn a_last_check_that_says_nothing_stopped_or_none_at_all_is_no_finding() {
+    fn a_last_check_that_says_nothing_stopped_is_a_note_and_no_finding() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let stamps = Stamps::of(&state);
@@ -379,6 +410,10 @@ mod tests {
         assert!(!stamps.last_check().exists());
         let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
         assert!(findings.is_empty(), "{findings:?}");
+        assert!(
+            notes(&followed, &state).is_empty(),
+            "no last-check, no note"
+        );
 
         state.ensure_update().unwrap();
         for said in [
@@ -389,11 +424,47 @@ mod tests {
             "bx update was canceled, and locked nothing\n",
             // Not at the start of its line: not what `settled` writes.
             " bx update stopped: indented\n",
-            "",
         ] {
             std::fs::write(stamps.last_check(), said).unwrap();
             let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
             assert!(findings.is_empty(), "{said:?}: {findings:?}");
+            let line = said.trim_end_matches('\n');
+            assert_eq!(
+                notes(&followed, &state),
+                [Finding {
+                    subject: "bx update".to_string(),
+                    origin: None,
+                    note: format!("{} says `{line}`", stamps.last_check().display()),
+                }],
+                "{said:?}"
+            );
         }
+
+        // Every line but a stopped or blank one, in order.
+        let stopped = format!("{STOPPED}it failed");
+        std::fs::write(
+            stamps.last_check(),
+            format!("judged here\n\n{stopped}\n  \n~/a: up to date with main\n"),
+        )
+        .unwrap();
+        let said: Vec<String> = notes(&followed, &state)
+            .into_iter()
+            .map(|note| note.note)
+            .collect();
+        let last = stamps.last_check();
+        assert_eq!(
+            said,
+            [
+                format!("{} says `judged here`", last.display()),
+                format!("{} says `~/a: up to date with main`", last.display()),
+            ]
+        );
+        std::fs::write(stamps.last_check(), "").unwrap();
+        assert!(notes(&followed, &state).is_empty());
+
+        // Nothing follows a branch: nothing asks about updates, so nothing.
+        std::fs::write(stamps.last_check(), "~/a: up to date with main\n").unwrap();
+        let pinned = [external(home.path(), "~/a", Pin::Rev(REV.to_string()))];
+        assert!(notes(&pinned, &state).is_empty());
     }
 }

@@ -7,9 +7,12 @@
 //!
 //! Every check reports in a fixed order, and each one in configuration order,
 //! so two runs over an unchanged machine print the same bytes. Any finding at
-//! all exits [`Exit::Pending`]; none exits [`Exit::Converged`]. There is no
-//! severity: a finding is something to look at, whichever check found it. A
-//! check that cannot ask what it needs is a finding, not an error.
+//! all exits [`Exit::Pending`]; none exits [`Exit::Converged`]. Findings have
+//! no severity among themselves: a finding is something to look at, whichever
+//! check found it. A check that cannot ask what it needs is a finding, not an
+//! error. Beside the findings a report holds notes: what is worth reading and
+//! needs nothing done, such as what the last update check found. A note is
+//! printed after every finding, and never changes the exit.
 //!
 //! Doctor takes no exclusive lock and writes nothing under the state directory
 //! or the home, so it runs beside an `apply` that holds the lock. It starts no
@@ -44,7 +47,8 @@
 //!    a destination, which no journal names and recovery never removes.
 //! 10. [`externals`] — an external that follows a branch `bx.lock` holds no
 //!     commit for, a lock entry nothing follows, an update stamp that holds
-//!     no time, and a `last-check` saying `bx update` stopped.
+//!     no time, and a `last-check` saying `bx update` stopped; what else
+//!     `last-check` says is a note.
 //! 11. [`stray_local`] — a `local.toml` inside the config repo, which bx
 //!     never loads, with the move to the state directory that makes it count.
 //! 12. [`bash`] — bash's generated file asks about followed externals'
@@ -101,6 +105,9 @@ pub struct Finding {
 pub struct Report {
     /// Every finding, check by check.
     pub findings: Vec<Finding>,
+    /// Every note, check by check: printed after the findings, and never a
+    /// reason to exit [`Exit::Pending`].
+    pub notes: Vec<Finding>,
 }
 
 /// What the checks ask the machine through.
@@ -172,18 +179,26 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
         home,
         probes.git,
     ));
-    Report { findings }
+    let notes = externals::notes(&resolved.externals, inputs.state());
+    Report { findings, notes }
 }
 
-/// The text `bx doctor` prints: one line per finding, then a tally.
+/// The text `bx doctor` prints: one line per finding, then one per note,
+/// then a tally, which counts the notes only when there are any.
 ///
 /// A finding reads like a `plan` row — `  ! {subject}  ({origin}) {note}` — so
-/// the two outputs point at a declaration the same way.
+/// the two outputs point at a declaration the same way; a note reads the same
+/// with `i` for `!`.
 #[must_use]
 pub fn render(report: &Report, home: &Path) -> String {
     let mut out = String::new();
-    for finding in &report.findings {
-        let _ = write!(out, "  ! {}", escape(&finding.subject));
+    let marked = report
+        .findings
+        .iter()
+        .map(|finding| ('!', finding))
+        .chain(report.notes.iter().map(|note| ('i', note)));
+    for (mark, finding) in marked {
+        let _ = write!(out, "  {mark} {}", escape(&finding.subject));
         if let Some(origin) = &finding.origin {
             let _ = write!(
                 out,
@@ -194,11 +209,16 @@ pub fn render(report: &Report, home: &Path) -> String {
         }
         let _ = writeln!(out, " {}", escape(&finding.note));
     }
-    let _ = writeln!(out, "Doctor: {} finding(s).", report.findings.len());
+    let _ = write!(out, "Doctor: {} finding(s)", report.findings.len());
+    if !report.notes.is_empty() {
+        let _ = write!(out, ", {} note(s)", report.notes.len());
+    }
+    out.push_str(".\n");
     out
 }
 
-/// The process status a report implies: pending on any finding at all.
+/// The process status a report implies: pending on any finding at all,
+/// whatever the notes say.
 #[must_use]
 pub fn exit(report: &Report) -> Exit {
     if report.findings.is_empty() {
@@ -385,12 +405,39 @@ content = \"a\\n\"
                 }),
                 note: "said\r\nno".to_string(),
             }],
+            ..Report::default()
         };
 
         assert_eq!(
             render(&report, Path::new("/var/home/example")),
             "  ! systemd\\x1b[2J  (/elsewhere/bx.toml:7) said\\r\\nno\nDoctor: 1 finding(s).\n"
         );
+    }
+
+    #[test]
+    fn notes_print_after_the_findings_and_never_leave_doctor_pending() {
+        let note = |subject: &str, note: &str| Finding {
+            subject: subject.to_string(),
+            origin: None,
+            note: note.to_string(),
+        };
+        let mut report = Report {
+            findings: Vec::new(),
+            notes: vec![note("bx update", "found\x1b[2J"), note("b", "two")],
+        };
+        let home = Path::new("/var/home/example");
+        assert_eq!(
+            render(&report, home),
+            "  i bx update found\\x1b[2J\n  i b two\nDoctor: 0 finding(s), 2 note(s).\n"
+        );
+        assert_eq!(exit(&report), Exit::Converged);
+
+        report.findings.push(note("a", "one"));
+        assert_eq!(
+            render(&report, home),
+            "  ! a one\n  i bx update found\\x1b[2J\n  i b two\nDoctor: 1 finding(s), 2 note(s).\n"
+        );
+        assert_eq!(exit(&report), Exit::Pending);
     }
 
     /// A machine with one thing for every check to find, in the order the
@@ -566,6 +613,39 @@ login-shell = \"zsh\"
             "{out}"
         );
         assert!(lines[1].starts_with("  ! ~/.ssh/config "), "{out}");
+    }
+
+    #[test]
+    fn what_the_last_update_check_found_is_a_note_and_a_stopped_update_a_finding() {
+        let home = guarded_home();
+        home.write(
+            ".config/bx/bx.lock",
+            "[[external]]\npath = \"~/a\"\nurl = \"https://h/o/a\"\nbranch = \"main\"\n\
+             rev = \"0e810e5afa27acbd074398eefbe28d13005dbc15\"\n",
+        );
+        let layer = "[[external]]\npath = \"~/a\"\nurl = \"https://h/o/a\"\nbranch = \"main\"\n";
+        let state = crate::state::StateDir::resolve(home.path());
+        state.ensure_update().unwrap();
+        let last = crate::update::Stamps::of(&state).last_check();
+        let summary = "~/a: 1 new commit(s) on main, 0e810e5 -> 1f921f6";
+        std::fs::write(&last, format!("{summary}\n")).unwrap();
+
+        let (out, code) = doctor_of(&home, layer, OsStr::new(""), &Every::unreachable());
+        assert_eq!(
+            out,
+            format!(
+                "  i bx update {} says `{summary}`\nDoctor: 0 finding(s), 1 note(s).\n",
+                last.display()
+            )
+        );
+        assert_eq!(code, Exit::Converged);
+
+        let stopped = format!("{}the remote was unreachable", crate::update::STOPPED);
+        std::fs::write(&last, format!("{stopped}\n")).unwrap();
+        let (out, code) = doctor_of(&home, layer, OsStr::new(""), &Every::unreachable());
+        assert!(out.starts_with("  ! bx update "), "{out}");
+        assert!(out.ends_with("Doctor: 1 finding(s).\n"), "{out}");
+        assert_eq!(code, Exit::Pending);
     }
 
     #[test]

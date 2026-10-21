@@ -51,7 +51,9 @@ pub fn self_upgrade(check: bool, force: bool, out: &mut dyn Write) -> Result<Exi
     )
 }
 
-/// `bx doctor`: what a human should look at, changing nothing.
+/// `bx doctor`: what a human should look at, changing nothing. Any finding
+/// exits [`Exit::Pending`]; a note, such as what the last update check found,
+/// is printed and never does.
 ///
 /// # Errors
 ///

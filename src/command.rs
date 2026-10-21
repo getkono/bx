@@ -191,6 +191,9 @@ fn converge(
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Report, Error> {
     let inputs = Inputs::load(env)?;
+    // An offer judged against a bx.lock this machine no longer has — a sync
+    // just brought in another machine's — is withdrawn and checked again.
+    update::relocked(&inputs);
     let report = converge_inputs(&inputs, env, mode, yes, out, ask, &mut |_, approved| {
         approved
     })?;

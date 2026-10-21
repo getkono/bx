@@ -416,6 +416,12 @@ impl UpdateMode {
 /// nothing new it still pulls and applies, so the machine ends where the
 /// configuration says.
 ///
+/// Every way it ends settles what the stamps offer, so no shell asks it again:
+/// run to the end, [`update::finished`] clears the offer; declined, abandoned
+/// at the question, refused or failed, [`update::settled`] answers it and
+/// says why in `last-check`. Only [`update::Error::Busy`] records nothing, as
+/// the run holding the stamps settles them.
+///
 /// Without `yes` it needs a terminal to ask on, and refuses before reaching
 /// the network.
 ///
@@ -458,18 +464,60 @@ fn update_with(
     if !yes && !env.stdin_tty {
         return Err(Error::NeedsConfirmation.into());
     }
-    let say =
-        |out: &mut dyn Write, text: &str| writeln!(out, "{text}").map_err(update::Error::Output);
     let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
     if !repo.is_dir() {
         return Err(Error::RepoMissing(repo).into());
     }
     // Held to the end, so two shells answering `y` at once, or a background
     // check fetching into a checkout this run moves, never overlap.
+    // Busy records nothing: the run that holds it settles the offer.
     let state = crate::state::StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
     let _held = update::Stamps::of(&state)
         .hold(update::HOLD_WAIT)?
         .ok_or(update::Error::Busy)?;
+    // Every other way this ends settles the offer, so no shell asks it again.
+    let why = match updating(env, names, yes, out, git, ask, &repo) {
+        Ok(Updated::Finished(exit)) => return Ok(exit),
+        Ok(Updated::Stopped(exit, why)) => Ok((exit, why.to_string())),
+        Err(error) => Err(error),
+    };
+    let reason = match &why {
+        Ok((_, why)) => why.clone(),
+        Err(error) => format!("bx update stopped: {error}"),
+    };
+    let ask = Inputs::load(env).ok().map(|inputs| {
+        update::ask_interval(
+            &inputs.resolved().externals,
+            inputs.resolved().update.interval(),
+        )
+    });
+    if let Err(error) = update::settled(&state, ask, &reason) {
+        tracing::warn!(%error, "could not settle what bx update was offered");
+    }
+    why.map(|(exit, _)| exit)
+}
+
+/// How [`updating`] ended.
+enum Updated {
+    /// It ran to the end, and [`update::finished`] started every interval.
+    Finished(Exit),
+    /// It stopped short, for the reason given, and changed no stamp.
+    Stopped(Exit, &'static str),
+}
+
+/// [`update_with`], under `update/check.lock`, for the config repo `repo`.
+fn updating(
+    env: &Env,
+    names: &[String],
+    yes: bool,
+    out: &mut dyn Write,
+    git: &Git,
+    ask: &mut dyn FnMut() -> Result<bool, Error>,
+    repo: &std::path::Path,
+) -> Result<Updated, update::Error> {
+    let say =
+        |out: &mut dyn Write, text: &str| writeln!(out, "{text}").map_err(update::Error::Output);
+    let repo = repo.to_path_buf();
     // One an interrupted replay left, or the user's own: theirs to finish.
     // Named first, since a replay left open leaves `bx.lock` changed too.
     if update::rebasing(git, &repo) {
@@ -588,6 +636,7 @@ fn update_with(
     let inputs = inputs.with_lock(after.clone());
     let mut asked = false;
     let mut recovering = false;
+    let mut declined = false;
     let mut failed: Option<update::Error> = None;
     let lock = |failed: &mut Option<update::Error>| match update::write_and_commit(
         git, &repo, &after, &message,
@@ -613,6 +662,7 @@ fn update_with(
                 recovering = true;
                 return approved;
             }
+            declined = changed && !approved;
             // Committed before the first write, so a checkout never stands at a
             // commit the config repo does not name.
             approved && (!changed || lock(&mut failed))
@@ -622,7 +672,7 @@ fn update_with(
         Ok(report) => report,
         Err(Error::Canceled) => {
             say(out, "Canceled. Nothing was locked or applied.")?;
-            return Ok(Exit::Canceled);
+            return Ok(Updated::Stopped(Exit::Canceled, CANCELED));
         }
         Err(other) => return Err(other.into()),
     };
@@ -635,10 +685,14 @@ fn update_with(
             "Nothing was locked: an interrupted apply had to be dealt with first. Run bx update \
              again.",
         )?;
-        return Ok(match plan::exit(&report, Mode::Apply) {
+        let exit = match plan::exit(&report, Mode::Apply) {
             Exit::Converged => Exit::Pending,
             exit => exit,
-        });
+        };
+        return Ok(Updated::Stopped(
+            exit,
+            "bx update dealt with an interrupted apply first, and locked nothing",
+        ));
     }
     // A lock that moves nothing `apply` writes — an entry dropped, or a
     // checkout that is a conflict either way — is still the user's to approve.
@@ -650,11 +704,12 @@ fn update_with(
                 Ok(approved) => approved,
                 Err(Error::Canceled) => {
                     say(out, "Canceled. Nothing was locked.")?;
-                    return Ok(Exit::Canceled);
+                    return Ok(Updated::Stopped(Exit::Canceled, CANCELED));
                 }
                 Err(other) => return Err(other.into()),
             }
         };
+        declined = !approved;
         if approved && lock(&mut failed) {
             say(out, "Locked.")?;
         }
@@ -662,7 +717,6 @@ fn update_with(
             return Err(error);
         }
     }
-    update::finished(&inputs)?;
     let attention = !unshared.is_empty()
         || found.iter().any(|found| {
             matches!(
@@ -672,11 +726,24 @@ fn update_with(
                     | update::Verdict::Unreachable(_)
             )
         });
-    Ok(match plan::exit(&report, Mode::Apply) {
+    let exit = match plan::exit(&report, Mode::Apply) {
         Exit::Converged if attention => Exit::Pending,
         exit => exit,
-    })
+    };
+    // Declined, what was found stays on offer, answered: the same commits
+    // are not offered again, and newer ones are.
+    if declined {
+        return Ok(Updated::Stopped(
+            exit,
+            "bx update was declined, and locked nothing",
+        ));
+    }
+    update::finished(&inputs)?;
+    Ok(Updated::Finished(exit))
 }
+
+/// What `last-check` says after a `bx update` abandoned at its question.
+const CANCELED: &str = "bx update was canceled, and locked nothing";
 
 /// `bx init`: create the repo when there is none, answer this account's unset
 /// values, offer the config already on the machine, then plan and apply

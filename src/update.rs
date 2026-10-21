@@ -57,6 +57,10 @@
 //! what is offered or asked, so a `bx update` run by hand withdraws open
 //! prompts, and clears `answered` with `available`, so the same commits are
 //! offered again once the next interval's check finds them still unapplied.
+//! A `bx update` that stops short — declined, abandoned at its question,
+//! refused or failed — answers the offer instead ([`settled`]) and says why in
+//! `last-check`; only one turned away because another holds the stamps
+//! records nothing, as that one settles them.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1259,6 +1263,51 @@ pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
         check_interval(externals, interval),
     );
     Stamps::of(inputs.state()).set(now(), Some(ask), Some(auto), Some(&[]))
+}
+
+/// After a `bx update` that stopped short of [`finished`] — declined,
+/// abandoned, refused or failed: what `available` offers is answered, so no
+/// shell asks it again, and every shell waiting on it gives way; `ask-due` is
+/// set to now plus `ask`, as [`Stamps::set`] does, so the question whether to
+/// check waits an interval too; and `why` is written to `last-check`. The offer
+/// itself stands, so a check that finds the same commits again offers nothing,
+/// and one that finds others offers them under their own generation.
+///
+/// `answered` is written as the hook writes an offer's answer: the offer's
+/// generation, then `ask` and the `ask-due` it settles, so the question due
+/// with it is not asked either. With nothing offered, nothing is answered.
+///
+/// # Errors
+///
+/// As [`Stamps::set`] and [`Stamps::write`].
+pub fn settled(state: &StateDir, ask: Option<Option<Interval>>, why: &str) -> Result<(), Error> {
+    let stamps = Stamps::of(state);
+    stamps.set(now(), ask, None, None)?;
+    let available = std::fs::read(stamps.available()).unwrap_or_default();
+    let first = available
+        .split(|&byte| byte == b'\n')
+        .next()
+        .map(|line| {
+            String::from_utf8_lossy(line)
+                .trim_matches([' ', '\t'])
+                .to_string()
+        })
+        .unwrap_or_default();
+    // As the hook names it: `gen G`'s `G`, or `old:` and the first line of an
+    // `available` an older bx wrote.
+    let generation = first
+        .strip_prefix("gen ")
+        .map_or_else(|| format!("old:{first}"), str::to_string);
+    if Stamps::offers(Some(&available), None) {
+        let due = Stamps::read(&stamps.ask_due()).map(|due| due.to_string());
+        stamps.write(
+            &stamps.answered(),
+            &format!("{generation}\nask {}\n", due.unwrap_or_default()),
+        )?;
+    }
+    stamps.write(&stamps.last_check(), &format!("{why}\n"))?;
+    stamps.wake();
+    Ok(())
 }
 
 /// After an `apply` that wrote: when an external follows a branch and no

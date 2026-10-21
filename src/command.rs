@@ -424,7 +424,9 @@ impl UpdateMode {
 /// work that runs is the work shown. Once applied, the branch is pushed to
 /// its upstream, never forced, when [`sync::may_push`] allows it, so no other
 /// machine's update diverges from this one's; a refused push is said and
-/// leaves the commit for `bx sync`, and a branch with no upstream, one that
+/// leaves the commit for `bx sync`, or, when the upstream moved, for another
+/// `bx update` to replay on top, as `bx sync` refuses the diverged branch;
+/// a branch with no upstream, one that
 /// is gone, or no repository pushes nothing. With nothing new it still pulls,
 /// applies and pushes what was left unpushed, so the machine ends where the
 /// configuration says.

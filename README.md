@@ -321,7 +321,9 @@ followed branch where it is now, lists the new commits, and shows the plan the
 new lock would make. Once you approve, it writes and commits `bx.lock` *before*
 it moves any checkout, then applies and pushes the commit to the branch's
 upstream, never forcing; a push the remote refuses is reported, and the commit
-waits for `bx sync`. If another
+waits for `bx sync` — or, when the upstream moved in the meantime, for another
+`bx update`, which replays it on top, since `bx sync` refuses the diverged
+branch. If another
 machine pushed first, `bx update` replays this machine's own unpushed lock
 commits on top of theirs; when both changed `bx.lock`, or any other commit is
 local, it changes nothing and says how to reconcile. A new commit

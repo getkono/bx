@@ -1282,6 +1282,9 @@ pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
 /// As [`Stamps::set`] and [`Stamps::write`].
 pub fn settled(state: &StateDir, ask: Option<Option<Interval>>, why: &str) -> Result<(), Error> {
     let stamps = Stamps::of(state);
+    // Read before `set` moves it, as the hook reads it before it answers: the
+    // question settled with the offer is the one due now, not the next one.
+    let due = Stamps::read(&stamps.ask_due()).map(|due| due.to_string());
     stamps.set(now(), ask, None, None)?;
     let available = std::fs::read(stamps.available()).unwrap_or_default();
     let first = available
@@ -1299,7 +1302,6 @@ pub fn settled(state: &StateDir, ask: Option<Option<Interval>>, why: &str) -> Re
         .strip_prefix("gen ")
         .map_or_else(|| format!("old:{first}"), str::to_string);
     if Stamps::offers(Some(&available), None) {
-        let due = Stamps::read(&stamps.ask_due()).map(|due| due.to_string());
         stamps.write(
             &stamps.answered(),
             &format!("{generation}\nask {}\n", due.unwrap_or_default()),

@@ -1084,12 +1084,13 @@ fn a_branch_diverged_by_a_persons_commit_is_left_for_them() {
     assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing moved");
 }
 
-#[test]
-fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
-    let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+/// A config repo in `home` whose `bx.lock` holds an entry nothing follows,
+/// so `bx update` would change a lock `apply` writes nothing for; and that
+/// lock's text.
+fn orphaned_lock(home: &GuardedHome) -> (std::path::PathBuf, String) {
+    upstream(home, &["skills/a/SKILL.md"]);
+    let repo = cloned(home, &layer());
+    update(home, true, &mut Vec::new()).expect("update");
     // An entry for an external nothing follows any more.
     let mut lock = Lock::read(&repo, home.path()).expect("bx.lock");
     let entry = lock
@@ -1104,11 +1105,19 @@ fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
     std::fs::write(repo.join("bx.lock"), lock.render()).expect("bx.lock");
     commit_all(home.path(), &repo, "an orphan");
     let orphaned = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
+    (repo, orphaned)
+}
 
+#[test]
+fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
+    let home = guarded_home();
+    let (repo, orphaned) = orphaned_lock(&home);
     let tty = Env {
         stdin_tty: true,
         ..env(home.path())
     };
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
     let mut out = Vec::new();
     update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
         Ok(false)
@@ -1120,6 +1129,7 @@ fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
         orphaned,
         "declined: kept"
     );
+    settled(&stamps, &generation, since, "declined");
 
     let mut out = Vec::new();
     update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
@@ -1133,6 +1143,37 @@ fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
         run(home.path(), &repo, &["log", "-1", "--format=%B"])
             .contains("~/gone: no longer followed")
     );
+}
+
+#[test]
+fn a_lock_change_apply_writes_nothing_for_abandoned_at_its_question_answers_the_offer() {
+    let home = guarded_home();
+    let (repo, orphaned) = orphaned_lock(&home);
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
+    let mut out = Vec::new();
+    let exit = update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
+        Err(Error::Canceled)
+    })
+    .expect("canceled");
+    assert_eq!(exit, Exit::Canceled);
+    assert!(
+        text(&out)
+            .lines()
+            .any(|line| line == "Canceled. Nothing was locked."),
+        "the lock's own question: {}",
+        text(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock"),
+        orphaned,
+        "canceled: kept"
+    );
+    settled(&stamps, &generation, since, "canceled");
 }
 
 #[test]
@@ -1380,20 +1421,27 @@ fn a_check_lock_that_cannot_be_opened_says_opening() {
     );
 }
 
+/// `ask-due` as [`on_offer`] leaves it: a question already due.
+const ASK_DUE: u64 = 1;
+
 /// The offer a check left in `home`'s stamps, as the prompt hook shows it,
-/// and its generation.
+/// with the question at [`ASK_DUE`] due alongside it, and its generation.
 fn on_offer(home: &GuardedHome) -> (Stamps, String) {
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     let lines = vec![format!("~/{AT}: 1 new commit(s) on master")];
     stamps
         .set(update::now(), None, None, Some(&lines))
         .expect("offered");
+    stamps
+        .write(&stamps.ask_due(), &format!("{ASK_DUE}\n"))
+        .expect("ask-due");
     assert!(offers(&stamps));
     (stamps, update::generation(&lines))
 }
 
-/// That `stamps` hold the offer of `generation` answered, `ask-due` an
-/// interval from a time in `since..=now`, and `last-check` saying `why`.
+/// That `stamps` hold the offer of `generation` answered along with the
+/// question that was due with it ([`ASK_DUE`]), `ask-due` an interval from a
+/// time in `since..=now`, and `last-check` saying `why`.
 fn settled(stamps: &Stamps, generation: &str, since: u64, why: &str) {
     let available = std::fs::read_to_string(stamps.available()).expect("still offered");
     assert!(
@@ -1408,8 +1456,9 @@ fn settled(stamps: &Stamps, generation: &str, since: u64, why: &str) {
     );
     assert_eq!(
         std::fs::read_to_string(stamps.answered()).expect("answered"),
-        format!("{generation}\nask {due}\n"),
-        "the offer, and the question due with it"
+        format!("{generation}\nask {ASK_DUE}\n"),
+        "the offer, and the question due with it, not the next one, which a shell \
+         still asks at {due}"
     );
     assert!(!offers(stamps), "no shell asks it again");
     let last = std::fs::read_to_string(stamps.last_check()).expect("last-check");

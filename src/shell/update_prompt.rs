@@ -20,9 +20,57 @@
 //! 3. **A question is due.** `update/ask-due` has passed: the hook asks
 //!    whether to check now. `y` runs `bx update`; any other answer snoozes.
 //!
-//! It asks at most once per shell, and starts at most one background check
-//! per shell. A shell that started one does not also ask whether to check:
-//! it offers what that check finds instead.
+//! It asks about an offer, or a question, at most once per shell: a shell that
+//! asked one nobody answered remembers it in `BX_UPDATE_ASKED`, and asks again
+//! only once a check finds something else. It starts at most one background
+//! check per shell. A shell that started one does not also ask whether to
+//! check: it offers what that check finds instead.
+//!
+//! # Many shells at once
+//!
+//! Every shell at a prompt sees the same offer, and the first answer, in any
+//! of them, settles it for all ([`crate::update`]'s *Shells asking at once*):
+//!
+//! - **One generation per offer.** `available` begins `gen G`, a hash of what
+//!   it offers. The hook offers it only while `answered` holds something else,
+//!   so a shell opened after an answer is not asked, even while the
+//!   `bx update` or `bx update --snooze` the answer started still runs. The
+//!   question whether to check is named `ask` and its `ask-due` the same way.
+//!   An offer's answer names the `ask-due` it was given under on a second
+//!   line, so the question due with it is settled too. An `available` an
+//!   older bx wrote has no `gen` line; its generation is `old:` and its first
+//!   line, so it too is asked once per shell and settled by one answer.
+//! - **Answered before anything starts.** The shell answered writes
+//!   `answered` with one redirect, then sends `SIGURG` with the `kill` builtin
+//!   to every other shell waiting under `waiting/`, then starts `bx update`
+//!   or the snooze.
+//! - **Waiting without polling.** A shell asking writes `waiting/$$`, traps
+//!   `SIGURG`, checks once more that nothing settled what it asks, and only
+//!   then reads, so an answer given before it registered is not waited out;
+//!   a wake-up that comes during that check sends it back to check again
+//!   rather than to the read. The signal ends the read at once:
+//!   zsh's `read` returns for any trapped signal, and bash's does in POSIX
+//!   mode, which the hook holds only for the read. Woken, it reads the stamps
+//!   again: answered, or withdrawn by a `bx update` run by hand, it says
+//!   `bx: answered in another shell`; replaced by a check that found
+//!   something else, it says so and asks about that at the next prompt;
+//!   otherwise it reads on. Afterwards it empties `waiting/$$` and puts back
+//!   the `URG` trap it found. `SIGURG` is ignored by a process that does not
+//!   trap it, so a waiting file left by a shell that is gone harms nothing
+//!   that later takes its pid, and bx removes such files whenever it wakes
+//!   the shells ([`crate::update::Stamps::wake`]).
+//! - **A wake-up can come late, never wrong.** A shell cannot test its flag
+//!   and start the read as one step, so a wake-up in the instant between
+//!   them does not end the read. A shell that cannot write `waiting/$$` — a
+//!   state directory an older bx left without `waiting/` — is never woken,
+//!   and traps nothing, so the `URG` trap it found stays as it was. Either
+//!   way the shell reads the stamps once more when its read ends, so it says
+//!   it was answered elsewhere, only at its timeout.
+//! - **Bounded.** A read waits at most `BX_UPDATE_PROMPT_TIMEOUT` seconds, 60
+//!   unless that is a positive whole number. One that times out, or meets the
+//!   end of its input, with nothing settled says
+//!   `bx: no answer; asking again at a later shell` and writes nothing, so
+//!   another shell asks.
 //!
 //! # Only a person at a terminal is asked
 //!
@@ -64,14 +112,16 @@
 //!
 //! # Invariant 6
 //!
-//! Sourcing either file defines two functions and registers one; nothing
+//! Sourcing either file defines four functions and registers one; nothing
 //! runs until the first prompt, which a startup benchmark (`zsh -i -c exit`,
 //! `bash -i -c exit`) never reaches. The hook itself reads the stamps with
 //! the `read` builtin and takes the time from a prompt expansion in zsh and
 //! `printf '%(%s)T'` in bash, so a prompt with nothing due starts no
-//! process. The only processes it ever starts are the detached background
-//! check, at most once per shell and only once `check-due` has passed, and
-//! `bx update` itself once someone answers.
+//! process. Asking starts none either: registering, waiting, waking and
+//! answering are redirects, `trap`, `read`, a glob and the `kill` builtin.
+//! The only processes it ever starts are the detached background check, at
+//! most once per shell and only once `check-due` has passed, and `bx update`
+//! itself once someone answers.
 //!
 //! # Invariant 2
 //!
@@ -79,8 +129,10 @@
 //! nothing but bx's own `BX_` names, a function's locals, zsh's hook arrays
 //! and an append to an unexported `PROMPT_COMMAND`. The hook assigns its
 //! locals, `BX_UPDATE_ASKED`, `BX_UPDATE_CHECKING` and, in bash,
-//! `BX_UPDATE_HOOK` (never exported), and
-//! registers itself as above; `env_guard`'s
+//! `BX_UPDATE_HOOK` (never exported); it reads `BX_UPDATE_PROMPT_TIMEOUT` and
+//! assigns it nothing. Its `SIGURG` trap assigns a local, and bash's puts back
+//! the trap it found by evaluating what `trap -p URG` printed, which is that
+//! trap and nothing else. It registers itself as above; `env_guard`'s
 //! `the_update_prompt_is_not_an_environment_fragment` and
 //! `the_bash_update_prompt_is_not_an_environment_fragment` hold the bytes to
 //! that, and the tests here run them.
@@ -97,36 +149,42 @@ pub const SECTION: &str = "bx update";
 pub const BASH_SINCE: (u32, u32) = (4, 4);
 
 /// The hook, as the `functions` phase holds it.
-pub const ZSH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, at most
-# once per shell. Reads bx's update stamps; starts nothing until one is due.
+pub const ZSH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, once per
+# offer. Reads bx's update stamps; starts nothing until one is due.
 __bx_update() {
   [[ -o interactive && -t 0 && -t 1 && $TERM != dumb ]] || return 0
   __bx_update_due
 }
 __bx_update_due() {
-  [[ -z $BX_UPDATE_ASKED ]] || return 0
   [[ -z ${CI-}${CLAUDECODE-}${CODEX_SANDBOX-}${GEMINI_CLI-}${CURSOR_AGENT-}${BX_NO_UPDATE_PROMPT-} ]] || return 0
   (( ${+commands[bx]} )) || return 0
   local dir=$HOME/.local/state/bx/update
   [[ ${XDG_STATE_HOME-} == /* ]] && dir=$XDG_STATE_HOME/bx/update
-  local now=${(%):-%D{%s}} due line answer
+  local now=${(%):-%D{%s}} due line gen= answered= also=
   local -a found
+  if [[ -r $dir/answered ]]; then
+    {
+      read -r answered
+      read -r also
+    } < $dir/answered
+  fi
   if [[ -s $dir/available ]]; then
     while read -r line
     do
       found+=("$line")
     done < $dir/available
-    typeset -g BX_UPDATE_ASKED=1
+    if [[ ${found[1]-} == 'gen '* ]]; then
+      gen=${found[1]#gen }
+      shift found
+    elif (( ${#found} )); then
+      gen=old:${found[1]}
+    fi
+  fi
+  if (( ${#found} )) && [[ $gen != "$answered" ]]; then
+    [[ $gen == "${BX_UPDATE_ASKED-}" ]] && return 0
     print -r -- "bx: what this configuration follows has new commits:"
     print -rl -- "  "${^found}
-    print -n -- "bx: update now? [y/N] "
-    read -k 1 -u 0 answer
-    print
-    if [[ $answer == [yY] ]]; then
-      command bx update
-    else
-      command bx update --snooze </dev/null >/dev/null 2>&1 &!
-    fi
+    __bx_update_ask $dir offer "$gen" "bx: update now? [y/N] "
     return 0
   fi
   if [[ -z $BX_UPDATE_CHECKING && -r $dir/check-due ]] && read -r due < $dir/check-due \
@@ -136,16 +194,94 @@ __bx_update_due() {
     return 0
   fi
   if [[ -z $BX_UPDATE_CHECKING && -r $dir/ask-due ]] && read -r due < $dir/ask-due \
-    && [[ $due == <-> ]] && (( due <= now )); then
-    typeset -g BX_UPDATE_ASKED=1
-    print -n -- "bx: check now whether what this configuration follows has new commits? [y/N] "
-    read -k 1 -u 0 answer
-    print
-    if [[ $answer == [yY] ]]; then
-      command bx update
-    else
-      command bx update --snooze </dev/null >/dev/null 2>&1 &!
-    fi
+    && [[ $due == <-> ]] && (( due <= now )) \
+    && [[ "ask $due" != "$answered" && "ask $due" != "$also" ]] \
+    && [[ "ask $due" != "${BX_UPDATE_ASKED-}" ]]; then
+    __bx_update_ask $dir ask "ask $due" \
+      "bx: check now whether what this configuration follows has new commits? [y/N] "
+  fi
+  return 0
+}
+# Whether what __bx_update_ask asks about ($2, offer or ask; $3, its
+# generation) stands in the update stamps under $1: 1 while it does, 0 once it
+# was answered, and 2 once a check replaced it with another offer.
+__bx_update_settled() {
+  local line= also=
+  if [[ -r $1/answered ]]; then
+    {
+      read -r line
+      read -r also
+    } < $1/answered
+  fi
+  [[ -n $3 && $line == "$3" ]] && return 0
+  [[ $2 == ask && $also == "$3" ]] && return 0
+  line=
+  if [[ $2 == offer ]]; then
+    [[ -s $1/available ]] || return 0
+    read -r line < $1/available
+    [[ $line == "gen $3" || "old:$line" == "$3" ]] && return 1
+    return 2
+  fi
+  [[ -r $1/ask-due ]] && read -r line < $1/ask-due
+  [[ "ask $line" == "$3" ]] && return 1
+  return 0
+}
+# Asks $4 about $2 ($3, its generation) under the update stamps in $1, for at
+# most BX_UPDATE_PROMPT_TIMEOUT seconds. Waits under waiting/, where whoever
+# answers it wakes this shell with SIGURG, so it gives way at once. An offer
+# answered settles the question due with it too, until the answer moves on.
+__bx_update_ask() {
+  setopt localoptions localtraps nullglob
+  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= spent= due= f p
+  local -i wait=60 start=${(%):-%D{%s}} now left
+  [[ ${BX_UPDATE_PROMPT_TIMEOUT-} == [1-9]* && $BX_UPDATE_PROMPT_TIMEOUT != *[^0-9]* ]] \
+    && wait=$BX_UPDATE_PROMPT_TIMEOUT
+  typeset -g BX_UPDATE_ASKED=$gen
+  print -r -- "$gen" 2>/dev/null >| $dir/waiting/$$
+  trap 'woken=1' URG
+  print -n -- "$4"
+  while [[ -z $outcome ]]
+  do
+    woken=
+    __bx_update_settled $dir $kind "$gen"
+    case $? in
+      0) outcome=answered ;;
+      2) outcome=changed ;;
+      *)
+        now=${(%):-%D{%s}}
+        left=wait-now+start
+        if [[ -n $spent ]] || (( left <= 0 )); then
+          outcome=none
+        elif [[ -z $woken ]]; then
+          read -k 1 -u 0 -t $left answer && outcome=read
+          [[ -n $outcome$woken ]] || spent=1
+        fi
+        ;;
+    esac
+  done
+  : 2>/dev/null >| $dir/waiting/$$
+  trap - URG
+  print
+  case $outcome in
+    answered) print -r -- "bx: answered in another shell"; return 0 ;;
+    changed) print -r -- "bx: a check found something else; asking about it at the next prompt"; return 0 ;;
+    none) print -r -- "bx: no answer; asking again at a later shell"; return 0 ;;
+  esac
+  [[ $kind == offer && -r $dir/ask-due ]] && read -r due < $dir/ask-due
+  if [[ $kind == offer ]]; then
+    printf '%s\nask %s\n' "$gen" "$due" 2>/dev/null >| $dir/answered
+  else
+    printf '%s\n' "$gen" 2>/dev/null >| $dir/answered
+  fi
+  for f in $dir/waiting/*
+  do
+    p=${f:t}
+    [[ $p == [1-9]* && $p != *[^0-9]* && $p != $$ && -s $f ]] && kill -URG $p 2>/dev/null
+  done
+  if [[ $answer == [yY] ]]; then
+    command bx update
+  else
+    command bx update --snooze </dev/null >/dev/null 2>&1 &!
   fi
   return 0
 }
@@ -155,8 +291,8 @@ precmd_functions+=(__bx_update)
 /// The hook in bash's words, as the `functions` phase of bash's file holds
 /// it: what [`ZSH`] does, registered on `PROMPT_COMMAND` as the module's
 /// *bash's hook* says.
-pub const BASH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, at most
-# once per shell. Reads bx's update stamps; starts nothing until one is due.
+pub const BASH: &str = r#"# Asks about followed externals' updates at a prompt a person is at, once per
+# offer. Reads bx's update stamps; starts nothing until one is due.
 # Returns the status it was called with, so the prompt shows the same one.
 __bx_update() {
   local last=$?
@@ -166,30 +302,36 @@ __bx_update() {
   return $last
 }
 __bx_update_due() {
-  [[ -z $BX_UPDATE_ASKED ]] || return 0
   [[ -z ${CI-}${CLAUDECODE-}${CODEX_SANDBOX-}${GEMINI_CLI-}${CURSOR_AGENT-}${BX_NO_UPDATE_PROMPT-} ]] || return 0
   type -P bx >/dev/null || return 0
   local dir=$HOME/.local/state/bx/update
   [[ ${XDG_STATE_HOME-} == /* ]] && dir=$XDG_STATE_HOME/bx/update
-  local now due line answer
+  local now due line gen= answered= also=
   local -a found
   printf -v now '%(%s)T' -1
+  if [[ -r $dir/answered ]]; then
+    {
+      read -r answered
+      read -r also
+    } < "$dir/answered"
+  fi
   if [[ -s $dir/available ]]; then
     while read -r line
     do
       found+=("$line")
     done < "$dir/available"
-    BX_UPDATE_ASKED=1
+    if [[ ${found[0]-} == 'gen '* ]]; then
+      gen=${found[0]#gen }
+      found=("${found[@]:1}")
+    elif (( ${#found[@]} )); then
+      gen=old:${found[0]}
+    fi
+  fi
+  if (( ${#found[@]} )) && [[ $gen != "$answered" ]]; then
+    [[ $gen == "${BX_UPDATE_ASKED-}" ]] && return 0
     printf '%s\n' "bx: what this configuration follows has new commits:"
     printf '  %s\n' "${found[@]}"
-    printf '%s' "bx: update now? [y/N] "
-    read -r -n 1 answer
-    printf '\n'
-    if [[ $answer == [yY] ]]; then
-      command bx update
-    else
-      (command bx update --snooze </dev/null >/dev/null 2>&1 &)
-    fi
+    __bx_update_ask "$dir" offer "$gen" "bx: update now? [y/N] "
     return 0
   fi
   if [[ -z $BX_UPDATE_CHECKING && -r $dir/check-due ]] && read -r due < "$dir/check-due" \
@@ -199,16 +341,108 @@ __bx_update_due() {
     return 0
   fi
   if [[ -z $BX_UPDATE_CHECKING && -r $dir/ask-due ]] && read -r due < "$dir/ask-due" \
-    && [[ -n $due && $due != *[!0-9]* ]] && (( 10#$due <= now )); then
-    BX_UPDATE_ASKED=1
-    printf '%s' "bx: check now whether what this configuration follows has new commits? [y/N] "
-    read -r -n 1 answer
-    printf '\n'
-    if [[ $answer == [yY] ]]; then
-      command bx update
-    else
-      (command bx update --snooze </dev/null >/dev/null 2>&1 &)
-    fi
+    && [[ -n $due && $due != *[!0-9]* ]] && (( 10#$due <= now )) \
+    && [[ "ask $due" != "$answered" && "ask $due" != "$also" ]] \
+    && [[ "ask $due" != "${BX_UPDATE_ASKED-}" ]]; then
+    __bx_update_ask "$dir" ask "ask $due" \
+      "bx: check now whether what this configuration follows has new commits? [y/N] "
+  fi
+  return 0
+}
+# Whether what __bx_update_ask asks about ($2, offer or ask; $3, its
+# generation) stands in the update stamps under $1: 1 while it does, 0 once it
+# was answered, and 2 once a check replaced it with another offer.
+__bx_update_settled() {
+  local line= also=
+  if [[ -r $1/answered ]]; then
+    {
+      read -r line
+      read -r also
+    } < "$1/answered"
+  fi
+  [[ -n $3 && $line == "$3" ]] && return 0
+  [[ $2 == ask && $also == "$3" ]] && return 0
+  line=
+  if [[ $2 == offer ]]; then
+    [[ -s $1/available ]] || return 0
+    read -r line < "$1/available"
+    [[ $line == "gen $3" || "old:$line" == "$3" ]] && return 1
+    return 2
+  fi
+  [[ -r $1/ask-due ]] && read -r line < "$1/ask-due"
+  [[ "ask $line" == "$3" ]] && return 1
+  return 0
+}
+# Asks $4 about $2 ($3, its generation) under the update stamps in $1, for at
+# most BX_UPDATE_PROMPT_TIMEOUT seconds. Waits under waiting/, where whoever
+# answers it wakes this shell with SIGURG, so it gives way at once: bash ends
+# a read for a trapped signal only in POSIX mode, so the read runs in it. An
+# offer answered settles the question due with it too, until the answer moves on.
+__bx_update_ask() {
+  local -
+  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= spent= saved= posix= waits= due= f p start now
+  local -i wait=60 left
+  [[ ${BX_UPDATE_PROMPT_TIMEOUT-} == [1-9]* && $BX_UPDATE_PROMPT_TIMEOUT != *[!0-9]* ]] \
+    && wait=$BX_UPDATE_PROMPT_TIMEOUT
+  [[ -o posix ]] && posix=1
+  BX_UPDATE_ASKED=$gen
+  printf -v start '%(%s)T' -1
+  if { printf '%s\n' "$gen"; trap -p URG; } 2>/dev/null >| "$dir/waiting/$$"; then
+    waits=1
+    {
+      read -r saved
+      read -r -d '' saved
+    } 2>/dev/null < "$dir/waiting/$$"
+    trap 'woken=1' URG
+  fi
+  printf '%s' "$4"
+  while [[ -z $outcome ]]
+  do
+    woken=
+    __bx_update_settled "$dir" "$kind" "$gen"
+    case $? in
+      0) outcome=answered ;;
+      2) outcome=changed ;;
+      *)
+        printf -v now '%(%s)T' -1
+        left=wait-now+start
+        if [[ -n $spent ]] || (( left <= 0 )); then
+          outcome=none
+        elif [[ -z $woken ]]; then
+          set -o posix
+          read -r -n 1 -t $left answer && outcome=read
+          [[ -n $posix ]] || set +o posix
+          [[ -n $outcome$woken ]] || spent=1
+        fi
+        ;;
+    esac
+  done
+  if [[ -n $waits ]]; then
+    : 2>/dev/null >| "$dir/waiting/$$"
+    trap - URG
+    [[ -n $saved ]] && eval "$saved"
+  fi
+  printf '\n'
+  case $outcome in
+    answered) printf '%s\n' "bx: answered in another shell"; return 0 ;;
+    changed) printf '%s\n' "bx: a check found something else; asking about it at the next prompt"; return 0 ;;
+    none) printf '%s\n' "bx: no answer; asking again at a later shell"; return 0 ;;
+  esac
+  [[ $kind == offer && -r $dir/ask-due ]] && read -r due < "$dir/ask-due"
+  if [[ $kind == offer ]]; then
+    printf '%s\nask %s\n' "$gen" "$due" 2>/dev/null >| "$dir/answered"
+  else
+    printf '%s\n' "$gen" 2>/dev/null >| "$dir/answered"
+  fi
+  for f in "$dir"/waiting/*
+  do
+    p=${f##*/}
+    [[ $p == [1-9]* && $p != *[!0-9]* && $p != "$$" && -s $f ]] && kill -URG "$p" 2>/dev/null
+  done
+  if [[ $answer == [yY] ]]; then
+    command bx update
+  else
+    (command bx update --snooze </dev/null >/dev/null 2>&1 &)
   fi
   return 0
 }
@@ -287,7 +521,8 @@ mod tests {
                 assert!(warmed.success(), "the recording bx: {warmed}");
                 std::fs::remove_file(home.path().join("calls")).expect("the warm-up's record");
             }
-            std::fs::create_dir_all(Self::dir_in(home.path())).expect("update/");
+            // As `Stamps::set` leaves it.
+            std::fs::create_dir_all(Self::dir_in(home.path()).join("waiting")).expect("update/");
             Self { home, shell }
         }
 
@@ -295,37 +530,52 @@ mod tests {
             home.join(".local/state/bx/update")
         }
 
+        fn dir(&self) -> PathBuf {
+            Self::dir_in(self.home.path())
+        }
+
         fn stamp(&self, name: &str, text: &str) {
-            std::fs::write(Self::dir_in(self.home.path()).join(name), text).expect("a stamp");
+            std::fs::write(self.dir().join(name), text).expect("a stamp");
         }
 
-        /// Source the hook, call `function`, wait for any detached child, and
-        /// return what was printed and every `bx` call made.
-        fn run(&self, function: &str, input: &str, env: &[(&str, &str)]) -> (String, String) {
-            self.run_after("", function, input, env)
+        /// The stamp `name`, or `None` where it is absent.
+        fn read(&self, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.dir().join(name)).ok()
         }
 
-        /// [`Rig::run`], with `before` run ahead of the hook's bytes.
-        fn run_after(
+        /// `name` under the home once something writes it, as a detached
+        /// call does after the shell that started it is gone; `None` when
+        /// nothing does within ten seconds.
+        fn eventually(&self, name: &str) -> Option<String> {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(self.home.path().join(name)) {
+                    return Some(text);
+                }
+                if std::time::Instant::now() >= until {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        /// The shell, sourcing the hook behind `before` and then running
+        /// `function` from a script of its own called `name`, with its
+        /// standard streams piped; `None` where the shell is not installed.
+        fn spawn(
             &self,
+            name: &str,
             before: &str,
             function: &str,
-            input: &str,
             env: &[(&str, &str)],
-        ) -> (String, String) {
+        ) -> Option<std::process::Child> {
             let (program, flags, hook): (&str, &[&str], &str) = match self.shell {
                 Shell::Zsh => ("zsh", &["-f"], ZSH),
                 Shell::Bash => ("bash", &["--norc", "--noprofile"], BASH),
             };
-            let Some(program) = crate::shell::testing::installed(program) else {
-                return (String::new(), String::new());
-            };
-            let script = self.home.path().join("script");
-            std::fs::write(
-                &script,
-                format!("{before}\n{hook}\n{function}\nwait\nsleep 0.2\n"),
-            )
-            .expect("the script");
+            let program = crate::shell::testing::installed(program)?;
+            let script = self.home.path().join(name);
+            std::fs::write(&script, format!("{before}\n{hook}\n{function}\n")).expect("the script");
             let mut command = Command::new(program);
             command
                 .args(flags)
@@ -342,7 +592,45 @@ mod tests {
             for (name, value) in env {
                 command.env(name, value);
             }
-            let mut child = command.spawn().expect("the shell runs");
+            Some(command.spawn().expect("the shell runs"))
+        }
+
+        /// Wait until `child`, a shell [`Rig::spawn`] started, waits on a
+        /// prompt: its file under `waiting/` is there and not empty.
+        fn until_waiting(&self, child: &std::process::Child) {
+            let file = self.dir().join("waiting").join(child.id().to_string());
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !std::fs::metadata(&file).is_ok_and(|meta| meta.len() > 0) {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "the shell never waited on its prompt"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        /// Source the hook, call `function`, wait for any detached child, and
+        /// return what was printed and every `bx` call made.
+        fn run(&self, function: &str, input: &str, env: &[(&str, &str)]) -> (String, String) {
+            self.run_after("", function, input, env)
+        }
+
+        /// [`Rig::run`], with `before` run ahead of the hook's bytes.
+        fn run_after(
+            &self,
+            before: &str,
+            function: &str,
+            input: &str,
+            env: &[(&str, &str)],
+        ) -> (String, String) {
+            let Some(mut child) = self.spawn(
+                "script",
+                before,
+                &format!("{function}\nwait\nsleep 0.2"),
+                env,
+            ) else {
+                return (String::new(), String::new());
+            };
             // A hook that asks nothing never reads its input, so the shell can
             // exit before it is written: a closed pipe is then not a failure.
             match std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), input.as_bytes())
@@ -409,23 +697,43 @@ mod tests {
             let rig = Rig::new(shell);
             rig.stamp(
                 "available",
-                "~/a: 3 new commit(s) on main\n~/b: locks main\n",
+                "gen g1\n~/a: 3 new commit(s) on main\n~/b: locks main\n",
             );
             let (printed, calls) = rig.run("__bx_update_due", "y", &[]);
             assert!(
                 printed.contains("  ~/a: 3 new commit(s) on main\n  ~/b: locks main\n"),
                 "{shell:?}: {printed}"
             );
+            assert!(!printed.contains("gen g1"), "{shell:?}: {printed}");
             assert!(
                 printed.contains("bx: update now? [y/N] "),
                 "{shell:?}: {printed}"
             );
             assert_eq!(calls, "update\n", "{shell:?}");
+            assert_eq!(
+                rig.read("answered").as_deref(),
+                Some("g1\nask \n"),
+                "{shell:?}: written before bx update ran"
+            );
 
+            std::fs::remove_file(rig.dir().join("answered")).expect("answered");
             let (_, calls) = rig.run("__bx_update_due", "n", &[]);
             assert_eq!(
                 calls, "update\nupdate --snooze\n",
                 "{shell:?}: anything but y snoozes"
+            );
+            assert_eq!(
+                rig.read("answered").as_deref(),
+                Some("g1\nask \n"),
+                "{shell:?}"
+            );
+            let waiting: Vec<_> = std::fs::read_dir(rig.dir().join("waiting"))
+                .expect("waiting/")
+                .map(|entry| std::fs::read(entry.expect("an entry").path()).expect("a file"))
+                .collect();
+            assert!(
+                waiting.iter().all(Vec::is_empty),
+                "{shell:?}: no longer waiting: {waiting:?}"
             );
         }
     }
@@ -483,6 +791,323 @@ mod tests {
                 "{shell:?}: {printed}"
             );
             assert_eq!(calls, "update --snooze\n", "{shell:?}");
+        }
+    }
+
+    /// What a shell [`Rig::spawn`] started printed, once it exits; its
+    /// standard input is held open until then, so it never reads an end of
+    /// input.
+    fn finished(mut child: std::process::Child) -> String {
+        let input = child.stdin.take();
+        let status = child.wait().expect("the shell finishes");
+        drop(input);
+        let mut shown = String::new();
+        for stream in [
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read>),
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let mut stream = stream;
+            std::io::Read::read_to_string(&mut stream, &mut shown).expect("output");
+        }
+        assert!(status.success(), "{status}: {shown}");
+        shown
+    }
+
+    /// A pid no process has: a child's, once it was reaped.
+    fn gone_pid() -> u32 {
+        let mut child = Command::new("true").spawn().expect("true runs");
+        child.wait().expect("reaped");
+        child.id()
+    }
+
+    #[test]
+    fn shells_asking_at_once_give_way_to_the_first_answer() {
+        let env = [("BX_UPDATE_PROMPT_TIMEOUT", "30")];
+        for shell in shells() {
+            for (stamp, text, answered) in [
+                (
+                    "available",
+                    "gen g1\n~/a: 1 new commit(s) on main\n",
+                    "g1\nask \n",
+                ),
+                ("ask-due", "1\n", "ask 1\n"),
+            ] {
+                let rig = Rig::new(shell);
+                rig.stamp(stamp, text);
+                let Some(waiter) = rig.spawn("waiter", "", "__bx_update_due", &env) else {
+                    return;
+                };
+                rig.until_waiting(&waiter);
+                let mut answerer = rig
+                    .spawn("answerer", "", "__bx_update_due\nwait\nsleep 0.2", &env)
+                    .expect("the same shell");
+                std::io::Write::write_all(answerer.stdin.as_mut().expect("stdin"), b"n")
+                    .expect("the answer");
+                let answering = finished(answerer);
+                let answered_at = std::time::Instant::now();
+                let waited = finished(waiter);
+                assert!(
+                    answered_at.elapsed() < std::time::Duration::from_secs(1),
+                    "{shell:?}, {stamp}: gave way {:?} after the answer",
+                    answered_at.elapsed()
+                );
+                assert!(
+                    waited.ends_with("\nbx: answered in another shell\n"),
+                    "{shell:?}, {stamp}: {waited}"
+                );
+                assert!(
+                    !answering.contains("another shell"),
+                    "{shell:?}, {stamp}: {answering}"
+                );
+                assert_eq!(rig.read("answered").as_deref(), Some(answered));
+                assert_eq!(
+                    rig.eventually("calls").as_deref(),
+                    Some("update --snooze\n"),
+                    "{shell:?}, {stamp}: one answer, one snooze"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shell_opened_after_an_answer_is_not_asked() {
+        for shell in shells() {
+            let rig = Rig::new(shell);
+            // As a shell that answered leaves them while its snooze still
+            // waits for the lock.
+            rig.stamp("available", "gen g1\n~/a: 1 new commit(s) on main\n");
+            rig.stamp("ask-due", "1\n");
+            rig.stamp("answered", "g1\nask 1\n");
+            assert_eq!(
+                rig.run("__bx_update_due", "y", &[]),
+                (String::new(), String::new()),
+                "{shell:?}: neither the offer nor the question due with it"
+            );
+
+            // The question alone, answered in some shell.
+            rig.stamp("answered", "ask 1\n");
+            std::fs::remove_file(rig.dir().join("available")).expect("no offer");
+            assert_eq!(
+                rig.run("__bx_update_due", "y", &[]),
+                (String::new(), String::new()),
+                "{shell:?}"
+            );
+
+            // An offer answered, and a question due after it was.
+            rig.stamp("available", "gen g1\n~/a: 1 new commit(s) on main\n");
+            rig.stamp("answered", "g1\nask 0\n");
+            let (printed, calls) = rig.run("__bx_update_due", "y", &[]);
+            assert!(!printed.contains("new commits:"), "{shell:?}: {printed}");
+            assert!(
+                printed.contains("check now whether"),
+                "{shell:?}: {printed}"
+            );
+            assert_eq!(calls, "update\n", "{shell:?}");
+            assert_eq!(rig.read("answered").as_deref(), Some("ask 1\n"));
+        }
+    }
+
+    #[test]
+    fn an_unanswered_prompt_times_out_writes_nothing_and_asks_again_only_when_new() {
+        for shell in shells() {
+            let rig = Rig::new(shell);
+            rig.stamp("available", "gen g1\n~/a: 1 new commit(s) on main\n");
+            let (urg, list) = match shell {
+                Shell::Zsh => ("trap 'print mine' URG", "trap"),
+                Shell::Bash => ("trap 'echo mine' URG", "trap -p URG"),
+            };
+            let started = std::time::Instant::now();
+            let Some(child) = rig.spawn(
+                "script",
+                urg,
+                &format!(
+                    "__bx_update_due\nprintf '@\\n'\n__bx_update_due\nprintf '@\\n'\n\
+                     printf 'gen g2\\n~/a: 2 new commit(s) on main\\n' >| {}\n\
+                     __bx_update_due\nprintf '@\\n'\n{list}",
+                    rig.dir().join("available").display()
+                ),
+                &[("BX_UPDATE_PROMPT_TIMEOUT", "1")],
+            ) else {
+                return;
+            };
+            let shown = finished(child);
+            let took = started.elapsed();
+            let runs: Vec<&str> = shown.split("@\n").collect();
+            assert_eq!(runs.len(), 4, "{shell:?}: {shown}");
+            for asked in [runs[0], runs[2]] {
+                assert!(
+                    asked.ends_with(
+                        "bx: update now? [y/N] \nbx: no answer; asking again at a later shell\n"
+                    ),
+                    "{shell:?}: {asked}"
+                );
+            }
+            assert_eq!(runs[1], "", "{shell:?}: the same offer is not asked twice");
+            assert!(runs[2].contains("2 new commit(s)"), "{shell:?}: {shown}");
+            assert!(
+                runs[3].contains("mine"),
+                "{shell:?}: the trap is put back: {shown}"
+            );
+            assert!(
+                took >= std::time::Duration::from_secs(2),
+                "{shell:?}: each waited its second: {took:?}"
+            );
+            assert_eq!(rig.read("answered"), None, "{shell:?}: no answer written");
+            assert_eq!(
+                std::fs::read_to_string(rig.home.path().join("calls")).ok(),
+                None,
+                "{shell:?}: nothing started"
+            );
+        }
+    }
+
+    #[test]
+    fn an_offer_an_older_bx_wrote_is_asked_once_per_shell_and_settled_by_one_answer() {
+        for shell in shells() {
+            let rig = Rig::new(shell);
+            // No `gen` line: written before generations, and nothing rewrites
+            // it until the next check.
+            rig.stamp("available", "~/a: 1 new commit(s) on main\n");
+            let Some(child) = rig.spawn(
+                "script",
+                "",
+                "__bx_update_due\nprintf '@\\n'\n__bx_update_due",
+                &[("BX_UPDATE_PROMPT_TIMEOUT", "1")],
+            ) else {
+                return;
+            };
+            let shown = finished(child);
+            let runs: Vec<&str> = shown.split("@\n").collect();
+            assert_eq!(runs.len(), 2, "{shell:?}: {shown}");
+            assert!(
+                runs[0].ends_with("bx: no answer; asking again at a later shell\n"),
+                "{shell:?}: {shown}"
+            );
+            assert_eq!(runs[1], "", "{shell:?}: not asked again in that shell");
+
+            let (printed, _) = rig.run("__bx_update_due", "n", &[]);
+            assert!(printed.contains("update now?"), "{shell:?}: {printed}");
+            assert_eq!(
+                rig.read("answered").as_deref(),
+                Some("old:~/a: 1 new commit(s) on main\nask \n"),
+                "{shell:?}"
+            );
+            let (printed, _) = rig.run("__bx_update_due", "y", &[]);
+            assert_eq!(printed, "", "{shell:?}: another shell is not asked");
+        }
+    }
+
+    #[test]
+    fn a_shell_never_woken_learns_of_the_answer_when_its_read_times_out() {
+        for shell in shells() {
+            let rig = Rig::new(shell);
+            rig.stamp("available", "gen g1\n~/a: 1 new commit(s) on main\n");
+            // As an older bx left the state directory: nowhere to wait, so
+            // nothing wakes this shell, as with a wake-up that came just
+            // before its read began.
+            std::fs::remove_dir(rig.dir().join("waiting")).expect("no waiting/");
+            let (urg, list) = match shell {
+                Shell::Zsh => ("trap 'print mine' URG", "trap"),
+                Shell::Bash => ("trap 'echo mine' URG", "trap -p URG"),
+            };
+            let answer = format!(
+                "{urg}\n(sleep 0.5; printf 'g1\\nask \\n' >| {}) &",
+                rig.dir().join("answered").display()
+            );
+            let Some(child) = rig.spawn(
+                "script",
+                &answer,
+                &format!("__bx_update_due\nprintf '@\\n'\n{list}\nwait"),
+                &[("BX_UPDATE_PROMPT_TIMEOUT", "2")],
+            ) else {
+                return;
+            };
+            let shown = finished(child);
+            let runs: Vec<&str> = shown.split("@\n").collect();
+            assert_eq!(runs.len(), 2, "{shell:?}: {shown}");
+            assert!(
+                runs[0].ends_with("bx: update now? [y/N] \nbx: answered in another shell\n"),
+                "{shell:?}: {shown}"
+            );
+            assert!(
+                runs[1].contains("mine"),
+                "{shell:?}: the trap it found is kept: {shown}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(rig.home.path().join("calls")).ok(),
+                None,
+                "{shell:?}: nothing started"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_waiter_is_harmless_to_the_shell_that_answers() {
+        for shell in shells() {
+            let rig = Rig::new(shell);
+            rig.stamp("available", "gen g1\n~/a: 1 new commit(s) on main\n");
+            let stale = rig.dir().join("waiting").join(gone_pid().to_string());
+            std::fs::write(&stale, "g1\n").expect("a stale waiter");
+            std::fs::write(rig.dir().join("waiting/notapid"), "g1\n").expect("a stray file");
+            let (printed, calls) = rig.run("__bx_update_due", "n", &[]);
+            assert!(
+                printed.ends_with("bx: update now? [y/N] \n"),
+                "{shell:?}: nothing said about the stale pid: {printed}"
+            );
+            assert_eq!(calls, "update --snooze\n", "{shell:?}");
+        }
+    }
+
+    #[test]
+    fn bx_withdraws_a_prompt_whose_offer_it_settles_or_replaces() {
+        let env = [("BX_UPDATE_PROMPT_TIMEOUT", "30")];
+        let state = |rig: &Rig| crate::state::StateDir::resolve(rig.home.path());
+        for shell in shells() {
+            for (lines, said) in [
+                (
+                    vec!["~/a: 2 new commit(s) on main".to_string()],
+                    "bx: a check found something else; asking about it at the next prompt\n",
+                ),
+                (Vec::new(), "bx: answered in another shell\n"),
+            ] {
+                let rig = Rig::new(shell);
+                let stamps = crate::update::Stamps::of(&state(&rig));
+                let first = ["~/a: 1 new commit(s) on main".to_string()];
+                stamps.set(0, None, None, Some(&first)).expect("an offer");
+                let Some(waiter) = rig.spawn("waiter", "", "__bx_update_due", &env) else {
+                    return;
+                };
+                rig.until_waiting(&waiter);
+                let at = std::time::Instant::now();
+                // A check finding more, or a `bx update` run by hand.
+                stamps.set(0, None, None, Some(&lines)).expect("settled");
+                let waited = finished(waiter);
+                assert!(
+                    at.elapsed() < std::time::Duration::from_secs(1),
+                    "{shell:?}: {:?}",
+                    at.elapsed()
+                );
+                assert!(waited.ends_with(said), "{shell:?}: {waited}");
+                assert_eq!(
+                    std::fs::read_to_string(rig.home.path().join("calls")).ok(),
+                    None,
+                    "{shell:?}"
+                );
+                // A shell that is gone is pruned by the next waking.
+                let stale = stamps.waiting().join(gone_pid().to_string());
+                std::fs::write(&stale, "g\n").expect("a stale waiter");
+                stamps.wake();
+                assert!(!stale.exists(), "{shell:?}");
+            }
         }
     }
 
@@ -654,7 +1279,9 @@ mod tests {
                     "{shell:?}, XDG_STATE_HOME={value:?}: {printed}"
                 );
                 assert_eq!(calls, "update\n", "{shell:?}, XDG_STATE_HOME={value:?}");
+                // As `Stamps::set` clears them, so the next value is asked.
                 std::fs::remove_file(update.join("available")).expect("the stamp goes");
+                std::fs::remove_file(update.join("answered")).expect("the answer goes");
                 std::fs::remove_file(rig.home.path().join("calls")).expect("the calls go");
             }
         }
@@ -718,6 +1345,75 @@ mod tests {
                 }
             }
         }
+
+        /// bx says an offer stands exactly when the hook offers it: the same
+        /// lines, the same generation line, and the same reading of
+        /// `answered`.
+        #[test]
+        fn the_hook_and_bx_agree_on_whether_an_offer_stands(
+            stamps in proptest::collection::vec(
+                (
+                    proptest::option::of(
+                        "([ \t]?gen[ \t]{1,2}[ab ]{0,2}[ \t]?\n)?([ \t]?[ab~:]{0,3}[ \t]?\n){0,2}[ab]{0,2}",
+                    ),
+                    proptest::option::of("[ \t]?(old:)?[ab ]{0,2}[ \t]?(\n[ab\n]{0,2})?"),
+                ),
+                1..12,
+            ),
+        ) {
+            let bx: Vec<bool> = stamps
+                .iter()
+                .map(|(available, answered)| {
+                    crate::update::Stamps::offers(
+                        available.as_deref().map(str::as_bytes),
+                        answered.as_deref().map(str::as_bytes),
+                    )
+                })
+                .collect();
+            for shell in shells() {
+                if let Some(hook) = offers_from(shell, &stamps) {
+                    proptest::prop_assert_eq!(&hook, &bx, "{:?}: {:?}", shell, stamps);
+                }
+            }
+        }
+    }
+
+    /// Which of `stamps`, each an `available` and an `answered` in a state
+    /// directory of its own, `shell`'s hook offers, in one run of `shell`;
+    /// `None` when `shell` is not installed.
+    fn offers_from(shell: Shell, stamps: &[(Option<String>, Option<String>)]) -> Option<Vec<bool>> {
+        crate::shell::testing::installed(match shell {
+            Shell::Zsh => "zsh",
+            Shell::Bash => "bash",
+        })?;
+        let rig = Rig::new(shell);
+        let mut script = String::new();
+        for (i, (available, answered)) in stamps.iter().enumerate() {
+            let root = rig.home.path().join(format!("s{i}"));
+            let state = crate::state::StateDir::resolve_in(rig.home.path(), Some(root.as_os_str()));
+            let update = crate::update::Stamps::of(&state);
+            std::fs::create_dir_all(state.update()).expect("update/");
+            for (path, text) in [
+                (update.available(), available),
+                (update.answered(), answered),
+            ] {
+                if let Some(text) = text {
+                    std::fs::write(path, text).expect("a stamp");
+                }
+            }
+            script.push_str(&format!(
+                "XDG_STATE_HOME='{}'\nBX_UPDATE_ASKED=\nprintf '@\\n'\n__bx_update_due </dev/null\n",
+                root.display()
+            ));
+        }
+        let (printed, _) = rig.run(&script, "", &[]);
+        let offered: Vec<bool> = printed
+            .split("@\n")
+            .skip(1)
+            .map(|run| run.contains("has new commits:"))
+            .collect();
+        assert_eq!(offered.len(), stamps.len(), "{shell:?}: {printed}");
+        Some(offered)
     }
 
     /// Whether the installed bash is one [`BASH`] registers on: 4.4 or later.

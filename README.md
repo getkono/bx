@@ -335,14 +335,21 @@ as undeclared, for `bx rm` to release. A link never replaces a file or link
 you made; it is reported as a conflict instead. A `to` at, inside or above any
 external's checkout is refused when the configuration loads.
 
-**When bx asks.** zsh or bash asks at a prompt, at most once per shell:
+**When bx asks.** zsh or bash asks at a prompt, about each offer or question
+at most once per shell:
 
 | the external says | what happens |
 |---|---|
 | `check = "ask"` (the default) | once `[update] interval` (default `7d`) has passed, the prompt asks whether to check now; nothing reaches the network until you answer `y` |
 | `check = "auto"`, with its own `interval` | once that interval has passed, the shell starts one quiet, time-bounded check after its first prompt, and a later prompt offers whatever it found; nothing is applied until you answer `y` |
 
-Answering anything but `y` puts the question off for one interval. Nothing
+Answering any key but `y` puts the question off for one interval. One answer,
+in any shell, settles the question for every shell: a shell asking the same
+thing at that moment stops and says `bx: answered in another shell`, and a
+shell opened afterwards does not ask. A prompt nobody answers gives up after
+`BX_UPDATE_PROMPT_TIMEOUT` seconds (default `60`), writes nothing and puts
+nothing off, so a later shell asks again; the shell that timed out asks again
+only once a check finds something else. Nothing
 asks, and nothing is checked, unless the shell is interactive with a terminal
 on both ends: a script, `zsh -c`, `bash -c`, a service, continuous integration
 (`CI`), and coding agents (`CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`,

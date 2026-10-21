@@ -483,11 +483,14 @@ fn check_offers_what_it_found_and_snooze_puts_it_off() {
     let exit = update::check(&env, &[], false, &git(home.path()), &mut out).expect("check");
     assert_eq!(exit, Exit::Pending);
     let offered = std::fs::read_to_string(stamps.available()).expect("offered");
+    let (generation, lines) = offered.split_once('\n').expect("a generation line");
     assert!(
-        offered.starts_with(&format!("~/{AT}: 1 new commit(s)")),
+        lines.starts_with(&format!("~/{AT}: 1 new commit(s)")),
         "{offered}"
     );
-    assert_eq!(text(&out), offered, "what it says is what it offers");
+    assert_eq!(text(&out), lines, "what it says is what it offers");
+    let lines: Vec<String> = lines.lines().map(str::to_string).collect();
+    assert_eq!(generation, format!("gen {}", update::generation(&lines)));
     assert!(!home.child(".claude/skills/b").exists(), "nothing applied");
 
     let mut quiet = Vec::new();
@@ -538,6 +541,62 @@ fn a_background_check_looks_at_auto_externals_only_and_never_twice_at_once() {
     assert!(
         due <= update::now() + 24 * 60 * 60,
         "its own interval: {due}"
+    );
+}
+
+/// Whether a shell's prompt would offer what `stamps` hold now.
+fn offers(stamps: &Stamps) -> bool {
+    Stamps::offers(
+        std::fs::read(stamps.available()).ok().as_deref(),
+        std::fs::read(stamps.answered()).ok().as_deref(),
+    )
+}
+
+#[test]
+fn an_answered_offer_found_again_is_not_offered_and_a_new_one_is() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(
+        &home,
+        &layer().replace(
+            "branch = \"master\"\n",
+            "branch = \"master\"\ncheck = \"auto\"\n",
+        ),
+    );
+    update(&home, true, &mut Vec::new()).expect("update");
+    publish(&home, &["skills/b/SKILL.md"]);
+    let env = env(home.path());
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    let background =
+        || update::check(&env, &[], true, &git(home.path()), &mut Vec::new()).expect("background");
+
+    assert_eq!(background(), Exit::Pending);
+    assert!(offers(&stamps));
+    let offered = std::fs::read_to_string(stamps.available()).expect("offered");
+    // As the shell answered writes it, before its `bx update --snooze` has
+    // started, let alone taken the lock.
+    let generation = offered.lines().next().expect("a line").strip_prefix("gen ");
+    std::fs::write(stamps.answered(), format!("{}\n", generation.expect("gen"))).expect("answered");
+    assert!(!offers(&stamps), "answered in some shell");
+
+    // A check that was already running finds the same commits again.
+    assert_eq!(background(), Exit::Pending);
+    assert_eq!(
+        std::fs::read_to_string(stamps.available()).expect("offered"),
+        offered,
+        "the same bytes"
+    );
+    assert!(!offers(&stamps), "the answer stands");
+
+    publish(&home, &["skills/c/SKILL.md"]);
+    assert_eq!(background(), Exit::Pending);
+    assert!(offers(&stamps), "new commits are a new offer");
+
+    update::snooze(&env, &mut Vec::new()).expect("snooze");
+    assert!(!stamps.available().exists());
+    assert!(
+        !stamps.answered().exists(),
+        "next interval, the same commits are offered again"
     );
 }
 

@@ -1457,6 +1457,72 @@ fn a_sync_that_brings_in_another_lock_withdraws_the_offer_and_checks_again() {
 }
 
 #[test]
+fn an_apply_of_another_lock_declined_or_unconfirmed_keeps_the_offer() {
+    let home = guarded_home();
+    let (repo, second) = pushed_and_moved(&home);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    background(&home);
+    let offered = std::fs::read(stamps.available()).expect("offered");
+    let due = std::fs::read(stamps.check_due()).expect("check-due");
+    locked_elsewhere(&home, &second);
+    run(home.path(), &repo, &["pull", "--quiet", "--ff-only"]);
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let kept = |why: &str| {
+        assert_eq!(
+            std::fs::read(stamps.available()).expect("still offered"),
+            offered,
+            "{why}"
+        );
+        assert!(stamps.judged().is_file(), "{why}");
+        assert_eq!(
+            std::fs::read(stamps.check_due()).expect("check-due"),
+            due,
+            "{why}"
+        );
+    };
+
+    let exit = apply_with(&tty, false, &mut Vec::new(), &mut || Ok(false)).expect("declined");
+    assert_ne!(exit, Exit::Converged);
+    kept("declined");
+    let exit =
+        apply_with(&tty, false, &mut Vec::new(), &mut || Err(Error::Canceled)).expect("canceled");
+    assert_eq!(exit, Exit::Canceled);
+    kept("canceled");
+    let unconfirmed = apply_with(&env(home.path()), false, &mut Vec::new(), &mut never);
+    assert!(
+        matches!(unconfirmed, Err(Error::NeedsConfirmation)),
+        "{unconfirmed:?}"
+    );
+    kept("unconfirmed");
+
+    apply_with(&tty, false, &mut Vec::new(), &mut || Ok(true)).expect("approved");
+    assert!(!stamps.available().exists(), "approved: withdrawn");
+    assert!(!stamps.judged().exists());
+}
+
+#[test]
+fn a_check_carries_no_line_judged_against_an_older_lock() {
+    let home = guarded_home();
+    let (repo, second) = pushed_and_moved(&home);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    background(&home);
+    assert!(offers(&stamps));
+    // Another machine's lock, pulled by hand and never applied; then a check
+    // that cannot look at the external again.
+    locked_elsewhere(&home, &second);
+    run(home.path(), &repo, &["pull", "--quiet", "--ff-only"]);
+    std::fs::rename(home.child("upstream"), home.child("elsewhere")).expect("unreachable");
+    let (exit, last) = background(&home);
+    assert_eq!(exit, Exit::Converged, "{last}");
+    assert!(last.contains("not checked"), "{last}");
+    assert!(!stamps.available().exists(), "{last}");
+    assert!(!stamps.judged().exists());
+}
+
+#[test]
 fn an_offer_an_older_bx_wrote_without_its_lock_is_left_to_the_next_check() {
     let home = guarded_home();
     let (_, second) = pushed_and_moved(&home);

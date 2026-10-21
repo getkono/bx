@@ -78,9 +78,10 @@
 //! is judged against this machine's `bx.lock`, and `last-check` says why.
 //!
 //! An offer is only true of the `bx.lock` it was judged against, so `judged`
-//! records which one that was, and `bx apply` and `bx sync` withdraw the offer
-//! ([`relocked`]) once the `bx.lock` here is another, and make the next prompt
-//! check again.
+//! records which one that was. A `bx apply` or `bx sync` that applies another
+//! `bx.lock` withdraws the offer ([`relocked`]) and makes the next prompt check
+//! again; one that is declined leaves it standing. A check carries forward no
+//! line an earlier check judged against another `bx.lock`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1186,10 +1187,18 @@ fn looked(
     };
     let found = look_all(git, bound, &env.home, &chosen, lock, &ledger);
 
-    let available = offered(
-        &std::fs::read_to_string(stamps.available()).unwrap_or_default(),
-        &found,
-    );
+    // What an earlier check offered is carried only while it was judged
+    // against the bx.lock here: lines judged against another — a `git pull`
+    // brought one in without an apply — would outlive the lock that made
+    // them true, and `judged`, rewritten below, would no longer say so.
+    let judged_here = std::fs::read_to_string(stamps.judged())
+        .is_ok_and(|judged| judged.trim() == fingerprint(inputs.lock()));
+    let previous = if judged_here {
+        std::fs::read_to_string(stamps.available()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let available = offered(&previous, &found);
     let summaries: String = found.iter().map(|f| format!("{}\n", f.summary())).collect();
     if background {
         stamps.set(now, None, None, Some(&available))?;
@@ -1404,7 +1413,8 @@ pub fn fingerprint(lock: &Lock) -> String {
     generation(&[lock.render()])
 }
 
-/// Before `bx apply` or `bx sync` applies `inputs`: when what `available`
+/// Once `bx apply` or `bx sync` has applied `inputs` — approved, or with
+/// nothing to apply — never when declined: when what `available`
 /// offers was judged against another `bx.lock` than the one now here — a
 /// sync or a `git pull` brought in another machine's — the offer is
 /// withdrawn, every shell waiting on it is woken to see so, and `check-due`

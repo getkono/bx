@@ -64,6 +64,150 @@ fn locked(home: &GuardedHome) -> Option<String> {
     lock.iter().next().map(|(_, locked)| locked.rev.clone())
 }
 
+/// `bx update` on a machine whose push is refused, so the lock commit it
+/// makes stays on this machine's branch alone.
+fn update_unpushed(home: &GuardedHome) {
+    let hook = home.child(".config/bx/.git/hooks/pre-push");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("a hook");
+    crate::fs::set_mode(&hook, crate::fs::Mode::from_bits(0o755)).expect("executable");
+    let mut out = Vec::new();
+    update(home, true, &mut out).expect("a local lock commit");
+    assert!(text(&out).contains("was refused"), "{}", text(&out));
+    std::fs::remove_file(&hook).expect("the hook");
+}
+
+/// Commits only on the config repo's branch, and only on its upstream, as
+/// git last saw the upstream.
+fn ahead_behind(home: &GuardedHome, repo: &std::path::Path) -> String {
+    run(
+        home.path(),
+        repo,
+        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+    )
+}
+
+/// The upstream still at `pushed`, and nothing said about a push.
+fn assert_nowhere_pushed(home: &GuardedHome, pushed: &str, out: &[u8]) {
+    assert_eq!(
+        rev(home.path(), &home.child("remote.git"), "master"),
+        pushed
+    );
+    assert!(!text(out).contains("Pushed"), "{}", text(out));
+}
+
+#[test]
+fn update_pushes_its_lock_commit_to_the_upstream() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let repo = cloned(&home, &layer());
+
+    let mut out = Vec::new();
+    let exit = update(&home, true, &mut out).expect("update");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert!(
+        text(&out).ends_with("Pushed 1 commit(s) to origin/master.\n"),
+        "{}",
+        text(&out)
+    );
+    run(home.path(), &repo, &["fetch", "--quiet"]);
+    assert_eq!(ahead_behind(&home, &repo), "0\t0");
+    assert_eq!(
+        rev(home.path(), &home.child("remote.git"), "master"),
+        rev(home.path(), &repo, "HEAD"),
+        "the lock commit is the upstream's"
+    );
+
+    let mut again = Vec::new();
+    update(&home, true, &mut again).expect("a second update");
+    assert!(
+        !text(&again).contains("Pushed"),
+        "nothing left to push: {}",
+        text(&again)
+    );
+}
+
+#[test]
+fn a_push_refused_because_the_upstream_moved_keeps_the_lock_and_names_bx_sync() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let repo = cloned(&home, &layer());
+    // Another machine's commit, pushed aside; the hook moves the upstream to
+    // it once the lock is committed, after the pull.
+    let other = crate::sync::tests::other(&home);
+    std::fs::write(other.join("notes"), "x\n").expect("a note");
+    commit_all(home.path(), &other, "elsewhere");
+    run(
+        home.path(),
+        &other,
+        &["push", "--quiet", "origin", "HEAD:side"],
+    );
+    let hook = repo.join(".git/hooks/post-commit");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nunset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE\nexec git --git-dir='{}' \
+             update-ref refs/heads/master refs/heads/side\n",
+            home.child("remote.git").display()
+        ),
+    )
+    .expect("a hook");
+    crate::fs::set_mode(&hook, crate::fs::Mode::from_bits(0o755)).expect("executable");
+
+    let mut out = Vec::new();
+    let exit = update(&home, true, &mut out).expect("refused, and still an update");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    let said = text(&out);
+    assert!(
+        said.contains("Pushed nothing: the push to origin/master was refused")
+            && said.contains("`bx sync` pushes it"),
+        "{said}"
+    );
+    assert_eq!(
+        run(home.path(), &repo, &["log", "-1", "--format=%s"]),
+        "chore(bx): update bx.lock",
+        "the lock commit is kept"
+    );
+    assert!(home.child(".claude/skills/a/SKILL.md").is_file(), "applied");
+
+    std::fs::remove_file(&hook).expect("the hook");
+    let mut again = Vec::new();
+    update(&home, true, &mut again).expect("replayed and pushed");
+    assert!(
+        text(&again).starts_with("Replayed 1 unpushed bx.lock commit(s)")
+            && text(&again).ends_with("Pushed 1 commit(s) to origin/master.\n"),
+        "{}",
+        text(&again)
+    );
+    assert_eq!(ahead_behind(&home, &repo), "0\t0");
+}
+
+#[test]
+fn a_lock_whose_apply_leaves_a_conflict_is_committed_and_not_pushed() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let repo = cloned(&home, &layer());
+    let pushed = rev(home.path(), &home.child("remote.git"), "master");
+    // A file of the user's where the link would go.
+    std::fs::create_dir_all(home.child(".claude/skills")).expect("a dir");
+    std::fs::write(home.child(".claude/skills/a"), "mine\n").expect("a file");
+
+    let mut out = Vec::new();
+    update(&home, true, &mut out).expect("update");
+    assert!(
+        text(&out).contains("Pushed nothing: 1 commit(s) wait for an apply"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        run(home.path(), &repo, &["log", "-1", "--format=%s"]),
+        "chore(bx): update bx.lock"
+    );
+    assert_eq!(
+        rev(home.path(), &home.child("remote.git"), "master"),
+        pushed
+    );
+}
+
 #[test]
 fn update_locks_commits_and_applies_then_finds_nothing_new() {
     let home = guarded_home();
@@ -777,6 +921,7 @@ fn a_config_repo_with_no_upstream_is_locked_as_it_stands() {
         &repo,
         &["branch", "--quiet", "--unset-upstream"],
     );
+    let pushed = rev(home.path(), &home.child("remote.git"), "master");
     let mut out = Vec::new();
     let exit = update(&home, true, &mut out).expect("update");
     assert_eq!(exit, Exit::Converged, "{}", text(&out));
@@ -789,6 +934,7 @@ fn a_config_repo_with_no_upstream_is_locked_as_it_stands() {
         run(home.path(), &repo, &["log", "-1", "--format=%s"]),
         "chore(bx): update bx.lock"
     );
+    assert_nowhere_pushed(&home, &pushed, &out);
 }
 
 #[test]
@@ -801,6 +947,7 @@ fn a_config_repo_whose_upstream_is_gone_is_locked_as_it_stands() {
         &repo,
         &["config", "branch.master.merge", "refs/heads/gone"],
     );
+    let pushed = rev(home.path(), &home.child("remote.git"), "master");
     let mut out = Vec::new();
     let exit = update(&home, true, &mut out).expect("update");
     assert_eq!(exit, Exit::Converged, "{}", text(&out));
@@ -813,6 +960,7 @@ fn a_config_repo_whose_upstream_is_gone_is_locked_as_it_stands() {
         run(home.path(), &repo, &["log", "-1", "--format=%s"]),
         "chore(bx): update bx.lock"
     );
+    assert_nowhere_pushed(&home, &pushed, &out);
 }
 
 #[test]
@@ -825,7 +973,7 @@ fn a_branch_diverged_only_by_unpushed_lock_commits_catches_up_and_locks_again() 
     // This machine locks a new commit and never pushes it; another
     // machine pushes a change of its own.
     publish(&home, &["skills/b/SKILL.md"]);
-    update(&home, true, &mut Vec::new()).expect("a local lock commit");
+    update_unpushed(&home);
     let other = crate::sync::tests::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
@@ -857,7 +1005,7 @@ fn diverged(home: &GuardedHome) -> std::path::PathBuf {
     update(home, true, &mut Vec::new()).expect("update");
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(home, &["skills/b/SKILL.md"]);
-    update(home, true, &mut Vec::new()).expect("a local lock commit");
+    update_unpushed(home);
     let other = crate::sync::tests::other(home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
@@ -955,7 +1103,7 @@ fn a_replay_the_upstream_already_holds_says_so() {
     update(&home, true, &mut Vec::new()).expect("update");
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(&home, &["skills/b/SKILL.md"]);
-    update(&home, true, &mut Vec::new()).expect("a local lock commit");
+    update_unpushed(&home);
     // Another machine locked the very same commit and pushed it.
     let other = crate::sync::tests::other(&home);
     std::fs::copy(repo.join("bx.lock"), other.join("bx.lock")).expect("bx.lock");
@@ -1031,7 +1179,7 @@ fn lock_commits_both_machines_made_are_left_for_a_person() {
     update(&home, true, &mut Vec::new()).expect("update");
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(&home, &["skills/b/SKILL.md"]);
-    update(&home, true, &mut Vec::new()).expect("a local lock commit");
+    update_unpushed(&home);
     // The other machine locked a commit of its own on the same line.
     let other = crate::sync::tests::other(&home);
     let theirs = std::fs::read_to_string(other.join("bx.lock"))
@@ -1878,7 +2026,7 @@ fn an_update_both_machines_locked_answers_the_offer_and_says_why() {
     update(&home, true, &mut Vec::new()).expect("update");
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(&home, &["skills/b/SKILL.md"]);
-    update(&home, true, &mut Vec::new()).expect("a local lock commit");
+    update_unpushed(&home);
     let other = crate::sync::tests::other(&home);
     let theirs = std::fs::read_to_string(other.join("bx.lock"))
         .expect("bx.lock")

@@ -761,9 +761,19 @@ fn record_rev(op: &Op, ledger: &mut Ledger) -> Result<(), state::Error> {
 /// kind of directory bx fetches into, or reads an external's children from.
 #[must_use]
 pub(crate) fn finished_clone(ledger: &LedgerView, path: &Portable) -> bool {
-    ledger.get(path).is_some_and(|entry| {
-        entry.mechanism == Mechanism::Clone && entry.written != clone_written(None)
-    })
+    finished_clone_entry(ledger, path).is_some()
+}
+
+/// The ledger's entry for `path` when it records a clone bx made and
+/// finished, as [`finished_clone`] judges it; `None` otherwise.
+#[must_use]
+pub(crate) fn finished_clone_entry<'a>(
+    ledger: &'a LedgerView,
+    path: &Portable,
+) -> Option<&'a LedgerEntry> {
+    ledger
+        .get(path)
+        .filter(|entry| entry.mechanism == Mechanism::Clone && entry.written != clone_written(None))
 }
 
 /// Whether the ledger records `path` as a clone of bx's, finished or not: a

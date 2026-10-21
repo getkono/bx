@@ -26,8 +26,8 @@ fn doctor_names_a_modified_file_and_an_unpushed_commit_and_is_pending() {
     assert_eq!(exit, Exit::Pending);
     assert_eq!(
         text(&out),
-        "  ! ~/.config/bx has 1 uncommitted change(s) or untracked file(s), which `bx sync` \
-         neither commits nor publishes; `git -C ~/.config/bx status` shows them\n\
+        "  ! ~/.config/bx has 1 uncommitted change(s) or untracked file(s), which only this \
+         machine holds; `git -C ~/.config/bx status` shows them\n\
          \x20 ! ~/.config/bx is on master, with 1 commit(s) origin/master lacks as of the clone \
          or the last push, since nothing has fetched here, none of them a `bx update` lock \
          commit; `bx sync` pushes them\n\

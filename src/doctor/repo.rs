@@ -35,7 +35,7 @@ use crate::config::external::External;
 use crate::git::checkout::{own_checkout, problem};
 use crate::git::{self, Git};
 use crate::paths;
-use crate::plan::external::{finished_clone, kept_by_rm};
+use crate::plan::external::{finished_clone_entry, kept_by_rm};
 use crate::state::LedgerView;
 use crate::sync;
 use crate::update::SUBJECT;
@@ -88,8 +88,8 @@ fn config_repo(repo: &Path, home: &Path, git: &Git) -> Vec<Finding> {
     match git.query(repo, &["status", "--porcelain", "--untracked-files=all"]) {
         Ok(status) if status.is_empty() => {}
         Ok(status) => findings.push(finding(format!(
-            "has {} uncommitted change(s) or untracked file(s), which `bx sync` neither \
-             commits nor publishes; `git -C {at} status` shows them",
+            "has {} uncommitted change(s) or untracked file(s), which only this machine \
+             holds; `git -C {at} status` shows them",
             status.lines().count()
         ))),
         Err(error) => findings.push(finding(problem(&error))),
@@ -252,10 +252,7 @@ fn followed(externals: &[External], ledger: &LedgerView, home: &Path, git: &Git)
         let Some(follow) = external.follows() else {
             continue;
         };
-        if !finished_clone(ledger, &external.path) {
-            continue;
-        }
-        let Some(entry) = ledger.get(&external.path) else {
+        let Some(entry) = finished_clone_entry(ledger, &external.path) else {
             continue;
         };
         let dest = external.path.render(home);
@@ -379,8 +376,8 @@ mod tests {
         assert_eq!(
             notes(&home),
             [
-                "~/.config/bx has 2 uncommitted change(s) or untracked file(s), which `bx sync` \
-              neither commits nor publishes; `git -C ~/.config/bx status` shows them"
+                "~/.config/bx has 2 uncommitted change(s) or untracked file(s), which only this \
+              machine holds; `git -C ~/.config/bx status` shows them"
             ]
         );
     }
@@ -644,6 +641,95 @@ mod tests {
               would lose; `git -C ~/ext status` shows what is only here"
             ]
         );
+    }
+
+    #[test]
+    fn a_finished_clone_whose_directory_is_gone_is_not_looked_into() {
+        let home = guarded_home();
+        cloned(&home, "");
+        let (external, dest) = followed_clone(&home);
+        std::fs::remove_dir_all(&dest).unwrap();
+        // A git that cannot be started proves the checkout was not asked about.
+        let state = StateDir::resolve(home.path());
+        let ledger = LedgerView::read(&state, home.path())
+            .expect("the ledger")
+            .value;
+        let git = test_git(home.path()).with_program(home.child("no-such-git"));
+
+        assert_eq!(
+            followed(&[external], &ledger, home.path(), &git),
+            Vec::new()
+        );
+    }
+
+    /// The notes doctor finds in `home`'s config repo through a git that runs
+    /// `body`, a shell script, before it runs the real git. Git is started as
+    /// `git -C REPO ARGS`, so `$3` is the subcommand.
+    fn notes_through(home: &GuardedHome, body: &str) -> Vec<String> {
+        let wrapper = home.child("bin/git");
+        std::fs::create_dir_all(wrapper.parent().expect("a parent")).expect("bin");
+        std::fs::write(&wrapper, format!("#!/bin/sh\n{body}\nexec git \"$@\"\n"))
+            .expect("the wrapper");
+        std::fs::set_permissions(
+            &wrapper,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("executable");
+        let state = StateDir::resolve(home.path());
+        let ledger = LedgerView::read(&state, home.path())
+            .expect("the ledger")
+            .value;
+        let git = test_git(home.path()).with_program(&wrapper);
+        check(&home.child(".config/bx"), &[], &ledger, home.path(), &git)
+            .into_iter()
+            .map(|finding| format!("{} {}", finding.subject, finding.note))
+            .collect()
+    }
+
+    #[test]
+    fn a_git_that_stops_starting_at_the_branch_question_is_a_finding() {
+        let home = guarded_home();
+        cloned(&home, "");
+        // git answers `status`, then removes itself, so the next question,
+        // which branch is checked out, cannot start it.
+        let found = notes_through(
+            &home,
+            "if [ \"$3\" = status ]; then git \"$@\"; s=$?; rm -f \"$0\"; exit $s; fi",
+        );
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("~/.config/bx git could not be started"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_git_that_fails_a_question_about_the_upstream_is_a_finding() {
+        let home = guarded_home();
+        cloned(&home, "");
+        for (question, quoted) in [
+            ("for-each-ref", "`git for-each-ref"),
+            (
+                "rev-list",
+                "`git rev-list --left-right --count HEAD...@{upstream}`",
+            ),
+        ] {
+            let found = notes_through(
+                &home,
+                &format!("[ \"$3\" = {question} ] && {{ echo refused >&2; exit 1; }}"),
+            );
+
+            assert_eq!(found.len(), 1, "{question}: {found:?}");
+            assert!(
+                found[0].starts_with(&format!("~/.config/bx {quoted}")),
+                "{question}: {found:?}"
+            );
+            assert!(
+                found[0].ends_with("failed: refused"),
+                "{question}: {found:?}"
+            );
+        }
     }
 
     #[test]

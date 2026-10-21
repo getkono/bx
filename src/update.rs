@@ -104,8 +104,9 @@ use crate::sync;
 /// a slow load leaves the remotes less time rather than the check more.
 pub const BACKGROUND_BOUND: Duration = Duration::from_secs(30);
 
-// A check still running when a snooze gives up waiting would write its offer
-// back over the snooze; the snooze waits longer than any check may take.
+// A snooze that gives up waiting writes nothing, so a check still running
+// would leave its offer standing; the snooze waits longer than any check may
+// take, so it only gives up on a person's `bx update` or a `bx sync`.
 const _: () = assert!(BACKGROUND_BOUND.as_secs() < SNOOZE_WAIT.as_secs());
 
 /// How long a foreground `bx update` waits on one remote.
@@ -159,10 +160,10 @@ pub enum Error {
         .0.display()
     )]
     Rebasing(PathBuf),
-    /// Another `bx update` holds `update/check.lock`.
+    /// Another `bx update`, `bx sync` or check holds `update/check.lock`.
     #[error(
-        "another bx update is running, in this shell or another; let it finish, then run \
-         bx update again"
+        "another bx update or bx sync is running, in this shell or another; let it finish, \
+         then run bx update again"
     )]
     Busy,
     /// `bx.lock`, or a file under the state directory, could not be written.
@@ -1471,7 +1472,15 @@ pub fn snooze(
 }
 
 /// [`snooze`], waiting at most `wait` for a running check to let go, and
-/// carrying on without the lock once that wait runs out.
+/// giving up quietly once that wait runs out: it writes no stamp without the
+/// lock.
+///
+/// Giving up loses no answer. The shell that answered wrote `answered`
+/// before it started this, so no shell asks the same offer or question again
+/// while it stands; a person's `bx update` holding the lock through its
+/// question settles the stamps itself, and a `bx sync` holding it leaves them,
+/// `answered` with them, as they are, but for an offer it withdraws
+/// ([`relocked`]).
 pub(crate) fn snooze_waiting(
     env: &crate::env::Env,
     wait: Duration,
@@ -1480,10 +1489,16 @@ pub(crate) fn snooze_waiting(
     let inputs = crate::plan::Inputs::load(env)?;
     // A check another shell is running would write its offer back after
     // this clears it; a snooze waits it out, as it runs detached anyway.
-    // A person's `bx update` can hold it through its question for as long as
-    // they take; the answer given here is snoozed all the same, and the
-    // latest write stands.
-    let _held = Stamps::of(inputs.state()).hold(wait)?;
+    let Some(_held) = Stamps::of(inputs.state()).hold(wait)? else {
+        tracing::debug!("another bx update or bx sync holds the stamps; nothing snoozed");
+        writeln!(
+            out,
+            "Another bx update or bx sync holds the update stamps; nothing was snoozed, and \
+             the answer already given stands."
+        )
+        .map_err(Error::Output)?;
+        return Ok(crate::report::Exit::Converged);
+    };
     let interval = inputs.resolved().update.interval();
     let externals = &inputs.resolved().externals;
     let (ask, auto) = (

@@ -507,3 +507,86 @@ fn copies_an_interrupted_sync_wrote_and_never_committed_are_committed_first() {
         "b"
     );
 }
+
+#[test]
+fn a_sync_while_an_update_holds_the_lock_is_busy_and_touches_nothing() {
+    let home = guarded_home();
+    let repo = cloned(&home, "");
+    let head = rev(home.path(), &repo, "HEAD");
+    let theirs = publish_elsewhere(&home, &inline("~/.a", "a\\n"));
+    let env = env(home.path());
+    let stamps = update::Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    let held = stamps.try_hold().expect("hold").expect("free");
+
+    let mut out = Vec::new();
+    let error = sync_with(&env, true, &mut out, &git(home.path()), &mut never).expect_err("busy");
+
+    assert!(matches!(error, sync::Error::Busy), "{error:?}");
+    assert!(error.to_string().contains("run bx sync again"), "{error}");
+    assert!(out.is_empty(), "{}", text(&out));
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing pulled");
+    assert!(!home.child(".a").exists(), "nothing applied");
+    assert_eq!(
+        rev(home.path(), &home.child("remote.git"), "master"),
+        theirs,
+        "nothing pushed"
+    );
+
+    drop(held);
+    let exit =
+        sync_with(&env, true, &mut Vec::new(), &git(home.path()), &mut never).expect("once let go");
+    assert_eq!(exit, Exit::Converged);
+    assert_eq!(rev(home.path(), &repo, "HEAD"), theirs);
+}
+
+#[test]
+fn a_sync_that_cannot_open_the_lock_says_so_and_pulls_nothing() {
+    let home = guarded_home();
+    let repo = cloned(&home, "");
+    let head = rev(home.path(), &repo, "HEAD");
+    publish_elsewhere(&home, &inline("~/.a", "a\\n"));
+    let path = crate::state::StateDir::resolve(home.path())
+        .update()
+        .join("check.lock");
+    std::fs::create_dir_all(&path).expect("a directory where check.lock goes");
+
+    let error = sync_with(
+        &env(home.path()),
+        true,
+        &mut Vec::new(),
+        &git(home.path()),
+        &mut never,
+    )
+    .expect_err("no lock");
+
+    assert!(matches!(error, sync::Error::Lock(_)), "{error:?}");
+    assert!(error.to_string().starts_with("opening "), "{error}");
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing pulled");
+}
+
+#[test]
+fn a_sync_holds_the_lock_through_its_apply_so_an_update_is_busy_meanwhile() {
+    let home = guarded_home();
+    let repo = cloned(&home, "");
+    std::fs::write(repo.join("bx.toml"), inline("~/.a", "a\\n")).expect("bx.toml");
+    commit_all(home.path(), &repo, "mine");
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let stamps = update::Stamps::of(&crate::state::StateDir::resolve(home.path()));
+
+    let mut free_while_asked = None;
+    let exit = sync_with(&tty, false, &mut Vec::new(), &git(home.path()), &mut || {
+        free_while_asked = Some(stamps.try_hold().expect("try").is_some());
+        Ok(true)
+    })
+    .expect("sync");
+
+    assert_eq!(exit, Exit::Converged);
+    assert_eq!(free_while_asked, Some(false), "held while it asks");
+    assert!(
+        stamps.try_hold().expect("try").is_some(),
+        "let go once it ends"
+    );
+}

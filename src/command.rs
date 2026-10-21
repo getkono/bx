@@ -278,6 +278,11 @@ fn converge_inputs(
 /// `bx sync`: fast-forward the config repo from its upstream, apply exactly as
 /// `bx apply` does, and push what this machine committed.
 ///
+/// It holds `update/check.lock` throughout, as `bx update` does, so the two
+/// never write the config repo at once: while another holds it, it waits
+/// [`update::HOLD_WAIT`] and then stops with [`sync::Error::Busy`], before
+/// it has pulled anything.
+///
 /// [`sync::pull`] runs first and refuses a diverged branch, a missing
 /// upstream, and a push that would carry a state file, all before the apply
 /// changes anything. It is not free of writes itself: before the fetch it
@@ -299,7 +304,9 @@ fn converge_inputs(
 ///
 /// Whatever [`sync::pull`] and [`sync::push`] return, and as [`apply`]; and
 /// whatever [`sync::commit_carried`] returns after the apply, which leaves
-/// what the apply wrote on disk and uncommitted for the next `sync` to commit.
+/// what the apply wrote on disk and uncommitted for the next `sync` to commit;
+/// [`sync::Error::Busy`] while another sync, update or check holds
+/// `update/check.lock`, and [`sync::Error::Lock`] when it cannot be taken.
 pub fn sync(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, sync::Error> {
     sync_with(env, yes, out, &Git::new(env), &mut confirm)
 }
@@ -320,6 +327,13 @@ fn sync_with(
     git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, sync::Error> {
+    // Held to the end, so no `bx update` in another shell commits or pushes
+    // between this pull and this push, and this never runs inside its own.
+    let state = crate::state::StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
+    let _held = update::Stamps::of(&state)
+        .hold(update::HOLD_WAIT)
+        .map_err(|error| sync::Error::Lock(Box::new(error)))?
+        .ok_or(sync::Error::Busy)?;
     let pulled = sync::pull(env, git)?;
     if pulled.fast_forwarded > 0 {
         writeln!(out, "{}", fast_forwarded(&pulled)).map_err(sync::Error::Output)?;
@@ -450,7 +464,8 @@ impl UpdateMode {
 /// as [`apply`]; besides those, for [`UpdateMode::Update`]:
 /// [`Error::NeedsConfirmation`] without `yes` and a terminal,
 /// [`Error::RepoMissing`] with no config repo, [`update::Error::Busy`] while
-/// another `bx update` or check holds the stamps, [`update::Error::Rebasing`]
+/// another `bx update`, `bx sync` or check holds the stamps,
+/// [`update::Error::Rebasing`]
 /// while a rebase or `git am` stands open in the config repo, and
 /// [`update::Error::LockDiverged`] when this machine's unpushed lock commits
 /// and the upstream both changed `bx.lock`.

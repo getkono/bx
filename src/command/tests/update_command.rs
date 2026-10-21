@@ -1148,7 +1148,7 @@ fn a_move_nothing_here_can_check_exits_pending() {
 }
 
 #[test]
-fn a_snooze_while_a_check_holds_on_still_puts_the_question_off() {
+fn a_snooze_that_cannot_take_the_lock_writes_no_stamp_and_the_answer_stands() {
     let home = guarded_home();
     upstream(&home, &["skills/a/SKILL.md"]);
     cloned(&home, &layer());
@@ -1156,19 +1156,35 @@ fn a_snooze_while_a_check_holds_on_still_puts_the_question_off() {
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     std::fs::write(stamps.ask_due(), "1\n").expect("due");
     stamps
-        .write(&stamps.available(), "~/x: y\n")
+        .write(&stamps.available(), "gen 8323ea2e82044071\n~/x: y\n")
         .expect("offered");
-    // Held throughout, past the snooze's wait: it gives up waiting
-    // and writes anyway.
+    // As the shell answered writes it, before it starts the snooze.
+    std::fs::write(stamps.answered(), "8323ea2e82044071\nask 1\n").expect("answered");
+    let before: Vec<_> = [stamps.ask_due(), stamps.available(), stamps.answered()]
+        .iter()
+        .map(|path| std::fs::read(path).expect("a stamp"))
+        .collect();
+    // Held throughout, past the snooze's wait, as a person's `bx update` or a
+    // `bx sync` holds it: the snooze gives up and writes nothing.
     let _held = stamps.try_hold().expect("hold").expect("free");
-    update::snooze_waiting(
+    let mut out = Vec::new();
+    let exit = update::snooze_waiting(
         &env(home.path()),
         std::time::Duration::from_millis(50),
-        &mut Vec::new(),
+        &mut out,
     )
-    .expect("snoozed");
-    assert!(Stamps::read(&stamps.ask_due()).expect("ask-due") > 1);
-    assert!(!stamps.available().exists());
+    .expect("gave up quietly");
+    assert_eq!(exit, Exit::Converged);
+    assert!(text(&out).contains("nothing was snoozed"), "{}", text(&out));
+    let after: Vec<_> = [stamps.ask_due(), stamps.available(), stamps.answered()]
+        .iter()
+        .map(|path| std::fs::read(path).expect("a stamp"))
+        .collect();
+    assert_eq!(after, before, "no stamp written without the lock");
+    assert!(
+        !offers(&stamps),
+        "a new shell is still not asked: `answered` stands"
+    );
 }
 
 #[test]

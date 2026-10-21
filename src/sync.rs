@@ -27,6 +27,14 @@
 //! never merges, rebases, resets or force-pushes: a diverged history is a
 //! human's to reconcile, and `sync` is run again once they have.
 //!
+//! # One writer at a time
+//!
+//! `bx sync` and `bx update` both pull, commit to and push the config repo,
+//! so `bx sync` holds `update/check.lock` ([`crate::update::Stamps::hold`]),
+//! as `bx update` does, from before its pull to after its push. While another
+//! sync, update or check holds it, sync waits [`crate::update::HOLD_WAIT`]
+//! and then stops with [`Error::Busy`], having changed nothing.
+//!
 //! # Tracked targets are committed here, and only here
 //!
 //! A `direction = "track"` target's copy on this machine leads, and the apply
@@ -170,6 +178,17 @@ pub enum Error {
         /// Each offending path, as git names it in the repo.
         paths: Vec<String>,
     },
+    /// Another `bx sync`, `bx update` or check holds `update/check.lock`.
+    #[error(
+        "another bx sync or bx update is running, in this shell or another; nothing was \
+         pulled, applied or pushed. Let it finish, then run bx sync again"
+    )]
+    Busy,
+    /// `update/check.lock` could not be taken: its directory could not be
+    /// made, or the file opened or locked. Boxed, as [`crate::update::Error`]
+    /// holds this one.
+    #[error(transparent)]
+    Lock(Box<crate::update::Error>),
     /// Git answered in a shape bx does not understand.
     #[error("`git {args}` answered {answer:?}, which bx does not understand")]
     Unexpected {

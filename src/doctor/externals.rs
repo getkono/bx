@@ -15,7 +15,9 @@
 //! * an update stamp that holds no time, so an interactive shell never asks
 //!   about updates until `bx update` writes it again;
 //! * a `last-check` line saying `bx update` stopped — it failed, or the config
-//!   repo refused it — which stands until a `bx update` finishes. What else
+//!   repo refused it — which stands until a `bx update` finishes and removes
+//!   `last-check`, or a background check overwrites it with what it found.
+//!   What else
 //!   `last-check` holds — what a check found, or that `bx update` was
 //!   declined or canceled — is no finding: doctor has no severity, and a
 //!   finding would leave every machine whose shell checked `Pending`.

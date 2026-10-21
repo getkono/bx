@@ -61,9 +61,13 @@ fn format_version(
 /// `epoch` seconds as a UTC `YYYY-MM-DDTHH:MM:SSZ`, or `unknown` when it is not
 /// a count of seconds.
 fn built(epoch: &str) -> String {
-    let Ok(seconds) = epoch.parse::<u64>() else {
-        return "unknown".to_string();
-    };
+    epoch
+        .parse::<u64>()
+        .map_or_else(|_| "unknown".to_string(), utc)
+}
+
+/// `seconds` after the Unix epoch as a UTC `YYYY-MM-DDTHH:MM:SSZ`.
+pub(crate) fn utc(seconds: u64) -> String {
     let (year, month, day) = civil_from_days(seconds / 86_400);
     let of_day = seconds % 86_400;
     format!(

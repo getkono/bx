@@ -2,7 +2,8 @@
 //! stamps.
 //!
 //! Four things, read from files and nothing else — no remote is asked, and
-//! no checkout is looked into:
+//! no checkout is looked into ([`super::repo`] looks into the followed
+//! ones):
 //!
 //! * a followed external `bx.lock` holds no commit for, or holds one for
 //!   another url or branch than the one declared: `apply` leaves it as it is

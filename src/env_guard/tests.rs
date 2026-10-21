@@ -2035,17 +2035,20 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
     assert!(!hook.contains("declare"), "nor declares a global");
     // The one `eval` puts back the SIGURG trap the shell had: its text is
     // what `trap -p URG` printed into the shell's waiting file, read back
-    // past the generation line before the hook's own trap is set.
+    // past the generation line before the hook's own trap is set. Where that
+    // file cannot be written, neither trap is touched.
     assert_eq!(
         hook.matches("eval").count(),
         1,
         "one eval, putting the trap back"
     );
     for piece in [
-        "{ printf '%s\\n' \"$gen\"; trap -p URG; } 2>/dev/null >| \"$dir/waiting/$$\"\n",
-        "    read -r saved\n    read -r -d '' saved\n  } 2>/dev/null < \"$dir/waiting/$$\"\n  \
-         trap 'woken=1' URG\n",
-        "  trap - URG\n  [[ -n $saved ]] && eval \"$saved\"\n",
+        "  if { printf '%s\\n' \"$gen\"; trap -p URG; } 2>/dev/null >| \"$dir/waiting/$$\"; then\n    \
+         waits=1\n",
+        "      read -r saved\n      read -r -d '' saved\n    } 2>/dev/null < \"$dir/waiting/$$\"\n    \
+         trap 'woken=1' URG\n  fi\n",
+        "  if [[ -n $waits ]]; then\n    : 2>/dev/null >| \"$dir/waiting/$$\"\n    trap - URG\n    \
+         [[ -n $saved ]] && eval \"$saved\"\n  fi\n",
     ] {
         assert!(hook.contains(piece), "{piece}");
     }

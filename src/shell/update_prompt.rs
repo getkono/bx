@@ -37,28 +37,40 @@
 //!   `bx update` or `bx update --snooze` the answer started still runs. The
 //!   question whether to check is named `ask` and its `ask-due` the same way.
 //!   An offer's answer names the `ask-due` it was given under on a second
-//!   line, so the question due with it is settled too.
+//!   line, so the question due with it is settled too. An `available` an
+//!   older bx wrote has no `gen` line; its generation is `old:` and its first
+//!   line, so it too is asked once per shell and settled by one answer.
 //! - **Answered before anything starts.** The shell answered writes
 //!   `answered` with one redirect, then sends `SIGURG` with the `kill` builtin
 //!   to every other shell waiting under `waiting/`, then starts `bx update`
 //!   or the snooze.
 //! - **Waiting without polling.** A shell asking writes `waiting/$$`, traps
 //!   `SIGURG`, checks once more that nothing settled what it asks, and only
-//!   then reads, so no wake-up is lost between the check and the read. The
-//!   signal ends the read at once: zsh's `read` returns for any trapped
-//!   signal, and bash's does in POSIX mode, which the hook holds only for the
-//!   read. Woken, it reads the stamps again: answered, or withdrawn by a
-//!   `bx update` run by hand, it says `bx: answered in another shell`;
-//!   replaced by a check that found something else, it says so and asks
-//!   about that at the next prompt; otherwise it reads on. Afterwards it
-//!   empties `waiting/$$` and puts back the `URG` trap it found. `SIGURG` is
-//!   ignored by a process that does not trap it, so a waiting file left by a
-//!   shell that is gone harms nothing that later takes its pid, and bx removes
-//!   such files whenever it wakes the shells ([`crate::update::Stamps::wake`]).
+//!   then reads, so an answer given before it registered is not waited out;
+//!   a wake-up that comes during that check sends it back to check again
+//!   rather than to the read. The signal ends the read at once:
+//!   zsh's `read` returns for any trapped signal, and bash's does in POSIX
+//!   mode, which the hook holds only for the read. Woken, it reads the stamps
+//!   again: answered, or withdrawn by a `bx update` run by hand, it says
+//!   `bx: answered in another shell`; replaced by a check that found
+//!   something else, it says so and asks about that at the next prompt;
+//!   otherwise it reads on. Afterwards it empties `waiting/$$` and puts back
+//!   the `URG` trap it found. `SIGURG` is ignored by a process that does not
+//!   trap it, so a waiting file left by a shell that is gone harms nothing
+//!   that later takes its pid, and bx removes such files whenever it wakes
+//!   the shells ([`crate::update::Stamps::wake`]).
+//! - **A wake-up can come late, never wrong.** A shell cannot test its flag
+//!   and start the read as one step, so a wake-up in the instant between
+//!   them does not end the read. A shell that cannot write `waiting/$$` — a
+//!   state directory an older bx left without `waiting/` — is never woken,
+//!   and traps nothing, so the `URG` trap it found stays as it was. Either
+//!   way the shell reads the stamps once more when its read ends, so it says
+//!   it was answered elsewhere, only at its timeout.
 //! - **Bounded.** A read waits at most `BX_UPDATE_PROMPT_TIMEOUT` seconds, 60
 //!   unless that is a positive whole number. One that times out, or meets the
-//!   end of its input, says `bx: no answer; asking again at a later shell`
-//!   and writes nothing, so another shell asks.
+//!   end of its input, with nothing settled says
+//!   `bx: no answer; asking again at a later shell` and writes nothing, so
+//!   another shell asks.
 //!
 //! # Only a person at a terminal is asked
 //!
@@ -164,10 +176,12 @@ __bx_update_due() {
     if [[ ${found[1]-} == 'gen '* ]]; then
       gen=${found[1]#gen }
       shift found
+    elif (( ${#found} )); then
+      gen=old:${found[1]}
     fi
   fi
-  if (( ${#found} )) && [[ -z $gen || $gen != "$answered" ]]; then
-    [[ -n $gen && $gen == "${BX_UPDATE_ASKED-}" ]] && return 0
+  if (( ${#found} )) && [[ $gen != "$answered" ]]; then
+    [[ $gen == "${BX_UPDATE_ASKED-}" ]] && return 0
     print -r -- "bx: what this configuration follows has new commits:"
     print -rl -- "  "${^found}
     __bx_update_ask $dir offer "$gen" "bx: update now? [y/N] "
@@ -205,7 +219,7 @@ __bx_update_settled() {
   if [[ $2 == offer ]]; then
     [[ -s $1/available ]] || return 0
     read -r line < $1/available
-    [[ -z $3 || $line == "gen $3" ]] && return 1
+    [[ $line == "gen $3" || "old:$line" == "$3" ]] && return 1
     return 2
   fi
   [[ -r $1/ask-due ]] && read -r line < $1/ask-due
@@ -218,7 +232,7 @@ __bx_update_settled() {
 # answered settles the question due with it too, until the answer moves on.
 __bx_update_ask() {
   setopt localoptions localtraps nullglob
-  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= due= f p
+  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= spent= due= f p
   local -i wait=60 start=${(%):-%D{%s}} now left
   [[ ${BX_UPDATE_PROMPT_TIMEOUT-} == [1-9]* && $BX_UPDATE_PROMPT_TIMEOUT != *[^0-9]* ]] \
     && wait=$BX_UPDATE_PROMPT_TIMEOUT
@@ -228,6 +242,7 @@ __bx_update_ask() {
   print -n -- "$4"
   while [[ -z $outcome ]]
   do
+    woken=
     __bx_update_settled $dir $kind "$gen"
     case $? in
       0) outcome=answered ;;
@@ -235,12 +250,11 @@ __bx_update_ask() {
       *)
         now=${(%):-%D{%s}}
         left=wait-now+start
-        if (( left <= 0 )); then
+        if [[ -n $spent ]] || (( left <= 0 )); then
           outcome=none
-        else
-          woken=
+        elif [[ -z $woken ]]; then
           read -k 1 -u 0 -t $left answer && outcome=read
-          [[ -n $outcome$woken ]] || outcome=none
+          [[ -n $outcome$woken ]] || spent=1
         fi
         ;;
     esac
@@ -309,10 +323,12 @@ __bx_update_due() {
     if [[ ${found[0]-} == 'gen '* ]]; then
       gen=${found[0]#gen }
       found=("${found[@]:1}")
+    elif (( ${#found[@]} )); then
+      gen=old:${found[0]}
     fi
   fi
-  if (( ${#found[@]} )) && [[ -z $gen || $gen != "$answered" ]]; then
-    [[ -n $gen && $gen == "${BX_UPDATE_ASKED-}" ]] && return 0
+  if (( ${#found[@]} )) && [[ $gen != "$answered" ]]; then
+    [[ $gen == "${BX_UPDATE_ASKED-}" ]] && return 0
     printf '%s\n' "bx: what this configuration follows has new commits:"
     printf '  %s\n' "${found[@]}"
     __bx_update_ask "$dir" offer "$gen" "bx: update now? [y/N] "
@@ -350,7 +366,7 @@ __bx_update_settled() {
   if [[ $2 == offer ]]; then
     [[ -s $1/available ]] || return 0
     read -r line < "$1/available"
-    [[ -z $3 || $line == "gen $3" ]] && return 1
+    [[ $line == "gen $3" || "old:$line" == "$3" ]] && return 1
     return 2
   fi
   [[ -r $1/ask-due ]] && read -r line < "$1/ask-due"
@@ -364,22 +380,25 @@ __bx_update_settled() {
 # offer answered settles the question due with it too, until the answer moves on.
 __bx_update_ask() {
   local -
-  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= saved= posix= due= f p start now
+  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= spent= saved= posix= waits= due= f p start now
   local -i wait=60 left
   [[ ${BX_UPDATE_PROMPT_TIMEOUT-} == [1-9]* && $BX_UPDATE_PROMPT_TIMEOUT != *[!0-9]* ]] \
     && wait=$BX_UPDATE_PROMPT_TIMEOUT
   [[ -o posix ]] && posix=1
   BX_UPDATE_ASKED=$gen
   printf -v start '%(%s)T' -1
-  { printf '%s\n' "$gen"; trap -p URG; } 2>/dev/null >| "$dir/waiting/$$"
-  {
-    read -r saved
-    read -r -d '' saved
-  } 2>/dev/null < "$dir/waiting/$$"
-  trap 'woken=1' URG
+  if { printf '%s\n' "$gen"; trap -p URG; } 2>/dev/null >| "$dir/waiting/$$"; then
+    waits=1
+    {
+      read -r saved
+      read -r -d '' saved
+    } 2>/dev/null < "$dir/waiting/$$"
+    trap 'woken=1' URG
+  fi
   printf '%s' "$4"
   while [[ -z $outcome ]]
   do
+    woken=
     __bx_update_settled "$dir" "$kind" "$gen"
     case $? in
       0) outcome=answered ;;
@@ -387,21 +406,22 @@ __bx_update_ask() {
       *)
         printf -v now '%(%s)T' -1
         left=wait-now+start
-        if (( left <= 0 )); then
+        if [[ -n $spent ]] || (( left <= 0 )); then
           outcome=none
-        else
-          woken=
+        elif [[ -z $woken ]]; then
           set -o posix
           read -r -n 1 -t $left answer && outcome=read
           [[ -n $posix ]] || set +o posix
-          [[ -n $outcome$woken ]] || outcome=none
+          [[ -n $outcome$woken ]] || spent=1
         fi
         ;;
     esac
   done
-  : 2>/dev/null >| "$dir/waiting/$$"
-  trap - URG
-  [[ -n $saved ]] && eval "$saved"
+  if [[ -n $waits ]]; then
+    : 2>/dev/null >| "$dir/waiting/$$"
+    trap - URG
+    [[ -n $saved ]] && eval "$saved"
+  fi
   printf '\n'
   case $outcome in
     answered) printf '%s\n' "bx: answered in another shell"; return 0 ;;
@@ -951,6 +971,86 @@ mod tests {
     }
 
     #[test]
+    fn an_offer_an_older_bx_wrote_is_asked_once_per_shell_and_settled_by_one_answer() {
+        for shell in shells() {
+            let rig = Rig::new(shell);
+            // No `gen` line: written before generations, and nothing rewrites
+            // it until the next check.
+            rig.stamp("available", "~/a: 1 new commit(s) on main\n");
+            let Some(child) = rig.spawn(
+                "script",
+                "",
+                "__bx_update_due\nprintf '@\\n'\n__bx_update_due",
+                &[("BX_UPDATE_PROMPT_TIMEOUT", "1")],
+            ) else {
+                return;
+            };
+            let shown = finished(child);
+            let runs: Vec<&str> = shown.split("@\n").collect();
+            assert_eq!(runs.len(), 2, "{shell:?}: {shown}");
+            assert!(
+                runs[0].ends_with("bx: no answer; asking again at a later shell\n"),
+                "{shell:?}: {shown}"
+            );
+            assert_eq!(runs[1], "", "{shell:?}: not asked again in that shell");
+
+            let (printed, _) = rig.run("__bx_update_due", "n", &[]);
+            assert!(printed.contains("update now?"), "{shell:?}: {printed}");
+            assert_eq!(
+                rig.read("answered").as_deref(),
+                Some("old:~/a: 1 new commit(s) on main\nask \n"),
+                "{shell:?}"
+            );
+            let (printed, _) = rig.run("__bx_update_due", "y", &[]);
+            assert_eq!(printed, "", "{shell:?}: another shell is not asked");
+        }
+    }
+
+    #[test]
+    fn a_shell_never_woken_learns_of_the_answer_when_its_read_times_out() {
+        for shell in shells() {
+            let rig = Rig::new(shell);
+            rig.stamp("available", "gen g1\n~/a: 1 new commit(s) on main\n");
+            // As an older bx left the state directory: nowhere to wait, so
+            // nothing wakes this shell, as with a wake-up that came just
+            // before its read began.
+            std::fs::remove_dir(rig.dir().join("waiting")).expect("no waiting/");
+            let (urg, list) = match shell {
+                Shell::Zsh => ("trap 'print mine' URG", "trap"),
+                Shell::Bash => ("trap 'echo mine' URG", "trap -p URG"),
+            };
+            let answer = format!(
+                "{urg}\n(sleep 0.5; printf 'g1\\nask \\n' >| {}) &",
+                rig.dir().join("answered").display()
+            );
+            let Some(child) = rig.spawn(
+                "script",
+                &answer,
+                &format!("__bx_update_due\nprintf '@\\n'\n{list}\nwait"),
+                &[("BX_UPDATE_PROMPT_TIMEOUT", "2")],
+            ) else {
+                return;
+            };
+            let shown = finished(child);
+            let runs: Vec<&str> = shown.split("@\n").collect();
+            assert_eq!(runs.len(), 2, "{shell:?}: {shown}");
+            assert!(
+                runs[0].ends_with("bx: update now? [y/N] \nbx: answered in another shell\n"),
+                "{shell:?}: {shown}"
+            );
+            assert!(
+                runs[1].contains("mine"),
+                "{shell:?}: the trap it found is kept: {shown}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(rig.home.path().join("calls")).ok(),
+                None,
+                "{shell:?}: nothing started"
+            );
+        }
+    }
+
+    #[test]
     fn a_stale_waiter_is_harmless_to_the_shell_that_answers() {
         for shell in shells() {
             let rig = Rig::new(shell);
@@ -1179,7 +1279,9 @@ mod tests {
                     "{shell:?}, XDG_STATE_HOME={value:?}: {printed}"
                 );
                 assert_eq!(calls, "update\n", "{shell:?}, XDG_STATE_HOME={value:?}");
+                // As `Stamps::set` clears them, so the next value is asked.
                 std::fs::remove_file(update.join("available")).expect("the stamp goes");
+                std::fs::remove_file(update.join("answered")).expect("the answer goes");
                 std::fs::remove_file(rig.home.path().join("calls")).expect("the calls go");
             }
         }
@@ -1254,7 +1356,7 @@ mod tests {
                     proptest::option::of(
                         "([ \t]?gen[ \t]{1,2}[ab ]{0,2}[ \t]?\n)?([ \t]?[ab~:]{0,3}[ \t]?\n){0,2}[ab]{0,2}",
                     ),
-                    proptest::option::of("[ \t]?[ab ]{0,2}[ \t]?(\n[ab\n]{0,2})?"),
+                    proptest::option::of("[ \t]?(old:)?[ab ]{0,2}[ \t]?(\n[ab\n]{0,2})?"),
                 ),
                 1..12,
             ),

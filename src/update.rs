@@ -898,8 +898,9 @@ impl Stamps {
     ///
     /// It reads them as the hook's `read -r` does: whole lines only, each less
     /// the spaces and tabs around it. A first line `gen G` is the offer's
-    /// generation, and the lines after it are what is offered; one without it
-    /// is offered as it stands. Something is offered while there is a line to
+    /// generation, and the lines after it are what is offered; one without it,
+    /// as an older bx wrote it, is offered as it stands under the generation
+    /// `old:` and its first line. Something is offered while there is a line to
     /// offer, unless the first line of `answered`, read the same way, is its
     /// generation.
     #[must_use]
@@ -920,8 +921,9 @@ impl Stamps {
             .map(trim)
             .collect();
         let generation = match lines.first() {
-            Some(first) if first.starts_with(b"gen ") => Some(lines.remove(0)[4..].to_vec()),
-            _ => None,
+            Some(first) if first.starts_with(b"gen ") => lines.remove(0)[4..].to_vec(),
+            Some(first) => [b"old:".as_slice(), first].concat(),
+            None => Vec::new(),
         };
         let answered = answered
             .unwrap_or_default()
@@ -929,7 +931,7 @@ impl Stamps {
             .next()
             .map(trim)
             .unwrap_or_default();
-        !lines.is_empty() && generation.is_none_or(|generation| generation != answered)
+        !lines.is_empty() && generation != answered
     }
 
     /// The epoch in `path`, or `None` when it is absent or holds none.
@@ -1895,6 +1897,11 @@ mod tests {
             offers("~/a: x\n", Some("~/a: x\n")),
             "no generation: offered"
         );
+        assert!(
+            !offers("~/a: x\n~/b: y\n", Some("old:~/a: x\n")),
+            "an older bx's offer is settled under its first line"
+        );
+        assert!(offers("~/a: x\n", Some("old:~/b: y\n")));
         assert!(
             offers("gen  g\n~/a: x\n", Some("g\n")),
             "its generation is ` g`"

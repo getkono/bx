@@ -1919,7 +1919,7 @@ fn an_update_whose_pull_cannot_reach_the_remote_answers_the_offer_and_says_why()
     let since = update::now();
     let error = update(&home, true, &mut Vec::new()).expect_err("unreachable");
     assert!(matches!(error, update::Error::Sync(_)), "{error:?}");
-    settled(&stamps, &generation, since, "bx update stopped: ");
+    settled(&stamps, &generation, since, update::STOPPED);
 }
 
 #[test]
@@ -1930,10 +1930,40 @@ fn an_update_that_finishes_withdraws_the_offer() {
     update(&home, true, &mut Vec::new()).expect("update");
     publish(&home, &["skills/b/SKILL.md"]);
     let (stamps, _) = on_offer(&home);
+    // Why an earlier run stopped, which `bx doctor` names until one finishes.
+    std::fs::write(
+        stamps.last_check(),
+        format!("{}the remote was unreachable\n", update::STOPPED),
+    )
+    .expect("last-check");
     update(&home, true, &mut Vec::new()).expect("update");
     assert!(!stamps.available().exists());
     assert!(!stamps.answered().exists());
+    assert!(!stamps.last_check().exists());
     assert!(!offers(&stamps));
+}
+
+#[test]
+fn a_reason_that_spans_several_lines_is_written_as_one() {
+    let home = guarded_home();
+    let state = crate::state::StateDir::resolve(home.path());
+    let reason = format!(
+        "{}git fetch failed: ssh: connect to host h port 22: refused\n  \
+         fatal: Could not read from remote repository.\n\n\
+         Please make sure you have the correct access rights\n",
+        update::STOPPED
+    );
+    update::settled(&state, None, &reason).expect("settled");
+    assert_eq!(
+        std::fs::read_to_string(Stamps::of(&state).last_check()).expect("last-check"),
+        format!(
+            "{}git fetch failed: ssh: connect to host h port 22: refused fatal: Could not \
+             read from remote repository. Please make sure you have the correct access \
+             rights\n",
+            update::STOPPED
+        ),
+        "one line, so `bx doctor`, which names the line, names all of it"
+    );
 }
 
 #[test]

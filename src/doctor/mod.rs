@@ -41,8 +41,8 @@
 //! 9. [`orphans`] — a `.bx-` temporary file an interrupted write left beside
 //!    a destination, which no journal names and recovery never removes.
 //! 10. [`externals`] — an external that follows a branch `bx.lock` holds no
-//!     commit for, a lock entry nothing follows, and an update stamp that
-//!     holds no time.
+//!     commit for, a lock entry nothing follows, an update stamp that holds
+//!     no time, and a `last-check` saying `bx update` stopped.
 //! 11. [`stray_local`] — a `local.toml` inside the config repo, which bx
 //!     never loads, with the move to the state directory that makes it count.
 //! 12. [`bash`] — bash's generated file asks about followed externals'

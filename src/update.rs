@@ -61,8 +61,10 @@
 //! offered again once the next interval's check finds them still unapplied.
 //! A `bx update` that stops short — declined, abandoned at its question,
 //! refused or failed — answers the offer instead ([`settled`]) and says why in
-//! `last-check`; only one turned away because another holds the stamps
-//! records nothing, as that one settles them.
+//! `last-check`, which `bx doctor` names when it failed or was refused, until
+//! a `bx update` that finishes removes it ([`finished`]) or a background check
+//! overwrites it with what it found ([`check`]); only one turned away
+//! because another holds the stamps records nothing, as that one settles them.
 //!
 //! # Another machine's lock
 //!
@@ -586,6 +588,11 @@ pub fn message(before: &Lock, after: &Lock) -> String {
 
 /// The subject of every commit `bx update` makes.
 pub const SUBJECT: &str = "chore(bx): update bx.lock";
+
+/// What opens the line [`settled`] writes to `last-check` when `bx update`
+/// failed or the config repo refused it, before the error itself; `bx doctor`
+/// names such a line.
+pub const STOPPED: &str = "bx update stopped: ";
 
 /// What [`replay_own_lock_commits`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1492,12 +1499,14 @@ pub(crate) fn snooze_waiting(
     Ok(crate::report::Exit::Converged)
 }
 
-/// After a `bx update` that finished: every stamp starts a new interval, and
-/// nothing is offered until the next check finds something.
+/// After a `bx update` that finished: every stamp starts a new interval,
+/// nothing is offered until the next check finds something, and `last-check`
+/// is removed, so neither what a check found nor why an earlier `bx update`
+/// stopped outlives the update that took it in.
 ///
 /// # Errors
 ///
-/// As [`Stamps::set`].
+/// As [`Stamps::set`], and [`Error::Io`] when `last-check` cannot be removed.
 pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
     let interval = inputs.resolved().update.interval();
     let externals = &inputs.resolved().externals;
@@ -1505,14 +1514,19 @@ pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
         ask_interval(externals, interval),
         check_interval(externals, interval),
     );
-    Stamps::of(inputs.state()).set(now(), Some(ask), Some(auto), Some(&[]))
+    let stamps = Stamps::of(inputs.state());
+    stamps.set(now(), Some(ask), Some(auto), Some(&[]))?;
+    stamps.remove(&stamps.last_check())
 }
 
 /// After a `bx update` that stopped short of [`finished`] — declined,
 /// abandoned, refused or failed: what `available` offers is answered, so no
 /// shell asks it again, and every shell waiting on it gives way; `ask-due` is
 /// set to now plus `ask`, as [`Stamps::set`] does, so the question whether to
-/// check waits an interval too; and `why` is written to `last-check`. The offer
+/// check waits an interval too; and `why` is written to `last-check` as one
+/// line, its lines trimmed and joined by a space, so a reason that spans
+/// several — git's stderr and its hints — is read whole by `bx doctor`, which
+/// names that one line. The offer
 /// itself stands, so a check that finds the same commits again offers nothing,
 /// and one that finds others offers them under their own generation.
 ///
@@ -1550,9 +1564,19 @@ pub fn settled(state: &StateDir, ask: Option<Option<Interval>>, why: &str) -> Re
             &format!("{generation}\nask {}\n", due.unwrap_or_default()),
         )?;
     }
-    stamps.write(&stamps.last_check(), &format!("{why}\n"))?;
+    stamps.write(&stamps.last_check(), &format!("{}\n", one_line(why)))?;
     stamps.wake();
     Ok(())
+}
+
+/// `text` on one line: each line trimmed, the empty ones dropped, the rest
+/// joined by a space.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// After an `apply` that wrote: when an external follows a branch and no

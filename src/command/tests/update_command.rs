@@ -1084,12 +1084,13 @@ fn a_branch_diverged_by_a_persons_commit_is_left_for_them() {
     assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing moved");
 }
 
-#[test]
-fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
-    let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+/// A config repo in `home` whose `bx.lock` holds an entry nothing follows,
+/// so `bx update` would change a lock `apply` writes nothing for; and that
+/// lock's text.
+fn orphaned_lock(home: &GuardedHome) -> (std::path::PathBuf, String) {
+    upstream(home, &["skills/a/SKILL.md"]);
+    let repo = cloned(home, &layer());
+    update(home, true, &mut Vec::new()).expect("update");
     // An entry for an external nothing follows any more.
     let mut lock = Lock::read(&repo, home.path()).expect("bx.lock");
     let entry = lock
@@ -1104,11 +1105,19 @@ fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
     std::fs::write(repo.join("bx.lock"), lock.render()).expect("bx.lock");
     commit_all(home.path(), &repo, "an orphan");
     let orphaned = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
+    (repo, orphaned)
+}
 
+#[test]
+fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
+    let home = guarded_home();
+    let (repo, orphaned) = orphaned_lock(&home);
     let tty = Env {
         stdin_tty: true,
         ..env(home.path())
     };
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
     let mut out = Vec::new();
     update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
         Ok(false)
@@ -1120,6 +1129,7 @@ fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
         orphaned,
         "declined: kept"
     );
+    settled(&stamps, &generation, since, "declined");
 
     let mut out = Vec::new();
     update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
@@ -1133,6 +1143,37 @@ fn a_lock_change_apply_writes_nothing_for_is_still_asked_about() {
         run(home.path(), &repo, &["log", "-1", "--format=%B"])
             .contains("~/gone: no longer followed")
     );
+}
+
+#[test]
+fn a_lock_change_apply_writes_nothing_for_abandoned_at_its_question_answers_the_offer() {
+    let home = guarded_home();
+    let (repo, orphaned) = orphaned_lock(&home);
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
+    let mut out = Vec::new();
+    let exit = update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
+        Err(Error::Canceled)
+    })
+    .expect("canceled");
+    assert_eq!(exit, Exit::Canceled);
+    assert!(
+        text(&out)
+            .lines()
+            .any(|line| line == "Canceled. Nothing was locked."),
+        "the lock's own question: {}",
+        text(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock"),
+        orphaned,
+        "canceled: kept"
+    );
+    settled(&stamps, &generation, since, "canceled");
 }
 
 #[test]
@@ -1378,4 +1419,220 @@ fn a_check_lock_that_cannot_be_opened_says_opening() {
         error.to_string(),
         format!("opening {}: Is a directory (os error 21)", path.display())
     );
+}
+
+/// `ask-due` as [`on_offer`] leaves it: a question already due.
+const ASK_DUE: u64 = 1;
+
+/// The offer a check left in `home`'s stamps, as the prompt hook shows it,
+/// with the question at [`ASK_DUE`] due alongside it, and its generation.
+fn on_offer(home: &GuardedHome) -> (Stamps, String) {
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    let lines = vec![format!("~/{AT}: 1 new commit(s) on master")];
+    stamps
+        .set(update::now(), None, None, Some(&lines))
+        .expect("offered");
+    stamps
+        .write(&stamps.ask_due(), &format!("{ASK_DUE}\n"))
+        .expect("ask-due");
+    assert!(offers(&stamps));
+    (stamps, update::generation(&lines))
+}
+
+/// That `stamps` hold the offer of `generation` answered along with the
+/// question that was due with it ([`ASK_DUE`]), `ask-due` an interval from a
+/// time in `since..=now`, and `last-check` saying `why`.
+fn settled(stamps: &Stamps, generation: &str, since: u64, why: &str) {
+    let available = std::fs::read_to_string(stamps.available()).expect("still offered");
+    assert!(
+        available.starts_with(&format!("gen {generation}\n")),
+        "{available}"
+    );
+    let due = Stamps::read(&stamps.ask_due()).expect("ask-due");
+    let week = crate::config::update::DEFAULT_INTERVAL.seconds();
+    assert!(
+        (since + week..=update::now() + week).contains(&due),
+        "{due}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(stamps.answered()).expect("answered"),
+        format!("{generation}\nask {ASK_DUE}\n"),
+        "the offer, and the question due with it, not the next one, which a shell \
+         still asks at {due}"
+    );
+    assert!(!offers(stamps), "no shell asks it again");
+    let last = std::fs::read_to_string(stamps.last_check()).expect("last-check");
+    assert!(last.contains(why), "{last}");
+}
+
+/// Run `bx update` at a terminal, with every question answered by `answer`.
+fn answering(
+    home: &GuardedHome,
+    answer: &mut dyn FnMut() -> Result<bool, Error>,
+) -> Result<Exit, update::Error> {
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    update_with(&tty, &[], false, &mut Vec::new(), &git(home.path()), answer)
+}
+
+#[test]
+fn an_update_abandoned_at_its_question_answers_the_offer() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    publish(&home, &["skills/b/SKILL.md"]);
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
+    let exit = answering(&home, &mut || Err(Error::Canceled)).expect("canceled");
+    assert_eq!(exit, Exit::Canceled);
+    settled(&stamps, &generation, since, "canceled");
+}
+
+#[test]
+fn an_update_declined_answers_the_offer_rather_than_withdrawing_it() {
+    let home = guarded_home();
+    let first = upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    publish(&home, &["skills/b/SKILL.md"]);
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
+    answering(&home, &mut || Ok(false)).expect("declined");
+    assert_eq!(locked(&home).as_deref(), Some(first.as_str()));
+    settled(&stamps, &generation, since, "declined");
+}
+
+#[test]
+fn an_update_another_holds_records_nothing() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(&home, &layer());
+    let (stamps, _) = on_offer(&home);
+    std::fs::write(stamps.ask_due(), "1\n").expect("due");
+    let available = std::fs::read(stamps.available()).expect("offered");
+    let _held = stamps.try_hold().expect("hold").expect("free");
+    let error = update(&home, true, &mut Vec::new()).expect_err("busy");
+    assert!(matches!(error, update::Error::Busy), "{error:?}");
+    assert_eq!(
+        std::fs::read(stamps.available()).expect("offered"),
+        available
+    );
+    assert!(!stamps.answered().exists(), "the other run settles it");
+    assert_eq!(Stamps::read(&stamps.ask_due()), Some(1));
+    assert!(!stamps.last_check().exists());
+}
+
+#[test]
+fn an_update_a_diverged_config_repo_refuses_answers_the_offer_and_says_why() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let repo = cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    run(home.path(), &repo, &["push", "--quiet"]);
+    let edited = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
+    std::fs::write(repo.join("bx.lock"), format!("{edited}# mine\n")).expect("an edit");
+    commit_all(home.path(), &repo, "mine");
+    let other = crate::sync::tests::other(&home);
+    std::fs::write(other.join("notes"), "x\n").expect("a note");
+    commit_all(home.path(), &other, "elsewhere");
+    run(home.path(), &other, &["push", "--quiet"]);
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
+    let error = update(&home, true, &mut Vec::new()).expect_err("diverged");
+    assert!(
+        matches!(error, update::Error::Sync(sync::Error::Diverged { .. })),
+        "{error:?}"
+    );
+    settled(&stamps, &generation, since, &error.to_string());
+}
+
+#[test]
+fn an_update_both_machines_locked_answers_the_offer_and_says_why() {
+    let home = guarded_home();
+    let first = upstream(&home, &["skills/a/SKILL.md"]);
+    let repo = cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    run(home.path(), &repo, &["push", "--quiet"]);
+    publish(&home, &["skills/b/SKILL.md"]);
+    update(&home, true, &mut Vec::new()).expect("a local lock commit");
+    let other = crate::sync::tests::other(&home);
+    let theirs = std::fs::read_to_string(other.join("bx.lock"))
+        .expect("bx.lock")
+        .replace(&first, &"d".repeat(40));
+    std::fs::write(other.join("bx.lock"), theirs).expect("bx.lock");
+    commit_all(home.path(), &other, update::SUBJECT);
+    run(home.path(), &other, &["push", "--quiet"]);
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
+    let error = update(&home, true, &mut Vec::new()).expect_err("both changed it");
+    assert!(
+        matches!(error, update::Error::LockDiverged { .. }),
+        "{error:?}"
+    );
+    settled(&stamps, &generation, since, "reset --keep @{upstream}");
+}
+
+#[test]
+fn an_update_a_rebase_left_open_stops_answers_the_offer_and_says_why() {
+    let home = guarded_home();
+    let repo = diverged(&home);
+    std::fs::create_dir_all(repo.join(".git/rebase-merge")).expect("an open rebase");
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
+    let error = update(&home, true, &mut Vec::new()).expect_err("open");
+    assert!(matches!(error, update::Error::Rebasing(_)), "{error:?}");
+    settled(&stamps, &generation, since, "rebase --abort");
+}
+
+#[test]
+fn an_update_whose_pull_cannot_reach_the_remote_answers_the_offer_and_says_why() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    std::fs::rename(home.child("remote.git"), home.child("gone.git")).expect("unreachable");
+    let (stamps, generation) = on_offer(&home);
+    let since = update::now();
+    let error = update(&home, true, &mut Vec::new()).expect_err("unreachable");
+    assert!(matches!(error, update::Error::Sync(_)), "{error:?}");
+    settled(&stamps, &generation, since, "bx update stopped: ");
+}
+
+#[test]
+fn an_update_that_finishes_withdraws_the_offer() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(&home, &layer());
+    update(&home, true, &mut Vec::new()).expect("update");
+    publish(&home, &["skills/b/SKILL.md"]);
+    let (stamps, _) = on_offer(&home);
+    update(&home, true, &mut Vec::new()).expect("update");
+    assert!(!stamps.available().exists());
+    assert!(!stamps.answered().exists());
+    assert!(!offers(&stamps));
+}
+
+#[test]
+fn a_settled_offer_an_older_bx_wrote_is_answered_by_its_first_line() {
+    let home = guarded_home();
+    let state = crate::state::StateDir::resolve(home.path());
+    let stamps = Stamps::of(&state);
+    update::settled(&state, None, "why").expect("nothing offered");
+    assert!(!stamps.answered().exists(), "nothing to answer");
+    assert_eq!(
+        std::fs::read_to_string(stamps.last_check()).expect("last-check"),
+        "why\n"
+    );
+    stamps
+        .write(&stamps.available(), "~/x: y\n")
+        .expect("offered");
+    update::settled(&state, None, "why").expect("settled");
+    assert_eq!(
+        std::fs::read_to_string(stamps.answered()).expect("answered"),
+        "old:~/x: y\nask \n"
+    );
+    assert!(!offers(&stamps));
 }

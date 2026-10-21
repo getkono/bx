@@ -191,9 +191,18 @@ fn converge(
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Report, Error> {
     let inputs = Inputs::load(env)?;
+    let mut declined = false;
     let report = converge_inputs(&inputs, env, mode, yes, out, ask, &mut |_, approved| {
+        declined = !approved;
         approved
     })?;
+    // An offer judged against a bx.lock this machine no longer has — a sync
+    // just brought in another machine's — is withdrawn and checked again, once
+    // that lock is applied: approved, or with nothing to apply. A declined,
+    // canceled or unconfirmed apply leaves the offer as it stood.
+    if !declined {
+        update::relocked(&inputs);
+    }
     // A machine that just began following a branch starts its interval now,
     // so its shells ask once it has passed rather than never.
     if report.executed {

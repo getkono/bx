@@ -38,8 +38,10 @@
 //! | `available` | `gen` and the offer's [`generation`], then one line per external a check found new commits for |
 //! | `answered`  | the generation of the offer, or `ask` and the `ask-due` of the question, a shell last had answered |
 //! | `waiting/`  | one file per shell waiting on a prompt, named by its pid               |
+//! | `judged`    | the [`fingerprint`] of the `bx.lock` here when `available` was written |
 //!
-//! The first three are written whole by [`Stamps`] and nothing else. A
+//! The first three, and `judged`, are written whole by [`Stamps`] and nothing
+//! else; no shell reads `judged`. A
 //! missing or unreadable `ask-due` or `check-due` is never due: a machine that
 //! has not run `bx update` or `bx apply` since it began following a branch is
 //! not asked, rather than asked at once.
@@ -63,6 +65,25 @@
 //! a `bx update` that finishes removes it ([`finished`]) or a background check
 //! overwrites it with what it found ([`check`]); only one turned away
 //! because another holds the stamps records nothing, as that one settles them.
+//!
+//! # Another machine's lock
+//!
+//! The config repo is shared, so another machine may already have locked the
+//! commits a check finds. A background check therefore fetches the config
+//! repo's upstream first — objects and its remote-tracking ref, never the
+//! working tree — and, when this machine's branch is only behind it, judges
+//! each external against the `bx.lock` the upstream holds, which is the one
+//! `bx update` would lock on top of after its pull. A commit the upstream
+//! already locks is offered to nobody: `last-check` says another machine
+//! updated it and `bx sync` brings it in. A config repo that is not a git
+//! repository of its own, has no upstream, cannot be fetched or has diverged
+//! is judged against this machine's `bx.lock`, and `last-check` says why.
+//!
+//! An offer is only true of the `bx.lock` it was judged against, so `judged`
+//! records which one that was. A `bx apply` or `bx sync` that applies another
+//! `bx.lock` withdraws the offer ([`relocked`]) and makes the next prompt check
+//! again; one that is declined leaves it standing. A check carries forward no
+//! line an earlier check judged against another `bx.lock`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -78,8 +99,14 @@ use crate::plan::external::finished_clone;
 use crate::state::StateDir;
 use crate::sync;
 
-/// How long `bx update --background` may take, from start to finish.
+/// How long `bx update --background` may take, from start to finish:
+/// counted from when [`check`] begins, before the configuration is loaded, so
+/// a slow load leaves the remotes less time rather than the check more.
 pub const BACKGROUND_BOUND: Duration = Duration::from_secs(30);
+
+// A check still running when a snooze gives up waiting would write its offer
+// back over the snooze; the snooze waits longer than any check may take.
+const _: () = assert!(BACKGROUND_BOUND.as_secs() < SNOOZE_WAIT.as_secs());
 
 /// How long a foreground `bx update` waits on one remote.
 pub const LOOK_BOUND: Duration = Duration::from_secs(60);
@@ -801,6 +828,14 @@ impl Stamps {
         self.dir.join("answered")
     }
 
+    /// `judged`: the [`fingerprint`] of the `bx.lock` this machine had when
+    /// `available` was last written, which [`relocked`] compares with the one
+    /// it has now.
+    #[must_use]
+    pub fn judged(&self) -> PathBuf {
+        self.dir.join("judged")
+    }
+
     /// `waiting/`: one file per shell whose prompt is waiting for an answer,
     /// named by its pid and non-empty while it waits.
     #[must_use]
@@ -811,7 +846,8 @@ impl Stamps {
     /// Set `ask-due` to `now` plus `ask`, or removed when no external asks
     /// first; `check-due` to `now` plus `check`, or removed when no external
     /// checks on its own; and `available` to `available`'s lines under their
-    /// [`generation`], or removed, with `answered`, when there are none. A
+    /// [`generation`], or removed, with `answered` and `judged`, when there
+    /// are none. A
     /// stamp given as `None` is left as it is. Once `available` or `ask-due`
     /// is written, every shell waiting on a prompt is woken ([`Stamps::wake`])
     /// to see whether what it asks still stands.
@@ -851,6 +887,7 @@ impl Stamps {
             Some([]) => {
                 self.remove(&self.available())?;
                 self.remove(&self.answered())?;
+                self.remove(&self.judged())?;
             }
             Some(lines) => {
                 let text: String = std::iter::once(format!("gen {}\n", generation(lines)))
@@ -1042,7 +1079,9 @@ pub fn now() -> Epoch {
 /// the externals set to `check = "auto"`, runs only when no other one is, is
 /// bounded by [`BACKGROUND_BOUND`], writes what it found to `last-check`
 /// rather than to the terminal, and moves `check-due` on before it reaches
-/// the network, so a check that fails is not retried at every prompt. Either
+/// the network, so a check that fails is not retried at every prompt; it
+/// also fetches the config repo's upstream and judges against the `bx.lock`
+/// that holds when this machine is behind it ([`against_upstream`]). Either
 /// way, every external with new commits gets a line in `available`, which the
 /// next prompt offers to apply; lines for externals this check did not look
 /// at are kept.
@@ -1065,6 +1104,14 @@ pub fn check(
     git: &Git,
     out: &mut dyn std::io::Write,
 ) -> Result<crate::report::Exit, Error> {
+    // The whole background run shares one bound, counted from here so that
+    // loading the configuration spends it too; a person's check bounds each
+    // remote on its own.
+    let bound = if background {
+        Bound::Background(std::time::Instant::now() + BACKGROUND_BOUND)
+    } else {
+        Bound::EachRemote
+    };
     let state = StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
     let stamps = Stamps::of(&state);
     let now = now();
@@ -1082,12 +1129,12 @@ pub fn check(
         };
     };
     if !background {
-        return looked(env, names, false, git, &stamps, now, out);
+        return looked(env, names, bound, git, &stamps, now, out);
     }
     // Before anything that can fail, so a configuration that does not load
     // is retried hourly, not at every new shell's first prompt.
     stamps.set(now, None, Some(Some(Interval::HOUR)), None)?;
-    let result = looked(env, names, true, git, &stamps, now, out);
+    let result = looked(env, names, bound, git, &stamps, now, out);
     if let Err(error) = &result {
         stamps.write(
             &stamps.last_check(),
@@ -1101,12 +1148,13 @@ pub fn check(
 fn looked(
     env: &crate::env::Env,
     names: &[String],
-    background: bool,
+    bound: Bound,
     git: &Git,
     stamps: &Stamps,
     now: Epoch,
     out: &mut dyn std::io::Write,
 ) -> Result<crate::report::Exit, Error> {
+    let background = matches!(bound, Bound::Background(_));
     let inputs = crate::plan::Inputs::load(env)?;
     let ledger = crate::state::LedgerView::read(inputs.state(), &env.home)
         .map_err(crate::plan::Error::from)?
@@ -1117,13 +1165,6 @@ fn looked(
     if background {
         stamps.set(now, None, Some(auto), None)?;
     }
-    // The whole background run shares one bound; a person's check bounds each
-    // remote on its own.
-    let bound = if background {
-        Bound::Background(std::time::Instant::now() + BACKGROUND_BOUND)
-    } else {
-        Bound::EachRemote
-    };
     let chosen: Vec<&External> = select(externals, names, &env.home)?
         .into_iter()
         .filter(|external| {
@@ -1134,16 +1175,41 @@ fn looked(
                 )
         })
         .collect();
-    let found = look_all(git, bound, &env.home, &chosen, inputs.lock(), &ledger);
+    // Nothing to look at reaches no network, the config repo's included.
+    let against = match bound {
+        Bound::Background(deadline) if !chosen.is_empty() => against_upstream(
+            &git.clone()
+                .unattended()
+                .with_deadline(deadline)
+                .in_own_group(),
+            inputs.repo(),
+            &env.home,
+            inputs.lock(),
+        ),
+        _ => Against::Here,
+    };
+    let lock = match &against {
+        Against::Upstream { lock, .. } => lock,
+        Against::Here | Against::Unjudged(_) => inputs.lock(),
+    };
+    let found = look_all(git, bound, &env.home, &chosen, lock, &ledger);
 
-    let available = offered(
-        &std::fs::read_to_string(stamps.available()).unwrap_or_default(),
-        &found,
-    );
+    // What an earlier check offered is carried only while it was judged
+    // against the bx.lock here: lines judged against another — a `git pull`
+    // brought one in without an apply — would outlive the lock that made
+    // them true, and `judged`, rewritten below, would no longer say so.
+    let judged_here = std::fs::read_to_string(stamps.judged())
+        .is_ok_and(|judged| judged.trim() == fingerprint(inputs.lock()));
+    let previous = if judged_here {
+        std::fs::read_to_string(stamps.available()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let available = offered(&previous, &found);
     let summaries: String = found.iter().map(|f| format!("{}\n", f.summary())).collect();
     if background {
         stamps.set(now, None, None, Some(&available))?;
-        stamps.write(&stamps.last_check(), &summaries)?;
+        stamps.write(&stamps.last_check(), &said(&against, inputs.lock(), &found))?;
     } else {
         let ask = ask_interval(externals, interval);
         stamps.set(now, Some(ask), Some(auto), Some(&available))?;
@@ -1151,6 +1217,14 @@ fn looked(
         if chosen.is_empty() {
             writeln!(out, "No [[external]] follows a branch.").map_err(Error::Output)?;
         }
+    }
+    // Whichever lock the moves were judged against, the offer stands until
+    // this machine's own changes ([`relocked`]).
+    if !available.is_empty() {
+        stamps.write(
+            &stamps.judged(),
+            &format!("{}\n", fingerprint(inputs.lock())),
+        )?;
     }
     // A person's check that could not check some external — its remote
     // unreachable, or without the branch it follows — has not shown nothing
@@ -1212,6 +1286,175 @@ pub fn offered(previous: &str, found: &[Found]) -> Vec<String> {
                 .map(Found::summary),
         )
         .collect()
+}
+
+/// Which `bx.lock` a background check judges the externals against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Against {
+    /// This machine's: the upstream has nothing it lacks, or holds the same
+    /// lock.
+    Here,
+    /// The upstream's, which this machine's branch is only behind.
+    Upstream {
+        /// The lock the upstream holds.
+        lock: Lock,
+        /// The upstream, as `REMOTE/BRANCH`.
+        upstream: String,
+    },
+    /// This machine's, because the upstream could not be judged, for the
+    /// reason given.
+    Unjudged(String),
+}
+
+/// Fetch the upstream of the config repo at `repo` through `git`, and say
+/// which `bx.lock` a check judges against: the upstream's when this
+/// machine's branch is behind it and not ahead, so the lock is the one a
+/// `bx sync` or `bx update` here would fast-forward to, and it differs from
+/// `here`, the lock this machine has.
+///
+/// The fetch adds objects and moves the remote-tracking ref, as `bx sync`'s
+/// does, and never the branch or the working tree. Never fails: whatever
+/// keeps the upstream from being judged is [`Against::Unjudged`], and the
+/// check goes on against `here`.
+#[must_use]
+pub fn against_upstream(git: &Git, repo: &Path, home: &Path, here: &Lock) -> Against {
+    if checkout::toplevel_is_self(git, repo).is_err() {
+        return Against::Unjudged("the config repo is not a git repository of its own".to_string());
+    }
+    let Ok(branch) = git.query(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
+        return Against::Unjudged("the config repo has no branch checked out".to_string());
+    };
+    let upstream = match sync::upstream(git, repo, &branch) {
+        Ok(upstream) => upstream,
+        Err(sync::Error::NoUpstream { .. }) => {
+            return Against::Unjudged(format!("the config repo's {branch} has no upstream"));
+        }
+        Err(error) => return Against::Unjudged(error.to_string()),
+    };
+    let short = upstream.short.clone();
+    if let Err(error) = git.query(repo, &["fetch", "--quiet", &upstream.remote]) {
+        return Against::Unjudged(format!("{short} could not be fetched: {}", problem(&error)));
+    }
+    match sync::gone(git, repo, &branch) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Against::Unjudged(format!("{short}, which {branch} tracks, does not exist"));
+        }
+        Err(error) => return Against::Unjudged(error.to_string()),
+    }
+    let (ahead, behind) = match sync::counts(git, repo) {
+        Ok(counts) => counts,
+        Err(error) => return Against::Unjudged(error.to_string()),
+    };
+    if behind == 0 {
+        return Against::Here;
+    }
+    if ahead > 0 {
+        return Against::Unjudged(format!(
+            "{branch} and {short} have diverged, so bx update would lock neither as it stands"
+        ));
+    }
+    let spec = format!("@{{upstream}}:{}", lock::FILE);
+    let theirs = match git.query(repo, &["rev-parse", "--verify", "--quiet", &spec]) {
+        // The upstream holds no lock at all: every entry here is gone there.
+        Err(git::Error::Failed { .. }) => Lock::default(),
+        Err(error) => return Against::Unjudged(problem(&error)),
+        Ok(blob) => match git.query_whole(repo, &["cat-file", "blob", &blob]) {
+            Ok(text) => {
+                let file = PathBuf::from(format!("{short}:{}", lock::FILE));
+                match Lock::parse(&text, &file, home) {
+                    Ok(theirs) => theirs,
+                    Err(error) => return Against::Unjudged(error.to_string()),
+                }
+            }
+            Err(error) => return Against::Unjudged(problem(&error)),
+        },
+    };
+    if theirs == *here {
+        Against::Here
+    } else {
+        Against::Upstream {
+            lock: theirs,
+            upstream: short,
+        }
+    }
+}
+
+/// What a background check that judged against `against` writes to
+/// `last-check`: a first line saying which lock it judged against when it
+/// was not simply this machine's, then a line per external in `found`. One
+/// the upstream already locks at its branch's tip, and `here` does not, is
+/// named as another machine's update, which `bx sync` brings in.
+#[must_use]
+pub fn said(against: &Against, here: &Lock, found: &[Found]) -> String {
+    let mut said = match against {
+        Against::Here => String::new(),
+        Against::Upstream { upstream, .. } => format!(
+            "judged against bx.lock as {upstream} holds it: another machine updated it, and \
+             `bx sync` brings it in\n"
+        ),
+        Against::Unjudged(why) => format!("judged against this machine's bx.lock: {why}\n"),
+    };
+    for found in found {
+        let theirs = matches!(against, Against::Upstream { lock, .. }
+            if lock.get(&found.path) != here.get(&found.path));
+        let line = match (&found.verdict, &found.locked) {
+            (Verdict::Current, Some(rev)) if theirs => format!(
+                "{}: another machine already locked {} at {}; `bx sync` brings it in",
+                found.path,
+                found.branch,
+                short(rev)
+            ),
+            _ => found.summary(),
+        };
+        said.push_str(&line);
+        said.push('\n');
+    }
+    said
+}
+
+/// The fingerprint `judged` holds of `lock`: the [`generation`] of its
+/// bytes, so two machines' identical locks have the same one.
+#[must_use]
+pub fn fingerprint(lock: &Lock) -> String {
+    generation(&[lock.render()])
+}
+
+/// Once `bx apply` or `bx sync` has applied `inputs` — approved, or with
+/// nothing to apply — never when declined: when what `available`
+/// offers was judged against another `bx.lock` than the one now here — a
+/// sync or a `git pull` brought in another machine's — the offer is
+/// withdrawn, every shell waiting on it is woken to see so, and `check-due`
+/// is set to now when an external checks on its own, so the next prompt
+/// checks again against this lock.
+///
+/// `answered` is kept: a check that finds the same moves again finds them
+/// under the same generation, already answered. An `available` with no
+/// `judged` beside it, as an older bx wrote it, is left alone.
+///
+/// Best effort: a stamp that cannot be changed costs a stale offer until the
+/// next check, not the apply, so a failure is logged and nothing more.
+pub fn relocked(inputs: &crate::plan::Inputs) {
+    let stamps = Stamps::of(inputs.state());
+    let Ok(judged) = std::fs::read_to_string(stamps.judged()) else {
+        return;
+    };
+    if judged.trim() == fingerprint(inputs.lock()) {
+        return;
+    }
+    let externals = &inputs.resolved().externals;
+    let interval = inputs.resolved().update.interval();
+    let result = stamps
+        .remove(&stamps.available())
+        .and_then(|()| stamps.remove(&stamps.judged()))
+        .and_then(|()| match check_interval(externals, interval) {
+            Some(_) => stamps.write(&stamps.check_due(), &format!("{}\n", now())),
+            None => Ok(()),
+        });
+    stamps.wake();
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not withdraw an offer judged against another bx.lock");
+    }
 }
 
 /// `bx update --snooze`: put the next question off by one interval, and drop

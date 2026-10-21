@@ -1623,6 +1623,29 @@ fn an_update_that_finishes_withdraws_the_offer() {
 }
 
 #[test]
+fn a_reason_that_spans_several_lines_is_written_as_one() {
+    let home = guarded_home();
+    let state = crate::state::StateDir::resolve(home.path());
+    let reason = format!(
+        "{}git fetch failed: ssh: connect to host h port 22: refused\n  \
+         fatal: Could not read from remote repository.\n\n\
+         Please make sure you have the correct access rights\n",
+        update::STOPPED
+    );
+    update::settled(&state, None, &reason).expect("settled");
+    assert_eq!(
+        std::fs::read_to_string(Stamps::of(&state).last_check()).expect("last-check"),
+        format!(
+            "{}git fetch failed: ssh: connect to host h port 22: refused fatal: Could not \
+             read from remote repository. Please make sure you have the correct access \
+             rights\n",
+            update::STOPPED
+        ),
+        "one line, so `bx doctor`, which names the line, names all of it"
+    );
+}
+
+#[test]
 fn a_settled_offer_an_older_bx_wrote_is_answered_by_its_first_line() {
     let home = guarded_home();
     let state = crate::state::StateDir::resolve(home.path());

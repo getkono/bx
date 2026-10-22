@@ -5,28 +5,30 @@
 //! Every invocation gets its home per command, from a guarded tempdir; nothing
 //! here sets a variable in this process.
 
+mod common;
+
 use std::path::Path;
 use std::process::Output;
 
 use assert_cmd::Command;
 use bx::testing::guarded_home;
+use common::chmod;
 
-/// The variables of this process a `bx` it starts inherits; every other one
-/// is cleared, so a `CI`, `BX_LOG` or `XDG_*` set where the suite runs cannot
+/// The variables of this process a `bx` it starts inherits beyond the
+/// coverage profile [`common::isolated`] passes on; every other one is
+/// cleared, so a `CI`, `BX_LOG` or `XDG_*` set where the suite runs cannot
 /// reach what a test asserts. `PATH` finds git and the stubs a test puts on
-/// it, `LLVM_PROFILE_FILE` sends an instrumented binary's coverage where
-/// `cargo llvm-cov` reads it, and `TMPDIR` keeps scratch files where the
-/// suite's own go.
+/// it, and `TMPDIR` keeps scratch files where the suite's own go.
 fn inherited() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
-    ["PATH", "LLVM_PROFILE_FILE", "TMPDIR"]
+    ["PATH", "TMPDIR"]
         .into_iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
 }
 
 /// The `bx` under test, with an environment of [`inherited`] alone.
 fn bx_command() -> Command {
-    let mut command = Command::cargo_bin("bx").expect("the bx binary");
-    command.env_clear().envs(inherited());
+    let mut command = common::bx();
+    command.envs(inherited());
     command
 }
 
@@ -257,13 +259,6 @@ fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, Shape, u32)> {
     }
     found.sort_by(|a, b| a.0.cmp(&b.0));
     found
-}
-
-/// Set `path`'s permission bits.
-fn chmod(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
 #[test]

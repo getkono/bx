@@ -549,8 +549,8 @@ mod tests {
 
     use crate::fs::Mode;
     use crate::journal::tests::{
-        WRITES_THROUGH_PERMISSIONS, apply_session, created, frame_starts, intent, names_in, peek,
-        permissions_refuse, plant_file, raw_journal, seal, some_begin,
+        WRITES_THROUGH_PERMISSIONS, apply_session, created, frame_starts, intent, journal_file,
+        names_in, peek, permissions_refuse, plant_file, raw_journal, seal, some_begin,
         state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Done, End, Journal, Session, SessionKind, Written};
@@ -597,8 +597,7 @@ mod tests {
 
     #[test]
     fn a_short_journal_that_is_not_the_start_of_a_header_is_unreadable() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         // Too short for a header, like a torn one, but not a prefix of one.
         plant_file(&path, "BY", Mode::PRIVATE_FILE);
         assert!(matches!(
@@ -645,8 +644,7 @@ mod tests {
 
     #[test]
     fn a_journal_from_an_older_format_is_unreadable() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut bytes = MAGIC.to_vec();
         bytes.push(FORMAT - 1);
         bytes.extend_from_slice(&[0; NONCE]);
@@ -659,8 +657,7 @@ mod tests {
 
     #[test]
     fn a_run_of_nul_bytes_is_not_a_valid_frame() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut bytes = MAGIC.to_vec();
         bytes.push(FORMAT);
         bytes.extend(std::iter::repeat_n(0_u8, 4096));
@@ -707,8 +704,7 @@ mod tests {
         // Review round 4, item 1. Only the last frame can be unsynced, so a
         // damaged last frame is what a power loss leaves, and a damaged frame
         // with a whole one after it is what no crash leaves.
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let done = |rel: &str| {
             Record::Done(Done {
                 target: Portable::try_from(format!("~/{rel}")).expect("portable"),
@@ -752,8 +748,7 @@ mod tests {
 
     #[test]
     fn a_header_with_nothing_after_it_is_an_empty_interrupted_session() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut header = MAGIC.to_vec();
         header.push(FORMAT);
         std::fs::write(&path, &header).expect("write");
@@ -918,8 +913,7 @@ mod tests {
     #[test]
     fn every_stored_path_in_a_journal_is_checked_against_its_home() {
         let home = guarded_home();
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let ours = target(home.path(), ".conf").0;
         let foreign = absolute_under(home.path(), ".conf");
 
@@ -964,8 +958,7 @@ mod tests {
     #[test]
     fn a_journal_that_writes_one_target_twice_is_unreadable() {
         let home = guarded_home();
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let (target, dest) = target(home.path(), ".conf");
         let intent = Intent {
             after: Written::Absent,
@@ -1001,8 +994,7 @@ mod tests {
     #[test]
     fn a_journal_with_a_second_session_header_is_unreadable() {
         // r3 coverage C5.
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let begin = Record::Begin(some_begin());
         raw_journal(&path, &[begin.clone(), begin]);
         assert_eq!(
@@ -1036,8 +1028,7 @@ mod tests {
 
     #[test]
     fn a_journal_that_ends_with_an_end_record_is_terminated() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let begin = Record::Begin(some_begin());
         drop(Journal::create(&path, some_begin()).expect("create"));
         assert!(matches!(
@@ -1237,8 +1228,7 @@ mod tests {
     #[test]
     fn bytes_after_the_end_of_a_session_are_unreadable_not_terminated() {
         // Coverage review round 5, item 3.
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut journal = Journal::create(&path, some_begin()).expect("create");
         journal
             .append(&Record::End(End { written: 0 }))

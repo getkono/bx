@@ -127,6 +127,13 @@ pub(crate) fn state_beyond_set_aside_names(home: &crate::testing::GuardedHome) -
     state
 }
 
+/// A journal's path in a fresh tempdir, which holds nothing yet.
+pub(crate) fn journal_file() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let path = dir.path().join("journal.mpk");
+    (dir, path)
+}
+
 /// The names in `dir`, sorted.
 pub(crate) fn names_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)

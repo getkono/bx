@@ -102,14 +102,13 @@ impl Journal {
 mod tests {
     use super::*;
 
-    use crate::journal::tests::{peek, plant_file, some_begin};
+    use crate::journal::tests::{journal_file, peek, plant_file, some_begin};
     use crate::journal::{Done, Loaded, load};
     use crate::paths::Portable;
 
     #[test]
     fn the_journal_is_created_whole_at_0600_and_replaces_whatever_was_there() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         plant_file(&path, "not a journal at all", Mode::DEFAULT_FILE);
 
         let journal = Journal::create(&path, some_begin()).expect("create");
@@ -126,8 +125,7 @@ mod tests {
 
     #[test]
     fn creating_a_journal_replaces_its_name_and_never_truncates_a_file_in_place() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         plant_file(&path, "the previous file\n", Mode::PRIVATE_FILE);
 
         // A reader that opened the previous file before the create - `bx plan`
@@ -151,8 +149,7 @@ mod tests {
         // Why a failed append has to end the session: a frame torn mid-write
         // stops the loader, so anything appended after it is invisible to
         // recovery - including the Intent for a write that then lands.
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut journal = Journal::create(&path, some_begin()).expect("create");
         let after_begin = std::fs::read(&path).expect("read").len();
         journal

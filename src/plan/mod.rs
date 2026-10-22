@@ -832,6 +832,16 @@ pub(crate) mod tests {
         session.finish().expect("finish");
     }
 
+    /// Every target the ledger under `state` holds: what `rm` hands back.
+    fn ledger_targets(state: &StateDir, home: &Path) -> Vec<Portable> {
+        LedgerView::read(state, home)
+            .expect("the ledger")
+            .value
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect()
+    }
+
     fn text(change: &Change) -> &str {
         match change.diff.as_ref().map(|diff| &diff.kind) {
             Some(DiffKind::Text(text)) => text,
@@ -1562,12 +1572,7 @@ pub(crate) mod tests {
         assert_ne!(snapshot(home.path(), &OUTSIDE), before);
 
         let state = StateDir::resolve(home.path());
-        let targets: Vec<Portable> = LedgerView::read(&state, home.path())
-            .expect("the ledger")
-            .value
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect();
+        let targets = ledger_targets(&state, home.path());
         assert_eq!(targets.len(), 3);
         crate::restore::restore(&state, home.path(), &targets).expect("restore");
 
@@ -1722,12 +1727,7 @@ pub(crate) mod tests {
         );
 
         // `rm` puts back exactly what was there before.
-        let targets: Vec<Portable> = LedgerView::read(&state, home.path())
-            .expect("the ledger")
-            .value
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect();
+        let targets = ledger_targets(&state, home.path());
         crate::restore::restore(&state, home.path(), &targets).expect("restore");
         assert_eq!(
             std::fs::read_to_string(home.child(".zshrc")).expect(".zshrc"),
@@ -1807,12 +1807,7 @@ pub(crate) mod tests {
         );
 
         // `rm` restores the user's `~/.bashrc` exactly.
-        let targets: Vec<Portable> = LedgerView::read(&state, home.path())
-            .expect("the ledger")
-            .value
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect();
+        let targets = ledger_targets(&state, home.path());
         crate::restore::restore(&state, home.path(), &targets).expect("restore");
         assert_eq!(
             std::fs::read_to_string(home.child(".bashrc")).expect(".bashrc"),

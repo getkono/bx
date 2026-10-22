@@ -566,9 +566,7 @@ pub fn source_line(fragment: &Portable) -> String {
     format!("[[ -r {path} ]] && source {path}\n")
 }
 
-// Only tests build a `Var` by hand, so this sits last, beside them: the source
-// scans that read everything above the first `#[cfg(test)]` as this module's
-// shipped code still read all of it.
+// Only tests build a `Var` by hand, so this sits last, beside them.
 #[cfg(test)]
 impl Var {
     /// A variable written unconditionally.

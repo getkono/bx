@@ -1825,8 +1825,7 @@ impl ResolvedValues {
     }
 }
 
-// Only tests list these, so they sit last: the source scans read everything
-// above the first `#[cfg(test)]` as this module's shipped code.
+// Only tests list these, so they sit last.
 #[cfg(test)]
 impl ResolvedValues {
     /// Every **enabled** declaration, in declaration order.

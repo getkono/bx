@@ -1166,9 +1166,7 @@ impl<'a> Ctx<'a> {
 
 /// Read and parse every global layer in a config repo, **unmerged**.
 ///
-/// Only tests call it, so it sits last, beside them: the source scans that
-/// read everything above the first `#[cfg(test)]` as this module's shipped
-/// code still read all of it.
+/// Only tests call it, so it sits last, beside them.
 ///
 /// # Errors
 ///
@@ -1237,10 +1235,7 @@ mod tests {
         // depending on it. Only the module: a `#[cfg(test)]` item above it
         // is code the scan still reads, like everything around it.
         for (path, source) in crate::testing::module_sources("config") {
-            let code: String = source
-                .split("#[cfg(test)]\nmod tests {")
-                .next()
-                .expect("the non-test half")
+            let code: String = crate::testing::shipped_source(&path, &source)
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()

@@ -155,9 +155,7 @@ pub(crate) fn toggle_of(
     }))
 }
 
-// Only tests ask this, so it sits last: the source scans that read everything
-// above the first `#[cfg(test)]` as this module's shipped code still read all
-// of it.
+// Only tests ask this, so it sits last.
 #[cfg(test)]
 impl Section {
     /// The TOML key the section is written under.

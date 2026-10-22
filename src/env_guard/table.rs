@@ -648,7 +648,7 @@ pub fn is_relocating(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
     use crate::env_guard::fixtures::*;
@@ -881,7 +881,7 @@ mod tests {
 
     #[test]
     fn an_unknown_name_is_refused_even_with_an_inert_value() {
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         for (name, value) in [
             ("SOMETHING", "1"),
             ("SOMETHING", ""),
@@ -1005,7 +1005,7 @@ mod tests {
             vec![(1, Reason::NotEmittable), (2, Reason::UnreadableReference)]
         );
         // The review's case: a fragment that moves `HOME` no longer moves `~`.
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         assert_eq!(
             reasons("HOME=/etc/evil\nCARGO_HOME=~/cargo\n", &home_rooted),
             vec![(1, Reason::ReservedName), (2, Reason::UnreadableReference)]

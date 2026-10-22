@@ -11,16 +11,31 @@ use std::process::Output;
 use assert_cmd::Command;
 use bx::testing::guarded_home;
 
+/// The variables of this process a `bx` it starts inherits; every other one
+/// is cleared, so a `CI`, `BX_LOG` or `XDG_*` set where the suite runs cannot
+/// reach what a test asserts. `PATH` finds git and the stubs a test puts on
+/// it, `LLVM_PROFILE_FILE` sends an instrumented binary's coverage where
+/// `cargo llvm-cov` reads it, and `TMPDIR` keeps scratch files where the
+/// suite's own go.
+fn inherited() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
+    ["PATH", "LLVM_PROFILE_FILE", "TMPDIR"]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
+}
+
+/// The `bx` under test, with an environment of [`inherited`] alone.
+fn bx_command() -> Command {
+    let mut command = Command::cargo_bin("bx").expect("the bx binary");
+    command.env_clear().envs(inherited());
+    command
+}
+
 /// `bx` against `home`, with nothing else in the environment placing the repo
 /// or the state directory, and standard input not a terminal.
 fn bx(home: &Path, args: &[&str]) -> Output {
-    Command::cargo_bin("bx")
-        .expect("the bx binary")
+    bx_command()
         .args(args)
         .env("HOME", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_STATE_HOME")
-        .env_remove("NO_COLOR")
         // Only `bx sync` runs git; this keeps the system's git configuration
         // out of what it sees.
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -188,13 +203,10 @@ fn apply_over_a_damaged_ledger_it_cannot_move_aside_exits_one_and_writes_nothing
     let ledger = state.join("ledger.mpk");
     std::fs::write(&ledger, b"not a ledger").expect("damage the ledger");
 
-    let output = Command::cargo_bin("bx")
-        .expect("the bx binary")
+    let output = bx_command()
         .args(["apply", "--yes"])
         .env("HOME", home.path())
-        .env_remove("XDG_CONFIG_HOME")
         .env("XDG_STATE_HOME", &xdg_state)
-        .env_remove("NO_COLOR")
         .output()
         .expect("run bx");
 
@@ -312,13 +324,10 @@ fn plan_over_a_damaged_state_directory_elsewhere_changes_neither_it_nor_the_home
     chmod(&state, 0o755);
     let before = (snapshot(home.path()), snapshot(elsewhere.path()));
 
-    let output = Command::cargo_bin("bx")
-        .expect("the bx binary")
+    let output = bx_command()
         .arg("plan")
         .env("HOME", home.path())
-        .env_remove("XDG_CONFIG_HOME")
         .env("XDG_STATE_HOME", elsewhere.path())
-        .env_remove("NO_COLOR")
         .output()
         .expect("run bx");
 
@@ -1143,8 +1152,7 @@ fn served(home: &Path, latest: &str) -> (std::ffi::OsString, std::path::PathBuf)
 
 /// `bx self-upgrade ARGS` with `path` as its `PATH`.
 fn self_upgrade(home: &Path, path: &std::ffi::OsStr, args: &[&str]) -> Output {
-    Command::cargo_bin("bx")
-        .expect("the bx binary")
+    bx_command()
         .arg("self-upgrade")
         .args(args)
         .env("HOME", home)
@@ -1219,6 +1227,8 @@ fn self_upgrade_copy(exe: &Path, home: &Path, path: &std::ffi::OsStr) -> Output 
     for _ in 0..200 {
         match std::process::Command::new(exe)
             .arg("self-upgrade")
+            .env_clear()
+            .envs(inherited())
             .env("HOME", home)
             .env("PATH", path)
             .stdin(std::process::Stdio::null())
@@ -1381,8 +1391,7 @@ fn self_update_check_reports_exactly_as_self_upgrade_check() {
         let home = guarded_home();
         let (path, requests) = served(home.path(), &tag);
         let check = |spelling: &str| {
-            Command::cargo_bin("bx")
-                .expect("the bx binary")
+            bx_command()
                 .args([spelling, "--check"])
                 .env("HOME", home.path())
                 .env("PATH", &path)

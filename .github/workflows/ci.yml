@@ -155,9 +155,10 @@ jobs:
           install_args: shellcheck actionlint
       - name: ShellCheck
         run: mise run shellcheck
-      # No file may newly exceed the line limit, and the baseline of files
-      # already over it may only shrink: it is held against the PR's base, or
-      # against master before the push on a push to master.
+      # No file may newly exceed the line limit, the baseline of files
+      # already over it may only shrink, and the limit may only go down: both
+      # are held against the PR's base, or against master before the push on
+      # a push to master.
       - name: Line check
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

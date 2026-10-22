@@ -1902,10 +1902,8 @@ fn a_check_lock_that_cannot_be_opened_says_opening() {
         .expect_err("a directory is not opened for writing");
     // `open(2)` of a directory for writing is `EISDIR` on Linux and macOS.
     let refused = std::io::Error::from_raw_os_error(rustix::io::Errno::ISDIR.raw_os_error());
-    assert_eq!(
-        error.to_string(),
-        format!("opening {}: {refused}", path.display())
-    );
+    let expected = format!("opening {}: {refused}", path.display());
+    assert_eq!(error.to_string(), expected);
 }
 
 /// `ask-due` as [`on_offer`] leaves it: a question already due.

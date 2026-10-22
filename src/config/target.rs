@@ -1734,8 +1734,7 @@ fn parse_format(ctx: &Ctx, table: &Table) -> Result<Format, Error> {
 /// Parse one `[[target]]` entry that is not a tree.
 ///
 /// Only tests parse a lone entry outside a layer, so this sits last, beside
-/// them: the source scans that read everything above the first `#[cfg(test)]`
-/// as this module's shipped code still read all of it.
+/// them.
 ///
 /// # Errors
 ///

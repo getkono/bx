@@ -103,9 +103,7 @@ fn values_table(doc: &mut DocumentMut) -> &mut Table {
 /// table is a valid, readable statement that this account has answered nothing,
 /// and removing it would discard whatever comments sat above it.
 ///
-/// Only tests call it, so it sits last, beside them: the source scans that
-/// read everything above the first `#[cfg(test)]` as this module's shipped
-/// code still read all of it.
+/// Only tests call it, so it sits last, beside them.
 #[cfg(test)]
 pub fn unset(doc: &mut DocumentMut, name: &str) -> bool {
     doc.get_mut(VALUES)
@@ -345,10 +343,7 @@ mod tests {
         // true. The module is read whole, its submodules included, so splitting
         // it does not take a file out of the scan.
         for (path, source) in crate::testing::module_sources("config::values::local") {
-            let body = source
-                .split("#[cfg(test)]")
-                .next()
-                .expect("the non-test half");
+            let body = crate::testing::shipped_source(&path, &source);
 
             for forbidden in [
                 "std::fs",

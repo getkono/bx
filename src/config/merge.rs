@@ -1445,10 +1445,7 @@ mod tests {
                 // passes in by naming the call the library itself may not make — a
                 // textual scan cannot tell a description from a call, so whole-line
                 // comments are dropped and code is what is scanned.
-                let code = source
-                    .split("#[cfg(test)]")
-                    .next()
-                    .expect("the non-test half");
+                let code = crate::testing::shipped_source(&path, &source);
                 for (edge, seen) in edges.iter().zip(&mut edges_seen) {
                     *seen += code.lines().filter(|line| line.trim() == *edge).count();
                 }

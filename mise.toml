@@ -71,8 +71,8 @@ description = "Measure what bx's generated files cost zsh and bash startup again
 run = ["cargo build --release --bin bx", "bench/run.sh"]
 
 [tasks.line-check]
-description = "Fail when a file newly exceeds the line limit or the baseline grows (CI, pre-commit)"
-usage = 'arg "[base]" help="Ref whose baseline this one may not outgrow (default: origin/HEAD)"'
+description = "Fail when a file newly exceeds the line limit, the baseline grows, or the limit rises (CI, pre-commit)"
+usage = 'arg "[base]" help="Ref whose baseline and limit this one may not outgrow (default: origin/HEAD)"'
 run = 'scripts/line-check ${usage_base:-}'
 
 [tasks.shellcheck]

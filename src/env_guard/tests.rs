@@ -2354,6 +2354,13 @@ fn every_site_that_reaches_the_guard_is_known() {
     // into a further file is a new caller, as it was when sites were
     // matched by file. "This module" is the `env_guard` module wherever
     // its files are — `env_guard.rs` and everything beneath `env_guard/`.
+    //
+    // **A site is its whole line, arguments included, on purpose** (issue
+    // #308). Matching the call's shape — the path it names — would let a
+    // known site change what it hands the guard, `scan_with(content, …)`
+    // becoming `scan_with("", …)`, and still be claimed. A rename or a
+    // rustfmt reflow fails here instead; that failure is closed, names the
+    // lines, and costs one edit to `KNOWN`.
     const KNOWN: [&str; 20] = [
         // `bx add`'s advisory scan.
         "use crate::env_guard::{self, Reason, RootSet};",

@@ -326,10 +326,11 @@ mod tests {
     /// and a hand-maintained number is a list of one.
     ///
     /// So the census is re-derived from the enum at every run instead. Rust
-    /// cannot enumerate an enum's variants without a derive macro, and adding
-    /// a crate for it is not this module's decision — but the declaration is
-    /// in this module's source, and the census reads it from there at run
-    /// time. `testing::tests::no_user_specific_literal_survives_in_a_tracked_file`
+    /// cannot enumerate an enum's variants without a derive macro, and issue
+    /// #308 kept this census rather than add a dependency (`strum`'s
+    /// `EnumIter`) for a test. The declaration is in this module's source,
+    /// and the census reads it from there at run time.
+    /// `testing::tests::no_user_specific_literal_survives_in_a_tracked_file`
     /// already establishes source-reading as how this repository holds a
     /// property no type can carry.
     ///

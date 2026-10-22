@@ -1145,10 +1145,8 @@ pub(crate) mod tests {
 
     /// Leave the journal a session stands in, as a crash does.
     fn interrupt(home: &GuardedHome) {
-        use crate::journal::{Session, SessionKind};
-
         let state = StateDir::resolve(home.path());
-        drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+        drop(crate::journal::tests::apply_session(&state, home.path()));
     }
 
     /// Picks everything offered, and a session is interrupted while it asks.

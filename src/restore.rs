@@ -875,7 +875,9 @@ mod tests {
     use super::*;
 
     use crate::fs::Mode;
-    use crate::journal::tests::{peek, plant_file, target, write_to};
+    use crate::journal::tests::{
+        applied, apply_session, interrupted, peek, plant_file, target, write_to,
+    };
     use crate::journal::{Session, SessionKind};
     use crate::state::{ContentHash, LedgerView, Prior};
     use crate::testing::guarded_home;
@@ -884,9 +886,7 @@ mod tests {
     fn managed(state: &StateDir, home: &Path, rel: &str, bytes: &str, mode: Mode) -> Portable {
         let request = write_to(home, rel, bytes, mode);
         let portable = request.target.clone();
-        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
-        session.apply(request).expect("apply");
-        session.finish().expect("finish");
+        applied(state, home, vec![request]);
         portable
     }
 
@@ -947,11 +947,11 @@ mod tests {
     /// Apply `rel` in a session that dies between its `End` frame and its
     /// ledger save, then let recovery rebuild the ledger from the journal.
     fn applied_through_recovery(state: &StateDir, home: &Path, rel: &str, bytes: &str) {
-        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
-        session
-            .apply(write_to(home, rel, bytes, Mode::DEFAULT_FILE))
-            .expect("apply");
-        drop(session);
+        interrupted(
+            state,
+            home,
+            vec![write_to(home, rel, bytes, Mode::DEFAULT_FILE)],
+        );
         crate::journal::tests::seal(&state.journal(), 1);
         assert_eq!(
             crate::recover::recover(state).expect("recover"),
@@ -1665,8 +1665,7 @@ mod tests {
         let a = managed(&state, home.path(), ".a", "a-bx\n", Mode::DEFAULT_FILE);
 
         // An apply that never finished, over a different target.
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".b", "b-bx\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -1693,8 +1692,7 @@ mod tests {
         plant_file(&home.child(".b"), "b-theirs\n", Mode::DEFAULT_FILE);
         let a = managed(&state, home.path(), ".a", "a-bx\n", Mode::DEFAULT_FILE);
 
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".b", "b-bx\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -1889,9 +1887,7 @@ mod tests {
         let (ta, tb) = (target(home.path(), a).0, target(home.path(), b).0);
         match sharing {
             Sharing::OneRm | Sharing::OneRmReversed => {
-                let mut session =
-                    Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
-                        .expect("open");
+                let mut session = apply_session(&state, home.path());
                 session
                     .apply(write_to(home.path(), a, "a\n", Mode::DEFAULT_FILE))
                     .expect("apply a");
@@ -2264,9 +2260,7 @@ mod tests {
     fn managed_dir(state: &StateDir, home: &Path, rel: &str, mode: Mode) -> Portable {
         let request = crate::journal::tests::dir_to(home, rel, mode);
         let portable = request.target.clone();
-        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
-        session.apply(request).expect("apply");
-        session.finish().expect("finish");
+        applied(state, home, vec![request]);
         portable
     }
 

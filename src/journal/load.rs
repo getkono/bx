@@ -549,11 +549,12 @@ mod tests {
 
     use crate::fs::Mode;
     use crate::journal::tests::{
-        WRITES_THROUGH_PERMISSIONS, created, frame_starts, names_in, peek, permissions_refuse,
-        plant_file, raw_journal, seal, some_begin, state_beyond_set_aside_names, target, write_to,
+        WRITES_THROUGH_PERMISSIONS, apply_session, created, frame_starts, intent, names_in, peek,
+        permissions_refuse, plant_file, raw_journal, seal, some_begin,
+        state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Done, End, Journal, Session, SessionKind, Written};
-    use crate::state::{ContentHash, Mechanism, Prior, StateDir, dir_digest};
+    use crate::state::{Mechanism, StateDir, dir_digest};
     use crate::testing::{cannot_build, guarded_home};
 
     #[test]
@@ -765,8 +766,7 @@ mod tests {
         let state = StateDir::resolve(home.path());
         plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
 
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -880,21 +880,7 @@ mod tests {
             &path,
             &[
                 begin_under(home.path(), Vec::new()),
-                Record::Intent(Intent {
-                    target: foreign,
-                    dest: dest.clone(),
-                    temp: None,
-                    before: Prior::Absent,
-                    after: Written::Present {
-                        digest: ContentHash::of(b"[user]\n"),
-                        mode: Mode::DEFAULT_FILE,
-                    },
-                    created_dirs: Vec::new(),
-                    mechanism: Some(Mechanism::Own),
-                    ledger_written: None,
-                    dir: false,
-                    link: false,
-                }),
+                created(&foreign, &dest, b"[user]\n"),
             ],
         );
         let bytes = std::fs::read(&path).expect("the journal");
@@ -982,16 +968,9 @@ mod tests {
         let path = dir.path().join("journal.mpk");
         let (target, dest) = target(home.path(), ".conf");
         let intent = Intent {
-            target: target.clone(),
-            dest,
-            temp: None,
-            before: Prior::Absent,
             after: Written::Absent,
-            created_dirs: Vec::new(),
             mechanism: None,
-            ledger_written: None,
-            dir: false,
-            link: false,
+            ..intent(&target, &dest, b"")
         };
         let once = vec![
             Record::Begin(Begin {
@@ -1310,7 +1289,7 @@ mod tests {
         // by the next session's journal without ever being examined.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
-        drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+        drop(apply_session(&state, home.path()));
         let path = state.journal();
         let bytes = std::fs::read(&path).expect("read");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
@@ -1511,19 +1490,14 @@ mod tests {
         let home = guarded_home();
         let (target, dest) = target(home.path(), ".d");
         let intent = Intent {
-            target: target.clone(),
-            dest: dest.clone(),
             temp: Some(home.child(format!("{}x", fs::TEMP_PREFIX))),
-            before: Prior::Absent,
             after: Written::Present {
                 digest: dir_digest(),
                 mode: Mode::PRIVATE_DIR,
             },
-            created_dirs: Vec::new(),
             mechanism: Some(Mechanism::Dir),
-            ledger_written: None,
             dir: true,
-            link: false,
+            ..intent(&target, &dest, b"")
         };
         assert_eq!(
             misplaced(&intent, home.path()),

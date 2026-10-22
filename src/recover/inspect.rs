@@ -549,7 +549,8 @@ mod tests {
 
     use crate::fs::{self, Mode};
     use crate::journal::tests::{
-        link_at, link_to, peek, plant_file, raw_journal, seal, target, write_to,
+        apply_session, intent, link_at, link_to, peek, plant_file, raw_journal, seal, target,
+        write_to,
     };
     use crate::journal::{
         self, Begin, Content, Done, End, Intent, Loaded, Ownership, Record, Request, Session,
@@ -775,7 +776,7 @@ mod tests {
     fn an_interruption_that_named_nothing_still_exits_pending() {
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
-        drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+        drop(apply_session(&state, home.path()));
 
         let interruption = pending(&state).expect("pending").expect("interrupted");
         assert!(interruption.unfinished.is_empty());
@@ -806,8 +807,7 @@ mod tests {
         let state = StateDir::resolve(home.path());
         let bytes = "bx\n";
         let digest = ContentHash::of(bytes.as_bytes());
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".conf", bytes, Mode::DEFAULT_FILE))
             .expect("apply");
@@ -837,19 +837,11 @@ mod tests {
                     scope: Vec::new(),
                 }),
                 Record::Intent(Intent {
-                    target: portable.clone(),
-                    dest: dest.clone(),
-                    temp: None,
-                    before: Prior::Absent,
                     after: Written::Present {
                         digest,
                         mode: Mode::PRIVATE_FILE,
                     },
-                    created_dirs: Vec::new(),
-                    mechanism: Some(Mechanism::Own),
-                    ledger_written: None,
-                    dir: false,
-                    link: false,
+                    ..intent(&portable, &dest, b"")
                 }),
                 Record::Done(Done {
                     target: portable.clone(),
@@ -880,16 +872,8 @@ mod tests {
         let old = ContentHash::of(b"old\n");
         let new = ContentHash::of(b"new\n");
         let base = Intent {
-            target: portable,
-            dest,
-            temp: None,
-            before: Prior::Absent,
             after: Written::Absent,
-            created_dirs: Vec::new(),
-            mechanism: Some(Mechanism::Own),
-            ledger_written: None,
-            dir: false,
-            link: false,
+            ..intent(&portable, &dest, b"")
         };
         let tail = "bx will not overwrite it. Put back either of those two states, \
                     or abandon the interrupted session to have bx report it as a \
@@ -1033,21 +1017,7 @@ mod tests {
                     home: home.path().to_path_buf(),
                     scope: Vec::new(),
                 }),
-                Record::Intent(Intent {
-                    target: portable.clone(),
-                    dest,
-                    temp: None,
-                    before: Prior::Absent,
-                    after: Written::Present {
-                        digest: ContentHash::of(b"never landed\n"),
-                        mode: Mode::DEFAULT_FILE,
-                    },
-                    created_dirs: Vec::new(),
-                    mechanism: Some(Mechanism::Own),
-                    ledger_written: None,
-                    dir: false,
-                    link: false,
-                }),
+                Record::Intent(intent(&portable, &dest, b"never landed\n")),
                 Record::End(End { written: 0 }),
             ],
         );
@@ -1217,8 +1187,7 @@ mod tests {
         let dest = home.child(".conf");
         plant_file(&dest, "B0\n", Mode::DEFAULT_FILE);
 
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".conf", "B1\n", Mode::DEFAULT_FILE))
             .expect("the first write");
@@ -1256,8 +1225,7 @@ mod tests {
         let bx1 = "user line\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
         let bx2 = "user line\n# >>> bx >>>\nBX2\n# <<< bx <<<\n";
         plant_file(&dest, "user line\n", Mode::DEFAULT_FILE);
-        let mut first =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut first = apply_session(&state, home.path());
         first
             .apply(Request {
                 target: portable.clone(),
@@ -1293,23 +1261,14 @@ mod tests {
                     scope: Vec::new(),
                 }),
                 Record::Intent(Intent {
-                    target: portable.clone(),
-                    dest: dest.clone(),
-                    temp: None,
                     before: Prior::Existed(RestoreRef {
                         digest: displaced,
                         mode: Mode::DEFAULT_FILE,
                         len: u64::try_from(edited.len()).expect("a length"),
                     }),
-                    after: Written::Present {
-                        digest: ContentHash::of(bx2.as_bytes()),
-                        mode: Mode::DEFAULT_FILE,
-                    },
-                    created_dirs: Vec::new(),
                     mechanism: Some(region),
                     ledger_written: Some(ContentHash::of(bx1.as_bytes())),
-                    dir: false,
-                    link: false,
+                    ..intent(&portable, &dest, bx2.as_bytes())
                 }),
                 Record::Done(Done {
                     target: portable.clone(),
@@ -1384,8 +1343,7 @@ mod tests {
         // UnusableParent, never naming `abandon`.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         let request = write_to(home.path(), ".made/f.conf", "bx\n", Mode::DEFAULT_FILE);
         let key = request.target.clone();
         session.apply(request).expect("bx creates ~/.made/f.conf");

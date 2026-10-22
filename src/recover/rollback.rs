@@ -269,12 +269,10 @@ mod tests {
 
     use crate::fs::{self, Mode};
     use crate::journal::tests::{
-        crash_phases, dir_to, finish_crash_phases, link_at, link_to, names_in, peek, plant_file,
-        seal, target, write_to,
+        apply_session, crash_phases, dir_to, finish_crash_phases, link_at, link_to, names_in, peek,
+        plant_file, seal, target, write_to,
     };
-    use crate::journal::{
-        self, Content, Intent, Ownership, Record, Request, Session, SessionKind, Written,
-    };
+    use crate::journal::{self, Content, Intent, Ownership, Record, Request, SessionKind, Written};
     use crate::paths::Portable;
 
     use crate::state::{ContentHash, LedgerView, Mechanism, Prior, StateDir};
@@ -575,8 +573,7 @@ mod tests {
         };
         let home = PathBuf::from(home);
         let state = StateDir::resolve(&home);
-        let mut session =
-            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let mut session = apply_session(&state, &home);
         for request in crash_requests(&home) {
             session.apply(request).expect("apply");
         }
@@ -636,8 +633,7 @@ mod tests {
         };
         let home = PathBuf::from(home);
         let state = StateDir::resolve(&home);
-        let mut session =
-            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let mut session = apply_session(&state, &home);
         for request in link_requests(&home) {
             session.apply(request).expect("apply");
         }
@@ -803,8 +799,7 @@ mod tests {
             let home = guard.child(format!("rm-{index}-{phase}"));
             let state = StateDir::resolve(&home);
             let vault = home.join(".vault");
-            let mut session =
-                Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+            let mut session = apply_session(&state, &home);
             let request = write_to(&home, ".vault/key.conf", "secret\n", Mode::PRIVATE_FILE);
             let key = request.target.clone();
             session
@@ -1101,8 +1096,7 @@ mod tests {
         let dest = home.child(".conf");
         plant_file(&dest, "the user's\n", Mode::DEFAULT_FILE);
 
-        let mut first =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut first = apply_session(&state, home.path());
         first
             .apply(write_to(home.path(), ".conf", "one\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -1518,8 +1512,7 @@ mod tests {
         let dir = home.child(".config/app");
         let claims = vec![home.child(".config"), home.child(".config/app")];
 
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         for rel in [".config/app/a.conf", ".config/app/heir.conf"] {
             session
                 .apply(write_to(home.path(), rel, "bx\n", Mode::DEFAULT_FILE))
@@ -1607,8 +1600,7 @@ mod tests {
 
         // bx makes ~/.config/app for gone.conf, which claims it and ~/.config;
         // heir.conf goes in beside it and claims nothing.
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         for rel in [".config/app/gone.conf", ".config/app/heir.conf"] {
             session
                 .apply(write_to(home.path(), rel, "bx\n", Mode::DEFAULT_FILE))
@@ -1793,8 +1785,7 @@ mod tests {
                     .collect();
 
                 if earlier_apply {
-                    let mut session =
-                        Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+                    let mut session = apply_session(&state, &home);
                     for request in crash_requests(&home) {
                         if matches!(request.ownership, Ownership::Owned(_)) {
                             let Content::Bytes { planned, .. } = request.content else {

@@ -221,8 +221,9 @@ mod tests {
 
     use crate::fs::{self, Mode};
     use crate::journal::tests::{
-        WRITES_THROUGH_PERMISSIONS, frame_starts, names_in, peek, permissions_refuse, plant_file,
-        raw_journal, seal, state_beyond_set_aside_names, target, write_to,
+        WRITES_THROUGH_PERMISSIONS, apply_session, frame_starts, names_in, peek,
+        permissions_refuse, plant_file, raw_journal, seal, state_beyond_set_aside_names, target,
+        write_to,
     };
     use crate::journal::{
         self, Begin, Done, End, Intent, Loaded, Record, Session, SessionKind, Written,
@@ -334,7 +335,7 @@ mod tests {
 
         // And the refusal is cleared: bx can write again.
         assert!(pending(&state).expect("pending").is_none());
-        drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+        drop(apply_session(&state, home.path()));
     }
 
     #[test]
@@ -785,8 +786,7 @@ mod tests {
         let state = StateDir::resolve(home.path());
         let (portable, dest) = target(home.path(), ".conf");
         plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
-        let mut first =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut first = apply_session(&state, home.path());
         first
             .apply(write_to(home.path(), ".conf", "one\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -1244,8 +1244,7 @@ mod tests {
             let b = home.join(".b");
             plant_file(&a, "A0\n", Mode::DEFAULT_FILE);
             plant_file(&b, "B0\n", Mode::DEFAULT_FILE);
-            let mut session =
-                Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+            let mut session = apply_session(&state, &home);
             session
                 .apply(write_to(&home, ".a", "A1\n", Mode::DEFAULT_FILE))
                 .expect("apply .a");
@@ -1342,8 +1341,7 @@ mod tests {
         plant_file(&b, "B0\n", Mode::DEFAULT_FILE);
 
         // An earlier session, finished and unlinked: its last frame is the stale block.
-        let mut earlier =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut earlier = apply_session(&state, home.path());
         earlier
             .apply(write_to(home.path(), ".x", "X\n", Mode::DEFAULT_FILE))
             .expect("apply");

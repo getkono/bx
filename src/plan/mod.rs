@@ -746,7 +746,7 @@ pub(crate) mod tests {
     use crate::journal::{Content, Ownership, Request};
     use crate::paths::Portable;
     use crate::state::{ExclusiveLock, Mechanism};
-    use crate::testing::{GuardedHome, guarded_home};
+    use crate::testing::{GuardedHome, guarded_home, mode_of};
 
     /// An environment with nothing overridden and no terminal.
     pub(crate) fn env(home: &Path) -> Env {
@@ -1179,14 +1179,6 @@ pub(crate) mod tests {
             "[secrets]\nidentity = \"~/.config/age/key.txt\"\n",
         );
         key.to_public().to_string()
-    }
-
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::metadata(path)
-            .expect("the file")
-            .permissions()
-            .mode()
-            & 0o7777
     }
 
     #[test]

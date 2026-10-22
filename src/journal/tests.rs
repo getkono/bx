@@ -229,9 +229,11 @@ pub(crate) fn finish_crash_phases() -> [&'static str; FINISH_PHASES.len()] {
     FINISH_PHASES.map(Crash::name)
 }
 
-/// An Intent that says bx created `dest` holding `bytes`.
-pub(super) fn created(target: &Portable, dest: &Path, bytes: &[u8]) -> Record {
-    Record::Intent(Intent {
+/// The Intent a session journals for creating `dest` holding `bytes`, owned
+/// by bx: the base every test that needs another Intent builds on with
+/// `..intent(..)`.
+pub(crate) fn intent(target: &Portable, dest: &Path, bytes: &[u8]) -> Intent {
+    Intent {
         target: target.clone(),
         dest: dest.to_path_buf(),
         temp: None,
@@ -245,7 +247,12 @@ pub(super) fn created(target: &Portable, dest: &Path, bytes: &[u8]) -> Record {
         ledger_written: None,
         dir: false,
         link: false,
-    })
+    }
+}
+
+/// An Intent that says bx created `dest` holding `bytes`.
+pub(super) fn created(target: &Portable, dest: &Path, bytes: &[u8]) -> Record {
+    Record::Intent(intent(target, dest, bytes))
 }
 
 /// The ledger as it stands on disk under `state`.
@@ -277,13 +284,48 @@ pub(crate) fn mode_at(path: &Path) -> Option<Mode> {
         .map(|meta| Mode::from_bits(meta.permissions().mode()))
 }
 
+/// An apply session over `state`, for the account whose home is `home`,
+/// scoped to nothing.
+pub(crate) fn apply_session(state: &StateDir, home: &Path) -> Session {
+    Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open")
+}
+
 /// Apply `requests` in one session and finish it.
-pub(super) fn applied(state: &StateDir, home: &Path, requests: Vec<Request>) {
-    let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
+pub(crate) fn applied(state: &StateDir, home: &Path, requests: Vec<Request>) {
+    let mut session = apply_session(state, home);
     for request in requests {
         session.apply(request).expect("apply");
     }
     session.finish().expect("finish");
+}
+
+/// Apply `requests` in one session and abandon it without finishing, which
+/// is exactly the state a crash leaves: a journal that stands, and a ledger
+/// that does not yet know about any of it.
+pub(crate) fn interrupted(state: &StateDir, home: &Path, requests: Vec<Request>) {
+    let mut session = apply_session(state, home);
+    for request in requests {
+        session.apply(request).expect("apply");
+    }
+    drop(session);
+}
+
+/// A request to remove `rel` under `home`, releasing it, with the
+/// directories bx created for it, carrying what is there now as plan's
+/// observation.
+pub(crate) fn remove_to(home: &Path, rel: &str, created_dirs: Vec<PathBuf>) -> Request {
+    let (target, dest) = target(home, rel);
+    let planned = fs::observe(&dest).expect("plan's observation");
+    Request {
+        target,
+        dest,
+        content: Content::Absent {
+            created_dirs,
+            planned,
+        },
+        mode: Mode::DEFAULT_FILE,
+        ownership: Ownership::Released,
+    }
 }
 
 /// The text at `path` when a symlink is there, following nothing.

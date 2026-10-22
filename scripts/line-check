@@ -1,19 +1,25 @@
 #!/bin/sh
-# line-check — no tracked file may grow past LIMIT lines.
+# line-check — no tracked file may grow past LIMIT lines, and LIMIT only falls.
 #
 #   scripts/line-check [BASE]
 #
 # Counts the lines of every git-tracked text file in the working tree, outside
-# tests/fixtures/ (captured third-party output nobody edits). A file over LIMIT
-# fails the check unless its path is listed in scripts/line-check-baseline, the
-# files that were already over it when the gate landed. That list may only
-# shrink, so the check also fails when:
+# tests/fixtures/ (captured third-party output nobody edits) and Cargo.lock
+# (generated). A file over LIMIT fails the check unless its path is listed in
+# scripts/line-check-baseline. That list may only shrink, and LIMIT may only
+# fall, so the check also fails when:
 #
 #   - a listed path is no longer over LIMIT (or no longer exists): delete its
 #     line, so the file cannot quietly grow back;
-#   - the list holds a path BASE's list does not: the baseline is not a place to
-#     park a newly long file. BASE defaults to origin/HEAD; when it does not
-#     resolve, or holds no baseline yet, this part is skipped and says so.
+#   - LIMIT is above BASE's LIMIT;
+#   - the list holds a path BASE's list does not. The one exception is a LIMIT
+#     below BASE's: a path BASE already held over the new LIMIT may then join
+#     the list. Lowering the limit is the only way an entry is added, and a
+#     file grown onto the list still fails.
+#
+# BASE defaults to origin/HEAD. When it does not resolve, the comparisons with
+# it are skipped and the script says so, as it does for a BASE that holds no
+# baseline or no LIMIT yet.
 #
 # The baseline holds paths, not counts, so a listed file shrinking or growing
 # under its entry never churns the list. Lines starting with `#` and blank
@@ -21,7 +27,8 @@
 
 set -eu
 
-LIMIT=3743
+LIMIT=2153
+SCRIPT=scripts/line-check
 BASELINE=scripts/line-check-baseline
 
 cd "$(git rev-parse --show-toplevel)"
@@ -32,9 +39,13 @@ problem() {
 	fail=1
 }
 
-# Total lines of one file, counting a final line with no newline.
+note() {
+	printf 'line-check: %s\n' "$1" >&2
+}
+
+# Total lines read from stdin, counting a final line with no newline.
 lines() {
-	awk 'END { print NR }' "$1"
+	awk 'END { print NR }'
 }
 
 # Paths listed in a baseline read from stdin.
@@ -62,18 +73,25 @@ $1
 EOF
 }
 
-# Tracked text files outside tests/fixtures/ that are over LIMIT, sorted.
-# `--eol` marks a binary in the index as `i/-text`, and its path follows a tab.
-over=$(git -c core.quotePath=false ls-files --eol -- . ':!:tests/fixtures/' |
-	awk -F '\t' '$1 !~ /^i\/-text/ { print $2 }' |
-	while IFS= read -r path; do
-		if [ -f "$path" ] && [ ! -L "$path" ]; then
-			printf '%s\0' "$path"
-		fi
-	done |
+# Tracked text files outside the exclusions that are over LIMIT, sorted. Paths
+# travel NUL-terminated, so git quotes none of them. `--eol` marks a binary in
+# the index as `i/-text`, and the path follows the entry's first tab. Each path
+# reaches awk as `./PATH`, so one holding `=` is a file to awk, not an
+# assignment.
+# shellcheck disable=SC2016 # the inner sh expands the program, not this one
+over=$(git ls-files -z --eol -- . ':!:tests/fixtures/' ':!:Cargo.lock' |
+	xargs -0 sh -c '
+		for entry do
+			case $entry in i/-text*) continue ;; esac
+			path=${entry#*	}
+			if [ -f "$path" ] && [ ! -L "$path" ]; then
+				printf "./%s\0" "$path"
+			fi
+		done
+	' sh |
 	xargs -0 awk -v limit="$LIMIT" '
 		{ n[FILENAME]++ }
-		END { for (f in n) if (n[f] > limit) print f }
+		END { for (f in n) if (n[f] > limit) print substr(f, 3) }
 	' |
 	LC_ALL=C sort)
 
@@ -93,7 +111,7 @@ if [ -n "$unlisted" ]; then
 	fail=1
 	while IFS= read -r path; do
 		printf 'line-check: %s has %s lines, over the %s-line limit; split it\n' \
-			"$path" "$(lines "$path")" "$LIMIT" >&2
+			"$path" "$(lines <"$path")" "$LIMIT" >&2
 	done <<EOF
 $unlisted
 EOF
@@ -103,21 +121,44 @@ fi
 report "$(missing "$listed" "$over")" \
 	"%s is no longer over $LIMIT lines; delete it from $BASELINE"
 
-# A baseline entry BASE's baseline does not hold.
+# Lines of list $1 that BASE does not admit to the baseline: a path joins it
+# only when LIMIT fell below BASE's and BASE already held the path over LIMIT.
+unadmitted() {
+	printf '%s\n' "$1" | while IFS= read -r path; do
+		[ -n "$path" ] || continue
+		if [ -n "$base_limit" ] && [ "$LIMIT" -lt "$base_limit" ] &&
+			git cat-file -e "$base:$path" 2>/dev/null &&
+			[ "$(git show "$base:$path" | lines)" -gt "$LIMIT" ]; then
+			continue
+		fi
+		printf '%s\n' "$path"
+	done
+}
+
+# LIMIT and the baseline, against BASE's.
 base=${1-}
 if [ -z "$base" ] && git rev-parse -q --verify origin/HEAD >/dev/null; then
 	base=origin/HEAD
 fi
 if [ -z "$base" ]; then
-	printf 'line-check: no base to compare %s against; growth not checked\n' "$BASELINE" >&2
+	note "no base to compare LIMIT and $BASELINE against; neither checked"
 elif ! git rev-parse -q --verify "$base^{commit}" >/dev/null; then
 	problem "base $base does not resolve to a commit"
-elif ! git cat-file -e "$base:$BASELINE" 2>/dev/null; then
-	printf 'line-check: %s has no %s yet; growth not checked\n' "$base" "$BASELINE" >&2
 else
-	before=$(git show "$base:$BASELINE" | entries)
-	report "$(missing "$listed" "$before")" \
-		"$BASELINE gained %s, which $base does not list; the baseline only shrinks"
+	base_limit=$(git show "$base:$SCRIPT" 2>/dev/null |
+		sed -n 's/^LIMIT=\([0-9][0-9]*\)$/\1/p' | head -n 1)
+	if [ -z "$base_limit" ]; then
+		note "$base has no LIMIT in $SCRIPT yet; LIMIT not checked"
+	elif [ "$LIMIT" -gt "$base_limit" ]; then
+		problem "LIMIT is $LIMIT, above $base's $base_limit; the limit only goes down"
+	fi
+	if ! git cat-file -e "$base:$BASELINE" 2>/dev/null; then
+		note "$base has no $BASELINE yet; growth not checked"
+	else
+		before=$(git show "$base:$BASELINE" | entries)
+		report "$(unadmitted "$(missing "$listed" "$before")")" \
+			"$BASELINE gained %s, which $base does not list; only lowering LIMIT adds an entry, for a file $base already held over it"
+	fi
 fi
 
 if [ "$fail" = 0 ]; then

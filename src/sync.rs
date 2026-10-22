@@ -1118,9 +1118,15 @@ pub(crate) mod tests {
         commit_all(home.path(), &repo, "oops");
         std::fs::remove_file(repo.join("local.toml")).expect("remove");
         commit_all(home.path(), &repo, "undo");
+        let head = rev(home.path(), &repo, "HEAD");
 
         let error = pull(&env(home.path()), &git(home.path())).expect_err("still in history");
-        assert!(matches!(error, Error::WouldPushState { .. }), "{error:?}");
+        let Error::WouldPushState { paths, upstream } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(paths, &vec!["local.toml".to_string()]);
+        assert_eq!(upstream, "origin/master");
+        assert_eq!(rev(home.path(), &repo, "HEAD"), head);
     }
 
     #[test]

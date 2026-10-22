@@ -539,6 +539,7 @@ mod tests {
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
             // `state::store`'s 255-byte-name test pins the same rule for root.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -1417,6 +1418,7 @@ mod tests {
     fn an_unreadable_ledger_stops_bx_instead_of_resetting_it() {
         if rustix::process::geteuid().is_root() {
             // `0000` denies nothing to root; see the note in `state::store`.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -1440,10 +1442,16 @@ mod tests {
         // output as every target's prior on the next apply, and `bx rm` would
         // then write bx's generated content over the user's files.
         let err = Ledger::open(&dir, &lock, home.path()).expect_err("must fail");
-        assert!(matches!(err, Error::Read { .. }), "got {err}");
         assert!(
-            LedgerView::read(&dir, home.path()).is_err(),
-            "the reader must fail too"
+            matches!(&err, Error::Read { path, source }
+                if *path == dir.ledger() && source.kind() == std::io::ErrorKind::PermissionDenied),
+            "got {err}"
+        );
+        let err = LedgerView::read(&dir, home.path()).expect_err("the reader must fail too");
+        assert!(
+            matches!(&err, Error::Read { path, source }
+                if *path == dir.ledger() && source.kind() == std::io::ErrorKind::PermissionDenied),
+            "got {err}"
         );
         assert!(
             !dir.root().join("ledger.mpk.corrupt").exists(),

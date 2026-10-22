@@ -1562,6 +1562,7 @@ mod tests {
         // and reading it as "no file" survived mutation.
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         // Others can search the directory, and its owner cannot.
@@ -1597,6 +1598,7 @@ mod tests {
         // search can itself be examined, and what it names cannot.
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();

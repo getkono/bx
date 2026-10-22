@@ -2406,10 +2406,17 @@ pub(crate) mod tests {
         // later brings its file with it and is covered the day it is written;
         // nobody has to remember to extend a list.
         let home = guarded_home();
+        // A finished apply first, so a saved ledger and its fingerprints are
+        // among the files swept, beside the standing journal's snapshot.
+        own(home.path(), ".owned", b"owned\n", Mechanism::Own);
         let inputs = a_standing_write_over(&home);
 
         let paths = every_state_path(inputs.state());
         let blob_dir = inputs.state().restore();
+        assert!(
+            paths.contains(&inputs.state().ledger()),
+            "the fixture holds no ledger: {paths:?}"
+        );
         assert!(
             paths.iter().any(|path| path.parent() == Some(&*blob_dir)),
             "the fixture holds no restore snapshot, so the case that hung is untested: {paths:?}"
@@ -2426,22 +2433,29 @@ pub(crate) mod tests {
 
             // `refusal` runs on a thread with a deadline, so a read that waits
             // fails the test instead of hanging it.
-            let message = refusal(&inputs, Mode::Plan);
-            assert!(
-                message.contains(&path.display().to_string()),
-                "{}: {message}",
-                path.display()
-            );
-            assert!(
-                message.contains("not a regular file"),
-                "{}: {message}",
-                path.display()
-            );
+            for mode in [Mode::Plan, Mode::Apply] {
+                let message = refusal(&inputs, mode);
+                assert!(
+                    message.contains(&path.display().to_string()),
+                    "{mode:?} {}: {message}",
+                    path.display()
+                );
+                assert!(
+                    message.contains("not a regular file"),
+                    "{mode:?} {}: {message}",
+                    path.display()
+                );
+            }
 
             std::fs::remove_file(&path).expect("the FIFO goes");
             std::fs::write(&path, kept).expect("the file comes back");
         }
 
+        // No refused apply wrote past its refusal.
+        assert_eq!(
+            std::fs::read(home.child(".conf")).expect("untouched"),
+            b"new\n"
+        );
         // With every file back as it was, the same run reports the
         // interruption rather than a refusal: the sweep left nothing behind.
         assert!(plan(&inputs).interrupted.is_some());

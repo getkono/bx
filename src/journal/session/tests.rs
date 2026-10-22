@@ -433,6 +433,7 @@ fn a_removal_opens_its_directory_before_the_unlink_and_syncs_it_after() {
 fn a_directory_that_cannot_be_opened_fails_a_removal_before_the_file_goes() {
     if rustix::process::geteuid().is_root() {
         // Root ignores the permission bits, so there is nothing to assert.
+        crate::testing::skip_unconstructible("root ignores the permission bits");
         return;
     }
     let dir = tempfile::tempdir().expect("a tempdir");

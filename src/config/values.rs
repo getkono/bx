@@ -2158,6 +2158,11 @@ mod tests {
         kind.check(answer, &a_home()).map_err(|e| e.to_string())
     }
 
+    /// Whether `kind` refuses `answer` as malformed, not as some other error.
+    fn malformed(kind: ValueKind, answer: &str) -> bool {
+        matches!(kind.check(answer, &a_home()), Err(ValueError::Malformed { kind: k, .. }) if k == kind)
+    }
+
     #[test]
     fn a_path_value_is_tilde_expanded_and_normalised() {
         assert_eq!(
@@ -2324,8 +2329,8 @@ mod tests {
         assert_eq!(check(ValueKind::Bool, "true").unwrap(), "true");
         assert_eq!(check(ValueKind::Bool, "TRUE").unwrap(), "true");
         assert_eq!(check(ValueKind::Bool, "False").unwrap(), "false");
-        assert!(check(ValueKind::Bool, "yes").is_err());
-        assert!(check(ValueKind::Bool, "1").is_err());
+        assert!(malformed(ValueKind::Bool, "yes"));
+        assert!(malformed(ValueKind::Bool, "1"));
     }
 
     #[test]
@@ -2342,7 +2347,7 @@ mod tests {
             "some one@example.invalid",
             "someone@example.invalid ",
         ] {
-            assert!(check(ValueKind::Email, bad).is_err(), "{bad} was accepted");
+            assert!(malformed(ValueKind::Email, bad), "{bad} was accepted");
         }
     }
 
@@ -2365,7 +2370,7 @@ mod tests {
             "rsa AAAAB3Nz",
             "ssh-ed25519 not-base64!",
         ] {
-            assert!(check(ValueKind::SshKey, bad).is_err(), "{bad} was accepted");
+            assert!(malformed(ValueKind::SshKey, bad), "{bad} was accepted");
         }
     }
 
@@ -2373,20 +2378,12 @@ mod tests {
     fn an_age_recipient_accepts_age1_and_an_ssh_key() {
         let age = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
         assert_eq!(check(ValueKind::AgeRecipient, age).unwrap(), age);
-        assert!(
-            check(
-                ValueKind::AgeRecipient,
-                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample"
-            )
-            .is_ok(),
-            "age accepts an ssh recipient, and so does bx"
-        );
+        // age accepts an ssh recipient, and so does bx.
+        let ssh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample";
+        assert_eq!(check(ValueKind::AgeRecipient, ssh).as_deref(), Ok(ssh));
 
         for bad in ["age1", "age1BADCHARS", "age2ql3z7", "ql3z7hjy54pw3hy"] {
-            assert!(
-                check(ValueKind::AgeRecipient, bad).is_err(),
-                "{bad} was accepted"
-            );
+            assert!(malformed(ValueKind::AgeRecipient, bad), "{bad}");
         }
     }
 
@@ -3419,7 +3416,8 @@ mod tests {
         );
         assert_eq!(placeholders("none here").unwrap(), Vec::<&str>::new());
         assert_eq!(placeholders("{{{{a}}").unwrap(), Vec::<&str>::new());
-        assert!(placeholders("{{A}}").is_err());
+        let refused = placeholders("{{A}}");
+        assert!(matches!(refused, Err(PlaceholderError::IllegalName { .. })));
     }
 
     #[test]

@@ -105,8 +105,8 @@ Validate changes with `mise run`:
 - `shellcheck` — every shell script: the installer, the bench harness and its
   stubs, and `scripts/`
 - `actionlint` — the GitHub workflows
-- `line-check` — no file newly grows past the line limit, and the baseline of
-  files already over it only shrinks
+- `line-check` — no file newly grows past the line limit, the baseline of
+  files already over it only shrinks, and the limit only goes down
 
 `hk` runs `format`, `lint-fix`, `shellcheck`, `actionlint` and `line-check` on
 pre-commit, and `format-check`, `lint`, `test` and `coverage` on pre-push.

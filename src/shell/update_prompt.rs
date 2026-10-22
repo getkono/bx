@@ -1202,8 +1202,12 @@ mod tests {
     #[test]
     fn a_dumb_terminal_is_never_asked() {
         for shell in shells() {
+            // Per shell: a missing terminal for one must not skip the other.
             let Some(at_a_terminal) = calls_at_a_terminal(shell, "xterm") else {
-                return;
+                crate::testing::skip_unconstructible(&format!(
+                    "{shell:?}: no zsh with its zpty module to supply a terminal"
+                ));
+                continue;
             };
             assert_eq!(
                 at_a_terminal, "update --background\n",
@@ -1237,6 +1241,12 @@ mod tests {
                     "{shell:?}: {name}"
                 );
             }
+            // The positive control, in the same rig and last, since the answer
+            // it gives is recorded: with none of them set, the offer is shown
+            // and answered, so the silence above is each variable's doing.
+            let (printed, calls) = rig.run("__bx_update_due", "y", &[]);
+            assert!(printed.contains("  ~/a: x\n"), "{shell:?}: {printed}");
+            assert_eq!(calls, "update\n", "{shell:?}");
         }
     }
 

@@ -342,12 +342,10 @@ mod tests {
     const REV: &str = "0e810e5afa27acbd074398eefbe28d13005dbc15";
     const OTHER: &str = "85919cd1ffa7d2d5412f6d3fe437ebdbeeec4fc5";
 
-    fn home() -> PathBuf {
-        PathBuf::from("/home/example")
-    }
+    use crate::testing::example_home as home;
 
     fn portable(raw: &str) -> Portable {
-        Portable::parse_in(raw, &home()).unwrap()
+        Portable::parse_in(raw, home()).unwrap()
     }
 
     fn locked(url: &str, branch: &str, rev: &str) -> Locked {
@@ -359,7 +357,7 @@ mod tests {
     }
 
     fn parse(text: &str) -> Result<Lock, String> {
-        Lock::parse(text, Path::new("/repo/bx.lock"), &home()).map_err(|e| e.to_string())
+        Lock::parse(text, Path::new("/repo/bx.lock"), home()).map_err(|e| e.to_string())
     }
 
     fn followed(path: &str, url: &str, branch: &str) -> External {
@@ -543,9 +541,9 @@ mod tests {
     #[test]
     fn read_is_empty_without_a_file_and_names_one_it_cannot_read() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(Lock::read(dir.path(), &home()).unwrap(), Lock::default());
+        assert_eq!(Lock::read(dir.path(), home()).unwrap(), Lock::default());
         std::fs::create_dir(dir.path().join(FILE)).unwrap();
-        let err = Lock::read(dir.path(), &home()).unwrap_err().to_string();
+        let err = Lock::read(dir.path(), home()).unwrap_err().to_string();
         assert!(err.contains("bx.lock"), "{err}");
         assert_eq!(Lock::path_in(dir.path()), dir.path().join(FILE));
     }

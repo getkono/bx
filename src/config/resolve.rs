@@ -519,10 +519,11 @@ mod tests {
     use crate::config::target::{Attach, Format, Gen, Interactive};
     use crate::config::{Layer, LayerKind, parse_str};
     use crate::shell::placement::{place, vacated_fragments};
+    use crate::testing::assert_mentions;
     use std::path::PathBuf;
 
     pub(super) fn home() -> PathBuf {
-        PathBuf::from("/var/home/example")
+        crate::testing::example_home().to_path_buf()
     }
 
     /// Build a layer of the given kind out of TOML.
@@ -1553,13 +1554,14 @@ mod tests {
                     names: vec!["profile".to_string()]
                 }
             );
-            for part in [
-                "`~/.config/{{profile}}/s` at bx.toml:4",
-                "`~/.config/default/s` at bx.toml:7",
-                "the answer to `profile` at local.toml:3",
-            ] {
-                assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
-            }
+            assert_mentions(
+                &entry.hint,
+                &[
+                    "`~/.config/{{profile}}/s` at bx.toml:4",
+                    "`~/.config/default/s` at bx.toml:7",
+                    "the answer to `profile` at local.toml:3",
+                ],
+            );
         }
         assert_eq!(ready(&default, 2).path.as_str(), "~/.zshrc");
     }
@@ -1587,14 +1589,15 @@ mod tests {
                     names: vec!["p".to_string()]
                 }
             );
-            for part in [
-                "`~/{{p}}/s` at bx.toml:12",
-                "`~/{{q}}/{{r}}` at bx.toml:15",
-                "because of the answer to `p` at local.toml:2, carried in by the default of \
-                 `q` at bx.toml:4; change that answer, or answer `q` directly",
-            ] {
-                assert!(entry.hint.contains(part), "{index} {part}: {}", entry.hint);
-            }
+            assert_mentions(
+                &entry.hint,
+                &[
+                    "`~/{{p}}/s` at bx.toml:12",
+                    "`~/{{q}}/{{r}}` at bx.toml:15",
+                    "because of the answer to `p` at local.toml:2, carried in by the default of \
+                     `q` at bx.toml:4; change that answer, or answer `q` directly",
+                ],
+            );
             assert!(!entry.hint.contains("`r`"), "{index}: {}", entry.hint);
         }
         ready(&derived, 2);
@@ -1840,13 +1843,14 @@ mod tests {
                 names: vec!["p".to_string()]
             }
         );
-        for part in [
-            "`~/.config/s` at bx.toml:4",
-            "`~/.config/{{p}}/../s` at bx.toml:10",
-            "the answer to `p` at local.toml:2",
-        ] {
-            assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
-        }
+        assert_mentions(
+            &entry.hint,
+            &[
+                "`~/.config/s` at bx.toml:4",
+                "`~/.config/{{p}}/../s` at bx.toml:10",
+                "the answer to `p` at local.toml:2",
+            ],
+        );
         ready(&folded, 1);
         ready(&folded, 2);
 
@@ -1873,13 +1877,14 @@ mod tests {
         for flag in ["true", "false"] {
             let message = resolved(BOOL, Some(&format!("[values]\nflag = {flag}\n")))
                 .expect_err("one path for every answer is the layer's defect");
-            for part in [
-                "bx.toml:7",
-                "names the same file as `~/.config/s` at bx.toml:4",
-                "in this same layer",
-            ] {
-                assert!(message.contains(part), "{flag} {part}: {message}");
-            }
+            assert_mentions(
+                &message,
+                &[
+                    "bx.toml:7",
+                    "names the same file as `~/.config/s` at bx.toml:4",
+                    "in this same layer",
+                ],
+            );
         }
 
         const TWICE: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
@@ -1891,13 +1896,14 @@ mod tests {
         for p in ["a", "a/b"] {
             let message = resolved(TWICE, Some(&format!("[values]\np = \"{p}\"\n")))
                 .expect_err("one path for every answer is the layer's defect");
-            for part in [
-                "bx.toml:13",
-                "names the same file as `~/.config/{{p}}/../s` at bx.toml:10",
-                "in this same layer",
-            ] {
-                assert!(message.contains(part), "{p} {part}: {message}");
-            }
+            assert_mentions(
+                &message,
+                &[
+                    "bx.toml:13",
+                    "names the same file as `~/.config/{{p}}/../s` at bx.toml:10",
+                    "in this same layer",
+                ],
+            );
         }
     }
 
@@ -1961,13 +1967,14 @@ mod tests {
 
         let message = resolved(LAYER, Some("[values]\nroot = \"/srv/data\"\n"))
             .expect_err("one path for every answer is the layer's defect");
-        for part in [
-            "bx.toml:10",
-            "names the same file as `{{root}}/s` at bx.toml:7",
-            "in this same layer",
-        ] {
-            assert!(message.contains(part), "{part}: {message}");
-        }
+        assert_mentions(
+            &message,
+            &[
+                "bx.toml:10",
+                "names the same file as `{{root}}/s` at bx.toml:7",
+                "in this same layer",
+            ],
+        );
     }
 
     #[test]
@@ -1983,13 +1990,14 @@ mod tests {
 
         let message = resolved(LAYER, Some("[values]\nr = \"/srv\"\n"))
             .expect_err("one path for every answer is the layer's defect");
-        for part in [
-            "bx.toml:10",
-            "names the same file as `{{r}}/s` at bx.toml:7",
-            "in this same layer",
-        ] {
-            assert!(message.contains(part), "{part}: {message}");
-        }
+        assert_mentions(
+            &message,
+            &[
+                "bx.toml:10",
+                "names the same file as `{{r}}/s` at bx.toml:7",
+                "in this same layer",
+            ],
+        );
     }
 
     #[test]
@@ -2039,16 +2047,14 @@ mod tests {
                 loaded.push(format!("{first} and {second}"));
                 continue;
             };
-            for part in [
-                "bx.toml:10".to_string(),
-                format!("names the same file as `{first}` at bx.toml:7"),
-                "in this same layer".to_string(),
-            ] {
-                assert!(
-                    message.contains(&part),
-                    "{first} {second}: {part}: {message}"
-                );
-            }
+            assert_mentions(
+                &message,
+                &[
+                    "bx.toml:10",
+                    &format!("names the same file as `{first}` at bx.toml:7"),
+                    "in this same layer",
+                ],
+            );
         }
         assert!(
             loaded.is_empty(),
@@ -2088,16 +2094,14 @@ mod tests {
                 }
                 Err(message) => message,
             };
-            for part in [
-                "bx.toml:16".to_string(),
-                format!("names the same file as `{first}` at bx.toml:13"),
-                "in this same layer".to_string(),
-            ] {
-                assert!(
-                    message.contains(&part),
-                    "{first} {second}: {part}: {message}"
-                );
-            }
+            assert_mentions(
+                &message,
+                &[
+                    "bx.toml:16",
+                    &format!("names the same file as `{first}` at bx.toml:13"),
+                    "in this same layer",
+                ],
+            );
         }
         assert!(
             loaded.is_empty(),
@@ -2183,15 +2187,13 @@ mod tests {
                 let message = resolved(&layer, Some(&format!("[values]\np = \"{answer}\"\n")))
                     .expect_err("no answer loads this layer");
                 if matches!(answer, "a/b" | "b/c") {
-                    for part in [
-                        format!("names the same file as `{prefix}{{{{p}}}}/../../s`"),
-                        "in this same layer".to_string(),
-                    ] {
-                        assert!(
-                            message.contains(&part),
-                            "{prefix} {answer} {part}: {message}"
-                        );
-                    }
+                    assert_mentions(
+                        &message,
+                        &[
+                            &format!("names the same file as `{prefix}{{{{p}}}}/../../s`"),
+                            "in this same layer",
+                        ],
+                    );
                 } else {
                     // Where the pair names no file `s` shares, the toggles are
                     // refused for what each is: a toggle of nothing declared.
@@ -2209,12 +2211,13 @@ mod tests {
                     [[target]]\npath = \"{{p}}/./s\"\nenabled = true\n";
         let message = resolved(lead, Some("[values]\np = \"~\"\n"))
             .expect_err("one path for every answer is the layer's defect");
-        for part in [
-            "names the same file as `{{p}}/s` at bx.toml:7",
-            "in this same layer",
-        ] {
-            assert!(message.contains(part), "{part}: {message}");
-        }
+        assert_mentions(
+            &message,
+            &[
+                "names the same file as `{{p}}/s` at bx.toml:7",
+                "in this same layer",
+            ],
+        );
     }
 
     #[test]
@@ -2309,13 +2312,14 @@ mod tests {
 
         assert_eq!(keys(&resolved), ["~/.config/{{profile}}/s", "~/.zshrc"]);
         let entry = blocked(&resolved, 0);
-        for part in [
-            "modules/10-profile.toml:1",
-            "modules/10-profile.toml:4",
-            "the answer to `profile` at local.toml:2",
-        ] {
-            assert!(entry.hint.contains(part), "{part}: {}", entry.hint);
-        }
+        assert_mentions(
+            &entry.hint,
+            &[
+                "modules/10-profile.toml:1",
+                "modules/10-profile.toml:4",
+                "the answer to `profile` at local.toml:2",
+            ],
+        );
         ready(&resolved, 1);
     }
 

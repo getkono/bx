@@ -1760,13 +1760,7 @@ mod tests {
     use crate::fs::mode::ModeError;
     use toml_edit::Document;
 
-    /// The account's home every test in this module parses against.
-    ///
-    /// Deliberately not `/home/<user>`: nothing here may name a real account,
-    /// and nothing here may assume where a home lives.
-    fn home() -> &'static Path {
-        Path::new("/var/home/example")
-    }
+    use crate::testing::example_home as home;
 
     /// Parse the first `[[target]]` out of a document, against `home`.
     fn parse_in(text: &str, home: &Path) -> Result<Target, Error> {

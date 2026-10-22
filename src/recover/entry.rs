@@ -221,8 +221,8 @@ mod tests {
 
     use crate::fs::{self, Mode};
     use crate::journal::tests::{
-        WRITES_THROUGH_PERMISSIONS, cannot_build, frame_starts, names_in, peek, permissions_refuse,
-        plant_file, raw_journal, seal, state_beyond_set_aside_names, target, write_to,
+        WRITES_THROUGH_PERMISSIONS, frame_starts, names_in, peek, permissions_refuse, plant_file,
+        raw_journal, seal, state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{
         self, Begin, Done, End, Intent, Loaded, Record, Session, SessionKind, Written,
@@ -233,7 +233,7 @@ mod tests {
         ContentHash, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior, PriorBytes,
         RestoreRef, StateDir,
     };
-    use crate::testing::guarded_home;
+    use crate::testing::{cannot_build, guarded_home};
 
     thread_local! {
         /// The mode a test narrows the state directory to once the lock is

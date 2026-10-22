@@ -350,9 +350,7 @@ mod tests {
     use crate::config::{Layer, load_layer, load_layers, merge};
     use crate::report::Action;
 
-    fn home() -> &'static Path {
-        Path::new("/var/home/example")
-    }
+    use crate::testing::example_home as home;
 
     /// A config repo holding `files`, each `(relative path, contents)`, with
     /// the executable ones at `0755`.

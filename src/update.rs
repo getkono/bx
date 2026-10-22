@@ -1709,12 +1709,10 @@ mod tests {
     const A: &str = "0e810e5afa27acbd074398eefbe28d13005dbc15";
     const B: &str = "85919cd1ffa7d2d5412f6d3fe437ebdbeeec4fc5";
 
-    fn home() -> PathBuf {
-        PathBuf::from("/home/example")
-    }
+    use crate::testing::example_home as home;
 
     fn portable(raw: &str) -> Portable {
-        Portable::parse_in(raw, &home()).unwrap()
+        Portable::parse_in(raw, home()).unwrap()
     }
 
     fn followed(path: &str, check: Check) -> External {
@@ -1763,7 +1761,7 @@ mod tests {
             pinned("~/p"),
             followed("~/b", Check::Ask),
         ];
-        let all: Vec<&str> = select(&externals, &[], &home())
+        let all: Vec<&str> = select(&externals, &[], home())
             .unwrap()
             .iter()
             .map(|e| e.path.as_str())
@@ -1773,11 +1771,11 @@ mod tests {
         let named = select(
             &externals,
             &[
-                "/home/example/b".to_string(),
+                "/var/home/example/b".to_string(),
                 "~/b".to_string(),
                 "~/./a".to_string(),
             ],
-            &home(),
+            home(),
         )
         .unwrap();
         let named: Vec<&str> = named.iter().map(|e| e.path.as_str()).collect();
@@ -1786,7 +1784,7 @@ mod tests {
         for name in ["~/p", "~/nowhere", "relative"] {
             assert!(
                 matches!(
-                    select(&externals, &[name.to_string()], &home()),
+                    select(&externals, &[name.to_string()], home()),
                     Err(Error::NotFollowed(n)) if n == name
                 ),
                 "{name}"

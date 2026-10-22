@@ -828,7 +828,7 @@ mod tests {
 
     use std::os::unix::fs::PermissionsExt as _;
 
-    use crate::testing::guarded_home;
+    use crate::testing::{guarded_home, guarded_state};
 
     fn mode_of(path: &Path) -> Mode {
         Mode::from_bits(std::fs::metadata(path).expect("stat").permissions().mode())
@@ -925,8 +925,7 @@ mod tests {
 
     #[test]
     fn ensure_creates_the_state_directory_at_0700() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         assert!(dir.root().is_dir());
         assert_eq!(mode_of(dir.root()), Mode::PRIVATE_DIR);
@@ -934,8 +933,7 @@ mod tests {
 
     #[test]
     fn ensure_creates_restore_and_shell_at_0700() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         assert_eq!(mode_of(&dir.restore()), Mode::PRIVATE_DIR);
         assert_eq!(mode_of(&dir.shell()), Mode::PRIVATE_DIR);
@@ -943,8 +941,7 @@ mod tests {
 
     #[test]
     fn ensure_is_idempotent() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("first");
         let before: Vec<_> = std::fs::read_dir(dir.root())
             .expect("read_dir")
@@ -961,8 +958,7 @@ mod tests {
 
     #[test]
     fn ensure_tightens_a_group_readable_state_directory() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("first");
         std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o755))
             .expect("widen");
@@ -981,8 +977,7 @@ mod tests {
         // macro whole left the suite green — and this is the only signal a
         // user gets that bx narrowed a directory they own, which is what
         // decision 50 was sanctioned on.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("first");
         std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o755))
             .expect("widen");
@@ -1016,8 +1011,7 @@ mod tests {
         // write into it failed `EACCES` with no repair and no diagnostic. The
         // lock file is repaired on inequality for exactly this reason; one
         // rule now governs both.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("first");
         for wrong in [0o500, 0o600, 0o755, 0o770] {
             std::fs::set_permissions(dir.shell(), std::fs::Permissions::from_mode(wrong))
@@ -1029,8 +1023,7 @@ mod tests {
 
     #[test]
     fn ensure_creates_missing_ancestors_without_tightening_them() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         dir.ensure().expect("ensure");
 
         // The umask is whatever the test runner's is, so the assertion is
@@ -1043,8 +1036,7 @@ mod tests {
 
     #[test]
     fn ensure_reports_a_file_occupying_the_state_directory_path() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         home.write(".local/state/bx", "not a directory");
         let err = dir.ensure().expect_err("must fail");
         assert!(
@@ -1056,8 +1048,7 @@ mod tests {
 
     #[test]
     fn ensure_reports_a_file_occupying_a_subdirectory_path() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         home.write(".local/state/bx/restore", "not a directory");
         let err = dir.ensure().expect_err("must fail");
         assert!(
@@ -1815,8 +1806,7 @@ mod tests {
         // A loop, and a link whose path runs through a file, are the same
         // condition and must read the same way — and `restore/` inside a real
         // state directory is judged by the same code.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         std::fs::create_dir_all(dir.root()).expect("root");
         home.write("a-file", "not a directory");
         std::os::unix::fs::symlink(home.child("a-file/under-it"), dir.restore())

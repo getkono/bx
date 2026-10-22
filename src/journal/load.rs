@@ -549,13 +549,12 @@ mod tests {
 
     use crate::fs::Mode;
     use crate::journal::tests::{
-        WRITES_THROUGH_PERMISSIONS, cannot_build, created, frame_starts, names_in, peek,
-        permissions_refuse, plant_file, raw_journal, seal, some_begin,
-        state_beyond_set_aside_names, target, write_to,
+        WRITES_THROUGH_PERMISSIONS, created, frame_starts, names_in, peek, permissions_refuse,
+        plant_file, raw_journal, seal, some_begin, state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Done, End, Journal, Session, SessionKind, Written};
     use crate::state::{ContentHash, Mechanism, Prior, StateDir, dir_digest};
-    use crate::testing::guarded_home;
+    use crate::testing::{cannot_build, guarded_home};
 
     #[test]
     fn a_fresh_state_directory_has_no_session() {
@@ -1439,13 +1438,7 @@ mod tests {
                 plant(&state.journal());
 
                 let mut child =
-                    std::process::Command::new(std::env::current_exe().expect("the test binary"))
-                        .args([
-                            "--exact",
-                            "--ignored",
-                            "--nocapture",
-                            "journal::load::tests::journal_read_child",
-                        ])
+                    crate::testing::ignored_child("journal::load::tests::journal_read_child")
                         .env(READ_CHILD_HOME, &home)
                         .env(READ_CHILD_CALL, call)
                         // Inherited, unlike the crash harness's: this child

@@ -586,12 +586,10 @@ mod tests {
     use crate::config::parse_str;
     use std::path::PathBuf;
 
-    fn home() -> PathBuf {
-        PathBuf::from("/var/home/example")
-    }
+    use crate::testing::example_home as home;
 
     fn parse(text: &str) -> Result<Vec<EnvDecl>, String> {
-        parse_str(text, Path::new("/repo/bx.toml"), &home())
+        parse_str(text, Path::new("/repo/bx.toml"), home())
             .map(|config| config.envs)
             .map_err(|e| e.to_string())
     }
@@ -993,13 +991,13 @@ mod tests {
                     assert_eq!(place.syntax(), Syntax::EnvironmentD);
                 }
             }
-            Portable::parse_in(fragment, &home()).expect("a portable fragment path");
+            Portable::parse_in(fragment, home()).expect("a portable fragment path");
         }
     }
 
     #[test]
     fn the_source_line_tests_then_sources_the_one_fragment() {
-        let fragment = Portable::parse_in(Place::Zshrc.fragment(), &home()).expect("portable");
+        let fragment = Portable::parse_in(Place::Zshrc.fragment(), home()).expect("portable");
         assert_eq!(
             source_line(&fragment),
             "[[ -r ~/.local/share/bx/zshrc.zsh ]] && source ~/.local/share/bx/zshrc.zsh\n"
@@ -1014,7 +1012,7 @@ mod tests {
                 path: Vec::new(),
                 inherited: Vec::new(),
             },
-            home: home(),
+            home: home().to_path_buf(),
         }
     }
 
@@ -1033,7 +1031,7 @@ mod tests {
             )),
             "{PLIST_HEAD}"
         );
-        Portable::parse_in(LAUNCH_AGENT, &home()).expect("a portable path");
+        Portable::parse_in(LAUNCH_AGENT, home()).expect("a portable path");
     }
 
     #[test]

@@ -325,7 +325,7 @@ dir = true
         if std::fs::read_dir(&unlistable).is_ok() {
             std::fs::set_permissions(&unlistable, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod back");
-            return crate::journal::tests::cannot_build(
+            return crate::testing::cannot_build(
                 "a_directory_that_cannot_be_listed_names_nothing_and_the_rest_still_do",
                 crate::journal::tests::WRITES_THROUGH_PERMISSIONS,
             );

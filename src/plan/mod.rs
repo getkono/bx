@@ -735,7 +735,7 @@ fn look_at_state(inputs: &Inputs, report: &mut Report) -> Result<(), Error> {
 pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::Output;
 
     use super::*;
     use crate::config::when::{Distro, Machine};
@@ -2091,13 +2091,7 @@ pub(crate) mod tests {
     /// Re-run this test binary as an apply that aborts at `phase` of write
     /// `index`.
     pub(super) fn spawn_crash_child(home: &Path, index: usize, phase: &str) -> Output {
-        Command::new(std::env::current_exe().expect("the test binary"))
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "plan::tests::apply_crash_child",
-            ])
+        crate::testing::ignored_child("plan::tests::apply_crash_child")
             .env("BX_CRASH_AT", format!("{index}:{phase}"))
             .env(CRASH_HOME, home)
             // The child aborts, so it writes no profile; removing the pattern
@@ -3251,13 +3245,7 @@ pub(crate) mod tests {
                 let at = format!("{index}:{phase}");
                 let home = guard.child(format!("crash-{index}-{phase}"));
                 seed_sync_crash(&home);
-                let output = Command::new(std::env::current_exe().expect("the test binary"))
-                    .args([
-                        "--exact",
-                        "--ignored",
-                        "--nocapture",
-                        "plan::tests::track::sync_crash_child",
-                    ])
+                let output = crate::testing::ignored_child("plan::tests::track::sync_crash_child")
                     .env("BX_CRASH_AT", &at)
                     .env(SYNC_CRASH_HOME, &home)
                     .env_remove("LLVM_PROFILE_FILE")

@@ -666,27 +666,14 @@ mod tests {
     use super::*;
 
     use std::os::unix::fs::PermissionsExt as _;
-    use std::process::Command;
 
-    use crate::testing::guarded_home;
+    use crate::testing::{guarded_home, guarded_state, ignored_child, mode_of, run_ignored_child};
 
     /// Run this test binary again, in a new process, attempting the lock.
     fn child(dir: &StateDir) -> String {
-        let exe = std::env::current_exe().expect("the test binary");
-        let out = Command::new(exe)
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "state::lock::tests::child_attempts_the_lock",
-            ])
-            .env("BX_TEST_LOCK_DIR", dir.root())
-            .output()
-            .expect("spawn the child");
-        assert!(
-            out.status.success(),
-            "child failed: {}",
-            String::from_utf8_lossy(&out.stderr),
+        let out = run_ignored_child(
+            ignored_child("state::lock::tests::child_attempts_the_lock")
+                .env("BX_TEST_LOCK_DIR", dir.root()),
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
@@ -734,13 +721,7 @@ mod tests {
         use std::io::BufRead as _;
         use std::process::Stdio;
 
-        let mut writer = Command::new(std::env::current_exe().expect("the test binary"))
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "state::lock::tests::child_attempts_the_lock",
-            ])
+        let mut writer = ignored_child("state::lock::tests::child_attempts_the_lock")
             .env("BX_TEST_LOCK_DIR", dir.root())
             .env(HOLD, "1")
             .stdin(Stdio::piped())
@@ -769,8 +750,7 @@ mod tests {
 
     #[test]
     fn a_probe_of_a_missing_state_directory_is_absent_and_creates_nothing() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
 
         assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Absent);
         assert!(
@@ -781,8 +761,7 @@ mod tests {
 
     #[test]
     fn a_probe_of_a_directory_with_no_lock_file_is_absent_and_changes_nothing() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         std::fs::create_dir_all(dir.root()).expect("the state directory");
         std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o755))
             .expect("widen");
@@ -807,8 +786,7 @@ mod tests {
 
     #[test]
     fn a_probe_of_a_free_lock_is_free_narrows_nothing_and_keeps_nothing_locked() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         std::fs::create_dir_all(dir.root()).expect("the state directory");
         std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o755))
             .expect("widen");
@@ -828,8 +806,7 @@ mod tests {
 
     #[test]
     fn a_probe_sees_a_writer_in_another_process_and_then_its_release() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let writer = writer_elsewhere(&dir);
 
         let held = SharedLock::probe(&dir).expect("probe");
@@ -848,8 +825,7 @@ mod tests {
 
     #[test]
     fn a_probe_sees_a_writer_in_this_process() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let writer = ExclusiveLock::acquire(&dir).expect("writer");
 
         assert_eq!(SharedLock::probe(&dir).expect("probe"), Probe::Held);
@@ -864,8 +840,7 @@ mod tests {
         // a copy of the descriptor: the apply that follows a plan is then
         // refused as locked, as `t13` once was under load. Explicit, as both
         // guards' `Drop` is.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let mut found = None;
 
         let calls = release_recording::record(|| found = SharedLock::probe(&dir).ok());
@@ -887,8 +862,7 @@ mod tests {
 
     #[test]
     fn a_probe_refuses_a_symlink_at_the_lock_path_and_reaches_nothing_through_it() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         std::fs::create_dir_all(dir.root()).expect("the state directory");
         home.write(".bashrc", "the user wrote this\n");
         let before = mode_of(&home.child(".bashrc"));
@@ -917,8 +891,7 @@ mod tests {
 
     #[test]
     fn a_probe_refuses_a_directory_at_the_lock_path() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         std::fs::create_dir_all(dir.lock()).expect("occupy");
         std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o755))
             .expect("widen");
@@ -933,8 +906,7 @@ mod tests {
 
     #[test]
     fn a_probe_refuses_a_lock_file_with_a_second_link() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         std::fs::create_dir_all(dir.root()).expect("the state directory");
         home.write(".profile", "the user wrote this too\n");
         std::fs::hard_link(home.child(".profile"), dir.lock()).expect("hard link");
@@ -952,8 +924,7 @@ mod tests {
 
     #[test]
     fn a_probe_refuses_a_fifo_at_the_lock_path_without_waiting_for_a_writer() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         std::fs::create_dir_all(dir.root()).expect("the state directory");
         crate::testing::mkfifo(&dir.lock());
 
@@ -982,8 +953,7 @@ mod tests {
             crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         std::fs::create_dir_all(dir.root()).expect("the state directory");
         std::fs::write(dir.lock(), b"").expect("seed");
         std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o000))
@@ -1001,8 +971,7 @@ mod tests {
 
     #[test]
     fn the_lock_file_is_created_at_0600() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
         let mode = Mode::from_bits(
             std::fs::metadata(lock.path())
@@ -1016,8 +985,7 @@ mod tests {
 
     #[test]
     fn a_lock_guards_its_own_directory_by_identity_and_no_other() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
         assert!(lock.held().guards(dir.root()));
 
@@ -1039,8 +1007,7 @@ mod tests {
         // record said acquisition creates `restore/` and `shell/` too. It
         // creates the root and the lock file, and nothing pinned the
         // difference, so the record could say either.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         assert!(!dir.root().exists());
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
         assert!(dir.root().is_dir());
@@ -1056,8 +1023,7 @@ mod tests {
         // path when it opens it, before a refused lock reads any holder, so the
         // reader is called on the swapped path directly: it must not report
         // the bytes of whatever the link names.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         let lock = ExclusiveLock::acquire(&dir).expect("acquire");
         let err = ExclusiveLock::acquire(&dir).expect_err("a second acquisition is refused");
         assert!(
@@ -1083,8 +1049,7 @@ mod tests {
     fn a_lock_refused_for_anything_but_contention_is_an_error_naming_the_file() {
         // r3 round 1 (C2): a `flock` failure other than `EWOULDBLOCK` was
         // never reached, so reading it as success went unnoticed.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         std::fs::write(dir.lock(), b"").expect("seed");
         // An `O_PATH` descriptor names the file but cannot lock it: `EBADF`.
@@ -1116,8 +1081,7 @@ mod tests {
 
     #[test]
     fn a_second_exclusive_acquisition_is_refused() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let _first = ExclusiveLock::acquire(&dir).expect("first");
         let err = ExclusiveLock::acquire(&dir).expect_err("second must be refused");
         assert!(matches!(err, Error::Locked { .. }), "got {err}");
@@ -1126,8 +1090,7 @@ mod tests {
 
     #[test]
     fn a_refusal_names_the_pid_and_program_of_the_holder() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let _held = ExclusiveLock::acquire(&dir).expect("acquire");
         let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
         let Error::Locked { holder, path } = &err else {
@@ -1144,8 +1107,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_lock_body_still_yields_a_usable_message() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let held = ExclusiveLock::acquire(&dir).expect("acquire");
         // Overwrite the identity line with something that is not one.
         std::fs::write(held.path(), b"\xff\xfe not utf-8").expect("clobber");
@@ -1165,8 +1127,7 @@ mod tests {
         // the first `BODY` bytes and parses what it finds: the pid, and the
         // program name truncated at the bound — never a mangled name pieced
         // together from a later read.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let held = ExclusiveLock::acquire(&dir).expect("acquire");
 
         // The lengths below are literal rather than derived from `BODY`, so
@@ -1198,8 +1159,7 @@ mod tests {
 
     #[test]
     fn an_empty_lock_body_still_yields_a_usable_message() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let held = ExclusiveLock::acquire(&dir).expect("acquire");
         std::fs::write(held.path(), b"").expect("clobber");
         let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
@@ -1223,8 +1183,7 @@ mod tests {
 
     #[test]
     fn releasing_the_lock_lets_the_next_acquisition_succeed() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let first = ExclusiveLock::acquire(&dir).expect("first");
         drop(first);
         let _second = ExclusiveLock::acquire(&dir).expect("second");
@@ -1232,8 +1191,7 @@ mod tests {
 
     #[test]
     fn two_readers_share_the_lock() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let _a = SharedLock::acquire(&dir).expect("first reader");
         let b = SharedLock::acquire(&dir).expect("second reader");
         assert_eq!(b.path(), dir.lock());
@@ -1242,8 +1200,7 @@ mod tests {
 
     #[test]
     fn a_reader_does_not_block_on_a_writer_and_reports_the_holder() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let _writer = ExclusiveLock::acquire(&dir).expect("writer");
         assert!(SharedLock::try_acquire(&dir).expect("try").is_none());
         let err = SharedLock::acquire(&dir).expect_err("must be refused");
@@ -1252,8 +1209,7 @@ mod tests {
 
     #[test]
     fn a_writer_is_refused_while_a_reader_holds_the_lock() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let _reader = SharedLock::acquire(&dir).expect("reader");
         let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
         assert!(matches!(err, Error::Locked { .. }), "got {err}");
@@ -1261,8 +1217,7 @@ mod tests {
 
     #[test]
     fn a_refusal_never_names_a_writer_that_has_already_released() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         // A writer runs and finishes, leaving its identity behind unless the
         // drop clears it.
         let writer = ExclusiveLock::acquire(&dir).expect("writer");
@@ -1298,8 +1253,7 @@ mod tests {
         // leaves a window in which a reader can take the lock and be refused
         // naming the released pid, and afterwards the file is empty either
         // way, so swapping the two calls left every test green.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let writer = ExclusiveLock::acquire(&dir).expect("writer");
         let calls = release_recording::record(|| drop(writer));
         assert_eq!(calls, ["truncate", "unlock"]);
@@ -1314,8 +1268,7 @@ mod tests {
         // The call is recorded instead, which also pins the other half: a
         // reader writes no identity line, so it must not truncate the body a
         // writer may be holding.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         std::fs::write(dir.lock(), b"4242 someone\n").expect("a body it did not write");
 
@@ -1336,8 +1289,7 @@ mod tests {
         // and the whole holder degrade to `unknown` — reporting "another bx
         // process" where bx had the pid in hand, and making a non-ASCII name
         // indistinguishable from an unreadable lock file.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let held = ExclusiveLock::acquire(&dir).expect("acquire");
 
         // `"4242 "` is 5 bytes; 250 `n`s then takes the body to 255, so the
@@ -1370,8 +1322,7 @@ mod tests {
 
     #[test]
     fn the_lock_is_exclusive_across_two_processes() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let held = ExclusiveLock::acquire(&dir).expect("acquire");
 
         let refused = child(&dir);
@@ -1390,8 +1341,7 @@ mod tests {
 
     #[test]
     fn a_lock_held_by_a_dead_process_is_acquirable() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         // The child acquires and leaks the guard, so nothing in user space
         // releases the lock: only the kernel, when the process exits.
         let taken = child(&dir);
@@ -1401,8 +1351,7 @@ mod tests {
 
     #[test]
     fn the_lock_file_is_never_unlinked() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         let path = dir.lock();
         {
             let _lock = ExclusiveLock::acquire(&dir).expect("acquire");
@@ -1414,17 +1363,12 @@ mod tests {
         );
     }
 
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777
-    }
-
     #[test]
     fn a_symlink_at_the_lock_path_is_refused_and_never_truncates_what_it_names() {
         // Review round 3: the lock file was opened RDWR|CREATE following
         // symlinks and then truncated, so `<state>/lock -> ~/.bashrc` emptied
         // the user's file.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         home.write(".bashrc", "the user wrote this\n");
         let before = mode_of(&home.child(".bashrc"));
@@ -1453,8 +1397,7 @@ mod tests {
 
     #[test]
     fn a_dangling_symlink_at_the_lock_path_creates_nothing_through_it() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         std::os::unix::fs::symlink(home.child("elsewhere"), dir.lock()).expect("symlink");
 
@@ -1465,8 +1408,7 @@ mod tests {
 
     #[test]
     fn a_hard_link_or_a_fifo_at_the_lock_path_is_refused() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         home.write(".profile", "the user wrote this too\n");
         std::fs::hard_link(home.child(".profile"), dir.lock()).expect("hard link");
@@ -1486,8 +1428,7 @@ mod tests {
 
     #[test]
     fn a_lock_file_readable_beyond_its_owner_is_narrowed_to_0600() {
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         std::fs::write(dir.lock(), b"").expect("seed");
         std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o666))
@@ -1509,8 +1450,7 @@ mod tests {
         // bits. `0700` shares nothing with anybody, so the old condition left
         // it; the file bx promises at `0600` was not at `0600`.
         for wrong in [0o700, 0o606, 0o644] {
-            let home = guarded_home();
-            let dir = StateDir::resolve(home.path());
+            let (_home, dir) = guarded_state();
             dir.ensure().expect("ensure");
             std::fs::write(dir.lock(), b"").expect("seed");
             std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(wrong))
@@ -1531,8 +1471,7 @@ mod tests {
         // r4 round 2 (COV1): round 1's repair reached `store.rs` only, so this
         // warning's argument expressions ran zero times in the whole suite and
         // deleting the macro left it green.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         std::fs::write(dir.lock(), b"").expect("seed");
         std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o644)).expect("set");
@@ -1562,22 +1501,10 @@ mod tests {
 
     /// The two above, less which directory the child is told to use.
     fn child_under_umask_with(key: &str, value: &std::ffi::OsStr, umask: u32) -> String {
-        let exe = std::env::current_exe().expect("the test binary");
-        let out = Command::new(exe)
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "state::lock::tests::child_creates_the_state_directory_under_a_umask",
-            ])
-            .env(key, value)
-            .env("BX_TEST_UMASK", format!("{umask:o}"))
-            .output()
-            .expect("spawn the child");
-        assert!(
-            out.status.success(),
-            "child failed: {}",
-            String::from_utf8_lossy(&out.stderr),
+        let out = run_ignored_child(
+            ignored_child("state::lock::tests::child_creates_the_state_directory_under_a_umask")
+                .env(key, value)
+                .env("BX_TEST_UMASK", format!("{umask:o}")),
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
@@ -1725,8 +1652,7 @@ mod tests {
     fn a_directory_at_the_lock_path_is_refused_with_a_remedy() {
         // Review round 4: a directory there was a bare `Error::Lock` carrying
         // EISDIR, which says what failed and not what to do.
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         std::fs::create_dir(dir.lock()).expect("occupy");
         std::fs::write(dir.lock().join("keep"), b"x").expect("occupy");
@@ -1757,8 +1683,7 @@ mod tests {
             crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
-        let home = guarded_home();
-        let dir = StateDir::resolve(home.path());
+        let (_home, dir) = guarded_state();
         dir.ensure().expect("ensure");
         std::fs::write(dir.lock(), b"").expect("seed");
         std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o000))

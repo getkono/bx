@@ -265,7 +265,7 @@ mod tests {
     use crate::recover::*;
 
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::Output;
 
     use crate::fs::{self, Mode};
     use crate::journal::tests::{
@@ -550,9 +550,7 @@ mod tests {
     /// Re-invoke this test binary to run the ignored test `child`, crashing
     /// at `phase` of write `index`.
     fn spawn_child(child: &str, home: &Path, index: usize, phase: &str) -> Output {
-        let exe = std::env::current_exe().expect("the test binary");
-        Command::new(exe)
-            .args(["--exact", "--ignored", "--nocapture", child])
+        crate::testing::ignored_child(child)
             .env(CRASH_AT, format!("{index}:{phase}"))
             .env(CRASH_HOME, home)
             // cargo-llvm-cov points this at a pattern the parent owns. The child

@@ -1703,8 +1703,8 @@ mod tests {
     /// namespace, with `child_env` naming a world-writable setgid directory
     /// owned by a group those credentials are not in.
     ///
-    /// Skips, with a message on stderr, wherever the scenario cannot be
-    /// constructed; fails only when the child ran and failed.
+    /// Fails wherever the scenario cannot be constructed, unless the skip was
+    /// asked for by name, and when the child ran and failed.
     fn run_in_a_foreign_setgid_directory(
         name: &str,
         child_env: &str,
@@ -1737,15 +1737,9 @@ mod tests {
         credentials: &[&str],
         seed: impl FnOnce(&Path),
     ) {
-        // Written to the process's own stderr, not through `eprintln!`:
-        // libtest captures the macro's output and discards it for a test that
-        // passes, so a skip announced that way is invisible and the suite still
-        // reports green. This goes to file descriptor 2, which libtest does not
-        // intercept.
-        let skip = |why: &str| {
-            use std::io::Write as _;
-            let _ = writeln!(std::io::stderr(), "skipped {name}: {why}");
-        };
+        // A scenario this machine cannot build fails unless the skip was
+        // asked for by name; see `crate::testing::skip_unconstructible`.
+        let skip = |why: &str| crate::testing::cannot_build(name, why);
         let home = guarded_home();
         // Another uid has to reach the directory and run this test binary,
         // whose own directory it may not be able to read.

@@ -6,12 +6,12 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use crate::fs::remove::{prune_beneath, remove_made_dir};
 use crate::journal::tests::{
-    WRITES_THROUGH_PERMISSIONS, applied, cannot_build, dir_to, frame_starts, link_at, link_to,
-    mode_at, names_in, peek, permissions_refuse, plant_file, raw_journal, saved_ledger, seal,
+    WRITES_THROUGH_PERMISSIONS, applied, dir_to, frame_starts, link_at, link_to, mode_at, names_in,
+    peek, permissions_refuse, plant_file, raw_journal, saved_ledger, seal,
     state_beyond_set_aside_names, target, write_to,
 };
 use crate::journal::{Loaded, load};
-use crate::testing::guarded_home;
+use crate::testing::{cannot_build, guarded_home};
 
 #[test]
 fn a_session_that_finishes_leaves_no_journal_and_a_saved_ledger() {
@@ -1204,7 +1204,7 @@ const UMASK_CHILD_DIR: &str = "BX_TEST_UMASK_DIR";
 #[test]
 #[ignore = "spawned by a_directory_bx_will_not_remove_is_made_at_the_accounts_umask"]
 fn umask_child() {
-    // As `skips_allowed_child`: no instructions, nothing to do.
+    // Not spawned by its parent: no instructions, nothing to do.
     let Some(under) = std::env::var_os(UMASK_CHILD_DIR) else {
         return;
     };
@@ -1292,19 +1292,13 @@ fn a_directory_bx_will_not_remove_is_made_at_the_accounts_umask() {
     // which needs no `unsafe` and no shared lock.
     let guard = guarded_home();
     let exe = std::env::current_exe().expect("the test binary");
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(r#"umask 077; exec "$1" --exact --ignored journal::session::tests::umask_child"#)
-        .arg("sh")
-        .arg(&exe)
-        .env(UMASK_CHILD_DIR, guard.child("under"))
-        .output()
-        .expect("spawn the umask child");
-    assert!(
-        out.status.success(),
-        "the umask child failed:\n{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+    crate::testing::run_ignored_child(
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"umask 077; exec "$1" --exact --ignored journal::session::tests::umask_child"#)
+            .arg("sh")
+            .arg(&exe)
+            .env(UMASK_CHILD_DIR, guard.child("under")),
     );
 }
 

@@ -598,11 +598,11 @@ fn parse_local(path: &Path, text: Option<&str>) -> Result<DocumentMut, Error> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
-
     use super::*;
     use crate::plan::tests::{env, seed};
-    use crate::testing::{GuardedHome, guarded_home};
+    use crate::testing::{
+        GuardedHome, chmod, guarded_home, ignored_child, mode_of, run_ignored_child,
+    };
 
     /// Answers from a script, recording what was asked.
     #[derive(Default)]
@@ -723,10 +723,6 @@ pub(crate) mod tests {
 
     fn local(home: &GuardedHome) -> PathBuf {
         home.child(".local/state/bx/local.toml")
-    }
-
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777
     }
 
     #[test]
@@ -1005,8 +1001,7 @@ pub(crate) mod tests {
         .expect("load");
         answers.give("root", "~/s");
         home.write(".local/state/bx/local.toml", "[values]\nroot = \"~/s\"\n");
-        std::fs::set_permissions(local(&home), std::fs::Permissions::from_mode(0o644))
-            .expect("chmod");
+        chmod(&local(&home), 0o644);
 
         assert!(answers.save(&state).expect("save").is_none());
         assert_eq!(mode_of(&local(&home)), 0o644, "not rewritten");
@@ -1310,26 +1305,10 @@ pub(crate) mod tests {
         // As `command::tests::confirm_without_a_terminal_is_a_prompt_error_and_never_an_answer`:
         // in a child whose stdin is certainly not a terminal, so this never
         // hangs on a developer's machine.
-        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "init::tests::terminal_child",
-            ])
-            .env(TERMINAL_CHILD, "1")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("spawn the terminal child");
-        let ran = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "{ran}{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            ran.contains("1 passed") && ran.contains("0 failed"),
-            "{ran}"
+        run_ignored_child(
+            ignored_child("init::tests::terminal_child")
+                .env(TERMINAL_CHILD, "1")
+                .stdin(std::process::Stdio::null()),
         );
     }
 }

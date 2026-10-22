@@ -1900,9 +1900,11 @@ fn a_check_lock_that_cannot_be_opened_says_opening() {
     let error = Stamps::of(&state)
         .try_hold()
         .expect_err("a directory is not opened for writing");
+    // `open(2)` of a directory for writing is `EISDIR` on Linux and macOS.
+    let refused = std::io::Error::from_raw_os_error(rustix::io::Errno::ISDIR.raw_os_error());
     assert_eq!(
         error.to_string(),
-        format!("opening {}: Is a directory (os error 21)", path.display())
+        format!("opening {}: {refused}", path.display())
     );
 }
 

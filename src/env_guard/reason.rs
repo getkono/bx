@@ -333,8 +333,9 @@ mod tests {
     /// already establishes source-reading as how this repository holds a
     /// property no type can carry.
     ///
-    /// The module is read whole — `env_guard.rs` and every file beneath
-    /// `env_guard/` — and the declaration is found by its content, a line that
+    /// The module's shipped source is read whole — `env_guard.rs` and every
+    /// file beneath `env_guard/`, cut by [`crate::testing::shipped_source`] —
+    /// and the declaration is found by its content, a line that
     /// is exactly `pub enum Reason {`, so splitting the module does not move
     /// the enum out of the census's sight. Exactly one such line must exist.
     ///
@@ -345,6 +346,7 @@ mod tests {
         let declaration = DECLARATION.get_or_init(|| {
             let mut found = Vec::new();
             for (path, source) in crate::testing::module_sources("env_guard") {
+                let source = crate::testing::shipped_source(&path, &source);
                 let mut offset = 0;
                 for line in source.split_inclusive('\n') {
                     if line.trim() == "pub enum Reason {" {

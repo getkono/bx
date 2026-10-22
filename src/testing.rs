@@ -331,6 +331,29 @@ pub(crate) fn module_sources(module: &str) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
+/// The shipped half of the source file at `path` (beneath `src/`), whose text
+/// is `source`: the one rule every test that scans source uses to tell the
+/// code a release builds from the code only its tests build.
+///
+/// A file named `tests.rs`, or beneath a directory named `tests/`, is wholly
+/// test code, so its shipped half is empty. Any other file is shipped up to
+/// its inline `#[cfg(test)]` `mod tests {` block, which runs to the end of the
+/// file. Only that block is cut: a `#[cfg(test)]` item above production code
+/// is a single item, and the code after it is still shipped and still read.
+#[cfg(test)]
+pub(crate) fn shipped_source<'a>(path: &Path, source: &'a str) -> &'a str {
+    if path.file_stem().is_some_and(|stem| stem == "tests")
+        || path
+            .parent()
+            .is_some_and(|dir| dir.components().any(|c| c.as_os_str() == "tests"))
+    {
+        return "";
+    }
+    source
+        .find("#[cfg(test)]\nmod tests {")
+        .map_or(source, |end| &source[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +392,36 @@ mod tests {
     #[should_panic(expected = "has no source file")]
     fn a_module_with_no_source_is_refused() {
         let _ = module_sources("no_such_module");
+    }
+
+    #[test]
+    fn shipped_source_cuts_only_at_the_test_module() {
+        let source = "fn a() {}\n#[cfg(test)]\nstatic X: u8 = 0;\nfn b() {}\n\
+                      #[cfg(test)]\nmod tests {\n    fn c() {}\n}\n";
+        assert_eq!(
+            shipped_source(Path::new("a/b.rs"), source),
+            "fn a() {}\n#[cfg(test)]\nstatic X: u8 = 0;\nfn b() {}\n",
+            "a #[cfg(test)] item above production code hides none of it"
+        );
+        assert_eq!(
+            shipped_source(Path::new("a.rs"), "fn a() {}\n"),
+            "fn a() {}\n"
+        );
+        for test_file in ["a/tests.rs", "a/tests/b.rs", "tests/b/c.rs"] {
+            assert_eq!(
+                shipped_source(Path::new(test_file), source),
+                "",
+                "{test_file}"
+            );
+        }
+        // The rule holds on the file that motivated it: `when.rs` declares a
+        // test-only `static` above `Machine::read`.
+        let (path, when) = module_sources("config::when")
+            .into_iter()
+            .find(|(path, _)| path == Path::new("config/when.rs"))
+            .expect("config/when.rs");
+        assert!(when.contains("#[cfg(test)]\nstatic UNKNOWN"));
+        assert!(shipped_source(&path, &when).contains("pub fn read("));
     }
 
     #[test]

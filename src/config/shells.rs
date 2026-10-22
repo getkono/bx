@@ -185,9 +185,7 @@ impl Phase {
     }
 }
 
-// Only tests ask these, so they sit last, beside them: the source scans that
-// read everything above the first `#[cfg(test)]` as this module's shipped code
-// still read all of it.
+// Only tests ask these, so they sit last, beside them.
 #[cfg(test)]
 impl Shells {
     /// Only `shell`.

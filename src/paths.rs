@@ -663,9 +663,7 @@ pub fn normalize(path: &Path) -> PathBuf {
     out.into_iter().collect()
 }
 
-// Only tests call the two below. They sit last, beside the tests, so the
-// source scans that read everything above the first `#[cfg(test)]` as this
-// module's shipped code still read all of it.
+// Only tests call the one below, so it sits last, beside them.
 
 /// Expand leading `~/` on every line of repo content.
 ///
@@ -693,23 +691,18 @@ pub fn render_content(content: &str, home: &Path) -> String {
     out
 }
 
-/// The config repo root, resolved from the process environment.
-///
-/// # Errors
-///
-/// Whatever [`home`] returns.
-#[cfg(test)]
-pub fn config_root() -> Result<PathBuf, Error> {
-    let home = home()?;
-    Ok(config_root_in(
-        &home,
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config repo root, resolved from the process environment.
+    fn config_root() -> Result<PathBuf, Error> {
+        let home = super::home()?;
+        Ok(config_root_in(
+            &home,
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        ))
+    }
 
     fn home() -> PathBuf {
         // A deliberately non-standard home: nothing here may name a real

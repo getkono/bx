@@ -554,6 +554,7 @@ mod tests {
         // leaves the journal where it was.
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so there is nothing to assert.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();

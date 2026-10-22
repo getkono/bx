@@ -493,6 +493,7 @@ mod tests {
     fn a_destination_that_cannot_be_stat_ed_is_an_error_not_an_absent_file() {
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so there is nothing to assert.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();

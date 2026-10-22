@@ -1940,6 +1940,7 @@ mod tests {
         // `Fingerprints::read` with no remedy, though each file read perfectly.
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2024,6 +2025,7 @@ mod tests {
         // zero — so the whole arm could be replaced by `Ok(())` undetected.
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2311,6 +2313,7 @@ mod tests {
             // `0000` denies nothing to root, so the condition cannot be staged.
             // The root-independent half of this property is pinned by
             // `a_file_that_cannot_be_read_is_an_error_not_damage`.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");

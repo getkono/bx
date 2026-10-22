@@ -1671,6 +1671,7 @@ mod tests {
     fn an_unwritable_parent_directory_surfaces_a_typed_error() {
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so there is nothing to assert.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -1691,6 +1692,7 @@ mod tests {
     fn a_missing_directory_under_a_read_only_parent_is_a_write_error_naming_it() {
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so the mkdir is not refused.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -1722,6 +1724,7 @@ mod tests {
     fn a_parent_that_cannot_be_stat_ed_is_an_error_not_an_absent_directory() {
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so there is nothing to assert.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -1985,6 +1988,7 @@ mod tests {
     fn a_failed_rename_syncs_no_directory() {
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so the rename is not refused.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -2487,6 +2491,7 @@ mod tests {
     fn a_directory_that_cannot_be_opened_for_its_fsync_fails_before_the_rename() {
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so there is nothing to assert.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -2521,6 +2526,7 @@ mod tests {
         // never opened at all.
         if rustix::process::geteuid().is_root() {
             // Root ignores the permission bits, so the condition cannot be staged.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();

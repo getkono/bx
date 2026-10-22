@@ -198,11 +198,12 @@ mod tests {
                 "more than one",
             ),
         ] {
-            match find(text, '#') {
-                Found::Damaged(reason) => assert!(reason.contains(why), "{reason}"),
+            let reason = match find(text, '#') {
+                Found::Damaged(reason) => reason,
                 other => panic!("{text:?}: {other:?}"),
-            }
-            assert!(splice(Some(text), '#', BODY).is_err());
+            };
+            assert!(reason.contains(why), "{reason}");
+            assert_eq!(splice(Some(text), '#', BODY), Err(reason), "{text:?}");
         }
     }
 

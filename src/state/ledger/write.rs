@@ -1503,6 +1503,7 @@ mod tests {
     fn an_unreadable_restore_blob_is_reported() {
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();

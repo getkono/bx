@@ -2240,19 +2240,24 @@ mod tests {
             Mode::parse_octal("0688"),
             Err(ModeError::Invalid("0688".to_string()))
         );
-        assert!(
-            Mode::parse_octal("").is_err(),
+        assert_eq!(
+            Mode::parse_octal(""),
+            Err(ModeError::Invalid(String::new())),
             "an empty mode is not a mode"
         );
-        assert!(
-            Mode::parse_octal("+644").is_err(),
+        assert_eq!(
+            Mode::parse_octal("+644"),
+            Err(ModeError::Invalid("+644".to_string())),
             "a sign is not an octal digit"
         );
     }
 
     #[test]
     fn a_mode_wider_than_four_digits_is_rejected() {
-        assert!(Mode::parse_octal("00644").is_err());
+        assert_eq!(
+            Mode::parse_octal("00644"),
+            Err(ModeError::Invalid("00644".to_string()))
+        );
         assert!(message(&with("mode = \"00644\"\n")).contains("octal digits"));
     }
 
@@ -2478,7 +2483,10 @@ mod tests {
             KeyPath::parse(""),
             Err(KeyPathError::EmptySegment(String::new()))
         );
-        assert!(KeyPath::parse(".a").is_err());
+        assert_eq!(
+            KeyPath::parse(".a"),
+            Err(KeyPathError::EmptySegment(".a".to_string()))
+        );
     }
 
     #[test]

@@ -2543,7 +2543,12 @@ mod tests {
             }
         );
         assert_eq!(system.locate("absent-tool"), Presence::Missing);
-        assert!(system.hash(&dir.path().join("absent")).is_err());
+        let absent = dir.path().join("absent");
+        let missing = std::io::Error::from_raw_os_error(rustix::io::Errno::NOENT.raw_os_error());
+        assert_eq!(
+            system.hash(&absent),
+            Err(format!("reading {}: {missing}", absent.display()))
+        );
     }
 
     #[test]

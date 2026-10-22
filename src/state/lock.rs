@@ -979,6 +979,7 @@ mod tests {
     fn a_probe_reports_a_lock_file_it_cannot_open() {
         if rustix::process::geteuid().is_root() {
             // `0000` denies nothing to root, so the condition cannot be staged.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -1437,9 +1438,12 @@ mod tests {
         assert!(err.to_string().contains("not a plain file"), "{err}");
         assert!(matches!(
             SharedLock::acquire(&dir),
-            Err(Error::LockNotAFile { .. })
+            Err(Error::LockNotAFile { path }) if path == dir.lock()
         ));
-        assert!(ExclusiveLock::try_acquire(&dir).is_err());
+        assert!(matches!(
+            ExclusiveLock::try_acquire(&dir),
+            Err(Error::LockNotAFile { path }) if path == dir.lock()
+        ));
         assert_eq!(
             std::fs::read(home.child(".bashrc")).expect("read"),
             b"the user wrote this\n",
@@ -1634,6 +1638,7 @@ mod tests {
         // `ensure_dir` and the repair here were both unreachable by any test
         // that could make them matter, and deleting either left the suite green.
         if rustix::process::geteuid().is_root() {
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         for mask in [0o500, 0o277, 0o377] {
@@ -1663,6 +1668,7 @@ mod tests {
         // umask that made it, so the condition the test above says cannot
         // happen did, undiagnosably.
         if rustix::process::geteuid().is_root() {
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         for mask in [0o500, 0o277, 0o377] {
@@ -1737,7 +1743,10 @@ mod tests {
             assert!(message.contains("a directory"), "{message}");
             assert!(message.contains("Move it aside"), "{message}");
         }
-        assert!(ExclusiveLock::try_acquire(&dir).is_err());
+        assert!(matches!(
+            ExclusiveLock::try_acquire(&dir),
+            Err(Error::LockNotAFile { path }) if path == dir.lock()
+        ));
         assert_eq!(std::fs::read(dir.lock().join("keep")).expect("kept"), b"x");
     }
 
@@ -1745,6 +1754,7 @@ mod tests {
     fn a_lock_file_that_cannot_be_opened_is_reported() {
         if rustix::process::geteuid().is_root() {
             // `0000` denies nothing to root, so the condition cannot be staged.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
         let home = guarded_home();
@@ -1754,7 +1764,11 @@ mod tests {
         std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o000))
             .expect("chmod");
         let err = ExclusiveLock::acquire(&dir).expect_err("must fail");
-        assert!(matches!(err, Error::Lock { .. }), "got {err}");
-        assert!(ExclusiveLock::try_acquire(&dir).is_err());
+        let denied = |err: &Error| {
+            matches!(err, Error::Lock { path, source }
+                if *path == dir.lock() && source.kind() == std::io::ErrorKind::PermissionDenied)
+        };
+        assert!(denied(&err), "got {err}");
+        assert!(matches!(ExclusiveLock::try_acquire(&dir), Err(err) if denied(&err)));
     }
 }

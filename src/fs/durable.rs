@@ -343,11 +343,33 @@ mod tests {
                 .sync();
             (missing, onto_a_dir, no_sync, no_dir_sync)
         });
-        assert!(result.0.is_err(), "the open failed");
-        assert!(result.1.is_err(), "the rename failed");
-        assert!(result.2.is_err(), "the file sync failed: {:?}", result.2);
+        let errno =
+            |outcome: &io::Result<()>| outcome.as_ref().err().and_then(io::Error::raw_os_error);
+        use rustix::io::Errno;
+        assert_eq!(
+            errno(&result.0),
+            Some(Errno::NOENT.raw_os_error()),
+            "the open failed: {:?}",
+            result.0
+        );
+        // A file renamed over a directory that is not empty: Linux reports
+        // which of the two it checks first, and that varies by filesystem.
         assert!(
-            result.3.is_err(),
+            [Errno::ISDIR, Errno::NOTEMPTY]
+                .iter()
+                .any(|refused| errno(&result.1) == Some(refused.raw_os_error())),
+            "the rename failed: {:?}",
+            result.1
+        );
+        assert_eq!(
+            errno(&result.2),
+            Some(Errno::INVAL.raw_os_error()),
+            "the file sync failed: {:?}",
+            result.2
+        );
+        assert_eq!(
+            errno(&result.3),
+            Some(Errno::INVAL.raw_os_error()),
             "the directory sync failed: {:?}",
             result.3
         );
@@ -388,7 +410,12 @@ mod tests {
                 panic!("inside");
             });
         });
-        assert!(caught.is_err());
+        let payload = caught.expect_err("the closure panicked");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"inside"),
+            "the panic is the closure's own, not a recording assertion's"
+        );
 
         // Asserted on the thread's own state, not on a later recording: the
         // later one calls `start`, which replaces the buffer, so it comes back

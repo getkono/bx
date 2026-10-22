@@ -2192,6 +2192,13 @@ mod tests {
                             "{prefix} {answer} {part}: {message}"
                         );
                     }
+                } else {
+                    // Where the pair names no file `s` shares, the toggles are
+                    // refused for what each is: a toggle of nothing declared.
+                    assert!(
+                        message.contains("which no earlier layer declares"),
+                        "{prefix} {answer}: {message}"
+                    );
                 }
             }
         }
@@ -2735,7 +2742,18 @@ mod tests {
             crate::fs::case_insensitive,
         );
 
-        assert_eq!(outcome.is_err(), folds, "{outcome:?}");
+        match outcome {
+            Ok(()) => assert!(!folds, "two names for one file stood"),
+            Err(error @ Error::BadValue { .. }) => {
+                assert!(folds, "two files refused as one: {error}");
+                let message = error.to_string();
+                assert!(
+                    message.contains("on this volume, which does not tell names apart by case"),
+                    "the volume was judged, not guessed at: {message}"
+                );
+            }
+            Err(other) => panic!("not the shared-file refusal: {other:?}"),
+        }
     }
 
     /// The targets of one global layer, each ready.

@@ -61,66 +61,93 @@ fn stderr(output: &Output) -> String {
 
 const A_TARGET: &str = "[[target]]\npath = \"~/.a\"\ncontent = \"a\\n\"\n";
 
-#[test]
-fn t21_plan_exits_zero_when_converged_and_two_when_pending() {
-    let home = guarded_home();
-    seed(home.path(), "");
-    let converged = bx(home.path(), &["plan"]);
-    assert_eq!(converged.status.code(), Some(0), "{}", stderr(&converged));
-    assert_eq!(
-        stdout(&converged),
-        "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
-    );
-
-    seed(home.path(), A_TARGET);
-    let pending = bx(home.path(), &["plan"]);
-    assert_eq!(pending.status.code(), Some(2), "{}", stderr(&pending));
-    assert!(
-        stdout(&pending).starts_with("  + ~/.a  (~/.config/bx/bx.toml:1)\n"),
-        "{}",
-        stdout(&pending)
-    );
-    assert!(!stdout(&pending).contains('\x1b'), "coloured into a pipe");
-    assert!(!home.child(".a").exists(), "plan wrote");
+/// What a row of [`every_outcome_reaches_the_process_as_its_exit_code`]
+/// expects on standard output.
+enum Out {
+    Is(&'static str),
+    StartsWith(&'static str),
+    EndsWith(&'static str),
 }
 
 #[test]
-fn t22_apply_with_yes_then_plan_is_converged() {
+fn every_outcome_reaches_the_process_as_its_exit_code() {
+    // The rows run in order over one home, each writing `layer` first where
+    // it names one: 0 is converged, 2 pending and 1 an error, whatever the
+    // command. `written` is whether `~/.a` holds the target's bytes after it.
     let home = guarded_home();
-    seed(home.path(), A_TARGET);
+    for (layer, args, code, out, said, written) in [
+        // No config repo yet.
+        (None, &["plan"][..], 1, Out::Is(""), "run `bx init`", false),
+        (
+            Some(""),
+            &["plan"],
+            0,
+            Out::Is("Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"),
+            "",
+            false,
+        ),
+        (
+            Some(A_TARGET),
+            &["plan"],
+            2,
+            Out::StartsWith("  + ~/.a  (~/.config/bx/bx.toml:1)\n"),
+            "",
+            false,
+        ),
+        // Bare `bx` is the status view, with plan's exit codes.
+        (None, &[], 2, Out::StartsWith("  + ~/.a"), "", false),
+        // No `--yes` and no terminal: the plan is shown and nothing written.
+        (
+            None,
+            &["apply"],
+            1,
+            Out::StartsWith("  + ~/.a"),
+            "rerun with --yes",
+            false,
+        ),
+        (
+            None,
+            &["apply", "--yes"],
+            0,
+            Out::EndsWith("Applied 1 change(s).\n"),
+            "",
+            true,
+        ),
+        (
+            None,
+            &["plan"],
+            0,
+            Out::StartsWith("Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, "),
+            "",
+            true,
+        ),
+        (None, &[], 0, Out::StartsWith("  = ~/.a"), "", true),
+    ] {
+        if let Some(layer) = layer {
+            seed(home.path(), layer);
+        }
+        let output = bx(home.path(), args);
 
-    let applied = bx(home.path(), &["apply", "--yes"]);
-    assert_eq!(applied.status.code(), Some(0), "{}", stderr(&applied));
-    assert!(stdout(&applied).ends_with("Applied 1 change(s).\n"));
-    assert_eq!(std::fs::read(home.child(".a")).expect("written"), b"a\n");
-
-    let planned = bx(home.path(), &["plan"]);
-    assert_eq!(planned.status.code(), Some(0), "{}", stdout(&planned));
-
-    let status = bx(home.path(), &[]);
-    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
-    assert!(
-        stdout(&status).starts_with("  = ~/.a"),
-        "{}",
-        stdout(&status)
-    );
-}
-
-#[test]
-fn t23_plan_without_a_config_repo_exits_one_and_says_what_to_run() {
-    let home = guarded_home();
-
-    let output = bx(home.path(), &["plan"]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        stderr(&output).contains("run `bx init`"),
-        "{}",
-        stderr(&output)
-    );
-    // The message and nothing about bx's own source or how to debug it.
-    for noise in ["Location:", "src/main.rs", "RUST_BACKTRACE"] {
-        assert!(!stderr(&output).contains(noise), "{}", stderr(&output));
+        let (shown, err) = (stdout(&output), stderr(&output));
+        assert_eq!(output.status.code(), Some(code), "{args:?}: {err}");
+        let matched = match out {
+            Out::Is(whole) => shown == whole,
+            Out::StartsWith(start) => shown.starts_with(start),
+            Out::EndsWith(end) => shown.ends_with(end),
+        };
+        assert!(matched, "{args:?}: {shown}");
+        assert!(!shown.contains('\x1b'), "{args:?}: coloured into a pipe");
+        assert!(err.contains(said), "{args:?}: {err}");
+        // An error is its message, and nothing about bx's own source or how
+        // to debug it.
+        for noise in ["Location:", "src/main.rs", "RUST_BACKTRACE"] {
+            assert!(!err.contains(noise), "{args:?}: {err}");
+        }
+        assert_eq!(
+            std::fs::read(home.child(".a")).ok(),
+            written.then(|| b"a\n".to_vec()),
+            "{args:?}"
+        );
     }
 }
 
@@ -152,27 +179,6 @@ fn decision_21_a_home_spelled_with_a_parent_component_is_refused_naming_home() {
         before,
         "a refused HOME changed the home"
     );
-}
-
-#[test]
-fn decision_4_apply_without_yes_and_no_terminal_exits_one_having_shown_the_plan() {
-    let home = guarded_home();
-    seed(home.path(), A_TARGET);
-
-    let output = bx(home.path(), &["apply"]);
-
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(
-        stdout(&output).starts_with("  + ~/.a"),
-        "{}",
-        stdout(&output)
-    );
-    assert!(
-        stderr(&output).contains("rerun with --yes"),
-        "{}",
-        stderr(&output)
-    );
-    assert!(!home.child(".a").exists(), "written without confirmation");
 }
 
 /// `PATH_MAX`, which counts the terminating NUL: 4096 on Linux, 1024 on
@@ -983,21 +989,6 @@ fn update_check_exits_one_when_it_could_not_reach_an_external() {
         stdout(&checked)
     );
     assert!(!home.child(".config/bx/bx.lock").exists(), "nothing locked");
-}
-
-#[test]
-fn bare_bx_is_the_status_view_with_plan_exit_codes() {
-    let home = guarded_home();
-    seed(home.path(), A_TARGET);
-
-    let output = bx(home.path(), &[]);
-
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert!(
-        stdout(&output).starts_with("  + ~/.a"),
-        "{}",
-        stdout(&output)
-    );
 }
 
 #[test]

@@ -1066,13 +1066,11 @@ fn upgrade_with(
     let inputs = Inputs::load(env)?;
     let (followed, pinned) = pin::select(&inputs.resolved().externals, names, &env.home)?;
     let mut exits = Vec::new();
-    // Named externals that are all pinned leave `bx update` nothing to look
-    // at; with no names, it looks at every followed one, as `bx update
-    // --check` does.
-    if names.is_empty() || !followed.is_empty() {
+    // Each followed one chosen, by name: with none, `bx update --check`
+    // would look at every followed one instead.
+    if !followed.is_empty() {
         let followed: Vec<String> = followed
             .iter()
-            .filter(|_| !names.is_empty())
             .map(|external| external.path.to_string())
             .collect();
         exits.push(update::check(env, &followed, false, git, out)?);

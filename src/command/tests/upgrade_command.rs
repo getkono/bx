@@ -179,6 +179,11 @@ fn a_check_moves_nothing_and_exits_by_the_worst_it_found() {
         "{}",
         text(&out)
     );
+    assert!(
+        text(&out).contains(&format!("~/{AT}: 1 new commit(s) on master")),
+        "the follow is checked as bx update --check checks it: {}",
+        text(&out)
+    );
     assert_eq!(rev(home.path(), &repo, "HEAD"), head);
     assert_eq!(rev(home.path(), &home.child(PINNED), "HEAD"), first);
     assert!(
@@ -239,6 +244,165 @@ fn a_check_moves_nothing_and_exits_by_the_worst_it_found() {
         "could not look is not up to date: {}",
         text(&blind)
     );
+}
+
+#[test]
+fn a_pin_whose_remote_cannot_be_asked_is_an_error_to_a_check() {
+    let home = guarded_home();
+    let first = upstream(&home, &["skills/a/SKILL.md"]);
+    let gone = pinned(&first).replace("invalid/upstream", "invalid/gone");
+    cloned(&home, &gone);
+
+    let mut out = Vec::new();
+    let exit = upgrade(&home, &[], Upgrading::Check, &mut out).expect("check");
+    assert_eq!(exit, Exit::Error, "{}", text(&out));
+    assert!(
+        text(&out).contains(&format!("~/{PINNED}: not checked: ")),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("follows a branch"), "{}", text(&out));
+}
+
+#[test]
+fn an_upgrade_with_no_upstream_names_itself_and_rewrites_the_pin() {
+    let home = guarded_home();
+    let (repo, _, second) = released(&home);
+    run(home.path(), &repo, &["branch", "--unset-upstream"]);
+
+    let mut out = Vec::new();
+    let exit = upgrade(&home, &[], Upgrading::Upgrade { yes: true }, &mut out).expect("upgrade");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert!(
+        text(&out).starts_with(
+            "The config repo's master has no upstream, so there is nothing to pull; bx upgrade \
+             locks on top of it as it stands.\n"
+        ),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(subjects(&home, &repo, 1), [pin::SUBJECT]);
+    assert_eq!(rev(home.path(), &home.child(PINNED), "HEAD"), second);
+}
+
+#[test]
+fn an_interrupted_apply_is_recovered_and_nothing_is_upgraded_under_its_approval() {
+    use crate::journal::{Session, SessionKind};
+
+    let home = guarded_home();
+    let (repo, first, _) = released(&home);
+    let head = rev(home.path(), &repo, "HEAD");
+    let state = crate::state::StateDir::resolve(home.path());
+    drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+
+    let mut out = Vec::new();
+    let exit = upgrade(&home, &[], Upgrading::Upgrade { yes: true }, &mut out)
+        .expect("the recovering upgrade");
+    assert_eq!(exit, Exit::Pending, "{}", text(&out));
+    assert!(
+        text(&out).contains(
+            "Nothing was locked: an interrupted apply had to be dealt with first. Run bx \
+             upgrade again."
+        ),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing committed");
+    assert!(
+        std::fs::read_to_string(repo.join("bx.toml"))
+            .expect("bx.toml")
+            .contains(&first)
+    );
+    assert_eq!(
+        std::fs::read_to_string(update::Stamps::of(&state).last_check()).expect("last-check"),
+        "bx upgrade dealt with an interrupted apply first, and locked or upgraded nothing\n"
+    );
+}
+
+#[test]
+fn an_untagged_pin_past_the_newest_release_has_nothing_newer() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    tag(&home, "v1.0.0", false);
+    let second = publish(&home, &["skills/b/SKILL.md"]);
+    cloned(&home, &pinned(&second));
+    let names = [format!("~/{PINNED}")];
+    upgrade(
+        &home,
+        &names,
+        Upgrading::Upgrade { yes: true },
+        &mut Vec::new(),
+    )
+    .expect("clones it");
+
+    let mut out = Vec::new();
+    let exit = upgrade(&home, &names, Upgrading::Check, &mut out).expect("check");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert!(
+        text(&out).contains(&format!(
+            "~/{PINNED}: pinned at {}; nothing newer is released\n",
+            &second[..12]
+        )),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_pin_past_the_default_branch_with_no_release_has_nothing_newer() {
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    let dir = home.child("upstream");
+    run(home.path(), &dir, &["checkout", "--quiet", "-b", "ahead"]);
+    let ahead = publish(&home, &["skills/b/SKILL.md"]);
+    run(home.path(), &dir, &["checkout", "--quiet", "master"]);
+    cloned(&home, &pinned(&ahead));
+    let names = [format!("~/{PINNED}")];
+    upgrade(
+        &home,
+        &names,
+        Upgrading::Upgrade { yes: true },
+        &mut Vec::new(),
+    )
+    .expect("clones it");
+
+    let mut out = Vec::new();
+    let exit = upgrade(&home, &names, Upgrading::Check, &mut out).expect("check");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert!(
+        text(&out).contains(&format!(
+            "~/{PINNED}: pinned at {}; nothing newer is released\n",
+            &ahead[..12]
+        )),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_pin_subject_on_a_commit_that_touches_no_layer_is_not_replayed() {
+    let home = guarded_home();
+    let (repo, _, _) = released(&home);
+    std::fs::write(repo.join("notes"), "mine\n").expect("a note");
+    commit_all(home.path(), &repo, pin::SUBJECT);
+    let other = crate::sync::tests::other(&home);
+    std::fs::write(other.join("theirs"), "x\n").expect("a file");
+    commit_all(home.path(), &other, "elsewhere");
+    run(home.path(), &other, &["push", "--quiet"]);
+    let head = rev(home.path(), &repo, "HEAD");
+
+    let error = upgrade(
+        &home,
+        &[],
+        Upgrading::Upgrade { yes: true },
+        &mut Vec::new(),
+    )
+    .expect_err("diverged");
+    assert!(
+        matches!(error, update::Error::Sync(sync::Error::Diverged { .. })),
+        "{error:?}"
+    );
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing moved");
 }
 
 #[test]

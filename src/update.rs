@@ -437,10 +437,7 @@ pub fn look(
     };
     let dest = external.path.render(home);
     let reference = format!("refs/heads/{}", follow.branch);
-    let ours = finished_clone(ledger, &external.path)
-        && dest.is_dir()
-        && checkout::own_checkout(git, &dest).is_ok()
-        && matches!(checkout::origin_url(git, &dest), Ok(Some(url)) if url == external.url);
+    let ours = owned(git, ledger, external, &dest);
 
     let tip = if ours {
         git.query(
@@ -502,6 +499,21 @@ pub fn look(
         Ok(false) => found(Verdict::Rewritten { tip }),
         Err(error) => found(Verdict::Unreachable(problem(&error))),
     }
+}
+
+/// Whether `dest` is `external`'s checkout as bx made it: the ledger records
+/// bx's finished clone there, and it is a repository of its own whose
+/// `origin` is the url declared. Only such a checkout is fetched into.
+pub(crate) fn owned(
+    git: &Git,
+    ledger: &crate::state::LedgerView,
+    external: &External,
+    dest: &Path,
+) -> bool {
+    finished_clone(ledger, &external.path)
+        && dest.is_dir()
+        && checkout::own_checkout(git, dest).is_ok()
+        && matches!(checkout::origin_url(git, dest), Ok(Some(url)) if url == external.url)
 }
 
 /// The commit `reference` names on the remote at `url`, asked with

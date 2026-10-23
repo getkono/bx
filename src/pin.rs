@@ -27,7 +27,6 @@ use crate::fs::Mode;
 use crate::git::checkout::{self, problem};
 use crate::git::{self, Git};
 use crate::paths::Portable;
-use crate::plan::external::finished_clone;
 use crate::upgrade::Version;
 
 /// The subject of the commit `bx upgrade` makes for the pins it moves.
@@ -280,10 +279,7 @@ pub fn look(
         verdict,
     };
     let dest = external.path.render(home);
-    let ours = finished_clone(ledger, &external.path)
-        && dest.is_dir()
-        && checkout::own_checkout(git, &dest).is_ok()
-        && matches!(checkout::origin_url(git, &dest), Ok(Some(url)) if url == external.url);
+    let ours = crate::update::owned(git, ledger, external, &dest);
     let releases = match releases(git, home, &external.url) {
         Ok(releases) => releases,
         Err(why) => return found(Verdict::Unreachable(why)),
@@ -296,7 +292,7 @@ pub fn look(
         .filter(|release| release.commit == *rev)
         .max_by_key(|release| release.version);
     let tag = current.map(|release| release.name.clone());
-    if newest.commit == *rev || current.is_some_and(|c| c.version >= newest.version) {
+    if current.is_some_and(|c| c.version >= newest.version) {
         return found(Verdict::Current { tag });
     }
     let tip = newest.commit.clone();

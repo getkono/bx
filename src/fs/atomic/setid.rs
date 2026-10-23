@@ -522,14 +522,21 @@ pub(super) fn verify_set_id_kept(
 mod tests {
     use super::*;
 
+    // Used only by the user-namespace cases, which are Linux's.
+    #[cfg(target_os = "linux")]
     use std::ffi::OsString;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt as _;
+    #[cfg(target_os = "linux")]
     use std::path::PathBuf;
 
     use rustix::io::Errno;
 
-    use crate::fs::atomic::test_support::{desired, mode_of_path, names_in, seed, stage_now};
+    #[cfg(target_os = "linux")]
+    use crate::fs::atomic::test_support::names_in;
+    use crate::fs::atomic::test_support::{desired, mode_of_path, seed, stage_now};
     use crate::fs::atomic::{CreatedDirs, Drift, compare, compare_dir, ensure_dir, observe, stage};
+    #[cfg(target_os = "linux")]
     use crate::fs::mode::Kind;
     use crate::testing::guarded_home;
 
@@ -660,12 +667,17 @@ mod tests {
     /// Set only in the unprivileged child
     /// `a_setgid_bit_the_kernel_drops_is_refused_rather_than_published` runs
     /// itself as, naming the setgid directory the child writes into.
+    #[cfg(target_os = "linux")]
     const SET_ID_CHILD_DIR: &str = "BX_TEST_SET_ID_CHILD_DIR";
 
     /// Printed by that child before anything else, so the parent can tell a
     /// child that ran and failed from one that could not be started.
+    #[cfg(target_os = "linux")]
     const SET_ID_CHILD_RAN: &str = "bx-set-id-child-ran";
 
+    // `unshare` user namespaces are Linux's, as are the other cases that
+    // run a child through `run_in_a_foreign_setgid_directory_under`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_setgid_bit_the_kernel_drops_is_refused_rather_than_published() {
         const NAME: &str = "fs::atomic::setid::tests::a_setgid_bit_the_kernel_drops_is_refused_rather_than_published";
@@ -709,8 +721,10 @@ mod tests {
     /// Set only in the unprivileged child
     /// `a_setgid_bit_the_kernel_drops_from_a_directory_is_refused` runs itself
     /// as, naming the setgid directory the child creates directories in.
+    #[cfg(target_os = "linux")]
     const SET_ID_DIR_CHILD_DIR: &str = "BX_TEST_SET_ID_DIR_CHILD_DIR";
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_setgid_bit_the_kernel_drops_from_a_directory_is_refused() {
         const NAME: &str =
@@ -808,8 +822,10 @@ mod tests {
     }
 
     /// The variable the preflight test's child finds its setgid directory in.
+    #[cfg(target_os = "linux")]
     const SET_ID_PREFLIGHT_CHILD_DIR: &str = "BX_TEST_SET_ID_PREFLIGHT_CHILD_DIR";
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_setgid_bit_a_chmod_would_strip_is_refused_before_any_chmod() {
         const NAME: &str = "fs::atomic::setid::tests::a_setgid_bit_a_chmod_would_strip_is_refused_before_any_chmod";
@@ -908,8 +924,10 @@ mod tests {
     }
 
     /// The variable the uid-0 child finds its setgid directory in.
+    #[cfg(target_os = "linux")]
     const SET_ID_ROOT_CHILD_DIR: &str = "BX_TEST_SET_ID_ROOT_CHILD_DIR";
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn uid_zero_without_cap_fsetid_is_refused_like_any_other_process() {
         const NAME: &str = "fs::atomic::setid::tests::uid_zero_without_cap_fsetid_is_refused_like_any_other_process";
@@ -974,8 +992,10 @@ mod tests {
     }
 
     /// The variable the capability child finds its setgid directory in.
+    #[cfg(target_os = "linux")]
     const SET_ID_CAP_CHILD_DIR: &str = "BX_TEST_SET_ID_CAP_CHILD_DIR";
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_capability_does_not_survive_a_group_this_namespace_does_not_map() {
         const NAME: &str = "fs::atomic::setid::tests::\
@@ -1553,8 +1573,10 @@ mod tests {
     }
 
     /// The variable the foreign-file test's child finds its directory in.
+    #[cfg(target_os = "linux")]
     const FOREIGN_FILE_CHILD_DIR: &str = "BX_TEST_FOREIGN_FILE_CHILD_DIR";
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_foreign_file_s_prior_mode_without_owner_read_is_restored_as_recorded() {
         const NAME: &str = "fs::atomic::setid::tests::\
@@ -1631,6 +1653,7 @@ mod tests {
 
     /// The refusal a directory whose declared special bit did not stick gets,
     /// naming `dir`; returns the mode it reports on disk.
+    #[cfg(target_os = "linux")]
     fn assert_directory_set_id_not_kept(err: &Error, dir: &Path, declared: Mode) -> Mode {
         let message = err.to_string();
         let Error::DirectorySetIdNotKept {
@@ -1684,8 +1707,9 @@ mod tests {
     /// a user namespace, with `child_env` naming a world-writable setgid
     /// directory owned by a group that uid is not in.
     ///
-    /// Skips, with a message on stderr, wherever the scenario cannot be
-    /// constructed; fails only when the child ran and failed.
+    /// Fails wherever the scenario cannot be constructed, unless the skip was
+    /// asked for by name, and when the child ran and failed.
+    #[cfg(target_os = "linux")]
     fn run_unprivileged_in_a_foreign_setgid_directory(
         name: &str,
         child_env: &str,
@@ -1705,6 +1729,7 @@ mod tests {
     ///
     /// Fails wherever the scenario cannot be constructed, unless the skip was
     /// asked for by name, and when the child ran and failed.
+    #[cfg(target_os = "linux")]
     fn run_in_a_foreign_setgid_directory(
         name: &str,
         child_env: &str,
@@ -1730,6 +1755,7 @@ mod tests {
     /// overflow gid — while the child is uid 0 with a full capability set.
     /// That is the one combination `capable_wrt_inode_uidgid` refuses and
     /// nothing else here constructs.
+    #[cfg(target_os = "linux")]
     fn run_in_a_foreign_setgid_directory_under(
         name: &str,
         child_env: &str,

@@ -645,70 +645,15 @@ mod tests {
     }
 
     #[test]
-    fn a_switched_off_or_unusable_value_holds_the_function_back_too() {
-        let off = resolved(
-            "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\"\nenabled = false\n\
-             [[function]]\nname = \"f\"\nbody = \"echo {{a}}\"\n",
-        )
-        .expect("resolves");
-        let [Resolution::Blocked(entry)] = off.as_slice() else {
-            panic!("{off:?}");
-        };
-        assert!(matches!(entry.reason, BlockReason::DisabledValue { .. }));
-        assert!(entry.hint.contains("re-enable a"), "{}", entry.hint);
+    fn a_value_holds_the_function_back_or_fails_the_load_as_its_cause_decides() {
+        use crate::shell::source::tests::{Gated, assert_value_gating};
 
-        let unusable = resolved(
-            "[[value]]\nname = \"root\"\nkind = \"path\"\n\
-             [values]\nroot = \"relative\"\n\
-             [[function]]\nname = \"f\"\nbody = \"cd {{root}}\"\n",
-        )
-        .expect("resolves");
-        let [Resolution::Blocked(entry)] = unusable.as_slice() else {
-            panic!("{unusable:?}");
-        };
-        assert!(matches!(entry.reason, BlockReason::InvalidValue { .. }));
-
-        // An answer that brings a control character into the body blocks it,
-        // naming the answer's line.
-        let carriage = resolved(
-            "[[value]]\nname = \"a\"\nkind = \"string\"\n\
-             [values]\na = \"x\\ry\"\n\
-             [[function]]\nname = \"f\"\nbody = \"echo {{a}}\"\n",
-        )
-        .expect("resolves");
-        let [Resolution::Blocked(entry)] = carriage.as_slice() else {
-            panic!("{carriage:?}");
-        };
-        assert!(matches!(entry.reason, BlockReason::InvalidValue { .. }));
-        assert!(entry.hint.contains("control character"), "{}", entry.hint);
-        assert!(
-            entry.hint.contains("the answer to `a` at /repo/bx.toml:5"),
-            "{}",
-            entry.hint
-        );
-    }
-
-    #[test]
-    fn a_repo_defect_in_a_body_fails_the_load() {
-        let err = resolved("[[function]]\nname = \"f\"\nbody = \"echo {{nobody}}\"\n")
-            .expect_err("an undeclared value");
-        assert!(err.contains("function `f`"), "{err}");
-        assert!(err.contains("`nobody`"), "{err}");
-        // A committed default alone brings the control character in.
-        let err = resolved(
-            "[[value]]\nname = \"a\"\nkind = \"string\"\ndefault = \"x\\ry\"\n\
-             [[function]]\nname = \"f\"\nbody = \"echo {{a}}\"\n",
-        )
-        .expect_err("no answer can clear it");
-        assert!(err.contains("control character"), "{err}");
-    }
-
-    #[test]
-    fn a_disabled_function_resolves_to_nothing() {
-        let functions =
-            resolved("[[function]]\nname = \"f\"\nbody = \"echo {{nobody}}\"\nenabled = false\n")
-                .expect("a disabled body is not read");
-        assert!(functions.is_empty());
+        assert_value_gating(&Gated {
+            resolved,
+            entry: |name| format!("[[function]]\nname = \"s\"\nbody = \"echo {{{{{name}}}}}\"\n"),
+            named: "function `s`",
+            unusable: ("x\\ry", &["control character"]),
+        });
     }
 
     #[test]

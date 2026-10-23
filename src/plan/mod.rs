@@ -42,6 +42,7 @@ use std::collections::BTreeSet;
 pub(crate) use decide::read_repo_file;
 #[cfg(test)]
 pub use diff::DiffKind;
+pub(crate) use diff::unified;
 pub use diff::{Diff, Palette, View, render};
 pub use error::Error;
 pub use inputs::Inputs;

@@ -59,10 +59,10 @@ use toml_edit::{Document, Item, Table};
 use values::{ValueAssignment, ValueDecl};
 
 /// The name of the global layer inside a config repo.
-const GLOBAL_LAYER: &str = "bx.toml";
+pub(crate) const GLOBAL_LAYER: &str = "bx.toml";
 
 /// The directory holding the further global layers.
-const MODULES_DIR: &str = "modules";
+pub(crate) const MODULES_DIR: &str = "modules";
 
 /// One config repo's worth of configuration, unmerged.
 ///

@@ -1927,11 +1927,13 @@ mod tests {
             Some(AssignedValue::String("/var/scratch".to_string()))
         );
         assert_eq!(decl.origin.line, 1);
-    }
 
-    #[test]
-    fn the_natural_key_is_the_name() {
-        assert_eq!(decl(&with("")).unwrap().name, "scratch_root");
+        // Each flag set above is off unless a declaration says otherwise, and
+        // the name is the natural key whatever else is declared.
+        let bare = self::decl(&with("")).unwrap();
+        assert_eq!(bare.name, "scratch_root");
+        assert!(!bare.required);
+        assert!(!bare.is_root);
     }
 
     #[test]
@@ -1950,18 +1952,6 @@ mod tests {
 
         assert!(message.contains("\"age-recipient\""), "{message}");
         assert!(message.contains("bx.toml:3"), "{message}");
-    }
-
-    #[test]
-    fn required_defaults_to_false() {
-        assert!(!decl(&with("")).unwrap().required);
-        assert!(decl(&with("required = true\n")).unwrap().required);
-    }
-
-    #[test]
-    fn is_root_defaults_to_false() {
-        assert!(!decl(&with("")).unwrap().is_root);
-        assert!(decl(&with("is_root = true\n")).unwrap().is_root);
     }
 
     #[test]
@@ -2878,7 +2868,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_hint_withholds_a_derived_value_two_spellings_carry_equally() {
+    fn a_derived_value_every_colliding_spelling_carries_is_not_offered_as_the_way_out() {
         // Both spellings hold `q` once, so answering it rewrites both alike and
         // naming it would be advice that clears nothing.
         let values = derived_chain();
@@ -3204,128 +3194,79 @@ mod tests {
     }
 
     #[test]
-    fn a_single_placeholder_is_substituted() {
+    fn substitute_replaces_each_placeholder_and_refuses_what_is_not_one() {
+        use PlaceholderError::{IllegalName, Unterminated};
         let values = substitution_values();
+        let scratch = "/var/mnt/scratch/one";
+        let illegal = |name: &str| {
+            Err(Unresolved::Malformed(IllegalName {
+                name: name.to_string(),
+                at: 0,
+            }))
+        };
 
-        assert_eq!(
-            values
-                .substitute("export CARGO_HOME={{scratch_root}}/cargo")
-                .unwrap(),
-            "export CARGO_HOME=/var/mnt/scratch/one/cargo"
-        );
-    }
-
-    #[test]
-    fn two_placeholders_in_one_field_are_substituted() {
-        let values = substitution_values();
-
-        assert_eq!(
-            values
-                .substitute("{{scratch_root}}:{{scratch_root}}")
-                .unwrap(),
-            "/var/mnt/scratch/one:/var/mnt/scratch/one"
-        );
-    }
-
-    #[test]
-    fn text_with_no_placeholder_is_returned_unchanged() {
-        let values = substitution_values();
-
-        assert_eq!(values.substitute("").unwrap(), "");
-        assert_eq!(values.substitute("plain text").unwrap(), "plain text");
-    }
-
-    #[test]
-    fn four_braces_are_a_literal_two() {
-        // The operator's own files contain literal brace pairs — a GitHub
-        // workflow's expression syntax, a handlebars template — so there has to
-        // be a way to write one.
-        let values = substitution_values();
-
-        assert_eq!(
-            values.substitute("{{{{scratch_root}}").unwrap(),
-            "{{scratch_root}}"
-        );
-        assert_eq!(values.substitute("{{{{}}").unwrap(), "{{}}");
-        assert_eq!(
-            values.substitute("a{{{{b{{scratch_root}}").unwrap(),
-            "a{{b/var/mnt/scratch/one"
-        );
-    }
-
-    #[test]
-    fn an_unmatched_closing_brace_is_content() {
-        // There is no escape for a closing pair and none is needed: a closing
-        // pair is only special once a placeholder is open.
-        let values = substitution_values();
-
-        assert_eq!(values.substitute("a}}b").unwrap(), "a}}b");
-        assert_eq!(values.substitute("}}").unwrap(), "}}");
-        assert_eq!(
-            values.substitute("{{scratch_root}}}}").unwrap(),
-            "/var/mnt/scratch/one}}"
-        );
-    }
-
-    #[test]
-    fn an_unterminated_placeholder_is_an_error() {
-        let values = substitution_values();
-
-        assert!(matches!(
-            values.substitute("{{scratch_root").unwrap_err(),
-            Unresolved::Malformed(PlaceholderError::Unterminated { at: 0 })
-        ));
-        assert!(matches!(
-            values.substitute("ok {{x").unwrap_err(),
-            Unresolved::Malformed(PlaceholderError::Unterminated { at: 3 })
-        ));
-    }
-
-    #[test]
-    fn a_placeholder_with_illegal_name_characters_is_an_error() {
-        let values = substitution_values();
-
-        for bad in [
-            "{{Scratch}}",
-            "{{scratch-root}}",
-            "{{ scratch_root }}",
-            "{{}}",
-        ] {
-            assert!(
-                matches!(
-                    values.substitute(bad).unwrap_err(),
-                    Unresolved::Malformed(PlaceholderError::IllegalName { .. })
-                ),
-                "{bad} was accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn a_nested_placeholder_is_an_error_not_an_expansion() {
-        let values = substitution_values();
-
-        let error = values.substitute("{{a{{scratch_root}}}}").unwrap_err();
-
-        assert!(
-            matches!(
-                &error,
-                Unresolved::Malformed(PlaceholderError::IllegalName { name, .. })
-                    if name == "a{{scratch_root"
+        let cases: Vec<(&str, Result<String, Unresolved>)> = vec![
+            (
+                "export CARGO_HOME={{scratch_root}}/cargo",
+                Ok(format!("export CARGO_HOME={scratch}/cargo")),
             ),
-            "{error:?}"
-        );
-    }
-
-    #[test]
-    fn a_substituted_value_is_not_rescanned() {
-        // `braced` holds the literal text of a placeholder. Substituting it
-        // yields that text verbatim rather than expanding it a second time: one
-        // pass is what keeps this a name lookup rather than a template language.
-        let values = substitution_values();
-
+            (
+                "{{scratch_root}}:{{scratch_root}}",
+                Ok(format!("{scratch}:{scratch}")),
+            ),
+            ("", Ok(String::new())),
+            ("plain text", Ok("plain text".to_string())),
+            // The operator's own files contain literal brace pairs — a GitHub
+            // workflow's expression syntax, a handlebars template — so four
+            // braces are a literal two.
+            ("{{{{scratch_root}}", Ok("{{scratch_root}}".to_string())),
+            ("{{{{}}", Ok("{{}}".to_string())),
+            ("a{{{{b{{scratch_root}}", Ok(format!("a{{{{b{scratch}"))),
+            // There is no escape for a closing pair and none is needed: a
+            // closing pair is only special once a placeholder is open.
+            ("a}}b", Ok("a}}b".to_string())),
+            ("}}", Ok("}}".to_string())),
+            ("{{scratch_root}}}}", Ok(format!("{scratch}}}}}"))),
+            // `braced` holds the literal text of a placeholder, and yields it
+            // verbatim rather than expanding it a second time: one pass is what
+            // keeps this a name lookup rather than a template language.
+            ("{{braced}}", Ok("{{scratch_root}}".to_string())),
+            // The scanner indexes into the string, so it advances by characters
+            // and never splits one.
+            (
+                "café → {{scratch_root}} ☕",
+                Ok(format!("café → {scratch} ☕")),
+            ),
+            ("日本語", Ok("日本語".to_string())),
+            (
+                "{{scratch_root",
+                Err(Unresolved::Malformed(Unterminated { at: 0 })),
+            ),
+            ("ok {{x", Err(Unresolved::Malformed(Unterminated { at: 3 }))),
+            ("{{Scratch}}", illegal("Scratch")),
+            ("{{scratch-root}}", illegal("scratch-root")),
+            ("{{ scratch_root }}", illegal(" scratch_root ")),
+            ("{{}}", illegal("")),
+            // A nested placeholder is an error, not an expansion.
+            ("{{a{{scratch_root}}}}", illegal("a{{scratch_root")),
+            // A repo typo, unfixable by any answer, so it fails the load rather
+            // than blocking a target.
+            (
+                "{{nowhere}}",
+                Err(Unresolved::Undeclared("nowhere".to_string())),
+            ),
+            // An unanswered value is unset rather than an error.
+            (
+                "name = {{git_name}}",
+                Err(Unresolved::Unset {
+                    names: vec!["git_name".to_string()],
+                }),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(values.substitute(text), expected, "{text}");
+        }
         assert_eq!(values.get("braced").unwrap().text, "{{scratch_root}}");
-        assert_eq!(values.substitute("{{braced}}").unwrap(), "{{scratch_root}}");
     }
 
     #[test]
@@ -3351,30 +3292,6 @@ mod tests {
     }
 
     #[test]
-    fn a_placeholder_naming_an_undeclared_value_is_an_error() {
-        // A repo typo, unfixable by any answer, so it fails the load rather
-        // than blocking a target.
-        let values = substitution_values();
-
-        assert_eq!(
-            values.substitute("{{nowhere}}").unwrap_err(),
-            Unresolved::Undeclared("nowhere".to_string())
-        );
-    }
-
-    #[test]
-    fn an_unanswered_value_is_unset_rather_than_an_error() {
-        let values = substitution_values();
-
-        assert_eq!(
-            values.substitute("name = {{git_name}}").unwrap_err(),
-            Unresolved::Unset {
-                names: vec!["git_name".to_string()]
-            }
-        );
-    }
-
-    #[test]
     fn unset_names_come_back_in_declaration_order() {
         let mut first = a_decl("git_name", ValueKind::String);
         first.required = true;
@@ -3392,19 +3309,6 @@ mod tests {
             },
             "two reports of one problem have to read the same way"
         );
-    }
-
-    #[test]
-    fn substitution_handles_multi_byte_content() {
-        // The scanner indexes into the string, so it advances by characters and
-        // never splits one.
-        let values = substitution_values();
-
-        assert_eq!(
-            values.substitute("café → {{scratch_root}} ☕").unwrap(),
-            "café → /var/mnt/scratch/one ☕"
-        );
-        assert_eq!(values.substitute("日本語").unwrap(), "日本語");
     }
 
     #[test]

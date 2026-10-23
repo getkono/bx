@@ -1676,47 +1676,14 @@ mod tests {
     }
 
     #[test]
-    fn a_derived_value_every_colliding_spelling_carries_is_not_offered_as_the_way_out() {
-        // `q` carries the answer to `o` into both spellings, so answering `q`
-        // directly moves both files together and they stay one file. Naming it
-        // would be advice that clears nothing, so the hint does not.
-        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                             [[value]]\nname = \"o\"\nkind = \"string\"\n\
-                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{o}}\"\n\
-                             [[target]]\npath = \"~/{{p}}/{{q}}\"\ncontent = \"P\"\n\
-                             [[target]]\npath = \"~/work/{{q}}\"\ncontent = \"W\"\n\
-                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
-
-        for local in [
-            "[values]\np = \"work\"\no = \"x\"\n",
-            "[values]\np = \"work\"\no = \"x\"\nq = \"y\"\n",
-        ] {
-            let resolved =
-                resolved(LAYER, Some(local)).expect("an account's answers do not fail the load");
-            for index in [0, 1] {
-                let entry = blocked(&resolved, index);
-                assert!(
-                    entry.hint.ends_with("; change that answer"),
-                    "{local:?} {index}: {}",
-                    entry.hint
-                );
-                for part in ["the default of `q`", "directly"] {
-                    assert!(
-                        !entry.hint.contains(part),
-                        "{local:?} {index} {part}: {}",
-                        entry.hint
-                    );
-                }
-            }
-            ready(&resolved, 2);
-        }
-    }
-
-    #[test]
     fn a_derived_value_one_spelling_carries_twice_is_offered_as_the_way_out() {
-        // The exclusion above is by *count*, not by membership. `q` is carried
-        // by both spellings, but once by the first and twice by the second, so
-        // answering it does part them and the hint has to say so: with
+        // The end-to-end proof that a hint reaches the blocked entry and that
+        // the act it names clears it. Which derived values a hint offers is
+        // `answers_hint`'s rule, pinned by its tests in `values.rs`: a value
+        // every spelling carries equally is withheld, and the exclusion is by
+        // *count*, not by membership. `q` is carried by both spellings, but
+        // once by the first and twice by the second, so answering it does
+        // part them and the hint has to say so: with
         // `p = ""` both key `~/x`, and `q = "a"` makes them `~/a/x` and
         // `~/aa/x`. Before the count comparison, `q` was excluded and the hint
         // named only `p`, whose every answer keeps them one file or parts the
@@ -1781,43 +1748,6 @@ mod tests {
                 "named once in the defaults and once in the direct list: {hint}"
             );
         }
-    }
-
-    #[test]
-    fn a_derived_value_reached_down_two_defaults_is_named_once() {
-        // `left` and `right` both default to `{{shared}}`, so one text reaches
-        // `shared` twice, by two different routes, and every value on the way
-        // is an act that clears the entry. `shared` is offered once and in
-        // declaration order. `add_reach` is what keeps it to one entry with one
-        // total, which
-        // `derived_between_names_a_value_reached_down_two_defaults_once` pins
-        // directly; here the interest is that the whole chain reaches the
-        // account.
-        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                             [[value]]\nname = \"shared\"\nkind = \"string\"\n\
-                             default = \"{{p}}\"\n\
-                             [[value]]\nname = \"left\"\nkind = \"string\"\n\
-                             default = \"{{shared}}\"\n\
-                             [[value]]\nname = \"right\"\nkind = \"string\"\n\
-                             default = \"{{shared}}\"\n\
-                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
-                             content = \"{{{{}}\"\n\
-                             format = \"jsonc\"\nowns = [\"a.{{left}}{{right}}\"]\n\
-                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
-
-        let answered = resolved(LAYER, Some("[values]\np = \"b.c\"\n"))
-            .expect("an account's answer blocks its target, not the load");
-        let hint = &blocked(&answered, 0).hint;
-        assert_eq!(
-            hint.matches("`shared`").count(),
-            2,
-            "one default entry and one direct entry, not two of each: {hint}"
-        );
-        assert!(
-            hint.ends_with("change that answer, or answer `shared` or `left` or `right` directly"),
-            "{hint}"
-        );
-        ready(&answered, 1);
     }
 
     #[test]

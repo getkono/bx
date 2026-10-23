@@ -88,11 +88,7 @@ fn bits(meta: &std::fs::Metadata) -> Mode {
 mod tests {
     use super::*;
     use crate::plan::tests::inputs;
-    use crate::testing::guarded_home;
-
-    fn chmod(path: &Path, mode: u32) {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
+    use crate::testing::{chmod, guarded_home};
 
     #[test]
     fn a_region_target_with_no_mode_is_held_to_the_files_own() {

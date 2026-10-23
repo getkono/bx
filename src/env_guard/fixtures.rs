@@ -15,11 +15,26 @@ pub(super) fn rooted() -> RootSet {
     RootSet::new(Path::new(HOME), &[PathBuf::from(ROOT)])
 }
 
+/// The home alone, as the one declared root, spelled `~`.
+pub(super) fn home_rooted() -> RootSet {
+    RootSet::new(Path::new(HOME), &[PathBuf::from("~")])
+}
+
 pub(super) fn reason_of(verdict: &Verdict) -> Option<Reason> {
     match verdict {
         Verdict::Allowed => None,
         Verdict::Violation(violation) => Some(violation.reason),
     }
+}
+
+/// Assert that [`check`] refuses `NAME=VALUE` under `roots`, for `reason`.
+#[track_caller]
+pub(super) fn refused(name: &str, value: &str, roots: &RootSet, reason: Reason) {
+    assert_eq!(
+        reason_of(&check(name, value, roots)),
+        Some(reason),
+        "{name}={value}"
+    );
 }
 
 /// The operator's own relocating exports, with the scratch mount replaced

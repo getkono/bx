@@ -171,10 +171,12 @@ impl GuardedHome {
 /// The variable that opts a run into skipping a case this process cannot build.
 ///
 /// Some tests need an `EACCES` that a process holding `CAP_DAC_READ_SEARCH` —
-/// root, or a user namespace from `unshare -r` — never sees. No CI job runs
-/// that way, so a silent skip there would be a branch nothing exercises and a
-/// suite that goes green with the assertions never run. Instead such a run
-/// fails, unless this variable is set to `1` by name.
+/// root, or a user namespace from `unshare -r` — never sees; others need an
+/// unprivileged user namespace with subordinate ids, which `unshare` from
+/// util-linux builds. No CI job runs without them, so a silent skip there
+/// would be a branch nothing exercises and a suite that goes green with the
+/// assertions never run. Instead such a run fails, unless this variable is
+/// set to `1` by name. It is the one such policy in the crate.
 pub const ALLOW_UNCONSTRUCTIBLE_CASES: &str = "BX_ALLOW_UNCONSTRUCTIBLE_CASES";
 
 /// What to do about a case this process cannot construct, given the opt-in.
@@ -193,8 +195,9 @@ fn unconstructible_verdict(
     } else {
         Err(format!(
             "{reason}; the assertions of this test cannot run in this process. \
-             Run it without CAP_DAC_READ_SEARCH, or set {ALLOW_UNCONSTRUCTIBLE_CASES}=1 \
-             to skip it deliberately"
+             Run it as an unprivileged user without CAP_DAC_READ_SEARCH, on a kernel \
+             with unprivileged user namespaces and with util-linux present, or set \
+             {ALLOW_UNCONSTRUCTIBLE_CASES}=1 to skip it deliberately"
         ))
     }
 }
@@ -248,6 +251,99 @@ pub fn mkfifo(path: &Path) {
         .status()
         .unwrap_or_else(|e| panic!("running mkfifo for {}: {e}", path.display()));
     assert!(status.success(), "mkfifo {}: {status}", path.display());
+}
+
+/// [`skip_unconstructible`] for the test `name`, whose case cannot be built
+/// here because of `why`.
+#[cfg(test)]
+pub(crate) fn cannot_build(name: &str, why: &str) {
+    skip_unconstructible(&format!("{name} could not be run on this machine: {why}"));
+}
+
+/// This test binary, set to run exactly the `#[ignore]`d test `test` and
+/// nothing else, with its output uncaptured so a parent can read what it
+/// prints.
+///
+/// For a case that needs a process of its own: a stdin that is not a
+/// terminal, a `umask`, a crash, or a lock held by another pid. The capture
+/// is turned off through `RUST_TEST_NOCAPTURE`, so a parent that needs the
+/// child capturing removes that variable.
+#[cfg(test)]
+pub(crate) fn ignored_child(test: &str) -> std::process::Command {
+    let mut child = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+    child
+        .args(["--exact", "--ignored", test])
+        .env("RUST_TEST_NOCAPTURE", "1");
+    child
+}
+
+/// Run `child`, an [`ignored_child`], and assert that it passed exactly one
+/// test: a filter that matched nothing would otherwise report success over
+/// an empty run.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn run_ignored_child(child: &mut std::process::Command) -> std::process::Output {
+    let output = child.output().expect("spawn the child test");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        output.status.success(),
+        "the child failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed") && stdout.contains("0 failed"),
+        "the child ran no test:\n{stdout}"
+    );
+    output
+}
+
+/// A [`guarded_home`] and the state directory bx would use under it, not yet
+/// created.
+#[cfg(test)]
+pub(crate) fn guarded_state() -> (GuardedHome, crate::state::StateDir) {
+    let home = guarded_home();
+    let state = crate::state::StateDir::resolve(home.path());
+    (home, state)
+}
+
+/// The home the tests that touch no file name: deliberately non-standard,
+/// so nothing may name a real account or assume `/home/<user>`.
+#[cfg(test)]
+pub(crate) fn example_home() -> &'static Path {
+    Path::new("/var/home/example")
+}
+
+/// Assert that `message` mentions every one of `parts`.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_mentions(message: &str, parts: &[&str]) {
+    for part in parts {
+        assert!(
+            message.contains(part),
+            "{part:?} is missing from: {message}"
+        );
+    }
+}
+
+/// The permission bits of `path`, symlinks followed.
+#[cfg(test)]
+pub(crate) fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+/// Set the permission bits of `path` to `mode`.
+#[cfg(test)]
+pub(crate) fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
 }
 
 impl std::fmt::Debug for GuardedHome {
@@ -517,13 +613,75 @@ mod tests {
     fn an_unconstructible_case_fails_unless_the_skip_is_asked_for_by_name() {
         use std::ffi::OsStr;
 
-        for opt_in in [None, Some(OsStr::new("")), Some(OsStr::new("0"))] {
+        // Nothing but exactly `1` is a spelling of "yes": an empty value, a
+        // `0` or a `true` left over from another tool's convention must not
+        // turn the suite's own failures off.
+        let spellings = ["", "0", "true", "yes", "1 ", " 1"];
+        for opt_in in std::iter::once(None).chain(spellings.map(|s| Some(OsStr::new(s)))) {
             let message = unconstructible_verdict(opt_in, "no EACCES here")
                 .expect_err("an ordinary run must fail, not skip");
             assert!(message.starts_with("no EACCES here"), "{message}");
             assert!(
                 message.contains("BX_ALLOW_UNCONSTRUCTIBLE_CASES=1"),
                 "the failure names the opt-in: {message}"
+            );
+            assert!(
+                message.contains("unprivileged"),
+                "the failure names the environment: {message}"
+            );
+        }
+    }
+
+    /// What the parent tells [`skip_child`] to expect of the opt-in.
+    const EXPECT_SKIP: &str = "BX_TEST_EXPECT_SKIP";
+
+    /// What [`skip_child`] writes with `eprintln!`, which libtest captures.
+    const CAPTURED_MARKER: &str = "bx-eprintln-is-swallowed";
+
+    #[test]
+    #[ignore = "spawned by the_opt_in_is_read_from_the_environment_and_announced_past_the_capture"]
+    fn skip_child() {
+        let Some(expected) = std::env::var_os(EXPECT_SKIP) else {
+            return;
+        };
+        let skipped = std::panic::catch_unwind(|| skip_unconstructible("a probe")).is_ok();
+        assert_eq!(skipped, expected == "yes", "the opt-in was misread");
+        eprintln!("{CAPTURED_MARKER}");
+    }
+
+    #[test]
+    fn the_opt_in_is_read_from_the_environment_and_announced_past_the_capture() {
+        // A child can be given any state of the variable, where this process
+        // cannot set one. It runs captured, so its `eprintln!` reaches
+        // nowhere, and an opted-in skip's announcement still reaches its
+        // stderr: a skip announced through the capture would tell nobody.
+        for (set, expect) in [(None, "no"), (Some("1"), "yes"), (Some("0"), "no")] {
+            let mut child = ignored_child("testing::tests::skip_child");
+            child
+                .env(EXPECT_SKIP, expect)
+                .env_remove("RUST_TEST_NOCAPTURE");
+            match set {
+                Some(value) => child.env(ALLOW_UNCONSTRUCTIBLE_CASES, value),
+                None => child.env_remove(ALLOW_UNCONSTRUCTIBLE_CASES),
+            };
+            let out = run_ignored_child(&mut child);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                err.contains("skipped (BX_ALLOW_UNCONSTRUCTIBLE_CASES=1): a probe"),
+                expect == "yes",
+                "{set:?}: {err}"
+            );
+            assert!(!err.contains(CAPTURED_MARKER), "{set:?}: {err}");
+        }
+
+        // A value that is not `1`, set in the belief that it turns the
+        // opt-in off, leaves every unbuildable case failing while whoever
+        // set it thinks otherwise, and that is worth a red suite.
+        if let Some(value) = std::env::var_os(ALLOW_UNCONSTRUCTIBLE_CASES) {
+            assert!(
+                value == "1",
+                "{ALLOW_UNCONSTRUCTIBLE_CASES} is set to {value:?}, which is not a \
+                 spelling of the opt-in. Unset it, or set it to exactly 1."
             );
         }
     }
@@ -558,6 +716,13 @@ mod tests {
     fn a_skip_that_was_not_asked_for_panics() {
         let mut stderr = Vec::new();
         skip_unconstructible_to(None, "no EACCES here", &mut stderr);
+    }
+
+    #[test]
+    #[should_panic(expected = "\"x\" is missing from: abc")]
+    fn a_message_missing_a_part_fails_assert_mentions() {
+        assert_mentions("abc", &["a", "bc"]);
+        assert_mentions("abc", &["b", "x"]);
     }
 
     #[test]

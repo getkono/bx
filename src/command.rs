@@ -1282,7 +1282,7 @@ fn emit(out: &mut dyn Write, report: &Report, view: View, env: &Env) -> Result<(
 mod tests {
     use super::*;
     use crate::plan::tests::{env, inline, seed};
-    use crate::testing::guarded_home;
+    use crate::testing::{guarded_home, ignored_child, run_ignored_child};
 
     fn text(out: &[u8]) -> &str {
         std::str::from_utf8(out).expect("UTF-8 output")
@@ -1345,30 +1345,10 @@ mod tests {
         // machine it is, and this test would hang waiting for an answer. The
         // child's stdin is `/dev/null` either way, which is the same seam
         // `plan::tests`'s crash harness uses to fix a child's environment.
-        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "command::tests::confirm_child",
-            ])
-            .env(CONFIRM_CHILD, "1")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("spawn the confirmation child");
-
-        assert!(
-            output.status.success(),
-            "the child's assertion failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        // The child really ran the case, rather than being filtered out and
-        // reporting success over an empty run.
-        let ran = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            ran.contains("1 passed") && ran.contains("0 failed"),
-            "the child ran no test: {ran}"
+        run_ignored_child(
+            ignored_child("command::tests::confirm_child")
+                .env(CONFIRM_CHILD, "1")
+                .stdin(std::process::Stdio::null()),
         );
     }
 
@@ -2365,23 +2345,10 @@ mod tests {
         // As `confirm_without_a_terminal_is_a_prompt_error_and_never_an_answer`:
         // in a child whose stdin is certainly not a terminal, so this never
         // hangs on a developer's machine.
-        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "command::tests::passphrase_child",
-            ])
-            .env(PASSPHRASE_CHILD, "1")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("spawn the passphrase child");
-
-        let ran = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{ran}");
-        assert!(
-            ran.contains("1 passed") && ran.contains("0 failed"),
-            "the child ran no test: {ran}"
+        run_ignored_child(
+            ignored_child("command::tests::passphrase_child")
+                .env(PASSPHRASE_CHILD, "1")
+                .stdin(std::process::Stdio::null()),
         );
     }
 

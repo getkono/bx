@@ -688,7 +688,7 @@ mod tests {
     fn the_fragment_directory_is_owned_but_its_parent_is_not_refused() {
         // PR #75 note D2: `~/.local/share/bx` holds the fragments every shell
         // sources, so no tool may be pointed into it, even under a `~` root.
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         for value in [
             "/var/home/example/.local/share/bx",
             "/var/home/example/.local/share/bx/cargo",

@@ -195,23 +195,91 @@ pub fn quote(text: &str) -> String {
 pub(crate) mod testing {
     use std::path::{Path, PathBuf};
 
-    /// The installed shell `program`, or `None` on a machine excused from
-    /// supplying it. A runner may not excuse itself, as `env_guard`'s
-    /// differential checks rule. A version-manager shim is resolved to the
-    /// real shell first, and fails the check when it cannot be.
+    /// The variable that excuses a machine from supplying the programs the
+    /// tests run generated shell text in, and hold the environment guard to.
+    ///
+    /// Differential agreement with real bash, zsh, bun and uv is the guard's
+    /// strongest evidence, and a check that quietly asserts nothing is worse
+    /// than no check at all. Skipping therefore has to be asked for by name,
+    /// from outside the suite, and every other run fails instead.
+    pub(crate) const WITHOUT_SHELLS: &str = "BX_TEST_WITHOUT_SHELLS";
+
+    /// The variable every continuous-integration runner sets.
+    const ON_A_RUNNER: &str = "CI";
+
+    /// Whether an excuse that was `asked` for is honoured on a machine that
+    /// `is_ci` says is a continuous-integration runner.
+    ///
+    /// **A runner may not excuse itself**, and that is decided here rather
+    /// than in a workflow file. A CI step asserting the variable were unset
+    /// would bind this repository's own workflow and nothing else, and the
+    /// edit that set the variable could drop the step in the same breath.
+    /// Here, a runner that asks fails the suite it is running — whatever the
+    /// workflow says, and on any runner, not only this repository's.
+    ///
+    /// This is not hypothetical: the uv check landed with no job installing
+    /// uv, and both test jobs failed. Had either carried [`WITHOUT_SHELLS`],
+    /// they would have passed with the differential sweeps never run.
+    fn excuse_honoured(asked: bool, is_ci: bool) -> bool {
+        assert!(
+            !(asked && is_ci),
+            "{WITHOUT_SHELLS} is set and so is {ON_A_RUNNER}: a runner may not \
+             excuse itself from the differential checks, which are this \
+             module's strongest evidence. Install the missing program on the \
+             runner instead."
+        );
+        asked
+    }
+
+    /// Whether this machine has been excused from supplying the programs.
+    pub(crate) fn shells_are_excused() -> bool {
+        excuse_honoured(
+            std::env::var_os(WITHOUT_SHELLS).is_some(),
+            std::env::var_os(ON_A_RUNNER).is_some(),
+        )
+    }
+
+    /// The installed program `program` resolves to, seen through any
+    /// version-manager shim, which could not find its tool in the cleared
+    /// environment the checks run it in; a shim that cannot be resolved fails.
+    ///
+    /// A program that is not installed fails the check it would have run,
+    /// unless [`WITHOUT_SHELLS`] excuses this machine — which, per
+    /// [`excuse_honoured`], no runner may be. An excused skip is announced
+    /// through the stderr handle rather than `eprintln!`: libtest captures the
+    /// print macros and discards the capture for a test that passes, so a
+    /// macro would tell nobody.
     pub(crate) fn installed(program: &str) -> Option<PathBuf> {
         if let Some(path) =
             crate::detect::locate_real_in_env(program).unwrap_or_else(|shim| panic!("{shim}"))
         {
             return Some(path);
         }
-        let excused = std::env::var_os("BX_TEST_WITHOUT_SHELLS").is_some();
         assert!(
-            excused && std::env::var_os("CI").is_none(),
-            "{program} is not installed, so the shell checks held against it would assert \
-             nothing — install it, or set BX_TEST_WITHOUT_SHELLS off a runner"
+            shells_are_excused(),
+            "{program} is not installed, so every check held against it would assert \
+             nothing — install it, or set {WITHOUT_SHELLS} to skip those checks on purpose"
+        );
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipping the {program} checks: {WITHOUT_SHELLS} is set"
         );
         None
+    }
+
+    #[test]
+    fn a_runner_may_not_excuse_itself_from_the_differential_checks() {
+        // Off a runner the excuse is honoured, and it is never invented.
+        assert!(excuse_honoured(true, false));
+        assert!(!excuse_honoured(false, false));
+        assert!(!excuse_honoured(false, true));
+    }
+
+    #[test]
+    #[should_panic(expected = "a runner may not excuse itself")]
+    fn a_runner_that_asks_to_be_excused_fails_instead() {
+        excuse_honoured(true, true);
     }
 
     /// Run `script` in `shell` with `flags` and an empty environment, and

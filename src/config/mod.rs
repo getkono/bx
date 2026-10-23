@@ -1274,10 +1274,7 @@ mod tests {
             .collect()
     }
 
-    /// The account's home every test in this module parses against.
-    fn home() -> &'static Path {
-        Path::new("/var/home/example")
-    }
+    use crate::testing::example_home as home;
 
     fn parse(text: &str) -> Result<Config, Error> {
         parse_str(text, Path::new("bx.toml"), home())

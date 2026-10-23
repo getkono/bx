@@ -704,11 +704,7 @@ mod tests {
         ))
     }
 
-    fn home() -> PathBuf {
-        // A deliberately non-standard home: nothing here may name a real
-        // account, and nothing here may assume `/home/<user>`.
-        PathBuf::from("/var/home/example")
-    }
+    use crate::testing::example_home as home;
 
     #[test]
     fn state_dir_defaults_to_local_state_bx() {
@@ -743,7 +739,7 @@ mod tests {
     #[test]
     fn a_path_under_home_becomes_tilde_relative() {
         assert_eq!(
-            to_portable(Path::new("/var/home/example/.gitconfig"), &home()),
+            to_portable(Path::new("/var/home/example/.gitconfig"), home()),
             "~/.gitconfig"
         );
     }
@@ -753,7 +749,7 @@ mod tests {
         assert_eq!(
             to_portable(
                 Path::new("/var/home/example/.ssh/config.d/10-hosts.conf"),
-                &home()
+                home()
             ),
             "~/.ssh/config.d/10-hosts.conf"
         );
@@ -761,13 +757,13 @@ mod tests {
 
     #[test]
     fn home_itself_is_a_bare_tilde() {
-        assert_eq!(to_portable(&home(), &home()), "~");
+        assert_eq!(to_portable(home(), home()), "~");
     }
 
     #[test]
     fn a_path_outside_home_is_left_absolute() {
         assert_eq!(
-            to_portable(Path::new("/usr/bin/sccache"), &home()),
+            to_portable(Path::new("/usr/bin/sccache"), home()),
             "/usr/bin/sccache"
         );
     }
@@ -776,7 +772,7 @@ mod tests {
     fn a_prefix_that_is_not_a_path_component_does_not_match() {
         // /var/home/example-backup is not inside /var/home/example.
         assert_eq!(
-            to_portable(Path::new("/var/home/example-backup/x"), &home()),
+            to_portable(Path::new("/var/home/example-backup/x"), home()),
             "/var/home/example-backup/x"
         );
     }
@@ -784,7 +780,7 @@ mod tests {
     #[test]
     fn rendering_reverses_portability() {
         let original = Path::new("/var/home/example/.config/starship.toml");
-        assert_eq!(render(&to_portable(original, &home()), &home()), original);
+        assert_eq!(render(&to_portable(original, home()), home()), original);
     }
 
     #[test]
@@ -795,20 +791,20 @@ mod tests {
             Path::new("/home/other/.gitconfig")
         );
         assert_eq!(
-            render("~/.gitconfig", &home()),
+            render("~/.gitconfig", home()),
             Path::new("/var/home/example/.gitconfig")
         );
     }
 
     #[test]
     fn a_bare_tilde_renders_to_home() {
-        assert_eq!(render("~", &home()), home());
+        assert_eq!(render("~", home()), home());
     }
 
     #[test]
     fn an_absolute_path_renders_unchanged() {
         assert_eq!(
-            render("/usr/bin/sccache", &home()),
+            render("/usr/bin/sccache", home()),
             Path::new("/usr/bin/sccache")
         );
     }
@@ -816,14 +812,14 @@ mod tests {
     #[test]
     fn another_users_home_is_never_expanded() {
         assert_eq!(
-            render("~other/.linuxbrew", &home()),
+            render("~other/.linuxbrew", home()),
             Path::new("~other/.linuxbrew")
         );
     }
 
     #[test]
     fn content_expands_a_leading_tilde_per_line() {
-        let rendered = render_content("~/.cargo/bin\n~/.local/bin\n", &home());
+        let rendered = render_content("~/.cargo/bin\n~/.local/bin\n", home());
         assert_eq!(
             rendered,
             "/var/home/example/.cargo/bin\n/var/home/example/.local/bin\n"
@@ -832,7 +828,7 @@ mod tests {
 
     #[test]
     fn content_preserves_indentation() {
-        let rendered = render_content("  ~/.ssh/config.d/*.conf\n", &home());
+        let rendered = render_content("  ~/.ssh/config.d/*.conf\n", home());
         assert_eq!(rendered, "  /var/home/example/.ssh/config.d/*.conf\n");
     }
 
@@ -840,20 +836,20 @@ mod tests {
     fn a_tilde_that_is_not_leading_is_content() {
         // Rendering must never corrupt a file body: these are all real config.
         let body = "path = a~b\nignore = *~\nbackup=~/x is not leading\n";
-        assert_eq!(render_content(body, &home()), body);
+        assert_eq!(render_content(body, home()), body);
     }
 
     #[test]
     fn content_without_a_trailing_newline_is_preserved() {
         assert_eq!(
-            render_content("~/.gitconfig", &home()),
+            render_content("~/.gitconfig", home()),
             "/var/home/example/.gitconfig"
         );
     }
 
     #[test]
     fn empty_content_stays_empty() {
-        assert_eq!(render_content("", &home()), "");
+        assert_eq!(render_content("", home()), "");
     }
 
     // --- the XDG rule -----------------------------------------------------
@@ -861,7 +857,7 @@ mod tests {
     #[test]
     fn the_config_root_defaults_to_dot_config_under_home() {
         assert_eq!(
-            config_root_in(&home(), None),
+            config_root_in(home(), None),
             Path::new("/var/home/example/.config/bx")
         );
     }
@@ -869,15 +865,15 @@ mod tests {
     #[test]
     fn the_systemd_user_unit_directory_follows_the_same_xdg_rule() {
         assert_eq!(
-            systemd_user_dir_in(&home(), None),
+            systemd_user_dir_in(home(), None),
             Path::new("/var/home/example/.config/systemd/user")
         );
         assert_eq!(
-            systemd_user_dir_in(&home(), Some(OsStr::new("/etc/xdg-for-this-account"))),
+            systemd_user_dir_in(home(), Some(OsStr::new("/etc/xdg-for-this-account"))),
             Path::new("/etc/xdg-for-this-account/systemd/user")
         );
         assert_eq!(
-            systemd_user_dir_in(&home(), Some(OsStr::new("relative/config"))),
+            systemd_user_dir_in(home(), Some(OsStr::new("relative/config"))),
             Path::new("/var/home/example/.config/systemd/user")
         );
     }
@@ -885,7 +881,7 @@ mod tests {
     #[test]
     fn an_absolute_xdg_config_home_wins() {
         assert_eq!(
-            config_root_in(&home(), Some(OsStr::new("/etc/xdg-for-this-account"))),
+            config_root_in(home(), Some(OsStr::new("/etc/xdg-for-this-account"))),
             Path::new("/etc/xdg-for-this-account/bx")
         );
     }
@@ -894,7 +890,7 @@ mod tests {
     fn an_empty_xdg_config_home_falls_back_to_the_default() {
         // The base-directory specification calls an empty value invalid.
         assert_eq!(
-            config_root_in(&home(), Some(OsStr::new(""))),
+            config_root_in(home(), Some(OsStr::new(""))),
             Path::new("/var/home/example/.config/bx")
         );
     }
@@ -902,7 +898,7 @@ mod tests {
     #[test]
     fn a_relative_xdg_config_home_is_invalid_and_falls_back() {
         assert_eq!(
-            config_root_in(&home(), Some(OsStr::new("relative/config"))),
+            config_root_in(home(), Some(OsStr::new("relative/config"))),
             Path::new("/var/home/example/.config/bx")
         );
     }
@@ -913,7 +909,7 @@ mod tests {
 
         let raw = OsStr::from_bytes(b"/var/tmp/xdg\xff");
         assert_eq!(
-            config_root_in(&home(), Some(raw)),
+            config_root_in(home(), Some(raw)),
             Path::new(OsStr::from_bytes(b"/var/tmp/xdg\xff")).join("bx")
         );
     }
@@ -923,11 +919,11 @@ mod tests {
         // Entry A4 builds the state root this way rather than adding a second
         // resolver; this test is what pins that for it.
         assert_eq!(
-            xdg_base(None, &home(), ".local/state").join("bx"),
+            xdg_base(None, home(), ".local/state").join("bx"),
             Path::new("/var/home/example/.local/state/bx")
         );
         assert_eq!(
-            xdg_base(Some(OsStr::new("/var/state")), &home(), ".local/state").join("bx"),
+            xdg_base(Some(OsStr::new("/var/state")), home(), ".local/state").join("bx"),
             Path::new("/var/state/bx")
         );
     }
@@ -958,10 +954,13 @@ mod tests {
 
     #[test]
     fn an_absolute_home_is_taken_as_given() {
-        assert_eq!(home_in(Some(OsStr::new("/var/home/example"))), Ok(home()));
+        assert_eq!(
+            home_in(Some(OsStr::new("/var/home/example"))),
+            Ok(home().to_path_buf())
+        );
         assert_eq!(
             home_in(Some(OsStr::new("/var/home/example/"))),
-            Ok(home()),
+            Ok(home().to_path_buf()),
             "a trailing slash is a spelling of the same directory, not a second home"
         );
     }
@@ -1032,21 +1031,21 @@ mod tests {
     #[test]
     fn a_portable_round_trips_through_the_newtype() {
         let original = Path::new("/var/home/example/.config/starship.toml");
-        let portable = Portable::from_path(original, &home()).unwrap();
+        let portable = Portable::from_path(original, home()).unwrap();
 
         assert_eq!(portable.as_str(), "~/.config/starship.toml");
         assert_eq!(portable.to_string(), "~/.config/starship.toml");
-        assert_eq!(portable.render(&home()), original);
+        assert_eq!(portable.render(home()), original);
         assert!(portable.under_home());
     }
 
     #[test]
     fn a_portable_outside_home_stays_absolute_and_is_not_under_home() {
-        let portable = Portable::from_path(Path::new("/usr/bin/sccache"), &home()).unwrap();
+        let portable = Portable::from_path(Path::new("/usr/bin/sccache"), home()).unwrap();
 
         assert_eq!(portable.as_str(), "/usr/bin/sccache");
         assert!(!portable.under_home());
-        assert_eq!(portable.render(&home()), Path::new("/usr/bin/sccache"));
+        assert_eq!(portable.render(home()), Path::new("/usr/bin/sccache"));
     }
 
     #[test]
@@ -1067,7 +1066,7 @@ mod tests {
             "~ /x",
         ] {
             assert_eq!(
-                Portable::parse_in(raw, &home()),
+                Portable::parse_in(raw, home()),
                 Err(Error::UnknownRoot(raw.to_string())),
                 "{raw}"
             );
@@ -1080,7 +1079,7 @@ mod tests {
         // type can hold renders to a path that depends on the working
         // directory.
         for raw in ["~", "~/.ssh/config", "/usr/bin/sccache", "/", "/a/../b"] {
-            let rendered = Portable::parse_in(raw, &home()).unwrap().render(&home());
+            let rendered = Portable::parse_in(raw, home()).unwrap().render(home());
             assert!(
                 rendered.is_absolute(),
                 "{raw} rendered {}",
@@ -1091,7 +1090,7 @@ mod tests {
 
     #[test]
     fn a_bare_tilde_is_under_home() {
-        assert!(Portable::parse_in("~", &home()).unwrap().under_home());
+        assert!(Portable::parse_in("~", home()).unwrap().under_home());
     }
 
     #[test]
@@ -1107,7 +1106,7 @@ mod tests {
             ("/var/home/example", "~"),
         ] {
             assert_eq!(
-                Portable::parse_in(written, &home()),
+                Portable::parse_in(written, home()),
                 Err(Error::AbsoluteUnderHome {
                     raw: written.to_string(),
                     portable: expected.to_string(),
@@ -1116,7 +1115,7 @@ mod tests {
             );
         }
 
-        let message = Portable::parse_in("/var/home/example/.gitconfig", &home())
+        let message = Portable::parse_in("/var/home/example/.gitconfig", home())
             .expect_err("under home")
             .to_string();
         assert!(
@@ -1138,9 +1137,9 @@ mod tests {
             "/usr/bin/sccache",
             "/etc/hosts",
         ] {
-            let built = Portable::from_path(Path::new(absolute), &home()).unwrap();
+            let built = Portable::from_path(Path::new(absolute), home()).unwrap();
             assert_eq!(
-                Portable::parse_in(built.as_str(), &home()),
+                Portable::parse_in(built.as_str(), home()),
                 Ok(built.clone()),
                 "{absolute} does not parse back to itself"
             );
@@ -1150,11 +1149,11 @@ mod tests {
     #[test]
     fn a_relative_portable_is_rejected() {
         assert_eq!(
-            Portable::parse_in("files/starship.toml", &home()),
+            Portable::parse_in("files/starship.toml", home()),
             Err(Error::NotPortable("files/starship.toml".to_string()))
         );
         assert_eq!(
-            Portable::parse_in("", &home()),
+            Portable::parse_in("", home()),
             Err(Error::NotPortable(String::new())),
             "an empty path is not a path"
         );
@@ -1165,9 +1164,9 @@ mod tests {
         // Target's natural key is its path, so the ordering has to be total and
         // has to be the obvious one.
         let mut paths = [
-            Portable::parse_in("~/.zshrc", &home()).unwrap(),
-            Portable::parse_in("/usr/bin/sccache", &home()).unwrap(),
-            Portable::parse_in("~/.config/bx", &home()).unwrap(),
+            Portable::parse_in("~/.zshrc", home()).unwrap(),
+            Portable::parse_in("/usr/bin/sccache", home()).unwrap(),
+            Portable::parse_in("~/.config/bx", home()).unwrap(),
         ];
         paths.sort();
 
@@ -1190,7 +1189,7 @@ mod tests {
             ("/usr//bin/./sccache", "/usr/bin/sccache"),
         ] {
             assert_eq!(
-                Portable::parse_in(written, &home()).unwrap().as_str(),
+                Portable::parse_in(written, home()).unwrap().as_str(),
                 stored,
                 "{written}"
             );
@@ -1204,7 +1203,7 @@ mod tests {
         let spellings = ["~/.ssh/config", "~/.ssh/./config", "~/.ssh//config"];
         let keys: HashSet<Portable> = spellings
             .iter()
-            .map(|raw| Portable::parse_in(raw, &home()).unwrap())
+            .map(|raw| Portable::parse_in(raw, home()).unwrap())
             .collect();
 
         assert_eq!(keys.len(), 1, "one file must not acquire three ledger rows");
@@ -1278,13 +1277,13 @@ mod tests {
             "~//../.bashrc",
         ] {
             assert_eq!(
-                Portable::parse_in(escaping, &home()),
+                Portable::parse_in(escaping, home()),
                 Err(Error::EscapesRoot(escaping.to_string())),
                 "{escaping}"
             );
         }
         assert_eq!(
-            Portable::parse_in("~//x", &home()).unwrap().as_str(),
+            Portable::parse_in("~//x", home()).unwrap().as_str(),
             "~/x",
             "a doubled separator that does not climb still folds"
         );
@@ -1297,18 +1296,18 @@ mod tests {
     #[test]
     fn an_absolute_portable_clamps_at_the_root() {
         // The kernel resolves /.. to /, and so does this.
-        assert_eq!(Portable::parse_in("/..", &home()).unwrap().as_str(), "/");
+        assert_eq!(Portable::parse_in("/..", home()).unwrap().as_str(), "/");
         assert_eq!(
-            Portable::parse_in("/a/../..", &home()).unwrap().as_str(),
+            Portable::parse_in("/a/../..", home()).unwrap().as_str(),
             "/"
         );
         assert_eq!(
-            Portable::parse_in("/a/../b", &home()).unwrap().as_str(),
+            Portable::parse_in("/a/../b", home()).unwrap().as_str(),
             "/b"
         );
-        assert_eq!(Portable::parse_in("/", &home()).unwrap().as_str(), "/");
+        assert_eq!(Portable::parse_in("/", home()).unwrap().as_str(), "/");
         assert_eq!(
-            Portable::parse_in("/a/../../b", &home()).unwrap().as_str(),
+            Portable::parse_in("/a/../../b", home()).unwrap().as_str(),
             "/b",
             "climbing past the root clamps there and carries on"
         );
@@ -1320,25 +1319,25 @@ mod tests {
         // which is exactly the escaping value parse() refuses.
         let portable = Portable::from_path(
             Path::new("/var/home/example/.ssh/../../../../etc/passwd"),
-            &home(),
+            home(),
         )
         .unwrap();
 
         assert_eq!(portable.as_str(), "/etc/passwd");
         assert!(!portable.under_home());
-        assert_eq!(portable.render(&home()), Path::new("/etc/passwd"));
+        assert_eq!(portable.render(home()), Path::new("/etc/passwd"));
     }
 
     #[test]
     fn from_path_collapses_redundant_segments() {
         assert_eq!(
-            Portable::from_path(Path::new("/var/home/example/.ssh/./config"), &home())
+            Portable::from_path(Path::new("/var/home/example/.ssh/./config"), home())
                 .unwrap()
                 .as_str(),
             "~/.ssh/config"
         );
         assert_eq!(
-            Portable::from_path(Path::new("/var/home/example/a/../b"), &home())
+            Portable::from_path(Path::new("/var/home/example/a/../b"), home())
                 .unwrap()
                 .as_str(),
             "~/b"
@@ -1354,11 +1353,11 @@ mod tests {
         // that must never exist. The natural first caller is `bx add <path>`
         // handing a command-line argument straight through.
         assert_eq!(
-            Portable::from_path(Path::new("~/../../etc/passwd"), &home()),
+            Portable::from_path(Path::new("~/../../etc/passwd"), home()),
             Err(Error::NotPortable("~/../../etc/passwd".to_string()))
         );
         assert_eq!(
-            Portable::from_path(Path::new("files/starship.toml"), &home()),
+            Portable::from_path(Path::new("files/starship.toml"), home()),
             Err(Error::NotPortable("files/starship.toml".to_string())),
             "a relative path has no root to resolve `..` against"
         );
@@ -1396,7 +1395,7 @@ mod tests {
         // from -- a rename, dressed as support.
         let path = Path::new(OsStr::from_bytes(b"/var/home/example/.ssh/conf\xffig"));
         assert_eq!(
-            Portable::from_path(path, &home()),
+            Portable::from_path(path, home()),
             Err(Error::NotUtf8(path.to_path_buf()))
         );
 
@@ -1421,9 +1420,9 @@ mod tests {
             "/",
             "/usr/bin/sccache",
         ] {
-            let built = Portable::from_path(Path::new(raw), &home()).unwrap();
+            let built = Portable::from_path(Path::new(raw), home()).unwrap();
             assert_eq!(
-                Portable::parse_in(built.as_str(), &home()),
+                Portable::parse_in(built.as_str(), home()),
                 Ok(built),
                 "{raw}"
             );
@@ -1433,7 +1432,7 @@ mod tests {
     #[test]
     fn a_portable_survives_a_serde_round_trip() {
         // A4's ledger and A6's journal are keyed on it, in MessagePack.
-        let portable = Portable::parse_in("~/.ssh/config", &home()).unwrap();
+        let portable = Portable::parse_in("~/.ssh/config", home()).unwrap();
         let encoded = rmp_serde::to_vec(&portable).unwrap();
         let decoded: Portable = rmp_serde::from_slice(&encoded).unwrap();
 
@@ -1509,7 +1508,7 @@ mod tests {
             rmp_serde::from_slice(&encoded).expect("well-rooted and normalised");
 
         assert_eq!(
-            decoded.check_against(&home()),
+            decoded.check_against(home()),
             Err(Error::AbsoluteUnderHome {
                 raw: "/var/home/example/.gitconfig".to_string(),
                 portable: "~/.gitconfig".to_string(),
@@ -1518,15 +1517,15 @@ mod tests {
         );
         // A path genuinely outside the home passes, and so does the ~/ spelling.
         assert_eq!(
-            Portable::parse_in("/usr/bin/sccache", &home())
+            Portable::parse_in("/usr/bin/sccache", home())
                 .unwrap()
-                .check_against(&home()),
+                .check_against(home()),
             Ok(())
         );
         assert_eq!(
-            Portable::parse_in("~/.gitconfig", &home())
+            Portable::parse_in("~/.gitconfig", home())
                 .unwrap()
-                .check_against(&home()),
+                .check_against(home()),
             Ok(())
         );
         // And it answers for its home the same way every other rule here does.
@@ -1547,7 +1546,7 @@ mod tests {
             "/usr/bin/sccache",
             "/",
         ] {
-            let built = Portable::parse_in(raw, &home()).expect(raw);
+            let built = Portable::parse_in(raw, home()).expect(raw);
             let encoded = rmp_serde::to_vec(&built).unwrap();
             assert_eq!(
                 rmp_serde::from_slice::<Portable>(&encoded).expect(raw),

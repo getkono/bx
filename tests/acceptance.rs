@@ -25,6 +25,8 @@
 //!   run, which `local.toml` names. The example ships no ciphertext, because a
 //!   committed one is either decryptable by a committed key or by nobody.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -195,22 +197,14 @@ impl Machine {
         format!("{}:{SYSTEM_PATH}", self.stubs.path().display())
     }
 
-    /// A command with this machine's environment and nothing else.
-    ///
-    /// But for where a coverage build writes its profile: `cargo llvm-cov`
-    /// names the file in `LLVM_PROFILE_FILE`, and an instrumented `bx` without
-    /// it writes one into its working directory — the home, where every
-    /// comparison here would find it.
+    /// A command with this machine's environment and nothing else, run in
+    /// the home.
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
-        let mut command = Command::new(program);
+        let mut command = common::isolated(program);
         command
-            .env_clear()
             .env("HOME", self.path())
             .env("PATH", self.search_path())
             .current_dir(self.path());
-        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
-            command.env("LLVM_PROFILE_FILE", profile);
-        }
         command
     }
 

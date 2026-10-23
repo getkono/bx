@@ -365,13 +365,12 @@ pub(super) fn fresh_nonce() -> [u8; NONCE] {
 mod tests {
     use super::*;
 
-    use crate::journal::tests::{frame_starts, nonce_of, some_begin};
+    use crate::journal::tests::{frame_starts, journal_file, nonce_of, some_begin};
     use crate::journal::{Journal, Loaded, load};
 
     #[test]
     fn a_record_round_trips_through_a_frame() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let begin = Begin {
             kind: SessionKind::Restore,
             home: PathBuf::from("/home/someone"),
@@ -425,8 +424,7 @@ mod tests {
 
     #[test]
     fn every_frame_carries_a_checksum_of_its_nonce_length_and_body() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         drop(Journal::create(&path, some_begin()).expect("create"));
         let bytes = std::fs::read(&path).expect("read");
         let nonce = nonce_of(&bytes);
@@ -513,8 +511,7 @@ mod tests {
     #[test]
     fn the_search_for_a_whole_frame_after_damage_starts_past_the_damaged_frame() {
         // Coverage review round 5, item 6.
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut journal = Journal::create(&path, some_begin()).expect("create");
         journal
             .append(&Record::Done(Done {

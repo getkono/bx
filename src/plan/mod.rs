@@ -735,7 +735,7 @@ fn look_at_state(inputs: &Inputs, report: &mut Report) -> Result<(), Error> {
 pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::Output;
 
     use super::*;
     use crate::config::when::{Distro, Machine};
@@ -746,7 +746,7 @@ pub(crate) mod tests {
     use crate::journal::{Content, Ownership, Request};
     use crate::paths::Portable;
     use crate::state::{ExclusiveLock, Mechanism};
-    use crate::testing::{GuardedHome, guarded_home};
+    use crate::testing::{GuardedHome, guarded_home, mode_of};
 
     /// An environment with nothing overridden and no terminal.
     pub(crate) fn env(home: &Path) -> Env {
@@ -830,6 +830,16 @@ pub(crate) mod tests {
             })
             .expect("the write");
         session.finish().expect("finish");
+    }
+
+    /// Every target the ledger under `state` holds: what `rm` hands back.
+    fn ledger_targets(state: &StateDir, home: &Path) -> Vec<Portable> {
+        LedgerView::read(state, home)
+            .expect("the ledger")
+            .value
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect()
     }
 
     fn text(change: &Change) -> &str {
@@ -1179,14 +1189,6 @@ pub(crate) mod tests {
             "[secrets]\nidentity = \"~/.config/age/key.txt\"\n",
         );
         key.to_public().to_string()
-    }
-
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::metadata(path)
-            .expect("the file")
-            .permissions()
-            .mode()
-            & 0o7777
     }
 
     #[test]
@@ -1570,12 +1572,7 @@ pub(crate) mod tests {
         assert_ne!(snapshot(home.path(), &OUTSIDE), before);
 
         let state = StateDir::resolve(home.path());
-        let targets: Vec<Portable> = LedgerView::read(&state, home.path())
-            .expect("the ledger")
-            .value
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect();
+        let targets = ledger_targets(&state, home.path());
         assert_eq!(targets.len(), 3);
         crate::restore::restore(&state, home.path(), &targets).expect("restore");
 
@@ -1730,12 +1727,7 @@ pub(crate) mod tests {
         );
 
         // `rm` puts back exactly what was there before.
-        let targets: Vec<Portable> = LedgerView::read(&state, home.path())
-            .expect("the ledger")
-            .value
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect();
+        let targets = ledger_targets(&state, home.path());
         crate::restore::restore(&state, home.path(), &targets).expect("restore");
         assert_eq!(
             std::fs::read_to_string(home.child(".zshrc")).expect(".zshrc"),
@@ -1815,12 +1807,7 @@ pub(crate) mod tests {
         );
 
         // `rm` restores the user's `~/.bashrc` exactly.
-        let targets: Vec<Portable> = LedgerView::read(&state, home.path())
-            .expect("the ledger")
-            .value
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect();
+        let targets = ledger_targets(&state, home.path());
         crate::restore::restore(&state, home.path(), &targets).expect("restore");
         assert_eq!(
             std::fs::read_to_string(home.child(".bashrc")).expect(".bashrc"),
@@ -2091,13 +2078,7 @@ pub(crate) mod tests {
     /// Re-run this test binary as an apply that aborts at `phase` of write
     /// `index`.
     pub(super) fn spawn_crash_child(home: &Path, index: usize, phase: &str) -> Output {
-        Command::new(std::env::current_exe().expect("the test binary"))
-            .args([
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "plan::tests::apply_crash_child",
-            ])
+        crate::testing::ignored_child("plan::tests::apply_crash_child")
             .env("BX_CRASH_AT", format!("{index}:{phase}"))
             .env(CRASH_HOME, home)
             // The child aborts, so it writes no profile; removing the pattern
@@ -3251,13 +3232,7 @@ pub(crate) mod tests {
                 let at = format!("{index}:{phase}");
                 let home = guard.child(format!("crash-{index}-{phase}"));
                 seed_sync_crash(&home);
-                let output = Command::new(std::env::current_exe().expect("the test binary"))
-                    .args([
-                        "--exact",
-                        "--ignored",
-                        "--nocapture",
-                        "plan::tests::track::sync_crash_child",
-                    ])
+                let output = crate::testing::ignored_child("plan::tests::track::sync_crash_child")
                     .env("BX_CRASH_AT", &at)
                     .env(SYNC_CRASH_HOME, &home)
                     .env_remove("LLVM_PROFILE_FILE")

@@ -1686,13 +1686,13 @@ fn hold_trees(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
 
     use super::*;
     use crate::plan::tests::{env, inline, seed};
     use crate::report::Exit;
     use crate::state::Prior;
-    use crate::testing::{GuardedHome, guarded_home};
+    use crate::testing::{GuardedHome, chmod, guarded_home, mode_of};
 
     /// What the user's own `bx.toml` holds before any test edits it.
     const MINE: &str = "# my own notes\n";
@@ -1709,7 +1709,7 @@ mod tests {
         let path = home.child(rel);
         std::fs::create_dir_all(path.parent().expect("a parent")).expect("parents");
         std::fs::write(&path, bytes).expect("write");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        chmod(&path, mode);
         path
     }
 
@@ -1735,10 +1735,6 @@ mod tests {
 
     fn body(home: &GuardedHome, rel: &str) -> PathBuf {
         home.child(".config/bx/files").join(rel)
-    }
-
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777
     }
 
     fn ledger(home: &GuardedHome) -> LedgerView {

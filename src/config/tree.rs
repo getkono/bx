@@ -350,9 +350,8 @@ mod tests {
     use crate::config::{Layer, load_layer, load_layers, merge};
     use crate::report::Action;
 
-    fn home() -> &'static Path {
-        Path::new("/var/home/example")
-    }
+    use crate::testing::chmod;
+    use crate::testing::example_home as home;
 
     /// A config repo holding `files`, each `(relative path, contents)`, with
     /// the executable ones at `0755`.
@@ -364,10 +363,6 @@ mod tests {
             std::fs::write(&path, contents).expect("write");
         }
         dir
-    }
-
-    fn chmod(path: &Path, mode: u32) {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
     }
 
     /// Load `bx.toml` from `repo`, trees expanded.

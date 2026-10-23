@@ -54,7 +54,7 @@ jobs:
       # namespace `unshare --map-auto --map-root-user` builds, against a
       # directory set-group-ID to a group that uid is not in. A scenario the
       # machine cannot build fails the test rather than skipping it
-      # (`journal::tests::cannot_build`), so the runner has to be able to build
+      # (`testing::skip_unconstructible`), so the runner has to be able to build
       # it. Three things stand in the way on the stock image: Ubuntu's AppArmor
       # policy strips every capability from an unprivileged user namespace, so
       # the `chown` inside it is refused; `--map-auto` needs `newuidmap` and

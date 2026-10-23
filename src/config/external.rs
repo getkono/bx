@@ -671,15 +671,12 @@ pub(crate) fn unusable_rev(rev: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use toml_edit::Document;
 
     /// A commit id that is well formed.
     const REV: &str = "0e810e5afa27acbd074398eefbe28d13005dbc15";
 
-    fn home() -> PathBuf {
-        PathBuf::from("/home/example")
-    }
+    use crate::testing::example_home as home;
 
     /// Every `[[external]]` entry in `text`, parsed.
     fn parse(text: &str) -> Result<Vec<External>, String> {
@@ -690,7 +687,7 @@ mod tests {
             .ok_or("no [[external]]")?;
         tables
             .iter()
-            .map(|table| parse_external(table, Path::new("/repo/bx.toml"), text, &home()))
+            .map(|table| parse_external(table, Path::new("/repo/bx.toml"), text, home()))
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())
     }
@@ -992,7 +989,7 @@ mod tests {
         for path in [
             "~",
             "/opt/a",
-            "/home/example/a",
+            "/var/home/example/a",
             "relative/a",
             "~/../a",
             "~/{{x}}/a",
@@ -1052,9 +1049,9 @@ mod tests {
     #[test]
     fn parse_path_is_the_spelling_a_toggle_is_matched_by() {
         assert_eq!(
-            parse_path("~/a/./b//c", &home()).unwrap().as_str(),
+            parse_path("~/a/./b//c", home()).unwrap().as_str(),
             "~/a/b/c"
         );
-        assert!(parse_path("/opt/a", &home()).is_err());
+        assert!(parse_path("/opt/a", home()).is_err());
     }
 }

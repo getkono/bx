@@ -487,7 +487,7 @@ mod tests {
     /// A layer is parsed *against* a home, because a target path under it has
     /// one spelling. Nothing in this module reads one from the environment.
     pub(super) fn home() -> PathBuf {
-        PathBuf::from("/var/home/example")
+        crate::testing::example_home().to_path_buf()
     }
 
     /// The merge, against the fixtures' home.

@@ -1348,15 +1348,13 @@ mod tests {
         use crate::testing::guarded_home;
         use std::path::{Path, PathBuf};
 
-        fn home() -> PathBuf {
-            PathBuf::from("/var/home/example")
-        }
+        use crate::testing::example_home as home;
 
         fn layer(file: &str, kind: LayerKind, text: &str) -> Layer {
             Layer {
                 file: PathBuf::from(file),
                 kind,
-                config: parse_str(text, Path::new(file), &home())
+                config: parse_str(text, Path::new(file), home())
                     .unwrap_or_else(|e| panic!("{file}: {e}")),
             }
         }
@@ -1390,7 +1388,7 @@ mod tests {
                 machine,
                 present: &|tool| tool == "rg",
             };
-            merge(&gate(layers, &facts), &home())
+            merge(&gate(layers, &facts), home())
         }
 
         fn target(path: &str, body: &str, when: &str) -> String {
@@ -1633,7 +1631,7 @@ mod tests {
                     "may not declare a `[[value]]`",
                 ),
             ] {
-                let message = parse_str(&text, Path::new("modules/m.toml"), &home())
+                let message = parse_str(&text, Path::new("modules/m.toml"), home())
                     .expect_err(&text)
                     .to_string();
                 assert!(message.contains(needle), "{text}: {message}");

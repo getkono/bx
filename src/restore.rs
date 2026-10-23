@@ -875,7 +875,9 @@ mod tests {
     use super::*;
 
     use crate::fs::Mode;
-    use crate::journal::tests::{peek, plant_file, target, write_to};
+    use crate::journal::tests::{
+        applied, apply_session, interrupted, peek, plant_file, target, write_to,
+    };
     use crate::journal::{Session, SessionKind};
     use crate::state::{ContentHash, LedgerView, Prior};
     use crate::testing::guarded_home;
@@ -884,9 +886,7 @@ mod tests {
     fn managed(state: &StateDir, home: &Path, rel: &str, bytes: &str, mode: Mode) -> Portable {
         let request = write_to(home, rel, bytes, mode);
         let portable = request.target.clone();
-        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
-        session.apply(request).expect("apply");
-        session.finish().expect("finish");
+        applied(state, home, vec![request]);
         portable
     }
 
@@ -947,11 +947,11 @@ mod tests {
     /// Apply `rel` in a session that dies between its `End` frame and its
     /// ledger save, then let recovery rebuild the ledger from the journal.
     fn applied_through_recovery(state: &StateDir, home: &Path, rel: &str, bytes: &str) {
-        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
-        session
-            .apply(write_to(home, rel, bytes, Mode::DEFAULT_FILE))
-            .expect("apply");
-        drop(session);
+        interrupted(
+            state,
+            home,
+            vec![write_to(home, rel, bytes, Mode::DEFAULT_FILE)],
+        );
         crate::journal::tests::seal(&state.journal(), 1);
         assert_eq!(
             crate::recover::recover(state).expect("recover"),
@@ -1425,7 +1425,7 @@ mod tests {
         if std::fs::read(&unreadable).is_ok() {
             std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
                 .expect("chmod back");
-            return crate::journal::tests::cannot_build(
+            return crate::testing::cannot_build(
                 "a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore",
                 crate::journal::tests::WRITES_THROUGH_PERMISSIONS,
             );
@@ -1665,8 +1665,7 @@ mod tests {
         let a = managed(&state, home.path(), ".a", "a-bx\n", Mode::DEFAULT_FILE);
 
         // An apply that never finished, over a different target.
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".b", "b-bx\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -1693,8 +1692,7 @@ mod tests {
         plant_file(&home.child(".b"), "b-theirs\n", Mode::DEFAULT_FILE);
         let a = managed(&state, home.path(), ".a", "a-bx\n", Mode::DEFAULT_FILE);
 
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".b", "b-bx\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -1889,9 +1887,7 @@ mod tests {
         let (ta, tb) = (target(home.path(), a).0, target(home.path(), b).0);
         match sharing {
             Sharing::OneRm | Sharing::OneRmReversed => {
-                let mut session =
-                    Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
-                        .expect("open");
+                let mut session = apply_session(&state, home.path());
                 session
                     .apply(write_to(home.path(), a, "a\n", Mode::DEFAULT_FILE))
                     .expect("apply a");
@@ -2221,7 +2217,7 @@ mod tests {
                 // the whole test meant the `remove` half's skip took the
                 // `revert` half with it, and the revert half needs no
                 // privilege this one lacks that the remove half does not.
-                crate::journal::tests::cannot_build(
+                crate::testing::cannot_build(
                     "a_write_rm_cannot_make_is_the_sessions_own_error",
                     crate::journal::tests::WRITES_THROUGH_PERMISSIONS,
                 );
@@ -2264,9 +2260,7 @@ mod tests {
     fn managed_dir(state: &StateDir, home: &Path, rel: &str, mode: Mode) -> Portable {
         let request = crate::journal::tests::dir_to(home, rel, mode);
         let portable = request.target.clone();
-        let mut session = Session::open(state, SessionKind::Apply, home, Vec::new()).expect("open");
-        session.apply(request).expect("apply");
-        session.finish().expect("finish");
+        applied(state, home, vec![request]);
         portable
     }
 
@@ -2570,8 +2564,8 @@ mod tests {
 
         // r3 coverage COV1. Not an `eprintln!` that passes: a scenario this
         // machine cannot build fails unless a human opted the skip in. See
-        // `crate::journal::tests::cannot_build`.
-        let skip = |why: &str| crate::journal::tests::cannot_build(name, why);
+        // `crate::testing::cannot_build`.
+        let skip = |why: &str| crate::testing::cannot_build(name, why);
         let home = guarded_home();
         // Another uid has to reach the directory and run this test binary.
         fs::set_mode(home.path(), Mode::DEFAULT_DIR).expect("open the home to traversal");

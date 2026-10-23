@@ -1227,6 +1227,14 @@ mod tests {
 
     use super::capture::capturing;
     use crate::state::StateDir;
+    use crate::testing::mkfifo;
+
+    /// A state file's path in a fresh tempdir, which holds nothing yet.
+    fn state_file() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.mpk");
+        (dir, path)
+    }
 
     const KIND: &str = "bx.test";
     const OTHER: &str = "bx.other";
@@ -1280,8 +1288,7 @@ mod tests {
 
     #[test]
     fn a_round_trip_returns_the_same_value() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         save(&path, KIND, VERSION, &sample()).expect("save");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Loaded);
@@ -1419,8 +1426,7 @@ mod tests {
 
     #[test]
     fn an_older_version_still_loads() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, encoded(KIND, VERSION - 1, &sample())).expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Loaded);
@@ -1429,8 +1435,7 @@ mod tests {
 
     #[test]
     fn a_truncated_file_degrades_to_empty() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         let bytes = encoded(KIND, VERSION, &sample());
         std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
@@ -1440,8 +1445,7 @@ mod tests {
 
     #[test]
     fn garbage_bytes_degrade_to_empty() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, b"this is certainly not MessagePack").expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
@@ -1450,8 +1454,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_damage_not_a_silent_half_read() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         let mut bytes = encoded(KIND, VERSION, &sample());
         bytes.extend_from_slice(b"\x00\x00leftovers");
         std::fs::write(&path, &bytes).expect("seed");
@@ -1462,8 +1465,7 @@ mod tests {
 
     #[test]
     fn a_future_version_degrades_and_names_the_version() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, encoded(KIND, VERSION + 5, &sample())).expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(
@@ -1495,8 +1497,7 @@ mod tests {
         // Review round 4: the payload was decoded before the version was
         // looked at, so a newer format with a changed payload read as
         // `Malformed` — damage — whatever the file's loss.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, reshaped(VERSION + 1)).expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(
@@ -1517,8 +1518,7 @@ mod tests {
     fn a_newer_version_of_a_permanent_file_is_refused_and_nothing_is_renamed() {
         // Review round 4: after a rollback to an older bx, an intact ledger
         // was moved aside as damage, even under the lock.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (dir, path) = state_file();
         let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
         // Review round 5: whether the rest of the file reads as this format is
         // reported, so the message can say the version itself may be damaged.
@@ -1616,8 +1616,7 @@ mod tests {
 
     #[test]
     fn a_file_of_the_wrong_kind_is_not_accepted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, encoded(OTHER, VERSION, &sample())).expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert_eq!(
@@ -1632,8 +1631,7 @@ mod tests {
 
     #[test]
     fn damaged_bytes_are_quarantined_not_deleted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, b"garbage").expect("seed");
         let _: Loaded<Value> = locked_load(&path).expect("load");
         assert!(!path.exists(), "the damaged file must be moved aside");
@@ -1711,8 +1709,7 @@ mod tests {
         // Review round 3: a fixed `<name>.corrupt` was renamed over, so a
         // second damaged ledger destroyed the first — which may be the only
         // index there is to the user's restore blobs.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (dir, path) = state_file();
         for body in [&b"first"[..], b"second", b"third"] {
             std::fs::write(&path, body).expect("seed");
             let loaded: Loaded<Value> = locked_load(&path).expect("load");
@@ -1736,8 +1733,7 @@ mod tests {
         // Review round 5: `move_aside` took the lowest free number, so once a
         // human deleted `.corrupt` the next quarantine refilled it, and
         // `Loaded::quarantined` listed the newest first.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         for body in [&b"first"[..], b"second", b"third"] {
             std::fs::write(&path, body).expect("seed");
             let _: Loaded<Value> = locked_load(&path).expect("load");
@@ -1777,8 +1773,7 @@ mod tests {
         // r3 round 1 (L1a): with `v.mpk.corrupt.18446744073709551615` present,
         // the number after the highest overflowed, nothing was moved aside,
         // and the load still said the file had been quarantined.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         let crafted = StateDir::quarantine_nth(&path, u64::MAX);
         std::fs::write(&crafted, b"crafted").expect("seed");
         std::fs::write(&path, b"garbage").expect("seed");
@@ -1803,8 +1798,7 @@ mod tests {
 
         // A crafted top number, three quarantines, the first removed by a
         // human, then a fourth damaged load.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         let top = nth(&path, u64::MAX);
         std::fs::write(&top, b"crafted").expect("seed");
         for body in [&b"first"[..], b"second", b"third"] {
@@ -1834,8 +1828,7 @@ mod tests {
 
         // A crafted `<u64::MAX - 1>`: bx itself makes the top number, and
         // then takes the lowest free numbers.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         let below_top = nth(&path, u64::MAX - 1);
         std::fs::write(&below_top, b"crafted").expect("seed");
         let mut made = Vec::new();
@@ -1869,8 +1862,7 @@ mod tests {
         // Review round 4: a quarantine followed by a crash before the save left
         // the next reader and writer looking at `Health::Fresh`, with the
         // `.corrupt` file orphaned and reported nowhere.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (dir, path) = state_file();
         let first = StateDir::quarantine(&path);
 
         let absent: Loaded<Value> = load(
@@ -1987,8 +1979,7 @@ mod tests {
         // Both texts are stated as part of the contract — by this module's
         // `load` doc and by `state/mod.rs` — and deleting either macro passed
         // the entire suite.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, b"garbage").expect("seed");
 
         // The lockless reader: told what is wrong, and told who will move it.
@@ -2098,8 +2089,7 @@ mod tests {
 
     #[test]
     fn a_lockless_reader_reports_damage_and_moves_nothing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (dir, path) = state_file();
         std::fs::write(&path, b"garbage").expect("seed");
 
         let loaded: Loaded<Value> =
@@ -2117,8 +2107,7 @@ mod tests {
         // Review round 3's falsifier: the reader has read and judged the bytes,
         // a writer saves a fresh file, and the reader then acts on the path.
         // A rename by path there moved the writer's fresh file aside.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (dir, path) = state_file();
         save(&path, KIND, VERSION, &Value::new()).expect("seed");
 
         let loaded: Loaded<Value> =
@@ -2152,8 +2141,7 @@ mod tests {
         // `Damage::Malformed` is what `decode` produces for a whole file, and
         // a check answering with it would make `is_partial` say the rows named
         // are the whole loss when nothing was named.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         save(&path, KIND, VERSION, &sample()).expect("seed");
         let _ = load_checked::<Value>(&path, KIND, VERSION, Loss::Recomputable, None, |value| {
             value.clear();
@@ -2163,8 +2151,7 @@ mod tests {
 
     #[test]
     fn a_refused_value_is_the_error_and_nothing_is_renamed_even_under_the_lock() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (dir, path) = state_file();
         save(&path, KIND, VERSION, &sample()).expect("seed");
         let intact = std::fs::read(&path).expect("read");
         let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
@@ -2192,8 +2179,7 @@ mod tests {
 
     #[test]
     fn a_degraded_store_writes_a_clean_file_on_the_next_save() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, b"garbage").expect("seed");
         let loaded: Loaded<Value> = locked_load(&path).expect("load");
         assert!(loaded.health.is_reset());
@@ -2219,9 +2205,6 @@ mod tests {
     }
 
     /// Put a FIFO at `path`.
-    fn mkfifo(path: &Path) {
-        crate::testing::mkfifo(path);
-    }
 
     #[test]
     fn a_state_file_that_is_not_a_regular_file_is_never_read() {
@@ -2229,8 +2212,7 @@ mod tests {
         // FIFO at the name blocked in `open` until a writer appeared, and a
         // link to `/dev/zero` allocated until the process was killed. Both
         // return at once now, whether the name is the thing or a link to it.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (dir, path) = state_file();
         let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
         let fifo = || mkfifo(&path);
         let to_zero = || std::os::unix::fs::symlink("/dev/zero", &path).expect("symlink");
@@ -2265,8 +2247,7 @@ mod tests {
         // r5 (D1): the length was not bounded at all. A sparse file one byte
         // past the limit costs nothing to make and is refused before any of
         // it is allocated.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (dir, path) = state_file();
         let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
         let seed = || {
             std::fs::File::create(&path)
@@ -2316,8 +2297,7 @@ mod tests {
             crate::testing::skip_unconstructible("root ignores the permission bits");
             return;
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         save(&path, KIND, VERSION, &sample()).expect("save");
         let intact = std::fs::read(&path).expect("read");
         // What a `sudo bx` leaves behind: a perfectly good state file this
@@ -2412,8 +2392,7 @@ mod tests {
 
     #[test]
     fn an_occupied_quarantine_name_is_skipped_not_replaced() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         std::fs::write(&path, b"garbage").expect("seed");
         // Whatever holds the first name — a directory here — is left alone.
         let first = StateDir::quarantine(&path);
@@ -2431,8 +2410,7 @@ mod tests {
 
     #[test]
     fn state_files_are_written_at_0600() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.mpk");
+        let (_dir, path) = state_file();
         save(&path, KIND, VERSION, &sample()).expect("save");
         let mode = Mode::from_bits(std::fs::metadata(&path).expect("stat").permissions().mode());
         assert_eq!(mode, Mode::PRIVATE_FILE);

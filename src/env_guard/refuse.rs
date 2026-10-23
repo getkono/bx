@@ -418,11 +418,7 @@ mod tests {
             ("/var/home/example/.local/state/bx/nvim", BxOwnedDirectory),
             ("$NOWHERE", UnresolvedReference),
         ] {
-            assert_eq!(
-                reason_of(&check("BROWSER", value, &rooted())),
-                Some(reason),
-                "{value:?}"
-            );
+            refused("BROWSER", value, &rooted(), reason);
             // A command line's first word is judged as a program is, and only
             // the sentence of the grammar refusal differs.
             let as_command_line = match reason {
@@ -431,22 +427,14 @@ mod tests {
             };
             let first_word_only = !value.contains(' ');
             if first_word_only {
-                assert_eq!(
-                    reason_of(&check("EDITOR", value, &rooted())),
-                    Some(as_command_line),
-                    "{value:?}"
-                );
+                refused("EDITOR", value, &rooted(), as_command_line);
             }
         }
         // With no home, a `~` or `$HOME` program cannot be shown to be outside
         // bx's state directory, and does not resolve.
         for value in ["~/bin/nvim", "$HOME/bin/nvim"] {
             for name in ["TERMINAL", "VISUAL"] {
-                assert_eq!(
-                    reason_of(&check(name, value, &RootSet::strict())),
-                    Some(Reason::NoHome),
-                    "{name}={value}"
-                );
+                refused(name, value, &RootSet::strict(), Reason::NoHome);
             }
         }
     }
@@ -457,7 +445,7 @@ mod tests {
             BxOwnedDirectory, InsideConfigRepo, LaterExpansion, NoHome, NotACommandLine,
             NotAbsolute, RelocatingAssignment,
         };
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         // What the reference dotfiles set, and the shapes beside it.
         for (name, value) in [
             ("MANPAGER", "\"sh -c 'col -bx | bat -l man -p'\""),
@@ -484,13 +472,11 @@ mod tests {
         }
         // With no home, a `~` argument cannot be shown to be outside bx's
         // state directory; every other argument above is judged the same.
-        assert_eq!(
-            reason_of(&check(
-                "EDITOR",
-                "\"nvim ~/notes/todo.md\"",
-                &RootSet::strict()
-            )),
-            Some(NoHome)
+        refused(
+            "EDITOR",
+            "\"nvim ~/notes/todo.md\"",
+            &RootSet::strict(),
+            NoHome,
         );
         assert_eq!(
             check(
@@ -577,11 +563,7 @@ mod tests {
             ("\"sh -c 'CARGO_HOME+=/evil nvim'\"", RelocatingAssignment),
         ] {
             for roots in [rooted(), home_rooted.clone()] {
-                assert_eq!(
-                    reason_of(&check("EDITOR", value, &roots)),
-                    Some(reason),
-                    "{value}"
-                );
+                refused("EDITOR", value, &roots, reason);
             }
         }
     }
@@ -592,7 +574,7 @@ mod tests {
         // `notes/todo.md`, each judged on its own. Read whole, it opens with a
         // `~` that is not the home's, and is judged from its first `/`, as its
         // pieces are, rather than refused as another account's home.
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         for value in ["\"nvim ~:notes/todo.md\"", "\"nvim ~=notes/todo.md\""] {
             for roots in [rooted(), home_rooted.clone()] {
                 assert_eq!(check("EDITOR", value, &roots), Verdict::Allowed, "{value}");
@@ -627,17 +609,9 @@ mod tests {
                     BxOwnedDirectory,
                 ),
             ] {
-                assert_eq!(
-                    reason_of(&check("EDITOR", &value, &roots)),
-                    Some(reason),
-                    "{home}: {value}"
-                );
+                refused("EDITOR", &value, &roots, reason);
                 let options = value.replacen("nvim ", "", 1).replacen("less ", "", 1);
-                assert_eq!(
-                    reason_of(&check("LESS", &options, &roots)),
-                    Some(reason),
-                    "{home}: {options}"
-                );
+                refused("LESS", &options, &roots, reason);
             }
             for value in [
                 format!("\"nvim {home}/notes/todo.md\""),
@@ -671,11 +645,7 @@ mod tests {
             ("\"-R XDG_STATE_HOME=/tmp\"", RelocatingAssignment),
             ("\"-R XDG_STATE_HOME\"", RelocatingAssignment),
         ] {
-            assert_eq!(
-                reason_of(&check("LESS", value, &rooted())),
-                Some(reason),
-                "{value}"
-            );
+            refused("LESS", value, &rooted(), reason);
         }
     }
 
@@ -752,11 +722,7 @@ mod tests {
             ("SCCACHE_CACHE_SIZE", "10g"),
             ("SCCACHE_CACHE_SIZE", "K"),
         ] {
-            assert_eq!(
-                reason_of(&check(name, value, &rooted())),
-                Some(Reason::NotASetting),
-                "{name}={value:?}"
-            );
+            refused(name, value, &rooted(), Reason::NotASetting);
         }
     }
 
@@ -813,7 +779,7 @@ mod tests {
                 );
             }
             // Anything shaped like a path, a list or an option is refused.
-            let refused = [
+            let shaped = [
                 "/usr/lib/locale/x",
                 "\"a/b\"",
                 "en_US:C",
@@ -823,15 +789,11 @@ mod tests {
                 "",
             ];
             for name in locales.iter().chain(&modules) {
-                for value in refused {
-                    assert_eq!(
-                        reason_of(&check(name, value, &roots)),
-                        Some(Reason::NotASetting),
-                        "{name}={value}"
-                    );
+                for value in shaped {
+                    refused(name, value, &roots, Reason::NotASetting);
                 }
             }
-            for value in refused.iter().chain(&[
+            for value in shaped.iter().chain(&[
                 "ibus",
                 "\"@im=\"",
                 "\"@im=/usr/lib/ibus\"",
@@ -840,11 +802,7 @@ mod tests {
                 "\"@im=ibus x\"",
                 "\"x@im=ibus\"",
             ]) {
-                assert_eq!(
-                    reason_of(&check("XMODIFIERS", value, &roots)),
-                    Some(Reason::NotASetting),
-                    "{value}"
-                );
+                refused("XMODIFIERS", value, &roots, Reason::NotASetting);
             }
         }
         // None of them moves anything, so none is searched for in a tool's
@@ -881,17 +839,10 @@ mod tests {
                 ("", NotAbsolute),
                 ("/var/home/example/.local/state/bx/agent", BxOwnedDirectory),
             ] {
-                assert_eq!(
-                    reason_of(&check("SSH_AUTH_SOCK", value, &roots)),
-                    Some(reason),
-                    "{value}"
-                );
+                refused("SSH_AUTH_SOCK", value, &roots, reason);
             }
         }
-        assert_eq!(
-            reason_of(&check("SSH_AUTH_SOCK", "~/agent", &RootSet::strict())),
-            Some(NoHome)
-        );
+        refused("SSH_AUTH_SOCK", "~/agent", &RootSet::strict(), NoHome);
     }
 
     // Review round 6 (r3 round 1).
@@ -903,7 +854,7 @@ mod tests {
         // either would move them on bx's next run, leaving the ledger, the
         // journal and `local.toml` behind (invariants 3 and 4), so neither is
         // in the emit table, whatever the roots admit.
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         for name in ["XDG_STATE_HOME", "XDG_CONFIG_HOME"] {
             assert_eq!(emittable(name), None, "{name}");
             for value in [
@@ -913,11 +864,7 @@ mod tests {
                 "~/.config",
             ] {
                 for roots in [rooted(), home_rooted.clone(), RootSet::strict()] {
-                    assert_eq!(
-                        reason_of(&check(name, value, &roots)),
-                        Some(Reason::NotEmittable),
-                        "{name}={value}"
-                    );
+                    refused(name, value, &roots, Reason::NotEmittable);
                     assert_eq!(
                         reasons(&format!("export {name}={value}\n"), &roots),
                         vec![(1, Reason::NotEmittable)],
@@ -943,7 +890,7 @@ mod tests {
         // The repo is committed, and README calls it safe to make public: a
         // tool writing there could commit its credentials (invariant 5), and a
         // program or a search list there runs whatever was committed.
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         for (name, value) in [
             ("CARGO_HOME", "~/.config/bx/cargo"),
             ("CARGO_HOME", "~/.config/bx"),
@@ -951,11 +898,7 @@ mod tests {
             ("PATH", "~/.config/bx/bin:$PATH"),
             ("SSH_AUTH_SOCK", "~/.config/bx/a.sock"),
         ] {
-            assert_eq!(
-                reason_of(&check(name, value, &home_rooted)),
-                Some(Reason::InsideConfigRepo),
-                "{name}={value}"
-            );
+            refused(name, value, &home_rooted, Reason::InsideConfigRepo);
         }
         // A sibling whose name merely extends it is not the repo.
         assert_eq!(
@@ -963,9 +906,11 @@ mod tests {
             Verdict::Allowed
         );
         // With no home, every default repo is refused, whoever's home.
-        assert_eq!(
-            reason_of(&check("PATH", "/home/o/.config/bx/bin", &RootSet::strict())),
-            Some(Reason::InsideConfigRepo)
+        refused(
+            "PATH",
+            "/home/o/.config/bx/bin",
+            &RootSet::strict(),
+            Reason::InsideConfigRepo,
         );
         assert_eq!(
             check("PATH", "/home/o/.config/bxtra/bin", &RootSet::strict()),
@@ -974,36 +919,36 @@ mod tests {
         // A repo the environment moved is refused once the caller says so,
         // inside a declared root, and the home's default stays refused.
         let moved = rooted().with_config_repos(&[PathBuf::from("/var/mnt/scratch/example/cfg/bx")]);
-        assert_eq!(
-            reason_of(&check(
-                "CARGO_HOME",
-                "/var/mnt/scratch/example/cfg/bx/c",
-                &moved
-            )),
-            Some(Reason::InsideConfigRepo)
+        refused(
+            "CARGO_HOME",
+            "/var/mnt/scratch/example/cfg/bx/c",
+            &moved,
+            Reason::InsideConfigRepo,
         );
-        assert_eq!(
-            reason_of(&check(
-                "CARGO_HOME",
-                "/var/mnt/scratch/example/cfg/./bx/c",
-                &moved
-            )),
-            Some(Reason::InsideConfigRepo)
+        refused(
+            "CARGO_HOME",
+            "/var/mnt/scratch/example/cfg/./bx/c",
+            &moved,
+            Reason::InsideConfigRepo,
         );
         assert_eq!(
             check("CARGO_HOME", "/var/mnt/scratch/example/cfg/c", &moved),
             Verdict::Allowed
         );
-        assert_eq!(
-            reason_of(&check("EDITOR", "/var/home/example/.config/bx/ed", &moved)),
-            Some(Reason::InsideConfigRepo)
+        refused(
+            "EDITOR",
+            "/var/home/example/.config/bx/ed",
+            &moved,
+            Reason::InsideConfigRepo,
         );
         // A home of `/x` whose whole tree is a root: the repo under it is
         // still refused.
         let x = RootSet::new(Path::new("/x"), &[PathBuf::from("~")]);
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", "/x/.config/bx/cargo", &x)),
-            Some(Reason::InsideConfigRepo)
+        refused(
+            "CARGO_HOME",
+            "/x/.config/bx/cargo",
+            &x,
+            Reason::InsideConfigRepo,
         );
         assert_eq!(check("CARGO_HOME", "/x/cargo", &x), Verdict::Allowed);
         // bx's state directory is checked first: it is the stronger claim.
@@ -1029,45 +974,33 @@ mod tests {
         // entry's parent, so it lies inside that root too.
         let joined = "/var/mnt/scratch/example:/var/mnt/scratch/example/y";
         for name in ["CARGO_HOME", "GOPATH"] {
-            assert_eq!(
-                reason_of(&check(name, joined, &rooted())),
-                Some(Reason::DeclaredRootItself),
-                "{name}"
-            );
+            refused(name, joined, &rooted(), Reason::DeclaredRootItself);
         }
         let beneath = "/var/mnt/scratch/example/x:/var/mnt/scratch/example/y";
         for name in ["CARGO_HOME", "GOPATH"] {
             assert_eq!(check(name, beneath, &rooted()), Verdict::Allowed, "{name}");
         }
         // `GOPATH` is a list go splits at `:`, so each entry is the path.
-        assert_eq!(
-            reason_of(&check(
-                "GOPATH",
-                "/var/mnt/scratch/example/go:/etc/evil",
-                &rooted()
-            )),
-            Some(Reason::OutsideDeclaredRoots)
+        refused(
+            "GOPATH",
+            "/var/mnt/scratch/example/go:/etc/evil",
+            &rooted(),
+            Reason::OutsideDeclaredRoots,
         );
         // The review's climbing case: its entries normalise inside the root
         // and the whole string outside it. Since r3 round 2 its `..` is refused
         // before either, whichever kind holds it.
         let climbing = "/var/mnt/scratch/example/x:/../../../var/mnt/scratch/example/y";
         for name in ["CARGO_HOME", "GOPATH"] {
-            assert_eq!(
-                reason_of(&check(name, climbing, &rooted())),
-                Some(Reason::ParentComponent),
-                "{name}"
-            );
+            refused(name, climbing, &rooted(), Reason::ParentComponent);
         }
         // An entry that is refused keeps its own reason, and a value with no
         // `:` is one path either way.
-        assert_eq!(
-            reason_of(&check(
-                "CARGO_HOME",
-                "/var/mnt/scratch/example/k:",
-                &rooted()
-            )),
-            Some(Reason::NotAbsolute)
+        refused(
+            "CARGO_HOME",
+            "/var/mnt/scratch/example/k:",
+            &rooted(),
+            Reason::NotAbsolute,
         );
         assert_eq!(
             check("CARGO_HOME", "/var/mnt/scratch/example/cargo", &rooted()),
@@ -1126,11 +1059,7 @@ mod tests {
             ("PATH", "/usr/local/../bin:$PATH"),
             ("SSH_AUTH_SOCK", "/run/user/../agent"),
         ] {
-            assert_eq!(
-                reason_of(&check(name, value, &rooted())),
-                Some(ParentComponent),
-                "{name}={value}"
-            );
+            refused(name, value, &rooted(), ParentComponent);
         }
         // A kind that needs no root is refused for it with no root too; a
         // location is refused for having no root first.
@@ -1139,19 +1068,13 @@ mod tests {
             ("PATH", "/usr/local/../bin:$PATH"),
             ("SSH_AUTH_SOCK", "/run/user/../agent"),
         ] {
-            assert_eq!(
-                reason_of(&check(name, value, &RootSet::strict())),
-                Some(ParentComponent),
-                "{name}={value}"
-            );
+            refused(name, value, &RootSet::strict(), ParentComponent);
         }
-        assert_eq!(
-            reason_of(&check(
-                "CARGO_HOME",
-                "/var/mnt/scratch/example/a/../cargo",
-                &RootSet::strict()
-            )),
-            Some(NoRootsDeclared)
+        refused(
+            "CARGO_HOME",
+            "/var/mnt/scratch/example/a/../cargo",
+            &RootSet::strict(),
+            NoRootsDeclared,
         );
         // A `.` component, and dots inside a name, are neither.
         assert_eq!(
@@ -1175,7 +1098,7 @@ mod tests {
         // `UV_CACHE_DIR=~/.local/state` deleted bx's ledger with it
         // (invariant 4). So a location may neither be inside bx's directories
         // nor contain them.
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         assert_eq!(
             reasons("export UV_CACHE_DIR=~/.local/state\n", &home_rooted),
             vec![(1, ContainsBxDirectory)]
@@ -1188,22 +1111,17 @@ mod tests {
             ("CARGO_HOME", "~"),
             ("GOPATH", "/var/home/example/go:/var/home/example/.local"),
         ] {
-            assert_eq!(
-                reason_of(&check(name, value, &home_rooted)),
-                Some(ContainsBxDirectory),
-                "{name}={value}"
-            );
+            refused(name, value, &home_rooted, ContainsBxDirectory);
         }
         // bx's directories themselves keep their own reasons, and a sibling
         // or a directory beside them is fine.
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", "~/.local/state/bx", &home_rooted)),
-            Some(BxOwnedDirectory)
+        refused(
+            "CARGO_HOME",
+            "~/.local/state/bx",
+            &home_rooted,
+            BxOwnedDirectory,
         );
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", "~/.config/bx", &home_rooted)),
-            Some(InsideConfigRepo)
-        );
+        refused("CARGO_HOME", "~/.config/bx", &home_rooted, InsideConfigRepo);
         for value in [
             "~/.local/share",
             "~/.local/state/bxtra",
@@ -1227,11 +1145,7 @@ mod tests {
             ("/var/mnt/scratch/example/cfg", None),
             ("/var/mnt/scratch/example", Some(Reason::DeclaredRootItself)),
         ] {
-            assert_eq!(
-                reason_of(&check("CARGO_HOME", value, &moved)),
-                Some(ContainsBxDirectory),
-                "{value}"
-            );
+            refused("CARGO_HOME", value, &moved, ContainsBxDirectory);
             assert_eq!(
                 reason_of(&check("CARGO_HOME", value, &rooted())),
                 unmoved,
@@ -1261,11 +1175,7 @@ mod tests {
         // none of `$`, `{` or `%`: a list of known-bad characters missed it.
         let climb = r"'/var/mnt/scratch/example/a\..\..\..\..\..\var\home\example\.local\state\bx'";
         for name in ["BUN_INSTALL_CACHE_DIR", "BUN_INSTALL"] {
-            assert_eq!(
-                reason_of(&check(name, climb, &rooted())),
-                Some(UnlistedCharacter('\\')),
-                "{name}"
-            );
+            refused(name, climb, &rooted(), UnlistedCharacter('\\'));
         }
         // Every other character is refused by name, in a location and in an
         // entry of a list of locations.
@@ -1281,11 +1191,7 @@ mod tests {
             ("'/var/mnt/scratch/example/a=b'", '='),
         ] {
             for name in ["CARGO_HOME", "GOPATH"] {
-                assert_eq!(
-                    reason_of(&check(name, value, &rooted())),
-                    Some(UnlistedCharacter(unlisted)),
-                    "{name}={value}"
-                );
+                refused(name, value, &rooted(), UnlistedCharacter(unlisted));
             }
         }
         // A search-list entry and a socket hold the same characters, and need
@@ -1299,11 +1205,7 @@ mod tests {
                 ("SSH_AUTH_SOCK", "/run/a:b", ':'),
                 ("SSH_AUTH_SOCK", r"'/run/a\b'", '\\'),
             ] {
-                assert_eq!(
-                    reason_of(&check(name, value, &roots)),
-                    Some(UnlistedCharacter(unlisted)),
-                    "{name}={value}"
-                );
+                refused(name, value, &roots, UnlistedCharacter(unlisted));
             }
         }
         // `:` between a location's entries is the separator, not a character
@@ -1336,10 +1238,7 @@ mod tests {
             );
         }
         // A program keeps its own, stricter rule.
-        assert_eq!(
-            reason_of(&check("RUSTC_WRAPPER", "\"/usr/bin/a b\"", &rooted())),
-            Some(NotAProgram)
-        );
+        refused("RUSTC_WRAPPER", "\"/usr/bin/a b\"", &rooted(), NotAProgram);
     }
 
     #[test]
@@ -1348,7 +1247,7 @@ mod tests {
             BxOwnedDirectory, ContainsBxDirectory, InsideConfigRepo, NoRootsDeclared,
             OutsideDeclaredRoots, ParentComponent, UnlistedCharacter,
         };
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         for name in ["SCRATCH_HOME", "DATA_DIR"] {
             assert_eq!(emittable(name), Some(Kind::Anchor), "{name}");
         }
@@ -1404,9 +1303,11 @@ mod tests {
         // A tool-read location is still refused for containing them, whether
         // it names the directory itself or is written in terms of an anchor
         // that does.
-        assert_eq!(
-            reason_of(&check("UV_CACHE_DIR", "~/.local/state", &home_rooted)),
-            Some(ContainsBxDirectory)
+        refused(
+            "UV_CACHE_DIR",
+            "~/.local/state",
+            &home_rooted,
+            ContainsBxDirectory,
         );
         assert_eq!(
             reasons(
@@ -1427,20 +1328,10 @@ mod tests {
             ),
             ("scratch", Reason::NotAbsolute),
         ] {
-            assert_eq!(
-                reason_of(&check("SCRATCH_HOME", value, &home_rooted)),
-                Some(reason),
-                "{value}"
-            );
+            refused("SCRATCH_HOME", value, &home_rooted, reason);
         }
-        assert_eq!(
-            reason_of(&check("CACHE_DIR", "/etc", &rooted())),
-            Some(OutsideDeclaredRoots)
-        );
-        assert_eq!(
-            reason_of(&check("DATA_DIR", ROOT, &RootSet::strict())),
-            Some(NoRootsDeclared)
-        );
+        refused("CACHE_DIR", "/etc", &rooted(), OutsideDeclaredRoots);
+        refused("DATA_DIR", ROOT, &RootSet::strict(), NoRootsDeclared);
     }
 
     #[test]
@@ -1451,14 +1342,10 @@ mod tests {
         // bx's state directory exactly as a tool-read location with the
         // identical value is, and only unexported does the exemption stand.
         use Reason::ContainsBxDirectory;
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         let state = "/var/home/example/.local/state";
         for name in ["DATA_DIR", "SCRATCH_HOME", "UV_CACHE_DIR"] {
-            assert_eq!(
-                reason_of(&check(name, state, &home_rooted)),
-                Some(ContainsBxDirectory),
-                "{name}"
-            );
+            refused(name, state, &home_rooted, ContainsBxDirectory);
             assert_eq!(
                 reasons(&format!("export {name}={state}\n"), &home_rooted),
                 vec![(1, ContainsBxDirectory)],
@@ -1480,11 +1367,7 @@ mod tests {
         // uv puts executables in `$XDG_DATA_HOME/../bin`. With the value at the
         // root, that directory is beside the root and outside every one.
         for value in [ROOT.to_string(), format!("{ROOT}/")] {
-            assert_eq!(
-                reason_of(&check("XDG_DATA_HOME", &value, &rooted())),
-                Some(DeclaredRootItself),
-                "{value}"
-            );
+            refused("XDG_DATA_HOME", &value, &rooted(), DeclaredRootItself);
         }
         assert_eq!(
             reasons(
@@ -1504,20 +1387,20 @@ mod tests {
         // root, and no entry of a list of them may be either.
         for (name, kind) in EMITTABLE {
             if matches!(kind, Kind::Location | Kind::LocationList) {
-                assert_eq!(
-                    reason_of(&check(name, ROOT, &rooted())),
-                    Some(DeclaredRootItself),
-                    "{name}"
-                );
+                refused(name, ROOT, &rooted(), DeclaredRootItself);
             }
         }
-        assert_eq!(
-            reason_of(&check("GOPATH", &format!("{ROOT}/go:{ROOT}"), &rooted())),
-            Some(DeclaredRootItself)
+        refused(
+            "GOPATH",
+            &format!("{ROOT}/go:{ROOT}"),
+            &rooted(),
+            DeclaredRootItself,
         );
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", &format!("{ROOT}:{ROOT}/x"), &rooted())),
-            Some(DeclaredRootItself)
+        refused(
+            "CARGO_HOME",
+            &format!("{ROOT}:{ROOT}/x"),
+            &rooted(),
+            DeclaredRootItself,
         );
         // One level: a root nested in another lies beneath the outer one, and
         // the outer one is still a root itself.
@@ -1526,9 +1409,11 @@ mod tests {
             &[PathBuf::from("/var/mnt/scratch"), PathBuf::from(ROOT)],
         );
         assert_eq!(check("XDG_DATA_HOME", ROOT, &nested), Verdict::Allowed);
-        assert_eq!(
-            reason_of(&check("XDG_DATA_HOME", "/var/mnt/scratch", &nested)),
-            Some(DeclaredRootItself)
+        refused(
+            "XDG_DATA_HOME",
+            "/var/mnt/scratch",
+            &nested,
+            DeclaredRootItself,
         );
         // An anchor may be a root: no tool is known to read one.
         for name in ["SCRATCH_HOME", "DATA_DIR"] {
@@ -1582,10 +1467,7 @@ mod tests {
             );
         }
         assert_eq!(check("GOPATH", &value, &roots), Verdict::Allowed);
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", &value, &roots)),
-            Some(Reason::ContainsBxDirectory)
-        );
+        refused("CARGO_HOME", &value, &roots, Reason::ContainsBxDirectory);
     }
 
     #[test]
@@ -1628,10 +1510,7 @@ mod tests {
         );
         // `GOPATH` is read entry by entry, so its whole string is not judged
         // and the root entry still names the fix.
-        assert_eq!(
-            reason_of(&check("GOPATH", "/r1/c:/r2", &repo)),
-            Some(Reason::DeclaredRootItself)
-        );
+        refused("GOPATH", "/r1/c:/r2", &repo, Reason::DeclaredRootItself);
     }
 
     #[test]
@@ -1730,12 +1609,13 @@ mod tests {
         // contain them, while the two anchors no tool is known to read still may
         // — unexported, where no tool can read them.
         assert_eq!(emittable("CACHE_DIR"), Some(Kind::Location));
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         for value in ["~/.local/state", "~/.config", "~/.local"] {
-            assert_eq!(
-                reason_of(&check("CACHE_DIR", value, &home_rooted)),
-                Some(Reason::ContainsBxDirectory),
-                "{value}"
+            refused(
+                "CACHE_DIR",
+                value,
+                &home_rooted,
+                Reason::ContainsBxDirectory,
             );
             for anchor in ["DATA_DIR", "SCRATCH_HOME"] {
                 assert_eq!(
@@ -1848,11 +1728,7 @@ mod tests {
             ("SCRATCH_HOME", "\"/var/mnt/scratch/example/a b\""),
             ("SCRATCH_HOME", "\"/var/mnt/scratch/example/a b/state/bx\""),
         ] {
-            assert_eq!(
-                reason_of(&check(name, value, &odd)),
-                Some(UnlistedCharacter(' ')),
-                "{name}={value}"
-            );
+            refused(name, value, &odd, UnlistedCharacter(' '));
         }
         // Without the character the containment reasons stand, and an anchor
         // may contain what a tool-read location may not while it is not
@@ -1862,33 +1738,29 @@ mod tests {
             unexported("SCRATCH_HOME", "/var/mnt/scratch/example/ab", &plain),
             None
         );
-        assert_eq!(
-            reason_of(&check(
-                "SCRATCH_HOME",
-                "/var/mnt/scratch/example/ab",
-                &plain
-            )),
-            Some(ContainsBxDirectory)
+        refused(
+            "SCRATCH_HOME",
+            "/var/mnt/scratch/example/ab",
+            &plain,
+            ContainsBxDirectory,
         );
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", "/var/mnt/scratch/example/ab", &plain)),
-            Some(ContainsBxDirectory)
+        refused(
+            "CARGO_HOME",
+            "/var/mnt/scratch/example/ab",
+            &plain,
+            ContainsBxDirectory,
         );
-        assert_eq!(
-            reason_of(&check(
-                "CARGO_HOME",
-                "/var/mnt/scratch/example/ab/state/bx",
-                &plain
-            )),
-            Some(BxOwnedDirectory)
+        refused(
+            "CARGO_HOME",
+            "/var/mnt/scratch/example/ab/state/bx",
+            &plain,
+            BxOwnedDirectory,
         );
-        assert_eq!(
-            reason_of(&check(
-                "SCRATCH_HOME",
-                "/var/mnt/scratch/example/ab/state/bx",
-                &plain
-            )),
-            Some(BxOwnedDirectory)
+        refused(
+            "SCRATCH_HOME",
+            "/var/mnt/scratch/example/ab/state/bx",
+            &plain,
+            BxOwnedDirectory,
         );
         // The other half of `refuses_entry_placement`'s order: containing bx's
         // directories outranks the declared roots. Every value above that
@@ -1898,23 +1770,19 @@ mod tests {
         // is the only input that tells the two orders apart: under the swap it
         // would report `OutsideDeclaredRoots`, sending the user to declare a
         // root that would still not make the value legal.
-        assert_eq!(
-            reason_of(&check(
-                "UV_CACHE_DIR",
-                "/var/home/example/.local",
-                &rooted()
-            )),
-            Some(ContainsBxDirectory)
+        refused(
+            "UV_CACHE_DIR",
+            "/var/home/example/.local",
+            &rooted(),
+            ContainsBxDirectory,
         );
         // Not vacuous: a sibling that contains nothing of bx's, outside every
         // root in the same way, is refused for the roots.
-        assert_eq!(
-            reason_of(&check(
-                "UV_CACHE_DIR",
-                "/var/home/example/.cache",
-                &rooted()
-            )),
-            Some(Reason::OutsideDeclaredRoots)
+        refused(
+            "UV_CACHE_DIR",
+            "/var/home/example/.cache",
+            &rooted(),
+            Reason::OutsideDeclaredRoots,
         );
     }
 
@@ -1925,7 +1793,7 @@ mod tests {
         // kind is tried against every character class a value can carry. The
         // grammar refuses some before any kind is judged (`Unreadable`); every
         // other one is refused by name. None is approved.
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = home_rooted();
         let kinds = [
             ("CARGO_HOME", "/var/mnt/scratch/example/a{C}b", rooted()),
             (
@@ -1968,7 +1836,7 @@ mod tests {
         }
         // Components: `..` is refused in every path-valued kind, `.` and `//`
         // fold away, and a trailing `/` names the same directory.
-        let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+        let home_rooted = crate::env_guard::fixtures::home_rooted();
         for (name, value, roots, expected) in [
             (
                 "CARGO_HOME",

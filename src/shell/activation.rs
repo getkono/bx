@@ -2343,7 +2343,9 @@ mod tests {
 
     #[test]
     fn zsh_runs_a_cached_activation_as_the_tool_wrote_it_and_contains_a_broken_one() {
-        let Some(zsh) = installed_zsh() else { return };
+        let Some(zsh) = crate::shell::testing::installed("zsh") else {
+            return;
+        };
         let step = |name: &str, output: &str| Step {
             decl: decl(name, &[name]),
             shell: Shell::Zsh,
@@ -2383,24 +2385,6 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             format!("a'b $HOME|{home}/w|ok|zed\n")
         );
-    }
-
-    /// Where zsh is, or `None` where this machine is excused from having it —
-    /// the excuse `env_guard`'s differential checks honour, which no runner
-    /// may take.
-    fn installed_zsh() -> Option<PathBuf> {
-        match detect::locate_in_env("zsh") {
-            Presence::Present { path } => Some(path),
-            _ => {
-                let excused = std::env::var_os("BX_TEST_WITHOUT_SHELLS").is_some()
-                    && std::env::var_os("CI").is_none();
-                assert!(
-                    excused,
-                    "zsh is not installed; install it, or set BX_TEST_WITHOUT_SHELLS off a runner"
-                );
-                None
-            }
-        }
     }
 
     /// A tool named `tool` first on a search path of its own: a link to `sh`,

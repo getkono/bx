@@ -6,19 +6,18 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use crate::fs::remove::{prune_beneath, remove_made_dir};
 use crate::journal::tests::{
-    WRITES_THROUGH_PERMISSIONS, applied, cannot_build, dir_to, frame_starts, link_at, link_to,
-    mode_at, names_in, peek, permissions_refuse, plant_file, raw_journal, saved_ledger, seal,
-    state_beyond_set_aside_names, target, write_to,
+    WRITES_THROUGH_PERMISSIONS, applied, apply_session, dir_to, frame_starts, link_at, link_to,
+    mode_at, names_in, peek, permissions_refuse, plant_file, raw_journal, remove_to, saved_ledger,
+    seal, state_beyond_set_aside_names, target, write_to,
 };
 use crate::journal::{Loaded, load};
-use crate::testing::guarded_home;
+use crate::testing::{cannot_build, guarded_home};
 
 #[test]
 fn a_session_that_finishes_leaves_no_journal_and_a_saved_ledger() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     assert!(
         state.journal().exists(),
         "the journal exists while in flight"
@@ -54,7 +53,7 @@ fn a_session_that_finishes_leaves_no_journal_and_a_saved_ledger() {
 fn opening_a_session_over_an_unresolved_interruption_is_refused() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let session = Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let session = apply_session(&state, home.path());
     drop(session);
 
     let err = Session::open(&state, SessionKind::Apply, home.path(), Vec::new())
@@ -70,7 +69,7 @@ fn opening_a_session_over_an_unresolved_interruption_is_refused() {
 fn a_session_holds_the_state_lock_for_its_whole_life() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let session = Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let session = apply_session(&state, home.path());
     assert!(
         ExclusiveLock::try_acquire(&state).expect("try").is_none(),
         "the session holds the exclusive lock",
@@ -93,8 +92,7 @@ fn two_identical_sessions_produce_journals_that_differ_only_in_temp_paths() {
     let run = |root: &str| -> Vec<Record> {
         plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
         let state = StateDir::new(home.child(root));
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -136,8 +134,7 @@ fn a_write_records_the_prior_bytes_and_the_created_directories() {
     let state = StateDir::resolve(home.path());
     plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
         .expect("apply");
@@ -192,15 +189,13 @@ fn a_repeat_write_records_the_bytes_it_displaced_not_the_ledgers_first_prior() {
     plant_file(&home.child(".conf"), "the user's\n", Mode::DEFAULT_FILE);
     let (portable, _) = target(home.path(), ".conf");
 
-    let mut first =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut first = apply_session(&state, home.path());
     first
         .apply(write_to(home.path(), ".conf", "one\n", Mode::DEFAULT_FILE))
         .expect("apply");
     first.finish().expect("finish");
 
-    let mut second =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut second = apply_session(&state, home.path());
     second
         .apply(write_to(home.path(), ".conf", "two\n", Mode::DEFAULT_FILE))
         .expect("apply");
@@ -243,8 +238,7 @@ fn a_released_target_leaves_its_prior_bytes_behind_but_no_ledger_entry() {
     plant_file(&home.child(".conf"), "mine\n", Mode::DEFAULT_FILE);
     let (portable, dest) = target(home.path(), ".conf");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(Request {
             target: portable.clone(),
@@ -280,22 +274,16 @@ fn a_released_target_leaves_its_prior_bytes_behind_but_no_ledger_entry() {
 fn a_removal_takes_the_file_and_the_directories_bx_created() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let (portable, dest) = target(home.path(), ".config/deep/made.conf");
+    let dest = home.child(".config/deep/made.conf");
     plant_file(&dest, "bx wrote this\n", Mode::DEFAULT_FILE);
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
-        .apply(Request {
-            target: portable,
-            dest: dest.clone(),
-            content: Content::Absent {
-                created_dirs: vec![home.child(".config/deep"), home.child(".config")],
-                planned: fs::observe(&dest).expect("plan's observation"),
-            },
-            mode: Mode::DEFAULT_FILE,
-            ownership: Ownership::Released,
-        })
+        .apply(remove_to(
+            home.path(),
+            ".config/deep/made.conf",
+            vec![home.child(".config/deep"), home.child(".config")],
+        ))
         .expect("apply");
     session.finish().expect("finish");
 
@@ -314,21 +302,9 @@ fn a_removal_takes_the_file_and_the_directories_bx_created() {
 fn removing_a_destination_that_is_already_gone_is_not_an_error() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let (portable, dest) = target(home.path(), ".never-there");
-
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
-        .apply(Request {
-            target: portable,
-            dest: dest.clone(),
-            content: Content::Absent {
-                created_dirs: Vec::new(),
-                planned: fs::observe(&dest).expect("plan's observation"),
-            },
-            mode: Mode::DEFAULT_FILE,
-            ownership: Ownership::Released,
-        })
+        .apply(remove_to(home.path(), ".never-there", Vec::new()))
         .expect("apply");
     drop(session);
 
@@ -467,8 +443,7 @@ fn a_session_will_not_write_through_a_symlink_the_user_made() {
     plant_file(&home.child("real"), "real\n", Mode::DEFAULT_FILE);
     std::os::unix::fs::symlink(home.child("real"), home.child(".conf")).expect("symlink");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     let err = session
         .apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
         .expect_err("a symlink must be refused");
@@ -480,19 +455,9 @@ fn a_session_will_not_write_through_a_symlink_the_user_made() {
     // A refused write poisons its session, so the removal is refused in a
     // session of its own.
     let other = StateDir::new(home.child("other-state"));
-    let mut session =
-        Session::open(&other, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&other, home.path());
     let err = session
-        .apply(Request {
-            target: target(home.path(), ".conf").0,
-            dest: home.child(".conf"),
-            content: Content::Absent {
-                created_dirs: Vec::new(),
-                planned: fs::observe(&home.child(".conf")).expect("plan's observation"),
-            },
-            mode: Mode::DEFAULT_FILE,
-            ownership: Ownership::Released,
-        })
+        .apply(remove_to(home.path(), ".conf", Vec::new()))
         .expect_err("and so must a removal of one");
     assert!(
         matches!(err, Error::Write(fs::Error::NotAFile { .. })),
@@ -513,8 +478,7 @@ fn the_intent_is_synced_before_the_destination_is_renamed_over() {
     plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
     let journal = state.journal();
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     let (applied, events) =
         recording(|| session.apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE)));
     applied.expect("apply");
@@ -555,26 +519,20 @@ fn the_intent_is_synced_before_a_removal_unlinks_the_destination() {
     let dest = home.child(rel);
     let journal = state.journal();
 
-    let mut first =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
-    first
-        .apply(write_to(home.path(), rel, "x\n", Mode::DEFAULT_FILE))
-        .expect("apply");
-    first.finish().expect("finish");
+    applied(
+        &state,
+        home.path(),
+        vec![write_to(home.path(), rel, "x\n", Mode::DEFAULT_FILE)],
+    );
 
     let mut second =
         Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
     let (removed, events) = recording(|| {
-        second.apply(Request {
-            target: target(home.path(), rel).0,
-            dest: dest.clone(),
-            content: Content::Absent {
-                created_dirs: vec![home.child(".config/made"), home.child(".config")],
-                planned: fs::observe(&dest).expect("plan's observation"),
-            },
-            mode: Mode::DEFAULT_FILE,
-            ownership: Ownership::Released,
-        })
+        second.apply(remove_to(
+            home.path(),
+            rel,
+            vec![home.child(".config/made"), home.child(".config")],
+        ))
     });
     removed.expect("remove");
     second.finish().expect("finish");
@@ -613,8 +571,7 @@ fn a_request_whose_destination_is_not_where_its_target_renders_is_refused() {
     let mut request = write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE);
     request.dest = home.child(".elsewhere");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     let refused = session.apply(request).expect_err("refused");
     assert!(matches!(refused, Error::Misplaced { .. }), "got {refused}");
     assert!(!home.child(".elsewhere").exists());
@@ -639,8 +596,7 @@ fn a_failed_append_poisons_the_session() {
     let state = StateDir::resolve(home.path());
     plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     let real = std::mem::replace(
         &mut session.journal.file,
         OpenOptions::new()
@@ -688,8 +644,7 @@ fn a_failed_removal_intent_append_poisons_the_session_and_unlinks_nothing() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let (portable, dest) = target(home.path(), ".conf");
-    let mut first =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut first = apply_session(&state, home.path());
     first
         .apply(write_to(
             home.path(),
@@ -707,16 +662,7 @@ fn a_failed_removal_intent_append_poisons_the_session_and_unlinks_nothing() {
         .open("/dev/full")
         .expect("/dev/full");
     let err = session
-        .apply(Request {
-            target: portable.clone(),
-            dest: dest.clone(),
-            content: Content::Absent {
-                created_dirs: Vec::new(),
-                planned: fs::observe(&dest).expect("plan's observation"),
-            },
-            mode: Mode::DEFAULT_FILE,
-            ownership: Ownership::Released,
-        })
+        .apply(remove_to(home.path(), ".conf", Vec::new()))
         .expect_err("a full disk fails the removal's Intent append");
     assert!(
         matches!(&err, Error::Io { path, .. } if *path == state.journal()),
@@ -739,8 +685,7 @@ fn a_failed_publish_poisons_the_session_and_records_nothing() {
     let state = StateDir::resolve(home.path());
     let (portable, dest) = target(home.path(), ".conf");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     // Something occupies the destination between the Intent and the rename:
     // a directory with an entry in it, which no rename(2) replaces with a
     // file.
@@ -806,8 +751,7 @@ fn a_named_temp_recovery_cannot_unlink_is_left_and_the_rollback_goes_on() {
     let dir = home.child(".ro");
     let dest = home.child(".ro/x.conf");
     plant_file(&dest, "user\n", Mode::DEFAULT_FILE);
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session.before_publish = Some(lose_write);
     let applied = session.apply(write_to(
         home.path(),
@@ -889,8 +833,7 @@ fn a_prior_conflict_poisons_the_session_before_anything_is_published() {
         ownership: Ownership::Owned(Mechanism::Region { comment: '#' }),
     };
     plant_file(&dest, "user line\n", Mode::DEFAULT_FILE);
-    let mut first =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut first = apply_session(&state, home.path());
     first.apply(shared("BX1")).expect("apply");
     first.finish().expect("finish");
     let saved = std::fs::read(state.ledger()).expect("the saved ledger");
@@ -898,8 +841,7 @@ fn a_prior_conflict_poisons_the_session_before_anything_is_published() {
     let edit = format!("{}more\n", region("BX1"));
     plant_file(&dest, &edit, Mode::DEFAULT_FILE);
 
-    let mut second =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut second = apply_session(&state, home.path());
     let err = second
         .apply(shared("BX2"))
         .expect_err("a changed shared file is a conflict");
@@ -963,8 +905,7 @@ fn an_edit_between_fill_and_publish_is_kept_and_recovery_rolls_nothing_back_over
     let (portable, dest) = target(home.path(), ".conf");
     plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session.before_publish = Some(|dest: &Path| {
         std::fs::write(dest, "the user's edit\n").expect("an editor saves in place");
     });
@@ -1033,8 +974,7 @@ fn an_edit_between_plan_and_the_sessions_stage_is_kept_poisons_and_recovery_touc
     let second = write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE);
     std::fs::write(&dest, "the user's edit after plan\n").expect("an editor saves");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(first)
         .expect("the other destination is what plan saw");
@@ -1085,8 +1025,7 @@ fn a_session_keeps_one_set_of_the_directories_its_writes_created() {
     // given one `fs::CreatedDirs`. The session holds that set for its life.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(write_to(
             home.path(),
@@ -1204,7 +1143,7 @@ const UMASK_CHILD_DIR: &str = "BX_TEST_UMASK_DIR";
 #[test]
 #[ignore = "spawned by a_directory_bx_will_not_remove_is_made_at_the_accounts_umask"]
 fn umask_child() {
-    // As `skips_allowed_child`: no instructions, nothing to do.
+    // Not spawned by its parent: no instructions, nothing to do.
     let Some(under) = std::env::var_os(UMASK_CHILD_DIR) else {
         return;
     };
@@ -1222,7 +1161,7 @@ fn umask_child() {
     // remove. The two under it are bx's own, and keep bx's own mode.
     let home = under.join("in-home/home");
     let state = StateDir::resolve_in(&home, Some(under.join("in-home/state").as_os_str()));
-    let mut session = Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+    let mut session = apply_session(&state, &home);
     session
         .apply(write_to(
             &home,
@@ -1254,8 +1193,7 @@ fn umask_child() {
     let dest = under.join("beside/x.conf");
     let portable = Portable::try_from(dest.to_str().expect("utf-8").to_string())
         .expect("a well-formed absolute path");
-    let mut session =
-        Session::open(&beside_state, SessionKind::Apply, &beside_home, Vec::new()).expect("open");
+    let mut session = apply_session(&beside_state, &beside_home);
     session
         .apply(Request {
             target: portable,
@@ -1292,19 +1230,13 @@ fn a_directory_bx_will_not_remove_is_made_at_the_accounts_umask() {
     // which needs no `unsafe` and no shared lock.
     let guard = guarded_home();
     let exe = std::env::current_exe().expect("the test binary");
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(r#"umask 077; exec "$1" --exact --ignored journal::session::tests::umask_child"#)
-        .arg("sh")
-        .arg(&exe)
-        .env(UMASK_CHILD_DIR, guard.child("under"))
-        .output()
-        .expect("spawn the umask child");
-    assert!(
-        out.status.success(),
-        "the umask child failed:\n{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+    crate::testing::run_ignored_child(
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"umask 077; exec "$1" --exact --ignored journal::session::tests::umask_child"#)
+            .arg("sh")
+            .arg(&exe)
+            .env(UMASK_CHILD_DIR, guard.child("under")),
     );
 }
 
@@ -1317,7 +1249,7 @@ fn a_stage_that_made_other_directories_than_its_intent_named_is_refused() {
     // sides alike, so it alone is no difference.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let session = Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let session = apply_session(&state, home.path());
     let dest = home.child(".config/app/x.conf");
     let (app, config) = (home.child(".config/app"), home.child(".config"));
     let announced = [app.clone(), config.clone()];
@@ -1365,8 +1297,7 @@ fn a_write_refused_for_an_unannounced_directory_removes_what_it_made() {
     std::fs::create_dir(&config).expect("the user's, at prediction");
     let (portable, dest) = target(home.path(), ".config/app/x.conf");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session.after_intent = Some(lose_config);
     let err = session
         .apply(Request {
@@ -1403,8 +1334,7 @@ fn a_link_refused_for_an_unannounced_directory_removes_what_it_made() {
     std::fs::create_dir(&config).expect("the user's, at prediction");
     let (portable, dest) = target(home.path(), ".config/app/link");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session.after_intent = Some(lose_config);
     let err = session
         .apply(Request {
@@ -1442,7 +1372,7 @@ fn a_claim_that_appears_after_the_directory_is_lost_is_still_dropped() {
     let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
     let (portable, dest) = target(&home, ".bashrc");
 
-    let mut session = Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+    let mut session = apply_session(&state, &home);
     session.before_stage = Some(|dir| {
         std::fs::remove_dir(dir).expect("lose the directory before stage looks");
     });
@@ -1504,7 +1434,7 @@ fn a_refused_write_makes_no_directory_at_all() {
     // Everything plan looked at is gone by the time apply runs.
     std::fs::remove_dir_all(guard.child("account")).expect("the user removes the tree");
 
-    let mut session = Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+    let mut session = apply_session(&state, &home);
     let err = session
         .apply(Request {
             target: portable,
@@ -1552,7 +1482,7 @@ fn a_shared_directory_that_cannot_be_made_is_the_write_that_names_it() {
         );
     }
 
-    let mut session = Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+    let mut session = apply_session(&state, &home);
     let applied = session.apply(Request {
         target: portable,
         dest: dest.clone(),
@@ -1603,7 +1533,7 @@ fn a_destination_behind_a_directory_bx_cannot_search_is_a_read_not_a_write() {
         );
     }
 
-    let mut session = Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+    let mut session = apply_session(&state, &home);
     let applied = session.apply(Request {
         target: portable,
         dest: dest.clone(),
@@ -1674,8 +1604,7 @@ fn a_write_makes_the_home_it_needs_and_claims_none_of_it() {
         };
         let made = guard.child(made);
 
-        let mut session =
-            Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let mut session = apply_session(&state, &home);
         assert!(!made.exists(), "{case}: the write makes {}", made.display());
         session
             .apply(Request {
@@ -1758,8 +1687,7 @@ fn a_target_spelled_absolutely_under_the_home_is_refused_before_anything_is_touc
     let absolute = Portable::try_from(dest.to_str().expect("utf-8").to_string())
         .expect("a well-formed absolute path");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     let err = session
         .apply(Request {
             target: absolute,
@@ -1811,7 +1739,7 @@ fn a_hard_linked_decoy_at_a_blob_name_is_replaced_before_an_intent_names_it() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     state.ensure().expect("ensure");
-    let (portable, dest) = target(home.path(), ".conf");
+    let dest = home.child(".conf");
     plant_file(&dest, "the original\n", Mode::DEFAULT_FILE);
     let decoy = home.child("decoy");
     std::fs::write(&decoy, "ZZZZZZZZZZZZ\n").expect("a decoy of the same length");
@@ -1823,16 +1751,7 @@ fn a_hard_linked_decoy_at_a_blob_name_is_replaced_before_an_intent_names_it() {
     let mut session =
         Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
     session
-        .apply(Request {
-            target: portable,
-            dest: dest.clone(),
-            content: Content::Absent {
-                created_dirs: Vec::new(),
-                planned: fs::observe(&dest).expect("plan's observation"),
-            },
-            mode: Mode::DEFAULT_FILE,
-            ownership: Ownership::Released,
-        })
+        .apply(remove_to(home.path(), ".conf", Vec::new()))
         .expect("remove");
     drop(session);
     assert!(peek(&dest).is_none());
@@ -1862,8 +1781,7 @@ fn a_failed_removal_keeps_the_ledger_entry_and_poisons_the_session() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let (portable, dest) = target(home.path(), "locked/made.conf");
-    let mut first =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut first = apply_session(&state, home.path());
     first
         .apply(write_to(
             home.path(),
@@ -1885,16 +1803,11 @@ fn a_failed_removal_keeps_the_ledger_entry_and_poisons_the_session() {
     }
     let mut session =
         Session::open(&state, SessionKind::Restore, home.path(), Vec::new()).expect("open");
-    let removed = session.apply(Request {
-        target: portable.clone(),
-        dest: dest.clone(),
-        content: Content::Absent {
-            created_dirs: vec![locked.clone()],
-            planned: fs::observe(&dest).expect("plan's observation"),
-        },
-        mode: Mode::DEFAULT_FILE,
-        ownership: Ownership::Released,
-    });
+    let removed = session.apply(remove_to(
+        home.path(),
+        "locked/made.conf",
+        vec![locked.clone()],
+    ));
     let still_managed = session.ledger().get(&portable).is_some();
     let finished = session.finish();
     // Before any assertion, so the tempdir can be removed whatever happens.
@@ -1971,8 +1884,7 @@ fn an_edit_between_a_removals_intent_and_its_unlink_is_kept_and_recovery_touches
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let (portable, dest) = target(home.path(), ".conf");
-    let mut first =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut first = apply_session(&state, home.path());
     first
         .apply(write_to(
             home.path(),
@@ -2202,7 +2114,7 @@ fn a_removal_naming_a_directory_that_is_not_its_parent_is_refused_before_anythin
         std::fs::create_dir_all(&home).expect("the home");
         let state = StateDir::resolve(&home);
         let (portable, dest) = target(&home, ".conf");
-        let mut first = Session::open(&state, SessionKind::Apply, &home, Vec::new()).expect("open");
+        let mut first = apply_session(&state, &home);
         first
             .apply(write_to(&home, ".conf", "bx created\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -2219,16 +2131,7 @@ fn a_removal_naming_a_directory_that_is_not_its_parent_is_refused_before_anythin
         let mut session =
             Session::open(&state, SessionKind::Restore, &home, Vec::new()).expect("open");
         let err = session
-            .apply(Request {
-                target: portable.clone(),
-                dest: dest.clone(),
-                content: Content::Absent {
-                    created_dirs: vec![stray.clone()],
-                    planned: fs::observe(&dest).expect("plan's observation"),
-                },
-                mode: Mode::DEFAULT_FILE,
-                ownership: Ownership::Released,
-            })
+            .apply(remove_to(&home, ".conf", vec![stray.clone()]))
             .expect_err(case);
         assert!(
             matches!(&err, Error::StrayCreatedDir { target, dir } if *target == portable && *dir == stray),
@@ -2382,8 +2285,7 @@ fn a_released_write_hands_on_the_directories_its_entry_claimed() {
     let claims: Vec<PathBuf> = vec![dir.clone(), home.child(".config")];
 
     // bx makes both directories for a.conf, which claims them.
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(write_to(
             home.path(),
@@ -2394,8 +2296,7 @@ fn a_released_write_hands_on_the_directories_its_entry_claimed() {
         .expect("apply");
     session.finish().expect("finish");
     // An entry beneath the same directories that survives the hand-back.
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(write_to(
             home.path(),
@@ -2515,8 +2416,7 @@ fn a_ledger_that_refuses_after_a_publish_poisons_the_session_and_is_rolled_back(
     let (portable, dest) = target(home.path(), ".conf");
     plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     std::fs::rename(state.lock(), home.child("moved-lock")).expect("an outside mv of the lock");
     let second = ExclusiveLock::acquire(&state).expect("a second writer takes the new lock");
 
@@ -2601,8 +2501,7 @@ fn a_session_counts_every_write_it_published() {
     // Coverage review round 5, non-blocking.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     for rel in [".one", ".two", ".three"] {
         session
             .apply(write_to(home.path(), rel, "x\n", Mode::DEFAULT_FILE))
@@ -2687,8 +2586,7 @@ fn a_directory_changed_since_plan_poisons_the_session_with_nothing_announced() {
     let request = dir_to(home.path(), ".d", Mode::PRIVATE_DIR);
     fs::set_mode(&home.child(".d"), Mode::from_bits(0o711)).expect("chmod after plan");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     let err = session.apply(request).expect_err("the directory moved");
     assert!(
         matches!(&err, Error::Write(fs::Error::Changed { .. })),
@@ -2707,8 +2605,7 @@ fn a_directory_request_plan_saw_as_unchanged_is_refused() {
     std::fs::create_dir(home.child(".d")).expect("the directory");
     fs::set_mode(&home.child(".d"), Mode::PRIVATE_DIR).expect("chmod");
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     let err = session
         .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
         .expect_err("nothing was announced");
@@ -2723,8 +2620,7 @@ fn a_directory_request_plan_saw_as_unchanged_is_refused() {
 fn an_interrupted_directory_create_is_rolled_back_with_the_parents_it_invented() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(dir_to(home.path(), ".a/b", Mode::PRIVATE_DIR))
         .expect("apply");
@@ -2747,8 +2643,7 @@ fn an_interrupted_directory_create_is_rolled_back_with_the_parents_it_invented()
 fn an_interrupted_directory_create_leaves_a_directory_that_now_holds_something() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
         .expect("apply");
@@ -2768,8 +2663,7 @@ fn an_interrupted_directory_mode_change_is_set_back() {
     let state = StateDir::resolve(home.path());
     std::fs::create_dir(home.child(".d")).expect("the directory");
     fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
         .expect("apply");
@@ -2793,8 +2687,7 @@ fn an_interrupted_directory_mode_change_is_set_back() {
 fn a_file_where_a_directory_was_written_blocks_its_rollback() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
         .expect("apply");
@@ -2815,8 +2708,7 @@ fn a_terminated_directory_session_is_recorded_with_the_mode_it_displaced() {
     let state = StateDir::resolve(home.path());
     std::fs::create_dir(home.child(".d")).expect("the directory");
     fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(dir_to(home.path(), ".d", Mode::PRIVATE_DIR))
         .expect("apply");
@@ -2843,8 +2735,7 @@ fn a_link_write_is_journalled_and_recorded_under_its_text() {
     let portable = request.target.clone();
     let dest = request.dest.clone();
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session.apply(request).expect("make the link");
     assert_eq!(
         link_at(&dest).as_deref(),
@@ -2882,8 +2773,7 @@ fn a_link_write_is_journalled_and_recorded_under_its_text() {
     assert_eq!(entry.prior, Prior::Absent);
 
     // A retarget stores the text it displaces, and keeps the first prior.
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     session
         .apply(link_to(home.path(), ".local/bin/tool", "/opt/tool"))
         .expect("retarget");
@@ -2931,8 +2821,7 @@ fn a_link_is_never_written_over_a_file_and_a_link_removal_takes_only_a_link() {
     let dest = home.child(".tool");
     plant_file(&dest, "the user's\n", Mode::DEFAULT_FILE);
 
-    let mut session =
-        Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+    let mut session = apply_session(&state, home.path());
     let err = session
         .apply(link_to(home.path(), ".tool", "x"))
         .expect_err("a file is not replaced by a link");

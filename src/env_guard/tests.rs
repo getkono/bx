@@ -75,11 +75,7 @@ fn with_no_root_declared_every_relocating_variable_is_a_violation() {
         ("XDG_CACHE_HOME", "/anywhere"),
         ("MISE_DATA_DIR", "~/mise"),
     ] {
-        assert_eq!(
-            reason_of(&check(name, value, &RootSet::strict())),
-            Some(Reason::NoRootsDeclared),
-            "{name}"
-        );
+        refused(name, value, &RootSet::strict(), Reason::NoRootsDeclared);
     }
 }
 
@@ -89,19 +85,13 @@ fn a_root_set_with_a_home_but_no_roots_declares_nothing() {
     // root list being empty, not from the home being absent.
     let empty = RootSet::new(Path::new(HOME), &[]);
     assert_eq!(empty.home(), Some(Path::new(HOME)));
-    assert_eq!(
-        reason_of(&check("CARGO_HOME", "/x", &empty)),
-        Some(Reason::NoRootsDeclared)
-    );
+    refused("CARGO_HOME", "/x", &empty, Reason::NoRootsDeclared);
 }
 
 #[test]
 fn an_empty_value_is_not_absolute() {
     // `export CARGO_HOME` with no value at all.
-    assert_eq!(
-        reason_of(&check("CARGO_HOME", "", &rooted())),
-        Some(Reason::NotAbsolute)
-    );
+    refused("CARGO_HOME", "", &rooted(), Reason::NotAbsolute);
 }
 
 #[test]
@@ -117,11 +107,7 @@ fn a_location_given_a_word_is_not_absolute_and_an_unlisted_name_is_not_emittable
         ("PIP_CACHE_DIR", "cache"),
         ("CARGO_HOME", "https://example.invalid/cargo"),
     ] {
-        assert_eq!(
-            reason_of(&check(name, value, &rooted())),
-            Some(Reason::NotAbsolute),
-            "{name}={value}"
-        );
+        refused(name, value, &rooted(), Reason::NotAbsolute);
     }
     // Round 4 judged these by their names' families; the table lists none
     // of them, so each is refused whatever it is given.
@@ -134,11 +120,7 @@ fn a_location_given_a_word_is_not_absolute_and_an_unlisted_name_is_not_emittable
         ("MISE_QUIET", "1"),
         ("PIP_NO_CACHE_DIR", "1"),
     ] {
-        assert_eq!(
-            reason_of(&check(name, value, &rooted())),
-            Some(Reason::NotEmittable),
-            "{name}={value}"
-        );
+        refused(name, value, &rooted(), Reason::NotEmittable);
     }
     assert_eq!(check("UV_NO_CACHE", "1", &rooted()), Verdict::Allowed);
 }
@@ -146,11 +128,7 @@ fn a_location_given_a_word_is_not_absolute_and_an_unlisted_name_is_not_emittable
 #[test]
 fn a_relative_value_is_not_absolute() {
     for value in ["cache/cargo", "./cargo", "../example/cargo"] {
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", value, &rooted())),
-            Some(Reason::NotAbsolute),
-            "{value}"
-        );
+        refused("CARGO_HOME", value, &rooted(), Reason::NotAbsolute);
     }
 }
 
@@ -160,11 +138,7 @@ fn another_users_home_is_refused() {
     // resolve, so it cannot be shown to be inside any root. `~` is read
     // only alone or before `/`.
     for value in ["~other/cargo", "~+/cargo", "~-"] {
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", value, &rooted())),
-            Some(Reason::Unreadable),
-            "{value}"
-        );
+        refused("CARGO_HOME", value, &rooted(), Reason::Unreadable);
     }
 }
 
@@ -174,14 +148,10 @@ fn a_home_relative_value_is_a_violation_when_home_is_not_a_declared_root() {
     // root. A relocation into `$HOME` is as invisible to a shell bx did not
     // initialise as one anywhere else.
     for value in ["~/x", "$HOME/x", "${HOME}/x"] {
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", value, &rooted())),
-            Some(Reason::OutsideDeclaredRoots),
-            "{value}"
-        );
+        refused("CARGO_HOME", value, &rooted(), Reason::OutsideDeclaredRoots);
     }
     // Declaring home as a root is how a user opts in, and it then works.
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     assert_eq!(check("CARGO_HOME", "~/x", &home_rooted), Verdict::Allowed);
 }
 
@@ -192,25 +162,23 @@ fn bxs_own_state_directory_is_refused_even_inside_a_declared_root() {
     // allow it. `~/.local/state/bx` is where the ledger, the fingerprints
     // and the journal live; a tool pointed there writes among the files
     // that make `bx rm` exact.
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     for value in [
         "/var/home/example/.local/state/bx",
         "/var/home/example/.local/state/bx/ledger",
         "~/.local/state/bx",
         "$HOME/.local/state/bx/journal",
     ] {
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", value, &home_rooted)),
-            Some(Reason::BxOwnedDirectory),
-            "{value}"
-        );
+        refused("CARGO_HOME", value, &home_rooted, Reason::BxOwnedDirectory);
     }
     // The parent is not bx's either, but it contains bx's state directory,
     // and a tool that clears it clears bx's record (r3 round 2). A sibling
     // whose name merely extends it is fine.
-    assert_eq!(
-        reason_of(&check("CARGO_HOME", "~/.local/state", &home_rooted)),
-        Some(Reason::ContainsBxDirectory)
+    refused(
+        "CARGO_HOME",
+        "~/.local/state",
+        &home_rooted,
+        Reason::ContainsBxDirectory,
     );
     assert_eq!(
         check("CARGO_HOME", "~/.local/state/bxtra", &home_rooted),
@@ -225,13 +193,11 @@ fn a_state_directory_moved_by_the_environment_is_owned_when_it_is_declared() {
     // did read it says so, and the derived one stays owned as well.
     let moved = PathBuf::from("/var/mnt/scratch/example/state/bx");
     let roots = rooted().owning(std::slice::from_ref(&moved));
-    assert_eq!(
-        reason_of(&check(
-            "CARGO_HOME",
-            "/var/mnt/scratch/example/state/bx",
-            &roots
-        )),
-        Some(Reason::BxOwnedDirectory)
+    refused(
+        "CARGO_HOME",
+        "/var/mnt/scratch/example/state/bx",
+        &roots,
+        Reason::BxOwnedDirectory,
     );
     // Inside the declared root, and still refused - the exclusion outranks
     // the root test rather than being overridden by it.
@@ -247,13 +213,11 @@ fn a_program_needs_no_root_but_may_not_live_in_bxs_directory() {
     // directory is one `bx rm` deletes, so even a kind that needs no root
     // may not point there — and it may point at an ordinary program with
     // no root declared at all.
-    assert_eq!(
-        reason_of(&check(
-            "EDITOR",
-            "/var/home/example/.local/state/bx/editor",
-            &rooted()
-        )),
-        Some(Reason::BxOwnedDirectory)
+    refused(
+        "EDITOR",
+        "/var/home/example/.local/state/bx/editor",
+        &rooted(),
+        Reason::BxOwnedDirectory,
     );
     for roots in [
         rooted(),
@@ -344,11 +308,7 @@ fn the_kinds_that_move_nothing_need_no_root() {
         ("GOPATH", "/etc/evil:/usr/lib/go"),
         ("SCRATCH_HOME", "/etc/evil"),
     ] {
-        assert_eq!(
-            reason_of(&check(name, value, &RootSet::strict())),
-            Some(Reason::NoRootsDeclared),
-            "{name}={value}"
-        );
+        refused(name, value, &RootSet::strict(), Reason::NoRootsDeclared);
     }
     // Needing no root is not a licence: bx's own directories are still
     // refused to every one of them.
@@ -381,21 +341,15 @@ fn a_set_with_no_home_is_never_asked_what_holds_bxs_directories() {
     // consults the containing check is refused before it is reached.
     assert!(strict.refuses_everything().is_some());
     for name in ["CARGO_HOME", "SCRATCH_HOME"] {
-        assert_eq!(
-            reason_of(&check(name, "/x", &strict)),
-            Some(Reason::NoRootsDeclared),
-            "{name}"
-        );
+        refused(name, "/x", &strict, Reason::NoRootsDeclared);
     }
     // A set that does have a home answers the containing question, which
     // is the only configuration that asks it.
-    assert_eq!(
-        reason_of(&check(
-            "CARGO_HOME",
-            "/var/home/example/.local",
-            &RootSet::new(Path::new(HOME), &[PathBuf::from("~")])
-        )),
-        Some(Reason::ContainsBxDirectory)
+    refused(
+        "CARGO_HOME",
+        "/var/home/example/.local",
+        &home_rooted(),
+        Reason::ContainsBxDirectory,
     );
 }
 
@@ -651,10 +605,11 @@ fn the_six_names_that_used_to_leak_are_now_checked() {
             Verdict::Allowed,
             "{name}"
         );
-        assert_eq!(
-            reason_of(&check(name, "/var/cache/elsewhere", &rooted())),
-            Some(Reason::OutsideDeclaredRoots),
-            "{name}"
+        refused(
+            name,
+            "/var/cache/elsewhere",
+            &rooted(),
+            Reason::OutsideDeclaredRoots,
         );
     }
 }
@@ -681,13 +636,11 @@ fn an_sccache_directory_is_value_checked() {
         check("SCCACHE_DIR", "/var/cache/sccache/objects", &roots),
         Verdict::Allowed
     );
-    assert_eq!(
-        reason_of(&check(
-            "SCCACHE_DIR",
-            "/var/cache/sccache/objects",
-            &rooted()
-        )),
-        Some(Reason::OutsideDeclaredRoots)
+    refused(
+        "SCCACHE_DIR",
+        "/var/cache/sccache/objects",
+        &rooted(),
+        Reason::OutsideDeclaredRoots,
     );
 }
 
@@ -886,7 +839,7 @@ fn a_line_the_guard_cannot_read_is_never_approved() {
 #[test]
 fn a_prefix_does_not_carry_a_value_past_bxs_own_directory() {
     // The exclusion the module calls unconditional, bypassed by one word.
-    let wide = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let wide = home_rooted();
     let state = "/var/home/example/.local/state/bx";
     assert_eq!(
         reasons(&format!("export CARGO_HOME={state}"), &wide),
@@ -925,11 +878,7 @@ fn a_value_or_a_line_the_guard_does_not_read_is_refused_whatever_the_name() {
             "(/var/mnt/scratch/example)",
             "'/var/mnt/scratch/example'/$X",
         ] {
-            assert_eq!(
-                reason_of(&check(name, value, &rooted())),
-                Some(Reason::Unreadable),
-                "{name}={value}"
-            );
+            refused(name, value, &rooted(), Reason::Unreadable);
         }
     }
     // Ordinary rc content that round 2 let through as assigning nothing.
@@ -960,17 +909,13 @@ fn a_value_or_a_line_the_guard_does_not_read_is_refused_whatever_the_name() {
 fn a_quoted_tilde_is_a_literal_tilde() {
     // A shell expands `~` only unquoted at the start of a value. Quoted, or
     // arriving through a reference, it is a relative path.
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     assert_eq!(
         check("CARGO_HOME", "~/cargo", &home_rooted),
         Verdict::Allowed
     );
     for value in ["\"~/cargo\"", "'~/cargo'"] {
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", value, &home_rooted)),
-            Some(Reason::NotAbsolute),
-            "{value}"
-        );
+        refused("CARGO_HOME", value, &home_rooted, Reason::NotAbsolute);
     }
     // A literal `~` given to a location is a relative path.
     assert_eq!(
@@ -1071,14 +1016,8 @@ fn an_inadmissible_root_is_not_mistaken_for_no_root() {
     assert_eq!(dropped.inadmissible(), &[PathBuf::from("/")]);
     assert!(nothing.inadmissible().is_empty());
     assert!(RootSet::strict().inadmissible().is_empty());
-    assert_eq!(
-        reason_of(&check("CARGO_HOME", "/x", &dropped)),
-        Some(Reason::InadmissibleRoot)
-    );
-    assert_eq!(
-        reason_of(&check("CARGO_HOME", "/x", &nothing)),
-        Some(Reason::NoRootsDeclared)
-    );
+    refused("CARGO_HOME", "/x", &dropped, Reason::InadmissibleRoot);
+    refused("CARGO_HOME", "/x", &nothing, Reason::NoRootsDeclared);
     assert_eq!(
         reasons("export CARGO_HOME=/x\n", &dropped),
         vec![(1, Reason::InadmissibleRoot)]
@@ -1119,11 +1058,7 @@ fn behaviour_variables_in_a_location_family_are_allowed() {
         ("ASDF_CONCURRENCY", "8"),
     ] {
         for roots in [rooted(), RootSet::strict()] {
-            assert_eq!(
-                reason_of(&check(name, value, &roots)),
-                Some(Reason::NotEmittable),
-                "{name}"
-            );
+            refused(name, value, &roots, Reason::NotEmittable);
         }
     }
 }
@@ -1141,21 +1076,9 @@ fn a_family_variable_that_holds_a_location_is_still_judged() {
         "MISE_DATA_DIR",
         "MISE_CACHE_DIR",
     ] {
-        assert_eq!(
-            reason_of(&check(name, "cache", &rooted())),
-            Some(Reason::NotAbsolute),
-            "{name}"
-        );
-        assert_eq!(
-            reason_of(&check(name, "/etc/evil", &rooted())),
-            Some(Reason::OutsideDeclaredRoots),
-            "{name}"
-        );
-        assert_eq!(
-            reason_of(&check(name, ".cache/x", &rooted())),
-            Some(Reason::NotAbsolute),
-            "{name}"
-        );
+        refused(name, "cache", &rooted(), Reason::NotAbsolute);
+        refused(name, "/etc/evil", &rooted(), Reason::OutsideDeclaredRoots);
+        refused(name, ".cache/x", &rooted(), Reason::NotAbsolute);
     }
     // The family's other locations are not in the table at all.
     for name in [
@@ -1166,10 +1089,11 @@ fn a_family_variable_that_holds_a_location_is_still_judged() {
         "MISE_INSTALL_PATH",
         "UV_PROJECT_ENVIRONMENT",
     ] {
-        assert_eq!(
-            reason_of(&check(name, "/var/mnt/scratch/example/x", &rooted())),
-            Some(Reason::NotEmittable),
-            "{name}"
+        refused(
+            name,
+            "/var/mnt/scratch/example/x",
+            &rooted(),
+            Reason::NotEmittable,
         );
     }
 }
@@ -1237,7 +1161,7 @@ fn r3_3_assigning_commands_and_stale_values() {
 
 #[test]
 fn r3_4_special_parameters_and_a_fragment_assigned_home() {
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     let cases = [
         (
             "CARGO_HOME=/var/mnt/scratch/example/$@/$@/$@/$@/../../../../etc/evil",
@@ -1304,7 +1228,7 @@ fn r3_8_location_words_and_zsh_equals_expansion() {
 
 #[test]
 fn r4_1_a_state_directory_the_fragment_moves_is_owned_by_later_lines() {
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     let cases = [
         (
             "export XDG_STATE_HOME=/var/mnt/scratch/example/state\n\
@@ -1483,7 +1407,7 @@ fn r5_6_prompts_and_execignore_act_on_assignment() {
 #[test]
 fn r5_7_a_config_home_whose_repo_is_the_state_directory() {
     // Since round 6 no `XDG_CONFIG_HOME` is emittable at all.
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     assert_eq!(
         reasons("export XDG_CONFIG_HOME=~/.local/state", &home_rooted),
         vec![(1, Reason::NotEmittable)]
@@ -1498,7 +1422,7 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
         BxOwnedDirectory, NotACommandLine, NotAProgram, NotAbsolute, NotEmittable,
         RelocatingAssignment, ReservedName,
     };
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     // 1: a bare word a tool reads as a path. `BASH_ENV` and `ENV` are also
     // names a starting shell acts on, so they are reserved first.
     for (name, value) in R5_READ_AS_LOCATIONS {
@@ -1508,11 +1432,7 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
             NotEmittable
         };
         for roots in [rooted(), RootSet::strict()] {
-            assert_eq!(
-                reason_of(&check(name, value, &roots)),
-                Some(expected),
-                "{name}={value}"
-            );
+            refused(name, value, &roots, expected);
         }
     }
     // 2: a program given arguments. `EDITOR` is a command line since
@@ -1529,16 +1449,8 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
         ),
     ] {
         for roots in [rooted(), RootSet::strict()] {
-            assert_eq!(
-                reason_of(&check("EDITOR", value, &roots)),
-                Some(reason),
-                "{value}"
-            );
-            assert_eq!(
-                reason_of(&check("RUSTC_WRAPPER", value, &roots)),
-                Some(NotAProgram),
-                "{value}"
-            );
+            refused("EDITOR", value, &roots, reason);
+            refused("RUSTC_WRAPPER", value, &roots, NotAProgram);
         }
     }
     // A flag that points a tool at a file of its own outside bx's
@@ -1577,11 +1489,7 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
         ("PATH", "https://x:/usr/bin", NotAbsolute),
         ("SSH_AUTH_SOCK", "unix://agent", NotAbsolute),
     ] {
-        assert_eq!(
-            reason_of(&check(name, value, &rooted())),
-            Some(reason),
-            "{name}={value}"
-        );
+        refused(name, value, &rooted(), reason);
     }
     // 5: the strict set owns the default state directory under any home.
     for content in [
@@ -1597,11 +1505,7 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
     }
     // 6: names a shell acts on when assigned.
     for name in ["RPROMPT", "RPS1", "RPROMPT2", "RPS2", "EXECIGNORE"] {
-        assert_eq!(
-            reason_of(&check(name, "x", &RootSet::strict())),
-            Some(ReservedName),
-            "{name}"
-        );
+        refused(name, "x", &RootSet::strict(), ReservedName);
     }
     assert_eq!(
         reasons("RPROMPT='$(touch evil)'", &rooted()),
@@ -2478,7 +2382,7 @@ fn the_operator_fragment_and_a_data_home_beneath_its_root_scan_clean_in_all_thre
         assert_eq!(reasons(&at, &roots), vec![(26, at_root)], "{roots:?}");
     }
     // Written in terms of the home, under a `~` root.
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     let at_home = OPERATOR_FRAGMENT.replacen(
         "export SCRATCH_HOME=\"/var/mnt/scratch/example\"",
         "SCRATCH_HOME=\"$HOME\"",
@@ -2508,11 +2412,7 @@ fn a_name_no_table_holds_is_refused_and_a_location_is_judged_whatever_its_shape(
     for name in R4_UNLISTED_RELOCATIONS {
         for value in ["/etc/evil", "/var/mnt/scratch/example/x", "1"] {
             for roots in [rooted(), RootSet::strict()] {
-                assert_eq!(
-                    reason_of(&check(name, value, &roots)),
-                    Some(NotEmittable),
-                    "{name}={value}"
-                );
+                refused(name, value, &roots, NotEmittable);
             }
         }
     }
@@ -2543,11 +2443,7 @@ fn a_name_no_table_holds_is_refused_and_a_location_is_judged_whatever_its_shape(
         ("git+ssh://example.invalid/x", NotAbsolute),
         ("s3.a-b://bucket/key", NotAbsolute),
     ] {
-        assert_eq!(
-            reason_of(&check("CARGO_HOME", value, &rooted())),
-            Some(reason),
-            "{value:?}"
-        );
+        refused("CARGO_HOME", value, &rooted(), reason);
     }
     // Of the round-4 brief's settings, the ones the table lists still pass
     // with no root declared; the others are not emittable.
@@ -2565,11 +2461,7 @@ fn a_name_no_table_holds_is_refused_and_a_location_is_judged_whatever_its_shape(
         ("PIP_NO_CACHE_DIR", "1"),
         ("JAVA_HOME", "/usr/lib/jvm/java-21"),
     ] {
-        assert_eq!(
-            reason_of(&check(name, value, &RootSet::strict())),
-            Some(NotEmittable),
-            "{name}"
-        );
+        refused(name, value, &RootSet::strict(), NotEmittable);
     }
 }
 
@@ -2588,26 +2480,16 @@ fn the_names_and_location_words_the_review_found_missing_are_refused() {
         "MISE_DEFAULT_CONFIG_FILENAME",
     ] {
         for value in ["/etc/evil", "/var/mnt/scratch/example/x", "evil"] {
-            assert_eq!(
-                reason_of(&check(name, value, &rooted())),
-                Some(Reason::NotEmittable),
-                "{name}={value}"
-            );
+            refused(name, value, &rooted(), Reason::NotEmittable);
         }
     }
-    assert_eq!(
-        reason_of(&check("HOME", ROOT, &rooted())),
-        Some(Reason::ReservedName)
-    );
-    assert_eq!(
-        reason_of(&check("UV_PROJECT", "=ls", &rooted())),
-        Some(Reason::Unreadable)
-    );
+    refused("HOME", ROOT, &rooted(), Reason::ReservedName);
+    refused("UV_PROJECT", "=ls", &rooted(), Reason::Unreadable);
 }
 
 #[test]
 fn no_form_known_to_assign_is_approved_whatever_its_name_or_value() {
-    let home_rooted = RootSet::new(Path::new(HOME), &[PathBuf::from("~")]);
+    let home_rooted = home_rooted();
     for form in ASSIGNING_FORMS {
         for name in ["CARGO_HOME", "EDITOR", "npm_config_cache", "X"] {
             for value in ["/var/mnt/scratch/example/cargo", "/etc/evil", "nvim"] {

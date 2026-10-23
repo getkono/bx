@@ -7,7 +7,6 @@ src/config/mod.rs
 src/config/resolve.rs
 src/config/target.rs
 src/config/values.rs
-src/env_guard/refuse.rs
 src/env_guard/tests.rs
 src/fs/atomic/stage.rs
 src/journal/session/tests.rs

@@ -549,13 +549,13 @@ mod tests {
 
     use crate::fs::Mode;
     use crate::journal::tests::{
-        WRITES_THROUGH_PERMISSIONS, cannot_build, created, frame_starts, names_in, peek,
-        permissions_refuse, plant_file, raw_journal, seal, some_begin,
+        WRITES_THROUGH_PERMISSIONS, apply_session, created, frame_starts, intent, journal_file,
+        names_in, peek, permissions_refuse, plant_file, raw_journal, seal, some_begin,
         state_beyond_set_aside_names, target, write_to,
     };
     use crate::journal::{Done, End, Journal, Session, SessionKind, Written};
-    use crate::state::{ContentHash, Mechanism, Prior, StateDir, dir_digest};
-    use crate::testing::guarded_home;
+    use crate::state::{Mechanism, StateDir, dir_digest};
+    use crate::testing::{cannot_build, guarded_home};
 
     #[test]
     fn a_fresh_state_directory_has_no_session() {
@@ -597,8 +597,7 @@ mod tests {
 
     #[test]
     fn a_short_journal_that_is_not_the_start_of_a_header_is_unreadable() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         // Too short for a header, like a torn one, but not a prefix of one.
         plant_file(&path, "BY", Mode::PRIVATE_FILE);
         assert!(matches!(
@@ -645,8 +644,7 @@ mod tests {
 
     #[test]
     fn a_journal_from_an_older_format_is_unreadable() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut bytes = MAGIC.to_vec();
         bytes.push(FORMAT - 1);
         bytes.extend_from_slice(&[0; NONCE]);
@@ -659,8 +657,7 @@ mod tests {
 
     #[test]
     fn a_run_of_nul_bytes_is_not_a_valid_frame() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut bytes = MAGIC.to_vec();
         bytes.push(FORMAT);
         bytes.extend(std::iter::repeat_n(0_u8, 4096));
@@ -707,8 +704,7 @@ mod tests {
         // Review round 4, item 1. Only the last frame can be unsynced, so a
         // damaged last frame is what a power loss leaves, and a damaged frame
         // with a whole one after it is what no crash leaves.
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let done = |rel: &str| {
             Record::Done(Done {
                 target: Portable::try_from(format!("~/{rel}")).expect("portable"),
@@ -752,8 +748,7 @@ mod tests {
 
     #[test]
     fn a_header_with_nothing_after_it_is_an_empty_interrupted_session() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut header = MAGIC.to_vec();
         header.push(FORMAT);
         std::fs::write(&path, &header).expect("write");
@@ -766,8 +761,7 @@ mod tests {
         let state = StateDir::resolve(home.path());
         plant_file(&home.child(".conf"), "old\n", Mode::DEFAULT_FILE);
 
-        let mut session =
-            Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open");
+        let mut session = apply_session(&state, home.path());
         session
             .apply(write_to(home.path(), ".conf", "new\n", Mode::DEFAULT_FILE))
             .expect("apply");
@@ -881,21 +875,7 @@ mod tests {
             &path,
             &[
                 begin_under(home.path(), Vec::new()),
-                Record::Intent(Intent {
-                    target: foreign,
-                    dest: dest.clone(),
-                    temp: None,
-                    before: Prior::Absent,
-                    after: Written::Present {
-                        digest: ContentHash::of(b"[user]\n"),
-                        mode: Mode::DEFAULT_FILE,
-                    },
-                    created_dirs: Vec::new(),
-                    mechanism: Some(Mechanism::Own),
-                    ledger_written: None,
-                    dir: false,
-                    link: false,
-                }),
+                created(&foreign, &dest, b"[user]\n"),
             ],
         );
         let bytes = std::fs::read(&path).expect("the journal");
@@ -933,8 +913,7 @@ mod tests {
     #[test]
     fn every_stored_path_in_a_journal_is_checked_against_its_home() {
         let home = guarded_home();
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let ours = target(home.path(), ".conf").0;
         let foreign = absolute_under(home.path(), ".conf");
 
@@ -979,20 +958,12 @@ mod tests {
     #[test]
     fn a_journal_that_writes_one_target_twice_is_unreadable() {
         let home = guarded_home();
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let (target, dest) = target(home.path(), ".conf");
         let intent = Intent {
-            target: target.clone(),
-            dest,
-            temp: None,
-            before: Prior::Absent,
             after: Written::Absent,
-            created_dirs: Vec::new(),
             mechanism: None,
-            ledger_written: None,
-            dir: false,
-            link: false,
+            ..intent(&target, &dest, b"")
         };
         let once = vec![
             Record::Begin(Begin {
@@ -1023,8 +994,7 @@ mod tests {
     #[test]
     fn a_journal_with_a_second_session_header_is_unreadable() {
         // r3 coverage C5.
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let begin = Record::Begin(some_begin());
         raw_journal(&path, &[begin.clone(), begin]);
         assert_eq!(
@@ -1058,8 +1028,7 @@ mod tests {
 
     #[test]
     fn a_journal_that_ends_with_an_end_record_is_terminated() {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let begin = Record::Begin(some_begin());
         drop(Journal::create(&path, some_begin()).expect("create"));
         assert!(matches!(
@@ -1259,8 +1228,7 @@ mod tests {
     #[test]
     fn bytes_after_the_end_of_a_session_are_unreadable_not_terminated() {
         // Coverage review round 5, item 3.
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("journal.mpk");
+        let (_dir, path) = journal_file();
         let mut journal = Journal::create(&path, some_begin()).expect("create");
         journal
             .append(&Record::End(End { written: 0 }))
@@ -1311,7 +1279,7 @@ mod tests {
         // by the next session's journal without ever being examined.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
-        drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
+        drop(apply_session(&state, home.path()));
         let path = state.journal();
         let bytes = std::fs::read(&path).expect("read");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
@@ -1439,13 +1407,7 @@ mod tests {
                 plant(&state.journal());
 
                 let mut child =
-                    std::process::Command::new(std::env::current_exe().expect("the test binary"))
-                        .args([
-                            "--exact",
-                            "--ignored",
-                            "--nocapture",
-                            "journal::load::tests::journal_read_child",
-                        ])
+                    crate::testing::ignored_child("journal::load::tests::journal_read_child")
                         .env(READ_CHILD_HOME, &home)
                         .env(READ_CHILD_CALL, call)
                         // Inherited, unlike the crash harness's: this child
@@ -1518,19 +1480,14 @@ mod tests {
         let home = guarded_home();
         let (target, dest) = target(home.path(), ".d");
         let intent = Intent {
-            target: target.clone(),
-            dest: dest.clone(),
             temp: Some(home.child(format!("{}x", fs::TEMP_PREFIX))),
-            before: Prior::Absent,
             after: Written::Present {
                 digest: dir_digest(),
                 mode: Mode::PRIVATE_DIR,
             },
-            created_dirs: Vec::new(),
             mechanism: Some(Mechanism::Dir),
-            ledger_written: None,
             dir: true,
-            link: false,
+            ..intent(&target, &dest, b"")
         };
         assert_eq!(
             misplaced(&intent, home.path()),

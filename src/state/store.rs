@@ -1616,6 +1616,44 @@ mod tests {
     }
 
     #[test]
+    fn a_recomputable_link_that_cannot_be_followed_degrades_and_only_the_link_moves() {
+        // A link to nothing, one that loops (`ELOOP`), and one whose path runs
+        // through a file (`ENOTDIR`) are each a `DanglingLink`: fatal for the
+        // ledger, and for a file whose loss costs a recomputation, damage. A
+        // lockless reader leaves the link where it is; the lock holder moves
+        // the link itself aside, never creating its far end.
+        for far in ["unmounted/v.mpk", "v.mpk", "a-file/v.mpk"] {
+            let (dir, path) = state_file();
+            std::fs::write(dir.path().join("a-file"), b"not a directory").expect("a file");
+            let far = dir.path().join(far);
+            std::os::unix::fs::symlink(&far, &path).expect("symlink");
+            let shown = far.display();
+
+            let read = load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None)
+                .unwrap_or_else(|e| panic!("{shown}: {e}"));
+            assert_eq!(
+                read.health,
+                Health::Damaged(Damage::DanglingLink),
+                "{shown}"
+            );
+            assert!(read.value.is_empty(), "{shown}");
+            assert_eq!(std::fs::read_link(&path).expect("left in place"), far);
+
+            let opened: Loaded<Value> =
+                locked_load(&path).unwrap_or_else(|e| panic!("{shown}: {e}"));
+            assert_eq!(
+                opened.health,
+                Health::Reset(Damage::DanglingLink),
+                "{shown}"
+            );
+            let aside = StateDir::quarantine(&path);
+            assert_eq!(std::fs::read_link(&aside).expect("the link, moved"), far);
+            assert!(std::fs::symlink_metadata(&path).is_err(), "{shown}");
+            assert!(!dir.path().join("unmounted").exists(), "{shown}");
+        }
+    }
+
+    #[test]
     fn damaged_bytes_are_quarantined_not_deleted() {
         let (_dir, path) = state_file();
         std::fs::write(&path, b"garbage").expect("seed");

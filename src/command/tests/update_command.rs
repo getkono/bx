@@ -159,7 +159,7 @@ fn a_push_refused_because_the_upstream_moved_keeps_the_lock_and_names_bx_sync() 
     let said = text(&out);
     assert!(
         said.contains("Pushed nothing: the push to origin/master was refused")
-            && said.contains("`bx sync` pushes it"),
+            && said.contains("The 1 commit(s) stay committed here, and `bx sync` pushes them"),
         "{said}"
     );
     assert_eq!(

@@ -837,8 +837,9 @@ fn updating(
 /// The push is [`sync::push`]'s, never forced, and runs only when
 /// [`sync::may_push`] says the apply left nothing undone, as `bx sync`'s does.
 /// A push the remote refuses — it moved since the pull, or cannot be reached
-/// — is said, not raised: the lock is committed and applied here, `bx sync`
-/// pushes it, and a `bx update` replays it first over an upstream that moved.
+/// — is said, not raised: the commits stay here, the lock's or the carry's
+/// or both, `bx sync` pushes them, and a `bx update` replays them first over
+/// an upstream that moved.
 fn push_lock(
     git: &Git,
     pulled: &sync::Pulled,
@@ -860,11 +861,11 @@ fn push_lock(
         match sync::push(git, pulled) {
             Ok(()) => format!("Pushed {ahead} commit(s) to {upstream}."),
             Err(error) => {
-                tracing::debug!(%error, "the push of the lock commit was refused");
+                tracing::debug!(%error, "the push of the bx update commits was refused");
                 format!(
-                    "Pushed nothing: the push to {upstream} was refused ({error}). The lock \
-                     stays committed here, and `bx sync` pushes it; if {upstream} moved, run \
-                     `bx update` first, which replays it on top."
+                    "Pushed nothing: the push to {upstream} was refused ({error}). The \
+                     {ahead} commit(s) stay committed here, and `bx sync` pushes them; if \
+                     {upstream} moved, run `bx update` first, which replays them on top."
                 )
             }
         }

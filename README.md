@@ -69,7 +69,7 @@ There are twelve. You should not need a manual.
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
 | `bx sync` | pull, apply, carry this machine's copies of tracked files into the repo and commit them, push — no git knowledge required |
-| `bx update` | move [externals](#externals) that follow a branch to its new commits: pull, look, lock and commit, apply, push |
+| `bx update` | everything `bx sync` does, and move [externals](#externals) that follow a branch to its new commits: pull, look, lock and commit, apply and carry tracked files, push |
 | `bx secret list` | list declared secrets, and whether each decrypts here |
 | `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
 | `bx shell-init` | the one line for your shell rc — not built yet |
@@ -79,8 +79,12 @@ There are twelve. You should not need a manual.
 `--set NAME=VALUE` for each value it would ask for, so all four run without a
 terminal. `bx update --check` only looks, exiting `2` when something is new,
 and `1` when nothing is but a followed external could not be checked
-(its remote unreachable, or without the branch it follows),
-and `bx update --snooze` puts the next question off.
+(its remote unreachable, or without the branch it follows); it fetches the
+config repo's upstream without pulling it, so a commit another machine
+already locked is reported as one `bx sync` brings in rather than as new; an
+upstream it cannot fetch is said, and judged against this machine's
+`bx.lock`, without changing the exit status.
+`bx update --snooze` puts the next question off.
 
 `add` and `rm` need the file or directory to act on; without one they refuse
 and point you at `bx init`, which offers the config already on the machine.
@@ -319,13 +323,16 @@ or move a follow only `local.toml` declares into a committed file.
 **`bx update`** brings the config repo level with its upstream, asks each
 followed branch where it is now, lists the new commits, and shows the plan the
 new lock would make. Once you approve, it writes and commits `bx.lock` *before*
-it moves any checkout, then applies and pushes the commit to the branch's
-upstream, never forcing; a push the remote refuses is reported, and the commit
-waits for `bx sync` — or, when the upstream moved in the meantime, for another
-`bx update`, which replays it on top, since `bx sync` refuses the diverged
+it moves any checkout, then applies as `bx sync` does — carrying this
+machine's copies of tracked files into the repo and committing them — and
+pushes both commits to the branch's upstream, never forcing, so there is
+nothing left for a `bx sync` to do; a push the remote refuses is reported, and the commits
+wait for `bx sync` — or, when the upstream moved in the meantime, for another
+`bx update`, which replays them on top, since `bx sync` refuses the diverged
 branch. If another
-machine pushed first, `bx update` replays this machine's own unpushed lock
-commits on top of theirs; when both changed `bx.lock`, or any other commit is
+machine pushed first, `bx update` replays this machine's own unpushed lock and
+carry commits on top of theirs; when both changed `bx.lock` or the same tracked
+file, or any other commit is
 local, it changes nothing and says how to reconcile. A new commit
 is locked only once it is shown to descend from the one locked before, so a
 branch whose history was rewritten is reported and never locked. `plan` and

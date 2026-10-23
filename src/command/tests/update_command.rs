@@ -5,14 +5,14 @@ use crate::testing::GuardedHome;
 use crate::update::Stamps;
 
 /// Where the followed external is checked out, relative to the home.
-const AT: &str = ".local/share/skills";
+pub(super) const AT: &str = ".local/share/skills";
 
 /// The url every test declares; `~/.gitconfig` rewrites it to the
 /// repository at `~/upstream`.
 const URL: &str = "https://example.invalid/upstream";
 
 /// The followed external, linking each skill into `~/.claude/skills`.
-fn layer() -> String {
+pub(super) fn layer() -> String {
     format!(
         "[[external]]\npath = \"~/{AT}\"\nurl = \"{URL}\"\nbranch = \"master\"\n\
                  [[external.link]]\nfrom = \"skills/*\"\nto = \"~/.claude/skills/*\"\n\
@@ -21,7 +21,7 @@ fn layer() -> String {
 }
 
 /// An upstream at `~/upstream` reachable as [`URL`], holding `files`.
-fn upstream(home: &GuardedHome, files: &[&str]) -> String {
+pub(super) fn upstream(home: &GuardedHome, files: &[&str]) -> String {
     let dir = home.child("upstream");
     std::fs::create_dir_all(&dir).expect("the upstream");
     std::fs::write(
@@ -37,7 +37,7 @@ fn upstream(home: &GuardedHome, files: &[&str]) -> String {
 }
 
 /// Commit `files` on the upstream's `master`, and return the commit.
-fn publish(home: &GuardedHome, files: &[&str]) -> String {
+pub(super) fn publish(home: &GuardedHome, files: &[&str]) -> String {
     let dir = home.child("upstream");
     for file in files {
         let path = dir.join(file);
@@ -59,7 +59,7 @@ fn update(home: &GuardedHome, yes: bool, out: &mut Vec<u8>) -> Result<Exit, upda
     )
 }
 
-fn locked(home: &GuardedHome) -> Option<String> {
+pub(super) fn locked(home: &GuardedHome) -> Option<String> {
     let lock = Lock::read(&home.child(".config/bx"), home.path()).expect("bx.lock");
     lock.iter().next().map(|(_, locked)| locked.rev.clone())
 }
@@ -173,7 +173,7 @@ fn a_push_refused_because_the_upstream_moved_keeps_the_lock_and_names_bx_sync() 
     let mut again = Vec::new();
     update(&home, true, &mut again).expect("replayed and pushed");
     assert!(
-        text(&again).starts_with("Replayed 1 unpushed bx.lock commit(s)")
+        text(&again).starts_with("Replayed 1 unpushed bx update commit(s)")
             && text(&again).ends_with("Pushed 1 commit(s) to origin/master.\n"),
         "{}",
         text(&again)
@@ -984,7 +984,7 @@ fn a_branch_diverged_only_by_unpushed_lock_commits_catches_up_and_locks_again() 
     let exit = update(&home, true, &mut out).expect("caught up");
     assert_eq!(exit, Exit::Converged, "{}", text(&out));
     assert!(
-        text(&out).starts_with("Replayed 1 unpushed bx.lock commit(s)"),
+        text(&out).starts_with("Replayed 1 unpushed bx update commit(s)"),
         "{}",
         text(&out)
     );
@@ -1112,7 +1112,7 @@ fn a_replay_the_upstream_already_holds_says_so() {
     let mut out = Vec::new();
     update(&home, true, &mut out).expect("caught up");
     assert!(
-        text(&out).starts_with("This machine's unpushed bx.lock commits were already in"),
+        text(&out).starts_with("This machine's unpushed bx update commits were already in"),
         "{}",
         text(&out)
     );
@@ -1422,7 +1422,7 @@ fn auto() -> String {
 /// A config repo following [`auto`], locked at the upstream's first commit
 /// and pushed, and a second commit published upstream that nothing locks
 /// yet: the commit.
-fn pushed_and_moved(home: &GuardedHome) -> (std::path::PathBuf, String) {
+pub(super) fn pushed_and_moved(home: &GuardedHome) -> (std::path::PathBuf, String) {
     upstream(home, &["skills/a/SKILL.md"]);
     let repo = cloned(home, &auto());
     update(home, true, &mut Vec::new()).expect("update");
@@ -1431,7 +1431,7 @@ fn pushed_and_moved(home: &GuardedHome) -> (std::path::PathBuf, String) {
 }
 
 /// Another machine locks the external at `tip` and pushes it.
-fn locked_elsewhere(home: &GuardedHome, tip: &str) {
+pub(super) fn locked_elsewhere(home: &GuardedHome, tip: &str) {
     let other = crate::sync::tests::other(home);
     let lock = std::fs::read_to_string(other.join("bx.lock")).expect("bx.lock");
     let from = locked(home).expect("locked here");

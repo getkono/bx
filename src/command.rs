@@ -321,6 +321,21 @@ fn fast_forwarded(pulled: &sync::Pulled) -> String {
     )
 }
 
+/// The line `sync` and `update` say after [`sync::pull`] committed the
+/// tracked copies an interrupted sync left uncommitted.
+fn recovered_carry(pulled: &sync::Pulled) -> String {
+    format!(
+        "Committed {} tracked file(s) an interrupted bx sync carried into the repo.",
+        pulled.recovered
+    )
+}
+
+/// The line `sync` and `update` say after [`sync::commit_carried`] committed
+/// the `carried` tracked copies this run's apply wrote.
+fn committed_carry(carried: usize, pulled: &sync::Pulled) -> String {
+    format!("Committed {carried} tracked file(s) to {}.", pulled.branch)
+}
+
 /// [`sync`], through `git`, with the question asked through `ask`.
 fn sync_with(
     env: &Env,
@@ -341,12 +356,7 @@ fn sync_with(
         writeln!(out, "{}", fast_forwarded(&pulled)).map_err(sync::Error::Output)?;
     }
     if pulled.recovered > 0 {
-        writeln!(
-            out,
-            "Committed {} tracked file(s) an interrupted bx sync carried into the repo.",
-            pulled.recovered
-        )
-        .map_err(sync::Error::Output)?;
+        writeln!(out, "{}", recovered_carry(&pulled)).map_err(sync::Error::Output)?;
     }
     let report = match converge(env, Mode::Sync, yes, out, ask) {
         Ok(report) => report,
@@ -364,12 +374,7 @@ fn sync_with(
     };
     let committed = sync::commit_carried(env, git, &pulled.repo)?;
     if committed > 0 {
-        writeln!(
-            out,
-            "Committed {committed} tracked file(s) to {}.",
-            pulled.branch
-        )
-        .map_err(sync::Error::Output)?;
+        writeln!(out, "{}", committed_carry(committed, &pulled)).map_err(sync::Error::Output)?;
     }
     // Every carried file is in the one commit `commit_carried` made.
     let ahead = pulled.ahead + u64::from(committed > 0);
@@ -431,7 +436,8 @@ impl UpdateMode {
     }
 }
 
-/// `bx update`: move followed externals to their branches' new commits.
+/// `bx update`: everything [`sync`] does, and move followed externals to their
+/// branches' new commits.
 ///
 /// [`UpdateMode::Update`] first brings the config repo level with its
 /// upstream, as `bx sync` does, so the lock it writes is written on top of
@@ -440,7 +446,12 @@ impl UpdateMode {
 /// for the lock that would follow — the same rendering and the same one
 /// confirmation `bx apply` has. Once approved, `bx.lock` is written and
 /// committed **before** any checkout moves, and then the plan is applied: the
-/// work that runs is the work shown. Once applied, the branch is pushed to
+/// work that runs is the work shown. Wherever `bx sync` would run — the pull
+/// found an upstream — the apply is `bx sync`'s [`Mode::Sync`], so each
+/// tracked target this machine changed is carried into the repo and
+/// committed ([`sync::commit_carried`]) after the lock, and nothing is left
+/// for a `bx sync` to do; with no upstream, or no repository, it is a bare
+/// apply, as `bx sync` would refuse. Once applied, the branch is pushed to
 /// its upstream, never forced, when [`sync::may_push`] allows it, so no other
 /// machine's update diverges from this one's; a refused push is said and
 /// leaves the commit for `bx sync`, or, when the upstream moved, for another
@@ -469,8 +480,8 @@ impl UpdateMode {
 /// another `bx update`, `bx sync` or check holds the stamps,
 /// [`update::Error::Rebasing`]
 /// while a rebase or `git am` stands open in the config repo, and
-/// [`update::Error::LockDiverged`] when this machine's unpushed lock commits
-/// and the upstream both changed `bx.lock`.
+/// [`update::Error::LockDiverged`] when this machine's unpushed bx update commits
+/// and the upstream both changed `bx.lock`, or a tracked copy one carried.
 pub fn update(
     env: &Env,
     names: &[String],
@@ -559,21 +570,21 @@ fn updating(
         return Err(update::Error::Rebasing(repo));
     }
     update::refuse_edited_lock(git, &repo)?;
-    // Diverged only by this machine's own unpushed lock commits: those are
-    // replayed on top of the upstream, keeping every lock they hold.
+    // Diverged only by this machine's own unpushed bx update commits: those are
+    // replayed on top of the upstream, keeping every lock and copy they hold.
     let pulled = match sync::pull(env, git) {
         Err(diverged @ sync::Error::Diverged { .. }) => {
-            match update::replay_own_lock_commits(git, &repo)? {
+            match update::replay_own_commits(git, &repo)? {
                 update::Replay::Replayed(replayed) => {
                     say(
                         out,
                         &if replayed == 0 {
-                            "This machine's unpushed bx.lock commits were already in what \
+                            "This machine's unpushed bx update commits were already in what \
                              another machine pushed."
                                 .to_string()
                         } else {
                             format!(
-                                "Replayed {replayed} unpushed bx.lock commit(s) of this \
+                                "Replayed {replayed} unpushed bx update commit(s) of this \
                                  machine's on top of what another machine pushed."
                             )
                         },
@@ -594,6 +605,9 @@ fn updating(
         Ok(pulled) => {
             if pulled.fast_forwarded > 0 {
                 say(out, &fast_forwarded(&pulled))?;
+            }
+            if pulled.recovered > 0 {
+                say(out, &recovered_carry(&pulled))?;
             }
             Some(pulled)
         }
@@ -680,6 +694,15 @@ fn updating(
             ),
         )?;
     }
+    // Where `bx sync` would run, the apply is its own, carrying each tracked
+    // target this machine changed into the repo; where `bx sync` would refuse
+    // — no upstream to push to, or no repository to commit in — the apply is
+    // a bare one, and the repo is left as it stands.
+    let mode = if pulled.is_some() {
+        Mode::Sync
+    } else {
+        Mode::Apply
+    };
     let after = update::proposed(&before, &found, externals, committed);
     let message = update::message(&before, &after);
     let changed = after != before;
@@ -705,7 +728,7 @@ fn updating(
     let converged = converge_inputs(
         &inputs,
         env,
-        Mode::Apply,
+        mode,
         yes,
         out,
         ask,
@@ -740,7 +763,7 @@ fn updating(
             "Nothing was locked: an interrupted apply had to be dealt with first. Run bx update \
              again.",
         )?;
-        let exit = match plan::exit(&report, Mode::Apply) {
+        let exit = match plan::exit(&report, mode) {
             Exit::Converged => Exit::Pending,
             exit => exit,
         };
@@ -781,7 +804,7 @@ fn updating(
                     | update::Verdict::Unreachable(_)
             )
         });
-    let exit = match plan::exit(&report, Mode::Apply) {
+    let exit = match plan::exit(&report, mode) {
         Exit::Converged if attention => Exit::Pending,
         exit => exit,
     };
@@ -794,14 +817,22 @@ fn updating(
         ));
     }
     if let Some(pulled) = &pulled {
-        push_lock(git, pulled, u64::from(made.get()), &report, out)?;
+        // As `bx sync` does: every carried file in one commit, after the
+        // lock's, and pushed with it.
+        let carried = sync::commit_carried(env, git, &pulled.repo)?;
+        if carried > 0 {
+            say(out, &committed_carry(carried, pulled))?;
+        }
+        let committed = u64::from(made.get()) + u64::from(carried > 0);
+        push_lock(git, pulled, committed, &report, out)?;
     }
     update::finished(&inputs)?;
     Ok(Updated::Finished(exit))
 }
 
 /// Publish what `bx update` leaves the config repo's branch ahead by: the
-/// commits [`sync::pull`] found unpushed, and the `committed` lock commit.
+/// commits [`sync::pull`] found unpushed, and the `committed` ones this run
+/// made — the lock's, and the one carrying tracked files back.
 ///
 /// The push is [`sync::push`]'s, never forced, and runs only when
 /// [`sync::may_push`] says the apply left nothing undone, as `bx sync`'s does.
@@ -2495,4 +2526,5 @@ mod tests {
     mod doctor_command;
     mod sync_command;
     mod update_command;
+    mod update_sync_command;
 }

@@ -69,15 +69,20 @@
 //! # Another machine's lock
 //!
 //! The config repo is shared, so another machine may already have locked the
-//! commits a check finds. A background check therefore fetches the config
-//! repo's upstream first — objects and its remote-tracking ref, never the
-//! working tree — and, when this machine's branch is only behind it, judges
-//! each external against the `bx.lock` the upstream holds, which is the one
-//! `bx update` would lock on top of after its pull. A commit the upstream
-//! already locks is offered to nobody: `last-check` says another machine
-//! updated it and `bx sync` brings it in. A config repo that is not a git
-//! repository of its own, has no upstream, cannot be fetched or has diverged
-//! is judged against this machine's `bx.lock`, and `last-check` says why.
+//! commits a check finds. Every check, a person's `bx update --check` and the
+//! background one alike, therefore fetches the config repo's upstream first —
+//! objects and its remote-tracking ref, never the branch or the working tree
+//! — and, when this machine's branch is only behind it, judges each external
+//! against the `bx.lock` the upstream holds, which is the one `bx update`
+//! would lock on top of after its pull. A commit the upstream already locks
+//! is offered to nobody: the check says another machine updated it and
+//! `bx sync` brings it in. A config repo that is not a git repository of its
+//! own, has no upstream, cannot be fetched or has diverged is judged against
+//! this machine's `bx.lock`, and the check says why: a background one in
+//! `last-check`, always, and a person's on the terminal unless there is no
+//! repository or no upstream at all, as then this machine's lock is the
+//! only one. Either way, what the check exits with is decided by the
+//! externals alone.
 //!
 //! An offer is only true of the `bx.lock` it was judged against, so `judged`
 //! records which one that was. A `bx apply` or `bx sync` that applies another
@@ -137,17 +142,17 @@ pub enum Error {
          one by its `path`, or name none to update them all"
     )]
     NotFollowed(String),
-    /// This machine's unpushed lock commits and the upstream both changed
-    /// `bx.lock`.
+    /// This machine's unpushed `bx update` commits and the upstream both
+    /// changed `bx.lock`, or a tracked copy one of them carried.
     #[error(
-        "this machine has {commits} unpushed bx.lock commit(s), and another machine pushed a \
-         bx.lock of its own; nothing was changed. To take the other machine's, run \
-         `git -C {} reset --keep @{{upstream}}`, then bx update again; to keep this one's, \
-         merge by hand and run bx sync",
+        "this machine has {commits} unpushed bx update commit(s), and another machine pushed \
+         its own bx.lock or tracked file over the same file; nothing was changed. To take the \
+         other machine's, run `git -C {} reset --keep @{{upstream}}`, then bx update again; to \
+         keep this one's, merge by hand and run bx sync",
         .repo.display()
     )]
     LockDiverged {
-        /// How many of this machine's lock commits are unpushed.
+        /// How many of this machine's `bx update` commits are unpushed.
         commits: usize,
         /// The config repo.
         repo: PathBuf,
@@ -595,32 +600,34 @@ pub const SUBJECT: &str = "chore(bx): update bx.lock";
 /// names such a line.
 pub const STOPPED: &str = "bx update stopped: ";
 
-/// What [`replay_own_lock_commits`] did.
+/// What [`replay_own_commits`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replay {
     /// A local commit is not one `bx update` made; nothing was touched.
     NotOwn,
     /// This many of `bx update`'s commits now sit on top of the upstream.
     Replayed(usize),
-    /// The upstream changed `bx.lock` too, so they could not be replayed;
-    /// the branch is as it was.
+    /// The upstream changed a file they change too, so they could not be
+    /// replayed; the branch is as it was.
     Conflicted(usize),
 }
 
 /// When the config repo's branch has diverged from its upstream only by
-/// commits `bx update` made — each with [`SUBJECT`], one parent, and
-/// touching `bx.lock` alone — replay them on top of the upstream, as
-/// `git rebase` does. Every lock they held is kept, so nothing needs
-/// approving again. When the upstream changed `bx.lock` as well, the replay
-/// is abandoned and the branch left exactly as it was: which machine's lock
-/// to keep is a person's call. Any other local commit is left alone too.
+/// commits `bx update` makes, each with one parent — a lock commit, with
+/// [`SUBJECT`] and touching `bx.lock` alone, or a carry of tracked copies,
+/// with [`sync::CARRIED_SUBJECT`] and not touching `bx.lock` — replay them on
+/// top of the upstream, as `git rebase` does. Every lock and copy they held
+/// is kept, so nothing needs approving again. When the upstream changed one
+/// of their files as well, the replay is abandoned and the branch left
+/// exactly as it was: which machine's lock or copy to keep is a person's
+/// call. Any other local commit is left alone too.
 ///
 /// # Errors
 ///
 /// [`Error::Sync`] when git cannot list the commits, or a replay failed and
 /// was put back, and [`Error::Rebasing`] when a replay that failed could not
 /// be put back, so it stands open for a person to finish or abort.
-pub fn replay_own_lock_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
+pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
     let listed = git.query(
         repo,
         &["rev-list", "--format=%P%x00%s", "@{upstream}..HEAD"],
@@ -634,14 +641,22 @@ pub fn replay_own_lock_commits(git: &Git, repo: &Path) -> Result<Replay, Error> 
             return Ok(Replay::NotOwn);
         };
         let (parents, subject) = body.split_once('\0').unwrap_or((body, ""));
-        if parents.split_whitespace().count() != 1 || subject != SUBJECT {
+        if parents.split_whitespace().count() != 1 {
             return Ok(Replay::NotOwn);
         }
         let touched = git.query(
             repo,
             &["diff-tree", "--no-commit-id", "--name-only", "-r", commit],
         )?;
-        if touched != lock::FILE {
+        let own = match subject {
+            SUBJECT => touched == lock::FILE,
+            // Tracked copies only: never the lock, which is a lock commit's.
+            sync::CARRIED_SUBJECT => {
+                !touched.is_empty() && !touched.lines().any(|path| path == lock::FILE)
+            }
+            _ => false,
+        };
+        if !own {
             return Ok(Replay::NotOwn);
         }
         commits += 1;
@@ -1080,10 +1095,10 @@ pub fn now() -> Epoch {
 /// the externals set to `check = "auto"`, runs only when no other one is, is
 /// bounded by [`BACKGROUND_BOUND`], writes what it found to `last-check`
 /// rather than to the terminal, and moves `check-due` on before it reaches
-/// the network, so a check that fails is not retried at every prompt; it
-/// also fetches the config repo's upstream and judges against the `bx.lock`
-/// that holds when this machine is behind it ([`against_upstream`]). Either
-/// way, every external with new commits gets a line in `available`, which the
+/// the network, so a check that fails is not retried at every prompt. Both
+/// fetch the config repo's upstream and judge against the `bx.lock` that
+/// holds when this machine is behind it ([`against_upstream`]), and say
+/// which lock they judged against ([`said`]). Either way, every external with new commits gets a line in `available`, which the
 /// next prompt offers to apply; lines for externals this check did not look
 /// at are kept.
 ///
@@ -1177,21 +1192,25 @@ fn looked(
         })
         .collect();
     // Nothing to look at reaches no network, the config repo's included.
+    let fetcher = git.clone().unattended();
     let against = match bound {
-        Bound::Background(deadline) if !chosen.is_empty() => against_upstream(
-            &git.clone()
-                .unattended()
-                .with_deadline(deadline)
-                .in_own_group(),
+        _ if chosen.is_empty() => Against::Here,
+        Bound::Background(deadline) => against_upstream(
+            &fetcher.with_deadline(deadline).in_own_group(),
             inputs.repo(),
             &env.home,
             inputs.lock(),
         ),
-        _ => Against::Here,
+        Bound::EachRemote => against_upstream(
+            &fetcher.with_deadline(std::time::Instant::now() + LOOK_BOUND),
+            inputs.repo(),
+            &env.home,
+            inputs.lock(),
+        ),
     };
     let lock = match &against {
         Against::Upstream { lock, .. } => lock,
-        Against::Here | Against::Unjudged(_) => inputs.lock(),
+        Against::Here | Against::Alone(_) | Against::Unjudged(_) => inputs.lock(),
     };
     let found = look_all(git, bound, &env.home, &chosen, lock, &ledger);
 
@@ -1207,14 +1226,20 @@ fn looked(
         String::new()
     };
     let available = offered(&previous, &found);
-    let summaries: String = found.iter().map(|f| format!("{}\n", f.summary())).collect();
     if background {
         stamps.set(now, None, None, Some(&available))?;
         stamps.write(&stamps.last_check(), &said(&against, inputs.lock(), &found))?;
     } else {
         let ask = ask_interval(externals, interval);
         stamps.set(now, Some(ask), Some(auto), Some(&available))?;
-        out.write_all(summaries.as_bytes()).map_err(Error::Output)?;
+        // With no upstream at all, this machine's lock is the only one, and
+        // saying so at every check would be noise.
+        let shown = match &against {
+            Against::Alone(_) => &Against::Here,
+            against => against,
+        };
+        let said = said(shown, inputs.lock(), &found);
+        out.write_all(said.as_bytes()).map_err(Error::Output)?;
         if chosen.is_empty() {
             writeln!(out, "No [[external]] follows a branch.").map_err(Error::Output)?;
         }
@@ -1289,7 +1314,7 @@ pub fn offered(previous: &str, found: &[Found]) -> Vec<String> {
         .collect()
 }
 
-/// Which `bx.lock` a background check judges the externals against.
+/// Which `bx.lock` a check judges the externals against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Against {
     /// This machine's: the upstream has nothing it lacks, or holds the same
@@ -1302,6 +1327,13 @@ pub enum Against {
         /// The upstream, as `REMOTE/BRANCH`.
         upstream: String,
     },
+    /// This machine's, because there is no upstream to judge — the config
+    /// repo is no git repository of its own, or its branch tracks nothing —
+    /// for the reason given. No other machine's lock can reach this one
+    /// through it, so a person's check says nothing about it. A detached
+    /// `HEAD` or an upstream that is gone is [`Against::Unjudged`]: another
+    /// machine's lock may well be there.
+    Alone(String),
     /// This machine's, because the upstream could not be judged, for the
     /// reason given.
     Unjudged(String),
@@ -1315,12 +1347,13 @@ pub enum Against {
 ///
 /// The fetch adds objects and moves the remote-tracking ref, as `bx sync`'s
 /// does, and never the branch or the working tree. Never fails: whatever
-/// keeps the upstream from being judged is [`Against::Unjudged`], and the
+/// keeps the upstream from being judged is [`Against::Alone`] or
+/// [`Against::Unjudged`], and the
 /// check goes on against `here`.
 #[must_use]
 pub fn against_upstream(git: &Git, repo: &Path, home: &Path, here: &Lock) -> Against {
     if checkout::toplevel_is_self(git, repo).is_err() {
-        return Against::Unjudged("the config repo is not a git repository of its own".to_string());
+        return Against::Alone("the config repo is not a git repository of its own".to_string());
     }
     let Ok(branch) = git.query(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
         return Against::Unjudged("the config repo has no branch checked out".to_string());
@@ -1328,7 +1361,7 @@ pub fn against_upstream(git: &Git, repo: &Path, home: &Path, here: &Lock) -> Aga
     let upstream = match sync::upstream(git, repo, &branch) {
         Ok(upstream) => upstream,
         Err(sync::Error::NoUpstream { .. }) => {
-            return Against::Unjudged(format!("the config repo's {branch} has no upstream"));
+            return Against::Alone(format!("the config repo's {branch} has no upstream"));
         }
         Err(error) => return Against::Unjudged(error.to_string()),
     };
@@ -1381,8 +1414,8 @@ pub fn against_upstream(git: &Git, repo: &Path, home: &Path, here: &Lock) -> Aga
     }
 }
 
-/// What a background check that judged against `against` writes to
-/// `last-check`: a first line saying which lock it judged against when it
+/// What a check that judged against `against` says — a person's on the
+/// terminal, a background one in `last-check`: a first line saying which lock it judged against when it
 /// was not simply this machine's, then a line per external in `found`. One
 /// the upstream already locks at its branch's tip, and `here` does not, is
 /// named as another machine's update, which `bx sync` brings in.
@@ -1394,7 +1427,9 @@ pub fn said(against: &Against, here: &Lock, found: &[Found]) -> String {
             "judged against bx.lock as {upstream} holds it: another machine updated it, and \
              `bx sync` brings it in\n"
         ),
-        Against::Unjudged(why) => format!("judged against this machine's bx.lock: {why}\n"),
+        Against::Alone(why) | Against::Unjudged(why) => {
+            format!("judged against this machine's bx.lock: {why}\n")
+        }
     };
     for found in found {
         let theirs = matches!(against, Against::Upstream { lock, .. }

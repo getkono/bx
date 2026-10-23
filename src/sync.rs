@@ -328,7 +328,7 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
 /// The message of every commit [`commit_carried`] makes: fixed text, so two
 /// syncs that carry the same files make the same commit message, whichever
 /// machine and account ran them and whenever they ran.
-const CARRIED_SUBJECT: &str = "chore: carry tracked files back from bx sync";
+pub(crate) const CARRIED_SUBJECT: &str = "chore: carry tracked files back from bx sync";
 
 /// Commit every tracked target's copy that `sync` wrote into the config repo
 /// and git has not committed yet, in one commit, and return how many files it

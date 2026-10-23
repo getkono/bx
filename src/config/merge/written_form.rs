@@ -865,75 +865,224 @@ mod tests {
         assert_eq!(config.conflicts[0].file, "~/.config/s");
     }
 
-    #[test]
-    fn toggles_one_path_past_a_placeholder_are_the_layer_s_defect_whatever_climbs() {
-        // `~/{{p}}/../../s` and `~/{{p}}/.././../s` differ only by a `.`, so
-        // whatever `p` holds they name one file, or both climb out of the home
-        // and name none. No answer can part them: it is the layer's defect, even
-        // though a one-segment `p` makes neither a portable path. The second pair
-        // spreads the climb over two placeholders.
-        for (first, second) in [
-            ("~/{{p}}/../../s", "~/{{p}}/.././../s"),
-            ("~/{{p}}/{{q}}/../../../s", "~/{{p}}/{{q}}/../.././../s"),
-        ] {
-            let message = failure(&[
-                global(
-                    "bx.toml",
-                    &format!(
-                        "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                         [[value]]\nname = \"q\"\nkind = \"string\"\n{}\
-                         [[target]]\npath = \"{first}\"\nenabled = false\n\
-                         [[target]]\npath = \"{second}\"\nenabled = true\n",
-                        target_toml("~/s", "S")
-                    ),
-                ),
-                local("[values]\np = \"a/b\"\nq = \"c\"\n"),
-            ]);
-            assert!(
-                message.contains(&format!("names the same file as `{first}`")),
-                "{second}: {message}"
-            );
-            assert!(
-                message.contains("in this same layer"),
-                "{second}: {message}"
-            );
+    /// How a layer the same-layer table describes is refused.
+    #[derive(Clone, Copy, Debug)]
+    enum Refusal {
+        /// The statement at the first index names the file the statement at the
+        /// second does, counting the full entries and then the toggles.
+        Twice(usize, usize),
+        /// Neither toggle names a file any entry declares.
+        Undeclared,
+    }
+
+    /// A `bx.toml` of one `[[value]]` per `decls`, a full entry per `entries`
+    /// and a toggle per `toggles`, alternately off and on, merged under the
+    /// account's `answers`, refused as `refusal` says.
+    ///
+    /// Every value and every statement is three lines, so statement `i` opens
+    /// on line `3 * (decls + i) + 1`.
+    fn assert_refused(
+        decls: &[(&str, &str)],
+        entries: &[&str],
+        toggles: &[&str],
+        answers: &str,
+        refusal: Refusal,
+    ) {
+        let mut text: String = decls
+            .iter()
+            .map(|(name, kind)| format!("[[value]]\nname = \"{name}\"\nkind = \"{kind}\"\n"))
+            .collect();
+        for path in entries {
+            text.push_str(&target_toml(path, "S"));
+        }
+        for (i, path) in toggles.iter().enumerate() {
+            let enabled = i % 2 == 1;
+            text.push_str(&format!(
+                "[[target]]\npath = \"{path}\"\nenabled = {enabled}\n"
+            ));
+        }
+        let message = failure(&[
+            global("bx.toml", &text),
+            local(&format!("[values]\n{answers}\n")),
+        ]);
+
+        let case = format!("{entries:?} {toggles:?} under {answers:?}");
+        let spellings: Vec<&str> = entries.iter().chain(toggles).copied().collect();
+        let line = |i: usize| 3 * (decls.len() + i) + 1;
+        match refusal {
+            Refusal::Twice(at, earlier) => {
+                assert!(
+                    message.starts_with(&format!("bx.toml:{}:", line(at))),
+                    "{case}: {message}"
+                );
+                assert!(
+                    message.contains(&format!(
+                        "names the same file as `{}` at bx.toml:{} in this same layer",
+                        spellings[earlier],
+                        line(earlier)
+                    )),
+                    "{case}: {message}"
+                );
+            }
+            Refusal::Undeclared => assert!(
+                message.contains("which no earlier layer declares"),
+                "{case}: {message}"
+            ),
         }
     }
 
     #[test]
-    fn a_dotdot_past_the_root_is_the_layer_s_defect_whatever_is_answered() {
-        // At `/` there is nothing above to climb to, so a `..` left with nothing
-        // written before it to cancel is dropped. `/a/../../{{p}}` and
-        // `/a/../../../{{p}}` both name `/{{p}}`, as `/../{{p}}` and
-        // `/../../{{p}}` do, whatever `p` holds. A `path` value glued after the
-        // climb starts its own segment and clamps the same way (`/..{{r}}`
-        // against `/../../{{r}}`). No answer parts any pair, so each is the
-        // layer's defect rather than a block an answer could clear.
-        for (file, first, second) in [
-            ("/s", "/a/../../{{p}}", "/a/../../../{{p}}"),
-            ("/s", "/../{{p}}", "/../../{{p}}"),
-            ("/srv", "/..{{r}}", "/../../{{r}}"),
+    fn one_layer_naming_one_file_twice_by_spelling_alone_is_refused_whatever_the_answer() {
+        // Each pair below is one path as written, so whatever is answered it
+        // names one file, or none: no answer could part it, and blocking it
+        // with a hint to change the answer would be advice nothing can follow.
+        // It is the layer's own defect and fails the merge, naming both
+        // statements. Each pair carries an answer, which is why "is an answer
+        // in either spelling" cannot tell this apart. The pairs an answer can
+        // part, and so block rather than fail, are the resolve tests'.
+        use Refusal::{Twice, Undeclared};
+        const P: &[(&str, &str)] = &[("p", "string")];
+        const PQ: &[(&str, &str)] = &[("p", "string"), ("q", "string")];
+        const PR: &[(&str, &str)] = &[("p", "string"), ("r", "path")];
+        const R: &[(&str, &str)] = &[("r", "path")];
+        const RSP: &[(&str, &str)] = &[("r", "path"), ("s", "path"), ("p", "string")];
+        const GLUED: &str = "r = \"/srv\"\ns = \"/d\"\np = \"~\"";
+        const CLAMPED: &str = "p = \"s\"\nr = \"/srv\"";
+
+        // A toggle a `.`, a doubled `/` or a trailing `/` away from the entry
+        // it meets.
+        for toggle in [
+            "~/.config/{{p}}/./s",
+            "~/.config/{{p}}//s",
+            "~/.config/{{p}}/s/",
         ] {
-            let message = failure(&[
-                global(
-                    "bx.toml",
-                    &format!(
-                        "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                         [[value]]\nname = \"r\"\nkind = \"path\"\n{}\
-                         [[target]]\npath = \"{first}\"\nenabled = false\n\
-                         [[target]]\npath = \"{second}\"\nenabled = true\n",
-                        target_toml(file, "S")
-                    ),
-                ),
-                local("[values]\np = \"s\"\nr = \"/srv\"\n"),
-            ]);
-            assert!(
-                message.contains(&format!("names the same file as `{first}`")),
-                "{second}: {message}"
+            assert_refused(
+                P,
+                &["~/.config/{{p}}/s"],
+                &[toggle],
+                "p = \"work\"",
+                Twice(1, 0),
             );
-            assert!(
-                message.contains("in this same layer"),
-                "{second}: {message}"
+        }
+        // A `bool` holds no `/`, so the `..` always cancels it.
+        for answer in ["flag = true", "flag = false"] {
+            let decls = &[("flag", "bool")];
+            assert_refused(
+                decls,
+                &["~/.config/s"],
+                &["~/.config/{{flag}}/../s"],
+                answer,
+                Twice(1, 0),
+            );
+        }
+        // `{{p}}/..` against `{{p}}/./..` stay one path whether `p` holds a `/`
+        // or not, whichever entry the pair meets.
+        for answer in ["p = \"a\"", "p = \"a/b\""] {
+            let toggles = &["~/.config/{{p}}/../s", "~/.config/{{p}}/./../s"];
+            assert_refused(
+                P,
+                &["~/.config/s", "~/.config/a/s"],
+                toggles,
+                answer,
+                Twice(3, 2),
+            );
+        }
+        // Apart only by a `.` past a placeholder: whenever they name a file
+        // they name the same one, and where they name no file the entry
+        // declares, each is a toggle of nothing.
+        for prefix in ["~/", "~/x/y/"] {
+            let toggles = [
+                &format!("{prefix}{{{{p}}}}/../../s")[..],
+                &format!("{prefix}{{{{p}}}}/.././../s"),
+            ];
+            let file = [&format!("{prefix}s")[..]];
+            for answer in ["a/b", "b/c"] {
+                let answer = format!("p = \"{answer}\"");
+                assert_refused(P, &file, &toggles, &answer, Twice(2, 1));
+            }
+            for answer in ["a", "a/b/c", "."] {
+                let answer = format!("p = \"{answer}\"");
+                assert_refused(P, &file, &toggles, &answer, Undeclared);
+            }
+        }
+
+        // An entry and two toggles, the second naming the first's file.
+        let pairs = [
+            // Apart only by a `.`, however a `path` value roots the spelling.
+            (R, "/srv/s", "{{r}}/s", "{{r}}/./s", "r = \"/srv\""),
+            (P, "~/s", "{{p}}/s", "{{p}}/./s", "p = \"~\""),
+            // A `path` answer is absolute, so a `/` before it adds nothing, even
+            // with text glued on or after a `~` that precedes it.
+            (R, "/srv/s", "{{r}}/s", "/{{r}}/s", "r = \"/srv\""),
+            (
+                R,
+                "/srv.d/conf",
+                "{{r}}.d/conf",
+                "/{{r}}.d/conf",
+                "r = \"/srv\"",
+            ),
+            (R, "~/srv/s", "~{{r}}/s", "~/{{r}}/s", "r = \"/srv\""),
+            // An opening segment no answer makes empty is the same path with a
+            // separator after it or without.
+            (P, "~/work", "~{{p}}", "~{{p}}/", "p = \"/work\""),
+            (&[("e", "email")], "/a@b", "{{e}}", "{{e}}/", "e = \"/a@b\""),
+            // Text glued before a `path` value is joined to it by the value's
+            // own `/`, wherever the value sits.
+            (
+                RSP,
+                "/opt/srv/conf",
+                "/opt{{r}}/conf",
+                "/opt/{{r}}/conf",
+                GLUED,
+            ),
+            (
+                RSP,
+                "/srv/d/conf",
+                "{{r}}{{s}}/conf",
+                "{{r}}/{{s}}/conf",
+                GLUED,
+            ),
+            (
+                RSP,
+                "~/srv/conf",
+                "{{p}}{{r}}/conf",
+                "{{p}}/{{r}}/conf",
+                GLUED,
+            ),
+            (RSP, "~/srv/d", "~{{r}}{{s}}", "~/{{r}}/{{s}}", GLUED),
+            // A climb past a placeholder spread over two of them, so that a
+            // one-segment answer climbs out of the home.
+            (
+                PQ,
+                "~/s",
+                "~/{{p}}/{{q}}/../../../s",
+                "~/{{p}}/{{q}}/../.././../s",
+                "p = \"a/b\"\nq = \"c\"",
+            ),
+            // At `/` there is nothing above to climb to, so a `..` with nothing
+            // written before it to cancel is dropped; a `path` value glued after
+            // the climb starts its own segment and clamps the same way.
+            (PR, "/s", "/a/../../{{p}}", "/a/../../../{{p}}", CLAMPED),
+            (PR, "/s", "/../{{p}}", "/../../{{p}}", CLAMPED),
+            (PR, "/srv", "/..{{r}}", "/../../{{r}}", CLAMPED),
+        ];
+        for (decls, file, first, second, answer) in pairs {
+            assert_refused(decls, &[file], &[first, second], answer, Twice(2, 1));
+        }
+
+        // Nothing about the rule grows with the placeholders in a spelling: a
+        // pair carrying thirteen is decided like a pair carrying one.
+        for count in [1, 13] {
+            let names: Vec<String> = (1..=count).map(|i| format!("v{i}")).collect();
+            let decls: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "string")).collect();
+            let segments: String = names.iter().map(|n| format!("/{{{{{n}}}}}")).collect();
+            let answers: String = names.iter().map(|n| format!("{n} = \"a\"\n")).collect();
+            assert_refused(
+                &decls,
+                &[&format!("~{segments}/s")],
+                &[&format!("~{segments}/./s")],
+                &answers,
+                Twice(1, 0),
             );
         }
     }
@@ -945,8 +1094,9 @@ mod tests {
         // that climbs above the home and what keeps `~` from meeting `/`.
         // Cited by name rather than by line, which is the convention the rest
         // of this file follows and the only citation a refactor cannot rot.
-        // At `/` nothing is above the root, so a bare `..` clamps away (see
-        // `a_dotdot_past_the_root_is_the_layer_s_defect_whatever_is_answered`
+        // At `/` nothing is above the root, so a bare `..` clamps away (see the
+        // last rows of
+        // `one_layer_naming_one_file_twice_by_spelling_alone_is_refused_whatever_the_answer`
         // above); under `~` the home's own parent is unknown, so it does not.
         //
         // The root is pinned directly, and not only through a pair's verdict:

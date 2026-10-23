@@ -591,41 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn one_layer_naming_one_file_twice_by_spelling_alone_is_refused_whatever_the_answer() {
-        // `~/.config/{{p}}/./s` and `~/.config/{{p}}/s` are one file for every
-        // answer to `p`, so no answer can clear the collision: it is the layer's
-        // own defect, and blocking it with a hint to change the answer would be
-        // advice nothing can follow. Both spellings carry an answer, which is
-        // why "is an answer in either spelling" cannot tell this apart.
-        for toggle in [
-            "~/.config/{{p}}/./s",
-            "~/.config/{{p}}//s",
-            "~/.config/{{p}}/s/",
-        ] {
-            let message = failure(&[
-                global(
-                    "bx.toml",
-                    &format!(
-                        "[[value]]\nname = \"p\"\nkind = \"string\"\n{}\
-                         [[target]]\npath = \"{toggle}\"\nenabled = false\n",
-                        target_toml("~/.config/{{p}}/s", "x")
-                    ),
-                ),
-                local("[values]\np = \"work\"\n"),
-            ]);
-            assert!(message.starts_with("bx.toml:7:"), "{toggle}: {message}");
-            assert!(
-                message.contains("names the same file as `~/.config/{{p}}/s` at bx.toml:4"),
-                "{toggle}: {message}"
-            );
-            assert!(
-                message.contains("in this same layer"),
-                "{toggle}: {message}"
-            );
-        }
-    }
-
-    #[test]
     fn an_own_layer_entry_and_toggle_for_one_file_meet_three_different_refusals() {
         // Three refusals an own-layer `[[target]]` entry and toggle for one
         // file can meet, by three different producers, and which one a pair

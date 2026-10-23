@@ -1455,6 +1455,43 @@ fn assignments_in(text: &str) -> Vec<&str> {
     found
 }
 
+/// Assert that every name generated shell `text` gives a value to — found
+/// by [`assignments_in`], and by the guard's own reading of each line — is
+/// one of bx's own `BX_` names, which no tool reads, a name `text` declares
+/// `local`, which never leaves its function, or one of `allowed`. Returns
+/// the swept names and the locals, for the caller's non-vacuity checks.
+#[track_caller]
+fn assert_assigns_only<'a>(text: &'a str, allowed: &[&str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    let locals: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
+        .flat_map(str::split_whitespace)
+        .filter(|word| !word.starts_with('-'))
+        .map(|declared| declared.split('=').next().unwrap_or(declared))
+        .collect();
+    let admitted =
+        |name: &str| name.starts_with("BX_") || locals.contains(&name) || allowed.contains(&name);
+    let assigned = assignments_in(text);
+    for name in &assigned {
+        assert!(!name.is_empty(), "an assignment that names nothing");
+        assert!(
+            admitted(name),
+            "{name} is given a value, and is neither one of bx's own names, \
+             a local, nor one of {allowed:?}"
+        );
+    }
+    for (idx, line) in text.split('\n').enumerate() {
+        if let Statement::Assign { name, .. } = statement(line) {
+            assert!(
+                admitted(name),
+                "line {} assigns {name}, which the guard would have to judge",
+                idx + 1
+            );
+        }
+    }
+    (assigned, locals)
+}
+
 #[test]
 fn the_assignment_sweep_sees_every_form_the_module_knows_assigns() {
     // What makes `assignments_in` a mechanism rather than another list.
@@ -1596,31 +1633,14 @@ fn the_init_snippet_is_not_an_environment_fragment() {
     // Written this way the test survives the snippet being reformatted,
     // and fails the moment a generator puts a real assignment in it.
     let snippet = include_str!("../../bench/fixtures/bx/bx-init.zsh");
-    let locals: Vec<&str> = snippet
-        .lines()
-        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
-        .filter_map(|rest| rest.split_whitespace().next_back())
-        .map(|declared| declared.split('=').next().unwrap_or(declared))
-        .collect();
-    let assigned = assignments_in(snippet);
-    for name in &assigned {
-        assert!(
-            !name.is_empty(),
-            "the snippet assigns through something that names nothing"
-        );
-        assert!(
-            name.starts_with("BX_") || locals.contains(name),
-            "the snippet gives {name} a value, which is neither one of \
-                 bx's own names nor local to a function"
-        );
-    }
+    let (assigned, locals) = assert_assigns_only(snippet, &[]);
     // Not vacuous: the staleness test is what the snippet is for, and it
     // is the two names found above.
     assert!(assigned.contains(&"BX_BIN") && assigned.contains(&"BX_STALE"));
     // So the guard reads no environment assignment out of it either. Every
     // line is a comment, a blank, or shell outside the grammar, but for the
     // one local array — whose value the grammar cannot read, so nothing is
-    // learned from it and nothing is approved.
+    // learned from it and nothing is approved. Not even a `BX_` name.
     for (idx, line) in snippet.split('\n').enumerate() {
         if let Statement::Assign { name, .. } = statement(line) {
             assert!(
@@ -1649,21 +1669,7 @@ fn the_update_prompt_is_not_an_environment_fragment() {
     // runs at a prompt and moves no tool's files, as the functions phase's
     // registrations do.
     let hook = crate::shell::update_prompt::ZSH;
-    let locals: Vec<&str> = hook
-        .lines()
-        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
-        .flat_map(str::split_whitespace)
-        .filter(|word| !word.starts_with('-'))
-        .map(|declared| declared.split('=').next().unwrap_or(declared))
-        .collect();
-    let assigned = assignments_in(hook);
-    for name in &assigned {
-        assert!(
-            name.starts_with("BX_") || locals.contains(name) || *name == "precmd_functions",
-            "the update prompt gives {name} a value, which is neither one of bx's own \
-             names, a local, nor zsh's precmd hook array"
-        );
-    }
+    let (assigned, _) = assert_assigns_only(hook, &["precmd_functions"]);
     // Not vacuous: the once-per-shell markers, the registration, and the
     // locals the cross-shell wait assigns — the trap's included.
     for name in [
@@ -1684,17 +1690,8 @@ fn the_update_prompt_is_not_an_environment_fragment() {
         "one SIGURG trap set and taken down, under localtraps"
     );
     assert!(!hook.contains("eval"), "zsh puts the trap back itself");
-    // Nothing is exported, and nothing the guard would have to judge.
+    // Nothing is exported.
     assert!(!hook.contains("export"), "the hook exports nothing");
-    for (idx, line) in hook.split('\n').enumerate() {
-        if let Statement::Assign { name, .. } = statement(line) {
-            assert!(
-                locals.contains(&name) || name.starts_with("BX_") || name == "precmd_functions",
-                "line {} assigns {name}, which the guard would have to judge",
-                idx + 1
-            );
-        }
-    }
 }
 
 #[test]
@@ -1709,21 +1706,7 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
     // function: it expands the unexported BX_UPDATE_HOOK, and is nothing in a
     // child that inherits it.
     let hook = crate::shell::update_prompt::BASH;
-    let locals: Vec<&str> = hook
-        .lines()
-        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
-        .flat_map(str::split_whitespace)
-        .filter(|word| !word.starts_with('-'))
-        .map(|declared| declared.split('=').next().unwrap_or(declared))
-        .collect();
-    let assigned = assignments_in(hook);
-    for name in &assigned {
-        assert!(
-            name.starts_with("BX_") || locals.contains(name) || *name == "PROMPT_COMMAND",
-            "the bash update prompt gives {name} a value, which is neither one of bx's own \
-             names, a local, nor bash's PROMPT_COMMAND"
-        );
-    }
+    let (assigned, _) = assert_assigns_only(hook, &["PROMPT_COMMAND"]);
     for name in [
         "BX_UPDATE_ASKED",
         "BX_UPDATE_CHECKING",
@@ -1772,8 +1755,8 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
             .all(|append| hook.find(append).is_some_and(|at| at > guard)),
         "an append outside the attribute test"
     );
-    // Nothing is exported, and nothing the guard would have to judge.
-    // The hook's comments say "exported"; no line runs `export`.
+    // Nothing is exported: the hook's comments say "exported"; no line runs
+    // `export`.
     assert!(
         hook.lines()
             .all(|line| line.trim_start().starts_with('#') || !line.contains("export")),
@@ -1807,15 +1790,6 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
         3,
         "saved is declared empty, then holds what trap -p printed and nothing else"
     );
-    for (idx, line) in hook.split('\n').enumerate() {
-        if let Statement::Assign { name, .. } = statement(line) {
-            assert!(
-                locals.contains(&name) || name.starts_with("BX_") || name == "PROMPT_COMMAND",
-                "line {} assigns {name}, which the guard would have to judge",
-                idx + 1
-            );
-        }
-    }
 }
 
 /// `text` with its comments removed, line by line, carrying block state.

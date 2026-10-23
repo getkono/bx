@@ -2241,46 +2241,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A FIFO where `file` names a state file: both modes stop at once with an
-    /// error naming it, and nothing is written.
-    fn a_fifo_state_file_is_refused(file: fn(&StateDir) -> PathBuf) {
-        let home = guarded_home();
-        let inputs = inputs(&home, &inline("~/.a", "a\\n"));
-        let path = file(inputs.state());
-        fifo_at(&path);
-
-        for mode in [Mode::Plan, Mode::Apply] {
-            let message = refusal(&inputs, mode);
-            assert!(
-                message.contains(&path.display().to_string()),
-                "{mode:?}: {message}"
-            );
-            assert!(
-                message.contains("not a regular file"),
-                "{mode:?}: {message}"
-            );
-        }
-        assert!(
-            !home.child(".a").exists(),
-            "written past a refused state file"
-        );
-    }
-
-    #[test]
-    fn decision_20_a_fifo_at_the_ledger_is_refused_without_waiting() {
-        a_fifo_state_file_is_refused(StateDir::ledger);
-    }
-
-    #[test]
-    fn decision_20_a_fifo_at_the_fingerprints_is_refused_without_waiting() {
-        a_fifo_state_file_is_refused(StateDir::fingerprints);
-    }
-
-    #[test]
-    fn decision_20_a_fifo_at_the_journal_is_refused_without_waiting() {
-        a_fifo_state_file_is_refused(StateDir::journal);
-    }
-
     /// Stage an apply that died once its write was published: the journal
     /// stands over `new\n`, and rolling it back needs the restore snapshot of
     /// `old\n`. This is the state in which `bx plan` reads a fourth state file.
@@ -2310,41 +2270,6 @@ pub(crate) mod tests {
             .expect("the write");
         drop(session);
         inputs
-    }
-
-    #[test]
-    fn decision_33_a_fifo_at_the_restore_snapshot_is_refused_without_waiting() {
-        // P42R2-D3 and P42R2-COV3, the named case. `bx plan` reads
-        // <state>/restore/<digest> through `interrupted_rows` ->
-        // LedgerView::restore_bytes, which is a bare std::fs::read. The guard
-        // named three state files and not this one, so at 5d1bba7 this test
-        // does not merely fail: `run` never returns, and `refusal`'s deadline
-        // is what turns the hang into a failure.
-        let home = guarded_home();
-        let inputs = a_standing_write_over(&home);
-        let blob = inputs
-            .state()
-            .restore()
-            .join(crate::state::ContentHash::of(b"old\n").to_hex());
-        std::fs::remove_file(&blob).expect("the snapshot goes");
-        fifo_at(&blob);
-
-        for mode in [Mode::Plan, Mode::Apply] {
-            let message = refusal(&inputs, mode);
-            assert!(
-                message.contains(&blob.display().to_string()),
-                "{mode:?}: {message}"
-            );
-            assert!(
-                message.contains("not a regular file"),
-                "{mode:?}: {message}"
-            );
-        }
-        assert_eq!(
-            std::fs::read(home.child(".conf")).expect("untouched"),
-            b"new\n",
-            "a refused state file was written past"
-        );
     }
 
     /// Every path under `state`, deepest first, as the filesystem holds them.
@@ -2387,9 +2312,18 @@ pub(crate) mod tests {
         // later brings its file with it and is covered the day it is written;
         // nobody has to remember to extend a list.
         let home = guarded_home();
-        // A finished apply first, so a saved ledger and its fingerprints are
-        // among the files swept, beside the standing journal's snapshot.
+        // A finished apply and a saved fingerprint cache first, so a saved
+        // ledger and the fingerprints are among the files swept, beside the
+        // standing journal's snapshot.
         own(home.path(), ".owned", b"owned\n", Mechanism::Own);
+        let state = StateDir::resolve(home.path());
+        let lock = ExclusiveLock::try_acquire(&state)
+            .expect("try the lock")
+            .expect("nothing holds it");
+        let mut cache = crate::state::Fingerprints::default();
+        cache.set("tracked", crate::state::Fingerprint::raw(b"seen".to_vec()));
+        cache.save(&state, &lock).expect("save the fingerprints");
+        drop(lock);
         let inputs = a_standing_write_over(&home);
 
         let paths = every_state_path(inputs.state());
@@ -2397,6 +2331,10 @@ pub(crate) mod tests {
         assert!(
             paths.contains(&inputs.state().ledger()),
             "the fixture holds no ledger: {paths:?}"
+        );
+        assert!(
+            paths.contains(&inputs.state().fingerprints()),
+            "the fixture holds no fingerprints: {paths:?}"
         );
         assert!(
             paths.iter().any(|path| path.parent() == Some(&*blob_dir)),

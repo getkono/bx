@@ -48,6 +48,20 @@ fn publish(home: &GuardedHome, files: &[&str]) -> String {
     rev(home.path(), &dir, "HEAD")
 }
 
+/// A config repo following [`layer`]'s external from an [`upstream`]
+/// holding one skill. Returns the repo and the upstream's commit.
+fn following(home: &GuardedHome) -> (std::path::PathBuf, String) {
+    let first = upstream(home, &["skills/a/SKILL.md"]);
+    (cloned(home, &layer()), first)
+}
+
+/// [`following`], once `bx update` has locked the upstream's commit.
+fn locked_once(home: &GuardedHome) -> (std::path::PathBuf, String) {
+    let followed = following(home);
+    update(home, true, &mut Vec::new()).expect("update");
+    followed
+}
+
 fn update(home: &GuardedHome, yes: bool, out: &mut Vec<u8>) -> Result<Exit, update::Error> {
     update_with(
         &env(home.path()),
@@ -98,8 +112,7 @@ fn assert_nowhere_pushed(home: &GuardedHome, pushed: &str, out: &[u8]) {
 #[test]
 fn update_pushes_its_lock_commit_to_the_upstream() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
 
     let mut out = Vec::new();
     let exit = update(&home, true, &mut out).expect("update");
@@ -129,8 +142,7 @@ fn update_pushes_its_lock_commit_to_the_upstream() {
 #[test]
 fn a_push_refused_because_the_upstream_moved_keeps_the_lock_and_names_bx_sync() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
     // Another machine's commit, pushed aside; the hook moves the upstream to
     // it once the lock is committed, after the pull.
     let other = crate::sync::tests::other(&home);
@@ -184,8 +196,7 @@ fn a_push_refused_because_the_upstream_moved_keeps_the_lock_and_names_bx_sync() 
 #[test]
 fn a_lock_whose_apply_leaves_a_conflict_is_committed_and_not_pushed() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
     let pushed = rev(home.path(), &home.child("remote.git"), "master");
     // A file of the user's where the link would go.
     std::fs::create_dir_all(home.child(".claude/skills")).expect("a dir");
@@ -290,9 +301,7 @@ fn update_locks_commits_and_applies_then_finds_nothing_new() {
 #[test]
 fn update_commits_the_lock_before_it_moves_anything() {
     let home = guarded_home();
-    let first = upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, first) = locked_once(&home);
     let second = publish(&home, &["skills/b/SKILL.md"]);
     let hook = repo.join(".git/hooks/pre-commit");
     std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("a hook");
@@ -326,9 +335,7 @@ fn update_commits_the_lock_before_it_moves_anything() {
 #[test]
 fn a_force_push_past_a_commit_the_checkout_lacks_is_never_locked() {
     let home = guarded_home();
-    let first = upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, first) = locked_once(&home);
     // Another machine locked a commit this checkout never fetched,
     // and the branch was then rewritten past it.
     let dir = home.child("upstream");
@@ -394,8 +401,7 @@ fn two_links_naming_one_child_converge_in_one_apply() {
 #[test]
 fn update_without_yes_or_a_terminal_reaches_nothing() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
+    following(&home);
     let error = update(&home, false, &mut Vec::new()).expect_err("no terminal");
     assert!(
         matches!(error, update::Error::Plan(Error::NeedsConfirmation)),
@@ -484,8 +490,7 @@ fn an_external_one_account_switches_off_keeps_its_shared_lock_entry() {
 #[test]
 fn an_external_only_local_toml_follows_is_never_locked_in_the_shared_lock() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
+    following(&home);
     home.write(
         ".local/state/bx/local.toml",
         &format!(
@@ -521,9 +526,7 @@ fn an_external_only_local_toml_follows_is_never_locked_in_the_shared_lock() {
 #[test]
 fn update_refuses_a_lock_with_uncommitted_edits() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, _) = locked_once(&home);
     std::fs::write(repo.join("bx.lock"), "# mine\n").expect("an edit");
     let error = update(&home, true, &mut Vec::new()).expect_err("edited");
     assert!(matches!(error, update::Error::LockEdited(_)), "{error:?}");
@@ -538,8 +541,7 @@ fn an_interrupted_apply_is_recovered_and_nothing_is_locked_under_its_approval() 
     use crate::journal::{Session, SessionKind};
 
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
     let head = rev(home.path(), &repo, "HEAD");
     let state = crate::state::StateDir::resolve(home.path());
     drop(Session::open(&state, SessionKind::Apply, home.path(), Vec::new()).expect("open"));
@@ -569,8 +571,7 @@ fn an_interrupted_apply_is_recovered_and_nothing_is_locked_under_its_approval() 
 #[test]
 fn update_refuses_a_lock_git_has_never_seen() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
     // As a run killed between writing its first lock and committing
     // it leaves the file, or as one written by hand is.
     std::fs::write(repo.join("bx.lock"), "# mine\n").expect("untracked");
@@ -587,9 +588,7 @@ fn update_refuses_a_lock_git_has_never_seen() {
 #[test]
 fn a_rewritten_branch_is_reported_and_never_locked() {
     let home = guarded_home();
-    let first = upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (_, first) = locked_once(&home);
     let dir = home.child("upstream");
     run(
         home.path(),
@@ -616,9 +615,7 @@ fn a_rewritten_branch_is_reported_and_never_locked() {
 #[test]
 fn check_offers_what_it_found_and_snooze_puts_it_off() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     publish(&home, &["skills/b/SKILL.md"]);
     let env = env(home.path());
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
@@ -750,9 +747,7 @@ const DAY: u64 = 24 * 60 * 60;
 #[test]
 fn a_foreground_check_starts_a_new_ask_interval() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     std::fs::write(stamps.ask_due(), "1\n").expect("due long ago");
 
@@ -883,9 +878,7 @@ fn a_check_with_nothing_followed_says_so_and_converges() {
 #[test]
 fn an_apply_on_a_machine_that_never_ran_update_starts_the_interval() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     std::fs::remove_dir_all(home.child(".local/state/bx/update")).expect("a new machine");
     std::fs::remove_file(home.child(".claude/skills/a")).expect("one write to make");
@@ -914,8 +907,7 @@ fn an_auto_only_configuration_is_never_asked_whether_to_check() {
 #[test]
 fn a_config_repo_with_no_upstream_is_locked_as_it_stands() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
     run(
         home.path(),
         &repo,
@@ -940,8 +932,7 @@ fn a_config_repo_with_no_upstream_is_locked_as_it_stands() {
 #[test]
 fn a_config_repo_whose_upstream_is_gone_is_locked_as_it_stands() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
     run(
         home.path(),
         &repo,
@@ -966,9 +957,7 @@ fn a_config_repo_whose_upstream_is_gone_is_locked_as_it_stands() {
 #[test]
 fn a_branch_diverged_only_by_unpushed_lock_commits_catches_up_and_locks_again() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, _) = locked_once(&home);
     run(home.path(), &repo, &["push", "--quiet"]);
     // This machine locks a new commit and never pushes it; another
     // machine pushes a change of its own.
@@ -1098,9 +1087,7 @@ fn a_replay_that_cannot_be_put_back_is_named_as_an_open_rebase() {
 #[test]
 fn a_replay_the_upstream_already_holds_says_so() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, _) = locked_once(&home);
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(&home, &["skills/b/SKILL.md"]);
     update_unpushed(&home);
@@ -1131,9 +1118,7 @@ fn a_rebase_left_open_in_the_config_repo_is_named() {
 #[test]
 fn a_move_nothing_here_can_check_exits_pending() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     publish(&home, &["skills/b/SKILL.md"]);
     // A machine with the configuration and none of its checkouts.
     std::fs::remove_dir_all(home.child(AT)).expect("no checkout");
@@ -1150,9 +1135,7 @@ fn a_move_nothing_here_can_check_exits_pending() {
 #[test]
 fn a_snooze_that_cannot_take_the_lock_writes_no_stamp_and_the_answer_stands() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     std::fs::write(stamps.ask_due(), "1\n").expect("due");
     stamps
@@ -1190,9 +1173,7 @@ fn a_snooze_that_cannot_take_the_lock_writes_no_stamp_and_the_answer_stands() {
 #[test]
 fn lock_commits_both_machines_made_are_left_for_a_person() {
     let home = guarded_home();
-    let first = upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, first) = locked_once(&home);
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(&home, &["skills/b/SKILL.md"]);
     update_unpushed(&home);
@@ -1226,9 +1207,7 @@ fn lock_commits_both_machines_made_are_left_for_a_person() {
 #[test]
 fn a_branch_diverged_by_a_persons_commit_is_left_for_them() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, _) = locked_once(&home);
     run(home.path(), &repo, &["push", "--quiet"]);
     // A person's own edit, to bx.lock alone: theirs all the same.
     let edited = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
@@ -1343,9 +1322,7 @@ fn a_lock_change_apply_writes_nothing_for_abandoned_at_its_question_answers_the_
 #[test]
 fn a_remote_refusing_a_commit_by_id_still_lets_a_checkout_holding_it_move() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     let next = publish(&home, &["skills/b/SKILL.md"]);
     // A remote that refuses a commit asked for by id, as protocol v0
     // servers do by default: a checkout already holding the commit
@@ -1368,8 +1345,7 @@ fn a_remote_refusing_a_commit_by_id_still_lets_a_checkout_holding_it_move() {
 #[test]
 fn a_person_s_update_waits_briefly_then_says_another_runs() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
+    following(&home);
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     let _held = stamps.try_hold().expect("hold").expect("free");
     let error = update(&home, true, &mut Vec::new()).expect_err("busy");
@@ -1389,8 +1365,7 @@ fn a_person_s_update_waits_briefly_then_says_another_runs() {
 #[test]
 fn a_background_check_that_fails_says_why_and_waits_an_hour() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
     std::fs::write(repo.join("bx.toml"), "[[external]\n").expect("a broken layer");
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     let before = update::now();
@@ -1585,9 +1560,7 @@ fn a_background_check_diverged_from_its_upstream_judges_its_own_lock() {
 #[test]
 fn a_background_check_with_nothing_on_auto_never_fetches_the_config_repo() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, _) = locked_once(&home);
     run(home.path(), &repo, &["push", "--quiet"]);
     let tracked = rev(home.path(), &repo, "origin/master");
     let other = crate::sync::tests::other(&home);
@@ -1751,8 +1724,7 @@ fn a_config_repo_git_does_not_manage_gets_its_lock_uncommitted() {
 #[test]
 fn a_refused_first_lock_commit_leaves_no_lock_behind() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
+    let (repo, _) = following(&home);
     let hook = repo.join(".git/hooks/pre-commit");
     std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("a hook");
     crate::fs::set_mode(&hook, crate::fs::Mode::from_bits(0o755)).expect("executable");
@@ -1786,9 +1758,7 @@ fn each_flag_asks_for_its_mode() {
 #[test]
 fn update_says_it_fast_forwarded_and_declining_locks_nothing() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, _) = locked_once(&home);
     // Pushed, as `bx sync` would; then another machine pushed too.
     run(home.path(), &repo, &["push", "--quiet"]);
     let other = crate::sync::tests::other(&home);
@@ -1826,8 +1796,7 @@ fn update_says_it_fast_forwarded_and_declining_locks_nothing() {
 #[test]
 fn a_name_that_is_not_a_followed_external_is_refused() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
+    following(&home);
     let error = update_with(
         &env(home.path()),
         &["~/elsewhere".to_string()],
@@ -1965,9 +1934,7 @@ fn answering(
 #[test]
 fn an_update_abandoned_at_its_question_answers_the_offer() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     publish(&home, &["skills/b/SKILL.md"]);
     let (stamps, generation) = on_offer(&home);
     let since = update::now();
@@ -1979,9 +1946,7 @@ fn an_update_abandoned_at_its_question_answers_the_offer() {
 #[test]
 fn an_update_declined_answers_the_offer_rather_than_withdrawing_it() {
     let home = guarded_home();
-    let first = upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (_, first) = locked_once(&home);
     publish(&home, &["skills/b/SKILL.md"]);
     let (stamps, generation) = on_offer(&home);
     let since = update::now();
@@ -1993,8 +1958,7 @@ fn an_update_declined_answers_the_offer_rather_than_withdrawing_it() {
 #[test]
 fn an_update_another_holds_records_nothing() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
+    following(&home);
     let (stamps, _) = on_offer(&home);
     std::fs::write(stamps.ask_due(), "1\n").expect("due");
     let available = std::fs::read(stamps.available()).expect("offered");
@@ -2013,9 +1977,7 @@ fn an_update_another_holds_records_nothing() {
 #[test]
 fn an_update_a_diverged_config_repo_refuses_answers_the_offer_and_says_why() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, _) = locked_once(&home);
     run(home.path(), &repo, &["push", "--quiet"]);
     let edited = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
     std::fs::write(repo.join("bx.lock"), format!("{edited}# mine\n")).expect("an edit");
@@ -2037,9 +1999,7 @@ fn an_update_a_diverged_config_repo_refuses_answers_the_offer_and_says_why() {
 #[test]
 fn an_update_both_machines_locked_answers_the_offer_and_says_why() {
     let home = guarded_home();
-    let first = upstream(&home, &["skills/a/SKILL.md"]);
-    let repo = cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    let (repo, first) = locked_once(&home);
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(&home, &["skills/b/SKILL.md"]);
     update_unpushed(&home);
@@ -2075,9 +2035,7 @@ fn an_update_a_rebase_left_open_stops_answers_the_offer_and_says_why() {
 #[test]
 fn an_update_whose_pull_cannot_reach_the_remote_answers_the_offer_and_says_why() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     std::fs::rename(home.child("remote.git"), home.child("gone.git")).expect("unreachable");
     let (stamps, generation) = on_offer(&home);
     let since = update::now();
@@ -2089,9 +2047,7 @@ fn an_update_whose_pull_cannot_reach_the_remote_answers_the_offer_and_says_why()
 #[test]
 fn an_update_that_finishes_withdraws_the_offer() {
     let home = guarded_home();
-    upstream(&home, &["skills/a/SKILL.md"]);
-    cloned(&home, &layer());
-    update(&home, true, &mut Vec::new()).expect("update");
+    locked_once(&home);
     publish(&home, &["skills/b/SKILL.md"]);
     let (stamps, _) = on_offer(&home);
     // Why an earlier run stopped, which `bx doctor` names until one finishes.

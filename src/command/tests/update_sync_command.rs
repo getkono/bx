@@ -260,6 +260,39 @@ fn a_carry_another_machine_changed_too_is_left_for_a_person() {
 }
 
 #[test]
+fn a_carry_another_machine_changed_elsewhere_in_the_file_is_left_for_a_person() {
+    let home = guarded_home();
+    let repo = tracking(&home);
+    home.write(".lock", "a\n2\n3\n4\n5\n6\n7\n8\n");
+    update(&home, &mut Vec::new()).expect("carried and pushed");
+    let hook = refusing_pushes(&repo);
+    home.write(".lock", "b\n2\n3\n4\n5\n6\n7\n8\n");
+    let mut out = Vec::new();
+    update(&home, &mut out).expect("committed, and not pushed");
+    // A carry alone: the refusal names that one commit, never a lock.
+    assert!(
+        text(&out).contains("The 1 commit(s) stay committed here")
+            && !text(&out).contains("lock stays"),
+        "{}",
+        text(&out)
+    );
+    std::fs::remove_file(hook).expect("the hook");
+    // Lines apart, so git alone would merge the two without a conflict.
+    pushed_elsewhere(&home, "files/lock", "a\n2\n3\n4\n5\n6\n7\nc\n");
+    let head = rev(home.path(), &repo, "HEAD");
+
+    let mut out = Vec::new();
+    let error = update(&home, &mut out).expect_err("both changed the copy");
+    assert!(
+        matches!(error, update::Error::LockDiverged { commits: 1, .. }),
+        "{error}"
+    );
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing replayed");
+    assert!(!update::rebasing(&git(home.path()), &repo));
+    assert!(clean(&home, &repo));
+}
+
+#[test]
 fn a_declined_update_over_only_a_carry_writes_and_pushes_nothing() {
     let home = guarded_home();
     let repo = tracking(&home);

@@ -618,9 +618,10 @@ pub enum Replay {
 /// with [`sync::CARRIED_SUBJECT`] and not touching `bx.lock` — replay them on
 /// top of the upstream, as `git rebase` does. Every lock and copy they held
 /// is kept, so nothing needs approving again. When the upstream changed one
-/// of their files as well, the replay is abandoned and the branch left
-/// exactly as it was: which machine's lock or copy to keep is a person's
-/// call. Any other local commit is left alone too.
+/// of their files as well — anywhere in it, whether or not git could merge
+/// the two — the replay is never started, and the branch is left exactly as
+/// it was: which machine's lock or copy to keep is a person's call. Any other
+/// local commit is left alone too.
 ///
 /// # Errors
 ///
@@ -633,6 +634,7 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
         &["rev-list", "--format=%P%x00%s", "@{upstream}..HEAD"],
     )?;
     let mut commits = 0;
+    let mut ours = std::collections::BTreeSet::new();
     for pair in listed.lines().collect::<Vec<_>>().chunks(2) {
         let [header, body] = pair else {
             return Ok(Replay::NotOwn);
@@ -659,10 +661,23 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
         if !own {
             return Ok(Replay::NotOwn);
         }
+        ours.extend(touched.lines().map(str::to_string));
         commits += 1;
     }
     if commits == 0 {
         return Ok(Replay::NotOwn);
+    }
+    // Any file both sides changed to different bytes is refused before the
+    // replay, not only one whose hunks overlap: git would merge edits to
+    // different lines of it, and keep neither machine's lock or copy as it
+    // was. One both changed alike is the upstream already holding it.
+    let theirs = git.query(repo, &["diff", "--name-only", "HEAD...@{upstream}"])?;
+    let apart = git.query(repo, &["diff", "--name-only", "HEAD", "@{upstream}"])?;
+    if theirs
+        .lines()
+        .any(|path| ours.contains(path) && apart.lines().any(|differs| differs == path))
+    {
+        return Ok(Replay::Conflicted(commits));
     }
     // Through `commit`, so the user's own signing can ask what it asks.
     let replayed = git.commit(

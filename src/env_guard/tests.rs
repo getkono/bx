@@ -1107,46 +1107,36 @@ fn scan_reports_every_violation() {
     assert_eq!(found[1].line, 3);
 }
 
-// Round-3 reproductions, written against the round-2 API only.
+// Review rounds 3 and 4: each reproduction, written against the API of the
+// round before it and labelled with its round and item. The guard approves
+// none of them, under any root set its row names.
 
-/// Every case the guard approves; a reproduction fails listing all of them.
-fn r3_approved_cases(cases: &[(&str, RootSet)]) -> Vec<String> {
-    cases
-        .iter()
-        .filter(|(content, roots)| scan_with(content, roots).is_empty())
-        .map(|(content, _)| content.to_string())
-        .collect()
+/// The root sets a reproduction is scanned under, each built afresh.
+type Sets = &'static [fn() -> RootSet];
+
+const ROOTED: Sets = &[rooted];
+const BOTH: Sets = &[rooted, RootSet::strict];
+
+/// The home with no root declared.
+fn home_only() -> RootSet {
+    RootSet::new(Path::new(HOME), &[])
 }
 
-#[test]
-fn r3_1_quoted_escaped_and_aliased_keywords() {
-    let mut cases = Vec::new();
-    for content in [
+/// `(label, contents, root sets)`: every content is scanned under every set.
+#[rustfmt::skip]
+const ROUNDS_3_AND_4: &[(&str, &[&str], Sets)] = &[
+    ("r3.1 quoted, escaped and aliased keywords", &[
         "\\export CARGO_HOME=/etc/evil",
         "\"export\" CARGO_HOME=/etc/evil",
         "e''xport CARGO_HOME=/etc/evil",
         "alias ex=export\nex CARGO_HOME=/etc/evil",
-    ] {
-        cases.push((content, rooted()));
-        cases.push((content, RootSet::strict()));
-    }
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r3_2_multi_line_constructs() {
-    let cases = [
+    ], BOTH),
+    ("r3.2 multi-line constructs", &[
         ": '\n'; export CARGO_HOME=/etc/evil #'",
         "ex\\\nport CARGO_HOME=/etc/evil",
         "export CARGO_HOME=/var/mnt/scratch/example/cargo\nCARGO_\\\nHOME=/etc/evil",
-    ]
-    .map(|content| (content, rooted()));
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r3_3_assigning_commands_and_stale_values() {
-    let cases = [
+    ], ROOTED),
+    ("r3.3 assigning commands and stale values", &[
         "for CARGO_HOME in /etc/evil; do :; done",
         "read -r CARGO_HOME <<< /etc/evil",
         "printf -v CARGO_HOME /etc/evil",
@@ -1154,99 +1144,37 @@ fn r3_3_assigning_commands_and_stale_values() {
         ": ${CARGO_HOME::=/etc/evil}",
         "set -a\n: ${CARGO_HOME:=/etc/evil}",
         "R=/var/mnt/scratch/example\nunset R\nexport CARGO_HOME=$R/etc/evil",
-    ]
-    .map(|content| (content, rooted()));
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r3_4_special_parameters_and_a_fragment_assigned_home() {
-    let home_rooted = home_rooted();
-    let cases = [
-        (
-            "CARGO_HOME=/var/mnt/scratch/example/$@/$@/$@/$@/../../../../etc/evil",
-            rooted(),
-        ),
-        ("XDG_STATE_HOME=~/.local/state/b$@x", home_rooted.clone()),
-        ("HOME=/etc/evil\nCARGO_HOME=~/cargo", home_rooted),
-    ];
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r3_5_eval_and_source_with_a_literal_payload() {
-    let cases = [
+    ], ROOTED),
+    ("r3.4 special parameters", &[
+        "CARGO_HOME=/var/mnt/scratch/example/$@/$@/$@/$@/../../../../etc/evil",
+    ], ROOTED),
+    ("r3.4 a fragment-assigned home", &[
+        "XDG_STATE_HOME=~/.local/state/b$@x",
+        "HOME=/etc/evil\nCARGO_HOME=~/cargo",
+    ], &[home_rooted]),
+    ("r3.5 eval and source with a literal payload", &[
         "eval \"export CARGO_HOME=/etc/evil\"",
         "source /dev/stdin <<< 'export CARGO_HOME=/etc/evil'",
-    ]
-    .map(|content| (content, rooted()));
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r3_6_missing_relocating_names() {
-    let approved: Vec<&str> = [
-        "HOME",
-        "npm_config_cache",
-        "ZDOTDIR",
-        "YARN_CACHE_FOLDER",
-        "CCACHE_DIR",
-        "STARSHIP_CONFIG",
-        "PYTHONUSERBASE",
-        "TMPDIR",
-    ]
-    .into_iter()
-    .filter(|name| check(name, "/etc/evil", &rooted()) == Verdict::Allowed)
-    .collect();
-    assert_eq!(approved, Vec::<&str>::new());
-}
-
-#[test]
-fn r3_7_colon_lists() {
-    let cases = [
+    ], ROOTED),
+    ("r3.7 colon lists", &[
         "KUBECONFIG=/var/mnt/scratch/example/k:/etc/evil/config",
         "GOPATH=/var/mnt/scratch/example/go:/etc/evil",
-    ]
-    .map(|content| (content, rooted()));
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r3_8_location_words_and_zsh_equals_expansion() {
-    let cases = [
+    ], ROOTED),
+    ("r3.8 location words and zsh equals expansion", &[
         "MISE_SHARED_INSTALL_DIRS=evil",
         "MISE_TRUSTED_CONFIG_PATHS=evil",
         "UV_PROJECT=evil",
         "MISE_DEFAULT_CONFIG_FILENAME=evil.toml",
         "UV_PROJECT==ls",
-    ]
-    .map(|content| (content, rooted()));
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-// Round-4 reproductions, written against the round-3 API only.
-
-#[test]
-fn r4_1_a_state_directory_the_fragment_moves_is_owned_by_later_lines() {
-    let home_rooted = home_rooted();
-    let cases = [
-        (
-            "export XDG_STATE_HOME=/var/mnt/scratch/example/state\n\
-                 export CARGO_HOME=/var/mnt/scratch/example/state/bx",
-            rooted(),
-        ),
-        (
-            "export XDG_STATE_HOME=~/state\nexport CARGO_HOME=~/state/bx/cargo",
-            home_rooted,
-        ),
-    ];
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r4_2_a_name_whose_assignment_the_shell_acts_on() {
-    let mut cases = Vec::new();
-    for content in [
+    ], ROOTED),
+    ("r4.1 a state directory the fragment moves is owned by later lines", &[
+        "export XDG_STATE_HOME=/var/mnt/scratch/example/state\n\
+         export CARGO_HOME=/var/mnt/scratch/example/state/bx",
+    ], ROOTED),
+    ("r4.1 a state directory the fragment moves, under the home", &[
+        "export XDG_STATE_HOME=~/state\nexport CARGO_HOME=~/state/bx/cargo",
+    ], &[home_rooted]),
+    ("r4.2 a name whose assignment the shell acts on", &[
         "export HISTFILESIZE=0",
         "export HISTFILE=/etc/evil",
         "export HISTFILE=history",
@@ -1257,54 +1185,23 @@ fn r4_2_a_name_whose_assignment_the_shell_acts_on() {
         "PROMPT_COMMAND=x",
         "PS0=x",
         "precmd_functions=x",
-    ] {
-        cases.push((content, rooted()));
-        cases.push((content, RootSet::strict()));
-    }
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r4_3_a_path_given_to_a_name_no_list_holds() {
-    let mut cases = Vec::new();
-    let unlisted: Vec<String> = R4_UNLISTED_RELOCATIONS
-        .iter()
-        .map(|name| format!("export {name}=/etc/evil"))
-        .collect();
-    for content in &unlisted {
-        cases.push((content.as_str(), rooted()));
-        cases.push((content.as_str(), RootSet::strict()));
-    }
-    for content in [
+    ], BOTH),
+    ("r4.3 a path given to a name no list holds", &[
         "export SOMETHING=.",
         "export SOMETHING=..",
         "export SOMETHING=build/cache",
         "export SOMETHING=~/elsewhere",
         "export SOMETHING=a:/etc/evil",
         "X=/etc/evil",
-    ] {
-        cases.push((content, rooted()));
-    }
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r4_4_location_words_the_review_found_missing() {
-    let cases = [
+    ], ROOTED),
+    ("r4.4 location words the review found missing", &[
         "MISE_CONFIG_DIRECTORY=evil",
         "MISE_OVERRIDE_CONFIG_FILENAMES=evil",
         "UV_TOOL_FOLDER=evil",
         "ASDF_PLUGIN_MODULE=evil",
         "PIP_INSTALL_DEST=evil",
-    ]
-    .map(|content| (content, rooted()));
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r4_5_a_search_list_or_a_program_that_is_not_an_absolute_path() {
-    let mut cases = Vec::new();
-    for content in [
+    ], ROOTED),
+    ("r4.5 a search list or a program that is not an absolute path", &[
         "export PATH=.:/usr/bin",
         "export PATH=/usr/bin:",
         "export PATH=bin",
@@ -1312,106 +1209,44 @@ fn r4_5_a_search_list_or_a_program_that_is_not_an_absolute_path() {
         "export PATH=/var/home/example/.local/state/bx/bin:/usr/bin",
         "export EDITOR=./nvim",
         "export EDITOR=/var/home/example/.local/state/bx/nvim",
+    ], &[rooted, home_only]),
+];
+
+#[test]
+fn no_round_3_or_4_reproduction_is_approved() {
+    let mut approved = Vec::new();
+    let mut judge = |label: &str, content: &str, sets: Sets| {
+        for roots in sets {
+            if scan_with(content, &roots()).is_empty() {
+                approved.push(format!("{label}: {content:?}"));
+            }
+        }
+    };
+    for (label, contents, sets) in ROUNDS_3_AND_4 {
+        for content in *contents {
+            judge(label, content, sets);
+        }
+    }
+    for name in R4_UNLISTED_RELOCATIONS {
+        let content = format!("export {name}=/etc/evil");
+        judge("r4.3 a relocation no list held", &content, BOTH);
+    }
+    // r3.6: relocating names the round-3 lists missed, judged by `check`.
+    for name in [
+        "HOME",
+        "npm_config_cache",
+        "ZDOTDIR",
+        "YARN_CACHE_FOLDER",
+        "CCACHE_DIR",
+        "STARSHIP_CONFIG",
+        "PYTHONUSERBASE",
+        "TMPDIR",
     ] {
-        cases.push((content, rooted()));
-        cases.push((content, RootSet::new(Path::new(HOME), &[])));
+        if check(name, "/etc/evil", &rooted()) == Verdict::Allowed {
+            approved.push(format!("r3.6 missing relocating names: {name}"));
+        }
     }
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-// Round-5 reproductions, written against the round-4 API only.
-
-#[test]
-fn r5_1_a_bare_word_for_a_name_a_tool_reads_as_a_location() {
-    let lines: Vec<String> = R5_READ_AS_LOCATIONS
-        .iter()
-        .map(|(name, value)| format!("export {name}={value}"))
-        .collect();
-    let mut cases = Vec::new();
-    for line in &lines {
-        cases.push((line.as_str(), rooted()));
-        cases.push((line.as_str(), RootSet::strict()));
-    }
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r5_2_a_program_given_arguments() {
-    let mut cases = Vec::new();
-    for content in [
-        "export EDITOR=\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
-        "export EDITOR=\"/usr/bin/env XDG_CONFIG_HOME=/etc/evil nvim\"",
-        "export RUSTC_WRAPPER=\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
-    ] {
-        cases.push((content, rooted()));
-        cases.push((content, RootSet::strict()));
-    }
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r5_3_a_state_directory_moved_by_a_later_line() {
-    // Since round 6 the move itself is refused: bx's state directory is
-    // not a fragment's to move.
-    assert_eq!(
-        reasons(
-            "export CARGO_HOME=/var/mnt/scratch/example/state/bx\n\
-                 export XDG_STATE_HOME=/var/mnt/scratch/example/state",
-            &rooted()
-        ),
-        vec![(2, Reason::NotEmittable)]
-    );
-}
-
-#[test]
-fn r5_4_a_url_shaped_value_is_a_relative_path() {
-    let mut cases = Vec::new();
-    for content in [
-        "export EDITOR=x://ed",
-        "export RIPGREP_CONFIG_PATH=cfg://rc",
-        "export GIT_CONFIG_SYSTEM=https://x:/etc/evil",
-    ] {
-        cases.push((content, rooted()));
-        cases.push((content, RootSet::strict()));
-    }
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r5_5_the_strict_set_owns_the_default_state_directory() {
-    let cases = [
-        "export PATH=/var/home/example/.local/state/bx/bin:/usr/bin",
-        "export VISUAL=/var/home/example/.local/state/bx/nvim",
-        "export SSH_AUTH_SOCK=/var/home/example/.local/state/bx/agent.sock",
-    ]
-    .map(|content| (content, RootSet::strict()));
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r5_6_prompts_and_execignore_act_on_assignment() {
-    let mut cases = Vec::new();
-    for content in [
-        "RPROMPT='$(touch evil)'",
-        "RPS1=x",
-        "RPROMPT2=x",
-        "RPS2=x",
-        "EXECIGNORE=x",
-    ] {
-        cases.push((content, rooted()));
-        cases.push((content, RootSet::strict()));
-    }
-    assert_eq!(r3_approved_cases(&cases), Vec::<String>::new());
-}
-
-#[test]
-fn r5_7_a_config_home_whose_repo_is_the_state_directory() {
-    // Since round 6 no `XDG_CONFIG_HOME` is emittable at all.
-    let home_rooted = home_rooted();
-    assert_eq!(
-        reasons("export XDG_CONFIG_HOME=~/.local/state", &home_rooted),
-        vec![(1, Reason::NotEmittable)]
-    );
+    assert_eq!(approved, Vec::<String>::new());
 }
 
 // Review round 5: a fragment may set only a variable bx knows how to judge.
@@ -1423,6 +1258,15 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
         RelocatingAssignment, ReservedName,
     };
     let home_rooted = home_rooted();
+    // Each falsifier is refused as `check` judges it and as the scan reads
+    // its `export` line, under both root sets.
+    let both = |name: &str, value: &str, reason: Reason| {
+        for roots in [rooted(), RootSet::strict()] {
+            refused(name, value, &roots, reason);
+            let line = format!("export {name}={value}");
+            assert_eq!(reasons(&line, &roots), vec![(1, reason)], "{line}");
+        }
+    };
     // 1: a bare word a tool reads as a path. `BASH_ENV` and `ENV` are also
     // names a starting shell acts on, so they are reserved first.
     for (name, value) in R5_READ_AS_LOCATIONS {
@@ -1431,13 +1275,12 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
         } else {
             NotEmittable
         };
-        for roots in [rooted(), RootSet::strict()] {
-            refused(name, value, &roots, expected);
-        }
+        both(name, value, expected);
     }
     // 2: a program given arguments. `EDITOR` is a command line since
     // issue #112, whose arguments are judged for what they point at and
     // what they assign; a program is still one word.
+    let lesskey = "\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"";
     for (value, reason) in [
         (
             "\"/usr/bin/touch /var/home/example/.local/state/bx/written-by-editor\"",
@@ -1448,22 +1291,14 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
             RelocatingAssignment,
         ),
     ] {
-        for roots in [rooted(), RootSet::strict()] {
-            refused("EDITOR", value, &roots, reason);
-            refused("RUSTC_WRAPPER", value, &roots, NotAProgram);
-        }
+        both("EDITOR", value, reason);
+        both("RUSTC_WRAPPER", value, NotAProgram);
     }
+    both("RUSTC_WRAPPER", lesskey, NotAProgram);
     // A flag that points a tool at a file of its own outside bx's
     // directories is the user's command line to write: the maintainer's
     // ruling on #112 judges arguments only for bx's directories.
-    assert_eq!(
-        check(
-            "PAGER",
-            "\"/usr/bin/less --lesskey-file=/etc/evil/lesskey\"",
-            &rooted()
-        ),
-        Verdict::Allowed
-    );
+    assert_eq!(check("PAGER", lesskey, &rooted()), Verdict::Allowed);
     // 3: a state directory a later line moves. Since round 6 the move is
     // what is refused.
     assert_eq!(
@@ -1474,12 +1309,17 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
         ),
         vec![(2, NotEmittable)]
     );
-    // 4: no URL is exempt, for any kind that holds a path.
+    // 4: no URL is exempt, for any kind that holds a path. A relocation is
+    // judged where a root is declared: under the strict set it has none.
     for (name, value, reason) in [
         ("EDITOR", "x://ed", NotACommandLine),
         ("BROWSER", "x://ed", NotAProgram),
         ("RIPGREP_CONFIG_PATH", "cfg://rc", NotEmittable),
         ("GIT_CONFIG_SYSTEM", "https://x:/etc/evil", NotEmittable),
+    ] {
+        both(name, value, reason);
+    }
+    for (name, value, reason) in [
         ("CARGO_HOME", "cfg://rc", NotAbsolute),
         (
             "CARGO_HOME",
@@ -1504,13 +1344,16 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
         );
     }
     // 6: names a shell acts on when assigned.
-    for name in ["RPROMPT", "RPS1", "RPROMPT2", "RPS2", "EXECIGNORE"] {
-        refused(name, "x", &RootSet::strict(), ReservedName);
+    for roots in [rooted(), RootSet::strict()] {
+        for name in ["RPROMPT", "RPS1", "RPROMPT2", "RPS2", "EXECIGNORE"] {
+            refused(name, "x", &roots, ReservedName);
+            assert_eq!(unexported(name, "x", &roots), Some(ReservedName), "{name}");
+        }
+        assert_eq!(
+            reasons("RPROMPT='$(touch evil)'", &roots),
+            vec![(1, ReservedName)]
+        );
     }
-    assert_eq!(
-        reasons("RPROMPT='$(touch evil)'", &rooted()),
-        vec![(1, ReservedName)]
-    );
     // 7: a config repo landing on the state directory. Since round 6 no
     // fragment may move the config repo at all.
     assert_eq!(
@@ -1610,6 +1453,43 @@ fn assignments_in(text: &str) -> Vec<&str> {
         }
     }
     found
+}
+
+/// Assert that every name generated shell `text` gives a value to — found
+/// by [`assignments_in`], and by the guard's own reading of each line — is
+/// one of bx's own `BX_` names, which no tool reads, a name `text` declares
+/// `local`, which never leaves its function, or one of `allowed`. Returns
+/// the swept names and the locals, for the caller's non-vacuity checks.
+#[track_caller]
+fn assert_assigns_only<'a>(text: &'a str, allowed: &[&str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    let locals: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
+        .flat_map(str::split_whitespace)
+        .filter(|word| !word.starts_with('-'))
+        .map(|declared| declared.split('=').next().unwrap_or(declared))
+        .collect();
+    let admitted =
+        |name: &str| name.starts_with("BX_") || locals.contains(&name) || allowed.contains(&name);
+    let assigned = assignments_in(text);
+    for name in &assigned {
+        assert!(!name.is_empty(), "an assignment that names nothing");
+        assert!(
+            admitted(name),
+            "{name} is given a value, and is neither one of bx's own names, \
+             a local, nor one of {allowed:?}"
+        );
+    }
+    for (idx, line) in text.split('\n').enumerate() {
+        if let Statement::Assign { name, .. } = statement(line) {
+            assert!(
+                admitted(name),
+                "line {} assigns {name}, which the guard would have to judge",
+                idx + 1
+            );
+        }
+    }
+    (assigned, locals)
 }
 
 #[test]
@@ -1753,31 +1633,14 @@ fn the_init_snippet_is_not_an_environment_fragment() {
     // Written this way the test survives the snippet being reformatted,
     // and fails the moment a generator puts a real assignment in it.
     let snippet = include_str!("../../bench/fixtures/bx/bx-init.zsh");
-    let locals: Vec<&str> = snippet
-        .lines()
-        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
-        .filter_map(|rest| rest.split_whitespace().next_back())
-        .map(|declared| declared.split('=').next().unwrap_or(declared))
-        .collect();
-    let assigned = assignments_in(snippet);
-    for name in &assigned {
-        assert!(
-            !name.is_empty(),
-            "the snippet assigns through something that names nothing"
-        );
-        assert!(
-            name.starts_with("BX_") || locals.contains(name),
-            "the snippet gives {name} a value, which is neither one of \
-                 bx's own names nor local to a function"
-        );
-    }
+    let (assigned, locals) = assert_assigns_only(snippet, &[]);
     // Not vacuous: the staleness test is what the snippet is for, and it
     // is the two names found above.
     assert!(assigned.contains(&"BX_BIN") && assigned.contains(&"BX_STALE"));
     // So the guard reads no environment assignment out of it either. Every
     // line is a comment, a blank, or shell outside the grammar, but for the
     // one local array — whose value the grammar cannot read, so nothing is
-    // learned from it and nothing is approved.
+    // learned from it and nothing is approved. Not even a `BX_` name.
     for (idx, line) in snippet.split('\n').enumerate() {
         if let Statement::Assign { name, .. } = statement(line) {
             assert!(
@@ -1806,21 +1669,7 @@ fn the_update_prompt_is_not_an_environment_fragment() {
     // runs at a prompt and moves no tool's files, as the functions phase's
     // registrations do.
     let hook = crate::shell::update_prompt::ZSH;
-    let locals: Vec<&str> = hook
-        .lines()
-        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
-        .flat_map(str::split_whitespace)
-        .filter(|word| !word.starts_with('-'))
-        .map(|declared| declared.split('=').next().unwrap_or(declared))
-        .collect();
-    let assigned = assignments_in(hook);
-    for name in &assigned {
-        assert!(
-            name.starts_with("BX_") || locals.contains(name) || *name == "precmd_functions",
-            "the update prompt gives {name} a value, which is neither one of bx's own \
-             names, a local, nor zsh's precmd hook array"
-        );
-    }
+    let (assigned, _) = assert_assigns_only(hook, &["precmd_functions"]);
     // Not vacuous: the once-per-shell markers, the registration, and the
     // locals the cross-shell wait assigns — the trap's included.
     for name in [
@@ -1841,17 +1690,8 @@ fn the_update_prompt_is_not_an_environment_fragment() {
         "one SIGURG trap set and taken down, under localtraps"
     );
     assert!(!hook.contains("eval"), "zsh puts the trap back itself");
-    // Nothing is exported, and nothing the guard would have to judge.
+    // Nothing is exported.
     assert!(!hook.contains("export"), "the hook exports nothing");
-    for (idx, line) in hook.split('\n').enumerate() {
-        if let Statement::Assign { name, .. } = statement(line) {
-            assert!(
-                locals.contains(&name) || name.starts_with("BX_") || name == "precmd_functions",
-                "line {} assigns {name}, which the guard would have to judge",
-                idx + 1
-            );
-        }
-    }
 }
 
 #[test]
@@ -1866,21 +1706,7 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
     // function: it expands the unexported BX_UPDATE_HOOK, and is nothing in a
     // child that inherits it.
     let hook = crate::shell::update_prompt::BASH;
-    let locals: Vec<&str> = hook
-        .lines()
-        .filter_map(|line| line.trim_matches(BLANKS).strip_prefix("local "))
-        .flat_map(str::split_whitespace)
-        .filter(|word| !word.starts_with('-'))
-        .map(|declared| declared.split('=').next().unwrap_or(declared))
-        .collect();
-    let assigned = assignments_in(hook);
-    for name in &assigned {
-        assert!(
-            name.starts_with("BX_") || locals.contains(name) || *name == "PROMPT_COMMAND",
-            "the bash update prompt gives {name} a value, which is neither one of bx's own \
-             names, a local, nor bash's PROMPT_COMMAND"
-        );
-    }
+    let (assigned, _) = assert_assigns_only(hook, &["PROMPT_COMMAND"]);
     for name in [
         "BX_UPDATE_ASKED",
         "BX_UPDATE_CHECKING",
@@ -1929,8 +1755,8 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
             .all(|append| hook.find(append).is_some_and(|at| at > guard)),
         "an append outside the attribute test"
     );
-    // Nothing is exported, and nothing the guard would have to judge.
-    // The hook's comments say "exported"; no line runs `export`.
+    // Nothing is exported: the hook's comments say "exported"; no line runs
+    // `export`.
     assert!(
         hook.lines()
             .all(|line| line.trim_start().starts_with('#') || !line.contains("export")),
@@ -1964,15 +1790,6 @@ fn the_bash_update_prompt_is_not_an_environment_fragment() {
         3,
         "saved is declared empty, then holds what trap -p printed and nothing else"
     );
-    for (idx, line) in hook.split('\n').enumerate() {
-        if let Statement::Assign { name, .. } = statement(line) {
-            assert!(
-                locals.contains(&name) || name.starts_with("BX_") || name == "PROMPT_COMMAND",
-                "line {} assigns {name}, which the guard would have to judge",
-                idx + 1
-            );
-        }
-    }
 }
 
 /// `text` with its comments removed, line by line, carrying block state.

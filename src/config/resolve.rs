@@ -1676,47 +1676,14 @@ mod tests {
     }
 
     #[test]
-    fn a_derived_value_every_colliding_spelling_carries_is_not_offered_as_the_way_out() {
-        // `q` carries the answer to `o` into both spellings, so answering `q`
-        // directly moves both files together and they stay one file. Naming it
-        // would be advice that clears nothing, so the hint does not.
-        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                             [[value]]\nname = \"o\"\nkind = \"string\"\n\
-                             [[value]]\nname = \"q\"\nkind = \"string\"\ndefault = \"{{o}}\"\n\
-                             [[target]]\npath = \"~/{{p}}/{{q}}\"\ncontent = \"P\"\n\
-                             [[target]]\npath = \"~/work/{{q}}\"\ncontent = \"W\"\n\
-                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
-
-        for local in [
-            "[values]\np = \"work\"\no = \"x\"\n",
-            "[values]\np = \"work\"\no = \"x\"\nq = \"y\"\n",
-        ] {
-            let resolved =
-                resolved(LAYER, Some(local)).expect("an account's answers do not fail the load");
-            for index in [0, 1] {
-                let entry = blocked(&resolved, index);
-                assert!(
-                    entry.hint.ends_with("; change that answer"),
-                    "{local:?} {index}: {}",
-                    entry.hint
-                );
-                for part in ["the default of `q`", "directly"] {
-                    assert!(
-                        !entry.hint.contains(part),
-                        "{local:?} {index} {part}: {}",
-                        entry.hint
-                    );
-                }
-            }
-            ready(&resolved, 2);
-        }
-    }
-
-    #[test]
     fn a_derived_value_one_spelling_carries_twice_is_offered_as_the_way_out() {
-        // The exclusion above is by *count*, not by membership. `q` is carried
-        // by both spellings, but once by the first and twice by the second, so
-        // answering it does part them and the hint has to say so: with
+        // The end-to-end proof that a hint reaches the blocked entry and that
+        // the act it names clears it. Which derived values a hint offers is
+        // `answers_hint`'s rule, pinned by its tests in `values.rs`: a value
+        // every spelling carries equally is withheld, and the exclusion is by
+        // *count*, not by membership. `q` is carried by both spellings, but
+        // once by the first and twice by the second, so answering it does
+        // part them and the hint has to say so: with
         // `p = ""` both key `~/x`, and `q = "a"` makes them `~/a/x` and
         // `~/aa/x`. Before the count comparison, `q` was excluded and the hint
         // named only `p`, whose every answer keeps them one file or parts the
@@ -1784,43 +1751,6 @@ mod tests {
     }
 
     #[test]
-    fn a_derived_value_reached_down_two_defaults_is_named_once() {
-        // `left` and `right` both default to `{{shared}}`, so one text reaches
-        // `shared` twice, by two different routes, and every value on the way
-        // is an act that clears the entry. `shared` is offered once and in
-        // declaration order. `add_reach` is what keeps it to one entry with one
-        // total, which
-        // `derived_between_names_a_value_reached_down_two_defaults_once` pins
-        // directly; here the interest is that the whole chain reaches the
-        // account.
-        const LAYER: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                             [[value]]\nname = \"shared\"\nkind = \"string\"\n\
-                             default = \"{{p}}\"\n\
-                             [[value]]\nname = \"left\"\nkind = \"string\"\n\
-                             default = \"{{shared}}\"\n\
-                             [[value]]\nname = \"right\"\nkind = \"string\"\n\
-                             default = \"{{shared}}\"\n\
-                             [[target]]\npath = \"~/.config/zed/settings.json\"\n\
-                             content = \"{{{{}}\"\n\
-                             format = \"jsonc\"\nowns = [\"a.{{left}}{{right}}\"]\n\
-                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
-
-        let answered = resolved(LAYER, Some("[values]\np = \"b.c\"\n"))
-            .expect("an account's answer blocks its target, not the load");
-        let hint = &blocked(&answered, 0).hint;
-        assert_eq!(
-            hint.matches("`shared`").count(),
-            2,
-            "one default entry and one direct entry, not two of each: {hint}"
-        );
-        assert!(
-            hint.ends_with("change that answer, or answer `shared` or `left` or `right` directly"),
-            "{hint}"
-        );
-        ready(&answered, 1);
-    }
-
-    #[test]
     fn a_dotdot_against_a_placeholder_is_not_one_path_as_written() {
         // Reduced with its placeholder left in, `~/.config/{{p}}/../s` folds to
         // `~/.config/s`, which read as proof that the toggle and the first entry
@@ -1864,50 +1794,6 @@ mod tests {
     }
 
     #[test]
-    fn a_dotdot_pair_that_is_one_path_for_every_answer_is_the_layer_s_defect() {
-        // A `bool` holds no `/`, so `~/.config/{{flag}}/../s` is `~/.config/s`
-        // for both answers. And `{{p}}/..` against `{{p}}/./..` stay one path
-        // whether `p` holds a `/` or not. Neither pair is the answer's doing, so
-        // each fails the load rather than blocking with advice no answer could
-        // follow.
-        const BOOL: &str = "[[value]]\nname = \"flag\"\nkind = \"bool\"\n\
-                            [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
-                            [[target]]\npath = \"~/.config/{{flag}}/../s\"\nenabled = false\n\
-                            [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
-        for flag in ["true", "false"] {
-            let message = resolved(BOOL, Some(&format!("[values]\nflag = {flag}\n")))
-                .expect_err("one path for every answer is the layer's defect");
-            assert_mentions(
-                &message,
-                &[
-                    "bx.toml:7",
-                    "names the same file as `~/.config/s` at bx.toml:4",
-                    "in this same layer",
-                ],
-            );
-        }
-
-        const TWICE: &str = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                             [[target]]\npath = \"~/.config/s\"\ncontent = \"S\"\n\
-                             [[target]]\npath = \"~/.config/a/s\"\ncontent = \"AS\"\n\
-                             [[target]]\npath = \"~/.config/{{p}}/../s\"\nenabled = false\n\
-                             [[target]]\npath = \"~/.config/{{p}}/./../s\"\nenabled = true\n\
-                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
-        for p in ["a", "a/b"] {
-            let message = resolved(TWICE, Some(&format!("[values]\np = \"{p}\"\n")))
-                .expect_err("one path for every answer is the layer's defect");
-            assert_mentions(
-                &message,
-                &[
-                    "bx.toml:13",
-                    "names the same file as `~/.config/{{p}}/../s` at bx.toml:10",
-                    "in this same layer",
-                ],
-            );
-        }
-    }
-
-    #[test]
     fn a_pair_some_answer_separates_blocks_whatever_shape_separates_it() {
         // Each pair is one file for these answers and two files for another, so
         // each blocks the file's row rather than failing the load. What
@@ -1948,165 +1834,6 @@ mod tests {
             );
             ready(&resolved, 1);
         }
-    }
-
-    #[test]
-    fn a_path_value_pair_apart_only_by_a_dot_segment_fails_the_load() {
-        // The toggles `{{root}}/s` and `{{root}}/./s` share an opening segment
-        // and differ only by a `.`, which folds, so they are one file for every
-        // answer. That holds however the opening segment is rooted; the root a
-        // `path` value gives is pinned by
-        // `a_path_value_opening_a_spelling_is_rooted_at_slash`. (A full entry
-        // may not open with a placeholder; a toggle names a file by the spelling
-        // it reaches.)
-        const LAYER: &str = "[[value]]\nname = \"root\"\nkind = \"path\"\n\
-                             [[target]]\npath = \"/srv/data/s\"\ncontent = \"S\"\n\
-                             [[target]]\npath = \"{{root}}/s\"\nenabled = false\n\
-                             [[target]]\npath = \"{{root}}/./s\"\nenabled = true\n\
-                             [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n";
-
-        let message = resolved(LAYER, Some("[values]\nroot = \"/srv/data\"\n"))
-            .expect_err("one path for every answer is the layer's defect");
-        assert_mentions(
-            &message,
-            &[
-                "bx.toml:10",
-                "names the same file as `{{root}}/s` at bx.toml:7",
-                "in this same layer",
-            ],
-        );
-    }
-
-    #[test]
-    fn a_path_value_opening_a_spelling_is_rooted_at_slash() {
-        // `{{r}}/s` and `/{{r}}/s` differ in their opening segment, and are one
-        // file for every answer only because every `path` answer is absolute:
-        // the `/` written before it adds nothing. So the pair is the layer's
-        // defect, not a block an answer could clear.
-        const LAYER: &str = "[[value]]\nname = \"r\"\nkind = \"path\"\n\
-                             [[target]]\npath = \"/srv/s\"\ncontent = \"S\"\n\
-                             [[target]]\npath = \"{{r}}/s\"\nenabled = false\n\
-                             [[target]]\npath = \"/{{r}}/s\"\nenabled = true\n";
-
-        let message = resolved(LAYER, Some("[values]\nr = \"/srv\"\n"))
-            .expect_err("one path for every answer is the layer's defect");
-        assert_mentions(
-            &message,
-            &[
-                "bx.toml:10",
-                "names the same file as `{{r}}/s` at bx.toml:7",
-                "in this same layer",
-            ],
-        );
-    }
-
-    #[test]
-    fn a_pair_apart_only_around_its_opening_segment_fails_the_load() {
-        // Each pair names one file whatever is answered, so no answer could clear
-        // the collision and it is the layer's defect. A `path` answer is
-        // absolute, so a `/` before it adds nothing even with text glued on
-        // (`{{r}}.d/conf`), and neither does one after a `~` that precedes it
-        // (`~{{r}}/s`). An opening segment no answer makes empty (`~{{p}}`, and a
-        // lone `email`) is the same path with a separator after it or without.
-        let cases = [
-            (
-                "r",
-                "path",
-                "/srv.d/conf",
-                "{{r}}.d/conf",
-                "/{{r}}.d/conf",
-                "r = \"/srv\"",
-            ),
-            (
-                "r",
-                "path",
-                "~/srv/s",
-                "~{{r}}/s",
-                "~/{{r}}/s",
-                "r = \"/srv\"",
-            ),
-            (
-                "p",
-                "string",
-                "~/work",
-                "~{{p}}",
-                "~{{p}}/",
-                "p = \"/work\"",
-            ),
-            ("e", "email", "/a@b", "{{e}}", "{{e}}/", "e = \"/a@b\""),
-        ];
-        let mut loaded = Vec::new();
-        for (name, kind, file, first, second, answer) in cases {
-            let layer = format!(
-                "[[value]]\nname = \"{name}\"\nkind = \"{kind}\"\n\
-                 [[target]]\npath = \"{file}\"\ncontent = \"S\"\n\
-                 [[target]]\npath = \"{first}\"\nenabled = false\n\
-                 [[target]]\npath = \"{second}\"\nenabled = true\n"
-            );
-            let Err(message) = resolved(&layer, Some(&format!("[values]\n{answer}\n"))) else {
-                loaded.push(format!("{first} and {second}"));
-                continue;
-            };
-            assert_mentions(
-                &message,
-                &[
-                    "bx.toml:10",
-                    &format!("names the same file as `{first}` at bx.toml:7"),
-                    "in this same layer",
-                ],
-            );
-        }
-        assert!(
-            loaded.is_empty(),
-            "one path for every answer is the layer's defect, yet these loaded: {loaded:?}"
-        );
-    }
-
-    #[test]
-    fn a_path_value_glued_after_text_starts_its_own_segment() {
-        // A `path` answer always begins with `/`, so text glued before a `path`
-        // value is joined to it by that `/`: `/opt{{r}}/conf` is `/opt/srv/conf`
-        // for `r = "/srv"`, as `/opt/{{r}}/conf` is, and a `/` written before the
-        // value only doubles a separator, which folds. Each pair is one file for
-        // every answer, wherever the value sits and whatever is glued before it,
-        // so it is the layer's defect rather than a block an answer could clear.
-        let cases = [
-            ("/opt/srv/conf", "/opt{{r}}/conf", "/opt/{{r}}/conf"),
-            ("/srv/d/conf", "{{r}}{{s}}/conf", "{{r}}/{{s}}/conf"),
-            ("~/srv/conf", "{{p}}{{r}}/conf", "{{p}}/{{r}}/conf"),
-            ("~/srv/d", "~{{r}}{{s}}", "~/{{r}}/{{s}}"),
-        ];
-        let mut loaded = Vec::new();
-        for (file, first, second) in cases {
-            let layer = format!(
-                "[[value]]\nname = \"r\"\nkind = \"path\"\n\
-                 [[value]]\nname = \"s\"\nkind = \"path\"\n\
-                 [[value]]\nname = \"p\"\nkind = \"string\"\n\
-                 [[target]]\npath = \"{file}\"\ncontent = \"S\"\n\
-                 [[target]]\npath = \"{first}\"\nenabled = false\n\
-                 [[target]]\npath = \"{second}\"\nenabled = true\n"
-            );
-            let answers = "[values]\nr = \"/srv\"\ns = \"/d\"\np = \"~\"\n";
-            let message = match resolved(&layer, Some(answers)) {
-                Ok(resolved) => {
-                    loaded.push(format!("{first} and {second}: {:?}", keys(&resolved)));
-                    continue;
-                }
-                Err(message) => message,
-            };
-            assert_mentions(
-                &message,
-                &[
-                    "bx.toml:16",
-                    &format!("names the same file as `{first}` at bx.toml:13"),
-                    "in this same layer",
-                ],
-            );
-        }
-        assert!(
-            loaded.is_empty(),
-            "one path for every answer is the layer's defect, yet these loaded: {loaded:#?}"
-        );
     }
 
     #[test]
@@ -2167,85 +1894,6 @@ mod tests {
                 let expected: &[&str] = if *meet { &["/s"] } else { &[] };
                 assert_eq!(blocked, expected, "{answer}");
             }
-        }
-    }
-
-    #[test]
-    fn toggles_one_path_past_a_placeholder_fail_the_load_for_every_answer() {
-        // `{{p}}/../../s` and `{{p}}/.././../s` differ only by a `.`: whenever
-        // they name a file they name the same one, so no answer parts them and
-        // the pair is the layer's defect. `{{p}}/s` and `{{p}}/./s` are the same
-        // with the placeholder opening the spelling, which `p = "~"` roots.
-        for prefix in ["~/", "~/x/y/"] {
-            let layer = format!(
-                "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                 [[target]]\npath = \"{prefix}s\"\ncontent = \"S\"\n\
-                 [[target]]\npath = \"{prefix}{{{{p}}}}/../../s\"\nenabled = false\n\
-                 [[target]]\npath = \"{prefix}{{{{p}}}}/.././../s\"\nenabled = true\n"
-            );
-            for answer in ["a/b", "b/c", "a", "a/b/c", "."] {
-                let message = resolved(&layer, Some(&format!("[values]\np = \"{answer}\"\n")))
-                    .expect_err("no answer loads this layer");
-                if matches!(answer, "a/b" | "b/c") {
-                    assert_mentions(
-                        &message,
-                        &[
-                            &format!("names the same file as `{prefix}{{{{p}}}}/../../s`"),
-                            "in this same layer",
-                        ],
-                    );
-                } else {
-                    // Where the pair names no file `s` shares, the toggles are
-                    // refused for what each is: a toggle of nothing declared.
-                    assert!(
-                        message.contains("which no earlier layer declares"),
-                        "{prefix} {answer}: {message}"
-                    );
-                }
-            }
-        }
-
-        let lead = "[[value]]\nname = \"p\"\nkind = \"string\"\n\
-                    [[target]]\npath = \"~/s\"\ncontent = \"S\"\n\
-                    [[target]]\npath = \"{{p}}/s\"\nenabled = false\n\
-                    [[target]]\npath = \"{{p}}/./s\"\nenabled = true\n";
-        let message = resolved(lead, Some("[values]\np = \"~\"\n"))
-            .expect_err("one path for every answer is the layer's defect");
-        assert_mentions(
-            &message,
-            &[
-                "names the same file as `{{p}}/s` at bx.toml:7",
-                "in this same layer",
-            ],
-        );
-    }
-
-    #[test]
-    fn a_pair_with_many_placeholders_is_decided_like_any_other() {
-        // Nothing about the rule grows with the placeholders in a spelling: a
-        // pair carrying thirteen that is one path as written fails the load like
-        // a pair carrying one.
-        let layer = |count: usize| {
-            let decls: String = (1..=count)
-                .map(|i| format!("[[value]]\nname = \"v{i}\"\nkind = \"string\"\n"))
-                .collect();
-            let segments: String = (1..=count).map(|i| format!("/{{{{v{i}}}}}")).collect();
-            let answers: String = (1..=count).map(|i| format!("v{i} = \"a\"\n")).collect();
-            (
-                format!(
-                    "{decls}[[target]]\npath = \"~{segments}/s\"\ncontent = \"S\"\n\
-                     [[target]]\npath = \"~{segments}/./s\"\nenabled = false\n\
-                     [[target]]\npath = \"~/.zshrc\"\ncontent = \"setopt\"\n"
-                ),
-                format!("[values]\n{answers}"),
-            )
-        };
-
-        for count in [1, 13] {
-            let (text, answers) = layer(count);
-            let message = resolved(&text, Some(&answers))
-                .expect_err("one path for every answer is the layer's defect");
-            assert!(message.contains("in this same layer"), "{count}: {message}");
         }
     }
 

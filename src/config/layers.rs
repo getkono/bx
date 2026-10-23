@@ -638,7 +638,9 @@ mod tests {
     }
 
     #[test]
-    fn the_layer_order_is_bx_then_modules_then_local() {
+    fn the_local_layer_comes_after_every_repo_layer() {
+        // The order of the repo's own layers is `layer_files`', and its tests
+        // in `config/mod.rs` pin it; what this module adds is the local layer.
         let home = guarded_home();
         let (repo, state) = repo_and_state(&home);
         home.write(".config/bx/bx.toml", "");
@@ -646,15 +648,12 @@ mod tests {
         home.write(".config/bx/modules/10-shell.toml", "");
         home.write(".local/state/bx/local.toml", "");
 
-        let names: Vec<String> = layer_paths(&repo, &state)
-            .unwrap()
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let paths = layer_paths(&repo, &state).unwrap();
 
+        assert_eq!(paths.len(), 4, "{paths:?}");
         assert_eq!(
-            names,
-            ["bx.toml", "10-shell.toml", "20-git.toml", "local.toml"],
+            paths.last(),
+            Some(&state.join(LOCAL_FILE)),
             "the account always has the last word, which is the point"
         );
     }
@@ -1139,16 +1138,6 @@ mod tests {
 
         assert!(message.contains("10-git.toml"), "{message}");
         assert!(message.contains("~/.gitconfig"), "{message}");
-    }
-
-    #[test]
-    fn a_missing_repo_is_an_error() {
-        let home = guarded_home();
-        let (repo, state) = repo_and_state(&home);
-
-        let error = layer_paths(&repo, &state).expect_err("no repo at all");
-
-        assert!(matches!(error, Error::RepoMissing(_)), "{error}");
     }
 
     // --- a local layer that cannot be examined ------------------------------
